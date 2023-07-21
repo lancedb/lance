@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::{Any, TypeId};
 use std::sync::{Arc, Mutex};
 
 use lru_time_cache::LruCache;
 use object_store::path::Path;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
-use crate::format::Metadata;
 use crate::index::cache::IndexCache;
 
 /// A user session tracks the runtime state.
@@ -60,12 +60,15 @@ impl Default for Session {
     }
 }
 
+type ArcAny = Arc<dyn Any + Send + Sync>;
+
+/// Cache for various metadata about files.
 #[derive(Clone)]
 pub struct FileMetadataCache {
     /// The maximum number of metadata to cache.
     capacity: usize,
 
-    cache: Arc<Mutex<LruCache<Path, Arc<Metadata>>>>,
+    cache: Arc<Mutex<LruCache<(Path, TypeId), ArcAny>>>,
 }
 
 impl FileMetadataCache {
@@ -76,19 +79,20 @@ impl FileMetadataCache {
         }
     }
 
-    pub(crate) fn get(&self, fragment_path: &Path) -> Option<Arc<Metadata>> {
+    pub(crate) fn get<T: Send + Sync + 'static>(&self, path: &Path) -> Option<Arc<T>> {
         let mut cache = self.cache.lock().unwrap();
-        let idx = cache.get(fragment_path);
-        idx.cloned()
+        cache
+            .get(&(path.to_owned(), TypeId::of::<T>()))
+            .map(|metadata| metadata.clone().downcast::<T>().unwrap())
     }
 
-    pub(crate) fn insert(&self, fragment_path: Path, metadata: Arc<Metadata>) {
+    pub(crate) fn insert<T: Send + Sync + 'static>(&self, path: Path, metadata: Arc<T>) {
         if self.capacity == 0 {
             // Work-around. lru_time_cache panics if capacity is 0.
             return;
         }
         let mut cache = self.cache.lock().unwrap();
-        cache.insert(fragment_path, metadata);
+        cache.insert((path, TypeId::of::<T>()), metadata);
     }
 }
 

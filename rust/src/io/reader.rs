@@ -39,7 +39,7 @@ use object_store::path::Path;
 use prost::Message;
 
 use super::deletion::{read_deletion_file, DeletionVector};
-use super::ReadBatchParams;
+use super::{deletion_file_path, ReadBatchParams};
 use crate::arrow::*;
 use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::error::{Error, Result};
@@ -131,7 +131,7 @@ fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
 pub struct FileReader {
     object_reader: Arc<dyn ObjectReader>,
     metadata: Arc<Metadata>,
-    page_table: PageTable,
+    page_table: Arc<PageTable>,
     projection: Option<Schema>,
 
     /// The id of the fragment which this file belong to.
@@ -143,7 +143,7 @@ pub struct FileReader {
     with_row_id: bool,
 
     // deletion vector indicating which rows are deleting in the fragment
-    deletion_vector: Option<DeletionVector>,
+    deletion_vector: Option<Arc<DeletionVector>>,
 }
 
 impl std::fmt::Debug for FileReader {
@@ -220,29 +220,82 @@ impl FileReader {
             &m
         };
 
+        let cached_page_table: Option<Arc<PageTable>> = if let Some(session) = session {
+            session.file_metadata_cache.get(path)
+        } else {
+            None
+        };
+
         let projection = manifest.schema.clone();
-        let num_columns = manifest.schema.max_field_id().unwrap() + 1;
-        let page_table = PageTable::load(
-            object_reader.as_ref(),
-            metadata.page_table_position,
-            num_columns,
-            metadata.num_batches() as i32,
-        )
-        .await?;
+        let page_table = if let Some(page_table) = cached_page_table {
+            page_table
+        } else {
+            let num_columns = manifest.schema.max_field_id().unwrap() + 1;
+            let page_table = PageTable::load(
+                object_reader.as_ref(),
+                metadata.page_table_position,
+                num_columns,
+                metadata.num_batches() as i32,
+            )
+            .await?;
+            let page_table = Arc::new(page_table);
+
+            if let Some(session) = session {
+                session
+                    .file_metadata_cache
+                    .insert(path.clone(), page_table.clone());
+            }
+            page_table
+        };
 
         // read the fragment metadata so we can handle deletion
         let fragment = manifest
             .fragments
             .iter()
             .find(|frag| frag.id == fragment_id)
-            .map(|f| f.to_owned());
+            .map(|f| f.to_owned())
+            .ok_or(Error::IO {
+                message: format!("Fragment {} not found in manifest", fragment_id),
+            })?;
 
-        let deletion_vector = match &fragment {
-            Some(frag) => read_deletion_file(object_store.base_path(), frag, object_store).await,
-            None => Ok(None),
+        let deletion_vector = if let Some(deletion_file) = &fragment.deletion_file {
+            let cached_deletion_vector = if let Some(session) = session {
+                let path = deletion_file_path(object_store.base_path(), fragment_id, deletion_file);
+                session.file_metadata_cache.get(&path)
+            } else {
+                None
+            };
+
+            if let Some(deletion_vector) = cached_deletion_vector {
+                Some(deletion_vector)
+            } else {
+                let deletion_vector =
+                    read_deletion_file(object_store.base_path(), &fragment, object_store)
+                        .await?
+                        .ok_or(Error::IO {
+                            message: format!(
+                                "Deletion file {:?} not found in fragment {}",
+                                deletion_file, fragment_id
+                            ),
+                        })?;
+
+                let deletion_vector = Arc::new(deletion_vector);
+
+                if let Some(session) = session {
+                    let path =
+                        deletion_file_path(object_store.base_path(), fragment_id, deletion_file);
+                    session
+                        .file_metadata_cache
+                        .insert(path, deletion_vector.clone());
+                }
+
+                Some(deletion_vector)
+            }
+        } else {
+            None
         };
 
-        deletion_vector.map(|deletion_vector| Self {
+        Ok(Self {
             object_reader: object_reader.into(),
             metadata,
             projection: Some(projection),
@@ -302,7 +355,7 @@ impl FileReader {
             projection,
             batch_id,
             self.with_row_id,
-            self.deletion_vector.as_ref(),
+            self.deletion_vector.clone(),
         )
         .await
     }
@@ -357,7 +410,7 @@ async fn read_batch(
     schema: &Schema,
     batch_id: i32,
     with_row_id: bool,
-    deletion_vector: Option<&DeletionVector>,
+    deletion_vector: Option<Arc<DeletionVector>>,
 ) -> Result<RecordBatch> {
     // We box this because otherwise we get a higher-order lifetime error.
     let arrs = stream::iter(&schema.fields)
@@ -367,8 +420,11 @@ async fn read_batch(
         .boxed();
     let arrs = arrs.await?;
 
-    let should_fetch_row_id =
-        with_row_id || !matches!(deletion_vector, None | Some(DeletionVector::NoDeletions));
+    let should_fetch_row_id = with_row_id
+        || !matches!(
+            deletion_vector.as_deref(),
+            None | Some(DeletionVector::NoDeletions)
+        );
 
     let mut batch = RecordBatch::try_new(Arc::new(schema.into()), arrs)?;
 
