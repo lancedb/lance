@@ -144,6 +144,7 @@ impl Dataset {
         batch_size: Option<usize>,
         batch_readahead: Option<usize>,
         fragment_readahead: Option<usize>,
+        batch_size: Option<usize>,
         scan_in_order: Option<bool>,
         fragments: Option<Vec<FileFragment>>,
     ) -> PyResult<Scanner> {
@@ -172,6 +173,10 @@ impl Dataset {
 
         if let Some(fragment_readahead) = fragment_readahead {
             scanner.fragment_readahead(fragment_readahead);
+        }
+
+        if let Some(batch_size) = batch_size {
+            scanner.batch_size(batch_size);
         }
 
         scanner.scan_in_order(scan_in_order.unwrap_or(true));
