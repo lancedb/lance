@@ -9,12 +9,14 @@ mod index;
 mod manifest;
 mod metadata;
 mod page_table;
+mod mutation_log;
 use crate::{Error, Result};
 pub use fragment::*;
 pub use index::Index;
 pub use manifest::Manifest;
 pub use metadata::Metadata;
 pub use page_table::{PageInfo, PageTable};
+pub use mutation_log::MutationLog;
 
 /// Protobuf definitions
 pub mod pb {

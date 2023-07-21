@@ -27,7 +27,7 @@ use arrow_schema::Schema as ArrowSchema;
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use log::warn;
+use log::{warn};
 use object_store::path::Path;
 use uuid::Uuid;
 
@@ -49,6 +49,7 @@ use crate::io::{
     object_reader::{read_message, read_struct},
     read_manifest, read_metadata_offset, write_manifest, FileWriter, ObjectStore,
 };
+use crate::format::MutationLog;
 use crate::session::Session;
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
@@ -289,11 +290,11 @@ impl Dataset {
         })
     }
 
-    async fn write_impl(
+    pub async fn prepare_write(
         batches: Box<dyn RecordBatchReader + Send>,
         uri: &str,
         params: Option<WriteParams>,
-    ) -> Result<Self> {
+    ) -> Result<MutationLog> {
         let mut params = params.unwrap_or_default();
 
         let (object_store, base) =
@@ -368,31 +369,9 @@ impl Dataset {
             }
         }
 
-        let mut fragment_id = if matches!(params.mode, WriteMode::Append) {
-            dataset.as_ref().map_or(0, |d| {
-                d.manifest
-                    .fragments
-                    .iter()
-                    .map(|f| f.id)
-                    .max()
-                    .map(|id| id + 1)
-                    .unwrap_or(0)
-            })
-        } else {
-            // Create or Overwrite.
-            // Overwrite resets the fragment ID to zero.
-            0
-        };
-
-        let mut fragments: Vec<Fragment> = if matches!(params.mode, WriteMode::Append) {
-            dataset
-                .as_ref()
-                .map_or(vec![], |d| d.manifest.fragments.as_ref().clone())
-        } else {
-            // Create or Overwrite create new fragments.
-            vec![]
-        };
-
+        // Write the batches to fragment files -- set frag ID to 0 for now
+        // Mutation log will handle the fragment ID increment
+        let mut new_fragements: Vec<Fragment> = Vec::new();
         let mut writer = None;
         let mut batches: Vec<RecordBatch> = Vec::new();
         let mut num_rows: usize = 0;
@@ -405,9 +384,8 @@ impl Dataset {
                 if writer.is_none() {
                     writer = {
                         let file_path = format!("{}.lance", Uuid::new_v4());
-                        let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
-                        fragments.push(fragment);
-                        fragment_id += 1;
+                        let fragment = Fragment::with_file(0, &file_path, &schema);
+                        new_fragements.push(fragment);
                         Some(new_file_writer(&object_store, &base, &file_path, &schema).await?)
                     }
                 };
@@ -423,12 +401,13 @@ impl Dataset {
                 }
             }
         }
+
         if num_rows > 0 {
             if writer.is_none() {
                 writer = {
                     let file_path = format!("{}.lance", Uuid::new_v4());
-                    let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
-                    fragments.push(fragment);
+                    let fragment = Fragment::with_file(0, &file_path, &schema);
+                    new_fragements.push(fragment);
                     Some(new_file_writer(&object_store, &base, &file_path, &schema).await?)
                 }
             };
@@ -439,6 +418,24 @@ impl Dataset {
             w.finish().await?;
             drop(writer);
         };
+
+        match &params.mode {
+            WriteMode::Append => {
+                Ok(MutationLog::Append { fragments: new_fragements })
+            }
+            WriteMode::Overwrite => {
+                Ok(MutationLog::Append { fragments: new_fragements })
+            }
+            WriteMode::Create => Ok(MutationLog::Overwrite { fragments: new_fragements }),
+        }
+    }
+
+    async fn write_impl(
+        batches: Box<dyn RecordBatchReader + Send>,
+        uri: &str,
+        params: Option<WriteParams>,
+    ) -> Result<Self> {
+        let log = Self::prepare_write(batches, uri, params).await?;
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments));
         manifest.version = match dataset.as_ref() {
@@ -454,14 +451,6 @@ impl Dataset {
             (Some(d), WriteMode::Append) => Some(d.load_indices().await?),
             _ => None,
         };
-        write_manifest_file(
-            &object_store,
-            &base,
-            &mut manifest,
-            indices,
-            Default::default(),
-        )
-        .await?;
 
         Ok(Self {
             object_store: Arc::new(object_store),
