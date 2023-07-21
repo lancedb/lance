@@ -49,8 +49,18 @@ class LanceDataset(dataset_ops.DatasetSource):
         import tensorflow as tf
         import lance.tf.data
 
+        class DistributedSelector:
+            def __init__(self, world_size, rank):
+                self.world_size = world_size
+                self.rank = rank
+
+            def __call__(self, fragments):
+                return fragments[self.rank::self.world_size]
+
         ds = lance.tf.data.from_lance("s3://bucket/path/dataset.lance")
-            .filter("a > 10")
+            .select(["image", "label"])
+            .filter("val > 10.5")
+            .fragments(DistributedSelector(world_size=10, rank=5))
             .map(lambda x: x["a"] + x["b"])
 
     """
