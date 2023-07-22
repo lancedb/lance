@@ -19,10 +19,10 @@ from typing import Optional, Union
 try:
     import pandas as pd
 
-    ts_types = (pd.Timestamp,)
+    ts_types = Union[datetime, pd.Timestamp, str]
 except ImportError:
     pd = None
-    ts_types = ()
+    ts_types = Union[datetime, str]
 
 from .dataset import LanceDataset, LanceScanner, __version__, write_dataset
 from .fragment import _FragmentMetadata
@@ -44,7 +44,7 @@ __all__ = [
 def dataset(
     uri: Union[str, Path],
     version: Optional[int] = None,
-    asof: Optional[Union[datetime, *ts_types, str]] = None,
+    asof: Optional[ts_types] = None,
     block_size: Optional[int] = None,
 ) -> LanceDataset:
     """

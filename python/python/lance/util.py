@@ -18,13 +18,13 @@ from typing import Union
 try:
     import pandas as pd
 
-    ts_types = (pd.Timestamp,)
+    ts_types = Union[datetime, str]
 except ImportError:
     pd = None
-    ts_types = ()
+    ts_types = Union[datetime, pd.Timestamp, str]
 
 
-def sanitize_ts(ts: Union[datetime, *ts_types, str]) -> datetime:
+def sanitize_ts(ts: ts_types) -> datetime:
     """Returns a python datetime object from various timestamp input types."""
     if pd and isinstance(ts, str):
         ts = pd.to_datetime(ts).to_pydatetime()
@@ -33,7 +33,8 @@ def sanitize_ts(ts: Union[datetime, *ts_types, str]) -> datetime:
             ts = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
         except ValueError:
             raise ValueError(
-                f"Failed to parse timestamp string {ts}. Try installing Pandas.")
+                f"Failed to parse timestamp string {ts}. Try installing Pandas."
+            )
     elif pd and isinstance(ts, pd.Timestamp):
         ts = ts.to_pydatetime()
     elif not isinstance(ts, datetime):
