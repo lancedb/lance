@@ -12,7 +12,7 @@ runs:
     working-directory: python
     shell: bash
     run: |
-      pip3 install $(ls target/wheels/pylance-*.whl) pytest pandas duckdb polars ml_dtypes
+      pip3 install $(ls target/wheels/pylance-*.whl)[tests]
   - name: Run python tests
     shell: bash
     working-directory: python
