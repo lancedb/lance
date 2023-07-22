@@ -471,7 +471,7 @@ def test_delete_data(tmp_path: Path):
 
 
 @pytest.mark.skipif(not pd, reason="Pandas not available")
-def test_create_update_empty_dataset(tmp_path: Path):
+def test_create_update_empty_dataset(tmp_path: Path, provide_pandas: bool):
     base_dir = tmp_path / "dataset"
 
     fields = [

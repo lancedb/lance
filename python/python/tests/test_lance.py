@@ -23,7 +23,7 @@ from lance.vector import vec_to_table
 
 
 @pytest.mark.skipif(not pd, reason="Pandas not available")
-def test_table_roundtrip(tmp_path):
+def test_table_roundtrip(tmp_path, provide_pandas):
     uri = tmp_path
 
     df = pd.DataFrame({"a": range(100), "b": range(100)})
@@ -45,7 +45,7 @@ def test_table_roundtrip(tmp_path):
 
 
 @pytest.mark.skipif(not pd, reason="Pandas not available")
-def test_input_types(tmp_path):
+def test_input_types(tmp_path, provide_pandas):
     # test all input types for write_dataset
     uri = tmp_path
 
@@ -125,7 +125,7 @@ def cosine_distance(vec1, vec2):
 
 
 @pytest.mark.skipif(not pd, reason="Pandas not available")
-def test_count_rows(tmp_path):
+def test_count_rows(tmp_path, provide_pandas):
     df = pd.DataFrame({"values": range(100)})
     tbl = pa.Table.from_pandas(df)
     dataset = lance.write_dataset(tbl, tmp_path)
