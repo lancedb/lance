@@ -26,15 +26,43 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, List, Optional, Union
 
+import lance
 import tensorflow as tf
 from lance import LanceDataset as _LanceDataset
 from lance.fragment import LanceFragment
-from tensorflow.python.data.ops import dataset_ops
+from tensorflow.python.data.ops import dataset_ops, readers
+from tensorflow.python.framework import dtypes, tensor_spec
+from tensorflow.python.ops import gen_dataset_ops
 
 
 def from_lance(uri: Union[str, Path]) -> tf.data.Dataset:
     """Create a `tf.data.Dataset` from a Lance."""
     return LanceDataset(uri)
+
+
+def from_fragments(
+    dataset: _LanceDataset, fragments: tf.data.Dataset, name: str = None
+) -> tf.data.Dataset:
+    """Create a `tf.data.Dataset` from a Lance."""
+    ids = fragments.as_numpy_iterator()
+    print(list(ids))
+    # return fragments.map(read_lance)
+    return LanceDataset(dataset.uri, fragments=ids)
+
+
+class LanceFragmentDataset(dataset_ops.DatasetSource):
+    def __init__(self, dataset: _LanceDataset):
+        self._dataset = dataset
+        self._impl = tf.data.Dataset.from_tensor_slices(
+            [f.fragment_id for f in dataset.get_fragment()]
+        )
+        super().__init__(self._impl.element_spec)
+
+    def __repr__(self):
+        return "LanceFragmentDataset"
+
+    def __iter__(self):
+        return iter(self._impl)
 
 
 class LanceDataset(dataset_ops.DatasetSource):
@@ -65,20 +93,30 @@ class LanceDataset(dataset_ops.DatasetSource):
 
     """
 
-    def __init__(self, uri: str):
-        self._dataset: _LanceDataset = None
+    def __init__(self, uri: str, fragments: Optional[List[int]] = None):
+        self._dataset: _LanceDataset = lance.dataset(uri)
+        self._fragments: List[int] = None
+        self._select: Optional[List[str]] = None
+        
+        super().__init__(tf.va)
+
+    @staticmethod
+    def from_fragments(fragments: tf.data.Dataset) -> tf.data.Dataset:
+        return LanceDataset()
 
     def fragments(
-        self, selector: Callable[[List[LanceFragment]], List[LanceFragment]]
-    ) -> LanceDataset:
+        self,
+        selector: Optional[Callable[[List[LanceFragment]], List[LanceFragment]]] = None,
+    ) -> tf.data.Dataset:
         """Only read the specified fragments."""
-        pass
+        fragments = self._dataset.get_fragments()
+        return tf.data.Dataset.from_tensor_slices([str(f.fragment_id) for f in fragments])
 
     def select(self, columns: List[str]) -> LanceDataset:
         """Select only columns to read, if not called, all columns are read."""
         pass
 
-    def filter(self, predicate: Union[str, Callable], name=None):
+    def filter(self, predicate: Union[str, Callable], name: Optional[str] = None):
         """Filter this dataset according to predicate.
 
         If the predicate is string type, it is interpreted as a SQL expression, and
@@ -98,3 +136,7 @@ class LanceDataset(dataset_ops.DatasetSource):
             return self
 
         return super().filter(predicate, name)
+
+    @property
+    def element_spec(self):
+        pass

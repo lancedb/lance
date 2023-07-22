@@ -280,6 +280,7 @@ class LanceDataset(pa.dataset.Dataset):
     ) -> Iterator[pa.dataset.Fragment]:
         """Get all fragments from the dataset.
 
+
         Note: filter is not supported yet.
         """
         if filter is not None:
