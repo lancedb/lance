@@ -22,7 +22,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 
 import numpy as np
-import pandas as pd
+
+try:
+    import pandas as pd
+
+    df_types = (pd.Timestamp,)
+except ImportError:
+    pd = None
+    df_types = ()
 import pyarrow as pa
 import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
@@ -363,11 +370,11 @@ class LanceDataset(pa.dataset.Dataset):
         raise NotImplementedError("Versioning not yet supported in Rust")
 
     def merge(
-        self,
-        data_obj: ReaderLike,
-        left_on: str,
-        right_on: Optional[str] = None,
-        schema=None,
+            self,
+            data_obj: ReaderLike,
+            left_on: str,
+            right_on: Optional[str] = None,
+            schema=None,
     ):
         """
         Merge another dataset into this one.
@@ -885,7 +892,7 @@ class LanceScanner(pa.dataset.Scanner):
 
 
 ReaderLike = Union[
-    pd.DataFrame,
+    *df_types,
     pa.Table,
     pa.dataset.Dataset,
     pa.dataset.Scanner,
@@ -942,7 +949,7 @@ def write_dataset(
 def _coerce_reader(
     data_obj: ReaderLike, schema: Optional[pa.Schema] = None
 ) -> pa.RecordBatchReader:
-    if isinstance(data_obj, pd.DataFrame):
+    if pd and isinstance(data_obj, pd.DataFrame):
         return pa.Table.from_pandas(data_obj, schema=schema).to_reader()
     elif isinstance(data_obj, pa.Table):
         return data_obj.to_reader()
