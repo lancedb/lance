@@ -97,8 +97,10 @@ class LanceDataset(dataset_ops.DatasetSource):
         self._dataset: _LanceDataset = lance.dataset(uri)
         self._fragments: List[int] = None
         self._select: Optional[List[str]] = None
-        
-        super().__init__(tf.va)
+
+        var_tensor = tf.constant(self, shape=(), dtype=tf.variant, name="lance_dataset")
+        print("Dataset var tensor: ", var_tensor)
+        super().__init__(variant_tensor=var_tensor)
 
     @staticmethod
     def from_fragments(fragments: tf.data.Dataset) -> tf.data.Dataset:
@@ -139,4 +141,4 @@ class LanceDataset(dataset_ops.DatasetSource):
 
     @property
     def element_spec(self):
-        pass
+        return tf.TensorSpec(shape=(), dtype=tf.int32)
