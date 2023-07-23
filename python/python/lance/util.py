@@ -18,10 +18,10 @@ from typing import Union
 try:
     import pandas as pd
 
-    ts_types = Union[datetime, str]
+    ts_types = Union[datetime, pd.Timestamp, str]
 except ImportError:
     pd = None
-    ts_types = Union[datetime, pd.Timestamp, str]
+    ts_types = Union[datetime, str]
 
 
 def sanitize_ts(ts: ts_types) -> datetime:
