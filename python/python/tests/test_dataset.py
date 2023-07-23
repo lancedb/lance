@@ -470,7 +470,7 @@ def test_delete_data(tmp_path: Path):
     assert dataset.to_table() == pa.table({"a": range(20, 98), "b": range(20, 98)})
 
 
-def test_create_update_empty_dataset(tmp_path: Path):
+def test_create_update_empty_dataset(tmp_path: Path, provide_pandas: bool):
     base_dir = tmp_path / "dataset"
 
     fields = [

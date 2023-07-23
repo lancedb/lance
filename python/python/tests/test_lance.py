@@ -22,7 +22,7 @@ import pytest
 from lance.vector import vec_to_table
 
 
-def test_table_roundtrip(tmp_path):
+def test_table_roundtrip(tmp_path, provide_pandas):
     uri = tmp_path
 
     df = pd.DataFrame({"a": range(100), "b": range(100)})
@@ -43,7 +43,7 @@ def test_table_roundtrip(tmp_path):
     assert with_offset == table[10:]
 
 
-def test_input_types(tmp_path):
+def test_input_types(tmp_path, provide_pandas):
     # test all input types for write_dataset
     uri = tmp_path
 
@@ -122,7 +122,7 @@ def cosine_distance(vec1, vec2):
     return 1 - np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
 
 
-def test_count_rows(tmp_path):
+def test_count_rows(tmp_path, provide_pandas):
     df = pd.DataFrame({"values": range(100)})
     tbl = pa.Table.from_pandas(df)
     dataset = lance.write_dataset(tbl, tmp_path)

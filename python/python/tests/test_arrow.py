@@ -70,7 +70,7 @@ def test_bf16_repr():
 #     assert re.match(expected_re, repr(tab))
 
 
-def test_bf16_pandas():
+def test_bf16_pandas(provide_pandas):
     data = [1.1, None, 3.4]
     arr = bfloat16_array(data)
     arr_pandas = arr.to_pandas()

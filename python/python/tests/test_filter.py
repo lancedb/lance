@@ -128,7 +128,7 @@ def test_compound(dataset):
             )
 
 
-def test_match(tmp_path: Path):
+def test_match(tmp_path: Path, provide_pandas: bool):
     array = pa.array(["aaa", "bbb", "abc", "bca", "cab", "cba"])
     table = pa.Table.from_arrays([array], names=["str"])
     dataset = lance.write_dataset(table, tmp_path / "test_match")
@@ -145,7 +145,7 @@ def test_match(tmp_path: Path):
     pd.testing.assert_frame_equal(result, pd.DataFrame({"str": ["bca", "cab", "cba"]}))
 
 
-def test_escaped_name(tmp_path: Path):
+def test_escaped_name(tmp_path: Path, provide_pandas: bool):
     table = pa.table({"silly :name": pa.array([0, 1, 2])})
     dataset = lance.write_dataset(table, tmp_path / "test_escaped_name")
 

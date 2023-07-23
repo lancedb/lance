@@ -19,7 +19,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterator, Optional, Union
 
-import pandas as pd
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
 import pyarrow as pa
 
 from .lance import _Fragment
@@ -90,7 +93,7 @@ class LanceFragment(pa.dataset.Fragment):
             The schema of the data. If not specified, the schema will be inferred
             from the data.
         """
-        if isinstance(data, pd.DataFrame):
+        if pd and isinstance(data, pd.DataFrame):
             reader = pa.Table.from_pandas(data, schema=schema).to_reader()
         elif isinstance(data, pa.Table):
             reader = data.to_reader()

@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
@@ -31,6 +30,27 @@ from pyarrow._compute import Expression
 from .fragment import LanceFragment
 from .lance import __version__ as __version__
 from .lance import _Dataset, _Scanner, _write_dataset
+
+try:
+    import pandas as pd
+
+    ReaderLike = Union[
+        pd.Timestamp,
+        pa.Table,
+        pa.dataset.Dataset,
+        pa.dataset.Scanner,
+        Iterable[RecordBatch],
+        pa.RecordBatchReader,
+    ]
+except ImportError:
+    pd = None
+    ReaderLike = Union[
+        pa.Table,
+        pa.dataset.Dataset,
+        pa.dataset.Scanner,
+        Iterable[RecordBatch],
+        pa.RecordBatchReader,
+    ]
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -884,16 +904,6 @@ class LanceScanner(pa.dataset.Scanner):
         return self._ds.count_rows()
 
 
-ReaderLike = Union[
-    pd.DataFrame,
-    pa.Table,
-    pa.dataset.Dataset,
-    pa.dataset.Scanner,
-    Iterable[RecordBatch],
-    pa.RecordBatchReader,
-]
-
-
 def write_dataset(
     data_obj: ReaderLike,
     uri: Union[str, Path],
@@ -942,7 +952,7 @@ def write_dataset(
 def _coerce_reader(
     data_obj: ReaderLike, schema: Optional[pa.Schema] = None
 ) -> pa.RecordBatchReader:
-    if isinstance(data_obj, pd.DataFrame):
+    if pd and isinstance(data_obj, pd.DataFrame):
         return pa.Table.from_pandas(data_obj, schema=schema).to_reader()
     elif isinstance(data_obj, pa.Table):
         return data_obj.to_reader()
