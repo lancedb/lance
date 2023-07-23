@@ -1,8 +1,7 @@
 name: Run benchmarks
 
 on:
-  push:
-    branches: ["main"]
+  workflow_dispatch:
 
 jobs:
   dataset:
@@ -26,7 +25,8 @@ jobs:
     - name: Pip install
       working-directory: python
       run: |
-        python -m pip install $(ls target/wheels/*.whl)
+        pip install $(ls target/wheels/*.whl)
+        pip install pandas
     - name: Run test
       working-directory: benchmarks/${{ matrix.dataset }}
       run: |
