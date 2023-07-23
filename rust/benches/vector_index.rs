@@ -98,25 +98,26 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
 }
 
 async fn create_file(path: &std::path::Path, mode: WriteMode) {
+    let dimensions = 64;
     let schema = Arc::new(ArrowSchema::new(vec![Field::new(
         "vector",
         DataType::FixedSizeList(
             FieldRef::new(Field::new("item", DataType::Float32, true)),
-            128,
+            dimensions,
         ),
         false,
     )]));
 
-    let num_rows = 100_000;
-    let batch_size = 10000;
+    let num_rows = 1000;
+    let batch_size = 100;
     let batches: Vec<RecordBatch> = (0..(num_rows / batch_size))
         .map(|_| {
             RecordBatch::try_new(
                 schema.clone(),
                 vec![Arc::new(
                     FixedSizeListArray::try_new_from_values(
-                        create_float32_array(num_rows * 128),
-                        128,
+                        create_float32_array(num_rows * dimensions),
+                        dimensions,
                     )
                     .unwrap(),
                 )],
@@ -136,10 +137,10 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
         .await
         .unwrap();
     let mut ivf_params = IvfBuildParams::default();
-    ivf_params.num_partitions = 32;
+    ivf_params.num_partitions = 4;
     let mut pq_params = PQBuildParams::default();
     pq_params.num_bits = 8;
-    pq_params.num_sub_vectors = 16;
+    pq_params.num_sub_vectors = 4;
     pq_params.use_opq = false;
     let m_type = MetricType::L2;
     let params = VectorIndexParams::with_ivf_pq_params(m_type, ivf_params, pq_params);

@@ -47,11 +47,10 @@ fn l2_auto_vectorization(x: &[f32], y: &[f32]) -> f32 {
 }
 
 fn bench_distance(c: &mut Criterion) {
-    const DIMENSION: usize = 1024;
-    const TOTAL: usize = 1024 * 1024; // 1M vectors
+    const DIMENSION: usize = 64;
+    const TOTAL: usize = 1000;
 
     let key = generate_random_array_with_seed(DIMENSION, [0; 32]);
-    // 1M of 1024 D vectors. 4GB in memory.
     let target = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
 
     c.bench_function("L2(simd)", |b| {

@@ -24,51 +24,12 @@ fn bench_train(c: &mut Criterion) {
     // default tokio runtime
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let dimension: i32 = 128;
+    let dimension: i32 = 32;
     let array = generate_random_array(1024 * 4 * dimension as usize);
 
-    c.bench_function("train_128d_4k", |b| {
+    c.bench_function("train_32d_4k", |b| {
         b.to_async(&rt).iter(|| async {
-            let _ = KMeans::new(&array, 256, 25, 50).await;
-        })
-    });
-
-    #[cfg(feature = "faiss")]
-    c.bench_function("train_128d_4k_faiss", |b| {
-        use arrow_array::{cast::as_primitive_array, Float32Array};
-        use faiss::cluster::kmeans_clustering;
-
-        let array = data.as_ref().values();
-        let f32array: &Float32Array = as_primitive_array(&array);
-        b.iter(|| {
-            kmeans_clustering(dimension as u32, 256, f32array.values()).unwrap();
-        })
-    });
-
-    let array = generate_random_array(1024 * 64 * dimension as usize);
-    c.bench_function("train_128d_65535", |b| {
-        b.to_async(&rt).iter(|| async {
-            let _ = KMeans::new(&array, 256, 25, 50).await;
-        })
-    });
-
-    #[cfg(feature = "faiss")]
-    c.bench_function("train_128d_65535_faiss", |b| {
-        use arrow_array::{cast::as_primitive_array, Float32Array};
-        use faiss::cluster::kmeans_clustering;
-
-        let array = data.as_ref().values();
-        let f32array: &Float32Array = as_primitive_array(&array);
-        b.iter(|| {
-            kmeans_clustering(dimension as u32, 256, f32array.values()).unwrap();
-        })
-    });
-
-    let dimension = 8;
-    let array = generate_random_array(1024 * 64 * dimension as usize);
-    c.bench_function("train_8d_65535", |b| {
-        b.to_async(&rt).iter(|| async {
-            let _ = KMeans::new(&array, 256, 25, 50).await;
+            let _ = KMeans::new(&array, dimension as usize, 4, 50).await;
         })
     });
 }

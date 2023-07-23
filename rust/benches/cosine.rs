@@ -21,11 +21,10 @@ use pprof::criterion::{Output, PProfProfiler};
 use lance::utils::testing::generate_random_array_with_seed;
 
 fn bench_distance(c: &mut Criterion) {
-    const DIMENSION: usize = 1024;
-    const TOTAL: usize = 1024 * 1024; // 1M vectors
+    const DIMENSION: usize = 64;
+    const TOTAL: usize = 1000;
 
     let key = generate_random_array_with_seed(DIMENSION, [0; 32]);
-    // 1M of 1024 D vectors. 4GB in memory.
     let target = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
 
     c.bench_function("Cosine(simd)", |b| {
@@ -35,7 +34,6 @@ fn bench_distance(c: &mut Criterion) {
     });
 
     let key = generate_random_array_with_seed(DIMENSION, [5; 32]);
-    // 1M of 1024 D vectors. 4GB in memory.
     let target = generate_random_array_with_seed(TOTAL * DIMENSION, [7; 32]);
 
     c.bench_function("Cosine(simd) second rng seed", |b| {

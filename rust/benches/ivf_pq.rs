@@ -41,8 +41,8 @@ async fn create_dataset(path: &std::path::Path, dim: usize, mode: WriteMode) {
         false,
     )]));
 
-    let num_rows = 1_000_000;
-    let batch_size = 10_000;
+    let num_rows = 10000;
+    let batch_size = 1000;
     let batches: Vec<RecordBatch> = (0..(num_rows / batch_size) as i32)
         .map(|_| {
             RecordBatch::try_new(
@@ -73,7 +73,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
     // default tokio runtime
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    const DIM: usize = 768;
+    const DIM: usize = 128;
     let uri = format!("./ivf_pq_{}d.lance", DIM);
     std::fs::remove_dir_all(uri.to_string())
         .map_or_else(|_| println!("{} not exists", uri), |_| {});
@@ -82,8 +82,8 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
 
     let dataset = rt.block_on(async { Dataset::open(&uri).await.unwrap() });
 
-    let ivf_partition = 256;
-    let pq = 96;
+    let ivf_partition = 4;
+    let pq = 4;
 
     c.bench_function(
         format!("CreateIVF{},PQ{}(d={})", ivf_partition, pq, DIM).as_str(),

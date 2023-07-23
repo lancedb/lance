@@ -42,8 +42,8 @@ fn argmin_arrow_batch(x: &Float32Array, dimension: usize) -> Arc<UInt32Array> {
 }
 
 fn bench_argmin(c: &mut Criterion) {
-    const DIMENSION: usize = 1024 * 8;
-    const TOTAL: usize = 1024;
+    const DIMENSION: usize = 128 * 8;
+    const TOTAL: usize = 128;
     const SEED: [u8; 32] = [42; 32];
 
     let target = generate_random_array_with_seed(TOTAL * DIMENSION, SEED);

@@ -75,8 +75,8 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
         ),
         Field::new("blob", DataType::Binary, false),
     ]));
-    let num_rows = 100_000;
-    let batch_size = 10000;
+    let num_rows = 1000;
+    let batch_size = 100;
     let batches: Vec<RecordBatch> = (0..(num_rows / batch_size))
         .map(|i| {
             RecordBatch::try_new(
