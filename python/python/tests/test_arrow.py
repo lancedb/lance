@@ -15,7 +15,6 @@ import re
 
 import pandas as pd
 import pyarrow as pa
-import pytest
 from lance.arrow import BFloat16, BFloat16Array, PandasBFloat16Array, bfloat16_array
 
 
@@ -71,7 +70,6 @@ def test_bf16_repr():
 #     assert re.match(expected_re, repr(tab))
 
 
-@pytest.mark.skipif(not pd, reason="Pandas not available")
 def test_bf16_pandas(provide_pandas):
     data = [1.1, None, 3.4]
     arr = bfloat16_array(data)
