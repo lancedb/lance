@@ -15,7 +15,7 @@
 use arrow_array::RecordBatchIterator;
 use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Float32Array, RecordBatch};
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
-use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use futures::TryStreamExt;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};

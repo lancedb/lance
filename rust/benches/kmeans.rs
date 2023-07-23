@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};

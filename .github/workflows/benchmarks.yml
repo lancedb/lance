@@ -27,7 +27,7 @@ jobs:
           sudo apt install -y -qq protobuf-compiler libssl-dev pkg-config
           cargo install cargo-codspeed
       - name: Build the benchmark target(s)
-        run: cargo codspeed build l2 argmin cosine
+        run: cargo codspeed build l2 argmin cosine scan
       - name: CPU info
         run: cat /proc/cpuinfo | grep -E 'model name|flags' | head -n 2
       - name: Run benchmarks
@@ -35,4 +35,4 @@ jobs:
         with:
           token: ${{ secrets.CODSPEED_TOKEN }}
           working-directory: rust
-          run: cargo codspeed run l2 argmin cosine
+          run: cargo codspeed run l2 argmin cosine scan
