@@ -367,15 +367,9 @@ impl Dataset {
         }
 
         let mut fragment_id = if matches!(params.mode, WriteMode::Append) {
-            dataset.as_ref().map_or(0, |d| {
-                d.manifest
-                    .fragments
-                    .iter()
-                    .map(|f| f.id)
-                    .max()
-                    .map(|id| id + 1)
-                    .unwrap_or(0)
-            })
+            dataset
+                .as_ref()
+                .map_or(0, |d| d.manifest.max_fragment_id().unwrap_or(0) + 1)
         } else {
             // Create or Overwrite.
             // Overwrite resets the fragment ID to zero.
@@ -402,15 +396,12 @@ impl Dataset {
         }
         fragments.extend(new_fragments);
 
-        let mut manifest = Manifest::new(&schema, Arc::new(fragments));
-        manifest.version = match dataset.as_ref() {
-            Some(d) => d
-                .latest_manifest()
-                .await
-                .map(|m| m.version + 1)
-                .unwrap_or(1),
-            None => 1,
+        let mut manifest = if let Some(dataset) = &dataset {
+            Manifest::new_from_previous(&dataset.manifest, &schema, Arc::new(fragments))
+        } else {
+            Manifest::new(&schema, Arc::new(fragments))
         };
+
         // Inherit the index if we're just appending rows
         let indices = match (&dataset, &params.mode) {
             (Some(d), WriteMode::Append) => Some(d.load_indices().await?),
@@ -459,10 +450,8 @@ impl Dataset {
         let (object_store, base) = ObjectStore::from_uri(base_uri).await?;
         let latest_manifest = latest_manifest_path(&base);
         let mut indices = vec![];
-        let mut version = 1;
-        let schema = if object_store.exists(&latest_manifest).await? {
+        let mut manifest = if object_store.exists(&latest_manifest).await? {
             let dataset = Self::open(base_uri).await?;
-            version = dataset.version().version + 1;
 
             if matches!(mode, WriteMode::Append) {
                 // Append mode: inherit indices from previous version.
@@ -471,13 +460,12 @@ impl Dataset {
 
             let dataset_schema = dataset.schema();
             let added_on_schema = schema.exclude(dataset_schema)?;
-            dataset_schema.merge(&added_on_schema)?
-        } else {
-            schema.clone()
-        };
+            let schema = dataset_schema.merge(&added_on_schema)?;
 
-        let mut manifest = Manifest::new(&schema, Arc::new(fragments.to_vec()));
-        manifest.version = version;
+            Manifest::new_from_previous(&dataset.manifest, &schema, Arc::new(fragments.to_vec()))
+        } else {
+            Manifest::new(schema, Arc::new(fragments.to_vec()))
+        };
 
         // Preserve indices.
         write_manifest_file(
@@ -560,13 +548,11 @@ impl Dataset {
         // Inherit the index, since we are just adding columns.
         let indices = self.load_indices().await?;
 
-        let mut manifest = Manifest::new(self.schema(), Arc::new(updated_fragments));
-        manifest.version = self
-            .latest_manifest()
-            .await
-            .map(|m| m.version + 1)
-            .unwrap_or(1);
-        manifest.schema = new_schema;
+        let mut manifest = Manifest::new_from_previous(
+            self.manifest.as_ref(),
+            &new_schema,
+            Arc::new(updated_fragments),
+        );
 
         write_manifest_file(
             &self.object_store,
@@ -736,12 +722,11 @@ impl Dataset {
             Some(self.load_indices().await?)
         };
 
-        let mut manifest = Manifest::new(self.schema(), Arc::new(updated_fragments));
-        manifest.version = self
-            .latest_manifest()
-            .await
-            .map(|m| m.version + 1)
-            .unwrap_or(1);
+        let mut manifest = Manifest::new_from_previous(
+            self.manifest.as_ref(),
+            self.schema(),
+            Arc::new(updated_fragments),
+        );
 
         write_manifest_file(
             &self.object_store,
@@ -920,6 +905,8 @@ pub(crate) async fn write_manifest_file(
         apply_feature_flags(manifest);
     }
     manifest.set_timestamp(config.timestamp);
+
+    manifest.update_max_fragment_id();
 
     let paths = vec![
         manifest_path(base_path, manifest.version),
@@ -1435,9 +1422,13 @@ mod tests {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
+        let dataset = Dataset::write(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(0));
 
         let new_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "s",
@@ -1454,9 +1445,15 @@ mod tests {
         write_params.mode = WriteMode::Overwrite;
         let new_batch_reader =
             RecordBatchIterator::new(new_batches.into_iter().map(Ok), new_schema.clone());
-        Dataset::write(new_batch_reader, test_uri, Some(write_params.clone()))
+        let dataset = Dataset::write(new_batch_reader, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        // Fragment ids reset after overwrite.
+        assert_eq!(fragments[0].id(), 0);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(0));
 
         let actual_ds = Dataset::open(test_uri).await.unwrap();
         assert_eq!(actual_ds.version().version, 2);
@@ -1805,6 +1802,7 @@ mod tests {
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(dataset.fragments().len(), 2);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
 
         let right_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("i2", DataType::Int32, false),
@@ -1829,6 +1827,7 @@ mod tests {
         assert_eq!(dataset.fragments().len(), 2);
         assert_eq!(dataset.fragments()[0].files.len(), 2);
         assert_eq!(dataset.fragments()[1].files.len(), 2);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
 
         let actual_batches = dataset
             .scan()
@@ -1892,6 +1891,7 @@ mod tests {
         // We should not have any deletion file still
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(0));
         assert!(fragments[0].metadata.deletion_file.is_none());
 
         // Delete rows
@@ -1942,5 +1942,24 @@ mod tests {
         // Verify fragment is fully gone
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 0);
+
+        // Append after delete
+        let data = sequence_data(0..100);
+        let batches = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        dataset.validate().await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        // Fragment id picks up where we left off
+        assert_eq!(fragments[0].id(), 1);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
     }
 }
