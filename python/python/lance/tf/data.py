@@ -24,14 +24,14 @@ implementation for Lance.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, List, Optional, Union
+from typing import List, Optional, Union
+import logging
 
 import lance
 import pyarrow as pa
 import tensorflow as tf
 from lance import LanceDataset
 from lance.fragment import LanceFragment
-from tensorflow.python.data.ops import dataset_ops
 
 
 def arrow_data_type_to_tf(dt: pa.DataType) -> tf.DType:
@@ -88,11 +88,12 @@ def data_type_to_tensor_spec(dt: pa.DataType) -> tf.TensorSpec:
 
 
 def schema_to_spec(schema: pa.Schema, batch_size: int) -> tf.TypeSpec:
-    signitures = {}
+    """Convert PyArrow Schema to Tensorflow output signature."""
+    signature = {}
     for name in schema.names:
         field = schema.field_by_name(name)
-        signitures[name] = data_type_to_tensor_spec(field.type, batch_size=batch_size)
-    return signitures
+        signature[name] = data_type_to_tensor_spec(field.type, batch_size=batch_size)
+    return signature
 
 
 def from_lance(
@@ -114,11 +115,11 @@ def from_lance(
 
     schema = scanner.projected_schema
     signature = schema_to_spec(schema, batch_size=batch_size)
+    logging.debug("Output signature: %s", signature)
 
     def generator():
         for batch in scanner.to_batches():
             data = batch.to_pydict()
-            print(data)
             yield data
 
     return tf.data.Dataset.from_generator(generator, output_signature=signature)
