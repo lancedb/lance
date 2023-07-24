@@ -63,6 +63,8 @@ impl Default for Session {
 type ArcAny = Arc<dyn Any + Send + Sync>;
 
 /// Cache for various metadata about files.
+/// 
+/// The cache is keyed by the file path and the type of metadata.
 #[derive(Clone)]
 pub struct FileMetadataCache {
     /// The maximum number of metadata to cache.
