@@ -99,6 +99,7 @@ class LanceDataset(pa.dataset.Dataset):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
+        batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
         scan_in_order: bool = True,
@@ -131,7 +132,8 @@ class LanceDataset(pa.dataset.Dataset):
                     "nprobes": 1,
                     "refine_factor": 1
                 }
-
+        batch_size: int, default None
+            The number of rows to fetch per batch.
         batch_readahead: int, optional
             The number of batches to read ahead.
         fragment_readahead: int, optional
@@ -684,10 +686,16 @@ class ScannerBuilder:
         self._offset = None
         self._columns = None
         self._nearest = None
+        self._batch_size = None
         self._batch_readahead = None
         self._fragment_readahead = None
         self._scan_in_order = True
         self._fragments = None
+
+    def batch_size(self, batch_size: int) -> ScannerBuilder:
+        """Set batch size for Scanner"""
+        self._batch_size = batch_size
+        return self
 
     def batch_readahead(self, nbatches: Optional[int] = None) -> ScannerBuilder:
         if nbatches is not None and int(nbatches) < 0:
@@ -799,6 +807,7 @@ class ScannerBuilder:
             self._limit,
             self._offset,
             self._nearest,
+            self._batch_size,
             self._batch_readahead,
             self._fragment_readahead,
             self._scan_in_order,

@@ -138,6 +138,7 @@ impl Dataset {
         limit: Option<i64>,
         offset: Option<i64>,
         nearest: Option<&PyDict>,
+        batch_size: Option<usize>,
         batch_readahead: Option<usize>,
         fragment_readahead: Option<usize>,
         scan_in_order: Option<bool>,
@@ -159,6 +160,9 @@ impl Dataset {
             .limit(limit, offset)
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
+        if let Some(batch_size) = batch_size {
+            scanner.batch_size(batch_size);
+        }
         if let Some(batch_readahead) = batch_readahead {
             scanner.batch_readahead(batch_readahead);
         }
