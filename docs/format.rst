@@ -1,6 +1,12 @@
 File Format
 ===========
 
+Lance is both a file format and a table format. A Lance file is the file format,
+while a Lance Dataset is the table format. The file format is a columnar format
+that is optimized for fast point queries and scans. The dataset (table) format
+builds upon the file format to provide database-like semantics, such as appends, 
+updates, deletes, and schema evolution.
+
 Dataset Directory
 ------------------
 
@@ -14,6 +20,8 @@ A `Lance Dataset` is organized in a directory.
         _versions/*.manifest -- Manifest file for each dataset version.
         _fragment_manifests/*.lance -- Lance files containing data file metadata.
         _indices/{UUID-*}/index.idx -- Secondary index, each index per directory.
+        _deletions/*.{arrow,bin} -- Deletion files, which contain ids of rows
+          that have been deleted.
 
 .. image:: _static/format_overview.png
 
@@ -26,6 +34,8 @@ A fragment is a collection of rows. It is made up of multiple Lance files,
 which collectively contain all the columns in the fragment. It also may contain
 a deletion file, which houses the row ids of deleted rows.
 
+An index file stores the secondary index of a table.
+
 Manifest format
 ~~~~~~~~~~~~~~~
 
@@ -37,59 +47,56 @@ The manifest file format is defined by a protobuf message:
    :start-at: // Manifest is
    :end-at: } // Manifest
 
-
-Fragments
-~~~~~~~~~
-
-``DataFragment`` represents a chunk of data in the dataset. Itself includes one or more ``DataFile``,
-where each ``DataFile`` can contain several columns in the chunk of data. It also may include a 
-``DeletionFile``, which is explained in a later section.
-
-
 Fragment manifest format
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
 The fragment manifest is a Lance file, where each row is a fragment. The minimal schema
 is:
 
-.. code-block::
+.. list-table:: Fragment manifest schema
+   :widths: 20 20 75
+   :header-rows: 1
 
-    id: u32
-    data_files: struct
-        path: string
-        fields: list<u32>
-    deletion_file: struct
-        file_type: dictionary<u8, string>
-        read_version: u64
-        id: u64
-
-The fragment manifest may include additional fields, such as:
-
-.. code-block::
-
-    num_deleted_rows: u64
-    stats: struct
-        num_values: i64
-        <field_id_1>: struct
-            null_count: i64
-            min_value: <field_1_data_type>
-            max_value: <field_1_data_type>
-        ...
-        <field_id_N>: struct
-            null_count: i64
-            min_value: <field_N_data_type>
-            max_value: <field_N_data_type>
-
-These fields are non-nullable, except for ``deletion_file.file_type``. If the
-fragment does not have a deletion file, then ``file_type`` will be null. In those
-rows, ``deletion_file.read_version`` and ``deletion_file.id`` may be arbitrary
-values.
-
+   * - Field path
+     - Data type
+     - Description
+   * - ``id``
+     - ``u32``
+     - The fragment id for the fragment. These ids are unique to the fragments.
+   * - ``data_files.path``
+     - ``string``
+     - The path to the data file. This is relative to the dataset directory.
+   * - ``data_files.fields``
+     - ``list<u32>``
+     - The list of field ids that are stored in the data file.
+   * - ``deletion_file.file_type``
+     - ``dictionary<u8, string>``
+     - The type of the deletion file. The dictionary is always
+       ``{0: null, 1: "array", 2: "bitmap"}``.
+   * - ``deletion_file.read_version``
+     - ``u64``
+     - The version of the dataset that the deletion file was created off of.
+   * - ``deletion_file.id``
+     - ``u64``
+     - The id of the deletion file. This is unique to the fragment.
+   * - ``num_rows``
+     - ``u64``
+     - The number of rows in the fragment.
+   * - ``num_deletions``
+     - ``u64``
+     - The number of rows that have been deleted from the fragment. The sum of 
+       this column and ``num_rows`` is the total number of rows that were originally
+       in the fragment.
+   * - ``stats``
+     - ``struct``
+     - The fragment-level statistics. See the statistics section for the schema
+       and more details.
 
 .. warning::
 
     Extra fields may be present in the manifest. They should be ignored if they
     are not understood.
+
 
 Inline fragments
 ~~~~~~~~~~~~~~~~
@@ -105,6 +112,16 @@ turned off. The ``DataFragment`` protobuf message represents a single fragment.
    :end-at: } // DataFile
 
 
+
+
+
+Fragments
+~~~~~~~~~
+
+``DataFragment`` represents a chunk of rows in the dataset. Itself includes one or more ``DataFile``,
+where each ``DataFile`` can contain several columns in the chunk of data. It also may include a 
+``DeletionFile``, which is explained in a later section.
+
 The overall structure of a fragment is shown below. One or more data files store
 the columns of a fragment. New columns can be added to a fragment by adding new
 data files. The deletion file (if present), stores the rows that have been
@@ -115,6 +132,7 @@ deleted from the fragment.
 Every row has a unique id, which is an u64 that is composed of two u32s: the
 fragment id and the local row id. The local row id is just the index of the
 row in the data files.
+
 
 File Structure
 --------------
@@ -325,7 +343,11 @@ selectively reading only relevant stats columns.
 Statistic values
 ~~~~~~~~~~~~~~~~
 
-Three types of statistics are stored: null count, min value, max value. The min
+One global statistics is stored per page and per fragment: ``num_values``. This
+is the original number of values in the fragment or page. This does not account
+for any deletions.
+
+Three types of statistics are stored per column: null count, min value, max value. The min
 and max values are stored as their native data types in arrays.
 
 There are special behavior for different data types to account for nulls:
