@@ -860,9 +860,9 @@ class LanceScanner(pa.dataset.Scanner):
         raise NotImplementedError("from batches")
 
     @property
-    def dataset_schema(self):
+    def dataset_schema(self) -> Schema:
         """The schema with which batches will be read from fragments."""
-        raise NotImplementedError("")
+        return self._ds.schema
 
     def scan_batches(self):
         """
