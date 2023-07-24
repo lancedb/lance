@@ -23,9 +23,9 @@ implementation for Lance.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import List, Optional, Union
-import logging
 
 import lance
 import pyarrow as pa
