@@ -27,9 +27,9 @@ from pathlib import Path
 from typing import Callable, List, Optional, Union
 
 import lance
+import pyarrow as pa
 import tensorflow as tf
 from lance import LanceDataset
-import pyarrow as pa
 from lance.fragment import LanceFragment
 from tensorflow.python.data.ops import dataset_ops
 
