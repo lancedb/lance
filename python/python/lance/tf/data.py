@@ -29,17 +29,76 @@ from typing import Callable, List, Optional, Union
 import lance
 import tensorflow as tf
 from lance import LanceDataset
+import pyarrow as pa
 from lance.fragment import LanceFragment
-from tensorflow.python.data.ops import dataset_ops, readers
-from tensorflow.python.framework import dtypes, tensor_spec
-from tensorflow.python.ops import gen_dataset_ops
+from tensorflow.python.data.ops import dataset_ops
+
+
+def arrow_data_type_to_tf(dt: pa.DataType) -> tf.DType:
+    """Convert data type from Arrow to Tensorflow."""
+    if pa.types.is_boolean(dt):
+        return tf.bool
+    elif pa.types.is_int8(dt):
+        return tf.int8
+    elif pa.types.is_int16(dt):
+        return tf.int16
+    elif pa.types.is_int32(dt):
+        return tf.int32
+    elif pa.types.is_int64(dt):
+        return tf.int64
+    elif pa.types.is_uint8(dt):
+        return tf.uint8
+    elif pa.types.is_uint16(dt):
+        return tf.uint16
+    elif pa.types.is_uint32(dt):
+        return tf.uint32
+    elif pa.types.is_uint64(dt):
+        return tf.uint64
+    elif pa.types.is_float16(dt):
+        return tf.float16
+    elif pa.types.is_float32(dt):
+        return tf.float32
+    elif pa.types.is_float64(dt):
+        return tf.float64
+    elif pa.types.is_string(dt):
+        return tf.string
+
+    raise TypeError(f"Arrow/Tf conversion: Unsupported arrow data type: {dt}")
+
+
+def data_type_to_tensor_spec(dt: pa.DataType) -> tf.TensorSpec:
+    if (
+        pa.types.is_boolean(dt)
+        or pa.types.is_integers(dt)
+        or pa.types.is_floating(dt)
+        or pa.types.is_string(dt)
+    ):
+        return tf.TensorSpec(shape=(None,), dtype=arrow_data_type_to_tf(dt))
+    elif pa.types.is_list(dt):
+        return tf.TensorSpec(
+            shape=(
+                None,
+                None,
+            ),
+            dtype=arrow_data_type_to_tf(dt.value_type),
+        )
+
+    raise TypeError("Unsupported data type: ", dt)
+
+
+def schema_to_spec(schema: pa.Schema, batch_size: int) -> tf.TypeSpec:
+    signitures = {}
+    for name in schema.names:
+        field = schema.field_by_name(name)
+        signitures[name] = data_type_to_tensor_spec(field.type, batch_size=batch_size)
+    return signitures
 
 
 def from_lance(
     dataset: Union[str, Path, LanceDataset],
     *,
     columns: Optional[List[str]] = None,
-    batch_size: Optional[int] = None,
+    batch_size: int = 256,
     filter: Optional[str] = None,
     fragments: Union[List[LanceFragment], tf.data.Dataset] = None,
 ) -> tf.data.Dataset:
@@ -52,13 +111,16 @@ def from_lance(
         filter=filter, columns=columns, batch_size=batch_size, fragments=fragments
     )
 
-    schema = scanner.schema
-    print(scanner)
+    schema = scanner.projected_schema
+    signature = schema_to_spec(schema, batch_size=batch_size)
 
     def generator():
-        for batch in scanner:
-            yield batch
-    return tf.data.Dataset.from_generator(generator())
+        for batch in scanner.to_batches():
+            data = batch.to_pydict()
+            print(data)
+            yield data
+
+    return tf.data.Dataset.from_generator(generator, output_signature=signature)
 
 
 def lance_fragments(data: Union[str, Path, LanceDataset]) -> tf.data.Dataset:
@@ -68,94 +130,3 @@ def lance_fragments(data: Union[str, Path, LanceDataset]) -> tf.data.Dataset:
     return tf.data.Dataset.from_tensor_slices(
         [f.fragment_id for f in data.get_fragments()]
     )
-
-
-def from_fragments(
-    dataset: LanceDataset, fragments: tf.data.Dataset, name: str = None
-) -> tf.data.Dataset:
-    """Create a `tf.data.Dataset` from a Lance."""
-    ids = fragments.as_numpy_iterator()
-    print(list(ids))
-    # return fragments.map(read_lance)
-    return LanceTfDataset(dataset.uri, fragments=ids)
-
-
-class LanceTfDataset(dataset_ops.DatasetSource):
-    """Lance Tensorflow Dataset Source.
-
-    .. warning::
-
-        Experimental feature. API stability is not guaranteed.
-
-    .. code:: python
-
-        import tensorflow as tf
-        import lance.tf.data
-
-        class DistributedSelector:
-            def __init__(self, world_size, rank):
-                self.world_size = world_size
-                self.rank = rank
-
-            def __call__(self, fragments):
-                return fragments[self.rank::self.world_size]
-
-        ds = lance.tf.data.from_lance("s3://bucket/path/dataset.lance")
-            .select(["image", "label"])
-            .filter("val > 10.5")
-            .fragments(DistributedSelector(world_size=10, rank=5))
-            .map(lambda x: x["a"] + x["b"])
-
-    """
-
-    def __init__(self, uri: str, fragments: Optional[List[int]] = None):
-        self._dataset: _LanceDataset = lance.dataset(uri)
-        self._fragments: List[int] = None
-        self._select: Optional[List[str]] = None
-
-        var_tensor = tf.constant(self, shape=(), dtype=tf.variant, name="lance_dataset")
-        print("Dataset var tensor: ", var_tensor)
-        super().__init__(variant_tensor=var_tensor)
-
-    @staticmethod
-    def from_fragments(fragments: tf.data.Dataset) -> tf.data.Dataset:
-        return LanceDataset()
-
-    def fragments(
-        self,
-        selector: Optional[Callable[[List[LanceFragment]], List[LanceFragment]]] = None,
-    ) -> tf.data.Dataset:
-        """Only read the specified fragments."""
-        fragments = self._dataset.get_fragments()
-        return tf.data.Dataset.from_tensor_slices(
-            [str(f.fragment_id) for f in fragments]
-        )
-
-    def select(self, columns: List[str]) -> LanceDataset:
-        """Select only columns to read, if not called, all columns are read."""
-        pass
-
-    def filter(self, predicate: Union[str, Callable], name: Optional[str] = None):
-        """Filter this dataset according to predicate.
-
-        If the predicate is string type, it is interpreted as a SQL expression, and
-        be pushed down into the Lance storage.
-
-        See `SQL filter push-down <https://lancedb.github.io/lance/read_and_write.html#filter-push-down>`_
-        in more details.
-
-        Parameters
-        ----------
-        predicate : str or callable
-            If str, it is interpreted as a SQL expression. If callable, it is
-            pass to regular `tf.data` pipeline.
-        """
-        if isinstance(predicate, str):
-            self._dataset = self._dataset.filter(predicate)
-            return self
-
-        return super().filter(predicate, name)
-
-    @property
-    def element_spec(self):
-        return tf.TensorSpec(shape=(), dtype=tf.int32)

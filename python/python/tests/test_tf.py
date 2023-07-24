@@ -12,19 +12,20 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import lance
 import pandas as pd
 import pyarrow as pa
 import pytest
 
 try:
     import tensorflow as tf
-    from lance.tf.data import from_fragments, from_lance
 except ImportError:
     pytest.skip(
         "Tensorflow is not installed. Please install tensorflow to use lance.tf module.",
         allow_module_level=True,
     )
+
+import lance
+from lance.tf.data import from_lance
 
 
 @pytest.fixture
@@ -43,10 +44,8 @@ def tf_dataset(tmp_path):
 
 def test_fragment_dataset(tf_dataset):
     dataset = from_lance(tf_dataset)
-    fragments = dataset.fragments().shuffle(buffer_size=3, seed=32)
-    for f in fragments:
-        print(f)
-
+    for batch in dataset:
+        print(batch)
     ds = lance.dataset(tf_dataset)
-    dataset = from_fragments(ds, fragments)
-    print(list(dataset))
+    # dataset = from_fragments(ds, fragments)
+    # print(list(dataset))
