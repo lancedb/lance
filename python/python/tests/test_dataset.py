@@ -515,3 +515,14 @@ def test_scan_with_batch_size(tmp_path: Path):
         assert batch.num_rows == 16
         df = batch.to_pandas()
         assert df["a"].iloc[0] == idx * 16
+
+
+def test_scanner_schemas(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    df = pd.DataFrame({"a": range(50), "s": [f"s-{i}" for i in range(50)]})
+
+    dataset = lance.write_dataset(df, base_dir)
+
+    scanner = dataset.scanner(columns=["a"])
+    assert scanner.dataset_schema == dataset.schema
+    assert scanner.projected_schema == pa.schema([pa.field("a", pa.int64())])
