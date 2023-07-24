@@ -174,6 +174,7 @@ class LanceDataset(pa.dataset.Dataset):
             .limit(limit)
             .offset(offset)
             .nearest(**(nearest or {}))
+            .batch_size(batch_size)
             .batch_readahead(batch_readahead)
             .fragment_readahead(fragment_readahead)
             .scan_in_order(scan_in_order)

@@ -502,3 +502,14 @@ def test_create_update_empty_dataset(tmp_path: Path, provide_pandas: bool):
     assert dataset.to_table() == pa.table(
         {"a": ["foo"], "b": [1], "c": [2.0]}, schema=expected_schema
     )
+
+
+def test_scan_with_batch_size(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    df = pd.DataFrame({"a": range(10000), "b": range(10000)})
+    dataset = lance.write_dataset(df, base_dir)
+
+    batches = dataset.scanner(batch_size=16).to_batches()
+    batch = next(batches)
+
+    assert batch.num_rows == 16
