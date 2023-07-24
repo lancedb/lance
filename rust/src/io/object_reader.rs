@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{backtrace::Backtrace, cmp::min};
+use std::cmp::min;
 
 use std::ops::Range;
 
@@ -27,7 +27,6 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
-use log::info;
 use object_store::path::Path;
 use prost::Message;
 
@@ -93,29 +92,7 @@ impl ObjectReader for CloudObjectReader {
     }
 
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
-        info!(
-            "get_range: {:?} from {:?}, block_size: {:?}",
-            range, self.path, self.block_size
-        );
-
-        if range.start == 360002701 && range.end == 360002749 {
-            let bt = Backtrace::capture();
-            info!("suspicious get_range: {:?}", bt);
-        }
-        let start_time = std::time::Instant::now();
-        let res = self
-            .object_store
-            .inner
-            .get_range(&self.path, range.clone())
-            .await?;
-        let end_time = std::time::Instant::now();
-        info!(
-            "completed get_range: {:?} from {:?} in {:?}",
-            range,
-            self.path,
-            end_time - start_time
-        );
-        Ok(res)
+        Ok(self.object_store.inner.get_range(&self.path, range).await?)
     }
 }
 
@@ -124,7 +101,6 @@ pub(crate) async fn read_message<M: Message + Default>(
     reader: &dyn ObjectReader,
     pos: usize,
 ) -> Result<M> {
-    info!("reading message");
     let file_size = reader.size().await?;
     if pos > file_size {
         return Err(Error::IO {

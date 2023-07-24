@@ -34,7 +34,7 @@ use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
 use futures::stream::{self, TryStreamExt};
-use futures::{FutureExt, StreamExt};
+use futures::{Future, FutureExt, StreamExt};
 use object_store::path::Path;
 use prost::Message;
 
@@ -43,8 +43,8 @@ use super::{deletion_file_path, ReadBatchParams};
 use crate::arrow::*;
 use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::error::{Error, Result};
-use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
+use crate::format::{Fragment, Manifest};
 use crate::io::object_reader::{read_fixed_stride_array, read_struct, ObjectReader};
 use crate::io::{read_metadata_offset, read_struct_from_buf};
 use crate::session::Session;
@@ -159,6 +159,17 @@ impl std::fmt::Debug for FileReader {
 
 impl FileReader {
     /// Open file reader
+    ///
+    /// Open the file at the given path using the provided object store.
+    ///
+    /// The passed fragment ID determines the first 32-bits of the row IDs.
+    ///
+    /// If a manifest is passed in, it will be used to load the schema and dictionary.
+    /// This is typically done if the file is part of a dataset fragment. If no manifest
+    /// is passed in, then it is read from the file itself.
+    ///
+    /// The session passed in is used to cache metadata about the file. If no session
+    /// is passed in, there will be no caching.
     pub(crate) async fn try_new_with_fragment(
         object_store: &ObjectStore,
         path: &Path,
@@ -167,15 +178,9 @@ impl FileReader {
         session: Option<&Session>,
     ) -> Result<Self> {
         let object_reader = object_store.open(path).await?;
+        let is_dataset = manifest.is_some();
 
-        let cached_metadata = if let Some(session) = session {
-            session.file_metadata_cache.get(path)
-        } else {
-            None
-        };
-        let metadata = if let Some(m) = cached_metadata {
-            m
-        } else {
+        let metadata = Self::load_from_cache(session, path, |_| async {
             let file_size = object_reader.size().await?;
             let begin = if file_size < object_store.block_size() {
                 0
@@ -192,17 +197,9 @@ impl FileReader {
                 let offset = tail_bytes.len() - (file_size - metadata_pos);
                 read_struct_from_buf(&tail_bytes.slice(offset..))?
             };
-
-            let metadata = Arc::new(metadata);
-
-            if let Some(session) = session {
-                session
-                    .file_metadata_cache
-                    .insert(path.clone(), metadata.clone());
-            }
-
-            metadata
-        };
+            Ok(metadata)
+        })
+        .await?;
 
         // m is either
         // a ref if passed in as Some(&manifest), or
@@ -220,77 +217,36 @@ impl FileReader {
             &m
         };
 
-        let cached_page_table: Option<Arc<PageTable>> = if let Some(session) = session {
-            session.file_metadata_cache.get(path)
-        } else {
-            None
-        };
-
-        let projection = manifest.schema.clone();
-        let page_table = if let Some(page_table) = cached_page_table {
-            page_table
-        } else {
+        let page_table = Self::load_from_cache(session, path, |_| {
             let num_columns = manifest.schema.max_field_id().unwrap() + 1;
-            let page_table = PageTable::load(
+            PageTable::load(
                 object_reader.as_ref(),
                 metadata.page_table_position,
                 num_columns,
                 metadata.num_batches() as i32,
             )
-            .await?;
-            let page_table = Arc::new(page_table);
+        })
+        .await?;
 
-            if let Some(session) = session {
-                session
-                    .file_metadata_cache
-                    .insert(path.clone(), page_table.clone());
-            }
-            page_table
-        };
+        let projection = manifest.schema.clone();
 
         // read the fragment metadata so we can handle deletion
-        let fragment = manifest
-            .fragments
-            .iter()
-            .find(|frag| frag.id == fragment_id)
-            .map(|f| f.to_owned())
-            .ok_or(Error::IO {
-                message: format!("Fragment {} not found in manifest", fragment_id),
-            })?;
+        let fragment = if is_dataset {
+            let fragment = manifest
+                .fragments
+                .iter()
+                .find(|frag| frag.id == fragment_id)
+                .map(|f| f.to_owned())
+                .ok_or(Error::IO {
+                    message: format!("Fragment {} not found in manifest", fragment_id),
+                })?;
+            Some(fragment)
+        } else {
+            None
+        };
 
-        let deletion_vector = if let Some(deletion_file) = &fragment.deletion_file {
-            let cached_deletion_vector = if let Some(session) = session {
-                let path = deletion_file_path(object_store.base_path(), fragment_id, deletion_file);
-                session.file_metadata_cache.get(&path)
-            } else {
-                None
-            };
-
-            if let Some(deletion_vector) = cached_deletion_vector {
-                Some(deletion_vector)
-            } else {
-                let deletion_vector =
-                    read_deletion_file(object_store.base_path(), &fragment, object_store)
-                        .await?
-                        .ok_or(Error::IO {
-                            message: format!(
-                                "Deletion file {:?} not found in fragment {}",
-                                deletion_file, fragment_id
-                            ),
-                        })?;
-
-                let deletion_vector = Arc::new(deletion_vector);
-
-                if let Some(session) = session {
-                    let path =
-                        deletion_file_path(object_store.base_path(), fragment_id, deletion_file);
-                    session
-                        .file_metadata_cache
-                        .insert(path, deletion_vector.clone());
-                }
-
-                Some(deletion_vector)
-            }
+        let deletion_vector = if let Some(fragment) = &fragment {
+            Self::load_deletion_vector(object_store, fragment, session).await?
         } else {
             None
         };
@@ -304,6 +260,56 @@ impl FileReader {
             with_row_id: false,
             deletion_vector,
         })
+    }
+
+    /// Load some metadata about the fragment from the cache, if there is one.
+    async fn load_from_cache<T: Send + Sync + 'static, F, Fut>(
+        session: Option<&Session>,
+        path: &Path,
+        loader: F,
+    ) -> Result<Arc<T>>
+    where
+        F: Fn(&Path) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        if let Some(session) = session {
+            if let Some(metadata) = session.file_metadata_cache.get::<T>(path) {
+                return Ok(metadata);
+            }
+        }
+
+        let metadata = Arc::new(loader(path).await?);
+        if let Some(session) = session {
+            session
+                .file_metadata_cache
+                .insert(path.to_owned(), metadata.clone());
+        }
+        Ok(metadata)
+    }
+
+    async fn load_deletion_vector(
+        object_store: &ObjectStore,
+        fragment: &Fragment,
+        session: Option<&Session>,
+    ) -> Result<Option<Arc<DeletionVector>>> {
+        if let Some(deletion_file) = &fragment.deletion_file {
+            let path = deletion_file_path(object_store.base_path(), fragment.id, deletion_file);
+
+            let deletion_vector = Self::load_from_cache(session, &path, |_| async {
+                read_deletion_file(object_store.base_path(), fragment, object_store)
+                    .await?
+                    .ok_or(Error::IO {
+                        message: format!(
+                            "Deletion file {:?} not found in fragment {}",
+                            deletion_file, fragment.id
+                        ),
+                    })
+            })
+            .await?;
+            Ok(Some(deletion_vector))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Open one Lance data file for read.
