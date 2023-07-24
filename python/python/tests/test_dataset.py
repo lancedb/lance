@@ -509,7 +509,9 @@ def test_scan_with_batch_size(tmp_path: Path):
     df = pd.DataFrame({"a": range(10000), "b": range(10000)})
     dataset = lance.write_dataset(df, base_dir)
 
-    batches = dataset.scanner(batch_size=16).to_batches()
-    batch = next(batches)
+    batches = dataset.scanner(batch_size=16, scan_in_order=True).to_batches()
 
-    assert batch.num_rows == 16
+    for idx, batch in enumerate(batches):
+        assert batch.num_rows == 16
+        df = batch.to_pandas()
+        assert df["a"].iloc[0] == idx * 16
