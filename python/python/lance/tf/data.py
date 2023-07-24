@@ -35,7 +35,7 @@ from tensorflow.python.data.ops import dataset_ops
 
 
 def arrow_data_type_to_tf(dt: pa.DataType) -> tf.DType:
-    """Convert data type from Arrow to Tensorflow."""
+    """Convert Pyarrow DataType to Tensorflow."""
     if pa.types.is_boolean(dt):
         return tf.bool
     elif pa.types.is_int8(dt):
@@ -60,13 +60,14 @@ def arrow_data_type_to_tf(dt: pa.DataType) -> tf.DType:
         return tf.float32
     elif pa.types.is_float64(dt):
         return tf.float64
-    elif pa.types.is_string(dt):
+    elif pa.types.is_string(dt) or pa.types.is_binary(dt):
         return tf.string
 
     raise TypeError(f"Arrow/Tf conversion: Unsupported arrow data type: {dt}")
 
 
 def data_type_to_tensor_spec(dt: pa.DataType) -> tf.TensorSpec:
+    """Convert PyArrow DataType to Tensorflow TensorSpec."""
     if (
         pa.types.is_boolean(dt)
         or pa.types.is_integers(dt)
