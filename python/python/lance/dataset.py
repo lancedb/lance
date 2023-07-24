@@ -23,7 +23,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 
 import numpy as np
 import pyarrow as pa
-from pyarrow import RecordBatch, Schema
+from pyarrow import RecordBatch, Schema, dataset
 from pyarrow._compute import Expression
 
 from .fragment import LanceFragment
