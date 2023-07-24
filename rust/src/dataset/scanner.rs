@@ -102,11 +102,18 @@ pub struct Scanner {
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection = dataset.schema().clone();
+
+        // Default batch size to be large enough so that a i32 column can be
+        // read in a single range request. For the object store default of
+        // 256K, this is 64K rows. For local file systems, the default block size
+        // is just 4K, which would mean only 1K rows, which might be a little small.
+        // So we use a default minimum of 8K rows.
+        let batch_size = std::cmp::max(dataset.object_store().block_size() / 4, DEFAULT_BATCH_SIZE);
         Self {
             dataset,
             projections: projection,
             filter: None,
-            batch_size: DEFAULT_BATCH_SIZE,
+            batch_size,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
             fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
             limit: None,
@@ -120,11 +127,12 @@ impl Scanner {
 
     pub fn from_fragment(dataset: Arc<Dataset>, fragment: Fragment) -> Self {
         let projection = dataset.schema().clone();
+        let batch_size = std::cmp::max(dataset.object_store().block_size() / 4, DEFAULT_BATCH_SIZE);
         Self {
             dataset,
             projections: projection,
             filter: None,
-            batch_size: DEFAULT_BATCH_SIZE,
+            batch_size,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
             fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
             limit: None,

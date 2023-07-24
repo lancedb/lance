@@ -93,7 +93,10 @@ impl ObjectReader for CloudObjectReader {
     }
 
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
-        info!("get_range: {:?} from {:?}, block_size: {:?}", range, self.path, self.block_size);
+        info!(
+            "get_range: {:?} from {:?}, block_size: {:?}",
+            range, self.path, self.block_size
+        );
 
         if range.start == 360002701 && range.end == 360002749 {
             let bt = Backtrace::capture();
