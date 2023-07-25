@@ -17,7 +17,7 @@ import pyarrow as pa
 import pytest
 
 try:
-    import tensorflow as tf
+    import tensorflow as tf  # noqa: F401
 except ImportError:
     pytest.skip(
         "Tensorflow is not installed. Please install tensorflow to "
