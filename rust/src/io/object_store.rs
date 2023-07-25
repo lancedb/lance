@@ -278,10 +278,8 @@ impl ObjectStore {
 
     async fn new_from_url(url: Url, params: &ObjectStoreParams) -> Result<Self> {
         // Block size: On local file systems, we use 4KB block size. On cloud
-        // object stores, we use 256KB block size. This is generally the largest
-        // block size where we don't see a latency penalty. Cloud object stores
-        // are more limited by request rate limits than local systems, so we
-        // often want to use larger block sizes to reduce the number of requests.
+        // object stores, we use 64KB block size. This is generally the largest
+        // block size where we don't see a latency penalty.
         match url.scheme() {
             "s3" => Ok(Self {
                 inner: build_s3_object_store(
@@ -292,19 +290,19 @@ impl ObjectStore {
                 .await?,
                 scheme: String::from("s3"),
                 base_path: Path::from(url.path()),
-                block_size: 256 * 1024,
+                block_size: 64 * 1024,
             }),
             "gs" => Ok(Self {
                 inner: build_gcs_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("gs"),
                 base_path: Path::from(url.path()),
-                block_size: 256 * 1024,
+                block_size: 64 * 1024,
             }),
             "az" => Ok(Self {
                 inner: build_azure_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("az"),
                 base_path: Path::from(url.path()),
-                block_size: 256 * 1024,
+                block_size: 64 * 1024,
             }),
             "file" => Ok(Self::new_from_path(url.path())?.0),
             "memory" => Ok(Self {
