@@ -292,17 +292,6 @@ impl Dataset {
         let latest_manifest_path = latest_manifest_path(&base);
         let flag_dataset_exists = object_store.exists(&latest_manifest_path).await?;
 
-        // let mut schema: Schema = Schema::try_from(batches.schema().as_ref())?;
-        // let mut peekable = batches.peekable();
-        // if let Some(batch) = peekable.peek() {
-        //     if let Ok(b) = batch {
-        //         schema.set_dictionary(b)?;
-        //     } else {
-        //         return Err(Error::from(batch.as_ref().unwrap_err()));
-        //     }
-        // }
-        // schema.validate()?;
-
         let (stream, schema) = reader_to_stream(batches)?;
 
         // Running checks for the different write modes
@@ -389,8 +378,8 @@ impl Dataset {
 
         // Assign IDs
         for mut fragment in &mut new_fragments {
-            fragment_id += 1;
             fragment.id = fragment_id;
+            fragment_id += 1;
         }
         fragments.extend(new_fragments);
 

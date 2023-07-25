@@ -557,7 +557,7 @@ mod tests {
 
         let write_params = WriteParams {
             max_rows_per_file: 40,
-            max_rows_per_group: 2,
+            max_rows_per_group: 10,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -577,7 +577,7 @@ mod tests {
         let mut scanner = fragment.scan();
         let batches = scanner
             .with_row_id()
-            .filter(" i  < 110")
+            .filter(" i  < 105")
             .unwrap()
             .try_into_stream()
             .await
@@ -585,15 +585,19 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert_eq!(batches.len(), 2);
+        assert_eq!(batches.len(), 3);
 
         assert_eq!(
             batches[0].column_by_name("i").unwrap().as_ref(),
-            &Int32Array::from_iter_values(80..100)
+            &Int32Array::from_iter_values(80..90)
         );
         assert_eq!(
             batches[1].column_by_name("i").unwrap().as_ref(),
-            &Int32Array::from_iter_values(100..110)
+            &Int32Array::from_iter_values(90..100)
+        );
+        assert_eq!(
+            batches[2].column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from_iter_values(100..105)
         );
     }
 
@@ -761,7 +765,7 @@ mod tests {
                 .unwrap();
             let batches = stream.try_collect::<Vec<_>>().await.unwrap();
 
-            assert_eq!(batches[0].schema().as_ref(), &(&new_projection).into());
+            assert_eq!(batches[1].schema().as_ref(), &(&new_projection).into());
             let max_value_in_batch = if with_delete { 15 } else { 20 };
             let expected_batch = RecordBatch::try_new(
                 Arc::new(ArrowSchema::new(vec![
@@ -769,14 +773,14 @@ mod tests {
                     ArrowField::new("double_i", DataType::Int32, true),
                 ])),
                 vec![
-                    Arc::new(Int32Array::from_iter_values(0..max_value_in_batch)),
+                    Arc::new(Int32Array::from_iter_values(10..max_value_in_batch)),
                     Arc::new(Int32Array::from_iter_values(
-                        (0..(2 * max_value_in_batch)).step_by(2),
+                        (20..(2 * max_value_in_batch)).step_by(2),
                     )),
                 ],
             )
             .unwrap();
-            assert_eq!(batches[0], expected_batch);
+            assert_eq!(batches[1], expected_batch);
         }
     }
 

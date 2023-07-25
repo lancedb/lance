@@ -204,8 +204,17 @@ pub(crate) fn add_blanks(
     if !row_id_range
         .clone()
         .any(|row_id| deletion_vector.contains(row_id))
+        || batch.num_columns() == 0
     {
         return Ok(batch);
+    }
+
+    if batch.num_rows() == 0 {
+        // TODO: implement adding blanks for an empty batch.
+        // This is difficult because we need to create a batch for arbitrary schemas.
+        return Err(Error::NotSupported {
+            source: "Missing many rows in merge".into(),
+        });
     }
 
     let mut array_i = 0;

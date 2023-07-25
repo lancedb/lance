@@ -428,7 +428,10 @@ mod tests {
         for (id, node) in graph.nodes.iter().enumerate() {
             // Statistically， each node should have 10 neighbors.
             assert!(!node.neighbors.is_empty());
-            assert_eq!(node.vertex.row_id as usize, id);
+            // For the first fragment, the IDs should match.
+            if id < 40 {
+                assert_eq!(node.vertex.row_id as usize, id);
+            }
         }
     }
 }

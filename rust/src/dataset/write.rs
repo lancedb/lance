@@ -239,8 +239,6 @@ impl BatchReaderChunker {
             Err(e) => return Some(Err(e)),
         };
 
-        // Always starting within the first batch, since otherwise we would have
-        // dropped it.
         let mut batches = Vec::new();
 
         let mut rows_collected = 0;
