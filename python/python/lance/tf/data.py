@@ -107,9 +107,22 @@ def from_lance(
 ) -> tf.data.Dataset:
     """Create a `tf.data.Dataset` from a Lance dataset.
 
-
     Parameters
     ----------
+    dataset : Union[str, Path, LanceDataset]
+        Lance dataset or dataset URI/path.
+    columns : Optional[List[str]], optional
+        List of columns to include in the output dataset, by default None
+    batch_size : int, optional
+        Batch size, by default 256
+    filter : Optional[str], optional
+        SQL filter expression, by default None.
+    fragments : Union[List[LanceFragment], tf.data.Dataset], optional
+        If provided, only the fragments are read.
+
+    Examples
+    --------
+
 
     """
     if not isinstance(dataset, LanceDataset):
@@ -120,7 +133,8 @@ def from_lance(
         fragments = list(fragments)
 
     if fragments is not None:
-        fragments = [LanceFragment(dataset, f) for f in fragments]
+        # A Generator of Fragments
+        fragments = (LanceFragment(dataset, f) for f in fragments)
     scanner = dataset.scanner(
         filter=filter, columns=columns, batch_size=batch_size, fragments=fragments
     )
@@ -141,7 +155,6 @@ def lance_fragments(data: Union[str, Path, LanceDataset]) -> tf.data.Dataset:
     """Create a `tf.data.Dataset` from a Lance fragments."""
     if not isinstance(data, LanceDataset):
         data = lance.dataset(data)
-    print(data.get_fragments())
     return tf.data.Dataset.from_tensor_slices(
         [f.fragment_id for f in data.get_fragments()]
     )

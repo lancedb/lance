@@ -25,12 +25,13 @@ except ImportError:
     )
 
 import lance
+from lance.fragment import LanceFragment
 from lance.tf.data import from_lance, lance_fragments
 
 
 @pytest.fixture
 def tf_dataset(tmp_path):
-    df = pd.DataFrame({"a": range(10000), "s": ["val-{}" for i in range(10000)]})
+    df = pd.DataFrame({"a": range(10000), "s": [f"val-{i}" for i in range(10000)]})
     tbl = pa.Table.from_pandas(df)
 
     def batches():
@@ -43,30 +44,22 @@ def tf_dataset(tmp_path):
 
 
 def test_fragment_dataset(tf_dataset):
-    dataset = from_lance(tf_dataset)
-    for batch in dataset:
-        # print(batch)
-        pass
-    ds = lance.dataset(tf_dataset)
-    # dataset = from_fragments(ds, fragments)
-    # print(list(dataset))
-
+    ds = from_lance(tf_dataset, batch_size=100)
+    for idx, batch in enumerate(ds):
+        assert batch["a"].numpy()[0] == idx * 100
+        assert batch["s"].numpy()[0] == f"val-{idx * 100}".encode("utf-8")
+        assert batch["a"].shape == (100,)
 
 
 def test_shuffle(tf_dataset):
-    d = lance.dataset(tf_dataset)
-    df = d.to_table().to_pandas()
-    print(df)
-
-    frag1 = d.get_fragments()[0]
-    print("Frage 1 count: ", frag1.count_rows())
-    print(list(lance_fragments(tf_dataset).as_numpy_iterator()))
     fragments = lance_fragments(tf_dataset).shuffle(4, seed=20).take(3)
-    print(list(fragments.as_numpy_iterator()))
-    assert list(fragments.as_numpy_iterator()) == [2, 4, 1]
 
     ds = from_lance(tf_dataset, fragments=fragments, batch_size=100)
-    for batch, fragment_id in zip(ds, [2, 4, 1]):
-        print(batch)
-        assert batch["a"].numpy()[0] == fragment_id * 100
-        # print(batch)
+    raw_ds = lance.dataset(tf_dataset)
+    scanner = raw_ds.scanner(
+        fragments=[LanceFragment(raw_ds, fid) for fid in [0, 3, 1]], batch_size=100
+    )
+
+    for batch, raw_batch in zip(ds, scanner.to_batches()):
+        assert batch["a"].numpy()[0] == raw_batch.to_pydict()["a"][0]
+        assert batch["a"].numpy().shape == (100,)
