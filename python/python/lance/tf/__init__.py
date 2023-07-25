@@ -16,6 +16,6 @@ import importlib.util
 
 if importlib.util.find_spec("tensorflow") is None:
     raise ImportError(
-        "Tensorflow is not installed. Please install tensorflow to use lance.tf module.",
-        allow_module_level=True,
+        "Tensorflow is not installed. Please install tensorflow"
+        + " to use lance.tf module.",
     )
