@@ -204,7 +204,6 @@ pub(crate) fn add_blanks(
     if !row_id_range
         .clone()
         .any(|row_id| deletion_vector.contains(row_id))
-        || batch.num_columns() == 0
     {
         return Ok(batch);
     }

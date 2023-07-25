@@ -377,7 +377,7 @@ impl Dataset {
             write_fragments(object_store.clone(), &base, &schema, stream, params.clone()).await?;
 
         // Assign IDs
-        for mut fragment in &mut new_fragments {
+        for fragment in &mut new_fragments {
             fragment.id = fragment_id;
             fragment_id += 1;
         }
@@ -1014,6 +1014,12 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+
+        // The batch size batches the group size.
+        for batch in &actual_batches {
+            assert_eq!(batch.num_rows(), 10);
+        }
+
         // sort
         let actual_batch = concat_batches(&schema, &actual_batches).unwrap();
         let idx_arr = actual_batch.column_by_name("i").unwrap();
