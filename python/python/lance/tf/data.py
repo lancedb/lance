@@ -105,7 +105,7 @@ def from_lance(
     filter: Optional[str] = None,
     fragments: Union[List[LanceFragment], tf.data.Dataset] = None,
 ) -> tf.data.Dataset:
-    """Create a `tf.data.Dataset` from a Lance dataset.
+    """Create a ``tf.data.Dataset`` from a Lance dataset.
 
     Parameters
     ----------
@@ -118,11 +118,45 @@ def from_lance(
     filter : Optional[str], optional
         SQL filter expression, by default None.
     fragments : Union[List[LanceFragment], tf.data.Dataset], optional
-        If provided, only the fragments are read.
+        If provided, only the fragments are read. It can be used to feed
+        for distributed training.
 
     Examples
     --------
 
+    .. code-block:: python
+
+        import tensorflow as tf
+        import lance.tf.data
+
+        ds = lance.tf.data.from_lance(
+            "s3://bucket/path",
+            columns=["image", "id"],
+            filter="catalog = 'train' AND split = 'train'",
+            batch_size=100)
+
+        for batch in ds.repeat(10).shuffle(128).map(io_decode):
+            print(batch["image"].shape)
+
+    ``from_lance`` can takes a iterator or ``tf.data.Dataset`` of
+    Fragments. So that it can be used to feed for distributed training.
+
+    .. code-block:: python
+
+        import tensorflow as tf
+        import lance.tf.data
+
+        seed = 200  # seed to shuffle the fragments in distributed machines.
+        fragments = lance.tf.data.lance_fragments("s3://bucket/path")
+            repeat(10).shuffle(4, seed=seed)
+        ds = lance.tf.data.from_lance(
+            "s3://bucket/path",
+            columns=["image", "id"],
+            filter="catalog = 'train' AND split = 'train'",
+            fragments=fragments,
+            batch_size=100)
+        for batch in ds.shuffle(128).map(io_decode):
+            print(batch["image"].shape)
 
     """
     if not isinstance(dataset, LanceDataset):
