@@ -20,20 +20,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::{ArrowError, SchemaRef};
-use arrow_select::concat::concat_batches;
-use datafusion::datasource::file_format::FileWriterMode;
+use datafusion::error::DataFusionError;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use uuid::Uuid;
 
 use crate::error::Result;
+use crate::Error;
 use crate::{
     datatypes::Schema,
     format::Fragment,
     io::{object_store::ObjectStoreParams, FileWriter, ObjectStore},
-    Dataset,
 };
 
 use super::DATA_DIR;
@@ -75,12 +74,39 @@ impl Default for WriteParams {
     }
 }
 
+/// Convert reader to a stream
+///
+/// Will peek the first batch to get the dictionaries for dictionary columns
+pub fn reader_to_stream(
+    batches: Box<dyn RecordBatchReader + Send>,
+) -> Result<(SendableRecordBatchStream, Schema)> {
+    let arrow_schema = batches.schema();
+    let mut schema: Schema = Schema::try_from(batches.schema().as_ref())?;
+    let mut peekable = batches.peekable();
+    if let Some(batch) = peekable.peek() {
+        if let Ok(b) = batch {
+            schema.set_dictionary(b)?;
+        } else {
+            return Err(Error::from(batch.as_ref().unwrap_err()));
+        }
+    }
+    schema.validate()?;
+
+    let stream = RecordBatchStreamAdapter::new(
+        arrow_schema,
+        futures::stream::iter(peekable).map_err(DataFusionError::from),
+    );
+    let stream = Box::pin(stream) as SendableRecordBatchStream;
+
+    Ok((stream, schema))
+}
+
 /// Writes the given data to the dataset and returns fragments.
 ///
 /// NOTE: the fragments have not yet been assigned an ID. That must be done
 /// by the caller. This is so this function can be called in parallel, and the
 /// IDs can be assigned after writing is complete.
-pub(crate) async fn write_fragments(
+pub async fn write_fragments(
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
     schema: &Schema,
@@ -153,17 +179,6 @@ impl WriterGenerator {
     }
 }
 
-/// Create a new [FileWriter] with the related `data_file_path` under `<DATA_DIR>`.
-async fn new_file_writer(
-    object_store: &ObjectStore,
-    base_dir: &Path,
-    data_file_path: &str,
-    schema: &Schema,
-) -> Result<FileWriter> {
-    let full_path = base_dir.child(DATA_DIR).child(data_file_path);
-    FileWriter::try_new(object_store, &full_path, schema.clone()).await
-}
-
 fn chunk_stream(
     stream: SendableRecordBatchStream,
     chunk_size: usize,
@@ -182,9 +197,13 @@ fn chunk_stream(
 /// Wraps a RecordBatchReader into an iterator of RecordBatch chunks of a given size.
 /// This slices but does not copy any buffers.
 struct BatchReaderChunker {
+    /// The inner stream
     inner: SendableRecordBatchStream,
+    /// The batches that have been read from the inner stream but not yet fully yielded
     buffered: VecDeque<RecordBatch>,
+    /// The number of rows to yield in each chunk
     output_size: usize,
+    /// The position within the first batch in the buffer to start yielding from
     i: usize,
 }
 
@@ -214,17 +233,6 @@ impl BatchReaderChunker {
         Ok(())
     }
 
-    fn clean_buffer(&mut self) -> Result<()> {
-        while self
-            .buffered
-            .get(0)
-            .map_or(false, |batch| self.i >= batch.num_rows())
-        {
-            self.i -= self.buffered.pop_front().unwrap().num_rows();
-        }
-        Ok(())
-    }
-
     async fn next(&mut self) -> Option<Result<Vec<RecordBatch>>> {
         match self.fill_buffer().await {
             Ok(_) => {}
@@ -233,36 +241,134 @@ impl BatchReaderChunker {
 
         // Always starting within the first batch, since otherwise we would have
         // dropped it.
-        let mut ending_batch = 0;
-        let mut ending_i = self.i + self.output_size;
-        for batch in self.buffered.iter() {
-            if ending_i <= batch.num_rows() {
+        let mut batches = Vec::new();
+
+        let mut rows_collected = 0;
+
+        while rows_collected < self.output_size {
+            if let Some(batch) = self.buffered.pop_front() {
+                let rows_remaining_in_batch = batch.num_rows() - self.i;
+                let rows_to_take =
+                    std::cmp::min(rows_remaining_in_batch, self.output_size - rows_collected);
+
+                if rows_to_take == rows_remaining_in_batch {
+                    // We're taking the whole batch, so we can just move it
+                    let batch = if self.i == 0 {
+                        batch
+                    } else {
+                        // We are taking the remainder of the batch, so we need to slice it
+                        batch.slice(self.i, rows_to_take)
+                    };
+                    batches.push(batch);
+                    self.i = 0;
+                } else {
+                    // We're taking a slice of the batch, so we need to copy it
+                    batches.push(batch.slice(self.i, rows_to_take));
+                    // And then we need to push the remainder back onto the front of the queue
+                    self.i += rows_to_take;
+                    self.buffered.push_front(batch);
+                }
+
+                rows_collected += rows_to_take;
+            } else {
                 break;
             }
-            ending_i -= batch.num_rows();
-            ending_batch += 1;
         }
 
-        let mut batches = Vec::new();
-        if ending_batch == 0 {
-            // It's all in the first batch, so we can just slice it zero-copy
-            let batch = self.buffered[0].slice(self.i, ending_i);
-            batches.push(batch);
+        if batches.is_empty() {
+            None
         } else {
-            let mut start = self.i;
-            for batch in self.buffered.iter().take(ending_batch) {
-                batches.push(batch.slice(start, batch.num_rows()));
-                start = 0;
-            }
-            batches.push(self.buffered[ending_batch].slice(start, ending_i));
-        };
+            Some(Ok(batches))
+        }
+    }
+}
 
-        self.i = ending_i;
-        match self.clean_buffer() {
-            Ok(_) => {}
-            Err(e) => return Some(Err(e.into())),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::array::Int32Array;
+    use arrow_schema::DataType;
+    use arrow_schema::Schema as ArrowSchema;
+
+    #[tokio::test]
+    async fn test_chunking_large_batches() {
+        // Create a stream of 3 batches of 10 rows
+        let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from_iter(0..28))])
+                .unwrap();
+        let batches: Vec<RecordBatch> =
+            vec![batch.slice(0, 10), batch.slice(10, 10), batch.slice(20, 8)];
+        let stream = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)),
+        );
+
+        // Chunk into a stream of 3 row batches
+        let chunks: Vec<Vec<RecordBatch>> = chunk_stream(Box::pin(stream), 3)
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(chunks.len(), 10);
+        assert_eq!(chunks[0].len(), 1);
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let num_rows = chunk.iter().map(|batch| batch.num_rows()).sum::<usize>();
+            if i < chunks.len() - 1 {
+                assert_eq!(num_rows, 3);
+            } else {
+                // Last chunk is shorter
+                assert_eq!(num_rows, 1);
+            }
         }
 
-        Some(Ok(batches))
+        // The fourth chunk is split along the boundary between the original first
+        // two batches.
+        assert_eq!(chunks[3].len(), 2);
+        assert_eq!(chunks[3][0].num_rows(), 1);
+        assert_eq!(chunks[3][1].num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_chunking_small_batches() {
+        // Create a stream of 10 batches of 3 rows
+        let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from_iter(0..30))])
+                .unwrap();
+
+        let batches: Vec<RecordBatch> = (0..10).map(|i| batch.slice(i * 3, 3)).collect();
+        let stream = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)),
+        );
+
+        // Chunk into a stream of 10 row batches
+        let chunks: Vec<Vec<RecordBatch>> = chunk_stream(Box::pin(stream), 10)
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 4);
+        assert_eq!(chunks[0][0], batch.slice(0, 3));
+        assert_eq!(chunks[0][1], batch.slice(3, 3));
+        assert_eq!(chunks[0][2], batch.slice(6, 3));
+        assert_eq!(chunks[0][3], batch.slice(9, 1));
+
+        for chunk in &chunks {
+            let num_rows = chunk.iter().map(|batch| batch.num_rows()).sum::<usize>();
+            assert_eq!(num_rows, 10);
+        }
     }
 }

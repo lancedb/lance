@@ -727,7 +727,7 @@ mod test {
             .try_into_stream()
             .await
             .unwrap();
-        for expected_len in [8, 8, 4, 8, 8, 4] {
+        for expected_len in [8, 2, 8, 2, 8, 2, 8, 2, 8, 2] {
             assert_eq!(
                 stream.next().await.unwrap().unwrap().num_rows(),
                 expected_len as usize

@@ -29,12 +29,10 @@ use chrono::prelude::*;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use log::warn;
 use object_store::path::Path;
-use uuid::Uuid;
 
 mod feature_flags;
 pub mod fragment;
 mod hash_joiner;
-pub mod optimize;
 pub mod scanner;
 pub mod updater;
 mod write;
@@ -48,7 +46,7 @@ use crate::format::{pb, Fragment, Index, Manifest};
 use crate::io::object_store::ObjectStoreParams;
 use crate::io::{
     object_reader::{read_message, read_struct},
-    read_manifest, read_metadata_offset, write_manifest, FileWriter, ObjectStore,
+    read_manifest, read_metadata_offset, write_manifest, ObjectStore,
 };
 use crate::session::Session;
 use crate::{Error, Result};
@@ -294,16 +292,18 @@ impl Dataset {
         let latest_manifest_path = latest_manifest_path(&base);
         let flag_dataset_exists = object_store.exists(&latest_manifest_path).await?;
 
-        let mut schema: Schema = Schema::try_from(batches.schema().as_ref())?;
-        let mut peekable = batches.peekable();
-        if let Some(batch) = peekable.peek() {
-            if let Ok(b) = batch {
-                schema.set_dictionary(b)?;
-            } else {
-                return Err(Error::from(batch.as_ref().unwrap_err()));
-            }
-        }
-        schema.validate()?;
+        // let mut schema: Schema = Schema::try_from(batches.schema().as_ref())?;
+        // let mut peekable = batches.peekable();
+        // if let Some(batch) = peekable.peek() {
+        //     if let Ok(b) = batch {
+        //         schema.set_dictionary(b)?;
+        //     } else {
+        //         return Err(Error::from(batch.as_ref().unwrap_err()));
+        //     }
+        // }
+        // schema.validate()?;
+
+        let (stream, schema) = reader_to_stream(batches)?;
 
         // Running checks for the different write modes
         // create + dataset already exists = error
@@ -384,14 +384,8 @@ impl Dataset {
         };
 
         let object_store = Arc::new(object_store);
-        let mut new_fragments = write_fragments(
-            object_store.clone(),
-            &base,
-            &schema,
-            Box::new(peekable),
-            params.clone(),
-        )
-        .await?;
+        let mut new_fragments =
+            write_fragments(object_store.clone(), &base, &schema, stream, params.clone()).await?;
 
         // Assign IDs
         for mut fragment in &mut new_fragments {
@@ -424,7 +418,7 @@ impl Dataset {
         .await?;
 
         Ok(Self {
-            object_store: object_store,
+            object_store,
             base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
