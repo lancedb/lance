@@ -41,7 +41,7 @@ jobs:
         workspaces: python
     - name: Install linting tools
       run: |
-        pip install black isort ruff maturin
+        pip install black isort ruff maturin tensorflow>2
     - name: Lint Python
       run: |
         black --check python
