@@ -25,7 +25,7 @@ except ImportError:
     )
 
 import lance
-from lance.tf.data import from_lance
+from lance.tf.data import from_lance, lance_fragments
 
 
 @pytest.fixture
@@ -45,7 +45,28 @@ def tf_dataset(tmp_path):
 def test_fragment_dataset(tf_dataset):
     dataset = from_lance(tf_dataset)
     for batch in dataset:
-        print(batch)
+        # print(batch)
+        pass
     ds = lance.dataset(tf_dataset)
     # dataset = from_fragments(ds, fragments)
     # print(list(dataset))
+
+
+
+def test_shuffle(tf_dataset):
+    d = lance.dataset(tf_dataset)
+    df = d.to_table().to_pandas()
+    print(df)
+
+    frag1 = d.get_fragments()[0]
+    print("Frage 1 count: ", frag1.count_rows())
+    print(list(lance_fragments(tf_dataset).as_numpy_iterator()))
+    fragments = lance_fragments(tf_dataset).shuffle(4, seed=20).take(3)
+    print(list(fragments.as_numpy_iterator()))
+    assert list(fragments.as_numpy_iterator()) == [2, 4, 1]
+
+    ds = from_lance(tf_dataset, fragments=fragments, batch_size=100)
+    for batch, fragment_id in zip(ds, [2, 4, 1]):
+        print(batch)
+        assert batch["a"].numpy()[0] == fragment_id * 100
+        # print(batch)
