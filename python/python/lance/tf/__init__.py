@@ -12,7 +12,10 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-try:
-    import tensorflow
-except ImportError:
-    raise "Tensorflow is not installed. Please install tensorflow to use lance.tf module."
+import importlib.util
+
+if importlib.util.find_spec("tensorflow") is None:
+    raise ImportError(
+        "Tensorflow is not installed. Please install tensorflow to use lance.tf module.",
+        allow_module_level=True,
+    )

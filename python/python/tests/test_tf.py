@@ -12,13 +12,13 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import importlib.util
+
 import pandas as pd
 import pyarrow as pa
 import pytest
 
-try:
-    import tensorflow as tf
-except ImportError:
+if importlib.util.find_spec("tensorflow") is None:
     pytest.skip(
         "Tensorflow is not installed. Please install tensorflow to use lance.tf module.",
         allow_module_level=True,
