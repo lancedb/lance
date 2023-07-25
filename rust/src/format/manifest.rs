@@ -140,7 +140,13 @@ impl Manifest {
     /// Return the max fragment id.
     /// Note this does not support recycling of fragment ids.
     pub fn max_fragment_id(&self) -> Option<u64> {
-        self.max_fragment_id.try_into().ok()
+        if self.max_fragment_id == 0 {
+            // It might not have been updated, so the best we can do is recompute
+            // it from the fragment list.
+            self.fragments.iter().map(|f| f.id).max()
+        } else {
+            self.max_fragment_id.try_into().ok()
+        }
     }
 
     /// Return the fragments that are newer than the given manifest.
