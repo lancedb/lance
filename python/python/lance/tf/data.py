@@ -83,7 +83,7 @@ def data_type_to_tensor_spec(dt: pa.DataType) -> tf.TensorSpec:
         return tf.TensorSpec(shape=(None,), dtype=arrow_data_type_to_tf(dt))
     elif pa.types.is_fixed_size_list(dt):
         return tf.TensorSpec(
-            shape=(dt.list_size, None), dtype=arrow_data_type_to_tf(dt.value_type)
+            shape=(None, dt.list_size), dtype=arrow_data_type_to_tf(dt.value_type)
         )
     elif pa.types.is_list(dt) or pa.types.is_large_list(dt):
         return tf.TensorSpec(

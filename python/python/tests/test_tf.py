@@ -44,10 +44,10 @@ def tf_dataset(tmp_path):
         [
             pa.field("a", pa.int64()),
             pa.field("s", pa.string()),
-            pa.field("vec", pa.list_(pa.float32(), 100)),
+            pa.field("vec", pa.list_(pa.float32(), 128)),
         ]
     )
-    tbl = pa.Table.from_pandas(df)
+    tbl = pa.Table.from_pandas(df, schema=schema)
 
     def batches():
         for batch in tbl.to_batches(100):
@@ -70,7 +70,22 @@ def test_fragment_dataset(tf_dataset):
         assert batch["a"].numpy()[0] == idx * 100
         assert batch["s"].numpy()[0] == f"val-{idx * 100}".encode("utf-8")
         assert batch["a"].shape == (100,)
-        assert batch["vec"].shape == (100, 128,)  # Fixed size list
+        assert batch["vec"].shape == (
+            100,
+            128,
+        )  # Fixed size list
+
+
+def test_scan_use_tf_data(tf_dataset):
+    ds = tf.data.Dataset.from_lance(tf_dataset)
+    for idx, batch in enumerate(ds):
+        assert batch["a"].numpy()[0] == idx * 100
+        assert batch["s"].numpy()[0] == f"val-{idx * 100}".encode("utf-8")
+        assert batch["a"].shape == (100,)
+        assert batch["vec"].shape == (
+            100,
+            128,
+        )  # Fixed size list
 
 
 def test_shuffle(tf_dataset):
@@ -85,5 +100,7 @@ def test_shuffle(tf_dataset):
     for batch, raw_batch in zip(ds, scanner.to_batches()):
         assert batch["a"].numpy()[0] == raw_batch.to_pydict()["a"][0]
         assert batch["a"].numpy().shape == (100,)
-        assert batch["vec"].shape == (100, 128,)  # Fixed size list
-
+        assert batch["vec"].shape == (
+            100,
+            128,
+        )  # Fixed size list
