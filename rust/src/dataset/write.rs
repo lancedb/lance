@@ -115,8 +115,10 @@ pub async fn write_fragments(
     base_dir: &Path,
     schema: &Schema,
     data: SendableRecordBatchStream,
-    params: WriteParams,
+    mut params: WriteParams,
 ) -> Result<Vec<Fragment>> {
+    // Make sure the max rows per group is not larger than the max rows per file
+    params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
     let mut buffered_reader = chunk_stream(data, params.max_rows_per_group);
 
     let writer_generator = WriterGenerator::new(object_store, base_dir, schema);

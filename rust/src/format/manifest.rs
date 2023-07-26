@@ -139,6 +139,8 @@ impl Manifest {
 
     /// Return the max fragment id.
     /// Note this does not support recycling of fragment ids.
+    ///
+    /// This will return None if there are no fragments.
     pub fn max_fragment_id(&self) -> Option<u64> {
         if self.max_fragment_id == 0 {
             // It might not have been updated, so the best we can do is recompute

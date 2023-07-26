@@ -367,9 +367,9 @@ impl Dataset {
         }
 
         let mut fragment_id = if matches!(params.mode, WriteMode::Append) {
-            dataset
-                .as_ref()
-                .map_or(0, |d| d.manifest.max_fragment_id().unwrap_or(0) + 1)
+            dataset.as_ref().map_or(0, |d| {
+                d.manifest.max_fragment_id().map(|max| max + 1).unwrap_or(0)
+            })
         } else {
             // Create or Overwrite.
             // Overwrite resets the fragment ID to zero.
@@ -389,7 +389,7 @@ impl Dataset {
         let mut new_fragments =
             write_fragments(object_store.clone(), &base, &schema, stream, params.clone()).await?;
 
-        // Assign IDs
+        // Assign IDs.
         for fragment in &mut new_fragments {
             fragment.id = fragment_id;
             fragment_id += 1;
@@ -1072,6 +1072,8 @@ mod tests {
         let result = Dataset::write(reader, test_uri, None).await.unwrap();
         // check dataset empty
         assert_eq!(result.count_rows().await.unwrap(), 0);
+        // Since the dataset is empty, will return None.
+        assert_eq!(result.manifest.max_fragment_id(), None);
 
         // append rows to dataset
         let mut write_params = WriteParams {
@@ -1110,6 +1112,8 @@ mod tests {
         assert_eq!(&actual_schema, schema.as_ref());
         // check num rows is 10
         assert_eq!(actual_ds.count_rows().await.unwrap(), 10);
+        // Max fragment id is still 0 since we only have 1 fragment.
+        assert_eq!(actual_ds.manifest.max_fragment_id(), Some(0));
         // check expected batch is correct
         let actual_batches = actual_ds
             .scan()
@@ -1882,7 +1886,13 @@ mod tests {
         )]));
         let data = sequence_data(0..100);
         let batches = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let write_params = WriteParams {
+            max_rows_per_file: 50, // Split over two files.
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
 
         // Delete nothing
         dataset.delete("i < 0").await.unwrap();
@@ -1890,9 +1900,10 @@ mod tests {
 
         // We should not have any deletion file still
         let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 1);
-        assert_eq!(dataset.manifest.max_fragment_id(), Some(0));
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
         assert!(fragments[0].metadata.deletion_file.is_none());
+        assert!(fragments[1].metadata.deletion_file.is_none());
 
         // Delete rows
         dataset.delete("i < 10 OR i >= 90").await.unwrap();
@@ -1901,21 +1912,35 @@ mod tests {
         // Verify result:
         // There should be a deletion file in the metadata
         let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments.len(), 2);
         assert!(fragments[0].metadata.deletion_file.is_some());
+        assert!(fragments[1].metadata.deletion_file.is_some());
 
         // The deletion file should contain 20 rows
         let store = dataset.object_store().clone();
         let path = Path::from_filesystem_path(test_uri).unwrap();
+        // First fragment has 0..10 deleted
         let deletion_vector = read_deletion_file(&path, &fragments[0].metadata, &store)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(deletion_vector.len(), 20);
+        assert_eq!(deletion_vector.len(), 10);
         assert_eq!(
             deletion_vector.into_iter().collect::<HashSet<_>>(),
-            (0..10).chain(90..100).collect::<HashSet<_>>()
+            (0..10).collect::<HashSet<_>>()
         );
+        // Second fragment has 90..100 deleted
+        let deletion_vector = read_deletion_file(&path, &fragments[1].metadata, &store)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deletion_vector.len(), 10);
+        // The second fragment starts at 50, so 90..100 becomes 40..50 in local row ids.
+        assert_eq!(
+            deletion_vector.into_iter().collect::<HashSet<_>>(),
+            (40..50).collect::<HashSet<_>>()
+        );
+        let second_deletion_file = fragments[1].metadata.deletion_file.clone().unwrap();
 
         // Delete more rows
         dataset.delete("i < 20").await.unwrap();
@@ -1923,25 +1948,31 @@ mod tests {
 
         // Verify result
         let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments.len(), 2);
         assert!(fragments[0].metadata.deletion_file.is_some());
         let deletion_vector = read_deletion_file(&path, &fragments[0].metadata, &store)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(deletion_vector.len(), 30);
+        assert_eq!(deletion_vector.len(), 20);
         assert_eq!(
             deletion_vector.into_iter().collect::<HashSet<_>>(),
-            (0..20).chain(90..100).collect::<HashSet<_>>()
+            (0..20).collect::<HashSet<_>>()
+        );
+        // Second deletion vector was not rewritten
+        assert_eq!(
+            fragments[1].metadata.deletion_file.as_ref().unwrap(),
+            &second_deletion_file
         );
 
         // Delete full fragment
-        dataset.delete("i >= 20").await.unwrap();
+        dataset.delete("i >= 50").await.unwrap();
         dataset.validate().await.unwrap();
 
-        // Verify fragment is fully gone
+        // Verify second fragment is fully gone
         let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 0);
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].id(), 0);
 
         // Append after delete
         let data = sequence_data(0..100);
@@ -1957,9 +1988,10 @@ mod tests {
         dataset.validate().await.unwrap();
 
         let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments.len(), 2);
         // Fragment id picks up where we left off
-        assert_eq!(fragments[0].id(), 1);
-        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
+        assert_eq!(fragments[0].id(), 0);
+        assert_eq!(fragments[1].id(), 2);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
     }
 }
