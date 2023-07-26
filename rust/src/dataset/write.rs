@@ -74,9 +74,13 @@ impl Default for WriteParams {
     }
 }
 
-/// Convert reader to a stream
+/// Convert reader to a stream and a schema.
 ///
-/// Will peek the first batch to get the dictionaries for dictionary columns
+/// Will peek the first batch to get the dictionaries for dictionary columns.
+///
+/// NOTE: this does not validate the schema. For example, for appends the schema
+/// should be checked to make sure it matches the existing dataset schema before
+/// writing.
 pub fn reader_to_stream(
     batches: Box<dyn RecordBatchReader + Send>,
 ) -> Result<(SendableRecordBatchStream, Schema)> {

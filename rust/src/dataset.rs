@@ -40,6 +40,7 @@ mod write;
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::Scanner;
+use self::write::{reader_to_stream, write_fragments};
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{pb, Fragment, Index, Manifest};
@@ -52,7 +53,7 @@ use crate::session::Session;
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use scanner::ROW_ID;
-pub use write::*;
+pub use write::{WriteMode, WriteParams};
 
 const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
@@ -1121,6 +1122,48 @@ mod tests {
         let sorted_arr = take(&struct_arr, &sorted_indices, None).unwrap();
         let expected_struct_arr: StructArray = expected_batch.into();
         assert_eq!(&expected_struct_arr, as_struct_array(sorted_arr.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn test_write_params() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let num_rows: usize = 1_000;
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+        )
+        .unwrap()];
+
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        let write_params = WriteParams {
+            max_rows_per_file: 100,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.count_rows().await.unwrap(), num_rows);
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 10);
+        for fragment in &fragments {
+            assert_eq!(fragment.count_rows().await.unwrap(), 100);
+            let reader = fragment.open(dataset.schema()).await.unwrap();
+            assert_eq!(reader.num_batches(), 10);
+            for i in 0..reader.num_batches() {
+                assert_eq!(reader.num_rows_in_batch(i), 10);
+            }
+        }
     }
 
     #[tokio::test]
