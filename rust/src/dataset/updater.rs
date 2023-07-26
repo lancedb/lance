@@ -208,6 +208,14 @@ pub(crate) fn add_blanks(
         return Ok(batch);
     }
 
+    if batch.num_rows() == 0 {
+        // TODO: implement adding blanks for an empty batch.
+        // This is difficult because we need to create a batch for arbitrary schemas.
+        return Err(Error::NotSupported {
+            source: "Missing many rows in merge".into(),
+        });
+    }
+
     let mut array_i = 0;
     let selection_vector: Vec<u32> = row_id_range
         .map(move |row_id| {

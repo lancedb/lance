@@ -29,7 +29,6 @@ use chrono::prelude::*;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use log::warn;
 use object_store::path::Path;
-use uuid::Uuid;
 
 mod feature_flags;
 pub mod fragment;
@@ -41,19 +40,20 @@ mod write;
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::Scanner;
+use self::write::{reader_to_stream, write_fragments};
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{pb, Fragment, Index, Manifest};
 use crate::io::object_store::ObjectStoreParams;
 use crate::io::{
     object_reader::{read_message, read_struct},
-    read_manifest, read_metadata_offset, write_manifest, FileWriter, ObjectStore,
+    read_manifest, read_metadata_offset, write_manifest, ObjectStore,
 };
 use crate::session::Session;
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use scanner::ROW_ID;
-pub use write::*;
+pub use write::{WriteMode, WriteParams};
 
 const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
@@ -94,17 +94,6 @@ impl From<&Manifest> for Version {
             metadata: BTreeMap::default(),
         }
     }
-}
-
-/// Create a new [FileWriter] with the related `data_file_path` under `<DATA_DIR>`.
-async fn new_file_writer(
-    object_store: &ObjectStore,
-    base_dir: &Path,
-    data_file_path: &str,
-    schema: &Schema,
-) -> Result<FileWriter> {
-    let full_path = base_dir.child(DATA_DIR).child(data_file_path);
-    FileWriter::try_new(object_store, &full_path, schema.clone()).await
 }
 
 /// Get the manifest file path for a version.
@@ -322,16 +311,7 @@ impl Dataset {
         let latest_manifest_path = latest_manifest_path(&base);
         let flag_dataset_exists = object_store.exists(&latest_manifest_path).await?;
 
-        let mut schema: Schema = Schema::try_from(batches.schema().as_ref())?;
-        let mut peekable = batches.peekable();
-        if let Some(batch) = peekable.peek() {
-            if let Ok(b) = batch {
-                schema.set_dictionary(b)?;
-            } else {
-                return Err(Error::from(batch.as_ref().unwrap_err()));
-            }
-        }
-        schema.validate()?;
+        let (stream, schema) = reader_to_stream(batches)?;
 
         // Running checks for the different write modes
         // create + dataset already exists = error
@@ -411,52 +391,16 @@ impl Dataset {
             vec![]
         };
 
-        let mut writer = None;
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut num_rows: usize = 0;
-        for batch_result in peekable {
-            let batch: RecordBatch = batch_result?;
-            batches.push(batch.clone());
-            num_rows += batch.num_rows();
-            if num_rows >= params.max_rows_per_group {
-                // TODO: the max rows per group boundary is not accurately calculated yet.
-                if writer.is_none() {
-                    writer = {
-                        let file_path = format!("{}.lance", Uuid::new_v4());
-                        let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
-                        fragments.push(fragment);
-                        fragment_id += 1;
-                        Some(new_file_writer(&object_store, &base, &file_path, &schema).await?)
-                    }
-                };
+        let object_store = Arc::new(object_store);
+        let mut new_fragments =
+            write_fragments(object_store.clone(), &base, &schema, stream, params.clone()).await?;
 
-                writer.as_mut().unwrap().write(&batches).await?;
-                batches = Vec::new();
-                num_rows = 0;
-            }
-            if let Some(w) = writer.as_mut() {
-                if w.len() >= params.max_rows_per_file {
-                    w.finish().await?;
-                    writer = None;
-                }
-            }
+        // Assign IDs
+        for fragment in &mut new_fragments {
+            fragment.id = fragment_id;
+            fragment_id += 1;
         }
-        if num_rows > 0 {
-            if writer.is_none() {
-                writer = {
-                    let file_path = format!("{}.lance", Uuid::new_v4());
-                    let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
-                    fragments.push(fragment);
-                    Some(new_file_writer(&object_store, &base, &file_path, &schema).await?)
-                }
-            };
-            writer.as_mut().unwrap().write(&batches).await?;
-        }
-        if let Some(w) = writer.as_mut() {
-            // Drop the last writer.
-            w.finish().await?;
-            drop(writer);
-        };
+        fragments.extend(new_fragments);
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments));
         manifest.version = match dataset.as_ref() {
@@ -482,7 +426,7 @@ impl Dataset {
         .await?;
 
         Ok(Self {
-            object_store: Arc::new(object_store),
+            object_store,
             base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
@@ -1089,6 +1033,12 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+
+        // The batch size batches the group size.
+        for batch in &actual_batches {
+            assert_eq!(batch.num_rows(), 10);
+        }
+
         // sort
         let actual_batch = concat_batches(&schema, &actual_batches).unwrap();
         let idx_arr = actual_batch.column_by_name("i").unwrap();
@@ -1190,6 +1140,48 @@ mod tests {
         let sorted_arr = take(&struct_arr, &sorted_indices, None).unwrap();
         let expected_struct_arr: StructArray = expected_batch.into();
         assert_eq!(&expected_struct_arr, as_struct_array(sorted_arr.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn test_write_params() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let num_rows: usize = 1_000;
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+        )
+        .unwrap()];
+
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        let write_params = WriteParams {
+            max_rows_per_file: 100,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.count_rows().await.unwrap(), num_rows);
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 10);
+        for fragment in &fragments {
+            assert_eq!(fragment.count_rows().await.unwrap(), 100);
+            let reader = fragment.open(dataset.schema()).await.unwrap();
+            assert_eq!(reader.num_batches(), 10);
+            for i in 0..reader.num_batches() {
+                assert_eq!(reader.num_rows_in_batch(i), 10);
+            }
+        }
     }
 
     #[tokio::test]

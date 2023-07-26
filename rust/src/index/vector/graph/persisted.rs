@@ -415,7 +415,7 @@ mod tests {
         .unwrap()];
 
         let write_params = WriteParams {
-            max_rows_per_file: 40,
+            max_rows_per_file: 200,
             max_rows_per_group: 10,
             ..Default::default()
         };

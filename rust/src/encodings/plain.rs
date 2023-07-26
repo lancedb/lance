@@ -851,7 +851,6 @@ mod tests {
         let array = BooleanArray::from((0..120).map(|v| v % 5 == 0).collect::<Vec<_>>());
         let batch =
             RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
-        dbg!(&batch);
         file_writer.write(&[batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
