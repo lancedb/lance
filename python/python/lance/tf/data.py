@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterable, List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Union
 
 import lance
 import numpy as np
@@ -120,7 +120,7 @@ def from_lance(
     batch_size: int = 256,
     filter: Optional[str] = None,
     fragments: Union[Iterable[LanceFragment], tf.data.Dataset] = None,
-    output_signature=None,
+    output_signature: Optional[Dict[str, tf.TypeSpec]] = None,
 ) -> tf.data.Dataset:
     """Create a ``tf.data.Dataset`` from a Lance dataset.
 
@@ -138,6 +138,9 @@ def from_lance(
     fragments : Union[List[LanceFragment], tf.data.Dataset], optional
         If provided, only the fragments are read. It can be used to feed
         for distributed training.
+    output_signature : Optional[tf.TypeSpec], optional
+        Override output signature of the returned tensors. If not provided,
+        the output signature is inferred from the projection Schema.
 
     Examples
     --------
