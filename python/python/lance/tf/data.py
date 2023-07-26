@@ -195,10 +195,16 @@ def from_lance(
     return tf.data.Dataset.from_generator(generator, output_signature=signature)
 
 
-def lance_fragments(data: Union[str, Path, LanceDataset]) -> tf.data.Dataset:
-    """Create a `tf.data.Dataset` from a Lance fragments."""
-    if not isinstance(data, LanceDataset):
-        data = lance.dataset(data)
+def lance_fragments(dataset: Union[str, Path, LanceDataset]) -> tf.data.Dataset:
+    """Create a ``tf.data.Dataset`` of Lance Fragments in the dataset.
+
+    Parameters
+    ----------
+    dataset : Union[str, Path, LanceDataset]
+        A Lance Dataset or dataset URI/path.
+    """
+    if not isinstance(dataset, LanceDataset):
+        dataset = lance.dataset(dataset)
     return tf.data.Dataset.from_tensor_slices(
-        [f.fragment_id for f in data.get_fragments()]
+        [f.fragment_id for f in dataset.get_fragments()]
     )

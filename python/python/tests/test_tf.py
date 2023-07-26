@@ -32,7 +32,21 @@ from lance.tf.data import from_lance, lance_fragments
 
 @pytest.fixture
 def tf_dataset(tmp_path):
-    df = pd.DataFrame({"a": range(10000), "s": [f"val-{i}" for i in range(10000)]})
+    df = pd.DataFrame(
+        {
+            "a": range(10000),
+            "s": [f"val-{i}" for i in range(10000)],
+            "vec": [[i * 0.2] * 128 for i in range(10000)],
+        }
+    )
+
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64()),
+            pa.field("s", pa.string()),
+            pa.field("vec", pa.list_(pa.float32(), 100)),
+        ]
+    )
     tbl = pa.Table.from_pandas(df)
 
     def batches():
@@ -40,7 +54,13 @@ def tf_dataset(tmp_path):
             yield batch
 
     uri = tmp_path / "dataset.lance"
-    lance.write_dataset(batches(), uri, schema=tbl.schema, max_rows_per_file=100)
+    lance.write_dataset(
+        batches(),
+        uri,
+        schema=tbl.schema,
+        max_rows_per_group=100,
+        max_rows_per_file=1000,
+    )
     return uri
 
 
@@ -50,6 +70,7 @@ def test_fragment_dataset(tf_dataset):
         assert batch["a"].numpy()[0] == idx * 100
         assert batch["s"].numpy()[0] == f"val-{idx * 100}".encode("utf-8")
         assert batch["a"].shape == (100,)
+        assert batch["vec"].shape == (100, 128,)  # Fixed size list
 
 
 def test_shuffle(tf_dataset):
@@ -64,3 +85,5 @@ def test_shuffle(tf_dataset):
     for batch, raw_batch in zip(ds, scanner.to_batches()):
         assert batch["a"].numpy()[0] == raw_batch.to_pydict()["a"][0]
         assert batch["a"].numpy().shape == (100,)
+        assert batch["vec"].shape == (100, 128,)  # Fixed size list
+
