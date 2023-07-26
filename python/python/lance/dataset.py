@@ -62,10 +62,13 @@ class LanceDataset(pa.dataset.Dataset):
         version: Optional[int] = None,
         block_size: Optional[int] = None,
         index_cache_size: Optional[int] = None,
+        metadata_cache_size: Optional[int] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
-        self._ds = _Dataset(uri, version, block_size, index_cache_size)
+        self._ds = _Dataset(
+            uri, version, block_size, index_cache_size, metadata_cache_size
+        )
 
     def __reduce__(self):
         return LanceDataset, (self.uri, self._ds.version())
@@ -196,6 +199,7 @@ class LanceDataset(pa.dataset.Dataset):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
+        batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
         scan_in_order: bool = True,
@@ -229,6 +233,8 @@ class LanceDataset(pa.dataset.Dataset):
                     "refine_factor": 1
                 }
 
+        batch_size: int, optional
+            The number of rows to read at a time.
         batch_readahead: int, optional
             The number of batches to read ahead.
         fragment_readahead: int, optional
@@ -250,6 +256,7 @@ class LanceDataset(pa.dataset.Dataset):
             limit=limit,
             offset=offset,
             nearest=nearest,
+            batch_size=batch_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
             scan_in_order=scan_in_order,
@@ -290,6 +297,7 @@ class LanceDataset(pa.dataset.Dataset):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
+        batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
         scan_in_order: bool = True,
@@ -312,6 +320,7 @@ class LanceDataset(pa.dataset.Dataset):
             limit=limit,
             offset=offset,
             nearest=nearest,
+            batch_size=batch_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
             scan_in_order=scan_in_order,

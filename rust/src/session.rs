@@ -12,7 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::dataset::DEFAULT_INDEX_CACHE_SIZE;
+use std::any::{Any, TypeId};
+use std::sync::{Arc, Mutex};
+
+use lru_time_cache::LruCache;
+use object_store::path::Path;
+
+use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::index::cache::IndexCache;
 
 /// A user session tracks the runtime state.
@@ -20,6 +26,9 @@ use crate::index::cache::IndexCache;
 pub struct Session {
     /// Cache for opened indices.
     pub(crate) index_cache: IndexCache,
+
+    /// Cache for file metadata
+    pub(crate) file_metadata_cache: FileMetadataCache,
 }
 
 impl std::fmt::Debug for Session {
@@ -34,9 +43,10 @@ impl Session {
     /// Parameters:
     ///
     /// - ***index_cache_size***: the size of the index cache.
-    pub fn new(index_cache_size: usize) -> Self {
+    pub fn new(index_cache_size: usize, metadata_cache_size: usize) -> Self {
         Self {
             index_cache: IndexCache::new(index_cache_size),
+            file_metadata_cache: FileMetadataCache::new(metadata_cache_size),
         }
     }
 }
@@ -45,7 +55,46 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             index_cache: IndexCache::new(DEFAULT_INDEX_CACHE_SIZE),
+            file_metadata_cache: FileMetadataCache::new(DEFAULT_METADATA_CACHE_SIZE),
         }
+    }
+}
+
+type ArcAny = Arc<dyn Any + Send + Sync>;
+
+/// Cache for various metadata about files.
+///
+/// The cache is keyed by the file path and the type of metadata.
+#[derive(Clone)]
+pub struct FileMetadataCache {
+    /// The maximum number of metadata to cache.
+    capacity: usize,
+
+    cache: Arc<Mutex<LruCache<(Path, TypeId), ArcAny>>>,
+}
+
+impl FileMetadataCache {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            cache: Arc::new(Mutex::new(LruCache::with_capacity(capacity))),
+        }
+    }
+
+    pub(crate) fn get<T: Send + Sync + 'static>(&self, path: &Path) -> Option<Arc<T>> {
+        let mut cache = self.cache.lock().unwrap();
+        cache
+            .get(&(path.to_owned(), TypeId::of::<T>()))
+            .map(|metadata| metadata.clone().downcast::<T>().unwrap())
+    }
+
+    pub(crate) fn insert<T: Send + Sync + 'static>(&self, path: Path, metadata: Arc<T>) {
+        if self.capacity == 0 {
+            // Work-around. lru_time_cache panics if capacity is 0.
+            return;
+        }
+        let mut cache = self.cache.lock().unwrap();
+        cache.insert((path, TypeId::of::<T>()), metadata);
     }
 }
 
@@ -66,7 +115,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_disable_index_cache() {
-        let no_cache = Session::new(0);
+        let no_cache = Session::new(0, 0);
         assert!(no_cache.index_cache.get("abc").is_none());
 
         let schema = Schema {

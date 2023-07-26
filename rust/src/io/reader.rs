@@ -34,19 +34,20 @@ use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
 use futures::stream::{self, TryStreamExt};
-use futures::StreamExt;
+use futures::{Future, FutureExt, StreamExt};
 use object_store::path::Path;
 use prost::Message;
 
 use super::deletion::{read_deletion_file, DeletionVector};
-use super::ReadBatchParams;
+use super::{deletion_file_path, ReadBatchParams};
 use crate::arrow::*;
 use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::error::{Error, Result};
-use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
+use crate::format::{Fragment, Manifest};
 use crate::io::object_reader::{read_fixed_stride_array, read_struct, ObjectReader};
 use crate::io::{read_metadata_offset, read_struct_from_buf};
+use crate::session::Session;
 use crate::{
     datatypes::{Field, Schema},
     format::PageInfo,
@@ -129,8 +130,8 @@ fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
 /// It reads arrow data from one data file.
 pub struct FileReader {
     object_reader: Arc<dyn ObjectReader>,
-    metadata: Metadata,
-    page_table: PageTable,
+    metadata: Arc<Metadata>,
+    page_table: Arc<PageTable>,
     projection: Option<Schema>,
 
     /// The id of the fragment which this file belong to.
@@ -142,7 +143,7 @@ pub struct FileReader {
     with_row_id: bool,
 
     // deletion vector indicating which rows are deleting in the fragment
-    deletion_vector: Option<DeletionVector>,
+    deletion_vector: Option<Arc<DeletionVector>>,
 }
 
 impl std::fmt::Debug for FileReader {
@@ -158,30 +159,47 @@ impl std::fmt::Debug for FileReader {
 
 impl FileReader {
     /// Open file reader
+    ///
+    /// Open the file at the given path using the provided object store.
+    ///
+    /// The passed fragment ID determines the first 32-bits of the row IDs.
+    ///
+    /// If a manifest is passed in, it will be used to load the schema and dictionary.
+    /// This is typically done if the file is part of a dataset fragment. If no manifest
+    /// is passed in, then it is read from the file itself.
+    ///
+    /// The session passed in is used to cache metadata about the file. If no session
+    /// is passed in, there will be no caching.
     pub(crate) async fn try_new_with_fragment(
         object_store: &ObjectStore,
         path: &Path,
         fragment_id: u64,
         manifest: Option<&Manifest>,
+        session: Option<&Session>,
     ) -> Result<Self> {
         let object_reader = object_store.open(path).await?;
+        let is_dataset = manifest.is_some();
 
-        let file_size = object_reader.size().await?;
-        let begin = if file_size < object_store.block_size() {
-            0
-        } else {
-            file_size - object_store.block_size()
-        };
-        let tail_bytes = object_reader.get_range(begin..file_size).await?;
-        let metadata_pos = read_metadata_offset(&tail_bytes)?;
+        let metadata = Self::load_from_cache(session, path, |_| async {
+            let file_size = object_reader.size().await?;
+            let begin = if file_size < object_store.block_size() {
+                0
+            } else {
+                file_size - object_store.block_size()
+            };
+            let tail_bytes = object_reader.get_range(begin..file_size).await?;
+            let metadata_pos = read_metadata_offset(&tail_bytes)?;
 
-        let metadata: Metadata = if metadata_pos < file_size - tail_bytes.len() {
-            // We have not read the metadata bytes yet.
-            read_struct(object_reader.as_ref(), metadata_pos).await?
-        } else {
-            let offset = tail_bytes.len() - (file_size - metadata_pos);
-            read_struct_from_buf(&tail_bytes.slice(offset..))?
-        };
+            let metadata: Metadata = if metadata_pos < file_size - tail_bytes.len() {
+                // We have not read the metadata bytes yet.
+                read_struct(object_reader.as_ref(), metadata_pos).await?
+            } else {
+                let offset = tail_bytes.len() - (file_size - metadata_pos);
+                read_struct_from_buf(&tail_bytes.slice(offset..))?
+            };
+            Ok(metadata)
+        })
+        .await?;
 
         // m is either
         // a ref if passed in as Some(&manifest), or
@@ -199,29 +217,41 @@ impl FileReader {
             &m
         };
 
-        let projection = manifest.schema.clone();
-        let num_columns = manifest.schema.max_field_id().unwrap() + 1;
-        let page_table = PageTable::load(
-            object_reader.as_ref(),
-            metadata.page_table_position,
-            num_columns,
-            metadata.num_batches() as i32,
-        )
+        let page_table = Self::load_from_cache(session, path, |_| {
+            let num_columns = manifest.schema.max_field_id().unwrap() + 1;
+            PageTable::load(
+                object_reader.as_ref(),
+                metadata.page_table_position,
+                num_columns,
+                metadata.num_batches() as i32,
+            )
+        })
         .await?;
 
-        // read the fragment metadata so we can handle deletion
-        let fragment = manifest
-            .fragments
-            .iter()
-            .find(|frag| frag.id == fragment_id)
-            .map(|f| f.to_owned());
+        let projection = manifest.schema.clone();
 
-        let deletion_vector = match &fragment {
-            Some(frag) => read_deletion_file(object_store.base_path(), frag, object_store).await,
-            None => Ok(None),
+        // read the fragment metadata so we can handle deletion
+        let fragment = if is_dataset {
+            let fragment = manifest
+                .fragments
+                .iter()
+                .find(|frag| frag.id == fragment_id)
+                .map(|f| f.to_owned())
+                .ok_or(Error::IO {
+                    message: format!("Fragment {} not found in manifest", fragment_id),
+                })?;
+            Some(fragment)
+        } else {
+            None
         };
 
-        deletion_vector.map(|deletion_vector| Self {
+        let deletion_vector = if let Some(fragment) = &fragment {
+            Self::load_deletion_vector(object_store, fragment, session).await?
+        } else {
+            None
+        };
+
+        Ok(Self {
             object_reader: object_reader.into(),
             metadata,
             projection: Some(projection),
@@ -232,9 +262,59 @@ impl FileReader {
         })
     }
 
+    /// Load some metadata about the fragment from the cache, if there is one.
+    async fn load_from_cache<T: Send + Sync + 'static, F, Fut>(
+        session: Option<&Session>,
+        path: &Path,
+        loader: F,
+    ) -> Result<Arc<T>>
+    where
+        F: Fn(&Path) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        if let Some(session) = session {
+            if let Some(metadata) = session.file_metadata_cache.get::<T>(path) {
+                return Ok(metadata);
+            }
+        }
+
+        let metadata = Arc::new(loader(path).await?);
+        if let Some(session) = session {
+            session
+                .file_metadata_cache
+                .insert(path.to_owned(), metadata.clone());
+        }
+        Ok(metadata)
+    }
+
+    async fn load_deletion_vector(
+        object_store: &ObjectStore,
+        fragment: &Fragment,
+        session: Option<&Session>,
+    ) -> Result<Option<Arc<DeletionVector>>> {
+        if let Some(deletion_file) = &fragment.deletion_file {
+            let path = deletion_file_path(object_store.base_path(), fragment.id, deletion_file);
+
+            let deletion_vector = Self::load_from_cache(session, &path, |_| async {
+                read_deletion_file(object_store.base_path(), fragment, object_store)
+                    .await?
+                    .ok_or(Error::IO {
+                        message: format!(
+                            "Deletion file {:?} not found in fragment {}",
+                            deletion_file, fragment.id
+                        ),
+                    })
+            })
+            .await?;
+            Ok(Some(deletion_vector))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Open one Lance data file for read.
     pub(crate) async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<Self> {
-        Self::try_new_with_fragment(object_store, path, 0, None).await
+        Self::try_new_with_fragment(object_store, path, 0, None, None).await
     }
 
     /// Instruct the FileReader to return meta row id column.
@@ -281,7 +361,7 @@ impl FileReader {
             projection,
             batch_id,
             self.with_row_id,
-            self.deletion_vector.as_ref(),
+            self.deletion_vector.clone(),
         )
         .await
     }
@@ -336,15 +416,21 @@ async fn read_batch(
     schema: &Schema,
     batch_id: i32,
     with_row_id: bool,
-    deletion_vector: Option<&DeletionVector>,
+    deletion_vector: Option<Arc<DeletionVector>>,
 ) -> Result<RecordBatch> {
+    // We box this because otherwise we get a higher-order lifetime error.
     let arrs = stream::iter(&schema.fields)
-        .then(|f| async move { read_array(reader, f, batch_id, params).await })
+        .map(|f| read_array(reader, f, batch_id, params))
+        .buffered(num_cpus::get() * 4)
         .try_collect::<Vec<_>>()
-        .await?;
+        .boxed();
+    let arrs = arrs.await?;
 
-    let should_fetch_row_id =
-        with_row_id || !matches!(deletion_vector, None | Some(DeletionVector::NoDeletions));
+    let should_fetch_row_id = with_row_id
+        || !matches!(
+            deletion_vector.as_deref(),
+            None | Some(DeletionVector::NoDeletions)
+        );
 
     let mut batch = RecordBatch::try_new(Arc::new(schema.into()), arrs)?;
 
@@ -728,7 +814,7 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let fragment = 123;
-        let mut reader = FileReader::try_new_with_fragment(&store, &path, fragment, None)
+        let mut reader = FileReader::try_new_with_fragment(&store, &path, fragment, None, None)
             .await
             .unwrap();
         reader.with_row_id(true);
@@ -856,7 +942,7 @@ mod tests {
         let manifest = Manifest::new(&schema, Arc::new(vec![frag_struct]));
 
         let mut reader =
-            FileReader::try_new_with_fragment(&store, &path, fragment, Some(&manifest))
+            FileReader::try_new_with_fragment(&store, &path, fragment, Some(&manifest), None)
                 .await
                 .unwrap();
         reader.with_row_id(true);
@@ -913,7 +999,7 @@ mod tests {
         let manifest = Manifest::new(&schema, Arc::new(vec![frag_struct]));
 
         let mut reader =
-            FileReader::try_new_with_fragment(&store, &path, fragment, Some(&manifest))
+            FileReader::try_new_with_fragment(&store, &path, fragment, Some(&manifest), None)
                 .await
                 .unwrap();
         reader.with_row_id(false);

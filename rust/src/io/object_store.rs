@@ -277,6 +277,9 @@ impl ObjectStore {
     }
 
     async fn new_from_url(url: Url, params: &ObjectStoreParams) -> Result<Self> {
+        // Block size: On local file systems, we use 4KB block size. On cloud
+        // object stores, we use 64KB block size. This is generally the largest
+        // block size where we don't see a latency penalty.
         match url.scheme() {
             "s3" => Ok(Self {
                 inner: build_s3_object_store(
