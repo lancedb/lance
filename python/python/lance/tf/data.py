@@ -101,9 +101,16 @@ def schema_to_spec(schema: pa.Schema) -> tf.TypeSpec:
     """Convert PyArrow Schema to Tensorflow output signature."""
     signature = {}
     for name in schema.names:
-        field = schema.field_by_name(name)
+        field = schema.field(name)
         signature[name] = data_type_to_tensor_spec(field.type)
     return signature
+
+
+def column_to_tensor(column: pa.Array, tensor_spec: tf.TensorSpec) -> tf.Tensor:
+    if isinstance(tensor_spec, tf.RaggedTensorSpec):
+        return tf.ragged.constant(column, dtype=tensor_spec.dtype)
+    else:
+        return tf.constant(column, dtype=tensor_spec.dtype)
 
 
 def from_lance(
@@ -113,6 +120,7 @@ def from_lance(
     batch_size: int = 256,
     filter: Optional[str] = None,
     fragments: Union[Iterable[LanceFragment], tf.data.Dataset] = None,
+    output_signature=None,
 ) -> tf.data.Dataset:
     """Create a ``tf.data.Dataset`` from a Lance dataset.
 
@@ -183,16 +191,20 @@ def from_lance(
         filter=filter, columns=columns, batch_size=batch_size, fragments=fragments
     )
 
-    schema = scanner.projected_schema
-    signature = schema_to_spec(schema)
-    logging.debug("Output signature: %s", signature)
+    if output_signature is None:
+        schema = scanner.projected_schema
+        output_signature = schema_to_spec(schema)
+    logging.debug("Output signature: %s", output_signature)
 
     def generator():
         for batch in scanner.to_batches():
             data = batch.to_pydict()
-            yield data
+            yield {
+                name: column_to_tensor(column, output_signature[name])
+                for name, column in data.items()
+            }
 
-    return tf.data.Dataset.from_generator(generator, output_signature=signature)
+    return tf.data.Dataset.from_generator(generator, output_signature=output_signature)
 
 
 def lance_fragments(dataset: Union[str, Path, LanceDataset]) -> tf.data.Dataset:

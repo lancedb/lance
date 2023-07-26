@@ -48,14 +48,9 @@ def tf_dataset(tmp_path):
         ]
     )
     tbl = pa.Table.from_pandas(df, schema=schema)
-
-    def batches():
-        for batch in tbl.to_batches(100):
-            yield batch
-
     uri = tmp_path / "dataset.lance"
     lance.write_dataset(
-        batches(),
+        tbl,
         uri,
         schema=tbl.schema,
         max_rows_per_group=100,
@@ -74,6 +69,15 @@ def test_fragment_dataset(tf_dataset):
             100,
             128,
         )  # Fixed size list
+
+
+def test_projection(tf_dataset):
+    ds = from_lance(tf_dataset, batch_size=100, columns=["a"])
+
+    for idx, batch in enumerate(ds):
+        assert list(batch.keys()) == ["a"]
+        assert batch["a"].numpy()[0] == idx * 100
+        assert batch["a"].shape == (100,)
 
 
 def test_scan_use_tf_data(tf_dataset):
@@ -104,3 +108,43 @@ def test_shuffle(tf_dataset):
             100,
             128,
         )  # Fixed size list
+
+
+def test_var_length_list(tmp_path):
+    """Treat var length list as RaggedTensor."""
+    df = pd.DataFrame(
+        {
+            "a": range(200),
+            "l": [[i] * (i % 5 + 1) for i in range(200)],
+        }
+    )
+
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64()),
+            pa.field("l", pa.list_(pa.int32())),
+        ]
+    )
+    tbl = pa.Table.from_pandas(df, schema=schema)
+
+    uri = tmp_path / "dataset.lance"
+    lance.write_dataset(
+        tbl,
+        uri,
+        schema=tbl.schema,
+    )
+
+    output_signature = {
+        "a": tf.TensorSpec(shape=(None,), dtype=tf.int64),
+        "l": tf.RaggedTensorSpec(dtype=tf.dtypes.int32, shape=(8, None), ragged_rank=1),
+    }
+
+    ds = tf.data.Dataset.from_lance(
+        uri,
+        batch_size=8,
+        output_signature=output_signature,
+    )
+    for idx, batch in enumerate(ds):
+        assert batch["a"].numpy()[0] == idx * 8
+        assert batch["l"].shape == (8, None)
+        assert isinstance(batch["l"], tf.RaggedTensor)
