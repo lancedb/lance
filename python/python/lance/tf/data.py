@@ -208,3 +208,7 @@ def lance_fragments(dataset: Union[str, Path, LanceDataset]) -> tf.data.Dataset:
     return tf.data.Dataset.from_tensor_slices(
         [f.fragment_id for f in dataset.get_fragments()]
     )
+
+
+# Register `from_lance` to ``tf.data.Dataset``.
+tf.data.Dataset.from_lance = from_lance
