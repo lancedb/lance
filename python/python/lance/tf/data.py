@@ -159,7 +159,7 @@ def from_lance(
         for batch in ds.repeat(10).shuffle(128).map(io_decode):
             print(batch["image"].shape)
 
-    ``from_lance`` can takes a iterator or ``tf.data.Dataset`` of
+    ``from_lance`` can take an iterator or ``tf.data.Dataset`` of
     Fragments. So that it can be used to feed for distributed training.
 
     .. code-block:: python
