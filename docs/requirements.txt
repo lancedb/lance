@@ -8,3 +8,4 @@ duckdb>=0.8
 jupyterlab
 fastai
 xmltodict
+tensorflow
