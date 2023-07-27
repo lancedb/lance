@@ -1,5 +1,5 @@
 Tensorflow Integration
----------------------
+-----------------------
 
 Lance can be used as a regular `tf.data.Dataset <https://www.tensorflow.org/api_docs/python/tf/data/Dataset>`_
 in `Tensorflow <https://www.tensorflow.org/>`_.

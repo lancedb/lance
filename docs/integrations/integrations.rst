@@ -3,4 +3,4 @@ Integrations
 
 .. toctree::
 
-    Tensorflow <./tf>
+    Tensorflow <./tensorflow>
