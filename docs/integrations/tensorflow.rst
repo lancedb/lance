@@ -44,10 +44,10 @@ By default, Lance will infer the Tensor spec from the projected columns. You can
     batch_size = 256
     ds = lance.tf.data.from_lance(
         "s3://my-bucket/my-dataset",
-        columns=["image", "label"],
+        columns=["image", "labels"],
         batch_size=batch_size,
         output_signature={
-            "text": tf.TensorSpec(shape=(), dtype=tf.string),
+            "image": tf.TensorSpec(shape=(), dtype=tf.string),
             "labels": tf.RaggedTensorSpec(
                 dtype=tf.int32, shape=(batch_size, None), ragged_rank=1),
         },
