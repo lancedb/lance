@@ -176,7 +176,7 @@ def test_create_dot_index(dataset, tmp_path):
 
 def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     centroids = np.random.randn(5, 128).astype(np.float32)  # IVF5
-    dataset.create_index(
+    dataset_with_index = dataset.create_index(
         ["vector"],
         index_type="IVF_PQ",
         ivf_centroids=centroids,
@@ -185,8 +185,26 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     )
 
     q = np.random.randn(128)
-    actual = dataset.to_table(
+    actual = dataset_with_index.to_table(
         columns=["id"],
         nearest={"column": "vector", "q": q, "k": 10, "use_index": False},
     )["id"].to_numpy()
     assert len(actual) == 10
+
+    actual_index = dataset_with_index.list_indices()
+    index_uuid = actual_index[0]["uuid"]
+    assert len(index_uuid) == 36
+    expected_index = [
+        {
+            "name": "vector_idx",
+            "type": "Vector",
+            "fields": ["vector"],
+            "version": 2,
+            "uuid": index_uuid,
+            "filepath": str(tmp_path / "_indices" / index_uuid / "index.idx"),
+        }
+    ]
+    assert actual_index == expected_index
+    assert dataset_with_index.get_index("vector_idx") == expected_index
+    assert dataset_with_index.get_index("") == []
+    assert dataset_with_index.get_index("non-existent_idx") == []

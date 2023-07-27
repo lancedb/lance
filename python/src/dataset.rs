@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::Path;
 use std::str;
 use std::sync::Arc;
 
@@ -116,17 +117,25 @@ impl Dataset {
     }
 
     /// Load index metadata
-    fn load_indices(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
+    fn load_indices(self_: PyRef<'_, Self>, index_name: String) -> PyResult<Vec<PyObject>> {
         let index_metadata = self_
             .rt
             .block_on(async { self_.ds.load_indices().await })
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
         let py = self_.py();
+        let dataset_path = Path::new(&self_.uri);
+        let do_not_filter = index_name.eq(&"");
         Ok(index_metadata
             .iter()
+            .filter(|idx| do_not_filter || idx.name.eq(&index_name))
             .map(|idx| {
                 let dict = PyDict::new(py);
                 let schema = self_.ds.schema();
+                let index_path = dataset_path
+                    .join("_indices")
+                    .join(idx.uuid.to_string())
+                    .join("index.idx");
                 let field_names = schema
                     .project_by_ids(idx.fields.as_slice())
                     .unwrap()
@@ -144,6 +153,7 @@ impl Dataset {
                 dict.set_item("uuid", idx.uuid.to_string()).unwrap();
                 dict.set_item("fields", field_names).unwrap();
                 dict.set_item("version", idx.dataset_version).unwrap();
+                dict.set_item("filepath", index_path).unwrap();
                 dict.to_object(py)
             })
             .collect::<Vec<_>>())
