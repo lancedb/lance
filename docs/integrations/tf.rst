@@ -37,7 +37,7 @@ efficient column selection, filtering, and more.
         filter="split = 'train' AND collected_time > timestamp '2020-01-01'",
         batch_size=256)
 
-By default, Lance will infer the Tensor spec from the projected columns. You can also specify `tf.TensorSpec` manually.
+By default, Lance will infer the Tensor spec from the projected columns. You can also specify :class:`tf.TensorSpec` manually.
 
 .. code-block:: python
 
