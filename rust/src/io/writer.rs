@@ -33,6 +33,8 @@ use crate::{Error, Result};
 
 use super::ObjectStore;
 
+mod statistics;
+
 /// Write manifest to an open file.
 pub async fn write_manifest(
     writer: &mut ObjectWriter,
@@ -109,17 +111,20 @@ pub struct FileWriter {
     batch_id: i32,
     page_table: PageTable,
     metadata: Metadata,
+    stats_collector: statistics::StatisticsCollector,
 }
 
 impl FileWriter {
     pub async fn try_new(object_store: &ObjectStore, path: &Path, schema: Schema) -> Result<Self> {
         let object_writer = object_store.create(path).await?;
+        let stats_collector = statistics::StatisticsCollector::new(&schema.fields);
         Ok(Self {
             object_writer,
             schema,
             batch_id: 0,
             page_table: PageTable::default(),
             metadata: Metadata::default(),
+            stats_collector,
         })
     }
 
@@ -140,6 +145,12 @@ impl FileWriter {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
+            // If we are collecting stats for this column, collect them
+            if let Some(stats_builder) = self.stats_collector.get_builder(field.id) {
+                let stats_row = statistics::collect_statistics(&arrs);
+                stats_builder.append(stats_row);
+            }
+
             self.write_array(field, &arrs).await?;
         }
         let batch_length = batches.iter().map(|b| b.num_rows() as i32).sum();
@@ -149,6 +160,11 @@ impl FileWriter {
     }
 
     pub async fn finish(&mut self) -> Result<()> {
+        // Finish the statistics
+        let _statistics = self.stats_collector.finish();
+
+        // TODO: write the statistics to the file
+
         self.write_footer().await?;
         self.object_writer.shutdown().await
     }
