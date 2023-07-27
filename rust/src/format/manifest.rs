@@ -61,6 +61,9 @@ pub struct Manifest {
 
     /// The writer flags
     pub writer_feature_flags: u64,
+
+    /// The max fragment id used so far
+    pub max_fragment_id: u32,
 }
 
 impl Manifest {
@@ -75,6 +78,26 @@ impl Manifest {
             tag: None,
             reader_feature_flags: 0,
             writer_feature_flags: 0,
+            max_fragment_id: 0,
+        }
+    }
+
+    pub fn new_from_previous(
+        previous: &Self,
+        schema: &Schema,
+        fragments: Arc<Vec<Fragment>>,
+    ) -> Self {
+        Self {
+            schema: schema.clone(),
+            version: previous.version + 1,
+            fragments,
+            version_aux_data: 0,
+            index_section: None, // Caller should update index if they want to keep them.
+            timestamp_nanos: 0,  // This will be set on commit
+            tag: None,
+            reader_feature_flags: 0, // These will be set on commit
+            writer_feature_flags: 0, // These will be set on commit
+            max_fragment_id: previous.max_fragment_id,
         }
     }
 
@@ -98,10 +121,34 @@ impl Manifest {
         self.timestamp_nanos = nanos;
     }
 
+    /// Check the current fragment list and update the high water mark
+    pub fn update_max_fragment_id(&mut self) {
+        let max_fragment_id = self
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .max()
+            .unwrap_or_default()
+            .try_into()
+            .unwrap();
+
+        if max_fragment_id > self.max_fragment_id {
+            self.max_fragment_id = max_fragment_id;
+        }
+    }
+
     /// Return the max fragment id.
     /// Note this does not support recycling of fragment ids.
+    ///
+    /// This will return None if there are no fragments.
     pub fn max_fragment_id(&self) -> Option<u64> {
-        self.fragments.iter().map(|f| f.id).max()
+        if self.max_fragment_id == 0 {
+            // It might not have been updated, so the best we can do is recompute
+            // it from the fragment list.
+            self.fragments.iter().map(|f| f.id).max()
+        } else {
+            self.max_fragment_id.try_into().ok()
+        }
     }
 
     /// Return the fragments that are newer than the given manifest.
@@ -146,6 +193,7 @@ impl From<pb::Manifest> for Manifest {
             tag: if p.tag.is_empty() { None } else { Some(p.tag) },
             reader_feature_flags: p.reader_feature_flags,
             writer_feature_flags: p.writer_feature_flags,
+            max_fragment_id: p.max_fragment_id,
         }
     }
 }
@@ -173,6 +221,7 @@ impl From<&Manifest> for pb::Manifest {
             tag: m.tag.clone().unwrap_or("".to_string()),
             reader_feature_flags: m.reader_feature_flags,
             writer_feature_flags: m.writer_feature_flags,
+            max_fragment_id: m.max_fragment_id,
         }
     }
 }

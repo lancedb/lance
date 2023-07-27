@@ -92,6 +92,14 @@ message Manifest {
   // The flags are the same as for reader_feature_flags, although they will not
   // always apply to both.
   uint64 writer_feature_flags = 10;
+
+  // The highest fragment ID that has been used so far.
+  //
+  // This ID is not guaranteed to be present in the current version, but it may
+  // have been used in previous versions.
+  // 
+  // For a single file, will be zero.
+  uint32 max_fragment_id = 11;
 } // Manifest
 
 // Auxiliary Data attached to a version.
