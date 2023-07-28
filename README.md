@@ -3,8 +3,8 @@
  
 <img width="257" alt="Lance Logo" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
-**Modern columnar data format for ML. Convert from parquet in 2-lines of code for 100x faster random access, a vector index, data versioning, and more.<br/>**
-**Compatible with pandas, duckdb, polars, pyarrow, with more integrations on the way.**
+**Modern columnar data format for ML. Convert from Parquet in 2-lines of code for 100x faster random access, a vector index, data versioning, and more.<br/>**
+**Compatible with pandas, DuckDB, Polars, and pyarrow with more integrations on the way.**
 
 <a href="https://lancedb.github.io/lance/">Documentation</a> •
 <a href="https://blog.lancedb.com/">Blog</a> •
@@ -32,9 +32,9 @@
 
 Lance is a modern columnar data format that is optimized for ML workflows and datasets. Lance is perfect for:
 
-1. Building search engines and features stores.
+1. Building search engines and feature stores.
 2. Large-scale ML training requiring high performance IO and shuffles.
-3. Storing, querying, and inspecting deeply nested data for robotics or large blobs like images, point-clouds, and more.
+3. Storing, querying, and inspecting deeply nested data for robotics or large blobs like images, point clouds, and more.
 
 The key features of Lance include:
 
@@ -44,7 +44,7 @@ The key features of Lance include:
 
 * **Zero-copy, automatic versioning:** manage versions of your data without needing extra infrastructure.
 
-* **Ecosystem integrations:** Apache-Arrow, Pandas, Polars, DuckDB and more on the way.
+* **Ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB and more on the way.
 
 ## Quick Start
 
@@ -159,42 +159,42 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 
 Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://lancedb.github.io/lance/format.html).
 
-**Vector index**: Vector index for similarity search over embedding space
+**Vector index**: Vector index for similarity search over embedding space.
 
-**Encodings**: to achieve both fast columnar scan and sub-linear point queries, Lance uses custom encodings and layouts.
+**Encodings**: To achieve both fast columnar scan and sub-linear point queries, Lance uses custom encodings and layouts.
 
 **Nested fields**: Lance stores each subfield as a separate column to support efficient filters like “find images where detected objects include cats”.
 
-**Versioning**: a Manifest can be used to record snapshots. Currently we support creating new versions automatically via appends, overwrites, and index creation 
+**Versioning**: A Manifest can be used to record snapshots. Currently we support creating new versions automatically via appends, overwrites, and index creation .
 
 **Fast updates** (ROADMAP): Updates will be supported via write-ahead logs.
 
 **Rich secondary indices** (ROADMAP): 
-  - Inverted index for fuzzy search over many label / annotation fields
+  - Inverted index for fuzzy search over many label / annotation fields.
 
 ## Benchmarks
 
 ### Vector search
 
-We used the sift dataset to benchmark our results with 1M vectors of 128D
+We used the SIFT dataset to benchmark our results with 1M vectors of 128D
 
-1. For 100 randomly sampled query vectors, we get <1ms average response time (on a 2023 m2 macbook air)
+1. For 100 randomly sampled query vectors, we get <1ms average response time (on a 2023 m2 MacBook Air)
 
 ![avg_latency.png](docs/avg_latency.png)
 
-2. ANN is always a trade-off between recall and performance
+2. ANNs are always a trade-off between recall and performance
 
 ![avg_latency.png](docs/recall_vs_latency.png)
 
-### Vs parquet
+### Vs. parquet
 
-We create a Lance dataset using the Oxford Pet dataset to do some preliminary performance testing of Lance as compared to Parquet and raw image/xmls. For analytics queries, Lance is 50-100x better than reading the raw metadata. For batched random access, Lance is 100x better than both parquet and raw files.
+We create a Lance dataset using the Oxford Pet dataset to do some preliminary performance testing of Lance as compared to Parquet and raw image/XMLs. For analytics queries, Lance is 50-100x better than reading the raw metadata. For batched random access, Lance is 100x better than both parquet and raw files.
 
 ![](docs/lance_perf.png)
 
 ## Why are you building yet another data format?!
 
-Machine Learning development cycle involves the steps:
+The machine learning development cycle involves the steps:
 
 ```mermaid
 graph LR
@@ -210,21 +210,21 @@ graph LR
 ```
 
 People use different data representations to varying stages for the performance or limited by the tooling available.
-The academia mainly uses XML / JSON for annotations and zipped images/sensors data for deep learning, which
+Academia mainly uses XML / JSON for annotations and zipped images/sensors data for deep learning, which
 is difficult to integrated into data infrastructure and slow to train over cloud storage.
-While the industry uses data lake (Parquet-based techniques, i.e., Delta Lake, Iceberg) or data warehouse (AWS Redshift
+While industry uses data lakes (Parquet-based techniques, i.e., Delta Lake, Iceberg) or data warehouses (AWS Redshift
 or Google BigQuery) to collect and analyze data, they have to convert the data into training-friendly formats, such
 as [Rikai](https://github.com/eto-ai/rikai)/[Petastorm](https://github.com/uber/petastorm)
-or [Tfrecord](https://www.tensorflow.org/tutorials/load_data/tfrecord).
+or [TFRecord](https://www.tensorflow.org/tutorials/load_data/tfrecord).
 Multiple single-purpose data transforms, as well as syncing copies between cloud storage to local training
-instances have become a common practice among ML practices.
+instances have become a common practice.
 
-While each of the existing data formats excel at its original designed workload, we need a new data format
-to tailored for multistage ML development cycle to reduce the fraction in tools and data silos.
+While each of the existing data formats excels at the workload it was originally designed for, we need a new data format
+tailored for multistage ML development cycles to reduce and data silos.
 
 A comparison of different data formats in each stage of ML development cycle.
 
-|                     | Lance | Parquet & ORC | JSON & XML | Tfrecord | Database | Warehouse |
+|                     | Lance | Parquet & ORC | JSON & XML | TFRecord | Database | Warehouse |
 |---------------------|-------|---------------|------------|----------|----------|-----------|
 | Analytics           | Fast  | Fast          | Slow       | Slow     | Decent   | Fast      |
 | Feature Engineering | Fast  | Fast          | Decent     | Slow     | Decent   | Good      |
