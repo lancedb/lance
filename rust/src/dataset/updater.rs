@@ -122,6 +122,7 @@ impl Updater {
             self.fragment.dataset().object_store.as_ref(),
             &full_path,
             schema,
+            &Default::default(),
         )
         .await
     }

@@ -74,7 +74,13 @@ impl FileFragment {
 
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
 
-        let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
+        let mut writer = FileWriter::try_new(
+            &object_store,
+            &full_path,
+            schema.clone(),
+            &Default::default(),
+        )
+        .await?;
         let mut batches: Vec<RecordBatch> = Vec::new();
         let mut num_rows: usize = 0;
         for rst in reader {
