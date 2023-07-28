@@ -1008,7 +1008,9 @@ mod tests {
         let path = Path::from("/foo");
 
         // Write 10 batches.
-        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema, &Default::default())
+            .await
+            .unwrap();
         for batch_id in 0..10 {
             let value_range = batch_id * 10..batch_id * 10 + 10;
             let columns: Vec<ArrayRef> = vec![
@@ -1083,7 +1085,9 @@ mod tests {
         }
         schema.set_dictionary(&batches[0]).unwrap();
 
-        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema, &Default::default())
+            .await
+            .unwrap();
         for batch in batches.iter() {
             file_writer.write(&[batch.clone()]).await.unwrap();
         }
@@ -1125,9 +1129,10 @@ mod tests {
         let (store, path) = ObjectStore::from_uri("memory:///foo").await.unwrap();
 
         // Write 10 batches.
-        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
-            .await
-            .unwrap();
+        let mut file_writer =
+            FileWriter::try_new(&store, &path, schema.clone(), &Default::default())
+                .await
+                .unwrap();
         for batch_id in 0..10 {
             let value_range = batch_id * 10..batch_id * 10 + 10;
             let columns: Vec<ArrayRef> = vec![
@@ -1183,9 +1188,10 @@ mod tests {
         let (store, path) = ObjectStore::from_uri("memory:///foo").await.unwrap();
 
         // Write 10 batches.
-        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
-            .await
-            .unwrap();
+        let mut file_writer =
+            FileWriter::try_new(&store, &path, schema.clone(), &Default::default())
+                .await
+                .unwrap();
         for batch_id in 0..10 {
             let value_range = batch_id * 10..batch_id * 10 + 10;
             let columns: Vec<ArrayRef> = vec![
@@ -1252,7 +1258,9 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_arr]).unwrap();
 
-        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema, &Default::default())
+            .await
+            .unwrap();
         file_writer.write(&[batch.clone()]).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -1296,7 +1304,9 @@ mod tests {
             .collect::<Vec<_>>();
         let batches_ref = batches.iter().collect::<Vec<_>>();
 
-        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema, &Default::default())
+            .await
+            .unwrap();
         file_writer.write(&batches).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -1316,7 +1326,9 @@ mod tests {
         let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
 
-        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema, &Default::default())
+            .await
+            .unwrap();
         file_writer.write(&[batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -1494,9 +1506,10 @@ mod tests {
         // write to a lance file
         let store = ObjectStore::memory();
         let path = Path::from("/takes");
-        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
-            .await
-            .unwrap();
+        let mut file_writer =
+            FileWriter::try_new(&store, &path, schema.clone(), &Default::default())
+                .await
+                .unwrap();
         file_writer.write(&[batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -1604,9 +1617,10 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/take_list");
         let schema: Schema = (&arrow_schema).try_into().unwrap();
-        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
-            .await
-            .unwrap();
+        let mut file_writer =
+            FileWriter::try_new(&store, &path, schema.clone(), &Default::default())
+                .await
+                .unwrap();
         file_writer.write(&[batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -1674,7 +1688,9 @@ mod tests {
         .unwrap();
 
         let schema: Schema = (&arrow_schema).try_into().unwrap();
-        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema, &Default::default())
+            .await
+            .unwrap();
         file_writer.write(&[batch.clone()]).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -1698,7 +1714,9 @@ mod tests {
         // write to a lance file
         let store = ObjectStore::memory();
         let path = Path::from("/read_range");
-        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema, &Default::default())
+            .await
+            .unwrap();
         file_writer.write(&[batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
