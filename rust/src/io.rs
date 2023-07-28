@@ -24,6 +24,7 @@ use prost::bytes::Bytes;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+pub mod commit_store;
 pub(crate) mod deletion;
 pub(crate) mod exec;
 pub mod local;

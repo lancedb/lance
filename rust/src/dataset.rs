@@ -937,6 +937,9 @@ pub(crate) async fn write_manifest_file(
     for p in paths {
         write_manifest_file_to_path(object_store, manifest, indices.clone(), &p).await?
     }
+    // TODO: commit the original.
+
+    // Then use copy to link the latest manifest file to this version.
     Ok(())
 }
 
