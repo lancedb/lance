@@ -70,7 +70,7 @@ def run(ds, q=None, assert_func=None):
             expected_columns.extend(ds.schema.names)
         else:
             expected_columns.extend(columns)
-        for c in ["vector", "score"]:
+        for c in ["vector", "_distance"]:
             if c not in expected_columns:
                 expected_columns.append(c)
 
@@ -96,8 +96,8 @@ def run(ds, q=None, assert_func=None):
                     assert len(inmem.to_table(filter=filter_)) == len(rs)
                 else:
                     assert len(rs) == 15
-                    scores = rs["score"].to_numpy()
-                    assert (scores.max() - scores.min()) > 1e-6
+                    distances = rs["_distance"].to_numpy()
+                    assert (distances.max() - distances.min()) > 1e-6
                     if assert_func is not None:
                         assert_func(rs)
     return times

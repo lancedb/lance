@@ -232,14 +232,14 @@ mod tests {
             8,
         );
         let point = Float32Array::from((2..10).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let scores = l2_distance_batch(
+        let distances = l2_distance_batch(
             point.values(),
             as_primitive_array::<Float32Type>(mat.values().as_ref()).values(),
             8,
         );
 
         assert_eq!(
-            scores.as_ref(),
+            distances.as_ref(),
             &Float32Array::from(vec![32.0, 8.0, 0.0, 8.0])
         );
     }
@@ -254,10 +254,10 @@ mod tests {
             .map(|v| v as f32)
             .collect::<Vec<_>>();
         let point = Float32Array::from((0..10).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let scores = l2_distance_batch(&point.values()[2..], &mat[6..], 8);
+        let distances = l2_distance_batch(&point.values()[2..], &mat[6..], 8);
 
         assert_eq!(
-            scores.as_ref(),
+            distances.as_ref(),
             &Float32Array::from(vec![32.0, 8.0, 0.0, 8.0])
         );
     }
@@ -265,9 +265,9 @@ mod tests {
     fn test_odd_length_vector() {
         let mat = Float32Array::from_iter((0..5).map(|v| Some(v as f32)));
         let point = Float32Array::from((2..7).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let scores = l2_distance_batch(point.values(), mat.values(), 5);
+        let distances = l2_distance_batch(point.values(), mat.values(), 5);
 
-        assert_eq!(scores.as_ref(), &Float32Array::from(vec![20.0]));
+        assert_eq!(distances.as_ref(), &Float32Array::from(vec![20.0]));
     }
 
     #[test]

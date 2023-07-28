@@ -94,10 +94,10 @@ def test_nearest(tmp_path):
     top10 = dataset.to_table(
         nearest={"column": "emb", "q": arr[0].values, "k": 10, "nprobes": 10}
     )
-    scores = l2sq(arr[0].values, npvals.reshape((100, 32)))
-    indices = np.argsort(scores)
+    distances = l2sq(arr[0].values, npvals.reshape((100, 32)))
+    indices = np.argsort(distances)
     assert tbl.take(indices[:10]).to_pandas().equals(top10.to_pandas()[["emb"]])
-    assert np.allclose(scores[indices[:10]], top10.to_pandas().score.values)
+    assert np.allclose(distances[indices[:10]], top10.to_pandas()["_distance"].values)
 
 
 def l2sq(vec, mat):
@@ -114,8 +114,10 @@ def test_nearest_cosine(tmp_path):
         nearest={"column": "vector", "q": q, "k": 10, "metric": "cosine"}
     ).to_pandas()
     for i in range(len(rs)):
-        assert rs.score[i] == pytest.approx(cosine_distance(rs.vector[i], q), abs=1e-6)
-        assert 0 <= rs.score[i] <= 1
+        assert rs["_distance"][i] == pytest.approx(
+            cosine_distance(rs.vector[i], q), abs=1e-6
+        )
+        assert 0 <= rs["_distance"][i] <= 1
 
 
 def cosine_distance(vec1, vec2):

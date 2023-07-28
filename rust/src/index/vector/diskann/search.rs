@@ -31,7 +31,7 @@ use crate::{
     index::{
         vector::{
             graph::{GraphReadParams, PersistedGraph},
-            SCORE_COL,
+            DIST_COL,
         },
         Index,
     },
@@ -218,16 +218,16 @@ impl VectorIndex for DiskANNIndex {
         let state = greedy_search(&self.graph, 0, query.key.values(), query.k, query.k * 2).await?;
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID, DataType::UInt64, false),
-            Field::new(SCORE_COL, DataType::Float32, false),
+            Field::new(DIST_COL, DataType::Float32, false),
         ]));
 
         let mut candidates = Vec::with_capacity(query.k);
-        for (score, row) in state.candidates {
+        for (distance, row) in state.candidates {
             if candidates.len() == query.k {
                 break;
             }
             if !self.deletion_cache.as_ref().is_deleted(row as u64).await? {
-                candidates.push((score, row));
+                candidates.push((distance, row));
             }
         }
 
@@ -236,11 +236,14 @@ impl VectorIndex for DiskANNIndex {
             .take(query.k)
             .map(|(_, id)| *id as u64)
             .collect();
-        let scores: Float32Array = candidates.iter().take(query.k).map(|(d, _)| **d).collect();
+        let distances: Float32Array = candidates.iter().take(query.k).map(|(d, _)| **d).collect();
 
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(row_ids) as ArrayRef, Arc::new(scores) as ArrayRef],
+            vec![
+                Arc::new(row_ids) as ArrayRef,
+                Arc::new(distances) as ArrayRef,
+            ],
         )?;
         Ok(batch)
     }

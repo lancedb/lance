@@ -316,7 +316,7 @@ impl Scanner {
         self
     }
 
-    /// The Arrow schema of the output, including projections and vector / score
+    /// The Arrow schema of the output, including projections and vector / _distance
     pub fn schema(&self) -> Result<SchemaRef> {
         let schema = self
             .output_schema()
@@ -336,7 +336,7 @@ impl Scanner {
                 message: format!("Failed to convert vector field: {}", e),
             })?;
             extra_columns.push(vector_field);
-            extra_columns.push(ArrowField::new("score", DataType::Float32, false));
+            extra_columns.push(ArrowField::new("_distance", DataType::Float32, false));
         };
         if self.with_row_id {
             extra_columns.push(ArrowField::new(ROW_ID, DataType::UInt64, false));
@@ -488,14 +488,14 @@ impl Scanner {
                 }
             }
 
-            let knn_node = self.ann(q, index)?; // score, _rowid
+            let knn_node = self.ann(q, index)?; // _distance, _rowid
             let with_vector = self.dataset.schema().project(&[&q.column])?;
             let knn_node_with_vector = self.take(knn_node, &with_vector)?;
             let mut knn_node = if q.refine_factor.is_some() {
                 self.flat_knn(knn_node_with_vector, q)?
             } else {
                 knn_node_with_vector
-            }; // vector, score, _rowid
+            }; // vector, _distance, _rowid
 
             knn_node = self.knn_combined(&q, index, knn_node).await?;
 
@@ -545,8 +545,8 @@ impl Scanner {
                 let topk_appended = self.flat_knn(scan_node, q)?;
 
                 // To do a union, we need to make the schemas match. Right now
-                // knn_node: score, _rowid, vector
-                // topk_appended: vector, _rowid, score
+                // knn_node: _distance, _rowid, vector
+                // topk_appended: vector, _rowid, _distance
                 let new_schema = Schema::try_from(&topk_appended.schema().project(&[2, 1, 0])?)?;
                 let topk_appended = ProjectionExec::try_new(topk_appended, Arc::new(new_schema))?;
                 assert_eq!(topk_appended.schema(), knn_node.schema());
@@ -948,7 +948,7 @@ mod test {
                         ),
                         true,
                     ),
-                    ArrowField::new("score", DataType::Float32, false),
+                    ArrowField::new("_distance", DataType::Float32, false),
                 ])
             );
 
@@ -1107,7 +1107,7 @@ mod test {
                     ),
                     true,
                 ),
-                ArrowField::new("score", DataType::Float32, false),
+                ArrowField::new("_distance", DataType::Float32, false),
             ])
         );
 
@@ -1157,7 +1157,7 @@ mod test {
                     ),
                     true,
                 ),
-                ArrowField::new("score", DataType::Float32, false),
+                ArrowField::new("_distance", DataType::Float32, false),
             ])
         );
 
@@ -1376,7 +1376,7 @@ mod test {
     /// Query: nearest(vec, [...], 10) + filter(i > 10 and i < 20)
     ///
     /// Expected plan:
-    ///  KNNIndex(vec) -> Take(i) -> filter(i) -> take(s, vec) -> projection(s, vec, score)
+    ///  KNNIndex(vec) -> Take(i) -> filter(i) -> take(s, vec) -> projection(s, vec, _distance)
     #[tokio::test]
     async fn test_ann_with_index() {
         let test_dir = tempdir().unwrap();
@@ -1398,14 +1398,14 @@ mod test {
                 .iter()
                 .map(|f| f.name())
                 .collect::<Vec<_>>(),
-            vec!["s", "vec", "score"]
+            vec!["s", "vec", "_distance"]
         );
 
         let take = &plan.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
         assert_eq!(
             take.schema().field_names(),
-            ["score", "_rowid", "vec", "i", "s"]
+            ["_distance", "_rowid", "vec", "i", "s"]
         );
         assert_eq!(
             take.extra_schema
@@ -1420,12 +1420,15 @@ mod test {
         assert!(filter.as_any().is::<FilterExec>());
         assert_eq!(
             filter.schema().field_names(),
-            ["score", "_rowid", "vec", "i"]
+            ["_distance", "_rowid", "vec", "i"]
         );
 
         let take = &filter.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(take.schema().field_names(), ["score", "_rowid", "vec", "i"]);
+        assert_eq!(
+            take.schema().field_names(),
+            ["_distance", "_rowid", "vec", "i"]
+        );
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1438,7 +1441,7 @@ mod test {
         // TODO: Two continuous take execs, we can merge them into one.
         let take = &take.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(take.schema().field_names(), ["score", "_rowid", "vec"]);
+        assert_eq!(take.schema().field_names(), ["_distance", "_rowid", "vec"]);
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1450,7 +1453,7 @@ mod test {
 
         let knn = &take.children()[0];
         assert!(knn.as_any().is::<KNNIndexExec>());
-        assert_eq!(knn.schema().field_names(), ["score", "_rowid"]);
+        assert_eq!(knn.schema().field_names(), ["_distance", "_rowid"]);
     }
 
     /// Test KNN index with refine factor
@@ -1459,7 +1462,7 @@ mod test {
     ///
     /// Expected plan:
     ///  KNNIndex(vec) -> Take(vec) -> KNNFlat(vec, 10) -> Take(i) -> Filter(i)
-    ///     -> take(s, vec) -> projection(s, vec, score)
+    ///     -> take(s, vec) -> projection(s, vec, _distance)
     #[tokio::test]
     async fn test_knn_with_refine() {
         let test_dir = tempdir().unwrap();
@@ -1482,14 +1485,14 @@ mod test {
                 .iter()
                 .map(|f| f.name())
                 .collect::<Vec<_>>(),
-            vec!["s", "vec", "score"]
+            vec!["s", "vec", "_distance"]
         );
 
         let take = &plan.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
         assert_eq!(
             take.schema().field_names(),
-            ["score", "_rowid", "vec", "i", "s"]
+            ["_distance", "_rowid", "vec", "i", "s"]
         );
         assert_eq!(
             take.extra_schema
@@ -1504,12 +1507,15 @@ mod test {
         assert!(filter.as_any().is::<FilterExec>());
         assert_eq!(
             filter.schema().field_names(),
-            ["score", "_rowid", "vec", "i"]
+            ["_distance", "_rowid", "vec", "i"]
         );
 
         let take = &filter.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(take.schema().field_names(), ["score", "_rowid", "vec", "i"]);
+        assert_eq!(
+            take.schema().field_names(),
+            ["_distance", "_rowid", "vec", "i"]
+        );
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1525,7 +1531,7 @@ mod test {
 
         let take = &flat.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(take.schema().field_names(), ["score", "_rowid", "vec"]);
+        assert_eq!(take.schema().field_names(), ["_distance", "_rowid", "vec"]);
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1537,7 +1543,7 @@ mod test {
 
         let knn = &take.children()[0];
         assert!(knn.as_any().is::<KNNIndexExec>());
-        assert_eq!(knn.schema().field_names(), ["score", "_rowid"]);
+        assert_eq!(knn.schema().field_names(), ["_distance", "_rowid"]);
     }
 
     #[tokio::test]

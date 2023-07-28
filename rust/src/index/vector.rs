@@ -64,7 +64,7 @@ use crate::{
 };
 pub use traits::*;
 
-pub(crate) const SCORE_COL: &str = "score";
+pub(crate) const DIST_COL: &str = "_distance";
 const INDEX_FILE_NAME: &str = "index.idx";
 
 /// Query parameters for the vector indices

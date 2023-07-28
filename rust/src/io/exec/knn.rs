@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::{Dataset, ROW_ID};
 use crate::index::vector::flat::flat_search;
-use crate::index::vector::{open_index, Query, SCORE_COL};
+use crate::index::vector::{open_index, Query, DIST_COL};
 use crate::io::RecordBatchStream;
 use crate::{Error, Result};
 
@@ -59,7 +59,7 @@ impl KNNFlatStream {
                 Ok(b) => b,
                 Err(e) => {
                     tx.send(Err(DataFusionError::Execution(format!(
-                        "Failed to compute scores: {e}"
+                        "Failed to compute distances: {e}"
                     ))))
                     .await
                     .expect("KNNFlat failed to send message");
@@ -114,7 +114,7 @@ impl Stream for KNNFlatStream {
 impl DFRecordBatchStream for KNNFlatStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("score", DataType::Float32, false),
+            Field::new("_distance", DataType::Float32, false),
             Field::new(ROW_ID, DataType::UInt64, false),
         ]))
     }
@@ -125,7 +125,7 @@ impl DFRecordBatchStream for KNNFlatStream {
 /// Preconditions:
 /// - `input` schema must contains `query.column`,
 /// - The column must be a vector.
-/// - `input` schema does not have "score" column.
+/// - `input` schema does not have "_distance" column.
 pub struct KNNFlatExec {
     /// Input node.
     input: Arc<dyn ExecutionPlan>,
@@ -180,12 +180,12 @@ impl ExecutionPlan for KNNFlatExec {
         self
     }
 
-    /// Flat KNN inherits the schema from input node, and add one score column.
+    /// Flat KNN inherits the schema from input node, and add one distance column.
     fn schema(&self) -> arrow_schema::SchemaRef {
         let input_schema = self.input.schema();
         let mut fields = input_schema.fields().to_vec();
-        if input_schema.field_with_name(SCORE_COL).is_err() {
-            fields.push(Arc::new(Field::new(SCORE_COL, DataType::Float32, false)));
+        if input_schema.field_with_name(DIST_COL).is_err() {
+            fields.push(Arc::new(Field::new(DIST_COL, DataType::Float32, false)));
         }
 
         Arc::new(Schema::new_with_metadata(
@@ -261,7 +261,7 @@ impl KNNIndexStream {
                 Ok(b) => b,
                 Err(e) => {
                     tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to compute scores: {e}"
+                        "Failed to compute distances: {e}"
                     ))))
                     .await
                     .expect("KNNIndex failed to send message");
@@ -287,7 +287,7 @@ impl KNNIndexStream {
 impl DFRecordBatchStream for KNNIndexStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new(SCORE_COL, DataType::Float32, false),
+            Field::new(DIST_COL, DataType::Float32, false),
             Field::new(ROW_ID, DataType::UInt64, false),
         ]))
     }
@@ -370,7 +370,7 @@ impl ExecutionPlan for KNNIndexExec {
 
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new(SCORE_COL, DataType::Float32, false),
+            Field::new(DIST_COL, DataType::Float32, false),
             Field::new(ROW_ID, DataType::UInt64, false),
         ]))
     }
@@ -496,7 +496,7 @@ mod tests {
             .unwrap();
         let results = stream.try_collect::<Vec<_>>().await.unwrap();
 
-        assert!(results[0].schema().column_with_name("score").is_some());
+        assert!(results[0].schema().column_with_name("_distance").is_some());
 
         assert_eq!(results.len(), 1);
 
@@ -561,7 +561,7 @@ mod tests {
                     true,
                 ),
                 ArrowField::new("uri", DataType::Utf8, true),
-                ArrowField::new(SCORE_COL, DataType::Float32, false),
+                ArrowField::new(DIST_COL, DataType::Float32, false),
             ])
         );
     }

@@ -35,7 +35,7 @@ use crate::arrow::linalg::matrix::MatrixView;
 use crate::arrow::*;
 use crate::dataset::ROW_ID;
 use crate::index::Index;
-use crate::index::{pb, vector::kmeans::train_kmeans, vector::SCORE_COL};
+use crate::index::{pb, vector::kmeans::train_kmeans, vector::DIST_COL};
 use crate::io::deletion::LruDeletionVectorStore;
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::linalg::{l2::l2_distance_batch, norm_l2::norm_l2};
@@ -100,7 +100,7 @@ impl PQIndex {
         }
     }
 
-    fn fast_l2_scores(&self, key: &Float32Array) -> Result<ArrayRef> {
+    fn fast_l2_distances(&self, key: &Float32Array) -> Result<ArrayRef> {
         // Build distance table for each sub-centroid to the query key.
         //
         // Distance table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
@@ -110,7 +110,7 @@ impl PQIndex {
         for i in 0..self.num_sub_vectors {
             let from = key.slice(i * sub_vector_length, sub_vector_length);
             let subvec_centroids = self.pq.centroids(i).ok_or_else(|| Error::Index {
-                message: "PQIndex::l2_scores: PQ is not initialized".to_string(),
+                message: "PQIndex::l2_distances: PQ is not initialized".to_string(),
             })?;
             let distances = l2_distance_batch(
                 as_primitive_array::<Float32Type>(&from).values(),
@@ -141,7 +141,7 @@ impl PQIndex {
         }))
     }
 
-    fn cosine_scores(&self, key: &Float32Array) -> Result<ArrayRef> {
+    fn cosine_distances(&self, key: &Float32Array) -> Result<ArrayRef> {
         // Build two tables for cosine distance.
         //
         // xy table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
@@ -155,7 +155,7 @@ impl PQIndex {
         for i in 0..self.num_sub_vectors {
             let key_sub_vector: Float32Array = key.slice(i * sub_vector_length, sub_vector_length);
             let sub_vector_centroids = self.pq.centroids(i).ok_or_else(|| Error::Index {
-                message: "PQIndex::cosine_scores: PQ is not initialized".to_string(),
+                message: "PQIndex::cosine_distances: PQ is not initialized".to_string(),
             })?;
             let xy = sub_vector_centroids
                 .as_ref()
@@ -231,22 +231,22 @@ impl VectorIndex for PQIndex {
         let row_ids = self.row_ids.as_ref().unwrap();
         assert_eq!(code.len() % self.num_sub_vectors, 0);
 
-        let scores = if self.metric_type == MetricType::L2 {
-            self.fast_l2_scores(&query.key)?
+        let distances = if self.metric_type == MetricType::L2 {
+            self.fast_l2_distances(&query.key)?
         } else {
-            self.cosine_scores(&query.key)?
+            self.cosine_distances(&query.key)?
         };
 
         let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
-        let indices = sort_to_indices(&scores, None, Some(limit))?;
-        let scores = take(&scores, &indices, None)?;
+        let indices = sort_to_indices(&distances, None, Some(limit))?;
+        let distances = take(&distances, &indices, None)?;
         let row_ids = take(row_ids.as_ref(), &indices, None)?;
 
         let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new(SCORE_COL, DataType::Float32, false),
+            ArrowField::new(DIST_COL, DataType::Float32, false),
             ArrowField::new(ROW_ID, DataType::UInt64, false),
         ]));
-        Ok(RecordBatch::try_new(schema, vec![scores, row_ids])?)
+        Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
     }
 
     fn is_loadable(&self) -> bool {
