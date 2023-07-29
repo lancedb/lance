@@ -3,6 +3,6 @@
         "Cargo.toml"
     ],
     "rust-analyzer.cargo.features": [
-        "clap", "json"
+        "clap",
     ]
 }

@@ -14,13 +14,16 @@
 
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::datatypes::Schema;
+use crate::error::Result;
 use crate::format::pb;
 
 /// Lance Data File
 ///
 /// A data file is one piece of file storing data.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DataFile {
     /// Relative path of the data file to dataset root.
     pub path: String,
@@ -59,7 +62,8 @@ impl From<&pb::DataFile> for DataFile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DeletionFileType {
     Array,
     Bitmap,
@@ -74,7 +78,7 @@ impl DeletionFileType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeletionFile {
     pub read_version: u64,
     pub id: u64,
@@ -102,7 +106,7 @@ impl From<&pb::DeletionFile> for DeletionFile {
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
 /// If column exists in the schema, but the related file does not exist, treat this column as `nulls`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fragment {
     /// Fragment ID
     pub id: u64,
@@ -121,6 +125,11 @@ impl Fragment {
             files: vec![],
             deletion_file: None,
         }
+    }
+
+    pub fn from_json(json: &str) -> Result<Self> {
+        let fragment: Self = serde_json::from_str(json)?;
+        Ok(fragment)
     }
 
     /// Create a `Fragment` with one DataFile
@@ -182,6 +191,7 @@ mod tests {
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
+    use serde_json::{json, Value};
 
     #[test]
     fn test_new_fragment() {
@@ -231,5 +241,31 @@ mod tests {
         let proto = pb::DataFragment::from(&fragment);
         let fragment2 = Fragment::from(&proto);
         assert_eq!(fragment, fragment2);
+    }
+
+    #[test]
+    fn test_to_json() {
+        let mut fragment = Fragment::new(123);
+        let schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Float16, true)]);
+        fragment.add_file("foobar.lance", &Schema::try_from(&schema).unwrap());
+        fragment.deletion_file = Some(DeletionFile {
+            read_version: 123,
+            id: 456,
+            file_type: DeletionFileType::Array,
+        });
+
+        let json = serde_json::to_string(&fragment).unwrap();
+
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "id":123,
+                "files":[
+                    {"path":"foobar.lance","fields":[0]}],"deletion_file":{"read_version":123,"id":456,"file_type":"array"}}),
+        );
+
+        let frag2 = Fragment::from_json(&json).unwrap();
+        assert_eq!(fragment, frag2);
     }
 }

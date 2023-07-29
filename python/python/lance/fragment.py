@@ -114,6 +114,19 @@ class LanceFragment(pa.dataset.Fragment):
     def fragment_id(self):
         return self._fragment.id()
 
+    @staticmethod
+    def from_json(self) -> LanceFragment:
+        """Create a fragment from JSON format."""
+
+        pass
+
+    def to_json(self) -> str:
+        """Convert the fragment to JSON format."""
+        return {
+            "id": self.fragment_id,
+            "data_files": self._fragment.data_files(),
+        }
+
     def count_rows(
         self, filter: Optional[Union[pa.compute.Expression, str]] = None
     ) -> int:
