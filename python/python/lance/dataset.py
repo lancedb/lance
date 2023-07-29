@@ -857,7 +857,6 @@ class LanceScanner(pa.dataset.Scanner):
         return self.to_reader().read_all()
 
     def to_reader(self) -> pa.RecordBatchReader:
-        print("LanceReader to reader: ", self._scanner.to_pyarrow())
         return self._scanner.to_pyarrow()
 
     def to_batches(self) -> Iterator[RecordBatch]:

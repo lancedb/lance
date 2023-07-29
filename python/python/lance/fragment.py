@@ -189,7 +189,6 @@ class LanceFragment(pa.dataset.Fragment):
         s = self._fragment.scanner(
             columns=columns, filter=filter_str, limit=limit, offset=offset
         )
-        print(s)
         from .dataset import LanceScanner
 
         return LanceScanner(s, self._ds)
@@ -280,8 +279,7 @@ class LanceFragment(pa.dataset.Fragment):
         >>> dataset = lance.write_dataset(tab, "dataset")
         >>> frag = dataset.get_fragment(0)
         >>> frag.delete("a > 1")
-        LanceFileFragment(id=0, data_files=['....lance'], \
-deletion_file='_deletions/0-1-....arrow')
+        Fragment { id: 0, files: ..., deletion_file: Some(...) }
         >>> frag.delete("a > 0") is None
         True
         """
