@@ -27,7 +27,7 @@ import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
-from .fragment import LanceFragment, FragmentMetadata
+from .fragment import FragmentMetadata, LanceFragment
 from .lance import __version__ as __version__
 from .lance import _Dataset, _Scanner, _write_dataset
 
@@ -689,7 +689,9 @@ class LanceDataset(pa.dataset.Dataset):
             raise TypeError(
                 f"fragments must be list[FragmentMetadata], got {type(fragments)}"
             )
-        if len(fragments) > 0 and not all(isinstance(f, FragmentMetadata) for f in fragments):
+        if len(fragments) > 0 and not all(
+            isinstance(f, FragmentMetadata) for f in fragments
+        ):
             raise TypeError(
                 f"fragments must be list[FragmentMetadata], got {type(fragments[0])}"
             )

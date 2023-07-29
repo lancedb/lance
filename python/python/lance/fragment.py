@@ -16,9 +16,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, Optional, Union, Dict, Any
 import json
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, Optional, Union
 
 try:
     import pandas as pd
@@ -34,9 +34,8 @@ if TYPE_CHECKING:
 
 
 class FragmentMetadata:
-    """Metadata of a Fragment in the dataset.
+    """Metadata of a Fragment in the dataset."""
 
-    """
     def __init__(self, metadata: str):
         """Construct a FragmentMetadata from a JSON representation of the metadata.
 
@@ -65,6 +64,7 @@ class FragmentMetadata:
     def deletion_file(self):
         """Return the deletion file, if any"""
         return self._metadata.deletion_file()
+
 
 class LanceFragment(pa.dataset.Fragment):
     def __init__(self, dataset: "LanceDataset", fragment_id: int):
