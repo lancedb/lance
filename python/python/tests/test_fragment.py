@@ -12,11 +12,12 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import json
 from pathlib import Path
 
 import pandas as pd
 import pyarrow as pa
-from lance import LanceFragment
+from lance import FragmentMetadata, LanceDataset, LanceFragment
 
 
 def test_write_fragment(tmp_path: Path):
@@ -27,3 +28,22 @@ def test_write_fragment(tmp_path: Path):
     assert "id" in meta
     assert "files" in meta
     assert meta["files"][0]["fields"] == [0]
+
+
+def test_write_fragment_two_phases(tmp_path: Path):
+    num_files = 10
+    json_array = []
+    for i in range(num_files):
+        df = pd.DataFrame({"a": [i * 10]})
+        frag = LanceFragment.create(tmp_path, df)
+        json_array.append(json.dumps(frag.to_json()))
+
+    fragments = [FragmentMetadata.from_json(j) for j in json_array]
+
+    schema = pa.schema([pa.field("a", pa.int64())])
+    dataset = LanceDataset._commit(tmp_path, schema, fragments)
+
+    df = dataset.to_table().to_pandas()
+    pd.testing.assert_frame_equal(
+        df, pd.DataFrame({"a": [i * 10 for i in range(num_files)]})
+    )

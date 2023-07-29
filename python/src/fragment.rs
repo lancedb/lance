@@ -319,7 +319,6 @@ impl FragmentMetadata {
 
     #[staticmethod]
     fn from_json(json: &str) -> PyResult<Self> {
-        println!("Fragment json: {json}");
         let metadata = LanceFragmentMetadata::from_json(json).map_err(|err| {
             PyValueError::new_err(format!("Invalid metadata json payload: {json}: {}", err))
         })?;
