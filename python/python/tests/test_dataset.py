@@ -376,7 +376,7 @@ def test_deletion_file(tmp_path: Path):
     # New fragment has deletion file
     assert new_fragment.deletion_file() is not None
     assert re.match("_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file())
-    print(type(new_fragment))
+    print(type(new_fragment), new_fragment)
     dataset = lance.LanceDataset._commit(base_dir, table.schema, [new_fragment])
     assert dataset.count_rows() == 90
 
@@ -388,15 +388,16 @@ def test_commit_fragments_via_scanner(tmp_path: Path):
 
     base_dir = tmp_path / "test"
     scanner = pa.dataset.dataset(parquet_dir).scanner()
-    fragment = lance.fragment.LanceFragment.create(base_dir, scanner)
-    assert fragment.schema() == table.schema
+    fragment_metadata = lance.fragment.LanceFragment.create(base_dir, scanner)
 
     # Pickle-able
-    pickled = pickle.dumps(fragment)
+    pickled = pickle.dumps(fragment_metadata)
     unpickled = pickle.loads(pickled)
-    assert fragment == unpickled
+    assert fragment_metadata == unpickled
 
-    dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment])
+    dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment_metadata])
+    assert dataset.schema == table.schema
+
     tbl = dataset.to_table()
     assert tbl == table
 

@@ -285,11 +285,17 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if filter is not None:
             raise ValueError("get_fragments() does not support filter yet")
-        return [LanceFragment(self, f.id()) for f in self._ds.get_fragments()]
+        return [
+            LanceFragment(self, fragment_id=None, fragment=f)
+            for f in self._ds.get_fragments()
+        ]
 
     def get_fragment(self, fragment_id: int) -> Optional[pa.dataset.Fragment]:
-        """Get the fragment with fragment id"""
-        return self._ds.get_fragment(fragment_id)
+        """Get the fragment with fragment id."""
+        raw_fragment = self._ds.get_fragment(fragment_id)
+        if raw_fragment is None:
+            return None
+        return LanceFragment(self, fragment_id=None, fragment=raw_fragment)
 
     def to_batches(
         self,
@@ -851,6 +857,7 @@ class LanceScanner(pa.dataset.Scanner):
         return self.to_reader().read_all()
 
     def to_reader(self) -> pa.RecordBatchReader:
+        print("LanceReader to reader: ", self._scanner.to_pyarrow())
         return self._scanner.to_pyarrow()
 
     def to_batches(self) -> Iterator[RecordBatch]:

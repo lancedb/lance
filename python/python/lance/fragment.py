@@ -47,7 +47,12 @@ class FragmentMetadata:
         return self._metadata.__repr__()
 
     def __reduce__(self):
-        return (FragmentMetadata, (self.to_json(),))
+        return (FragmentMetadata, (self._metadata.json(),))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, FragmentMetadata):
+            return False
+        return self._metadata.__eq__(other._metadata)
 
     def to_json(self) -> Dict[str, Any]:
         return json.loads(self._metadata.json())
@@ -67,9 +72,19 @@ class FragmentMetadata:
 
 
 class LanceFragment(pa.dataset.Fragment):
-    def __init__(self, dataset: "LanceDataset", fragment_id: int):
+    def __init__(
+        self,
+        dataset: "LanceDataset",
+        fragment_id: Optional[int],
+        *,
+        fragment: Optional[_Fragment] = None,
+    ):
         self._ds = dataset
-        self._fragment = dataset.get_fragment(fragment_id)
+        if fragment is None:
+            if fragment_id is None:
+                raise ValueError("Either fragment or fragment_id must be specified")
+            fragment = dataset.get_fragment(fragment_id)._fragment
+        self._fragment = fragment
         if self._fragment is None:
             raise ValueError(f"Fragment id does not exist: {fragment_id}")
 
@@ -174,7 +189,7 @@ class LanceFragment(pa.dataset.Fragment):
         s = self._fragment.scanner(
             columns=columns, filter=filter_str, limit=limit, offset=offset
         )
-
+        print(s)
         from .dataset import LanceScanner
 
         return LanceScanner(s, self._ds)
@@ -270,10 +285,10 @@ deletion_file='_deletions/0-1-....arrow')
         >>> frag.delete("a > 0") is None
         True
         """
-        metadata = self._fragment.delete(predicate)
-        if metadata is None:
+        raw_fragment = self._fragment.delete(predicate)
+        if raw_fragment is None:
             return None
-        return FragmentMetadata(metadata)
+        return FragmentMetadata(raw_fragment.metadata().json())
 
     @property
     def schema(self) -> pa.Schema:

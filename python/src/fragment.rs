@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow::pyarrow::{PyArrowType, FromPyArrow, ToPyArrow};
+use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::fragment::FileFragment as LanceFragment;
@@ -25,7 +25,11 @@ use lance::format::{pb, DataFile as LanceDataFile, Fragment as LanceFragmentMeta
 use lance::io::deletion_file_path;
 use prost::Message;
 use pyo3::prelude::*;
-use pyo3::{pyclass::CompareOp, types::{PyBytes, PyDict}, exceptions::*};
+use pyo3::{
+    exceptions::*,
+    pyclass::CompareOp,
+    types::{PyBytes, PyDict},
+};
 use tokio::runtime::Runtime;
 
 use crate::dataset::get_write_params;
@@ -124,10 +128,14 @@ impl FileFragment {
                 None
             };
 
-            let metadata =
-                LanceFragment::create(dataset_uri, fragment_id.unwrap_or(0), batches.as_mut(), params)
-                    .await
-                    .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            let metadata = LanceFragment::create(
+                dataset_uri,
+                fragment_id.unwrap_or(0),
+                batches.as_mut(),
+                params,
+            )
+            .await
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
             Ok(FragmentMetadata::new(metadata, schema))
         })
     }
@@ -312,8 +320,9 @@ impl FragmentMetadata {
     #[staticmethod]
     fn from_json(json: &str) -> PyResult<Self> {
         println!("Fragment json: {json}");
-        let metadata = LanceFragmentMetadata::from_json(json)
-            .map_err(|err| PyValueError::new_err(format!("Invalid metadata json payload: {json}: {}", err)))?;
+        let metadata = LanceFragmentMetadata::from_json(json).map_err(|err| {
+            PyValueError::new_err(format!("Invalid metadata json payload: {json}: {}", err))
+        })?;
 
         Ok(Self {
             inner: metadata,
