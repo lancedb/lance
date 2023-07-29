@@ -290,7 +290,7 @@ class LanceDataset(pa.dataset.Dataset):
             for f in self._ds.get_fragments()
         ]
 
-    def get_fragment(self, fragment_id: int) -> Optional[pa.dataset.Fragment]:
+    def get_fragment(self, fragment_id: int) -> Optional[LanceFragment]:
         """Get the fragment with fragment id."""
         raw_fragment = self._ds.get_fragment(fragment_id)
         if raw_fragment is None:
