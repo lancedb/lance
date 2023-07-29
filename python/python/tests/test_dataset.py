@@ -325,11 +325,12 @@ def test_add_columns(tmp_path: Path):
         c_array = pa.compute.multiply(batch.column(0), 2)
         return pa.RecordBatch.from_arrays([c_array], names=["c"])
 
-    fragment = fragment.add_columns(adder, columns=["a"])
+    fragment_metadata = fragment.add_columns(adder, columns=["a"])
     schema = dataset.schema.append(pa.field("c", pa.int64()))
-    assert fragment.schema() == schema
 
-    dataset = lance.LanceDataset._commit(base_dir, schema, [fragment])
+    dataset = lance.LanceDataset._commit(base_dir, schema, [fragment_metadata])
+    assert dataset.schema == schema
+
     tbl = dataset.to_table()
     assert tbl == pa.Table.from_pydict(
         {"a": range(100), "b": range(100), "c": pa.array(range(0, 200, 2), pa.int64())}
@@ -375,8 +376,9 @@ def test_deletion_file(tmp_path: Path):
     # New fragment has deletion file
     assert new_fragment.deletion_file() is not None
     assert re.match("_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file())
+    print(type(new_fragment))
     dataset = lance.LanceDataset._commit(
-        base_dir, table.schema, [new_fragment.metadata()]
+        base_dir, table.schema, [new_fragment]
     )
     assert dataset.count_rows() == 90
 

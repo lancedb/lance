@@ -37,12 +37,18 @@ class FragmentMetadata:
     """Metadata of a Fragment in the dataset.
 
     """
-    def __init__(self, metadata: _FragmentMetadata):
-        self._metadata = metadata
+    def __init__(self, metadata: str):
+        """Construct a FragmentMetadata from a JSON representation of the metadata.
+
+        Internal use only.
+        """
+        self._metadata = _FragmentMetadata.from_json(metadata)
 
     def __repr__(self):
         return self._metadata.__repr__()
 
+    def __reduce__(self):
+        return (FragmentMetadata, (self.to_json(),))
 
     def to_json(self) -> Dict[str, Any]:
         return json.loads(self._metadata.json())
@@ -50,12 +56,7 @@ class FragmentMetadata:
     @staticmethod
     def from_json(json_data: Dict[str, Any]) -> FragmentMetadata:
         """Reconstruct the Fragment metadata from a JSON blob"""
-        json_str = json.dumps(json_data)
-        pass
-
-    def schema(self) -> pa.Schema:
-        """Return the schema of the fragment"""
-        return self._metadata.schema()
+        return FragmentMetadata(json_data)
 
     def data_files(self) -> Iterator[str]:
         """Return the data files of the fragment"""
@@ -145,7 +146,7 @@ class LanceFragment(pa.dataset.Fragment):
         inner_meta = _Fragment.create(
             dataset_uri, fragment_id, reader, max_rows_per_group=max_rows_per_group
         )
-        return FragmentMetadata(inner_meta)
+        return FragmentMetadata(inner_meta.json())
 
     @property
     def fragment_id(self):
@@ -207,7 +208,7 @@ class LanceFragment(pa.dataset.Fragment):
         self,
         value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
         columns: Optional[list[str]] = None,
-    ) -> LanceFragment:
+    ) -> FragmentMetadata:
         """Add columns to this Fragment.
 
         Parameters
@@ -236,7 +237,8 @@ class LanceFragment(pa.dataset.Fragment):
                 )
 
             updater.update(new_value)
-        return updater.finish()
+        metadata = updater.finish()
+        return FragmentMetadata(metadata.json())
 
     def delete(self, predicate: str) -> LanceFragment | None:
         """Delete rows from this Fragment.
@@ -268,7 +270,10 @@ deletion_file='_deletions/0-1-....arrow')
         >>> frag.delete("a > 0") is None
         True
         """
-        self._fragment.delete(predicate)
+        metadata = self._fragment.delete(predicate)
+        if metadata is None:
+            return None
+        return FragmentMetadata(metadata)
 
     @property
     def schema(self) -> pa.Schema:

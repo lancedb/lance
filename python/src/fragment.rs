@@ -309,6 +309,18 @@ impl FragmentMetadata {
         }
     }
 
+    #[staticmethod]
+    fn from_json(json: &str) -> PyResult<Self> {
+        println!("Fragment json: {json}");
+        let metadata = LanceFragmentMetadata::from_json(json)
+            .map_err(|err| PyValueError::new_err(format!("Invalid metadata json payload: {json}: {}", err)))?;
+
+        Ok(Self {
+            inner: metadata,
+            schema: Schema::from(&Vec::<pb::Field>::new()),
+        })
+    }
+
     fn __richcmp__(&self, other: &Self, op: CompareOp) -> PyResult<bool> {
         match op {
             CompareOp::Lt => Ok(self.inner.id < other.inner.id),

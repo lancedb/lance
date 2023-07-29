@@ -685,6 +685,14 @@ class LanceDataset(pa.dataset.Dataset):
             base_uri = str(base_uri)
         if not isinstance(new_schema, pa.Schema):
             raise TypeError(f"schema must be pyarrow.Schema, got {type(new_schema)}")
+        if not isinstance(fragments, list):
+            raise TypeError(
+                f"fragments must be list[FragmentMetadata], got {type(fragments)}"
+            )
+        if len(fragments) > 0 and not all(isinstance(f, FragmentMetadata) for f in fragments):
+            raise TypeError(
+                f"fragments must be list[FragmentMetadata], got {type(fragments[0])}"
+            )
         raw_fragments = [f._metadata for f in fragments]
         # TODO: make fragments as a generator
         _Dataset.commit(base_uri, new_schema, raw_fragments)
