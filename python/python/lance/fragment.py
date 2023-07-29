@@ -17,7 +17,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, Optional, Union
+from typing import TYPE_CHECKING, Callable, Iterator, Optional, Union, Dict, Any
+import json
 
 try:
     import pandas as pd
@@ -31,6 +32,38 @@ from .lance import _FragmentMetadata as _FragmentMetadata
 if TYPE_CHECKING:
     from .dataset import LanceDataset, LanceScanner
 
+
+class FragmentMetadata:
+    """Metadata of a Fragment in the dataset.
+
+    """
+    def __init__(self, metadata: _FragmentMetadata):
+        self._metadata = metadata
+
+    def __repr__(self):
+        return self._metadata.__repr__()
+
+
+    def to_json(self) -> Dict[str, Any]:
+        return json.loads(self._metadata.json())
+
+    @staticmethod
+    def from_json(json_data: Dict[str, Any]) -> FragmentMetadata:
+        """Reconstruct the Fragment metadata from a JSON blob"""
+        json_str = json.dumps(json_data)
+        pass
+
+    def schema(self) -> pa.Schema:
+        """Return the schema of the fragment"""
+        return self._metadata.schema()
+
+    def data_files(self) -> Iterator[str]:
+        """Return the data files of the fragment"""
+        return self._metadata.data_files()
+
+    def deletion_file(self):
+        """Return the deletion file, if any"""
+        return self._metadata.deletion_file()
 
 class LanceFragment(pa.dataset.Fragment):
     def __init__(self, dataset: "LanceDataset", fragment_id: int):
@@ -53,7 +86,7 @@ class LanceFragment(pa.dataset.Fragment):
         filename: Union[str, Path],
         schema: pa.Schema,
         fragment_id: int,
-    ) -> LanceFragment:
+    ) -> FragmentMetadata:
         """Create a fragment from the given datafile uri.
 
         This can be used if the datafile is loss from dataset.
@@ -67,17 +100,18 @@ class LanceFragment(pa.dataset.Fragment):
         fragment_id: int
             The ID of the fragment.
         """
-        return _Fragment.create_from_file(filename, schema, fragment_id)
+        metadata = _Fragment.create_from_file(filename, schema, fragment_id)
+        return FragmentMetadata(metadata)
 
     @staticmethod
     def create(
         dataset_uri: Union[str, Path],
-        fragment_id: int,
-        data: pa.Table,
+        data: Union[pa.Table, pa.RecordBatchReader],
+        fragment_id: Optional[int] = None,
         schema: Optional[pa.Schema] = None,
         max_rows_per_group: int = 1024,
-    ) -> LanceFragment:
-        """Create a new fragment from the given data.
+    ) -> FragmentMetadata:
+        """Create a :class:`FragmentMetadata` from the given data.
 
         This can be used if the dataset is not yet created.
 
@@ -92,6 +126,8 @@ class LanceFragment(pa.dataset.Fragment):
         schema: pa.Schema, optional
             The schema of the data. If not specified, the schema will be inferred
             from the data.
+        max_rows_per_group: int, default 1024
+            The maximum number of rows per group in the data file.
         """
         if pd and isinstance(data, pd.DataFrame):
             reader = pa.Table.from_pandas(data, schema=schema).to_reader()
@@ -106,26 +142,14 @@ class LanceFragment(pa.dataset.Fragment):
 
         if isinstance(dataset_uri, Path):
             dataset_uri = str(dataset_uri)
-        return _Fragment.create(
+        inner_meta = _Fragment.create(
             dataset_uri, fragment_id, reader, max_rows_per_group=max_rows_per_group
         )
+        return FragmentMetadata(inner_meta)
 
     @property
     def fragment_id(self):
         return self._fragment.id()
-
-    @staticmethod
-    def from_json(self) -> LanceFragment:
-        """Create a fragment from JSON format."""
-
-        pass
-
-    def to_json(self) -> str:
-        """Convert the fragment to JSON format."""
-        return {
-            "id": self.fragment_id,
-            "data_files": self._fragment.data_files(),
-        }
 
     def count_rows(
         self, filter: Optional[Union[pa.compute.Expression, str]] = None
@@ -262,7 +286,12 @@ deletion_file='_deletions/0-1-....arrow')
         return self._fragment.deletion_file()
 
     @property
-    def metadata(self) -> _FragmentMetadata:
-        """Return the metadata of this fragment."""
+    def metadata(self) -> FragmentMetadata:
+        """Return the metadata of this fragment.
 
-        return self._fragment.metadata()
+        Returns
+        -------
+        FragmentMetadata
+        """
+
+        return FragmentMetadata(self._fragment.metadata())

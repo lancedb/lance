@@ -120,10 +120,6 @@ impl FileFragment {
         &self.metadata
     }
 
-    pub fn json(&self) -> Result<String> {
-        todo!()
-    }
-
     /// The id of this [`FileFragment`].
     pub fn id(&self) -> usize {
         self.metadata.id as usize

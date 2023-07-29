@@ -27,7 +27,7 @@ import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
-from .fragment import LanceFragment
+from .fragment import LanceFragment, FragmentMetadata
 from .lance import __version__ as __version__
 from .lance import _Dataset, _Scanner, _write_dataset
 
@@ -656,7 +656,7 @@ class LanceDataset(pa.dataset.Dataset):
     def _commit(
         base_uri: Union[str, Path],
         new_schema: pa.Schema,
-        fragments,
+        fragments: Iterable[FragmentMetadata],
         mode: str = "append",
     ) -> LanceDataset:
         """Create a new version of dataset with collected fragments.
@@ -668,7 +668,7 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         new_schema : pa.Schema
             The schema for the new version of dataset.
-        fragments : list[Fragment]
+        fragments : list[FragmentMetadata]
             The fragments to create new version of dataset.
 
         Returns
@@ -685,7 +685,9 @@ class LanceDataset(pa.dataset.Dataset):
             base_uri = str(base_uri)
         if not isinstance(new_schema, pa.Schema):
             raise TypeError(f"schema must be pyarrow.Schema, got {type(new_schema)}")
-        _Dataset.commit(base_uri, new_schema, fragments)
+        raw_fragments = [f._metadata for f in fragments]
+        # TODO: make fragments as a generator
+        _Dataset.commit(base_uri, new_schema, raw_fragments)
         return LanceDataset(base_uri)
 
 

@@ -339,7 +339,7 @@ def test_add_columns(tmp_path: Path):
 def test_create_from_fragments(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
-    fragment = lance.fragment.LanceFragment.create(base_dir, 1, table)
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
 
     dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment])
     tbl = dataset.to_table()
@@ -349,7 +349,7 @@ def test_create_from_fragments(tmp_path: Path):
 def test_data_files(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
-    fragment = lance.fragment.LanceFragment.create(base_dir, 1, table)
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
 
     data_files = fragment.data_files()
     assert len(data_files) == 1
@@ -388,7 +388,7 @@ def test_commit_fragments_via_scanner(tmp_path: Path):
 
     base_dir = tmp_path / "test"
     scanner = pa.dataset.dataset(parquet_dir).scanner()
-    fragment = lance.fragment.LanceFragment.create(base_dir, 1, scanner)
+    fragment = lance.fragment.LanceFragment.create(base_dir, scanner)
     assert fragment.schema() == table.schema
 
     # Pickle-able
