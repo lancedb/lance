@@ -325,11 +325,12 @@ def test_add_columns(tmp_path: Path):
         c_array = pa.compute.multiply(batch.column(0), 2)
         return pa.RecordBatch.from_arrays([c_array], names=["c"])
 
-    fragment = fragment.add_columns(adder, columns=["a"])
+    fragment_metadata = fragment.add_columns(adder, columns=["a"])
     schema = dataset.schema.append(pa.field("c", pa.int64()))
-    assert fragment.schema() == schema
 
-    dataset = lance.LanceDataset._commit(base_dir, schema, [fragment])
+    dataset = lance.LanceDataset._commit(base_dir, schema, [fragment_metadata])
+    assert dataset.schema == schema
+
     tbl = dataset.to_table()
     assert tbl == pa.Table.from_pydict(
         {"a": range(100), "b": range(100), "c": pa.array(range(0, 200, 2), pa.int64())}
@@ -339,7 +340,7 @@ def test_add_columns(tmp_path: Path):
 def test_create_from_fragments(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
-    fragment = lance.fragment.LanceFragment.create(base_dir, 1, table)
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
 
     dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment])
     tbl = dataset.to_table()
@@ -349,7 +350,7 @@ def test_create_from_fragments(tmp_path: Path):
 def test_data_files(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
-    fragment = lance.fragment.LanceFragment.create(base_dir, 1, table)
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
 
     data_files = fragment.data_files()
     assert len(data_files) == 1
@@ -375,9 +376,8 @@ def test_deletion_file(tmp_path: Path):
     # New fragment has deletion file
     assert new_fragment.deletion_file() is not None
     assert re.match("_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file())
-    dataset = lance.LanceDataset._commit(
-        base_dir, table.schema, [new_fragment.metadata()]
-    )
+    print(type(new_fragment), new_fragment)
+    dataset = lance.LanceDataset._commit(base_dir, table.schema, [new_fragment])
     assert dataset.count_rows() == 90
 
 
@@ -388,15 +388,16 @@ def test_commit_fragments_via_scanner(tmp_path: Path):
 
     base_dir = tmp_path / "test"
     scanner = pa.dataset.dataset(parquet_dir).scanner()
-    fragment = lance.fragment.LanceFragment.create(base_dir, 1, scanner)
-    assert fragment.schema() == table.schema
+    fragment_metadata = lance.fragment.LanceFragment.create(base_dir, scanner)
 
     # Pickle-able
-    pickled = pickle.dumps(fragment)
+    pickled = pickle.dumps(fragment_metadata)
     unpickled = pickle.loads(pickled)
-    assert fragment == unpickled
+    assert fragment_metadata == unpickled
 
-    dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment])
+    dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment_metadata])
+    assert dataset.schema == table.schema
+
     tbl = dataset.to_table()
     assert tbl == table
 

@@ -16,8 +16,9 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, Optional, Union
 
 try:
     import pandas as pd
@@ -32,10 +33,59 @@ if TYPE_CHECKING:
     from .dataset import LanceDataset, LanceScanner
 
 
+class FragmentMetadata:
+    """Metadata of a Fragment in the dataset."""
+
+    def __init__(self, metadata: str):
+        """Construct a FragmentMetadata from a JSON representation of the metadata.
+
+        Internal use only.
+        """
+        self._metadata = _FragmentMetadata.from_json(metadata)
+
+    def __repr__(self):
+        return self._metadata.__repr__()
+
+    def __reduce__(self):
+        return (FragmentMetadata, (self._metadata.json(),))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, FragmentMetadata):
+            return False
+        return self._metadata.__eq__(other._metadata)
+
+    def to_json(self) -> Dict[str, Any]:
+        """Serialize :class:`FragmentMetadata` to a JSON blob"""
+        return json.loads(self._metadata.json())
+
+    @staticmethod
+    def from_json(json_data: Dict[str, Any]) -> FragmentMetadata:
+        """Reconstruct :class:`FragmentMetadata` from a JSON blob"""
+        return FragmentMetadata(json_data)
+
+    def data_files(self) -> Iterator[str]:
+        """Return the data files of the fragment"""
+        return self._metadata.data_files()
+
+    def deletion_file(self):
+        """Return the deletion file, if any"""
+        return self._metadata.deletion_file()
+
+
 class LanceFragment(pa.dataset.Fragment):
-    def __init__(self, dataset: "LanceDataset", fragment_id: int):
+    def __init__(
+        self,
+        dataset: "LanceDataset",
+        fragment_id: Optional[int],
+        *,
+        fragment: Optional[_Fragment] = None,
+    ):
         self._ds = dataset
-        self._fragment = dataset.get_fragment(fragment_id)
+        if fragment is None:
+            if fragment_id is None:
+                raise ValueError("Either fragment or fragment_id must be specified")
+            fragment = dataset.get_fragment(fragment_id)._fragment
+        self._fragment = fragment
         if self._fragment is None:
             raise ValueError(f"Fragment id does not exist: {fragment_id}")
 
@@ -58,6 +108,10 @@ class LanceFragment(pa.dataset.Fragment):
 
         This can be used if the datafile is loss from dataset.
 
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
+
         Parameters
         ----------
         filename: str
@@ -72,14 +126,18 @@ class LanceFragment(pa.dataset.Fragment):
     @staticmethod
     def create(
         dataset_uri: Union[str, Path],
-        fragment_id: int,
-        data: pa.Table,
+        data: Union[pa.Table, pa.RecordBatchReader],
+        fragment_id: Optional[int] = None,
         schema: Optional[pa.Schema] = None,
         max_rows_per_group: int = 1024,
-    ) -> LanceFragment:
-        """Create a new fragment from the given data.
+    ) -> FragmentMetadata:
+        """Create a :class:`FragmentMetadata` from the given data.
 
         This can be used if the dataset is not yet created.
+
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
 
         Parameters
         ----------
@@ -92,6 +150,8 @@ class LanceFragment(pa.dataset.Fragment):
         schema: pa.Schema, optional
             The schema of the data. If not specified, the schema will be inferred
             from the data.
+        max_rows_per_group: int, default 1024
+            The maximum number of rows per group in the data file.
         """
         if pd and isinstance(data, pd.DataFrame):
             reader = pa.Table.from_pandas(data, schema=schema).to_reader()
@@ -106,9 +166,10 @@ class LanceFragment(pa.dataset.Fragment):
 
         if isinstance(dataset_uri, Path):
             dataset_uri = str(dataset_uri)
-        return _Fragment.create(
+        inner_meta = _Fragment.create(
             dataset_uri, fragment_id, reader, max_rows_per_group=max_rows_per_group
         )
+        return FragmentMetadata(inner_meta.json())
 
     @property
     def fragment_id(self):
@@ -136,7 +197,6 @@ class LanceFragment(pa.dataset.Fragment):
         s = self._fragment.scanner(
             columns=columns, filter=filter_str, limit=limit, offset=offset
         )
-
         from .dataset import LanceScanner
 
         return LanceScanner(s, self._ds)
@@ -170,8 +230,12 @@ class LanceFragment(pa.dataset.Fragment):
         self,
         value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
         columns: Optional[list[str]] = None,
-    ) -> LanceFragment:
+    ) -> FragmentMetadata:
         """Add columns to this Fragment.
+
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
 
         Parameters
         ----------
@@ -199,14 +263,19 @@ class LanceFragment(pa.dataset.Fragment):
                 )
 
             updater.update(new_value)
-        return updater.finish()
+        metadata = updater.finish()
+        return FragmentMetadata(metadata.json())
 
-    def delete(self, predicate: str) -> LanceFragment | None:
+    def delete(self, predicate: str) -> FragmentMetadata | None:
         """Delete rows from this Fragment.
 
         This will add or update the deletion file of this fragment. It does not
         modify or delete the data files of this fragment. If no rows are left after
         the deletion, this method will return None.
+
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
 
         Parameters
         ----------
@@ -215,7 +284,7 @@ class LanceFragment(pa.dataset.Fragment):
 
         Returns
         -------
-        LanceFragment or None
+        FragmentMetadata or None
             A new fragment containing the new deletion file, or None if no rows left.
 
         Examples
@@ -226,12 +295,14 @@ class LanceFragment(pa.dataset.Fragment):
         >>> dataset = lance.write_dataset(tab, "dataset")
         >>> frag = dataset.get_fragment(0)
         >>> frag.delete("a > 1")
-        LanceFileFragment(id=0, data_files=['....lance'], \
-deletion_file='_deletions/0-1-....arrow')
+        Fragment { id: 0, files: ..., deletion_file: Some(...) }
         >>> frag.delete("a > 0") is None
         True
         """
-        self._fragment.delete(predicate)
+        raw_fragment = self._fragment.delete(predicate)
+        if raw_fragment is None:
+            return None
+        return FragmentMetadata(raw_fragment.metadata().json())
 
     @property
     def schema(self) -> pa.Schema:
@@ -249,7 +320,12 @@ deletion_file='_deletions/0-1-....arrow')
         return self._fragment.deletion_file()
 
     @property
-    def metadata(self) -> _FragmentMetadata:
-        """Return the metadata of this fragment."""
+    def metadata(self) -> FragmentMetadata:
+        """Return the metadata of this fragment.
 
-        return self._fragment.metadata()
+        Returns
+        -------
+        FragmentMetadata
+        """
+
+        return FragmentMetadata(self._fragment.metadata())

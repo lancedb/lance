@@ -12,24 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow::pyarrow::PyArrowType;
-use arrow::pyarrow::{FromPyArrow, ToPyArrow};
+use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::datatypes::Schema;
-use lance::format::pb;
-use lance::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
+use lance::format::{pb, DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance::io::deletion_file_path;
 use prost::Message;
-use pyo3::exceptions::*;
 use pyo3::prelude::*;
-use pyo3::pyclass::CompareOp;
-use pyo3::types::{PyBytes, PyDict};
-use std::fmt::Write as _;
+use pyo3::{
+    exceptions::*,
+    pyclass::CompareOp,
+    types::{PyBytes, PyDict},
+};
 use tokio::runtime::Runtime;
 
 use crate::dataset::get_write_params;
@@ -102,7 +102,7 @@ impl FileFragment {
     #[pyo3(signature = (dataset_uri, fragment_id, reader, **kwargs))]
     fn create(
         dataset_uri: &str,
-        fragment_id: usize,
+        fragment_id: Option<usize>,
         reader: &PyAny,
         kwargs: Option<&PyDict>,
     ) -> PyResult<FragmentMetadata> {
@@ -128,10 +128,14 @@ impl FileFragment {
                 None
             };
 
-            let metadata =
-                LanceFragment::create(dataset_uri, fragment_id, batches.as_mut(), params)
-                    .await
-                    .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            let metadata = LanceFragment::create(
+                dataset_uri,
+                fragment_id.unwrap_or(0),
+                batches.as_mut(),
+                params,
+            )
+            .await
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
             Ok(FragmentMetadata::new(metadata, schema))
         })
     }
@@ -313,6 +317,18 @@ impl FragmentMetadata {
         }
     }
 
+    #[staticmethod]
+    fn from_json(json: &str) -> PyResult<Self> {
+        let metadata = LanceFragmentMetadata::from_json(json).map_err(|err| {
+            PyValueError::new_err(format!("Invalid metadata json payload: {json}: {}", err))
+        })?;
+
+        Ok(Self {
+            inner: metadata,
+            schema: Schema::from(&Vec::<pb::Field>::new()),
+        })
+    }
+
     fn __richcmp__(&self, other: &Self, op: CompareOp) -> PyResult<bool> {
         match op {
             CompareOp::Lt => Ok(self.inner.id < other.inner.id),
@@ -358,6 +374,13 @@ impl FragmentMetadata {
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let arrow_schema: ArrowSchema = (&self_.schema).into();
         arrow_schema.to_pyarrow(self_.py())
+    }
+
+    fn json(self_: PyRef<'_, Self>) -> PyResult<String> {
+        let json = serde_json::to_string(&self_.inner).map_err(|e| {
+            PyValueError::new_err(format!("Unable to serialize FragmentMetadata: {}", e))
+        })?;
+        Ok(json)
     }
 
     /// Returns the data file objects associated with this fragment.

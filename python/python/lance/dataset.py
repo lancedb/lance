@@ -27,7 +27,7 @@ import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
-from .fragment import LanceFragment
+from .fragment import FragmentMetadata, LanceFragment
 from .lance import __version__ as __version__
 from .lance import _Dataset, _Scanner, _write_dataset
 
@@ -285,11 +285,17 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if filter is not None:
             raise ValueError("get_fragments() does not support filter yet")
-        return [LanceFragment(self, f.id()) for f in self._ds.get_fragments()]
+        return [
+            LanceFragment(self, fragment_id=None, fragment=f)
+            for f in self._ds.get_fragments()
+        ]
 
-    def get_fragment(self, fragment_id: int) -> Optional[pa.dataset.Fragment]:
-        """Get the fragment with fragment id"""
-        return self._ds.get_fragment(fragment_id)
+    def get_fragment(self, fragment_id: int) -> Optional[LanceFragment]:
+        """Get the fragment with fragment id."""
+        raw_fragment = self._ds.get_fragment(fragment_id)
+        if raw_fragment is None:
+            return None
+        return LanceFragment(self, fragment_id=None, fragment=raw_fragment)
 
     def to_batches(
         self,
@@ -656,7 +662,7 @@ class LanceDataset(pa.dataset.Dataset):
     def _commit(
         base_uri: Union[str, Path],
         new_schema: pa.Schema,
-        fragments,
+        fragments: Iterable[FragmentMetadata],
         mode: str = "append",
     ) -> LanceDataset:
         """Create a new version of dataset with collected fragments.
@@ -668,7 +674,7 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         new_schema : pa.Schema
             The schema for the new version of dataset.
-        fragments : list[Fragment]
+        fragments : list[FragmentMetadata]
             The fragments to create new version of dataset.
 
         Returns
@@ -685,7 +691,19 @@ class LanceDataset(pa.dataset.Dataset):
             base_uri = str(base_uri)
         if not isinstance(new_schema, pa.Schema):
             raise TypeError(f"schema must be pyarrow.Schema, got {type(new_schema)}")
-        _Dataset.commit(base_uri, new_schema, fragments)
+        if not isinstance(fragments, list):
+            raise TypeError(
+                f"fragments must be list[FragmentMetadata], got {type(fragments)}"
+            )
+        if len(fragments) > 0 and not all(
+            isinstance(f, FragmentMetadata) for f in fragments
+        ):
+            raise TypeError(
+                f"fragments must be list[FragmentMetadata], got {type(fragments[0])}"
+            )
+        raw_fragments = [f._metadata for f in fragments]
+        # TODO: make fragments as a generator
+        _Dataset.commit(base_uri, new_schema, raw_fragments)
         return LanceDataset(base_uri)
 
 
