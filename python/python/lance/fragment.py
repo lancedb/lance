@@ -55,11 +55,12 @@ class FragmentMetadata:
         return self._metadata.__eq__(other._metadata)
 
     def to_json(self) -> Dict[str, Any]:
+        """Serialize :class:`FragmentMetadata` to a JSON blob"""
         return json.loads(self._metadata.json())
 
     @staticmethod
     def from_json(json_data: Dict[str, Any]) -> FragmentMetadata:
-        """Reconstruct the Fragment metadata from a JSON blob"""
+        """Reconstruct :class:`FragmentMetadata` from a JSON blob"""
         return FragmentMetadata(json_data)
 
     def data_files(self) -> Iterator[str]:
@@ -283,7 +284,7 @@ class LanceFragment(pa.dataset.Fragment):
 
         Returns
         -------
-        LanceFragment or None
+        FragmentMetadata or None
             A new fragment containing the new deletion file, or None if no rows left.
 
         Examples
