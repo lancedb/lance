@@ -102,10 +102,14 @@ class LanceFragment(pa.dataset.Fragment):
         filename: Union[str, Path],
         schema: pa.Schema,
         fragment_id: int,
-    ) -> FragmentMetadata:
+    ) -> LanceFragment:
         """Create a fragment from the given datafile uri.
 
         This can be used if the datafile is loss from dataset.
+
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
 
         Parameters
         ----------
@@ -116,8 +120,7 @@ class LanceFragment(pa.dataset.Fragment):
         fragment_id: int
             The ID of the fragment.
         """
-        metadata = _Fragment.create_from_file(filename, schema, fragment_id)
-        return FragmentMetadata(metadata)
+        return _Fragment.create_from_file(filename, schema, fragment_id)
 
     @staticmethod
     def create(
@@ -130,6 +133,10 @@ class LanceFragment(pa.dataset.Fragment):
         """Create a :class:`FragmentMetadata` from the given data.
 
         This can be used if the dataset is not yet created.
+
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
 
         Parameters
         ----------
@@ -225,6 +232,10 @@ class LanceFragment(pa.dataset.Fragment):
     ) -> FragmentMetadata:
         """Add columns to this Fragment.
 
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
+
         Parameters
         ----------
         value_func: Callable.
@@ -254,12 +265,16 @@ class LanceFragment(pa.dataset.Fragment):
         metadata = updater.finish()
         return FragmentMetadata(metadata.json())
 
-    def delete(self, predicate: str) -> LanceFragment | None:
+    def delete(self, predicate: str) -> FragmentMetadata | None:
         """Delete rows from this Fragment.
 
         This will add or update the deletion file of this fragment. It does not
         modify or delete the data files of this fragment. If no rows are left after
         the deletion, this method will return None.
+
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
 
         Parameters
         ----------
