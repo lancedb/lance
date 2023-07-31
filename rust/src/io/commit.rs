@@ -19,6 +19,15 @@
 //! only once, even if there are concurrent writers. Different stores have
 //! different abilities to handle concurrent writes, so a trait is provided
 //! to allow for different implementations.
+//!
+//! The trait [CommitHandler] can be implemented to provide different commit
+//! strategies. The default implementation for most object stores is
+//! [RenameCommitHandler], which writes the manifest to a temporary path, then
+//! renames the temporary path to the final path if no object already exists
+//! at the final path. This is an atomic operation in most object stores, but
+//! not in AWS S3. So for AWS S3, the default commit handler is
+//! [UnsafeCommitHandler], which writes the manifest to the final path without
+//! any checks.
 
 use std::{fmt::Debug, sync::atomic::AtomicBool};
 
@@ -37,12 +46,17 @@ pub type ManifestWriter = for<'a> fn(
     path: &'a Path,
 ) -> BoxFuture<'a, crate::Result<()>>;
 
+/// Handle commits that prevent conflicting writes.
+///
+/// Commit implementations ensure that if there are multiple concurrent writers
+/// attempting to write the next version of a table, only one will win. In order
+/// to work, all writers must use the same commit handler type.
 #[async_trait::async_trait]
 pub trait CommitHandler: Debug + Send + Sync {
     /// Commit a manifest to a path.
     ///
-    /// This function should return an error if another transaction has already
-    /// been committed to the path.
+    /// This function should return an [CommitError::CommitConflict] if another
+    /// transaction has already been committed to the path.
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -53,6 +67,7 @@ pub trait CommitHandler: Debug + Send + Sync {
     ) -> Result<(), CommitError>;
 }
 
+/// Errors that can occur when committing a manifest.
 pub enum CommitError {
     /// Another transaction has already been written to the path
     CommitConflict,
@@ -80,6 +95,9 @@ impl From<CommitError> for crate::Error {
 /// Whether we have issued a warning about using the unsafe commit handler.
 static WARNED_ON_UNSAFE_COMMIT: AtomicBool = AtomicBool::new(false);
 
+/// A naive commit implementation that does not prevent conflicting writes.
+///
+/// This will log a warning the first time it is used.
 pub struct UnsafeCommitHandler;
 
 #[async_trait::async_trait]
@@ -95,7 +113,10 @@ impl CommitHandler for UnsafeCommitHandler {
         // Log a one-time warning
         if !WARNED_ON_UNSAFE_COMMIT.load(std::sync::atomic::Ordering::Relaxed) {
             WARNED_ON_UNSAFE_COMMIT.store(true, std::sync::atomic::Ordering::Relaxed);
-            log::warn!("Using unsafe commit handler");
+            log::warn!(
+                "Using unsafe commit handler. Concurrent writes may result in data loss. \
+                        Consider providing a commit handler that prevents conflicting writes."
+            );
         }
 
         // Write the manifest naively
@@ -111,6 +132,9 @@ impl Debug for UnsafeCommitHandler {
     }
 }
 
+/// A commit implementation that uses a temporary path and renames the object.
+///
+/// This only works for object stores that support atomic rename if not exist.
 pub struct RenameCommitHandler;
 
 #[async_trait::async_trait]
