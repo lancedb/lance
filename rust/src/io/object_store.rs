@@ -28,9 +28,7 @@ use async_trait::async_trait;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_credential_types::provider::ProvideCredentials;
 use futures::{StreamExt, TryStreamExt};
-use object_store::aws::{AwsCredential as ObjectStoreAwsCredential, AmazonS3};
-use object_store::azure::MicrosoftAzure;
-use object_store::gcp::GoogleCloudStorage;
+use object_store::aws::AwsCredential as ObjectStoreAwsCredential;
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
 use tokio::sync::RwLock;
@@ -40,7 +38,7 @@ use crate::error::{Error, Result};
 use crate::io::object_reader::CloudObjectReader;
 use crate::io::object_writer::ObjectWriter;
 
-use super::commit_store::CommitStore;
+use super::commit::{CommitHandler, RenameCommitHandler, UnsafeCommitHandler};
 use super::local::LocalObjectReader;
 use super::object_reader::ObjectReader;
 
@@ -52,7 +50,7 @@ pub struct ObjectStore {
     scheme: String,
     base_path: Path,
     block_size: usize,
-    commit_store: Arc<dyn CommitStore>,
+    pub commit_handler: Arc<dyn CommitHandler>,
 }
 
 impl std::fmt::Display for ObjectStore {
@@ -139,7 +137,7 @@ async fn build_s3_object_store(
     uri: &str,
     credentials_refresh_offset: Duration,
     credentials: Option<Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>>,
-) -> Result<Arc<AmazonS3>> {
+) -> Result<Arc<dyn OSObjectStore>> {
     use aws_config::meta::region::RegionProviderChain;
 
     const DEFAULT_REGION: &str = "us-west-2";
@@ -176,7 +174,7 @@ async fn build_s3_object_store(
     ))
 }
 
-async fn build_gcs_object_store(uri: &str) -> Result<Arc<GoogleCloudStorage>> {
+async fn build_gcs_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     // GCS enables cache for public buckets, we disable to improve consistency
     let mut headers = HeaderMap::new();
     headers.insert(CACHE_CONTROL, "no-cache".parse().unwrap());
@@ -188,7 +186,7 @@ async fn build_gcs_object_store(uri: &str) -> Result<Arc<GoogleCloudStorage>> {
     ))
 }
 
-async fn build_azure_object_store(uri: &str) -> Result<Arc<MicrosoftAzure>> {
+async fn build_azure_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     Ok(Arc::new(
         MicrosoftAzureBuilder::from_env().with_url(uri).build()?,
     ))
@@ -206,7 +204,9 @@ pub struct ObjectStoreParams {
 
     // Custom AWS Credentials
     pub aws_credentials: Option<Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>>,
-    // TODO: add parameter to pass a custom table locking mechanism
+
+    /// Custom commit handler
+    pub commit_handler: Option<Arc<dyn CommitHandler>>,
 }
 
 // Need this for setting a non-zero default duration
@@ -216,6 +216,7 @@ impl Default for ObjectStoreParams {
             object_store_wrapper: None,
             s3_credentials_refresh_offset: Duration::from_secs(60),
             aws_credentials: None,
+            commit_handler: None,
         }
     }
 }
@@ -270,15 +271,13 @@ impl ObjectStore {
         }
         let expanded_path = expanded_path.canonicalize()?;
 
-        let local_fs = Arc::new(LocalFileSystem::new());
-
         Ok((
             Self {
-                inner: local_fs.clone(),
+                inner: Arc::new(LocalFileSystem::new()),
                 scheme: String::from("file"),
                 base_path: Path::from_absolute_path(&expanded_path)?,
                 block_size: 4 * 1024, // 4KB block size
-                commit_store: local_fs,
+                commit_handler: Arc::new(RenameCommitHandler),
             },
             Path::from_filesystem_path(&expanded_path)?,
         ))
@@ -289,51 +288,52 @@ impl ObjectStore {
         // object stores, we use 64KB block size. This is generally the largest
         // block size where we don't see a latency penalty.
         match url.scheme() {
-            "s3" => {
-                let s3_store = build_s3_object_store(
+            "s3" => Ok(Self {
+                inner: build_s3_object_store(
                     url.to_string().as_str(),
                     params.s3_credentials_refresh_offset,
                     params.aws_credentials.clone(),
-                ).await?;
-
-                Ok(Self {
-                inner: s3_store.clone(),
+                )
+                .await?,
                 scheme: String::from("s3"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
-                commit_store: s3_store,
-            })},
-            "gs" => {
-                let gcs_store = build_gcs_object_store(url.to_string().as_str()).await?;
-                Ok(Self {
-                    inner: gcs_store.clone(),
-                    scheme: String::from("gs"),
-                    base_path: Path::from(url.path()),
-                    block_size: 64 * 1024,
-                    commit_store: gcs_store,
-                })
-            }
-            "az" => {
-                let azure_store = build_azure_object_store(url.to_string().as_str()).await?;
-                Ok(Self {
-                    inner: azure_store.clone(),
-                    scheme: String::from("az"),
-                    base_path: Path::from(url.path()),
-                    block_size: 64 * 1024,
-                    commit_store: azure_store,
-                })
-            }
+                commit_handler: params
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(UnsafeCommitHandler)),
+            }),
+            "gs" => Ok(Self {
+                inner: build_gcs_object_store(url.to_string().as_str()).await?,
+                scheme: String::from("gs"),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+                commit_handler: params
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+            }),
+            "az" => Ok(Self {
+                inner: build_azure_object_store(url.to_string().as_str()).await?,
+                scheme: String::from("az"),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+                commit_handler: params
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+            }),
             "file" => Ok(Self::new_from_path(url.path())?.0),
-            "memory" => {
-                let memory_store = Arc::new(InMemory::new());
-                Ok(Self {
-                    inner: memory_store.clone(),
-                    scheme: String::from("memory"),
-                    base_path: Path::from(url.path()),
-                    block_size: 64 * 1024,
-                    commit_store: memory_store,
-                })
-            }
+            "memory" => Ok(Self {
+                inner: Arc::new(InMemory::new()),
+                scheme: String::from("memory"),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+                commit_handler: params
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+            }),
             s => Err(Error::IO {
                 message: format!("Unsupported URI scheme: {}", s),
             }),
@@ -342,13 +342,12 @@ impl ObjectStore {
 
     /// Create a in-memory object store directly for testing.
     pub fn memory() -> Self {
-        let memory_store = Arc::new(InMemory::new());
         Self {
-            inner: memory_store.clone(),
+            inner: Arc::new(InMemory::new()),
             scheme: String::from("memory"),
             base_path: Path::from("/"),
             block_size: 64 * 1024,
-            commit_store: memory_store,
+            commit_handler: Arc::new(RenameCommitHandler),
         }
     }
 

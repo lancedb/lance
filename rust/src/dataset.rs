@@ -26,6 +26,7 @@ use arrow_array::{
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;
+use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use log::warn;
 use object_store::path::Path;
@@ -913,8 +914,7 @@ impl Default for ManifestWriteConfig {
     }
 }
 
-/// Finish writing the manifest file, and commit the changes by linking the latest manifest file
-/// to this version.
+/// Commit a manifest file and create a copy at the latest manifest path.
 pub(crate) async fn write_manifest_file(
     object_store: &ObjectStore,
     base_path: &Path,
@@ -929,31 +929,41 @@ pub(crate) async fn write_manifest_file(
 
     manifest.update_max_fragment_id();
 
-    let paths = vec![
-        manifest_path(base_path, manifest.version),
-        latest_manifest_path(base_path),
-    ];
+    // First, commit the new manifest file.
+    let path = manifest_path(base_path, manifest.version);
+    object_store
+        .commit_handler
+        .commit(
+            manifest,
+            indices,
+            &path,
+            object_store,
+            write_manifest_file_to_path,
+        )
+        .await?;
 
-    for p in paths {
-        write_manifest_file_to_path(object_store, manifest, indices.clone(), &p).await?
-    }
-    // TODO: commit the original.
+    // Then, create a copy at the latest manifest path
+    object_store
+        .inner
+        .copy(&path, &latest_manifest_path(base_path))
+        .await?;
 
-    // Then use copy to link the latest manifest file to this version.
     Ok(())
 }
 
-async fn write_manifest_file_to_path(
-    object_store: &ObjectStore,
-    manifest: &mut Manifest,
+fn write_manifest_file_to_path<'a>(
+    object_store: &'a ObjectStore,
+    manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
-    path: &Path,
-) -> Result<()> {
-    let mut object_writer = object_store.create(path).await?;
-    let pos = write_manifest(&mut object_writer, manifest, indices).await?;
-    object_writer.write_magics(pos).await?;
-    object_writer.shutdown().await?;
-    Ok(())
+    path: &'a Path,
+) -> BoxFuture<'a, Result<()>> {
+    Box::pin(async {
+        let mut object_writer = object_store.create(path).await?;
+        let pos = write_manifest(&mut object_writer, manifest, indices).await?;
+        object_writer.write_magics(pos).await?;
+        object_writer.shutdown().await?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
