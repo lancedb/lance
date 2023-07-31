@@ -343,12 +343,12 @@ selectively reading only relevant stats columns.
 Statistic values
 ~~~~~~~~~~~~~~~~
 
-One global statistics is stored per page and per fragment: ``num_values``. This
+One global statistic is stored per page and per fragment: ``num_values``. This
 is the original number of values in the fragment or page. This does not account
 for any deletions.
 
-Three types of statistics are stored per column: null count, min value, max value. The min
-and max values are stored as their native data types in arrays.
+Three types of statistics are stored per column: null count, min value, max value.
+The min and max values are stored as their native data types in arrays.
 
 There are special behavior for different data types to account for nulls:
 
@@ -420,11 +420,10 @@ Controlling statistics collection
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Sometimes, users may not wish to collect statistics on all columns. This might be
-especially true for column that are large binary blobs.
+especially true for columns that are large binary blobs.
 
-There is a field called ``statistics_columns`` that tracks which field ids to
-collect statistics for going forward. This field is optional, and if it is not
-set then statistics should be collected for all columns, if possible.
+Within the schema, each field has a ``collect_statistics`` flag that determines
+whether a writer should collect statistics for that column.
 
 Partitioning
 ------------

@@ -120,13 +120,6 @@ message Manifest {
   //   * read_version: u64
   //   * id: u64
   repeated string external_manifest_paths = 12;
-
-  // The field ids of the columns to collect statistics for.
-  //
-  // In future writes, statistics for other columns will be dropped and 
-  // statistics will only be collected for these columns going forward. If
-  // this field is empty, then statistics will be collected for all columns.
-  repeated uint32 statistics_columns = 13;
 } // Manifest
 
 // Auxiliary Data attached to a version.
@@ -340,4 +333,7 @@ message Field {
 
   // optional extension type name
   string extension_name = 9;
+
+  // Whether to collect statistics for this column. Only affects leaf columns.
+  bool collect_statistics = 10;
 }
