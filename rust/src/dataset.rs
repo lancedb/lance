@@ -1258,6 +1258,7 @@ mod tests {
         // Write with custom manifest
         manifest.writer_feature_flags = 5; // Set another flag
         manifest.reader_feature_flags = 5;
+        manifest.version += 1;
         write_manifest_file(
             dataset.object_store(),
             &dataset.base,
