@@ -599,6 +599,7 @@ impl From<&Field> for pb::Field {
             dictionary: field.dictionary.as_ref().map(pb::Dictionary::from),
             extension_name: field.extension_name.clone(),
             r#type: 0,
+            collect_statistics: false,
         }
     }
 }

@@ -41,6 +41,8 @@ impl From<&Metadata> for pb::Metadata {
             batch_offsets: m.batch_offsets.clone(),
             page_table_position: m.page_table_position as u64,
             manifest_position: m.manifest_position.unwrap_or(0) as u64,
+            stats_page_table_position: 0,
+            stats_schema: vec![],
         }
     }
 }

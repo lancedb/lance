@@ -222,6 +222,7 @@ impl From<&Manifest> for pb::Manifest {
             reader_feature_flags: m.reader_feature_flags,
             writer_feature_flags: m.writer_feature_flags,
             max_fragment_id: m.max_fragment_id,
+            external_manifest_paths: vec![],
         }
     }
 }
