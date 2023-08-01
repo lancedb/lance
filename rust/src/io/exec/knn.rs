@@ -138,8 +138,8 @@ impl std::fmt::Debug for KNNFlatExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "KNN(flat, k={}, metric={})",
-            self.query.k, self.query.metric_type
+            "KNN(flat, k={}, metric={}, child={:?})",
+            self.query.k, self.query.metric_type, self.input
         )
     }
 }

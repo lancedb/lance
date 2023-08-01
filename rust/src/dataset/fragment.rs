@@ -19,8 +19,10 @@ use std::sync::Arc;
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::future::try_join_all;
-use futures::{join, TryFutureExt, TryStreamExt};
+use futures::stream::BoxStream;
+use futures::{join, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use object_store::path::Path;
 use uuid::Uuid;
 
@@ -35,7 +37,7 @@ use crate::io::deletion::{deletion_file_path, read_deletion_file, write_deletion
 use crate::io::{FileReader, FileWriter, ObjectStore, ReadBatchParams};
 use crate::{Error, Result};
 
-use super::WriteParams;
+use super::{WriteParams, ROW_ID};
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -470,6 +472,14 @@ impl FragmentReader {
 
     pub(crate) fn with_row_id(&mut self) -> &mut Self {
         self.readers[0].0.with_row_id(true);
+        self.readers[0].1 = self.readers[0]
+            .1
+            .merge(&ArrowSchema::new(vec![ArrowField::new(
+                ROW_ID,
+                DataType::UInt64,
+                false,
+            )]))
+            .unwrap();
         self
     }
 
@@ -510,15 +520,14 @@ impl FragmentReader {
     }
 
     /// Take rows from this fragment.
+    /// TODO: Are these supposed to be row ids? or indices??
     pub async fn take(&self, indices: &[u32]) -> Result<RecordBatch> {
-        let mut batches = vec![];
-
-        // TODO: Putting this loop in async blocks cause lifetime issues.
-        // We need to fix
-        for (reader, schema) in self.readers.iter() {
-            let batch = reader.take(indices, schema).await?;
-            batches.push(batch);
-        }
+        // Boxed to avoid lifetime issue.
+        let stream: BoxStream<_> = futures::stream::iter(&self.readers)
+            .map(|(reader, schema)| reader.take(indices, &schema))
+            .buffered(4)
+            .boxed();
+        let batches: Vec<RecordBatch> = stream.try_collect::<Vec<_>>().await?;
 
         merge_batches(&batches)
     }
@@ -535,7 +544,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::dataset::WriteParams;
+    use crate::dataset::{WriteParams, ROW_ID};
 
     async fn create_dataset(test_uri: &str) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -615,13 +624,14 @@ mod tests {
             .find(|f| f.id() == 3)
             .unwrap();
 
+        // Repeated indices are repeated in result.
         let batch = fragment
-            .take(&[1, 2, 4, 5, 8], dataset.schema())
+            .take(&[1, 2, 4, 5, 5, 8], dataset.schema())
             .await
             .unwrap();
         assert_eq!(
             batch.column_by_name("i").unwrap().as_ref(),
-            &Int32Array::from(vec![121, 122, 124, 125, 128])
+            &Int32Array::from(vec![121, 122, 124, 125, 125, 128])
         );
 
         dataset.delete("i in (122, 124)").await.unwrap();
@@ -641,6 +651,25 @@ mod tests {
         assert_eq!(
             batch.column_by_name("i").unwrap().as_ref(),
             &Int32Array::from(vec![121, 125, 128])
+        );
+
+        // Empty indices gives empty result
+        let batch = fragment.take(&[], dataset.schema()).await.unwrap();
+        assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(Vec::<i32>::new())
+        );
+
+        // Can get row ids
+        let mut reader = fragment.open(dataset.schema()).await.unwrap();
+        let batch = reader.with_row_id().take(&[1, 2, 4, 5, 8]).await.unwrap();
+        assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(vec![121, 125, 128])
+        );
+        assert_eq!(
+            batch.column_by_name(ROW_ID).unwrap().as_ref(),
+            &UInt64Array::from(vec![1, 5, 8])
         );
     }
 

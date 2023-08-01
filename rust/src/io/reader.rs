@@ -405,6 +405,10 @@ impl FileReader {
             .try_collect::<Vec<_>>()
             .await?;
         let schema = Arc::new(ArrowSchema::from(projection));
+        dbg!(
+            &schema,
+            batches.iter().map(|b| b.schema()).collect::<Vec<_>>()
+        );
         Ok(concat_batches(&schema, &batches)?)
     }
 }
