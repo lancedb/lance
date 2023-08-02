@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::Float32Type;
 use arrow_arith::aggregate::min;
-use arrow_array::builder::UInt64Builder;
-use arrow_array::types::UInt64Type;
+use arrow_array::builder::{UInt64Builder, UInt8Builder};
+use arrow_array::types::{UInt64Type, UInt8Type};
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray,
     Float32Array, RecordBatch, UInt64Array, UInt8Array,
@@ -27,6 +27,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use futures::{stream, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
@@ -237,6 +238,8 @@ impl VectorIndex for PQIndex {
             self.cosine_distances(&query.key)?
         };
 
+        debug_assert_eq!(distances.len(), row_ids.len());
+
         let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
         let indices = sort_to_indices(&distances, None, Some(limit))?;
         let distances = take(&distances, &indices, None)?;
@@ -268,23 +271,71 @@ impl VectorIndex for PQIndex {
         let row_ids =
             read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
 
-        let mut filtered_row_id_builder = UInt64Builder::new();
+        // Need to remove any deleted rows from the index.
         let deletion_checker = self.deletion_lookup_cache.as_ref();
-        // TODO: consider a more optimized way of reading
-        // group by frag_id and check per frag in one go
-        for row_id in as_primitive_array::<UInt64Type>(row_ids.as_ref()) {
-            let row = row_id.expect("Found null row id.");
-            if !deletion_checker.is_deleted(row).await? {
-                filtered_row_id_builder.append_value(row);
+        let row_id_values = as_primitive_array::<UInt64Type>(row_ids.as_ref()).values();
+        let indices_to_remove: BoxStream<_> =
+            futures::stream::iter(row_id_values.iter().enumerate())
+                .map(|(i, row_id)| async move {
+                    let res = deletion_checker.is_deleted(*row_id).await;
+                    (i, res)
+                })
+                .buffered(4)
+                .filter_map(|(i, res)| {
+                    futures::future::ready(match res {
+                        Ok(true) => Some(Ok(i)),
+                        Ok(false) => None,
+                        Err(e) => Some(Err(e)),
+                    })
+                })
+                .boxed();
+        let indices_to_remove = indices_to_remove.try_collect::<Vec<_>>().await?;
+
+        let (row_ids, pq_code) = if indices_to_remove.is_empty() {
+            (row_ids, pq_code)
+        } else {
+            // Only run this slow path if there are any indices to remove.
+            let mut filtered_row_id_builder =
+                UInt64Builder::with_capacity(row_ids.len() - indices_to_remove.len());
+            let mut filtered_pq_code_builder = UInt8Builder::with_capacity(
+                pq_code.len() - (indices_to_remove.len() * self.num_sub_vectors),
+            );
+
+            let pq_code_values = as_primitive_array::<UInt8Type>(pq_code.as_ref())
+                .values()
+                .as_ref();
+
+            let mut indices_to_remove_iter = indices_to_remove.iter();
+            let mut i = 0;
+            let length = row_ids.len();
+            while i < length {
+                let next_index = indices_to_remove_iter.next().unwrap_or(&length);
+                debug_assert!(i <= *next_index, "i: {}, next_index: {}", i, next_index);
+                let num_rows_to_copy = *next_index - i;
+                if num_rows_to_copy > 0 {
+                    // Copy non-deleted rows.
+                    filtered_row_id_builder.append_slice(&row_id_values[i..*next_index]);
+                    let pq_start = i * self.num_sub_vectors;
+                    let pq_end = *next_index * self.num_sub_vectors;
+                    debug_assert_eq!(pq_end - pq_start, num_rows_to_copy * self.num_sub_vectors);
+                    let pq_code = pq_code_values.get(pq_start..pq_end).unwrap();
+                    filtered_pq_code_builder.append_slice(pq_code);
+
+                    i += num_rows_to_copy;
+                }
+                i += 1; // Skip the deleted row.
             }
-        }
+            let row_ids: ArrayRef = Arc::new(filtered_row_id_builder.finish());
+            let pq_code: ArrayRef = Arc::new(filtered_pq_code_builder.finish());
+            (row_ids, pq_code)
+        };
 
         Ok(Arc::new(Self {
             nbits: self.pq.num_bits,
             num_sub_vectors: self.pq.num_sub_vectors,
             dimension: self.pq.dimension,
             code: Some(Arc::new(as_primitive_array(&pq_code).clone())),
-            row_ids: Some(Arc::new(filtered_row_id_builder.finish())),
+            row_ids: Some(Arc::new(as_primitive_array(&row_ids).clone())),
             pq: self.pq.clone(),
             metric_type: self.metric_type,
             deletion_lookup_cache: self.deletion_lookup_cache.clone(),

@@ -41,6 +41,7 @@ use prost::Message;
 use super::deletion::{read_deletion_file, DeletionVector};
 use super::{deletion_file_path, ReadBatchParams};
 use crate::arrow::*;
+use crate::dataset::ROW_ID;
 use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::error::{Error, Result};
 use crate::format::{pb, Metadata, PageTable};
@@ -404,11 +405,13 @@ impl FileReader {
             .buffered(num_cpus::get() * 4)
             .try_collect::<Vec<_>>()
             .await?;
-        let schema = Arc::new(ArrowSchema::from(projection));
-        dbg!(
-            &schema,
-            batches.iter().map(|b| b.schema()).collect::<Vec<_>>()
-        );
+
+        let mut schema = ArrowSchema::from(projection);
+        if self.with_row_id {
+            schema = schema.try_with_column(ArrowField::new(ROW_ID, DataType::UInt64, false))?;
+        }
+        let schema = Arc::new(schema);
+
         Ok(concat_batches(&schema, &batches)?)
     }
 }
@@ -466,18 +469,19 @@ async fn read_batch(
         None
     };
 
+    // TODO: This is a minor cop out. Pushing deletion vector in to the decoders is hard
+    // so I'm going to just leave deletion filter at this layer for now.
+    // We should push this down futurther when we get to statistics-based predicate pushdown
+    let deletion_mask =
+        deletion_vector.and_then(|v| v.build_predicate(row_ids.as_ref().unwrap().iter()));
+
     if with_row_id {
-        let row_id_arr = Arc::new(UInt64Array::from(row_ids.clone().unwrap()));
+        let row_id_arr = Arc::new(UInt64Array::from(row_ids.unwrap()));
         batch = batch.try_with_column(
             ArrowField::new("_rowid", DataType::UInt64, false),
             row_id_arr,
         )?;
     }
-
-    // TODO: This is a minor cop out. Pushing deletion vector in to the decoders is hard
-    // so I'm going to just leave deletion filter at this layer for now.
-    // We should push this down futurther when we get to statistics-based predicate pushdown
-    let deletion_mask = deletion_vector.and_then(|v| v.build_predicate(row_ids.unwrap().iter()));
 
     match deletion_mask {
         None => Ok(batch),

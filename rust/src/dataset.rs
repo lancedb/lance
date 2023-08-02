@@ -41,7 +41,6 @@ use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_datas
 use self::fragment::FileFragment;
 use self::scanner::Scanner;
 use self::write::{reader_to_stream, write_fragments};
-use crate::arrow::SchemaExt;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{pb, Fragment, Index, Manifest};
@@ -671,11 +670,7 @@ impl Dataset {
             row_ids_per_fragment.values().flatten().count()
         );
 
-        let schema = Arc::new(ArrowSchema::from(projection));
         let fragments = self.get_fragments();
-        dbg!(row_ids.len());
-        dbg!(row_ids_per_fragment.keys().collect::<Vec<_>>());
-        dbg!(fragments.iter().map(|f| f.metadata.id).collect::<Vec<_>>());
         let fragment_and_indices = fragments.iter().filter_map(|f| {
             let local_row_ids = row_ids_per_fragment.get(&(f.id() as u64))?;
             Some((f, local_row_ids))
@@ -691,22 +686,12 @@ impl Dataset {
         )?;
         let schema_with_row_id = Arc::new(ArrowSchema::from(&projection_with_row_id));
 
-        let schema_ref = &projection_with_row_id;
         let batches = stream::iter(fragment_and_indices)
-            .then(|(fragment, indices)| {
-                async move {
-                    let mut reader = fragment.open(schema_ref).await?;
-                    // We need row id to reconstruct the requested order of rows
-                    reader.with_row_id();
-                    reader.take(indices.as_slice()).await
-                }
-            })
+            .then(|(fragment, indices)| fragment.take_rows(indices, projection, true))
             .try_collect::<Vec<_>>()
             .await?;
 
-        dbg!(batches.len());
         let one_batch = concat_batches(&schema_with_row_id, &batches)?;
-        dbg!(one_batch.num_rows());
         // Note: one_batch may contains fewer rows than the number of requested
         // row ids because some rows may have been deleted.
 
@@ -727,6 +712,10 @@ impl Dataset {
             .filter_map(|o| returned_row_ids.binary_search(o).ok().map(|pos| pos as u64))
             .collect();
         let num_rows = one_batch.num_rows();
+
+        // Remove the row id column.
+        let keep_indices = (0..one_batch.num_columns() - 1).collect::<Vec<_>>();
+        let one_batch = one_batch.project(&keep_indices)?;
         let struct_arr: StructArray = one_batch.into();
         let reordered = take(&struct_arr, &remapping_index, None)?;
         assert_eq!(reordered.len(), num_rows);

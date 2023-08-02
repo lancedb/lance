@@ -458,6 +458,7 @@ impl Scanner {
         }
         plan = Arc::new(ProjectionExec::try_new(plan, output_schema)?);
 
+        debug!("Execution plan:\n{:?}", plan);
         dbg!(&plan);
 
         Ok(plan)

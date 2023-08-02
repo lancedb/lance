@@ -117,6 +117,7 @@ mod tests {
     async fn test_disable_index_cache() {
         let no_cache = Session::new(0, 0);
         assert!(no_cache.index_cache.get("abc").is_none());
+        let no_cache = Arc::new(no_cache);
 
         let schema = Schema {
             fields: vec![],
@@ -125,10 +126,10 @@ mod tests {
         let manifest = Arc::new(Manifest::new(&schema, Arc::new(vec![])));
         let object_store = Arc::new(ObjectStore::from_uri("memory://").await.unwrap().0);
         let deletion_cache = Arc::new(LruDeletionVectorStore::new(
+            no_cache.clone(),
             object_store.clone(),
             object_store.as_ref().base_path().clone(),
             manifest,
-            100,
         ));
 
         let pq = Arc::new(ProductQuantizer::new(1, 8, 1));

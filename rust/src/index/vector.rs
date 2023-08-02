@@ -386,10 +386,10 @@ pub(crate) async fn open_index(
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
 
     let deletion_cache = Arc::new(LruDeletionVectorStore::new(
+        dataset.session.clone(),
         Arc::new(dataset.object_store().clone()),
         object_store.base_path().clone(),
         dataset.manifest.clone(),
-        100_usize,
     ));
 
     for stg in vec_idx.stages.iter().rev() {

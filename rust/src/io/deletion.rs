@@ -1,6 +1,5 @@
 use std::ops::Range;
 use std::slice::Iter;
-use std::sync::Mutex;
 use std::{collections::HashSet, sync::Arc};
 
 use arrow::ipc::reader::FileReader as ArrowFileReader;
@@ -9,7 +8,6 @@ use arrow::ipc::CompressionType;
 use arrow_array::{BooleanArray, RecordBatch, UInt32Array};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use bytes::Buf;
-use lru_time_cache::LruCache;
 use object_store::path::Path;
 use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
@@ -19,6 +17,7 @@ use super::ObjectStore;
 use crate::dataset::DELETION_DIRS;
 use crate::error::{box_error, CorruptFileSnafu};
 use crate::format::{DeletionFile, DeletionFileType, Fragment, Manifest};
+use crate::session::Session;
 use crate::{Error, Result};
 
 /// Threshold for when a DeletionVector::Set should be promoted to a DeletionVector::Bitmap.
@@ -334,67 +333,72 @@ pub async fn read_deletion_file(
     }
 }
 
+/// Cache wrapper for deletion vectors.
+///
+/// Note: This may be shared across versions of the same dataset.
 pub struct LruDeletionVectorStore {
-    // can't clone mutex, so need to arc it
-    cache: Arc<Mutex<LruCache<u64, Arc<DeletionVector>>>>,
+    session: Arc<Session>,
     object_store: Arc<ObjectStore>,
-    path: Path,
+    base_path: Path,
+    // TODO: This needs to change as we change dataset versions, otherwise we
+    // will be loading old versions of the deletion files.
     manifest: Arc<Manifest>,
 }
 
 impl LruDeletionVectorStore {
     pub(crate) fn new(
+        session: Arc<Session>,
         object_store: Arc<ObjectStore>,
-        path: Path,
+        base_path: Path,
         manifest: Arc<Manifest>,
-        cache_capacity: usize,
     ) -> Self {
         Self {
-            cache: Arc::new(Mutex::new(LruCache::with_capacity(cache_capacity))),
+            session,
             object_store,
-            path,
+            base_path,
             manifest,
         }
     }
 
     pub async fn is_deleted(&self, row_id: u64) -> Result<bool> {
-        let frag_id = row_id >> 32;
+        let fragment_id = row_id >> 32;
         let local_row_id = row_id as u32;
+        let fragment = self
+            .manifest
+            .as_ref()
+            .fragments
+            .as_ref()
+            .iter()
+            .find(|frag| frag.id == fragment_id);
 
-        let deletion_vec = {
-            let val_in_cache: Option<Arc<DeletionVector>> = {
-                let mut cache = self.cache.lock().unwrap();
-                cache.get(&frag_id).cloned()
-            };
+        // If fragment is gone, it must have been deleted.
+        let Some(fragment) = fragment else { return Ok(true) };
+        // If there's no deletion file, then the row is not deleted.
+        let Some(deletion_file) = &fragment.deletion_file else { return Ok(false) };
 
-            // Lock is released while we do IO so we block others or poision the lock
-            if val_in_cache.is_none() {
-                let fragment = self
-                    .manifest
-                    .as_ref()
-                    .fragments
-                    .as_ref()
-                    .iter()
-                    .find(|frag| frag.id == frag_id);
-                let dvec = match fragment {
-                    Some(frag) => {
-                        let dvec = read_deletion_file(&self.path, frag, self.object_store.as_ref())
-                            .await?;
-                        dvec.unwrap_or(DeletionVector::NoDeletions)
-                    }
-                    None => DeletionVector::NoDeletions,
-                };
+        let deletion_vector = {
+            let path = deletion_file_path(&self.base_path, fragment_id, deletion_file);
+            let val_in_cache: Option<Arc<DeletionVector>> =
+                self.session.file_metadata_cache.get(&path);
 
-                // IO is done, now lock again
-                let mut cache = self.cache.lock().unwrap();
-                cache.insert(frag_id, Arc::new(dvec));
-                cache.get(&frag_id).unwrap().clone()
+            if let Some(deletion_vector) = val_in_cache {
+                deletion_vector
             } else {
-                val_in_cache.unwrap()
+                let deletion_vector =
+                    read_deletion_file(&self.base_path, fragment, self.object_store.as_ref())
+                        .await?
+                        .unwrap_or(DeletionVector::NoDeletions);
+                let deletion_vector = Arc::new(deletion_vector);
+
+                self.session
+                    .file_metadata_cache
+                    .insert(path, deletion_vector.clone());
+
+                deletion_vector
             }
         };
 
-        Ok(match deletion_vec.as_ref() {
+        Ok(match deletion_vector.as_ref() {
             DeletionVector::Bitmap(bitmap) => bitmap.contains(local_row_id),
             DeletionVector::Set(set) => set.contains(&local_row_id),
             DeletionVector::NoDeletions => false,

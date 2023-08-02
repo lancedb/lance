@@ -15,8 +15,6 @@
 //! Flat Vector Index.
 //!
 
-use std::sync::Arc;
-
 use arrow::array::as_primitive_array;
 use arrow::datatypes::Float32Type;
 use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
