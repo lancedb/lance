@@ -63,10 +63,10 @@ is:
    * - ``id``
      - ``u32``
      - The fragment id for the fragment. These ids are unique to the fragments.
-   * - ``data_files.path``
+   * - ``data_files[].path``
      - ``string``
      - The path to the data file. This is relative to the dataset directory.
-   * - ``data_files.fields``
+   * - ``data_files[].fields``
      - ``list<u32>``
      - The list of field ids that are stored in the data file.
    * - ``deletion_file.file_type``
