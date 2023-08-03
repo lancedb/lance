@@ -17,13 +17,15 @@
 //! Based on the query, we might have information about which fragment ids and
 //! row ids can be excluded from the search.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::error::Result;
+use crate::io::deletion::DeletionVector;
 use crate::Dataset;
 
 /// Filter out row ids that we know are not relevant to the query. This currently
@@ -53,47 +55,51 @@ impl PreFilter {
     /// Returns a vector of indices into the input slice that should be included,
     /// also known as a selection vector.
     pub async fn filter_row_ids(&self, row_ids: &[u64]) -> Result<Vec<u64>> {
-        // Group by the fragment id so we reduce mutex contention on the cache.
-        let mut check_tasks = HashMap::new();
-        for (i, row_id) in row_ids.iter().enumerate() {
-            let fragment_id = (row_id >> 32) as u32;
-            let task = check_tasks.entry(fragment_id).or_insert_with(Vec::new);
-            task.push((i as u64, row_id));
-        }
-
         let dataset = self.dataset.as_ref();
-
-        let mut stream: BoxStream<_> = futures::stream::iter(check_tasks.drain())
-            .map(|(fragment_id, ids)| async move {
-                let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
-                        return Ok(vec![]);
-                    };
+        let mut relevant_fragments: HashMap<u32, _> = HashMap::new();
+        for row_id in row_ids {
+            let fragment_id = (row_id >> 32) as u32;
+            if let Entry::Vacant(entry) = relevant_fragments.entry(fragment_id) {
+                if let Some(fragment) = dataset.get_fragment(fragment_id as usize) {
+                    entry.insert(fragment);
+                }
+            }
+        }
+        let stream: BoxStream<_> = futures::stream::iter(relevant_fragments.drain())
+            .map(|(fragment_id, fragment)| async move {
                 let deletion_vector = match fragment.get_deletion_vector().await {
                     Ok(Some(deletion_vector)) => deletion_vector,
-                    Ok(None) => return Ok(ids.iter().map(|(i, _)| *i).collect()),
+                    Ok(None) => return Ok((fragment_id, None)),
                     Err(err) => return Err(err),
                 };
-
-                let mut selection = Vec::new();
-                for (i, row_id) in ids {
-                    let local_row_id = *row_id as u32;
-                    if !deletion_vector.contains(local_row_id) {
-                        selection.push(i);
-                    }
-                }
-
-                Ok(selection)
+                Ok((fragment_id, Some(deletion_vector)))
             })
             .buffer_unordered(num_cpus::get())
             .boxed();
+        let deletion_vector_map: HashMap<u32, Option<Arc<DeletionVector>>> =
+            stream.try_collect::<HashMap<_, _>>().await?;
 
-        let mut selection_vector = Vec::new();
-        while let Some(res) = stream.next().await {
-            let selection = res?;
-            selection_vector.extend(selection);
-        }
-
-        selection_vector.sort();
+        let selection_vector = row_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row_id)| {
+                let fragment_id = (row_id >> 32) as u32;
+                let local_row_id = *row_id as u32;
+                match deletion_vector_map.get(&fragment_id) {
+                    Some(Some(deletion_vector)) => {
+                        if deletion_vector.contains(local_row_id) {
+                            None
+                        } else {
+                            Some(i as u64)
+                        }
+                    }
+                    // If the fragment has no deletion vector, then the row must be there.
+                    Some(None) => Some(i as u64),
+                    // If the fragment isn't found, then it must have been deleted.
+                    None => None,
+                }
+            })
+            .collect::<Vec<u64>>();
 
         Ok(selection_vector)
     }
