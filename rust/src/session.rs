@@ -102,27 +102,17 @@ impl FileMetadataCache {
 mod tests {
     use super::*;
 
-    use crate::{
-        datatypes::Schema,
-        format::Manifest,
-        index::vector::{
-            pq::{PQIndex, ProductQuantizer},
-            MetricType,
-        },
-        io::ObjectStore,
+    use crate::index::vector::{
+        pq::{PQIndex, ProductQuantizer},
+        MetricType,
     };
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_disable_index_cache() {
         let no_cache = Session::new(0, 0);
         assert!(no_cache.index_cache.get("abc").is_none());
         let no_cache = Arc::new(no_cache);
-
-        let schema = Schema {
-            fields: vec![],
-            metadata: HashMap::new(),
-        };
 
         let pq = Arc::new(ProductQuantizer::new(1, 8, 1));
         let idx = Arc::new(PQIndex::new(pq, MetricType::L2));

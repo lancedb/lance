@@ -459,7 +459,6 @@ impl Scanner {
         plan = Arc::new(ProjectionExec::try_new(plan, output_schema)?);
 
         debug!("Execution plan:\n{:?}", plan);
-        dbg!(&plan);
 
         Ok(plan)
     }
@@ -692,7 +691,6 @@ mod test {
     use crate::arrow::*;
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
-    use crate::index::vector::diskann::DiskANNParams;
     use crate::index::{
         DatasetIndexExt,
         {vector::VectorIndexParams, IndexType},
@@ -1735,6 +1733,7 @@ mod test {
     #[tokio::test]
     async fn test_ann_with_deletion() {
         let vec_params = vec![
+            // TODO: re-enable diskann test when we can tune to get reproducible results.
             // VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::new(10, 1.5, 10)),
             VectorIndexParams::ivf_pq(4, 8, 2, false, MetricType::L2, 2),
         ];
