@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use super::Query;
 use crate::{
     arrow::linalg::matrix::MatrixView,
-    index::{pb::Transform, Index},
+    index::{pb::Transform, prefilter::PreFilter, Index},
     io::{object_reader::ObjectReader, object_writer::ObjectWriter},
     Result,
 };
@@ -47,7 +47,7 @@ pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
-    async fn search(&self, query: &Query) -> Result<RecordBatch>;
+    async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch>;
 
     /// If the index is loadable by IVF, so it can be a sub-index that
     /// is loaded on demand by IVF.

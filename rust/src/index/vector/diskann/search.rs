@@ -29,13 +29,13 @@ use super::row_vertex::{RowVertex, RowVertexSerDe};
 use crate::{
     dataset::{Dataset, ROW_ID},
     index::{
+        prefilter::PreFilter,
         vector::{
             graph::{GraphReadParams, PersistedGraph},
             DIST_COL,
         },
         Index,
     },
-    io::deletion::LruDeletionVectorStore,
     Result,
 };
 use crate::{
@@ -176,8 +176,6 @@ pub async fn greedy_search(
 
 pub struct DiskANNIndex {
     graph: PersistedGraph<RowVertex>,
-
-    deletion_cache: Arc<LruDeletionVectorStore>,
 }
 
 impl std::fmt::Debug for DiskANNIndex {
@@ -193,16 +191,12 @@ impl DiskANNIndex {
         dataset: Arc<Dataset>,
         index_column: &str,
         graph_path: &Path,
-        deletion_cache: Arc<LruDeletionVectorStore>,
     ) -> Result<Self> {
         let params = GraphReadParams::default();
         let serde = Arc::new(RowVertexSerDe::new());
         let graph =
             PersistedGraph::try_new(dataset, index_column, graph_path, params, serde).await?;
-        Ok(Self {
-            graph,
-            deletion_cache,
-        })
+        Ok(Self { graph })
     }
 }
 
@@ -214,7 +208,7 @@ impl Index for DiskANNIndex {
 
 #[async_trait]
 impl VectorIndex for DiskANNIndex {
-    async fn search(&self, query: &Query) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch> {
         let state = greedy_search(&self.graph, 0, query.key.values(), query.k, query.k * 2).await?;
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID, DataType::UInt64, false),
@@ -226,7 +220,7 @@ impl VectorIndex for DiskANNIndex {
             if candidates.len() == query.k {
                 break;
             }
-            if !self.deletion_cache.as_ref().is_deleted(row as u64).await? {
+            if pre_filter.check_one(row as u64).await? {
                 candidates.push((distance, row));
             }
         }

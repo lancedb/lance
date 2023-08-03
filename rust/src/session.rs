@@ -109,7 +109,7 @@ mod tests {
             pq::{PQIndex, ProductQuantizer},
             MetricType,
         },
-        io::{deletion::LruDeletionVectorStore, ObjectStore},
+        io::ObjectStore,
     };
     use std::{collections::HashMap, sync::Arc};
 
@@ -123,17 +123,9 @@ mod tests {
             fields: vec![],
             metadata: HashMap::new(),
         };
-        let manifest = Arc::new(Manifest::new(&schema, Arc::new(vec![])));
-        let object_store = Arc::new(ObjectStore::from_uri("memory://").await.unwrap().0);
-        let deletion_cache = Arc::new(LruDeletionVectorStore::new(
-            no_cache.clone(),
-            object_store.clone(),
-            object_store.as_ref().base_path().clone(),
-            manifest,
-        ));
 
         let pq = Arc::new(ProductQuantizer::new(1, 8, 1));
-        let idx = Arc::new(PQIndex::new(pq, MetricType::L2, deletion_cache));
+        let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
         no_cache.index_cache.insert("abc", idx);
 
         assert!(no_cache.index_cache.get("abc").is_none());

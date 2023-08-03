@@ -278,7 +278,7 @@ impl Index for OPQIndex {
 
 #[async_trait]
 impl VectorIndex for OPQIndex {
-    async fn search(&self, query: &Query) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, session: &Session) -> Result<RecordBatch> {
         let mat = MatrixView::new(query.key.clone(), query.key.len());
         let transformed = self.opq.transform(&mat).await?;
         let mut transformed_query = query.clone();
@@ -295,6 +295,7 @@ impl VectorIndex for OPQIndex {
         _reader: &dyn ObjectReader,
         _offset: usize,
         _length: usize,
+        _session: &Session,
     ) -> Result<Arc<dyn VectorIndex>> {
         Err(Error::Index {
             message: "OPQ does not support load".to_string(),

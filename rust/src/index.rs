@@ -29,6 +29,7 @@ pub mod pb {
 }
 
 pub(crate) mod cache;
+pub(crate) mod prefilter;
 pub mod vector;
 
 use crate::dataset::write_manifest_file;

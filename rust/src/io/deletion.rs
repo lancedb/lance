@@ -16,8 +16,7 @@ use snafu::ResultExt;
 use super::ObjectStore;
 use crate::dataset::DELETION_DIRS;
 use crate::error::{box_error, CorruptFileSnafu};
-use crate::format::{DeletionFile, DeletionFileType, Fragment, Manifest};
-use crate::session::Session;
+use crate::format::{DeletionFile, DeletionFileType, Fragment};
 use crate::{Error, Result};
 
 /// Threshold for when a DeletionVector::Set should be promoted to a DeletionVector::Bitmap.
@@ -330,79 +329,6 @@ pub async fn read_deletion_file(
 
             Ok(Some(DeletionVector::Bitmap(bitmap)))
         }
-    }
-}
-
-/// Cache wrapper for deletion vectors.
-///
-/// Note: This may be shared across versions of the same dataset.
-pub struct LruDeletionVectorStore {
-    session: Arc<Session>,
-    object_store: Arc<ObjectStore>,
-    base_path: Path,
-    // TODO: This needs to change as we change dataset versions, otherwise we
-    // will be loading old versions of the deletion files.
-    manifest: Arc<Manifest>,
-}
-
-impl LruDeletionVectorStore {
-    pub(crate) fn new(
-        session: Arc<Session>,
-        object_store: Arc<ObjectStore>,
-        base_path: Path,
-        manifest: Arc<Manifest>,
-    ) -> Self {
-        Self {
-            session,
-            object_store,
-            base_path,
-            manifest,
-        }
-    }
-
-    pub async fn is_deleted(&self, row_id: u64) -> Result<bool> {
-        let fragment_id = row_id >> 32;
-        let local_row_id = row_id as u32;
-        let fragment = self
-            .manifest
-            .as_ref()
-            .fragments
-            .as_ref()
-            .iter()
-            .find(|frag| frag.id == fragment_id);
-
-        // If fragment is gone, it must have been deleted.
-        let Some(fragment) = fragment else { return Ok(true) };
-        // If there's no deletion file, then the row is not deleted.
-        let Some(deletion_file) = &fragment.deletion_file else { return Ok(false) };
-
-        let deletion_vector = {
-            let path = deletion_file_path(&self.base_path, fragment_id, deletion_file);
-            let val_in_cache: Option<Arc<DeletionVector>> =
-                self.session.file_metadata_cache.get(&path);
-
-            if let Some(deletion_vector) = val_in_cache {
-                deletion_vector
-            } else {
-                let deletion_vector =
-                    read_deletion_file(&self.base_path, fragment, self.object_store.as_ref())
-                        .await?
-                        .unwrap_or(DeletionVector::NoDeletions);
-                let deletion_vector = Arc::new(deletion_vector);
-
-                self.session
-                    .file_metadata_cache
-                    .insert(path, deletion_vector.clone());
-
-                deletion_vector
-            }
-        };
-
-        Ok(match deletion_vector.as_ref() {
-            DeletionVector::Bitmap(bitmap) => bitmap.contains(local_row_id),
-            DeletionVector::Set(set) => set.contains(&local_row_id),
-            DeletionVector::NoDeletions => false,
-        })
     }
 }
 
