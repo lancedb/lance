@@ -652,8 +652,6 @@ impl Dataset {
         let mut sorted_row_ids = Vec::from(row_ids);
         sorted_row_ids.sort();
 
-        assert_eq!(row_ids.len(), sorted_row_ids.len());
-
         // Group ROW Ids by the fragment
         let mut row_ids_per_fragment: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
         sorted_row_ids.iter().for_each(|row_id| {
@@ -664,11 +662,6 @@ impl Dataset {
                 .and_modify(|v| v.push(offset))
                 .or_insert_with(|| vec![offset]);
         });
-
-        assert_eq!(
-            row_ids.len(),
-            row_ids_per_fragment.values().flatten().count()
-        );
 
         let fragments = self.get_fragments();
         let fragment_and_indices = fragments.iter().filter_map(|f| {
@@ -693,7 +686,9 @@ impl Dataset {
 
         let one_batch = concat_batches(&schema_with_row_id, &batches)?;
         // Note: one_batch may contains fewer rows than the number of requested
-        // row ids because some rows may have been deleted.
+        // row ids because some rows may have been deleted. Because of this, we
+        // get the results with row ids so that we can re-order the results
+        // to match the requested order.
 
         let returned_row_ids = one_batch
             .column_by_name(ROW_ID)

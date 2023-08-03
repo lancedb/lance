@@ -575,14 +575,6 @@ impl FragmentReader {
 
     pub(crate) fn with_row_id(&mut self) -> &mut Self {
         self.readers[0].0.with_row_id(true);
-        // self.readers[0].1 = self.readers[0]
-        //     .1
-        //     .merge(&ArrowSchema::new(vec![ArrowField::new(
-        //         ROW_ID,
-        //         DataType::UInt64,
-        //         false,
-        //     )]))
-        //     .unwrap();
         self
     }
 
@@ -627,7 +619,7 @@ impl FragmentReader {
         // Boxed to avoid lifetime issue.
         let stream: BoxStream<_> = futures::stream::iter(&self.readers)
             .map(|(reader, schema)| reader.take(indices, schema))
-            .buffered(4)
+            .buffered(num_cpus::get())
             .boxed();
         let batches: Vec<RecordBatch> = stream.try_collect::<Vec<_>>().await?;
 

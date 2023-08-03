@@ -58,7 +58,6 @@ impl Take {
 
         let bg_thread = tokio::spawn(async move {
             if let Err(e) = child
-                .try_filter(|batch| futures::future::ready(batch.num_rows() > 0))
                 .zip(stream::repeat_with(|| {
                     (dataset.clone(), projection.clone())
                 }))

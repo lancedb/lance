@@ -239,8 +239,6 @@ impl VectorIndex for PQIndex {
 
         let (code, row_ids) = self.filter_arrays(pre_filter).await?;
 
-        // let code = self.code.as_ref().unwrap();
-        // let row_ids = self.row_ids.as_ref().unwrap();
         assert_eq!(code.len() % self.num_sub_vectors, 0);
 
         let distances = if self.metric_type == MetricType::L2 {
@@ -274,8 +272,6 @@ impl VectorIndex for PQIndex {
         offset: usize,
         length: usize,
     ) -> Result<Arc<dyn VectorIndex>> {
-        // TODO: is this the right place to filter even? Because I think this
-        // might get cached, which is bad.
         let pq_code_length = self.pq.num_sub_vectors * length;
         let pq_code =
             read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;

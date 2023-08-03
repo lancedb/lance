@@ -45,6 +45,9 @@ pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// ]);
     /// ```
     ///
+    /// The `pre_filter` argument is used to filter out row ids that we know are
+    /// not relevant to the query. For example, it removes deleted rows.
+    ///
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
     async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch>;
