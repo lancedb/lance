@@ -706,14 +706,12 @@ impl Dataset {
             .iter()
             .filter_map(|o| returned_row_ids.binary_search(o).ok().map(|pos| pos as u64))
             .collect();
-        let num_rows = one_batch.num_rows();
 
         // Remove the row id column.
         let keep_indices = (0..one_batch.num_columns() - 1).collect::<Vec<_>>();
         let one_batch = one_batch.project(&keep_indices)?;
         let struct_arr: StructArray = one_batch.into();
         let reordered = take(&struct_arr, &remapping_index, None)?;
-        assert_eq!(reordered.len(), num_rows);
         Ok(as_struct_array(&reordered).into())
     }
 
