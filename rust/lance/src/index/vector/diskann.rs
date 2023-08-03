@@ -148,12 +148,12 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
         // Make sure valid arguments should create index successfully
         let params =
             VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::default());
-        let dataset = dataset
+        dataset
             .create_index(&["embeddings"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();

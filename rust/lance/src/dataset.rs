@@ -2141,12 +2141,12 @@ mod tests {
 
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
-        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
         dataset.validate().await.unwrap();
 
         // Make sure valid arguments should create index successfully
         let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 50);
-        let dataset = dataset
+        dataset
             .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();

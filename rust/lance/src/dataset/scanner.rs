@@ -1046,7 +1046,7 @@ mod test {
         };
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
-        let dataset = Dataset::write(reader, path, Some(params)).await.unwrap();
+        let mut dataset = Dataset::write(reader, path, Some(params)).await.unwrap();
 
         if build_index {
             let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
@@ -1982,9 +1982,9 @@ mod test {
             .unwrap()];
 
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-            let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+            let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
-            let mut dataset = dataset
+            dataset
                 .create_index(
                     &["vec"],
                     IndexType::Vector,
