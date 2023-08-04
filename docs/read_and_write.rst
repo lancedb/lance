@@ -131,29 +131,6 @@ mechanism.
   This will be fixed in future releases.
 
 
-
-Committing mechanisms for S3
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Most supported storage systems (e.g. local file system, Google Cloud Storage,
-Azure Blob Store) natively support atomic commits, which prevent concurrent
-writers from corrupting the dataset. However, S3 does not support this natively.
-To work around this, you may provide a locking mechanism that Lance can use to
-lock the table while providing a write. To do so, you should implement classes
-subclassing :py:class:`lance.commit.CommitLock` and 
-:py:class:`lance.commit.CommitLease`. Then you can pass the commit lock to the
-``commit_lock`` parameter of :py:meth:`lance.write_dataset`.
-
-In order for the locking mechanism to work, all writers must use the same exact
-mechanism.
-
-.. warning::
-
-  Lance _detects_ but does not yet resolve conflicts. So if there are multiple
-  writers, only one will succeed if they try to commit at exactly the same time.
-  This will be fixed in future releases.
-
-
 Reading Lance Dataset
 ---------------------
 
