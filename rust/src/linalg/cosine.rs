@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use arrow_array::Float32Array;
 use num_traits::real::Real;
+use half::f16;
 
 use super::dot::dot;
 use super::norm_l2::norm_l2;
@@ -30,6 +31,18 @@ pub trait Cosine {
 
     /// Fast cosine function, that assumes that the norm of the first vector is already known.
     fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output;
+}
+
+impl Cosine for [f16] {
+    type Output = f16;
+
+    fn cosine(&self, other: &Self) -> Self::Output {
+        todo!()
+    }
+
+    fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output {
+        todo!()
+    }
 }
 
 impl Cosine for [f32] {
@@ -78,7 +91,7 @@ pub fn cosine_distance(from: &[f32], to: &[f32]) -> f32 {
 /// Cosine Distance
 ///
 /// <https://en.wikipedia.org/wiki/Cosine_similarity>
-pub fn cosine_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Float32Array> {
+pub fn cosine_distance_batch<T: Cosine>(from: &T, to: &T, dimension: usize) -> Arc<> {
     let x_norm = norm_l2(from);
 
     let dists = unsafe {
@@ -190,6 +203,9 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
+    use arrow_array::Float16Array;
+    use half::f16;
+    use num_traits::{AsPrimitive, FromPrimitive};
 
     #[test]
     fn test_cosine() {
@@ -213,5 +229,12 @@ mod tests {
         let d = cosine_distance_batch(x.values(), y.values(), 2);
         assert_relative_eq!(d.value(0), 0.0);
         assert_relative_eq!(d.value(1), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_f16() {
+        let x: Float16Array = (1..9).map(|v| f16::from_i32(v)).collect();
+        let y: Float16Array = (100..108).map(|v| f16::from_i32(v)).collect();
+        let d = cosine_distance_batch(x.values(), y.values(), 8);
     }
 }
