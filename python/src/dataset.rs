@@ -27,6 +27,7 @@ use lance::datatypes::Schema;
 use lance::format::Fragment;
 use lance::index::vector::ivf::IvfBuildParams;
 use lance::index::vector::pq::PQBuildParams;
+use lance::io::object_store::ObjectStoreParams;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong};
@@ -43,6 +44,10 @@ use lance::index::{
     vector::{MetricType, VectorIndexParams},
     DatasetIndexExt, IndexType,
 };
+
+use self::commit::PyCommitLock;
+
+pub mod commit;
 
 const DEFAULT_NPROBS: usize = 1;
 const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
@@ -558,6 +563,16 @@ pub(crate) fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>
         if let Some(maybe_nrows) = options.get_item("max_rows_per_group") {
             p.max_rows_per_group = usize::extract(maybe_nrows)?;
         }
+
+        if let Some(commit_handler) = options.get_item("commit_handler") {
+            let py_commit_lock = PyCommitLock::new(commit_handler.to_object(options.py()));
+            let object_store_params = ObjectStoreParams {
+                commit_handler: Some(Arc::new(py_commit_lock)),
+                ..Default::default()
+            };
+            p.store_params = Some(object_store_params);
+        }
+
         Some(p)
     };
     Ok(params)

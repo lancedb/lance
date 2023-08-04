@@ -236,14 +236,14 @@ impl ObjectStore {
         let (object_store, base_path) = match Url::parse(uri) {
             Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
                 // On Windows, the drive is parsed as a scheme
-                Self::new_from_path(uri)
+                Self::new_from_path(uri, &params)
             }
             Ok(url) => {
                 let store = Self::new_from_url(url.clone(), &params).await?;
                 let path = Path::from(url.path());
                 Ok((store, path))
             }
-            Err(_) => Self::new_from_path(uri),
+            Err(_) => Self::new_from_path(uri, &params),
         }?;
 
         Ok((
@@ -258,7 +258,7 @@ impl ObjectStore {
         ))
     }
 
-    fn new_from_path(str_path: &str) -> Result<(Self, Path)> {
+    fn new_from_path(str_path: &str, params: &ObjectStoreParams) -> Result<(Self, Path)> {
         let expanded = tilde(str_path).to_string();
         let expanded_path = StdPath::new(&expanded);
 
@@ -277,7 +277,10 @@ impl ObjectStore {
                 scheme: String::from("file"),
                 base_path: Path::from_absolute_path(&expanded_path)?,
                 block_size: 4 * 1024, // 4KB block size
-                commit_handler: Arc::new(RenameCommitHandler),
+                commit_handler: params
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
             },
             Path::from_filesystem_path(&expanded_path)?,
         ))
@@ -323,7 +326,7 @@ impl ObjectStore {
                     .clone()
                     .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
             }),
-            "file" => Ok(Self::new_from_path(url.path())?.0),
+            "file" => Ok(Self::new_from_path(url.path(), params)?.0),
             "memory" => Ok(Self {
                 inner: Arc::new(InMemory::new()),
                 scheme: String::from("memory"),
