@@ -119,7 +119,7 @@ impl CommitHandler for UnsafeCommitHandler {
             WARNED_ON_UNSAFE_COMMIT.store(true, std::sync::atomic::Ordering::Relaxed);
             log::warn!(
                 "Using unsafe commit handler. Concurrent writes may result in data loss. \
-                        Consider providing a commit handler that prevents conflicting writes."
+                 Consider providing a commit handler that prevents conflicting writes."
             );
         }
 

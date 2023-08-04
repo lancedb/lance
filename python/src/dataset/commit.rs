@@ -14,15 +14,31 @@
 
 use std::fmt::Debug;
 
-use lance::{
-    io::commit::{CommitError, CommitLease, CommitLock},
-    Error,
-};
-use pyo3::prelude::*;
+use lance::io::commit::{CommitError, CommitLease, CommitLock};
+use lance::Error;
 
-fn handle_error(py_err: PyErr) -> Error {
-    Error::Internal {
-        message: format!("Error from commit handler: {}", py_err),
+use pyo3::{exceptions::PyIOError, prelude::*};
+
+fn handle_error(py_err: PyErr, py: Python) -> CommitError {
+    let py_conflict_error = py
+        .import("lance")
+        .and_then(|lance| lance.getattr("commit"))
+        .and_then(|commit| commit.getattr("CommitConflictError"))
+        .map_err(|err| {
+            CommitError::OtherError(Error::Internal {
+                message: format!("Error importing from pylance {}", err),
+            })
+        })
+        .and_then(|exception| Ok(exception.get_type()));
+    let Ok(py_conflict_error) = py_conflict_error else {
+        return py_conflict_error.unwrap_err();
+    };
+    if py_err.is_instance(py, py_conflict_error) {
+        CommitError::CommitConflict
+    } else {
+        CommitError::OtherError(Error::Internal {
+            message: format!("Error from commit handler: {}", py_err),
+        })
     }
 }
 
@@ -55,26 +71,17 @@ impl CommitLock for PyCommitLock {
     type Lease = PyCommitLease;
 
     async fn lock(&self, version: u64) -> Result<Self::Lease, CommitError> {
-        let lease = Python::with_gil(|py| {
-            let py_conflict_error = py
-                .import("lance")
-                .map_err(handle_error)?
-                .getattr("commit")
-                .map_err(handle_error)?
-                .getattr("CommitConflictError")
-                .map_err(handle_error)?
-                .get_type();
-            self.inner
-                .call_method1(py, "lock", (version,))
-                .map_err(|err| {
-                    if err.is_instance(py, py_conflict_error) {
-                        CommitError::CommitConflict
-                    } else {
-                        CommitError::OtherError(handle_error(err))
-                    }
-                })
-        });
-        Ok(PyCommitLease { inner: lease? })
+        let lease = Python::with_gil(|py| -> Result<_, CommitError> {
+            let lease = self
+                .inner
+                .call1(py, (version,))
+                .map_err(|err| handle_error(err, py))?;
+            lease
+                .call_method0(py, "__enter__")
+                .map_err(|err| handle_error(err, py))?;
+            Ok(lease)
+        })?;
+        Ok(PyCommitLease { inner: lease })
     }
 }
 
@@ -86,9 +93,33 @@ pub struct PyCommitLease {
 impl CommitLease for PyCommitLease {
     async fn release(&self, success: bool) -> Result<(), CommitError> {
         Python::with_gil(|py| {
-            self.inner
-                .call_method1(py, "release", (success,))
-                .map_err(handle_error)
+            if success {
+                self.inner
+                    .call_method1(py, "__exit__", (py.None(), py.None(), py.None()))
+                    .map_err(|err| handle_error(err, py))
+            } else {
+                // If the commit failed, we pass up an exception to the
+                // context manager.
+                PyIOError::new_err("commit failed").restore(py);
+                let args = py
+                    .import("sys")
+                    .unwrap()
+                    .getattr("exc_info")
+                    .unwrap()
+                    .call0()
+                    .unwrap();
+                self.inner
+                    .call_method1(
+                        py,
+                        "__exit__",
+                        (
+                            args.get_item(0).unwrap(),
+                            args.get_item(1).unwrap(),
+                            args.get_item(2).unwrap(),
+                        ),
+                    )
+                    .map_err(|err| handle_error(err, py))
+            }
         })?;
         Ok(())
     }

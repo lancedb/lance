@@ -985,10 +985,8 @@ def write_dataset(
     }
 
     if commit_lock:
-        if not isinstance(commit_lock, CommitLock):
-            raise TypeError(
-                f"commit_lock must be of type CommitLock, got {type(commit_lock)}"
-            )
+        if not callable(commit_lock):
+            raise TypeError(f"commit_lock must be a function, got {type(commit_lock)}")
         params["commit_handler"] = commit_lock
 
     uri = os.fspath(uri) if isinstance(uri, Path) else uri

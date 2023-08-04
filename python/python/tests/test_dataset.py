@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import contextlib
 import os
 import pickle
 import platform
@@ -31,7 +32,7 @@ import pyarrow as pa
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
-from lance.commit import CommitConflictError, CommitLease, CommitLock
+from lance.commit import CommitConflictError
 
 
 def test_dataset_overwrite(tmp_path: Path):
@@ -534,39 +535,38 @@ def test_custom_commit_lock(tmp_path: Path):
     called_lock = False
     called_release = False
 
-    class TestLock(CommitLock):
-        def lock(self, version: int):
-            nonlocal called_lock
-            called_lock = True
-            assert version == 1
-            return TestLease()
-
-    class TestLease(CommitLease):
-        def release(self, success: bool):
-            nonlocal called_release
-            called_release = True
-            assert success
+    @contextlib.contextmanager
+    def commit_lock(version: int):
+        nonlocal called_lock
+        nonlocal called_release
+        called_lock = True
+        assert version == 1
+        yield
+        called_release = True
 
     lance.write_dataset(
-        pa.table({"a": range(100)}), tmp_path / "test1", commit_lock=TestLock()
+        pa.table({"a": range(100)}), tmp_path / "test1", commit_lock=commit_lock
     )
     assert called_lock
     assert called_release
 
-    class TestLease(CommitLease):  # noqa
-        def release(self, _success: bool):
+    @contextlib.contextmanager
+    def commit_lock(_version: int):
+        try:
+            yield
+        finally:
             raise Exception("hello world!")
 
     with pytest.raises(Exception, match="hello world!"):
         lance.write_dataset(
-            pa.table({"a": range(100)}), tmp_path / "test2", commit_lock=TestLock()
+            pa.table({"a": range(100)}), tmp_path / "test2", commit_lock=commit_lock
         )
 
-    class TestLock(CommitLock):
-        def lock(self, _version: int):
-            raise CommitConflictError()
+    @contextlib.contextmanager
+    def commit_lock(_version: int):
+        raise CommitConflictError()
 
     with pytest.raises(Exception, match="CommitConflictError"):
         lance.write_dataset(
-            pa.table({"a": range(100)}), tmp_path / "test3", commit_lock=TestLock()
+            pa.table({"a": range(100)}), tmp_path / "test3", commit_lock=commit_lock
         )
