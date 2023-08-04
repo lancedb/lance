@@ -46,7 +46,7 @@ use crate::{
     arrow::{linalg::matrix::MatrixView, *},
     dataset::{Dataset, ROW_ID},
     datatypes::Field,
-    index::{pb, vector::Transformer, Index},
+    index::{pb, prefilter::PreFilter, vector::Transformer, Index},
 };
 use crate::{io::object_reader::ObjectReader, session::Session};
 use crate::{Error, Result};
@@ -97,7 +97,12 @@ impl IVFIndex {
         })
     }
 
-    async fn search_in_partition(&self, partition_id: usize, query: &Query) -> Result<RecordBatch> {
+    async fn search_in_partition(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: &PreFilter,
+    ) -> Result<RecordBatch> {
         let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
         let part_index = if let Some(part_idx) = self.session.index_cache.get(&cache_key) {
             part_idx
@@ -117,7 +122,7 @@ impl IVFIndex {
         // Query in partition.
         let mut part_query = query.clone();
         part_query.key = as_primitive_array(&residual_key).clone().into();
-        let batch = part_index.search(&part_query).await?;
+        let batch = part_index.search(&part_query, pre_filter).await?;
         Ok(batch)
     }
 }
@@ -136,14 +141,17 @@ impl Index for IVFIndex {
 
 #[async_trait]
 impl VectorIndex for IVFIndex {
-    async fn search(&self, query: &Query) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch> {
         let partition_ids =
             self.ivf
                 .find_partitions(&query.key, query.nprobes, self.metric_type)?;
         assert!(partition_ids.len() <= query.nprobes);
         let part_ids = partition_ids.values().to_vec();
         let batches = stream::iter(part_ids)
-            .map(|part_id| async move { self.search_in_partition(part_id as usize, query).await })
+            .map(|part_id| async move {
+                self.search_in_partition(part_id as usize, query, pre_filter)
+                    .await
+            })
             .buffer_unordered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;

@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use super::Query;
 use crate::{
     arrow::linalg::matrix::MatrixView,
-    index::{pb::Transform, Index},
+    index::{pb::Transform, prefilter::PreFilter, Index},
     io::{object_reader::ObjectReader, object_writer::ObjectWriter},
     Result,
 };
@@ -45,9 +45,12 @@ pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// ]);
     /// ```
     ///
+    /// The `pre_filter` argument is used to filter out row ids that we know are
+    /// not relevant to the query. For example, it removes deleted rows.
+    ///
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
-    async fn search(&self, query: &Query) -> Result<RecordBatch>;
+    async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch>;
 
     /// If the index is loadable by IVF, so it can be a sub-index that
     /// is loaded on demand by IVF.

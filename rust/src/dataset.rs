@@ -23,7 +23,7 @@ use std::time::SystemTime;
 use arrow_array::{
     cast::as_struct_array, RecordBatch, RecordBatchReader, StructArray, UInt64Array,
 };
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -662,33 +662,54 @@ impl Dataset {
                 .and_modify(|v| v.push(offset))
                 .or_insert_with(|| vec![offset]);
         });
-        let schema = Arc::new(ArrowSchema::from(projection));
+
         let fragments = self.get_fragments();
-        let fragment_and_indices = fragments
-            .iter()
-            .map(|f| {
-                (
-                    f,
-                    row_ids_per_fragment.get(&(f.id() as u64)),
-                    schema.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let fragment_and_indices = fragments.iter().filter_map(|f| {
+            let local_row_ids = row_ids_per_fragment.get(&(f.id() as u64))?;
+            Some((f, local_row_ids))
+        });
+
+        let projection_with_row_id = Schema::merge(
+            projection,
+            &ArrowSchema::new(vec![ArrowField::new(
+                ROW_ID,
+                arrow::datatypes::DataType::UInt64,
+                false,
+            )]),
+        )?;
+        let schema_with_row_id = Arc::new(ArrowSchema::from(&projection_with_row_id));
+
         let batches = stream::iter(fragment_and_indices)
-            .then(|(fragment, indices_opt, schema)| async move {
-                let Some(indices) = indices_opt else {
-                    return Ok(RecordBatch::new_empty(schema));
-                };
-                fragment.take(indices.as_slice(), projection).await
-            })
+            .then(|(fragment, indices)| fragment.take_rows(indices, projection, true))
             .try_collect::<Vec<_>>()
             .await?;
-        let one_batch = concat_batches(&schema, &batches)?;
+
+        let one_batch = concat_batches(&schema_with_row_id, &batches)?;
+        // Note: one_batch may contains fewer rows than the number of requested
+        // row ids because some rows may have been deleted. Because of this, we
+        // get the results with row ids so that we can re-order the results
+        // to match the requested order.
+
+        let returned_row_ids = one_batch
+            .column_by_name(ROW_ID)
+            .ok_or_else(|| Error::Internal {
+                message: "ROW_ID column not found".into(),
+            })?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::Internal {
+                message: "ROW_ID column is not UInt64Array".into(),
+            })?
+            .values();
 
         let remapping_index: UInt64Array = row_ids
             .iter()
-            .map(|o| sorted_row_ids.binary_search(o).unwrap() as u64)
+            .filter_map(|o| returned_row_ids.binary_search(o).ok().map(|pos| pos as u64))
             .collect();
+
+        // Remove the row id column.
+        let keep_indices = (0..one_batch.num_columns() - 1).collect::<Vec<_>>();
+        let one_batch = one_batch.project(&keep_indices)?;
         let struct_arr: StructArray = one_batch.into();
         let reordered = take(&struct_arr, &remapping_index, None)?;
         Ok(as_struct_array(&reordered).into())
@@ -1581,26 +1602,20 @@ mod tests {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params))
+        let mut dataset = Dataset::write(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
-        let dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(dataset.count_rows().await.unwrap(), 400);
         let projection = Schema::try_from(schema.as_ref()).unwrap();
-        let values = dataset
-            .take_rows(
-                &[
-                    5_u64 << 32,        // 200
-                    (4_u64 << 32) + 39, // 199
-                    39,                 // 39
-                    1_u64 << 32,        // 40
-                    (2_u64 << 32) + 20, // 100
-                ],
-                &projection,
-            )
-            .await
-            .unwrap();
+        let indices = &[
+            5_u64 << 32,        // 200
+            (4_u64 << 32) + 39, // 199
+            39,                 // 39
+            1_u64 << 32,        // 40
+            (2_u64 << 32) + 20, // 100
+        ];
+        let values = dataset.take_rows(indices, &projection).await.unwrap();
         assert_eq!(
             RecordBatch::try_new(
                 schema.clone(),
@@ -1614,6 +1629,28 @@ mod tests {
             .unwrap(),
             values
         );
+
+        // Delete some rows from a fragment
+        dataset.delete("i in (199, 100)").await.unwrap();
+        dataset.validate().await.unwrap();
+        let values = dataset.take_rows(indices, &projection).await.unwrap();
+        assert_eq!(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values([200, 39, 40])),
+                    Arc::new(StringArray::from_iter_values(
+                        [200, 39, 40].iter().map(|v| format!("str-{v}"))
+                    )),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+
+        // Take an empty selection.
+        let values = dataset.take_rows(&[], &projection).await.unwrap();
+        assert_eq!(RecordBatch::new_empty(schema.clone()), values);
     }
 
     #[tokio::test]

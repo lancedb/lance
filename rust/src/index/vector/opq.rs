@@ -28,6 +28,7 @@ use super::{
     MetricType, Query, Transformer, VectorIndex,
 };
 use crate::index::pb::{Transform, TransformType};
+use crate::index::prefilter::PreFilter;
 use crate::io::{
     object_reader::{read_fixed_stride_array, ObjectReader},
     object_writer::ObjectWriter,
@@ -278,12 +279,12 @@ impl Index for OPQIndex {
 
 #[async_trait]
 impl VectorIndex for OPQIndex {
-    async fn search(&self, query: &Query) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch> {
         let mat = MatrixView::new(query.key.clone(), query.key.len());
         let transformed = self.opq.transform(&mat).await?;
         let mut transformed_query = query.clone();
         transformed_query.key = transformed.data();
-        self.sub_index.search(&transformed_query).await
+        self.sub_index.search(&transformed_query, pre_filter).await
     }
 
     fn is_loadable(&self) -> bool {
@@ -390,9 +391,8 @@ mod tests {
             .unwrap();
         let uuid = index_file.file_name().to_str().unwrap().to_string();
 
-        let index = open_index(Arc::new(dataset), "vector", &uuid)
-            .await
-            .unwrap();
+        let dataset = Arc::new(dataset);
+        let index = open_index(dataset.clone(), "vector", &uuid).await.unwrap();
 
         if with_opq {
             let opq_idx = index.as_any().downcast_ref::<OPQIndex>().unwrap();
@@ -414,7 +414,8 @@ mod tests {
             use_index: true,
             key: Float32Array::from_iter_values((0..64).map(|x| x as f32 + 640.0)).into(),
         };
-        let results = index.search(&query).await.unwrap();
+        let pre_filter = PreFilter::new(dataset);
+        let results = index.search(&query, &pre_filter).await.unwrap();
         let row_ids: &UInt64Array = as_primitive_array(&results[ROW_ID]);
         assert_eq!(row_ids.len(), 4);
         assert!(row_ids.values().contains(&10));

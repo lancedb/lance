@@ -17,8 +17,6 @@ use std::sync::Arc;
 
 use arrow::datatypes::Float32Type;
 use arrow_arith::aggregate::min;
-use arrow_array::builder::UInt64Builder;
-use arrow_array::types::UInt64Type;
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray,
     Float32Array, RecordBatch, UInt64Array, UInt8Array,
@@ -34,9 +32,9 @@ use super::{MetricType, Query, VectorIndex};
 use crate::arrow::linalg::matrix::MatrixView;
 use crate::arrow::*;
 use crate::dataset::ROW_ID;
+use crate::index::prefilter::PreFilter;
 use crate::index::Index;
 use crate::index::{pb, vector::kmeans::train_kmeans, vector::DIST_COL};
-use crate::io::deletion::LruDeletionVectorStore;
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::linalg::{l2::l2_distance_batch, norm_l2::norm_l2};
 use crate::{Error, Result};
@@ -66,9 +64,6 @@ pub struct PQIndex {
 
     /// Metric type.
     metric_type: MetricType,
-
-    /// Deletion vector cache.
-    deletion_lookup_cache: Arc<LruDeletionVectorStore>,
 }
 
 impl std::fmt::Debug for PQIndex {
@@ -83,11 +78,7 @@ impl std::fmt::Debug for PQIndex {
 
 impl PQIndex {
     /// Load a PQ index (page) from the disk.
-    pub(crate) fn new(
-        pq: Arc<ProductQuantizer>,
-        metric_type: MetricType,
-        deletion_cache: Arc<LruDeletionVectorStore>,
-    ) -> Self {
+    pub(crate) fn new(pq: Arc<ProductQuantizer>, metric_type: MetricType) -> Self {
         Self {
             nbits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors,
@@ -96,11 +87,10 @@ impl PQIndex {
             row_ids: None,
             pq,
             metric_type,
-            deletion_lookup_cache: deletion_cache,
         }
     }
 
-    fn fast_l2_distances(&self, key: &Float32Array) -> Result<ArrayRef> {
+    fn fast_l2_distances(&self, key: &Float32Array, code: &UInt8Array) -> Result<ArrayRef> {
         // Build distance table for each sub-centroid to the query key.
         //
         // Distance table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
@@ -122,26 +112,21 @@ impl PQIndex {
 
         Ok(Arc::new(unsafe {
             Float32Array::from_trusted_len_iter(
-                self.code
-                    .as_ref()
-                    .unwrap()
-                    .values()
-                    .chunks_exact(self.num_sub_vectors)
-                    .map(|c| {
-                        Some(
-                            c.iter()
-                                .enumerate()
-                                .map(|(sub_vec_idx, centroid)| {
-                                    distance_table[sub_vec_idx * 256 + *centroid as usize]
-                                })
-                                .sum::<f32>(),
-                        )
-                    }),
+                code.values().chunks_exact(self.num_sub_vectors).map(|c| {
+                    Some(
+                        c.iter()
+                            .enumerate()
+                            .map(|(sub_vec_idx, centroid)| {
+                                distance_table[sub_vec_idx * 256 + *centroid as usize]
+                            })
+                            .sum::<f32>(),
+                    )
+                }),
             )
         }))
     }
 
-    fn cosine_distances(&self, key: &Float32Array) -> Result<ArrayRef> {
+    fn cosine_distances(&self, key: &Float32Array, code: &UInt8Array) -> Result<ArrayRef> {
         // Build two tables for cosine distance.
         //
         // xy table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
@@ -182,31 +167,56 @@ impl PQIndex {
         }
 
         Ok(Arc::new(Float32Array::from_iter(
-            self.code
-                .as_ref()
-                .unwrap()
-                .values()
-                .chunks_exact(self.num_sub_vectors)
-                .map(|c| {
-                    let xy = c
-                        .iter()
-                        .enumerate()
-                        .map(|(sub_vec_idx, centroid)| {
-                            let idx = sub_vec_idx * 256 + *centroid as usize;
-                            xy_table[idx]
-                        })
-                        .sum::<f32>();
-                    let y_norm = c
-                        .iter()
-                        .enumerate()
-                        .map(|(sub_vec_idx, centroid)| {
-                            let idx = sub_vec_idx * 256 + *centroid as usize;
-                            y_norm_table[idx]
-                        })
-                        .sum::<f32>();
-                    xy / (x_norm.sqrt() * y_norm.sqrt())
-                }),
+            code.values().chunks_exact(self.num_sub_vectors).map(|c| {
+                let xy = c
+                    .iter()
+                    .enumerate()
+                    .map(|(sub_vec_idx, centroid)| {
+                        let idx = sub_vec_idx * 256 + *centroid as usize;
+                        xy_table[idx]
+                    })
+                    .sum::<f32>();
+                let y_norm = c
+                    .iter()
+                    .enumerate()
+                    .map(|(sub_vec_idx, centroid)| {
+                        let idx = sub_vec_idx * 256 + *centroid as usize;
+                        y_norm_table[idx]
+                    })
+                    .sum::<f32>();
+                xy / (x_norm.sqrt() * y_norm.sqrt())
+            }),
         )))
+    }
+
+    /// Filter the row id and PQ code arrays based on the pre-filter.
+    async fn filter_arrays(
+        &self,
+        pre_filter: &PreFilter,
+    ) -> Result<(Arc<UInt8Array>, Arc<UInt64Array>)> {
+        if self.code.is_none() || self.row_ids.is_none() {
+            return Err(Error::Index {
+                message: "PQIndex::filter_arrays: PQ is not initialized".to_string(),
+            });
+        }
+        let code = self.code.clone().unwrap();
+        let row_ids = self.row_ids.clone().unwrap();
+        let indices_to_keep = pre_filter.filter_row_ids(row_ids.values()).await?;
+        let indices_to_keep = UInt64Array::from(indices_to_keep);
+
+        let row_ids = take(row_ids.as_ref(), &indices_to_keep, None)?;
+        let row_ids = Arc::new(as_primitive_array(&row_ids).clone());
+
+        let code = FixedSizeListArray::try_new_from_values(
+            code.as_ref().clone(),
+            self.pq.num_sub_vectors as i32,
+        )
+        .unwrap();
+        let code = take(&code, &indices_to_keep, None)?;
+        let code = as_fixed_size_list_array(&code).values().clone();
+        let code = Arc::new(as_primitive_array(&code).clone());
+
+        Ok((code, row_ids))
     }
 }
 
@@ -220,22 +230,24 @@ impl Index for PQIndex {
 impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
-    async fn search(&self, query: &Query) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch> {
         if self.code.is_none() || self.row_ids.is_none() {
             return Err(Error::Index {
                 message: "PQIndex::search: PQ is not initialized".to_string(),
             });
         }
 
-        let code = self.code.as_ref().unwrap();
-        let row_ids = self.row_ids.as_ref().unwrap();
+        let (code, row_ids) = self.filter_arrays(pre_filter).await?;
+
         assert_eq!(code.len() % self.num_sub_vectors, 0);
 
         let distances = if self.metric_type == MetricType::L2 {
-            self.fast_l2_distances(&query.key)?
+            self.fast_l2_distances(&query.key, code.as_ref())?
         } else {
-            self.cosine_distances(&query.key)?
+            self.cosine_distances(&query.key, code.as_ref())?
         };
+
+        debug_assert_eq!(distances.len(), row_ids.len());
 
         let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
         let indices = sort_to_indices(&distances, None, Some(limit))?;
@@ -268,26 +280,14 @@ impl VectorIndex for PQIndex {
         let row_ids =
             read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
 
-        let mut filtered_row_id_builder = UInt64Builder::new();
-        let deletion_checker = self.deletion_lookup_cache.as_ref();
-        // TODO: consider a more optimized way of reading
-        // group by frag_id and check per frag in one go
-        for row_id in as_primitive_array::<UInt64Type>(row_ids.as_ref()) {
-            let row = row_id.expect("Found null row id.");
-            if !deletion_checker.is_deleted(row).await? {
-                filtered_row_id_builder.append_value(row);
-            }
-        }
-
         Ok(Arc::new(Self {
             nbits: self.pq.num_bits,
             num_sub_vectors: self.pq.num_sub_vectors,
             dimension: self.pq.dimension,
             code: Some(Arc::new(as_primitive_array(&pq_code).clone())),
-            row_ids: Some(Arc::new(filtered_row_id_builder.finish())),
+            row_ids: Some(Arc::new(as_primitive_array(&row_ids).clone())),
             pq: self.pq.clone(),
             metric_type: self.metric_type,
-            deletion_lookup_cache: self.deletion_lookup_cache.clone(),
         }))
     }
 }

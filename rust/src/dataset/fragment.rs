@@ -14,13 +14,15 @@
 
 //! Wraps a Fragment of the dataset.
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
 use futures::future::try_join_all;
-use futures::{join, TryFutureExt, TryStreamExt};
+use futures::stream::BoxStream;
+use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
 use object_store::path::Path;
 use uuid::Uuid;
 
@@ -31,7 +33,9 @@ use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
 use crate::format::Fragment;
-use crate::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
+use crate::io::deletion::{
+    deletion_file_path, read_deletion_file, write_deletion_file, DeletionVector,
+};
 use crate::io::{FileReader, FileWriter, ObjectStore, ReadBatchParams};
 use crate::{Error, Result};
 
@@ -279,10 +283,111 @@ impl FileFragment {
         Ok(())
     }
 
-    /// Take rows from this fragment.
+    /// Take rows from this fragment based on the offset in the file.
+    ///
+    /// This will always return the same number of rows as the input indices.
+    /// If indices are out-of-bounds, this will return an error.
     pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
-        let reader = self.open(projection).await?;
-        reader.take(indices).await
+        // Re-map the indices to row ids using the deletion vector
+        let deletion_vector = self.get_deletion_vector().await?;
+        let row_ids = if let Some(deletion_vector) = deletion_vector {
+            // Naive case is O(N*M), where N = indices.len() and M = deletion_vector.len()
+            // We can do better by sorting the deletion vector and using binary search
+            // This is O(N * log M + M log M).
+            let mut sorted_deleted_ids = deletion_vector
+                .as_ref()
+                .clone()
+                .into_iter()
+                .collect::<Vec<_>>();
+            sorted_deleted_ids.sort();
+
+            let mut row_ids = indices.to_vec();
+            for row_id in row_ids.iter_mut() {
+                // We find the number of deleted rows that are less than each row
+                // index, and that becomes the initial offset. We increment the
+                // index by that amount, plus the number of deleted row ids we
+                // encounter along the way. So for example, if deleted rows are
+                // [2, 3, 5] and we want row 4, we need to advanced by 2 (since
+                // 2 and 3 are less than 4). That puts us at row 6, but since
+                // we passed row 5, we need to advance by 1 more, giving a final
+                // row id of 7.
+                let mut new_row_id = *row_id;
+                let offset = sorted_deleted_ids.partition_point(|v| *v <= new_row_id);
+
+                let mut deletion_i = offset;
+                let mut i = 0;
+                while i < offset {
+                    // Advance the row id
+                    new_row_id += 1;
+                    while deletion_i < sorted_deleted_ids.len()
+                        && sorted_deleted_ids[deletion_i] == new_row_id
+                    {
+                        // If we encounter a deleted row, we need to advance
+                        // again.
+                        deletion_i += 1;
+                        new_row_id += 1;
+                    }
+                    i += 1;
+                }
+
+                *row_id = new_row_id;
+            }
+
+            Cow::Owned(row_ids)
+        } else {
+            Cow::Borrowed(indices)
+        };
+
+        // Then call take rows
+        self.take_rows(&row_ids, projection, false).await
+    }
+
+    /// Get the deletion vector for this fragment, using the cache if available.
+    pub(crate) async fn get_deletion_vector(&self) -> Result<Option<Arc<DeletionVector>>> {
+        let Some(deletion_file) =  self.metadata.deletion_file.as_ref() else { return Ok(None) };
+
+        let cache = &self.dataset.session.file_metadata_cache;
+        let path = deletion_file_path(&self.dataset.base, self.metadata.id, deletion_file);
+        if let Some(deletion_vector) = cache.get::<DeletionVector>(&path) {
+            Ok(Some(deletion_vector))
+        } else {
+            let deletion_vector = read_deletion_file(
+                &self.dataset.base,
+                &self.metadata,
+                self.dataset.object_store(),
+            )
+            .await?;
+            match deletion_vector {
+                Some(deletion_vector) => {
+                    let deletion_vector = Arc::new(deletion_vector);
+                    cache.insert(path, deletion_vector.clone());
+                    Ok(Some(deletion_vector))
+                }
+                None => Ok(None),
+            }
+        }
+    }
+
+    /// Take rows based on internal local row ids
+    ///
+    /// If the row ids are out-of-bounds, this will return an error. But if the
+    /// row id is marked deleted, it will be ignored. Thus, the number of rows
+    /// returned may be less than the number of row ids provided.
+    ///
+    /// To recover the original row ids from the returned RecordBatch, set the
+    /// `with_row_id` parameter to true. This will add a column named `_row_id`
+    /// to the RecordBatch at the end.
+    pub(crate) async fn take_rows(
+        &self,
+        row_ids: &[u32],
+        projection: &Schema,
+        with_row_id: bool,
+    ) -> Result<RecordBatch> {
+        let mut reader = self.open(projection).await?;
+        if with_row_id {
+            reader.with_row_id();
+        }
+        reader.take(row_ids).await
     }
 
     /// Scan this [`FileFragment`].
@@ -511,14 +616,12 @@ impl FragmentReader {
 
     /// Take rows from this fragment.
     pub async fn take(&self, indices: &[u32]) -> Result<RecordBatch> {
-        let mut batches = vec![];
-
-        // TODO: Putting this loop in async blocks cause lifetime issues.
-        // We need to fix
-        for (reader, schema) in self.readers.iter() {
-            let batch = reader.take(indices, schema).await?;
-            batches.push(batch);
-        }
+        // Boxed to avoid lifetime issue.
+        let stream: BoxStream<_> = futures::stream::iter(&self.readers)
+            .map(|(reader, schema)| reader.take(indices, schema))
+            .buffered(num_cpus::get())
+            .boxed();
+        let batches: Vec<RecordBatch> = stream.try_collect::<Vec<_>>().await?;
 
         merge_batches(&batches)
     }
@@ -535,7 +638,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::dataset::WriteParams;
+    use crate::dataset::{WriteParams, ROW_ID};
 
     async fn create_dataset(test_uri: &str) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -605,7 +708,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fragment_take() {
+    async fn test_fragment_take_indices() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut dataset = create_dataset(test_uri).await;
@@ -615,13 +718,62 @@ mod tests {
             .find(|f| f.id() == 3)
             .unwrap();
 
+        // Repeated indices are repeated in result.
+        let batch = fragment
+            .take(&[1, 2, 4, 5, 5, 8], dataset.schema())
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(vec![121, 122, 124, 125, 125, 128])
+        );
+
+        dataset.delete("i in (122, 123, 125)").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Deleted rows are skipped
+        let fragment = dataset
+            .get_fragments()
+            .into_iter()
+            .find(|f| f.id() == 3)
+            .unwrap();
+        assert!(fragment.metadata().deletion_file.is_some());
         let batch = fragment
             .take(&[1, 2, 4, 5, 8], dataset.schema())
             .await
             .unwrap();
         assert_eq!(
             batch.column_by_name("i").unwrap().as_ref(),
-            &Int32Array::from(vec![121, 122, 124, 125, 128])
+            &Int32Array::from(vec![121, 124, 127, 128, 131])
+        );
+
+        // Empty indices gives empty result
+        let batch = fragment.take(&[], dataset.schema()).await.unwrap();
+        assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(Vec::<i32>::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fragment_take_rows() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = create_dataset(test_uri).await;
+        let fragment = dataset
+            .get_fragments()
+            .into_iter()
+            .find(|f| f.id() == 3)
+            .unwrap();
+
+        // Repeated indices are repeated in result.
+        let batch = fragment
+            .take_rows(&[1, 2, 4, 5, 5, 8], dataset.schema(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(vec![121, 122, 124, 125, 125, 128])
         );
 
         dataset.delete("i in (122, 124)").await.unwrap();
@@ -635,12 +787,36 @@ mod tests {
             .unwrap();
         assert!(fragment.metadata().deletion_file.is_some());
         let batch = fragment
-            .take(&[1, 2, 4, 5, 8], dataset.schema())
+            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false)
             .await
             .unwrap();
         assert_eq!(
             batch.column_by_name("i").unwrap().as_ref(),
             &Int32Array::from(vec![121, 125, 128])
+        );
+
+        // Empty indices gives empty result
+        let batch = fragment
+            .take_rows(&[], dataset.schema(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(Vec::<i32>::new())
+        );
+
+        // Can get row ids
+        let batch = fragment
+            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(vec![121, 125, 128])
+        );
+        assert_eq!(
+            batch.column_by_name(ROW_ID).unwrap().as_ref(),
+            &UInt64Array::from(vec![(3 << 32) + 1, (3 << 32) + 5, (3 << 32) + 8])
         );
     }
 

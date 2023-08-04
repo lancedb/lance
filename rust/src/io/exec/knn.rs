@@ -31,6 +31,7 @@ use tokio::task::JoinHandle;
 
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::{Dataset, ROW_ID};
+use crate::index::prefilter::PreFilter;
 use crate::index::vector::flat::flat_search;
 use crate::index::vector::{open_index, Query, DIST_COL};
 use crate::io::RecordBatchStream;
@@ -138,8 +139,8 @@ impl std::fmt::Debug for KNNFlatExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "KNN(flat, k={}, metric={})",
-            self.query.k, self.query.metric_type
+            "KNN(flat, k={}, metric={}, child={:?})",
+            self.query.k, self.query.metric_type, self.input
         )
     }
 }
@@ -246,7 +247,7 @@ impl KNNIndexStream {
         let q = query.clone();
         let name = index_name.to_string();
         let bg_thread = tokio::spawn(async move {
-            let index = match open_index(dataset, &q.column, &name).await {
+            let index = match open_index(dataset.clone(), &q.column, &name).await {
                 Ok(idx) => idx,
                 Err(e) => {
                     tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
@@ -257,7 +258,8 @@ impl KNNIndexStream {
                     return;
                 }
             };
-            let result = match index.search(&q).await {
+            let pre_filter = PreFilter::new(dataset);
+            let result = match index.search(&q, &pre_filter).await {
                 Ok(b) => b,
                 Err(e) => {
                     tx.send(Err(datafusion::error::DataFusionError::Execution(format!(

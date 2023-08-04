@@ -22,21 +22,17 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::{concat::concat_batches, take::take};
 use futures::future;
-use futures::stream::{repeat_with, Stream, StreamExt, TryStreamExt};
+use futures::stream::{repeat_with, StreamExt, TryStreamExt};
 
 use super::{Query, DIST_COL};
 use crate::arrow::*;
+use crate::io::RecordBatchStream;
 use crate::{Error, Result};
 
-pub async fn flat_search(
-    stream: impl Stream<Item = Result<RecordBatch>>,
-    query: &Query,
-) -> Result<RecordBatch> {
+pub async fn flat_search(stream: impl RecordBatchStream, query: &Query) -> Result<RecordBatch> {
+    let input_schema = stream.schema();
     let batches = stream
-        .filter(|batch| {
-            let pred = batch.as_ref().map(|b| b.num_rows() > 0).unwrap_or(false);
-            future::ready(pred)
-        })
+        .try_filter(|batch| future::ready(batch.num_rows() > 0))
         .zip(repeat_with(|| query.metric_type))
         .map(|(batch, mt)| async move {
             let k = query.key.clone();
@@ -74,6 +70,11 @@ pub async fn flat_search(
         .buffer_unordered(16)
         .try_collect::<Vec<_>>()
         .await?;
+
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(input_schema));
+    }
+
     let batch = concat_batches(&batches[0].schema(), &batches)?;
     let distances = batch.column_by_name(DIST_COL).unwrap();
     let indices = sort_to_indices(distances, None, Some(query.k))?;

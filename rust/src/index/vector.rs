@@ -51,7 +51,6 @@ use crate::{
         },
     },
     io::{
-        deletion::LruDeletionVectorStore,
         object_reader::{read_message, ObjectReader},
         read_message_from_buf, read_metadata_offset,
     },
@@ -385,13 +384,6 @@ pub(crate) async fn open_index(
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
 
-    let deletion_cache = Arc::new(LruDeletionVectorStore::new(
-        Arc::new(dataset.object_store().clone()),
-        object_store.base_path().clone(),
-        dataset.manifest.clone(),
-        100_usize,
-    ));
-
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
             #[allow(unused_variables)]
@@ -444,11 +436,7 @@ pub(crate) async fn open_index(
                     });
                 };
                 let pq = Arc::new(ProductQuantizer::try_from(pq_proto).unwrap());
-                last_stage = Some(Arc::new(PQIndex::new(
-                    pq,
-                    metric_type,
-                    deletion_cache.clone(),
-                )));
+                last_stage = Some(Arc::new(PQIndex::new(pq, metric_type)));
             }
             Some(Stage::Diskann(diskann_proto)) => {
                 if last_stage.is_some() {
@@ -460,15 +448,8 @@ pub(crate) async fn open_index(
                     });
                 };
                 let graph_path = index_dir.child(diskann_proto.filename.as_str());
-                let diskann = Arc::new(
-                    DiskANNIndex::try_new(
-                        dataset.clone(),
-                        column,
-                        &graph_path,
-                        deletion_cache.clone(),
-                    )
-                    .await?,
-                );
+                let diskann =
+                    Arc::new(DiskANNIndex::try_new(dataset.clone(), column, &graph_path).await?);
                 last_stage = Some(diskann);
             }
             _ => {}

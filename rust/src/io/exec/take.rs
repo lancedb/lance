@@ -68,7 +68,9 @@ impl Take {
                     let rows = if extra.fields.is_empty() {
                         batch
                     } else {
-                        batch.merge(&dataset.take_rows(row_ids.values(), &extra).await?)?
+                        let new_columns = dataset.take_rows(row_ids.values(), &extra).await?;
+                        debug_assert_eq!(batch.num_rows(), new_columns.num_rows());
+                        batch.merge(&new_columns)?
                     };
                     Ok::<RecordBatch, Error>(rows)
                 })
