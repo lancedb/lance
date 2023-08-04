@@ -203,7 +203,7 @@ pub trait CommitLock {
     ///
     /// To prevent poisoned locks, it's recommended to set a timeout on the lock
     /// of at least 30 seconds.
-    /// 
+    ///
     /// It is not required that the lock tracks the version. It is provided in
     /// case the locking is handled by a catalog service that needs to know the
     /// current version of the table.
