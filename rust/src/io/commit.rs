@@ -28,6 +28,10 @@
 //! not in AWS S3. So for AWS S3, the default commit handler is
 //! [UnsafeCommitHandler], which writes the manifest to the final path without
 //! any checks.
+//!
+//! When providing your own commit handler, most often you are implementing in
+//! terms of a lock. The trait [CommitLock] can be implemented as a simpler
+//! alternative to [CommitHandler].
 
 use std::{fmt::Debug, sync::atomic::AtomicBool};
 
@@ -183,5 +187,216 @@ impl CommitHandler for RenameCommitHandler {
 impl Debug for RenameCommitHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RenameCommitHandler").finish()
+    }
+}
+// TODO: write a unit test for this.
+/// A commit implementation that uses a lock to prevent conflicting writes.
+#[async_trait::async_trait]
+pub trait CommitLock {
+    type Lease: CommitLease;
+
+    /// Attempt to lock the path for the given version.
+    ///
+    /// If it is already locked by another transaction, wait until it is unlocked.
+    /// Once it is unlocked, return [CommitError::CommitConflict] if the version
+    /// has already been committed. Otherwise, return the lock.
+    ///
+    /// To prevent poisoned locks, it's recommended to set a timeout on the lock
+    /// of at least 30 seconds.
+    async fn lock(&self, version: u64) -> Result<Self::Lease, CommitError>;
+}
+
+#[async_trait::async_trait]
+pub trait CommitLease: Send + Sync {
+    /// Return the lease, indicating whether the commit was successful.
+    async fn release(&self, success: bool) -> Result<(), CommitError>;
+}
+
+#[async_trait::async_trait]
+impl<T: CommitLock + Send + Sync + Debug> CommitHandler for T {
+    async fn commit(
+        &self,
+        manifest: &mut Manifest,
+        indices: Option<Vec<Index>>,
+        path: &Path,
+        object_store: &ObjectStore,
+        manifest_writer: ManifestWriter,
+    ) -> Result<(), CommitError> {
+        // NOTE: once we have the lease we cannot use ? to return errors, since
+        // we must release the lease before returning.
+        let lease = self.lock(manifest.version).await?;
+
+        // Head the location and make sure it's not already committed
+        match object_store.inner.head(path).await {
+            Ok(_) => {
+                // The path already exists, so it's already committed
+                // Release the lock
+                lease.release(false).await?;
+
+                return Err(CommitError::CommitConflict);
+            }
+            Err(ObjectStoreError::NotFound { .. }) => {}
+            Err(e) => {
+                // Something else went wrong
+                // Release the lock
+                lease.release(false).await?;
+
+                return Err(CommitError::OtherError(e.into()));
+            }
+        }
+        let res = manifest_writer(object_store, manifest, indices, path).await;
+
+        // Release the lock
+        lease.release(res.is_ok()).await?;
+
+        res.map_err(|err| err.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use futures::future::join_all;
+
+    use super::*;
+
+    use crate::dataset::WriteParams;
+    use crate::io::object_store::ObjectStoreParams;
+    use crate::Dataset;
+
+    async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
+        // Create a dataset, passing handler as commit handler
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "x",
+            DataType::Int64,
+            false,
+        )]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(data)], schema);
+
+        let options = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                commit_handler: Some(handler),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, "memory://test", Some(options))
+            .await
+            .unwrap();
+
+        // Create 10 concurrent tasks to write into the table
+        // Record how many succeed and how many fail
+        let tasks = (0..10).map(|_| {
+            let mut dataset = dataset.clone();
+            tokio::task::spawn(async move {
+                dataset
+                    .delete("x = 2")
+                    .await
+                    .map(|_| dataset.manifest.version)
+            })
+        });
+
+        let task_results: Vec<Option<u64>> = join_all(tasks)
+            .await
+            .iter()
+            .map(|res| match res {
+                Ok(Ok(version)) => Some(*version),
+                _ => None,
+            })
+            .collect();
+
+        let num_successes = task_results.iter().filter(|x| x.is_some()).count();
+        let distinct_results: HashSet<_> = task_results.iter().filter_map(|x| x.as_ref()).collect();
+
+        if should_succeed {
+            assert_eq!(
+                num_successes,
+                distinct_results.len(),
+                "Expected no two tasks to succeed for the same version. Got {:?}",
+                task_results
+            );
+        } else {
+            assert!(
+                num_successes > distinct_results.len(),
+                "Expected some conflicts. Got {:?}",
+                task_results
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rename_commit_handler() {
+        // Rename is default for memory
+        let handler = Arc::new(RenameCommitHandler);
+        test_commit_handler(handler, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_custom_commit() {
+        #[derive(Debug)]
+        struct CustomCommitHandler {
+            locked_version: Arc<Mutex<Option<u64>>>,
+        }
+
+        struct CustomCommitLease {
+            version: u64,
+            locked_version: Arc<Mutex<Option<u64>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl CommitLock for CustomCommitHandler {
+            type Lease = CustomCommitLease;
+
+            async fn lock(&self, version: u64) -> Result<Self::Lease, CommitError> {
+                let mut locked_version = self.locked_version.lock().unwrap();
+                if locked_version.is_some() {
+                    // Already locked
+                    return Err(CommitError::CommitConflict);
+                }
+
+                // Lock the version
+                *locked_version = Some(version);
+
+                Ok(CustomCommitLease {
+                    version,
+                    locked_version: self.locked_version.clone(),
+                })
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl CommitLease for CustomCommitLease {
+            async fn release(&self, _success: bool) -> Result<(), CommitError> {
+                let mut locked_version = self.locked_version.lock().unwrap();
+                if *locked_version != Some(self.version) {
+                    // Already released
+                    return Err(CommitError::CommitConflict);
+                }
+
+                // Release the version
+                *locked_version = None;
+
+                Ok(())
+            }
+        }
+
+        let locked_version = Arc::new(Mutex::new(None));
+        let handler = Arc::new(CustomCommitHandler { locked_version });
+        test_commit_handler(handler, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_unsafe_commit_handler() {
+        let handler = Arc::new(UnsafeCommitHandler);
+        test_commit_handler(handler, false).await;
     }
 }
