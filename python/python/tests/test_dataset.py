@@ -553,7 +553,7 @@ def test_custom_commit_lock(tmp_path: Path):
     assert called_lock
     assert called_release
 
-    class TestLease(CommitLease): # noqa
+    class TestLease(CommitLease):  # noqa
         def release(self, _success: bool):
             raise Exception("hello world!")
 

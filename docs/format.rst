@@ -243,3 +243,20 @@ collisions. The suffix is determined by the file type (``.arrow`` for Arrow file
 Deletes can be materialized by re-writing data files with the deleted rows 
 removed. However, this invalidates row indices and thus the ANN indices, which
 can be expensive to recompute.
+
+
+Committing Datasets
+-------------------
+
+A new version of a dataset is committed by writing a new manifest file to the
+``_versions`` directory. Only after successfully committing this file should
+the ``_latest.manifest`` file be updated.
+
+To prevent concurrent writers from overwriting each other, the commit process
+must be atomic and consistent for all writers. If two writers try to commit
+using different mechanisms, they may overwrite each other's changes. For any
+storage system that natively supports atomic rename-if-not-exists or
+put-if-not-exists, these operations should be used. This is true of local file
+systems and cloud object stores, with the notable except of AWS S3. For ones
+that lack this functionality, an external locking mechanism can be configured
+by the user.

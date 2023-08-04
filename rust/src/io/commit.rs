@@ -189,13 +189,13 @@ impl Debug for RenameCommitHandler {
         f.debug_struct("RenameCommitHandler").finish()
     }
 }
-// TODO: write a unit test for this.
+
 /// A commit implementation that uses a lock to prevent conflicting writes.
 #[async_trait::async_trait]
 pub trait CommitLock {
     type Lease: CommitLease;
 
-    /// Attempt to lock the path for the given version.
+    /// Attempt to lock the table for the given version.
     ///
     /// If it is already locked by another transaction, wait until it is unlocked.
     /// Once it is unlocked, return [CommitError::CommitConflict] if the version
@@ -203,6 +203,10 @@ pub trait CommitLock {
     ///
     /// To prevent poisoned locks, it's recommended to set a timeout on the lock
     /// of at least 30 seconds.
+    /// 
+    /// It is not required that the lock tracks the version. It is provided in
+    /// case the locking is handled by a catalog service that needs to know the
+    /// current version of the table.
     async fn lock(&self, version: u64) -> Result<Self::Lease, CommitError>;
 }
 

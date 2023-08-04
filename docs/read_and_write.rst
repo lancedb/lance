@@ -108,6 +108,28 @@ to those files. Any subsequent queries will not return the deleted rows.
   Do not read datasets with deleted rows using Lance versions prior to 0.5.0,
   as they will return the deleted rows. This is fixed in 0.5.0 and later.
 
+
+Committing mechanisms for S3
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Most supported storage systems (e.g. local file system, Google Cloud Storage,
+Azure Blob Store) natively support atomic commits, which prevent concurrent
+writers from corrupting the dataset. However, S3 does not support this natively.
+To work around this, you may provide a locking mechanism that Lance can use to
+lock the table while providing a write. To do so, you should implement classes
+subclassing :py:class:`lance.commit.CommitLock` and 
+:py:class:`lance.commit.CommitLease`. Then you can pass the commit lock to the
+``commit_lock`` parameter of :py:meth:`lance.write_dataset`.
+
+In order for the locking mechanism to work, all writers must use the same exact
+mechanism.
+
+.. warning::
+
+  Lance does not yet resolve conflicts, so if there are multiple writers, only
+  one will succeed. This will be fixed in future releases.
+
+
 Reading Lance Dataset
 ---------------------
 
