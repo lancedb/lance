@@ -19,8 +19,8 @@ use std::iter::Sum;
 use std::sync::Arc;
 
 use arrow_array::Float32Array;
-use num_traits::real::Real;
 use half::{bf16, f16};
+use num_traits::real::Real;
 
 /// Calculate the L2 distance between two vectors.
 ///
