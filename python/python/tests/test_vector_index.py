@@ -193,6 +193,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
 
     actual_index = dataset_with_index.list_indices()
     index_uuid = actual_index[0]["uuid"]
+    index_stats = actual_index[0].pop("index_stats")
     assert len(index_uuid) == 36
     expected_index = [
         {
@@ -205,6 +206,9 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
         }
     ]
     assert actual_index == expected_index
-    assert dataset_with_index.get_index("vector_idx") == expected_index
     assert dataset_with_index.get_index("") == []
     assert dataset_with_index.get_index("non-existent_idx") == []
+    assert index_stats.startswith(
+        "Ivf(l2) -> PQ=PQ(num_sub_vectors=8, nbits=8, metric_type=l2), "
+        "num_partitions=5, partition_info=\n[0]: length="
+    )

@@ -129,7 +129,29 @@ impl IVFIndex {
 
 impl std::fmt::Debug for IVFIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Ivf({}) -> {:?}", self.metric_type, self.sub_index)
+        let partitions = self
+            .ivf
+            .lengths
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| {
+                format!(
+                    "[{}]: length={}, centroid={:?}",
+                    i,
+                    len,
+                    self.ivf.centroids.value(i)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        write!(
+            f,
+            "Ivf({}) -> PQ={:?}, num_partitions={}, partition_info=\n{}",
+            self.metric_type,
+            self.sub_index,
+            self.ivf.num_partitions(),
+            partitions
+        )
     }
 }
 

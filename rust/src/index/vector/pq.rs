@@ -70,7 +70,7 @@ impl std::fmt::Debug for PQIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "PQ(m={}, nbits={}, {})",
+            "PQ(num_sub_vectors={}, nbits={}, metric_type={})",
             self.num_sub_vectors, self.nbits, self.metric_type
         )
     }

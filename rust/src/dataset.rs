@@ -48,11 +48,11 @@ use self::transaction::{Operation, Transaction};
 use self::write::{reader_to_stream, write_fragments};
 use crate::datatypes::Schema;
 use crate::error::box_error;
-use crate::format::{Fragment, Index, Manifest};
-use crate::io::reader::read_manifest_indexes;
+use crate::format::{pb, Fragment, Index, Manifest};
+use crate::index::vector::open_index;
 use crate::io::{
     commit::{commit_new_dataset, commit_transaction, CommitError},
-    object_reader::read_struct,
+    object_reader::{read_message, read_struct},
     object_store::ObjectStoreParams,
     read_manifest, read_metadata_offset, write_manifest, ObjectStore,
 };
@@ -953,6 +953,25 @@ impl Dataset {
     pub async fn load_indices(&self) -> Result<Vec<Index>> {
         let manifest_file = self.manifest_file(self.version().version);
         read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest).await
+    }
+
+    pub async fn index_stats(&self, index_name: &str) -> Result<String> {
+        let indices = self.load_indices().await.unwrap();
+        let index_id = indices
+            .iter()
+            .find(|idx| idx.name == index_name)
+            .map(|idx| idx.uuid.to_string())
+            .unwrap_or("".to_string());
+        if index_id.len() == 36 {
+            Ok(format!(
+                "{:?}",
+                open_index(Arc::new(self.clone()), "vector", &index_id).await?
+            ))
+        } else {
+            Err(Error::Index {
+                message: format!("Index name '{index_name}' does not exists in dataset."),
+            })
+        }
     }
 
     pub async fn validate(&self) -> Result<()> {
@@ -1981,6 +2000,11 @@ mod tests {
         let expected = dataset.manifest.version - 2;
         assert_eq!(actual, expected);
         dataset.validate().await.unwrap();
+
+        let index_stats = dataset.index_stats("embeddings_idx").await.unwrap();
+        let expected_stats = "Ivf(l2) -> PQ=PQ(num_sub_vectors=2, nbits=8, metric_type=l2), \
+        num_partitions=10, partition_info=\n[0]: length=";
+        assert!(index_stats.starts_with(expected_stats));
 
         // Overwrite should invalidate index
         let write_params = WriteParams {

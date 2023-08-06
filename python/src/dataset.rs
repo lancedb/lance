@@ -143,6 +143,11 @@ impl Dataset {
                     .iter()
                     .map(|f| f.name.clone())
                     .collect::<Vec<_>>();
+                let index_stats = self_
+                    .rt
+                    .block_on(async { self_.ds.index_stats(&idx.name).await })
+                    .map_err(|err| PyValueError::new_err(err.to_string()))
+                    .unwrap();
 
                 dict.set_item("name", idx.name.clone()).unwrap();
                 // TODO: once we add more than vector indices, we need to:
@@ -154,6 +159,7 @@ impl Dataset {
                 dict.set_item("fields", field_names).unwrap();
                 dict.set_item("version", idx.dataset_version).unwrap();
                 dict.set_item("filepath", index_path).unwrap();
+                dict.set_item("index_stats", index_stats).unwrap();
                 dict.to_object(py)
             })
             .collect::<Vec<_>>())
