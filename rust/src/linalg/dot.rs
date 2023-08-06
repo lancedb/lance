@@ -18,6 +18,7 @@ use std::iter::Sum;
 use std::sync::Arc;
 
 use arrow_array::Float32Array;
+use half::{bf16, f16};
 use num_traits::real::Real;
 
 #[inline]
@@ -32,10 +33,34 @@ pub trait Dot {
     fn dot(&self, other: &Self) -> Self::Output;
 }
 
+impl Dot for [bf16] {
+    type Output = bf16;
+
+    fn dot(&self, other: &[bf16]) -> bf16 {
+        dot(self, other)
+    }
+}
+
+impl Dot for [f16] {
+    type Output = f16;
+
+    fn dot(&self, other: &[f16]) -> f16 {
+        dot(self, other)
+    }
+}
+
 impl Dot for [f32] {
     type Output = f32;
 
     fn dot(&self, other: &[f32]) -> f32 {
+        dot(self, other)
+    }
+}
+
+impl Dot for [f64] {
+    type Output = f64;
+
+    fn dot(&self, other: &[f64]) -> f64 {
         dot(self, other)
     }
 }

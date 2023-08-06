@@ -19,6 +19,7 @@ use std::iter::Sum;
 use std::sync::Arc;
 
 use arrow_array::Float32Array;
+use half::{bf16, f16};
 use num_traits::real::Real;
 
 /// Calculate the L2 distance between two vectors.
@@ -39,6 +40,26 @@ fn l2_scalar<T: Real + Sum>(from: &[T], to: &[T]) -> T {
         .zip(to.iter())
         .map(|(a, b)| (a.sub(*b).powi(2)))
         .sum::<T>()
+}
+
+impl L2 for [bf16] {
+    type Output = bf16;
+
+    #[inline]
+    fn l2(&self, other: &[bf16]) -> bf16 {
+        // TODO: add SIMD support
+        l2_scalar(self, other)
+    }
+}
+
+impl L2 for [f16] {
+    type Output = f16;
+
+    #[inline]
+    fn l2(&self, other: &[f16]) -> f16 {
+        // TODO: add SIMD support
+        l2_scalar(self, other)
+    }
 }
 
 impl L2 for [f32] {
@@ -76,6 +97,16 @@ impl L2 for Float32Array {
     #[inline]
     fn l2(&self, other: &Self) -> f32 {
         self.values().l2(other.values())
+    }
+}
+
+impl L2 for [f64] {
+    type Output = f64;
+
+    #[inline]
+    fn l2(&self, other: &[f64]) -> f64 {
+        // TODO: add SIMD support
+        l2_scalar(self, other)
     }
 }
 

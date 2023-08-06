@@ -16,10 +16,11 @@ use std::iter::Sum;
 use std::sync::Arc;
 
 use arrow_array::Float32Array;
+use half::{bf16, f16};
 use num_traits::real::Real;
 
 use super::dot::dot;
-use super::norm_l2::norm_l2;
+use super::norm_l2::{norm_l2, Normalize};
 
 /// Cosine Distance
 pub trait Cosine {
@@ -30,6 +31,38 @@ pub trait Cosine {
 
     /// Fast cosine function, that assumes that the norm of the first vector is already known.
     fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output;
+}
+
+impl Cosine for [bf16] {
+    type Output = bf16;
+
+    #[inline]
+    fn cosine(&self, other: &Self) -> Self::Output {
+        let x_norm = self.norm_l2();
+        self.cosine_fast(x_norm, other)
+    }
+
+    #[inline]
+    fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output {
+        // TODO: Implement SIMD
+        cosine_scalar(self, x_norm, other)
+    }
+}
+
+impl Cosine for [f16] {
+    type Output = f16;
+
+    #[inline]
+    fn cosine(&self, other: &Self) -> Self::Output {
+        let x_norm = self.norm_l2();
+        self.cosine_fast(x_norm, other)
+    }
+
+    #[inline]
+    fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output {
+        // TODO: Implement SIMD
+        cosine_scalar(self, x_norm, other)
+    }
 }
 
 impl Cosine for [f32] {
@@ -60,6 +93,22 @@ impl Cosine for [f32] {
     }
 }
 
+impl Cosine for [f64] {
+    type Output = f64;
+
+    #[inline]
+    fn cosine(&self, other: &Self) -> Self::Output {
+        let x_norm = self.norm_l2();
+        self.cosine_fast(x_norm, other)
+    }
+
+    #[inline]
+    fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output {
+        // TODO: Implement SIMD
+        cosine_scalar(self, x_norm, other)
+    }
+}
+
 /// Fallback non-SIMD implementation
 #[allow(dead_code)] // Does not fallback on aarch64.
 #[inline]
@@ -71,7 +120,7 @@ fn cosine_scalar<T: Real + Sum>(x: &[T], x_norm: T, y: &[T]) -> T {
 }
 
 /// Cosine distance function between two vectors.
-pub fn cosine_distance(from: &[f32], to: &[f32]) -> f32 {
+pub fn cosine_distance<T: Cosine + ?Sized>(from: &T, to: &T) -> T::Output {
     from.cosine(to)
 }
 
