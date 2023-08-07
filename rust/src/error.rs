@@ -45,6 +45,8 @@ pub enum Error {
     },
     #[snafu(display("Not supported: {source}"))]
     NotSupported { source: BoxedError },
+    #[snafu(display("Invalid Operation {message}"))]
+    InvalidOperation { message: String },
     #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lancedb/lance/issues. {message}"))]
     Internal { message: String },
     #[snafu(display("LanceError(Arrow): {message}"))]
