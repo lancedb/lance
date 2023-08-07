@@ -32,6 +32,36 @@ import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
 
+# Various valid inputs for write_dataset
+input_schema = pa.schema([pa.field("a", pa.float64()), pa.field("b", pa.int64())])
+input_data = [
+    # (schema, data)
+    (None, pa.table({"a": [1.0, 2.0], "b": [20, 30]})),
+    (None, pa.record_batch([[1.0, 2.0], [20, 30]], names=["a", "b"])),
+    (None, pd.DataFrame({"a": [1.0, 2.0], "b": [20, 30]})),
+    (None, pl.DataFrame({"a": [1.0, 2.0], "b": [20, 30]})),
+    (
+        input_schema,
+        [pa.record_batch([pa.array([1.0, 2.0]), pa.array([20, 30])], names=["a", "b"])],
+    ),
+    # Can provide an iterator with a schema that is different but cast-able
+    (
+        input_schema,
+        iter(
+            pa.table(
+                {"a": [1.0, 2.0], "b": pa.array([20, 30], pa.int32())}
+            ).to_batches()
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize("schema,data", input_data, ids=type)
+def test_input_data(tmp_path: Path, schema, data):
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(data, base_dir, schema=schema)
+    assert dataset.to_table() == input_data[0][1]
+
 
 def test_dataset_overwrite(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
