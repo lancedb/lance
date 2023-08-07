@@ -26,6 +26,9 @@ use arrow_schema::Schema;
 use env_logger::Env;
 use pyo3::prelude::*;
 
+#[macro_use]
+extern crate lazy_static;
+
 pub(crate) mod arrow;
 pub(crate) mod dataset;
 pub(crate) mod errors;

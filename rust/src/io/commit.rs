@@ -156,7 +156,13 @@ impl CommitHandler for RenameCommitHandler {
 
         // Add .tmp_ prefix to the path
         let mut parts: Vec<_> = path.parts().collect();
-        let new_name = format!(".tmp_{}", parts.last().unwrap().as_ref());
+        // Add a UUID to the end of the filename to avoid conflicts
+        let uuid = uuid::Uuid::new_v4();
+        let new_name = format!(
+            ".tmp_{}_{}",
+            parts.last().unwrap().as_ref(),
+            uuid.as_hyphenated()
+        );
         let _ = std::mem::replace(parts.last_mut().unwrap(), new_name.into());
         let tmp_path: Path = parts.into_iter().collect();
 

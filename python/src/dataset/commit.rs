@@ -19,21 +19,28 @@ use lance::Error;
 
 use pyo3::{exceptions::PyIOError, prelude::*};
 
-fn handle_error(py_err: PyErr, py: Python) -> CommitError {
-    let py_conflict_error = py
-        .import("lance")
-        .and_then(|lance| lance.getattr("commit"))
-        .and_then(|commit| commit.getattr("CommitConflictError"))
-        .map_err(|err| {
-            CommitError::OtherError(Error::Internal {
-                message: format!("Error importing from pylance {}", err),
-            })
+lazy_static! {
+    static ref PY_CONFLICT_ERROR: PyResult<PyObject> = {
+        Python::with_gil(|py| {
+            py.import("lance")
+                .and_then(|lance| lance.getattr("commit"))
+                .and_then(|commit| commit.getattr("CommitConflictError"))
+                .map(|error| error.to_object(py))
         })
-        .and_then(|exception| Ok(exception.get_type()));
-    let Ok(py_conflict_error) = py_conflict_error else {
-        return py_conflict_error.unwrap_err();
     };
-    if py_err.is_instance(py, py_conflict_error) {
+}
+
+fn handle_error(py_err: PyErr, py: Python) -> CommitError {
+    let conflict_err_type = match &*PY_CONFLICT_ERROR {
+        Ok(err) => err.as_ref(py).get_type(),
+        Err(import_error) => {
+            return CommitError::OtherError(Error::Internal {
+                message: format!("Error importing from pylance {}", import_error),
+            })
+        }
+    };
+
+    if py_err.is_instance(py, conflict_err_type) {
         CommitError::CommitConflict
     } else {
         CommitError::OtherError(Error::Internal {
