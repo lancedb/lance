@@ -21,8 +21,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
-    ExecutionPlan, Partitioning, RecordBatchStream as DFRecordBatchStream,
-    SendableRecordBatchStream, Statistics,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
+    RecordBatchStream as DFRecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 use futures::stream::Stream;
 use futures::FutureExt;
@@ -142,6 +142,16 @@ impl std::fmt::Debug for KNNFlatExec {
             "KNN(flat, k={}, metric={}, child={:?})",
             self.query.k, self.query.metric_type, self.input
         )
+    }
+}
+
+impl DisplayAs for KNNFlatExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                std::fmt::Debug::fmt(&self, f)
+            }
+        }
     }
 }
 
@@ -341,6 +351,16 @@ impl std::fmt::Debug for KNNIndexExec {
             "KNN(index, name={}, k={})",
             self.index_name, self.query.k
         )
+    }
+}
+
+impl DisplayAs for KNNIndexExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                std::fmt::Debug::fmt(&self, f)
+            }
+        }
     }
 }
 

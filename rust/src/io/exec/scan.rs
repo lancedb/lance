@@ -22,7 +22,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
-    ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
+    SendableRecordBatchStream,
 };
 use futures::stream::Stream;
 use futures::{stream, Future};
@@ -207,6 +208,16 @@ impl std::fmt::Debug for LanceScanExec {
             self.with_row_id,
             self.ordered_output
         )
+    }
+}
+
+impl DisplayAs for LanceScanExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                std::fmt::Debug::fmt(&self, f)
+            }
+        }
     }
 }
 

@@ -22,7 +22,9 @@ use std::task::{Context, Poll};
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+};
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
@@ -138,6 +140,16 @@ impl std::fmt::Debug for ProjectionExec {
             "Projection(schema={:?},\n\tchild={:?})",
             columns, self.input
         )
+    }
+}
+
+impl DisplayAs for ProjectionExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                std::fmt::Debug::fmt(&self, f)
+            }
+        }
     }
 }
 
