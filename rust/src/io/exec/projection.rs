@@ -147,7 +147,14 @@ impl DisplayAs for ProjectionExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                std::fmt::Debug::fmt(&self, f)
+                let columns = self
+                    .project
+                    .fields
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "Projection: fields=[{}]", columns)
             }
         }
     }

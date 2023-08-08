@@ -215,7 +215,21 @@ impl DisplayAs for LanceScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                std::fmt::Debug::fmt(&self, f)
+                let columns = self
+                    .projection
+                    .fields
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "LanceScan: uri={}, projection=[{}], row_id={}, ordered={}",
+                    self.dataset.data_dir(),
+                    columns,
+                    self.with_row_id,
+                    self.ordered_output
+                )
             }
         }
     }

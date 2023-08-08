@@ -149,7 +149,11 @@ impl DisplayAs for KNNFlatExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                std::fmt::Debug::fmt(&self, f)
+                write!(
+                    f,
+                    "KNNFlat: k={} metric={}",
+                    self.query.k, self.query.metric_type
+                )
             }
         }
     }
@@ -358,7 +362,7 @@ impl DisplayAs for KNNIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                std::fmt::Debug::fmt(&self, f)
+                write!(f, "KNNIndex: name={}, k={}", self.index_name, self.query.k)
             }
         }
     }
@@ -570,6 +574,7 @@ mod tests {
 
         let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch]));
         let idx = KNNFlatExec::try_new(input, query).unwrap();
+        println!("{:?}", idx);
         assert_eq!(
             idx.schema().as_ref(),
             &ArrowSchema::new(vec![

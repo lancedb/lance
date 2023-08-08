@@ -178,7 +178,14 @@ impl DisplayAs for TakeExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                std::fmt::Debug::fmt(&self, f)
+                let columns = self
+                    .output_schema
+                    .fields
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "Take: columns={:?}", columns)
             }
         }
     }
