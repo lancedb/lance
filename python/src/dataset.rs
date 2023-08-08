@@ -117,7 +117,7 @@ impl Dataset {
     }
 
     /// Load index metadata
-    fn load_indices(self_: PyRef<'_, Self>, index_name: String) -> PyResult<Vec<PyObject>> {
+    fn load_indices(self_: PyRef<'_, Self>, index_name: Option<String>) -> PyResult<Vec<PyObject>> {
         let index_metadata = self_
             .rt
             .block_on(async { self_.ds.load_indices().await })

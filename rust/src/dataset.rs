@@ -961,7 +961,9 @@ impl Dataset {
             .iter()
             .find(|idx| idx.name == index_name)
             .map(|idx| idx.uuid.to_string())
-            .unwrap_or("".to_string());
+            .ok_or_else(|_| Error::Index {
+                message: format!("Index name '{index_name}' does not exists in dataset."),
+            })?;
         if index_id.len() == 36 {
             Ok(format!(
                 "{:?}",
