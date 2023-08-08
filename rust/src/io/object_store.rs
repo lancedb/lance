@@ -38,6 +38,7 @@ use crate::error::{Error, Result};
 use crate::io::object_reader::CloudObjectReader;
 use crate::io::object_writer::ObjectWriter;
 
+use super::commit::{CommitHandler, RenameCommitHandler, UnsafeCommitHandler};
 use super::local::LocalObjectReader;
 use super::object_reader::ObjectReader;
 
@@ -49,6 +50,7 @@ pub struct ObjectStore {
     scheme: String,
     base_path: Path,
     block_size: usize,
+    pub commit_handler: Arc<dyn CommitHandler>,
 }
 
 impl std::fmt::Display for ObjectStore {
@@ -202,6 +204,9 @@ pub struct ObjectStoreParams {
 
     // Custom AWS Credentials
     pub aws_credentials: Option<Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>>,
+
+    /// Custom commit handler
+    pub commit_handler: Option<Arc<dyn CommitHandler>>,
 }
 
 // Need this for setting a non-zero default duration
@@ -211,6 +216,7 @@ impl Default for ObjectStoreParams {
             object_store_wrapper: None,
             s3_credentials_refresh_offset: Duration::from_secs(60),
             aws_credentials: None,
+            commit_handler: None,
         }
     }
 }
@@ -230,14 +236,14 @@ impl ObjectStore {
         let (object_store, base_path) = match Url::parse(uri) {
             Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
                 // On Windows, the drive is parsed as a scheme
-                Self::new_from_path(uri)
+                Self::new_from_path(uri, &params)
             }
             Ok(url) => {
                 let store = Self::new_from_url(url.clone(), &params).await?;
                 let path = Path::from(url.path());
                 Ok((store, path))
             }
-            Err(_) => Self::new_from_path(uri),
+            Err(_) => Self::new_from_path(uri, &params),
         }?;
 
         Ok((
@@ -252,7 +258,7 @@ impl ObjectStore {
         ))
     }
 
-    fn new_from_path(str_path: &str) -> Result<(Self, Path)> {
+    fn new_from_path(str_path: &str, params: &ObjectStoreParams) -> Result<(Self, Path)> {
         let expanded = tilde(str_path).to_string();
         let expanded_path = StdPath::new(&expanded);
 
@@ -271,6 +277,10 @@ impl ObjectStore {
                 scheme: String::from("file"),
                 base_path: Path::from_absolute_path(&expanded_path)?,
                 block_size: 4 * 1024, // 4KB block size
+                commit_handler: params
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
             },
             Path::from_filesystem_path(&expanded_path)?,
         ))
@@ -291,25 +301,41 @@ impl ObjectStore {
                 scheme: String::from("s3"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
+                commit_handler: params
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(UnsafeCommitHandler)),
             }),
             "gs" => Ok(Self {
                 inner: build_gcs_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("gs"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
+                commit_handler: params
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
             }),
             "az" => Ok(Self {
                 inner: build_azure_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("az"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
+                commit_handler: params
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
             }),
-            "file" => Ok(Self::new_from_path(url.path())?.0),
+            "file" => Ok(Self::new_from_path(url.path(), params)?.0),
             "memory" => Ok(Self {
                 inner: Arc::new(InMemory::new()),
                 scheme: String::from("memory"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
+                commit_handler: params
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
             }),
             s => Err(Error::IO {
                 message: format!("Unsupported URI scheme: {}", s),
@@ -324,6 +350,7 @@ impl ObjectStore {
             scheme: String::from("memory"),
             base_path: Path::from("/"),
             block_size: 64 * 1024,
+            commit_handler: Arc::new(RenameCommitHandler),
         }
     }
 

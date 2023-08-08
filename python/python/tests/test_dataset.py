@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import contextlib
 import os
 import pickle
 import platform
@@ -31,6 +32,7 @@ import pyarrow as pa
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
+from lance.commit import CommitConflictError
 
 # Various valid inputs for write_dataset
 input_schema = pa.schema([pa.field("a", pa.float64()), pa.field("b", pa.int64())])
@@ -557,3 +559,44 @@ def test_scanner_schemas(tmp_path: Path):
     scanner = dataset.scanner(columns=["a"])
     assert scanner.dataset_schema == dataset.schema
     assert scanner.projected_schema == pa.schema([pa.field("a", pa.int64())])
+
+
+def test_custom_commit_lock(tmp_path: Path):
+    called_lock = False
+    called_release = False
+
+    @contextlib.contextmanager
+    def commit_lock(version: int):
+        nonlocal called_lock
+        nonlocal called_release
+        called_lock = True
+        assert version == 1
+        yield
+        called_release = True
+
+    lance.write_dataset(
+        pa.table({"a": range(100)}), tmp_path / "test1", commit_lock=commit_lock
+    )
+    assert called_lock
+    assert called_release
+
+    @contextlib.contextmanager
+    def commit_lock(_version: int):
+        try:
+            yield
+        finally:
+            raise Exception("hello world!")
+
+    with pytest.raises(Exception, match="hello world!"):
+        lance.write_dataset(
+            pa.table({"a": range(100)}), tmp_path / "test2", commit_lock=commit_lock
+        )
+
+    @contextlib.contextmanager
+    def commit_lock(_version: int):
+        raise CommitConflictError()
+
+    with pytest.raises(Exception, match="CommitConflictError"):
+        lance.write_dataset(
+            pa.table({"a": range(100)}), tmp_path / "test3", commit_lock=commit_lock
+        )

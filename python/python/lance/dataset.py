@@ -27,6 +27,7 @@ import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
+from .commit import CommitLock
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import __version__ as __version__
 from .lance import _Dataset, _Scanner, _write_dataset
@@ -949,6 +950,7 @@ def write_dataset(
     mode: str = "create",
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
+    commit_lock: Optional[CommitLock] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -981,6 +983,11 @@ def write_dataset(
         "max_rows_per_file": max_rows_per_file,
         "max_rows_per_group": max_rows_per_group,
     }
+
+    if commit_lock:
+        if not callable(commit_lock):
+            raise TypeError(f"commit_lock must be a function, got {type(commit_lock)}")
+        params["commit_handler"] = commit_lock
 
     uri = os.fspath(uri) if isinstance(uri, Path) else uri
     _write_dataset(reader, uri, params)
