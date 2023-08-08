@@ -19,7 +19,9 @@ use std::task::{Context, Poll};
 use arrow_array::{cast::as_primitive_array, RecordBatch, UInt64Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+};
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use futures::FutureExt;
 use tokio::sync::mpsc::{self, Receiver};
@@ -148,6 +150,7 @@ impl RecordBatchStream for Take {
 /// The rows are identified by the inexplicit row IDs from `input` plan.
 ///
 /// The output schema will be the input schema, merged with extra schemas from the dataset.
+#[derive(Debug)]
 pub struct TakeExec {
     /// Dataset to read from.
     dataset: Arc<Dataset>,
@@ -160,15 +163,20 @@ pub struct TakeExec {
     output_schema: Schema,
 }
 
-impl std::fmt::Debug for TakeExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let columns = self
-            .output_schema
-            .fields
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect::<Vec<_>>();
-        write!(f, "Take(columns={:?}, \n\tchild={:?})", columns, self.input)
+impl DisplayAs for TakeExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                let columns = self
+                    .output_schema
+                    .fields
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "Take: columns={:?}", columns)
+            }
+        }
     }
 }
 

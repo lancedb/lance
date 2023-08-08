@@ -21,8 +21,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
-    ExecutionPlan, Partitioning, RecordBatchStream as DFRecordBatchStream,
-    SendableRecordBatchStream, Statistics,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
+    RecordBatchStream as DFRecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 use futures::stream::Stream;
 use futures::FutureExt;
@@ -127,6 +127,7 @@ impl DFRecordBatchStream for KNNFlatStream {
 /// - `input` schema must contains `query.column`,
 /// - The column must be a vector.
 /// - `input` schema does not have "_distance" column.
+#[derive(Debug)]
 pub struct KNNFlatExec {
     /// Input node.
     input: Arc<dyn ExecutionPlan>,
@@ -135,13 +136,17 @@ pub struct KNNFlatExec {
     query: Query,
 }
 
-impl std::fmt::Debug for KNNFlatExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "KNN(flat, k={}, metric={}, child={:?})",
-            self.query.k, self.query.metric_type, self.input
-        )
+impl DisplayAs for KNNFlatExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "KNNFlat: k={} metric={}",
+                    self.query.k, self.query.metric_type
+                )
+            }
+        }
     }
 }
 
@@ -325,6 +330,7 @@ impl Stream for KNNIndexStream {
 }
 
 /// [ExecutionPlan] for KNNIndex node.
+#[derive(Debug)]
 pub struct KNNIndexExec {
     /// Dataset to read from.
     dataset: Arc<Dataset>,
@@ -334,13 +340,13 @@ pub struct KNNIndexExec {
     query: Query,
 }
 
-impl std::fmt::Debug for KNNIndexExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "KNN(index, name={}, k={})",
-            self.index_name, self.query.k
-        )
+impl DisplayAs for KNNIndexExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "KNNIndex: name={}, k={}", self.index_name, self.query.k)
+            }
+        }
     }
 }
 
@@ -550,6 +556,7 @@ mod tests {
 
         let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch]));
         let idx = KNNFlatExec::try_new(input, query).unwrap();
+        println!("{:?}", idx);
         assert_eq!(
             idx.schema().as_ref(),
             &ArrowSchema::new(vec![

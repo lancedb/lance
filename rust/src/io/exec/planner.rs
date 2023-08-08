@@ -332,6 +332,18 @@ impl Planner {
             }
             SQLExpr::Nested(inner) => self.parse_sql_expr(inner.as_ref()),
             SQLExpr::Function(func) => self.parse_function(func),
+            SQLExpr::ILike {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+            } => Ok(Expr::Like(Like::new(
+                *negated,
+                Box::new(self.parse_sql_expr(expr)?),
+                Box::new(self.parse_sql_expr(pattern)?),
+                *escape_char,
+                true,
+            ))),
             SQLExpr::Like {
                 negated,
                 expr,
@@ -342,6 +354,7 @@ impl Planner {
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
                 *escape_char,
+                false,
             ))),
             SQLExpr::Cast { expr, data_type } => Ok(Expr::Cast(datafusion::logical_expr::Cast {
                 expr: Box::new(self.parse_sql_expr(expr)?),

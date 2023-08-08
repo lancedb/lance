@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use datafusion::{
     execution::context::TaskContext,
-    physical_plan::{ExecutionPlan, SendableRecordBatchStream},
+    physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
 };
 
 #[derive(Debug)]
@@ -32,6 +32,14 @@ pub struct TestingExec {
 impl TestingExec {
     pub(crate) fn new(batches: Vec<RecordBatch>) -> Self {
         Self { batches }
+    }
+}
+
+impl DisplayAs for TestingExec {
+    fn fmt_as(&self, t: DisplayFormatType, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => todo!(),
+        }
     }
 }
 

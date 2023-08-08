@@ -22,7 +22,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
-    ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
+    SendableRecordBatchStream,
 };
 use futures::stream::Stream;
 use futures::{stream, Future};
@@ -180,6 +181,7 @@ impl Stream for LanceStream {
 }
 
 /// DataFusion [ExecutionPlan] for scanning one Lance dataset
+#[derive(Debug)]
 pub struct LanceScanExec {
     dataset: Arc<Dataset>,
     fragments: Arc<Vec<Fragment>>,
@@ -191,22 +193,27 @@ pub struct LanceScanExec {
     ordered_output: bool,
 }
 
-impl std::fmt::Debug for LanceScanExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let columns = self
-            .projection
-            .fields
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect::<Vec<_>>();
-        write!(
-            f,
-            "LanceScan(uri={}, projection={:#?}, row_id={}, ordered={})",
-            self.dataset.data_dir(),
-            columns,
-            self.with_row_id,
-            self.ordered_output
-        )
+impl DisplayAs for LanceScanExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                let columns = self
+                    .projection
+                    .fields
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "LanceScan: uri={}, projection=[{}], row_id={}, ordered={}",
+                    self.dataset.data_dir(),
+                    columns,
+                    self.with_row_id,
+                    self.ordered_output
+                )
+            }
+        }
     }
 }
 
