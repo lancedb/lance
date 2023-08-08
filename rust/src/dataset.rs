@@ -35,6 +35,7 @@ mod feature_flags;
 pub mod fragment;
 mod hash_joiner;
 pub mod scanner;
+pub mod transaction;
 pub mod updater;
 mod write;
 

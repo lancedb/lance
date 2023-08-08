@@ -35,6 +35,7 @@
 
 use std::{fmt::Debug, sync::atomic::AtomicBool};
 
+use crate::dataset::transaction::Transaction;
 use crate::{format::Index, format::Manifest};
 use futures::future::BoxFuture;
 use object_store::path::Path;
@@ -261,6 +262,47 @@ impl<T: CommitLock + Send + Sync + Debug> CommitHandler for T {
 
         res.map_err(|err| err.into())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitConfig {
+    pub num_retries: u32,
+    // TODO: add isolation_level
+}
+
+impl Default for CommitConfig {
+    fn default() -> Self {
+        Self {
+            num_retries: 3,
+        }
+    }
+}
+
+pub(crate) async fn commit_transaction(
+    object_store: &ObjectStore,
+    base_path: &Path,
+    transaction: &Transaction,
+    indices: Option<Vec<Index>>,
+    write_config: ManifestWriteConfig,
+    commit_config: CommitConfig,
+) -> crate::Result<()> {
+    // First, get all transactions since read_version
+    // If any of them conflict with the transaction, return an error
+
+    let new_version = todo!();
+
+    for retry in 0..commit_config.num_retries {
+        // Get the latest manifest
+        // Build the transaction
+
+        // try commit
+
+        // If success, return
+
+        // if conflict, check for compatibility. If incompatible, return conflicterror
+    }
+
+    // return retryerror for commit
 }
 
 #[cfg(test)]
