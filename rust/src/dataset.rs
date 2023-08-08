@@ -453,18 +453,15 @@ impl Dataset {
 
         // Check params are correct
         if params.is_none() {
-            let mut _params = WriteParams::default();
-            _params.mode = WriteMode::Append;
-            params = Some(_params);
-        } else {
-            if !matches!(params.as_ref().unwrap().mode, WriteMode::Append) {
-                return Err(Error::InvalidOperation {
-                    message: format!("Invalid create mode on append operation."),
-                });
-            }
+            params = Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            });
         }
-
-        let params = params.unwrap();
+        // Force append mode
+        let mut params = params.unwrap();
+        params.mode = WriteMode::Append;
+        let params = params;
 
         let (stream, schema) = reader_to_stream(batches)?;
 
@@ -1065,7 +1062,7 @@ mod tests {
         DictionaryArray, Int32Array, RecordBatch, StringArray, UInt16Array,
     };
     use arrow_array::{
-        Float32Array, Int8Array, Int8DictionaryArray, RecordBatchIterator, UInt32Array, Int64Array,
+        Float32Array, Int64Array, Int8Array, Int8DictionaryArray, RecordBatchIterator, UInt32Array,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
@@ -1486,7 +1483,9 @@ mod tests {
         write_params.mode = WriteMode::Append;
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
-        ds.append(batches, Some(write_params.clone())).await.unwrap();
+        ds.append(batches, Some(write_params.clone()))
+            .await
+            .unwrap();
 
         let expected_batch = RecordBatch::try_new(
             schema.clone(),
@@ -1517,15 +1516,7 @@ mod tests {
         let expected_struct_arr: StructArray = expected_batch.into();
         assert_eq!(&expected_struct_arr, as_struct_array(sorted_arr.as_ref()));
 
-        // Each fragments has different fragment ID
-        assert_eq!(
-            actual_ds
-                .fragments()
-                .iter()
-                .map(|f| f.id)
-                .collect::<Vec<_>>(),
-            (0..2).collect::<Vec<_>>()
-        )
+        actual_ds.validate().await.unwrap();
     }
 
     #[tokio::test]
@@ -1566,15 +1557,13 @@ mod tests {
             .unwrap();
 
         write_params.mode = WriteMode::Append;
-        let other_batches = RecordBatchIterator::new(other_batches.into_iter().map(Ok), other_schema.clone());
+        let other_batches =
+            RecordBatchIterator::new(other_batches.into_iter().map(Ok), other_schema.clone());
 
         let result = ds.append(other_batches, Some(write_params.clone())).await;
         // Error because schema is different
-        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::SchemaMismatch { .. })))
     }
-
-
-
 
     #[tokio::test]
     async fn append_dictionary() {
