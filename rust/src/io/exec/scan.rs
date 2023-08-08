@@ -181,6 +181,7 @@ impl Stream for LanceStream {
 }
 
 /// DataFusion [ExecutionPlan] for scanning one Lance dataset
+#[derive(Debug)]
 pub struct LanceScanExec {
     dataset: Arc<Dataset>,
     fragments: Arc<Vec<Fragment>>,
@@ -190,25 +191,6 @@ pub struct LanceScanExec {
     fragment_readahead: usize,
     with_row_id: bool,
     ordered_output: bool,
-}
-
-impl std::fmt::Debug for LanceScanExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let columns = self
-            .projection
-            .fields
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect::<Vec<_>>();
-        write!(
-            f,
-            "LanceScan(uri={}, projection={:#?}, row_id={}, ordered={})",
-            self.dataset.data_dir(),
-            columns,
-            self.with_row_id,
-            self.ordered_output
-        )
-    }
 }
 
 impl DisplayAs for LanceScanExec {

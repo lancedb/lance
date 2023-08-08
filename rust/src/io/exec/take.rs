@@ -150,6 +150,7 @@ impl RecordBatchStream for Take {
 /// The rows are identified by the inexplicit row IDs from `input` plan.
 ///
 /// The output schema will be the input schema, merged with extra schemas from the dataset.
+#[derive(Debug)]
 pub struct TakeExec {
     /// Dataset to read from.
     dataset: Arc<Dataset>,
@@ -160,18 +161,6 @@ pub struct TakeExec {
 
     /// Output schema is the merged schema between input schema and extra schema.
     output_schema: Schema,
-}
-
-impl std::fmt::Debug for TakeExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let columns = self
-            .output_schema
-            .fields
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect::<Vec<_>>();
-        write!(f, "Take(columns={:?}, \n\tchild={:?})", columns, self.input)
-    }
 }
 
 impl DisplayAs for TakeExec {

@@ -122,25 +122,10 @@ impl RecordBatchStream for ProjectionStream {
     }
 }
 
+#[derive(Debug)]
 pub struct ProjectionExec {
     input: Arc<dyn ExecutionPlan>,
     project: Arc<Schema>,
-}
-
-impl std::fmt::Debug for ProjectionExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let columns = self
-            .project
-            .fields
-            .iter()
-            .map(|f| f.name.clone())
-            .collect::<Vec<_>>();
-        write!(
-            f,
-            "Projection(schema={:?},\n\tchild={:?})",
-            columns, self.input
-        )
-    }
 }
 
 impl DisplayAs for ProjectionExec {

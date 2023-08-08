@@ -127,22 +127,13 @@ impl DFRecordBatchStream for KNNFlatStream {
 /// - `input` schema must contains `query.column`,
 /// - The column must be a vector.
 /// - `input` schema does not have "_distance" column.
+#[derive(Debug)]
 pub struct KNNFlatExec {
     /// Input node.
     input: Arc<dyn ExecutionPlan>,
 
     /// The query to execute.
     query: Query,
-}
-
-impl std::fmt::Debug for KNNFlatExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "KNN(flat, k={}, metric={}, child={:?})",
-            self.query.k, self.query.metric_type, self.input
-        )
-    }
 }
 
 impl DisplayAs for KNNFlatExec {
@@ -339,6 +330,7 @@ impl Stream for KNNIndexStream {
 }
 
 /// [ExecutionPlan] for KNNIndex node.
+#[derive(Debug)]
 pub struct KNNIndexExec {
     /// Dataset to read from.
     dataset: Arc<Dataset>,
@@ -346,16 +338,6 @@ pub struct KNNIndexExec {
     index_name: String,
     /// The vector query to execute.
     query: Query,
-}
-
-impl std::fmt::Debug for KNNIndexExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "KNN(index, name={}, k={})",
-            self.index_name, self.query.k
-        )
-    }
 }
 
 impl DisplayAs for KNNIndexExec {
