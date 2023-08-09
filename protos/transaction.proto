@@ -22,29 +22,55 @@ import "format.proto";
 
 package lance.format.pb;
 
+// A transaction represents the changes to a dataset.
+//
+// This has two purposes:
+// 1. When retrying a commit, the transaction can be used to re-build an updated
+//    manifest.
+// 2. When there's a conflict, this can be used to determine whether the other
+//    transaction is compatible with this one.
 message Transaction {
   // The version of the dataset this transaction was built from.
   uint64 read_version = 1;
 
+  // The UUID
+  string uuid = 2;
+
+  // Optional version tag
+  string tag = 3;
+
   message Append {
-    // The new fragments to append
+    // The new fragments to append.
+    //
+    // The fragment IDs are meaningless here, because they are not yet assigned
+    // final values.
     repeated DataFragment fragments = 1;
   }
 
   message Delete {
     // The fragments to update
+    //
+    // The fragment IDs will match existing fragments in the dataset.
     repeated DataFragment updated_fragments = 1;
-    // The fragments to review
+    // The fragments to delete entirely.
     repeated uint64 deleted_fragment_ids = 2;
     // The predicate that was evaluated
+    //
+    // This may be used to determine whether the delete would have affected 
+    // files written by a concurrent transaction.
     string predicate = 3;
   }
 
   message Overwrite {
     // The new fragments
+    //
+    // The fragment IDs are meaningless here, because they are not yet assigned
+    // final values.
     repeated DataFragment fragments = 1;
     // The new schema
     repeated Field schema = 2;
+    // Schema metadata.
+    map<string, bytes> schema_metadata = 3;
   }
 
   message CreateIndex {}
@@ -53,17 +79,25 @@ message Transaction {
   // kinds of operations just rearrange data.
   message Rewrite {
     // The old fragments that are being replaced
+    //
+    // These should all have existing fragment IDs.
     repeated DataFragment old_fragments = 1;
     // The new fragments
+    //
+    // These fragments IDs are not yet assigned.
     repeated DataFragment new_fragments = 2;
   }
 
   // An operation that merges in a new column, altering the schema.
   message Merge {
     // The updated fragments
+    //
+    // These should all have existing fragment IDs.
     repeated DataFragment fragments = 1;
     // The new schema
     repeated Field schema = 2;
+    // Schema metadata.
+    map<string, bytes> schema_metadata = 3;
   }
 
   // The operation of this transaction.
@@ -75,7 +109,4 @@ message Transaction {
     Rewrite rewrite = 104;
     Merge merge = 105;
   }
-
-  // Optional version tag
-  string tag = 8;
 }

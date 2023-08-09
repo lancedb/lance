@@ -21,6 +21,7 @@
 // [ ] Commit tests
 // [ ] Python API
 // [ ] Python API docs
+// [ ] Make transaction a separate file
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -39,6 +40,7 @@ use crate::{Error, Result};
 #[derive(Debug, Clone)]
 pub struct Transaction {
     pub read_version: u64,
+    pub uuid: String,
     pub operation: Operation,
     pub tag: Option<String>,
 }
@@ -85,8 +87,10 @@ pub enum Operation {
 
 impl Transaction {
     pub fn new(read_version: u64, operation: Operation, tag: Option<String>) -> Self {
+        let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
         Self {
             read_version,
+            uuid,
             operation,
             tag,
         }
@@ -175,6 +179,7 @@ impl Transaction {
     pub(crate) fn build_manifest(
         &self,
         current_manifest: &Manifest,
+        transaction_file_path: &str,
         config: &ManifestWriteConfig,
     ) -> Result<Manifest> {
         // Get the schema and the final fragment list
@@ -247,7 +252,7 @@ impl Transaction {
 
         manifest.update_max_fragment_id();
 
-        manifest.set_transaction(Some(self))?;
+        manifest.transaction_file = Some(transaction_file_path.to_string());
 
         Ok(manifest)
     }
@@ -275,6 +280,7 @@ impl TryFrom<&pb::Transaction> for Transaction {
             Some(pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
                 fragments,
                 schema,
+                schema_metadata: _schema_metadata, // TODO: handle metadata
             })) => Operation::Overwrite {
                 fragments: fragments.iter().map(Fragment::from).collect(),
                 schema: Schema::from(schema),
@@ -290,6 +296,7 @@ impl TryFrom<&pb::Transaction> for Transaction {
             Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
                 fragments,
                 schema,
+                schema_metadata: _schema_metadata, // TODO: handle metadata
             })) => Operation::Merge {
                 fragments: fragments.iter().map(Fragment::from).collect(),
                 schema: Schema::from(schema),
@@ -302,6 +309,7 @@ impl TryFrom<&pb::Transaction> for Transaction {
         };
         Ok(Self {
             read_version: message.read_version,
+            uuid: message.uuid.clone(),
             operation,
             tag: if message.tag.is_empty() {
                 None
@@ -336,6 +344,7 @@ impl From<&Transaction> for pb::Transaction {
                 pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
                     schema: schema.into(),
+                    schema_metadata: Default::default(), // TODO: handle metadata
                 })
             }
             Operation::Rewrite {
@@ -352,12 +361,14 @@ impl From<&Transaction> for pb::Transaction {
                 pb::transaction::Operation::Merge(pb::transaction::Merge {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
                     schema: schema.into(),
+                    schema_metadata: Default::default(), // TODO: handle metadata
                 })
             }
         };
 
         Self {
             read_version: value.read_version,
+            uuid: value.uuid.clone(),
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
         }

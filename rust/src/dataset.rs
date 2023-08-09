@@ -385,11 +385,11 @@ impl Dataset {
             WriteMode::Append => Operation::Append { fragments },
         };
 
-        let transaction = Transaction {
-            read_version: dataset.map(|ds| ds.manifest.version).unwrap_or(0),
-            tag: None,
+        let transaction = Transaction::new(
+            dataset.map(|ds| ds.manifest.version).unwrap_or(0),
             operation,
-        };
+            None,
+        );
 
         let manifest = commit_transaction(
             &object_store,
@@ -612,14 +612,14 @@ impl Dataset {
         // Inherit the index, since we are just adding columns.
         let indices = self.load_indices().await?;
 
-        let transaction = Transaction {
-            read_version: self.manifest.version,
-            tag: None,
-            operation: Operation::Merge {
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Merge {
                 fragments: updated_fragments,
                 schema: new_schema,
             },
-        };
+            None,
+        );
 
         let manifest = commit_transaction(
             &self.object_store,
@@ -822,15 +822,15 @@ impl Dataset {
             Some(self.load_indices().await?)
         };
 
-        let transaction = Transaction {
-            read_version: self.manifest.version,
-            tag: None,
-            operation: Operation::Delete {
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
                 predicate: predicate.to_string(),
             },
-        };
+            None,
+        );
 
         let manifest = commit_transaction(
             &self.object_store,

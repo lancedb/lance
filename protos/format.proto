@@ -101,14 +101,17 @@ message Manifest {
   // For a single file, will be zero.
   uint32 max_fragment_id = 11;
 
-  // Serialized and compressioned transaction message.bool
+  // Path to the transaction file, relative to the root.
   //
   // This contains a serialized Transaction message representing the transaction
-  // that created this version. It is compressed using ZSTD.
+  // that created this version.
   //
-  // This is serialized and compressed since it is infrequently accessed and
-  // contains information redundant to the other fields in the manifest.
-  bytes transaction_message = 12;
+  // May be empty if no transaction file was written.
+  //
+  // The path format is "_transactions/{read_version}-{uuid}.txn" where
+  // {read_version} is the version of the table the transaction read from, and
+  // {uuid} is a hyphen-separated UUID.
+  string transaction_file = 12;
 } // Manifest
 
 // Auxiliary Data attached to a version.

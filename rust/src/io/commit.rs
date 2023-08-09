@@ -38,10 +38,11 @@ use std::{fmt::Debug, sync::atomic::AtomicBool};
 use crate::dataset::transaction::Transaction;
 use crate::dataset::{write_manifest_file, ManifestWriteConfig};
 use crate::Dataset;
-use crate::{format::Index, format::Manifest};
+use crate::{format::pb, format::Index, format::Manifest};
 use futures::future::BoxFuture;
 use object_store::path::Path;
 use object_store::Error as ObjectStoreError;
+use prost::Message;
 
 use super::ObjectStore;
 
@@ -278,6 +279,38 @@ impl Default for CommitConfig {
     }
 }
 
+/// Read the transaction data from a transaction file.
+async fn read_transaction_file(
+    object_store: &ObjectStore,
+    base_path: &Path,
+    transaction_file: &str,
+) -> crate::Result<Transaction> {
+    let path = base_path.child(transaction_file);
+    let result = object_store.inner.get(&path).await?;
+    let data = result.bytes().await?;
+    let transaction = pb::Transaction::decode(data)?;
+    (&transaction).try_into()
+}
+
+/// Write a transaction to a file and return the relative path.
+async fn write_transaction_file(
+    object_store: &ObjectStore,
+    base_path: &Path,
+    transaction: &Transaction,
+) -> crate::Result<String> {
+    let relative_path = format!(
+        "_transactions/{}-{}.txn",
+        transaction.read_version, transaction.uuid
+    );
+    let path = base_path.child(relative_path.clone());
+    let mut writer = object_store.create(&path).await?;
+    let message = pb::Transaction::from(transaction);
+    writer.write_protobuf(&message).await?;
+    writer.shutdown().await?;
+
+    Ok(relative_path)
+}
+
 pub(crate) fn check_transaction(
     transaction: &Transaction,
     other_version: u64,
@@ -318,6 +351,8 @@ pub(crate) async fn commit_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
 ) -> crate::Result<Manifest> {
+    let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
+
     let mut current_manifest = Dataset::checkout(base_path.as_ref(), transaction.read_version)
         .await?
         .manifest;
@@ -328,7 +363,12 @@ pub(crate) async fn commit_transaction(
         version += 1;
         match Dataset::checkout(base_path.as_ref(), version).await {
             Ok(dataset) => {
-                other_transactions.push(dataset.manifest.transaction()?);
+                let other_txn = if let Some(txn_file) = &dataset.manifest.transaction_file {
+                    Some(read_transaction_file(object_store, base_path, txn_file).await?)
+                } else {
+                    None
+                };
+                other_transactions.push(other_txn);
                 current_manifest = dataset.manifest;
             }
             Err(crate::Error::NotFound { .. }) => {
@@ -350,7 +390,11 @@ pub(crate) async fn commit_transaction(
 
     for _ in 0..commit_config.num_retries {
         // Build an up-to-date manifest from the transaction and current manifest
-        let mut manifest = transaction.build_manifest(current_manifest.as_ref(), write_config)?;
+        let mut manifest = transaction.build_manifest(
+            current_manifest.as_ref(),
+            &transaction_file,
+            write_config,
+        )?;
 
         // Try to commit the manifest
         let result = write_manifest_file(
@@ -369,11 +413,12 @@ pub(crate) async fn commit_transaction(
                 current_manifest = Dataset::checkout(base_path.as_ref(), target_version)
                     .await?
                     .manifest;
-                check_transaction(
-                    transaction,
-                    target_version,
-                    &current_manifest.transaction()?,
-                )?;
+                let other_transaction = if let Some(txn_file) = &current_manifest.transaction_file {
+                    Some(read_transaction_file(object_store, base_path, txn_file).await?)
+                } else {
+                    None
+                };
+                check_transaction(transaction, target_version, &other_transaction)?;
                 target_version += 1;
             }
             Err(err) => {
