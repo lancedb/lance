@@ -34,6 +34,7 @@ use futures::{
 };
 use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
+use serde::Serialize;
 
 #[cfg(feature = "opq")]
 use super::opq::train_opq;
@@ -155,9 +156,51 @@ impl std::fmt::Debug for IVFIndex {
     }
 }
 
+#[derive(Serialize)]
+pub struct IvfIndexPartitionStats {
+    length: u32,
+    offset: usize,
+    centroids: String,
+}
+
+#[derive(Serialize)]
+pub struct IvfIndexStats {
+    index_type: String,
+    uuid: String,
+    uri: String,
+    metric_type: String,
+    num_partitions: usize,
+    sub_index: String,
+    partitions: Vec<IvfIndexPartitionStats>,
+}
+
 impl Index for IVFIndex {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn statistics(&self) -> Result<String> {
+        let partitions_stats = self
+            .ivf
+            .lengths
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| IvfIndexPartitionStats {
+                length: len,
+                offset: self.ivf.offsets[i],
+                centroids: format!("{:?}", self.ivf.centroids.value(i)),
+            })
+            .collect::<Vec<_>>();
+
+        Ok(serde_json::to_string(&IvfIndexStats {
+            index_type: "ivf".to_string(),
+            uuid: self.uuid.clone(),
+            uri: self.reader.path().to_string(),
+            metric_type: self.metric_type.to_string(),
+            num_partitions: self.ivf.num_partitions(),
+            sub_index: self.sub_index.statistics()?,
+            partitions: partitions_stats,
+        })?)
     }
 }
 

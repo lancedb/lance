@@ -27,6 +27,7 @@ use arrow_select::take::take;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use rand::SeedableRng;
+use serde::Serialize;
 
 use super::{MetricType, Query, VectorIndex};
 use crate::arrow::linalg::matrix::MatrixView;
@@ -220,9 +221,24 @@ impl PQIndex {
     }
 }
 
+#[derive(Serialize)]
+pub struct PQIndexStats {
+    nbits: u32,
+    num_sub_vectors: usize,
+    metric_type: String,
+}
+
 impl Index for PQIndex {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn statistics(&self) -> Result<String> {
+        Ok(serde_json::to_string(&PQIndexStats {
+            nbits: self.nbits,
+            num_sub_vectors: self.num_sub_vectors,
+            metric_type: self.metric_type.to_string(),
+        })?)
     }
 }
 

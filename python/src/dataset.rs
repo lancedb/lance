@@ -125,10 +125,12 @@ impl Dataset {
 
         let py = self_.py();
         let dataset_path = Path::new(&self_.uri);
-        let do_not_filter = index_name.eq(&"");
+        let name = index_name.unwrap_or_default();
+        let do_not_filter = name.eq(&"");
+
         Ok(index_metadata
             .iter()
-            .filter(|idx| do_not_filter || idx.name.eq(&index_name))
+            .filter(|idx| do_not_filter || idx.name.eq(&name))
             .map(|idx| {
                 let dict = PyDict::new(py);
                 let schema = self_.ds.schema();

@@ -11,6 +11,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import json
 import random
 import string
 import time
@@ -208,7 +209,11 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     assert actual_index == expected_index
     assert dataset_with_index.get_index("") == []
     assert dataset_with_index.get_index("non-existent_idx") == []
-    assert index_stats.startswith(
-        "Ivf(l2) -> PQ=PQ(num_sub_vectors=8, nbits=8, metric_type=l2), "
-        "num_partitions=5, partition_info=\n[0]: length="
-    )
+
+    index_stats = json.loads(index_stats)
+    sub_index = '{"nbits":8,"num_sub_vectors":8,"metric_type":"l2"}'
+    assert index_stats["index_type"] == "ivf"
+    assert index_stats["uuid"] == index_uuid
+    assert index_stats["num_partitions"] == 5
+    assert index_stats["metric_type"] == "l2"
+    assert index_stats["sub_index"] == sub_index

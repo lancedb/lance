@@ -22,6 +22,7 @@ use arrow::array::{as_primitive_array, Float32Builder};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use serde::Serialize;
 
 use super::{
     pq::{PQBuildParams, ProductQuantizer},
@@ -271,9 +272,27 @@ impl std::fmt::Debug for OPQIndex {
     }
 }
 
+#[derive(Serialize)]
+pub struct OPQIndexStats {
+    dim: usize,
+    sub_index: String,
+}
+
 impl Index for OPQIndex {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn statistics(&self) -> Result<String> {
+        Ok(serde_json::to_string(&OPQIndexStats {
+            dim: self
+                .opq
+                .rotation
+                .as_ref()
+                .map(|m| m.num_columns())
+                .unwrap_or(0),
+            sub_index: self.sub_index.statistics()?,
+        })?)
     }
 }
 
