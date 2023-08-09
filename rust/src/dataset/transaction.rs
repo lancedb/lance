@@ -12,16 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// TODO:
-// [ ] Module docs
-// [ ] Conflict resolution Tests
-// [x] Serialization
-// [x] Deserialization
-// [x] Commit function
-// [ ] Commit tests
-// [ ] Python API
-// [ ] Python API docs
-// [x] Make transaction a separate file
+//! Transaction definitions for updating datasets
+//!
+//! Prior to creating a new manifest, a transaction must be created representing
+//! the changes being made to the dataset. By representing them as incremental
+//! changes, we can detect whether concurrent operations are compatible with
+//! one another. We can also rebuild manifests when retrying committing a
+//! manifest.
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -46,9 +43,6 @@ pub struct Transaction {
     pub operation: Operation,
     pub tag: Option<String>,
 }
-// phalanx/src/catalog.rs
-
-// TODO: This should have a protobuf message
 
 /// An operation on a dataset.
 #[derive(Debug, Clone)]
@@ -64,7 +58,8 @@ pub enum Operation {
         deleted_fragment_ids: Vec<u64>,
         predicate: String,
     },
-    /// Overwrite the entire dataset with the given fragments.
+    /// Overwrite the entire dataset with the given fragments. This is also
+    /// used when initially creating a table.
     Overwrite {
         fragments: Vec<Fragment>,
         schema: Schema,
@@ -83,8 +78,6 @@ pub enum Operation {
         fragments: Vec<Fragment>,
         schema: Schema,
     },
-    // TODO: a Custom one to allow arbitrary changes that will have same conflict
-    // resolution rules as unknown?
 }
 
 impl Transaction {
@@ -140,6 +133,14 @@ impl Transaction {
                     deleted_fragment_ids.iter().any(|f| left_ids.contains(f))
                         || updated_fragments.iter().any(|f| left_ids.contains(&f.id))
                 }
+                Operation::Rewrite {
+                    old_fragments: right_fragments,
+                    ..
+                } => {
+                    // As long as they rewrite disjoint fragments they shouldn't conflict.
+                    let left_ids: HashSet<u64> = old_fragments.iter().map(|f| f.id).collect();
+                    right_fragments.iter().any(|f| left_ids.contains(&f.id))
+                }
                 _ => true,
             },
             // Overwrite always succeeds
@@ -148,6 +149,11 @@ impl Transaction {
                 Operation::Append { .. } => false,
                 // Indices are identified by UUIDs, so they shouldn't conflict.
                 Operation::CreateIndex { .. } => false,
+                // Although some of the rows we indexed may have been deleted,
+                // row ids are still valid, so we allow this optimistically.
+                Operation::Delete { .. } => false,
+                // Merge doesn't change row ids, so this should be fine.
+                Operation::Merge { .. } => false,
                 // Rewrite likely changed many of the row ids, so our index is
                 // likely useless. It should be rebuilt.
                 // TODO: we could be smarter here and only invalidate the index
@@ -168,9 +174,16 @@ impl Transaction {
                     let left_ids: HashSet<u64> = left_fragments.iter().map(|f| f.id).collect();
                     right_fragments.iter().any(|f| left_ids.contains(&f.id))
                 }
+                Operation::Rewrite { old_fragments, .. } => {
+                    // If we update any fragments that were rewritten, we conflict.
+                    let left_ids: HashSet<u64> = left_fragments.iter().map(|f| f.id).collect();
+                    old_fragments.iter().any(|f| left_ids.contains(&f.id))
+                }
                 _ => true,
             },
-            _ => true,
+            // Merge changes the schema, but preserves row ids, so the only operation
+            // it's compatible with is CreateIndex.
+            Operation::Merge { .. } => !matches!(&other.operation, Operation::CreateIndex),
         }
     }
 
@@ -456,13 +469,70 @@ mod tests {
 
         // Transactions and whether they are expected to conflict with each
         // of other_transactions
-        let cases = [(
-            Operation::Append {
-                fragments: vec![fragment0.clone()],
-            },
-            [false, false, false, true, true, false],
-            // TODO: more cases
-        )];
+        let cases = [
+            (
+                Operation::Append {
+                    fragments: vec![fragment0.clone()],
+                },
+                [false, false, false, true, true, false],
+            ),
+            (
+                Operation::Delete {
+                    // Delete that affects fragments different from other transactions
+                    updated_fragments: vec![fragment1.clone()],
+                    deleted_fragment_ids: vec![],
+                    predicate: "x > 2".to_string(),
+                },
+                [true, false, false, true, true, false],
+            ),
+            (
+                Operation::Delete {
+                    // Delete that affects same fragments as other transactions
+                    updated_fragments: vec![fragment0.clone(), fragment2.clone()],
+                    deleted_fragment_ids: vec![],
+                    predicate: "x > 2".to_string(),
+                },
+                [true, false, true, true, true, true],
+            ),
+            (
+                Operation::Overwrite {
+                    fragments: vec![fragment0.clone(), fragment2.clone()],
+                    schema: Schema::default(),
+                },
+                // No conflicts: overwrite can always happen since it doesn't
+                // depend on previous state of the table.
+                [false, false, false, false, false, false],
+            ),
+            (
+                Operation::CreateIndex,
+                // Will only conflict with operations that modify row ids.
+                [false, false, false, false, true, true],
+            ),
+            (
+                // Rewrite that affects different fragments
+                Operation::Rewrite {
+                    old_fragments: vec![fragment1.clone()],
+                    new_fragments: vec![fragment0.clone()],
+                },
+                [false, true, false, true, true, false],
+            ),
+            (
+                // Rewrite that affects the same fragments
+                Operation::Rewrite {
+                    old_fragments: vec![fragment0.clone(), fragment2.clone()],
+                    new_fragments: vec![fragment0.clone()],
+                },
+                [false, true, true, true, true, true],
+            ),
+            (
+                Operation::Merge {
+                    fragments: vec![fragment0.clone(), fragment2.clone()],
+                    schema: Schema::default(),
+                },
+                // Merge conflicts with everything except CreateIndex.
+                [true, false, true, true, true, true],
+            ),
+        ];
 
         for (operation, expected_conflicts) in &cases {
             let transaction = Transaction::new(0, operation.clone(), None);

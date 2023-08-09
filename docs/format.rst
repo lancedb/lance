@@ -265,8 +265,13 @@ Conflict resolution
 ~~~~~~~~~~~~~~~~~~~
 
 If two writers try to commit at the same time, one will succeed and the other
-will fail. The failed writer should attempt to retry the commit.
+will fail. The failed writer should attempt to retry the commit, but only if
+it's changes are compatible with the changes made by the successful writer.
 
+The changes for a given commit are recorded as a transaction file, under the
+``_transactions`` prefix in the dataset directory. The transaction file is a
+serialize ``Transaction`` protobuf message. See the ``transaction.proto`` file
+for its definition.
 
 .. image:: _static/conflict_resolution_flow.png
 
@@ -283,7 +288,6 @@ The commit process is as follows:
  4. Build a manifest and attempt to commit it to the next version. If the commit
     fails because another writer has already committed, go back to step 3.
  5. If the commit succeeds, update the ``_latest.manifest`` file.
-
 
 When checking whether two transactions conflict, be conservative. If the
 transaction file is missing, assume it conflicts. If the transaction file 

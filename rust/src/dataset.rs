@@ -245,7 +245,7 @@ impl Dataset {
         .await
     }
 
-    pub(crate) async fn checkout_manifest(
+    async fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         manifest_path: &Path,

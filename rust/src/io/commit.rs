@@ -38,6 +38,7 @@ use std::{fmt::Debug, sync::atomic::AtomicBool};
 use crate::dataset::transaction::Transaction;
 use crate::dataset::{write_manifest_file, ManifestWriteConfig};
 use crate::Dataset;
+use crate::Result;
 use crate::{format::pb, format::Index, format::Manifest};
 use futures::future::BoxFuture;
 use object_store::path::Path;
@@ -52,7 +53,7 @@ pub type ManifestWriter = for<'a> fn(
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,
-) -> BoxFuture<'a, crate::Result<()>>;
+) -> BoxFuture<'a, Result<()>>;
 
 /// Handle commits that prevent conflicting writes.
 ///
@@ -72,7 +73,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
-    ) -> Result<(), CommitError>;
+    ) -> std::result::Result<(), CommitError>;
 }
 
 /// Errors that can occur when committing a manifest.
@@ -117,7 +118,7 @@ impl CommitHandler for UnsafeCommitHandler {
         path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
-    ) -> Result<(), CommitError> {
+    ) -> std::result::Result<(), CommitError> {
         // Log a one-time warning
         if !WARNED_ON_UNSAFE_COMMIT.load(std::sync::atomic::Ordering::Relaxed) {
             WARNED_ON_UNSAFE_COMMIT.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -154,7 +155,7 @@ impl CommitHandler for RenameCommitHandler {
         path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
-    ) -> Result<(), CommitError> {
+    ) -> std::result::Result<(), CommitError> {
         // Create a temporary object, then use `rename_if_not_exists` to commit.
         // If failed, clean up the temporary object.
 
@@ -217,13 +218,13 @@ pub trait CommitLock {
     /// It is not required that the lock tracks the version. It is provided in
     /// case the locking is handled by a catalog service that needs to know the
     /// current version of the table.
-    async fn lock(&self, version: u64) -> Result<Self::Lease, CommitError>;
+    async fn lock(&self, version: u64) -> std::result::Result<Self::Lease, CommitError>;
 }
 
 #[async_trait::async_trait]
 pub trait CommitLease: Send + Sync {
     /// Return the lease, indicating whether the commit was successful.
-    async fn release(&self, success: bool) -> Result<(), CommitError>;
+    async fn release(&self, success: bool) -> std::result::Result<(), CommitError>;
 }
 
 #[async_trait::async_trait]
@@ -235,7 +236,7 @@ impl<T: CommitLock + Send + Sync + Debug> CommitHandler for T {
         path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
-    ) -> Result<(), CommitError> {
+    ) -> std::result::Result<(), CommitError> {
         // NOTE: once we have the lease we cannot use ? to return errors, since
         // we must release the lease before returning.
         let lease = self.lock(manifest.version).await?;
@@ -284,7 +285,7 @@ async fn read_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction_file: &str,
-) -> crate::Result<Transaction> {
+) -> Result<Transaction> {
     let path = base_path.child("_transactions").child(transaction_file);
     let result = object_store.inner.get(&path).await?;
     let data = result.bytes().await?;
@@ -297,7 +298,7 @@ async fn write_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction: &Transaction,
-) -> crate::Result<String> {
+) -> Result<String> {
     let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
     let path = base_path.child("_transactions").child(file_name.as_str());
 
@@ -308,11 +309,11 @@ async fn write_transaction_file(
     Ok(file_name)
 }
 
-pub(crate) fn check_transaction(
+fn check_transaction(
     transaction: &Transaction,
     other_version: u64,
     other_transaction: &Option<Transaction>,
-) -> crate::Result<()> {
+) -> Result<()> {
     if other_transaction.is_none() {
         return Err(crate::Error::Internal {
             message: format!(
@@ -345,7 +346,7 @@ pub(crate) async fn commit_new_dataset(
     transaction: &Transaction,
     indices: Option<Vec<Index>>,
     write_config: &ManifestWriteConfig,
-) -> crate::Result<Manifest> {
+) -> Result<Manifest> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
     let mut manifest = transaction.build_manifest(None, &transaction_file, write_config)?;
@@ -370,7 +371,7 @@ pub(crate) async fn commit_transaction(
     indices: Option<Vec<Index>>,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
-) -> crate::Result<Manifest> {
+) -> Result<Manifest> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
@@ -471,6 +472,7 @@ mod tests {
 
     use super::*;
 
+    use crate::dataset::transaction::Operation;
     use crate::dataset::WriteParams;
     use crate::io::object_store::ObjectStoreParams;
     use crate::Dataset;
@@ -561,7 +563,7 @@ mod tests {
         impl CommitLock for CustomCommitHandler {
             type Lease = CustomCommitLease;
 
-            async fn lock(&self, version: u64) -> Result<Self::Lease, CommitError> {
+            async fn lock(&self, version: u64) -> std::result::Result<Self::Lease, CommitError> {
                 let mut locked_version = self.locked_version.lock().unwrap();
                 if locked_version.is_some() {
                     // Already locked
@@ -580,7 +582,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl CommitLease for CustomCommitLease {
-            async fn release(&self, _success: bool) -> Result<(), CommitError> {
+            async fn release(&self, _success: bool) -> std::result::Result<(), CommitError> {
                 let mut locked_version = self.locked_version.lock().unwrap();
                 if *locked_version != Some(self.version) {
                     // Already released
@@ -603,5 +605,31 @@ mod tests {
     async fn test_unsafe_commit_handler() {
         let handler = Arc::new(UnsafeCommitHandler);
         test_commit_handler(handler, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_roundtrip_transaction_file() {
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("test");
+        let transaction = Transaction::new(
+            42,
+            Operation::Append { fragments: vec![] },
+            Some("hello world".to_string()),
+        );
+
+        let file_name = write_transaction_file(&object_store, &base_path, &transaction)
+            .await
+            .unwrap();
+        let read_transaction = read_transaction_file(&object_store, &base_path, &file_name)
+            .await
+            .unwrap();
+
+        assert_eq!(transaction.read_version, read_transaction.read_version);
+        assert_eq!(transaction.uuid, read_transaction.uuid);
+        assert!(matches!(
+            read_transaction.operation,
+            Operation::Append { .. }
+        ));
+        assert_eq!(transaction.tag, read_transaction.tag);
     }
 }
