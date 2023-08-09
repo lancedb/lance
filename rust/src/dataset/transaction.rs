@@ -21,7 +21,7 @@
 // [ ] Commit tests
 // [ ] Python API
 // [ ] Python API docs
-// [ ] Make transaction a separate file
+// [x] Make transaction a separate file
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -39,6 +39,8 @@ use crate::{Error, Result};
 /// given the current manifest.
 #[derive(Debug, Clone)]
 pub struct Transaction {
+    /// The version of the table this transaction is based off of. If this is
+    /// the first transaction, this should be 0.
     pub read_version: u64,
     pub uuid: String,
     pub operation: Operation,
@@ -93,6 +95,17 @@ impl Transaction {
             uuid,
             operation,
             tag,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match &self.operation {
+            Operation::Append { .. } => "Append",
+            Operation::Delete { .. } => "Delete",
+            Operation::Overwrite { .. } => "Overwrite",
+            Operation::CreateIndex => "CreateIndex",
+            Operation::Rewrite { .. } => "Rewrite",
+            Operation::Merge { .. } => "Merge",
         }
     }
 
@@ -176,9 +189,11 @@ impl Transaction {
     }
 
     /// Create a new manifest from the current manifest and the transaction.
+    ///
+    /// `current_manifest` should only be None if the dataset does not yet exist.
     pub(crate) fn build_manifest(
         &self,
-        current_manifest: &Manifest,
+        current_manifest: Option<&Manifest>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
     ) -> Result<Manifest> {
@@ -186,14 +201,40 @@ impl Transaction {
         let schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
             Operation::Merge { ref schema, .. } => schema.clone(),
-            _ => current_manifest.schema.clone(),
+            _ => {
+                if let Some(current_manifest) = current_manifest {
+                    current_manifest.schema.clone()
+                } else {
+                    return Err(Error::Internal {
+                        message: "Cannot create a new dataset without a schema".to_string(),
+                    });
+                }
+            }
         };
 
-        let mut fragment_id = current_manifest.max_fragment_id().unwrap_or(0) + 1;
+        let mut fragment_id = if matches!(self.operation, Operation::Overwrite { .. }) {
+            0
+        } else {
+            current_manifest
+                .and_then(|m| m.max_fragment_id())
+                .map(|id| id + 1)
+                .unwrap_or(0)
+        };
         let mut final_fragments = Vec::new();
+
+        let maybe_existing_fragments =
+            current_manifest
+                .map(|m| m.fragments.as_ref())
+                .ok_or_else(|| Error::Internal {
+                    message: format!(
+                        "No current manifest was provided while building manifest for operation {}",
+                        self.name()
+                    ),
+                });
+
         match &self.operation {
             Operation::Append { ref fragments } => {
-                final_fragments.extend(current_manifest.fragments.as_ref().clone());
+                final_fragments.extend(maybe_existing_fragments?.clone());
                 final_fragments.extend(Self::fragments_with_ids(
                     fragments.clone(),
                     &mut fragment_id,
@@ -205,7 +246,7 @@ impl Transaction {
                 ..
             } => {
                 // Remove the deleted fragments
-                final_fragments.extend(current_manifest.fragments.as_ref().clone());
+                final_fragments.extend(maybe_existing_fragments?.clone());
                 final_fragments.retain(|f| !deleted_fragment_ids.contains(&f.id));
                 final_fragments.iter_mut().for_each(|f| {
                     for updated in updated_fragments {
@@ -230,18 +271,18 @@ impl Transaction {
                 ));
             }
             Operation::CreateIndex { .. } => {
-                final_fragments.extend(current_manifest.fragments.as_ref().clone())
+                final_fragments.extend(maybe_existing_fragments?.clone())
             }
             Operation::Merge { ref fragments, .. } => {
-                final_fragments.extend(Self::fragments_with_ids(
-                    fragments.clone(),
-                    &mut fragment_id,
-                ));
+                final_fragments.extend(fragments.clone());
             }
         };
 
-        let mut manifest =
-            Manifest::new_from_previous(current_manifest, &schema, Arc::new(final_fragments));
+        let mut manifest = if let Some(current_manifest) = current_manifest {
+            Manifest::new_from_previous(current_manifest, &schema, Arc::new(final_fragments))
+        } else {
+            Manifest::new(&schema, Arc::new(final_fragments))
+        };
 
         manifest.tag = self.tag.clone();
 

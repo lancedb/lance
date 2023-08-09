@@ -285,7 +285,7 @@ async fn read_transaction_file(
     base_path: &Path,
     transaction_file: &str,
 ) -> crate::Result<Transaction> {
-    let path = base_path.child(transaction_file);
+    let path = base_path.child("_transactions").child(transaction_file);
     let result = object_store.inner.get(&path).await?;
     let data = result.bytes().await?;
     let transaction = pb::Transaction::decode(data)?;
@@ -298,17 +298,14 @@ async fn write_transaction_file(
     base_path: &Path,
     transaction: &Transaction,
 ) -> crate::Result<String> {
-    let relative_path = format!(
-        "_transactions/{}-{}.txn",
-        transaction.read_version, transaction.uuid
-    );
-    let path = base_path.child(relative_path.clone());
-    let mut writer = object_store.create(&path).await?;
-    let message = pb::Transaction::from(transaction);
-    writer.write_protobuf(&message).await?;
-    writer.shutdown().await?;
+    let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
+    let path = base_path.child("_transactions").child(file_name.as_str());
 
-    Ok(relative_path)
+    let message = pb::Transaction::from(transaction);
+    let buf = message.encode_to_vec();
+    object_store.inner.put(&path, buf.into()).await?;
+
+    Ok(file_name)
 }
 
 pub(crate) fn check_transaction(
@@ -342,36 +339,59 @@ pub(crate) fn check_transaction(
     Ok(())
 }
 
-/// Attempt to commit a transaction, with retries and conflict resolution.
-pub(crate) async fn commit_transaction(
+pub(crate) async fn commit_new_dataset(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction: &Transaction,
     indices: Option<Vec<Index>>,
     write_config: &ManifestWriteConfig,
-    commit_config: &CommitConfig,
 ) -> crate::Result<Manifest> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
-    let mut current_manifest = Dataset::checkout(base_path.as_ref(), transaction.read_version)
-        .await?
-        .manifest;
+    let mut manifest = transaction.build_manifest(None, &transaction_file, write_config)?;
+
+    write_manifest_file(
+        object_store,
+        base_path,
+        &mut manifest,
+        indices.clone(),
+        write_config,
+    )
+    .await?;
+
+    Ok(manifest)
+}
+
+/// Attempt to commit a transaction, with retries and conflict resolution.
+pub(crate) async fn commit_transaction(
+    dataset: &Dataset,
+    object_store: &ObjectStore,
+    transaction: &Transaction,
+    indices: Option<Vec<Index>>,
+    write_config: &ManifestWriteConfig,
+    commit_config: &CommitConfig,
+) -> crate::Result<Manifest> {
+    // Note: object_store has been configured with WriteParams, but dataset.object_store()
+    // has not necessarily. So for anything involving writing, use `object_store`.
+    let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
+
+    let mut dataset = dataset.clone();
     // First, get all transactions since read_version
     let mut other_transactions = Vec::new();
     let mut version = transaction.read_version;
     loop {
         version += 1;
-        match Dataset::checkout(base_path.as_ref(), version).await {
-            Ok(dataset) => {
+        match dataset.checkout_version(version).await {
+            Ok(next_dataset) => {
                 let other_txn = if let Some(txn_file) = &dataset.manifest.transaction_file {
-                    Some(read_transaction_file(object_store, base_path, txn_file).await?)
+                    Some(read_transaction_file(object_store, &dataset.base, txn_file).await?)
                 } else {
                     None
                 };
                 other_transactions.push(other_txn);
-                current_manifest = dataset.manifest;
+                dataset = next_dataset;
             }
-            Err(crate::Error::NotFound { .. }) => {
+            Err(crate::Error::NotFound { .. }) | Err(crate::Error::DatasetNotFound { .. }) => {
                 break;
             }
             Err(e) => {
@@ -391,7 +411,7 @@ pub(crate) async fn commit_transaction(
     for _ in 0..commit_config.num_retries {
         // Build an up-to-date manifest from the transaction and current manifest
         let mut manifest = transaction.build_manifest(
-            current_manifest.as_ref(),
+            Some(dataset.manifest.as_ref()),
             &transaction_file,
             write_config,
         )?;
@@ -399,7 +419,7 @@ pub(crate) async fn commit_transaction(
         // Try to commit the manifest
         let result = write_manifest_file(
             object_store,
-            base_path,
+            &dataset.base,
             &mut manifest,
             indices.clone(),
             write_config,
@@ -407,17 +427,19 @@ pub(crate) async fn commit_transaction(
         .await;
 
         match result {
-            Ok(()) => return Ok(manifest),
+            Ok(()) => {
+                return Ok(manifest);
+            }
             Err(crate::Error::CommitConflict { .. }) => {
                 // See if we can retry the commit
-                current_manifest = Dataset::checkout(base_path.as_ref(), target_version)
-                    .await?
-                    .manifest;
-                let other_transaction = if let Some(txn_file) = &current_manifest.transaction_file {
-                    Some(read_transaction_file(object_store, base_path, txn_file).await?)
-                } else {
-                    None
-                };
+                dataset = dataset.checkout_version(target_version).await?;
+
+                let other_transaction =
+                    if let Some(txn_file) = dataset.manifest.transaction_file.as_ref() {
+                        Some(read_transaction_file(object_store, &dataset.base, txn_file).await?)
+                    } else {
+                        None
+                    };
                 check_transaction(transaction, target_version, &other_transaction)?;
                 target_version += 1;
             }
@@ -510,11 +532,9 @@ mod tests {
                 task_results
             );
         } else {
-            assert!(
-                num_successes > distinct_results.len(),
-                "Expected some conflicts. Got {:?}",
-                task_results
-            );
+            // All we can promise here is at least one tasks succeeds, but multiple
+            // could in theory.
+            assert!(num_successes >= distinct_results.len(),);
         }
     }
 

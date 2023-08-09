@@ -47,7 +47,7 @@ use self::write::{reader_to_stream, write_fragments};
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{pb, Fragment, Index, Manifest};
-use crate::io::commit::commit_transaction;
+use crate::io::commit::{commit_new_dataset, commit_transaction};
 use crate::io::object_store::ObjectStoreParams;
 use crate::io::{
     object_reader::{read_message, read_struct},
@@ -245,7 +245,7 @@ impl Dataset {
         .await
     }
 
-    async fn checkout_manifest(
+    pub(crate) async fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         manifest_path: &Path,
@@ -386,20 +386,31 @@ impl Dataset {
         };
 
         let transaction = Transaction::new(
-            dataset.map(|ds| ds.manifest.version).unwrap_or(0),
+            dataset.as_ref().map(|ds| ds.manifest.version).unwrap_or(0),
             operation,
             None,
         );
 
-        let manifest = commit_transaction(
-            &object_store,
-            &base,
-            &transaction,
-            indices,
-            &Default::default(),
-            &Default::default(),
-        )
-        .await?;
+        let manifest = if let Some(dataset) = &dataset {
+            commit_transaction(
+                dataset,
+                &object_store,
+                &transaction,
+                indices,
+                &Default::default(),
+                &Default::default(),
+            )
+            .await?
+        } else {
+            commit_new_dataset(
+                &object_store,
+                &base,
+                &transaction,
+                indices,
+                &Default::default(),
+            )
+            .await?
+        };
 
         Ok(Self {
             object_store,
@@ -622,8 +633,8 @@ impl Dataset {
         );
 
         let manifest = commit_transaction(
+            self,
             &self.object_store,
-            &self.base,
             &transaction,
             Some(indices),
             &Default::default(),
@@ -833,8 +844,8 @@ impl Dataset {
         );
 
         let manifest = commit_transaction(
+            self,
             &self.object_store,
-            &self.base,
             &transaction,
             indices,
             &Default::default(),
