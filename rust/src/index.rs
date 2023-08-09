@@ -179,7 +179,7 @@ impl DatasetIndexExt for Dataset {
             &self.base,
             &mut new_manifest,
             Some(indices),
-            Default::default(),
+            &Default::default(),
         )
         .await?;
 

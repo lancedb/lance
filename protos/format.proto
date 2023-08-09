@@ -101,10 +101,14 @@ message Manifest {
   // For a single file, will be zero.
   uint32 max_fragment_id = 11;
 
-  // Transaction that generated this version.
+  // Serialized and compressioned transaction message.bool
   //
-  // If empty, should be treated as unknown.
-  Transaction transaction = 12;
+  // This contains a serialized Transaction message representing the transaction
+  // that created this version. It is compressed using ZSTD.
+  //
+  // This is serialized and compressed since it is infrequently accessed and
+  // contains information redundant to the other fields in the manifest.
+  bytes transaction_message = 12;
 } // Manifest
 
 // Auxiliary Data attached to a version.
@@ -299,62 +303,4 @@ message Field {
 
   // optional extension type name
   string extension_name = 9;
-}
-
-message Transaction {
-  // The version of the dataset this transaction was built from.
-  uint64 read_version = 1;
-
-  message Append {
-    // The new fragments to append
-    repeated DataFragment fragments = 1;
-  }
-
-  message Delete {
-    // The fragments to update
-    repeated DataFragment updated_fragments = 1;
-    // The fragments to review
-    repeated uint64 deleted_fragment_ids = 2;
-    // The predicate that was evaluated
-    string predicate = 3;
-  }
-
-  message Overwrite {
-    // The new fragments
-    repeated DataFragment fragments = 1;
-    // The new schema
-    repeated Field schema = 2;
-  }
-
-  message CreateIndex {}
-
-  // An operation that rewrites but does not change the data in the table. These
-  // kinds of operations just rearrange data.
-  message Rewrite {
-    // The old fragments that are being replaced
-    repeated DataFragment old_fragments = 1;
-    // The new fragments
-    repeated DataFragment new_fragments = 2;
-  }
-
-  // An operation that merges in a new column, altering the schema.
-  message Merge {
-    // The updated fragments
-    repeated DataFragment fragments = 1;
-    // The new schema
-    repeated Field schema = 2;
-  }
-
-  // The operation of this transaction.
-  oneof operation {
-    Append append = 100;
-    Delete delete = 101;
-    Overwrite overwrite = 102;
-    CreateIndex create_index = 103;
-    Rewrite rewrite = 104;
-    Merge merge = 105;
-  }
-
-  // Optional version tag
-  string tag = 8;
 }

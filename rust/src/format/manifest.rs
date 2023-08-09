@@ -20,9 +20,11 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use chrono::prelude::*;
+use prost::Message;
 use prost_types::Timestamp;
 
 use super::Fragment;
+use crate::dataset::transaction::Transaction;
 use crate::datatypes::Schema;
 use crate::error::{Error, Result};
 use crate::format::{pb, ProtoStruct};
@@ -64,6 +66,9 @@ pub struct Manifest {
 
     /// The max fragment id used so far
     pub max_fragment_id: u32,
+
+    /// The transaction message
+    pub transaction_message: Option<Vec<u8>>,
 }
 
 impl Manifest {
@@ -79,6 +84,7 @@ impl Manifest {
             reader_feature_flags: 0,
             writer_feature_flags: 0,
             max_fragment_id: 0,
+            transaction_message: None,
         }
     }
 
@@ -98,6 +104,7 @@ impl Manifest {
             reader_feature_flags: 0, // These will be set on commit
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: previous.max_fragment_id,
+            transaction_message: None,
         }
     }
 
@@ -170,6 +177,28 @@ impl Manifest {
             .cloned()
             .collect())
     }
+
+    /// Read transaction
+    pub fn transaction(&self) -> Result<Option<Transaction>> {
+        let Some(transaction_message) = &self.transaction_message else {
+            return Ok(None);
+        };
+        let raw_message = zstd::decode_all(transaction_message.as_slice())?;
+        let message = pb::Transaction::decode(raw_message.as_slice()).map_err(|e| Error::IO {
+            message: format!("Unable to decode transaction message: {}", e),
+        })?;
+        (&message).try_into().map(Some)
+    }
+
+    /// Set the transaction
+    pub fn set_transaction(&mut self, transaction: Option<&Transaction>) -> Result<()> {
+        if let Some(transaction) = transaction {
+            let buf = pb::Transaction::from(transaction).encode_to_vec();
+            self.transaction_message = Some(zstd::encode_all(buf.as_slice(), 0)?);
+        }
+
+        Ok(())
+    }
 }
 
 impl ProtoStruct for Manifest {
@@ -194,6 +223,11 @@ impl From<pb::Manifest> for Manifest {
             reader_feature_flags: p.reader_feature_flags,
             writer_feature_flags: p.writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
+            transaction_message: if p.transaction_message.is_empty() {
+                None
+            } else {
+                Some(p.transaction_message)
+            },
         }
     }
 }
@@ -223,6 +257,7 @@ impl From<&Manifest> for pb::Manifest {
             reader_feature_flags: m.reader_feature_flags,
             writer_feature_flags: m.writer_feature_flags,
             max_fragment_id: m.max_fragment_id,
+            transaction_message: m.transaction_message.clone().unwrap_or(vec![]),
         }
     }
 }

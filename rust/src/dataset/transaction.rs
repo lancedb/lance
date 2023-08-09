@@ -12,11 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// TODO:
+// [ ] Module docs
+// [ ] Conflict resolution Tests
+// [x] Serialization
+// [x] Deserialization
+// [x] Commit function
+// [ ] Commit tests
+// [ ] Python API
+// [ ] Python API docs
+
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     datatypes::Schema,
-    format::{Fragment, Manifest},
+    format::{pb, Fragment, Manifest},
 };
 
 use super::{feature_flags::apply_feature_flags, ManifestWriteConfig};
@@ -26,6 +36,7 @@ use crate::{Error, Result};
 ///
 /// This contains enough information to be able to build the next manifest,
 /// given the current manifest.
+#[derive(Debug, Clone)]
 pub struct Transaction {
     pub read_version: u64,
     pub operation: Operation,
@@ -68,9 +79,6 @@ pub enum Operation {
         fragments: Vec<Fragment>,
         schema: Schema,
     },
-    /// An unknown transaction type. Exists for backwards compatibility for
-    /// conflict resolution.
-    Unknown,
     // TODO: a Custom one to allow arbitrary changes that will have same conflict
     // resolution rules as unknown?
 }
@@ -95,6 +103,7 @@ impl Transaction {
                 Operation::Append { .. } => false,
                 Operation::Rewrite { .. } => false,
                 Operation::CreateIndex { .. } => false,
+                Operation::Delete { .. } => false,
                 _ => true,
             },
             Operation::Rewrite { old_fragments, .. } => match &other.operation {
@@ -166,7 +175,7 @@ impl Transaction {
     pub(crate) fn build_manifest(
         &self,
         current_manifest: &Manifest,
-        config: ManifestWriteConfig,
+        config: &ManifestWriteConfig,
     ) -> Result<Manifest> {
         // Get the schema and the final fragment list
         let schema = match self.operation {
@@ -224,11 +233,6 @@ impl Transaction {
                     &mut fragment_id,
                 ));
             }
-            Operation::Unknown => {
-                return Err(Error::invalid_input(
-                    "Cannot build a manifest for unknown transaction type",
-                ))
-            }
         };
 
         let mut manifest =
@@ -243,6 +247,187 @@ impl Transaction {
 
         manifest.update_max_fragment_id();
 
+        manifest.set_transaction(Some(self))?;
+
         Ok(manifest)
+    }
+}
+
+impl TryFrom<&pb::Transaction> for Transaction {
+    type Error = Error;
+
+    fn try_from(message: &pb::Transaction) -> Result<Self> {
+        let operation = match &message.operation {
+            Some(pb::transaction::Operation::Append(pb::transaction::Append { fragments })) => {
+                Operation::Append {
+                    fragments: fragments.iter().map(Fragment::from).collect(),
+                }
+            }
+            Some(pb::transaction::Operation::Delete(pb::transaction::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                predicate,
+            })) => Operation::Delete {
+                updated_fragments: updated_fragments.iter().map(Fragment::from).collect(),
+                deleted_fragment_ids: deleted_fragment_ids.clone(),
+                predicate: predicate.clone(),
+            },
+            Some(pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
+                fragments,
+                schema,
+            })) => Operation::Overwrite {
+                fragments: fragments.iter().map(Fragment::from).collect(),
+                schema: Schema::from(schema),
+            },
+            Some(pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
+                old_fragments,
+                new_fragments,
+            })) => Operation::Rewrite {
+                old_fragments: old_fragments.iter().map(Fragment::from).collect(),
+                new_fragments: new_fragments.iter().map(Fragment::from).collect(),
+            },
+            Some(pb::transaction::Operation::CreateIndex(_)) => Operation::CreateIndex,
+            Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
+                fragments,
+                schema,
+            })) => Operation::Merge {
+                fragments: fragments.iter().map(Fragment::from).collect(),
+                schema: Schema::from(schema),
+            },
+            None => {
+                return Err(Error::Internal {
+                    message: "Transaction message did not contain an operation".to_string(),
+                });
+            }
+        };
+        Ok(Self {
+            read_version: message.read_version,
+            operation,
+            tag: if message.tag.is_empty() {
+                None
+            } else {
+                Some(message.tag.clone())
+            },
+        })
+    }
+}
+
+impl From<&Transaction> for pb::Transaction {
+    fn from(value: &Transaction) -> Self {
+        let operation = match &value.operation {
+            Operation::Append { fragments } => {
+                pb::transaction::Operation::Append(pb::transaction::Append {
+                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                })
+            }
+            Operation::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                predicate,
+            } => pb::transaction::Operation::Delete(pb::transaction::Delete {
+                updated_fragments: updated_fragments
+                    .iter()
+                    .map(pb::DataFragment::from)
+                    .collect(),
+                deleted_fragment_ids: deleted_fragment_ids.clone(),
+                predicate: predicate.clone(),
+            }),
+            Operation::Overwrite { fragments, schema } => {
+                pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
+                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                    schema: schema.into(),
+                })
+            }
+            Operation::Rewrite {
+                old_fragments,
+                new_fragments,
+            } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
+                old_fragments: old_fragments.iter().map(pb::DataFragment::from).collect(),
+                new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
+            }),
+            Operation::CreateIndex => {
+                pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {})
+            }
+            Operation::Merge { fragments, schema } => {
+                pb::transaction::Operation::Merge(pb::transaction::Merge {
+                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                    schema: schema.into(),
+                })
+            }
+        };
+
+        Self {
+            read_version: value.read_version,
+            operation: Some(operation),
+            tag: value.tag.clone().unwrap_or("".to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_conflicts() {
+        let fragment0 = Fragment::new(0);
+        let fragment1 = Fragment::new(1);
+        let fragment2 = Fragment::new(2);
+        // The transactions that will be checked against
+        let other_operations = [
+            Operation::Append {
+                fragments: vec![fragment0.clone()],
+            },
+            Operation::CreateIndex,
+            Operation::Delete {
+                updated_fragments: vec![fragment0.clone()],
+                deleted_fragment_ids: vec![2],
+                predicate: "x > 2".to_string(),
+            },
+            Operation::Merge {
+                fragments: vec![fragment0.clone(), fragment2.clone()],
+                schema: Schema::default(),
+            },
+            Operation::Overwrite {
+                fragments: vec![fragment0.clone(), fragment2.clone()],
+                schema: Schema::default(),
+            },
+            Operation::Rewrite {
+                old_fragments: vec![fragment0.clone()],
+                new_fragments: vec![fragment2.clone()],
+            },
+        ];
+        let other_transactions = other_operations
+            .iter()
+            .map(|op| Transaction::new(0, op.clone(), None))
+            .collect::<Vec<_>>();
+
+        // Transactions and whether they are expected to conflict with each
+        // of other_transactions
+        let cases = [(
+            Operation::Append {
+                fragments: vec![fragment0.clone()],
+            },
+            [false, false, false, true, true, false],
+            // TODO: more cases
+        )];
+
+        for (operation, expected_conflicts) in &cases {
+            let transaction = Transaction::new(0, operation.clone(), None);
+            for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
+                assert_eq!(
+                    transaction.conflicts_with(other),
+                    *expected_conflict,
+                    "Transaction {:?} should {} with {:?}",
+                    transaction,
+                    if *expected_conflict {
+                        "conflict"
+                    } else {
+                        "not conflict"
+                    },
+                    other
+                );
+            }
+        }
     }
 }

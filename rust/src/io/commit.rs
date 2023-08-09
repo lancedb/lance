@@ -36,6 +36,8 @@
 use std::{fmt::Debug, sync::atomic::AtomicBool};
 
 use crate::dataset::transaction::Transaction;
+use crate::dataset::{write_manifest_file, ManifestWriteConfig};
+use crate::Dataset;
 use crate::{format::Index, format::Manifest};
 use futures::future::BoxFuture;
 use object_store::path::Path;
@@ -272,37 +274,123 @@ pub struct CommitConfig {
 
 impl Default for CommitConfig {
     fn default() -> Self {
-        Self {
-            num_retries: 3,
-        }
+        Self { num_retries: 3 }
     }
 }
 
+pub(crate) fn check_transaction(
+    transaction: &Transaction,
+    other_version: u64,
+    other_transaction: &Option<Transaction>,
+) -> crate::Result<()> {
+    if other_transaction.is_none() {
+        return Err(crate::Error::Internal {
+            message: format!(
+                "There was a conflicting transaction at version {}, \
+                and it was missing transaction metadata.",
+                other_version
+            ),
+        });
+    }
+
+    if transaction.conflicts_with(other_transaction.as_ref().unwrap()) {
+        return Err(crate::Error::CommitConflict {
+            version: other_version,
+            source: format!(
+                "There was a concurrent commit that conflicts with this one and it \
+                cannot be automatically resolve. Please rerun the operation off the latest version \
+                of the table.\n Transaction: {:?}\n Conflicting Transaction: {:?}",
+                transaction, other_transaction
+            )
+            .into(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Attempt to commit a transaction, with retries and conflict resolution.
 pub(crate) async fn commit_transaction(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction: &Transaction,
     indices: Option<Vec<Index>>,
-    write_config: ManifestWriteConfig,
-    commit_config: CommitConfig,
-) -> crate::Result<()> {
+    write_config: &ManifestWriteConfig,
+    commit_config: &CommitConfig,
+) -> crate::Result<Manifest> {
+    let mut current_manifest = Dataset::checkout(base_path.as_ref(), transaction.read_version)
+        .await?
+        .manifest;
     // First, get all transactions since read_version
-    // If any of them conflict with the transaction, return an error
-
-    let new_version = todo!();
-
-    for retry in 0..commit_config.num_retries {
-        // Get the latest manifest
-        // Build the transaction
-
-        // try commit
-
-        // If success, return
-
-        // if conflict, check for compatibility. If incompatible, return conflicterror
+    let mut other_transactions = Vec::new();
+    let mut version = transaction.read_version;
+    loop {
+        version += 1;
+        match Dataset::checkout(base_path.as_ref(), version).await {
+            Ok(dataset) => {
+                other_transactions.push(dataset.manifest.transaction()?);
+                current_manifest = dataset.manifest;
+            }
+            Err(crate::Error::NotFound { .. }) => {
+                break;
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
     }
 
-    // return retryerror for commit
+    let mut target_version = version + 1;
+
+    // If any of them conflict with the transaction, return an error
+    for (version_offset, other_transaction) in other_transactions.iter().enumerate() {
+        let other_version = transaction.read_version + version_offset as u64 + 1;
+        check_transaction(transaction, other_version, other_transaction)?;
+    }
+
+    for _ in 0..commit_config.num_retries {
+        // Build an up-to-date manifest from the transaction and current manifest
+        let mut manifest = transaction.build_manifest(current_manifest.as_ref(), write_config)?;
+
+        // Try to commit the manifest
+        let result = write_manifest_file(
+            object_store,
+            base_path,
+            &mut manifest,
+            indices.clone(),
+            write_config,
+        )
+        .await;
+
+        match result {
+            Ok(()) => return Ok(manifest),
+            Err(crate::Error::CommitConflict { .. }) => {
+                // See if we can retry the commit
+                current_manifest = Dataset::checkout(base_path.as_ref(), target_version)
+                    .await?
+                    .manifest;
+                check_transaction(
+                    transaction,
+                    target_version,
+                    &current_manifest.transaction()?,
+                )?;
+                target_version += 1;
+            }
+            Err(err) => {
+                // If other error, return
+                return Err(err);
+            }
+        }
+    }
+
+    Err(crate::Error::CommitConflict {
+        version: target_version,
+        source: format!(
+            "Failed to commit the transaction after {} retries.",
+            commit_config.num_retries
+        )
+        .into(),
+    })
 }
 
 #[cfg(test)]
