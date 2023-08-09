@@ -441,27 +441,16 @@ impl Dataset {
         Self::write_impl(batches, uri, params).await
     }
 
-    /// Append to existing [Dataset] with a stream of [RecordBatch]s
-    ///
-    /// Returns void result or Returns [Error]
-    pub async fn append(
+    pub async fn append_impl(
         &mut self,
-        batches: impl RecordBatchReader + Send + 'static,
-        mut params: Option<WriteParams>,
+        batches: Box<dyn RecordBatchReader + Send>,
+        params: Option<WriteParams>,
     ) -> Result<()> {
-        let batches = Box::new(batches);
-
-        // Check params are correct
-        if params.is_none() {
-            params = Some(WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            });
-        }
         // Force append mode
-        let mut params = params.unwrap();
-        params.mode = WriteMode::Append;
-        let params = params;
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            ..params.unwrap_or_default()
+        };
 
         let (stream, schema) = reader_to_stream(batches)?;
 
@@ -515,6 +504,20 @@ impl Dataset {
         .await?;
 
         Ok(())
+    }
+
+    /// Append to existing [Dataset] with a stream of [RecordBatch]s
+    ///
+    /// Returns void result or Returns [Error]
+    pub async fn append(
+        &mut self,
+        batches: impl RecordBatchReader + Send + 'static,
+        params: Option<WriteParams>,
+    ) -> Result<()> {
+        // Box it so we don't monomorphize for every one. We take the generic
+        // parameter for API ergonomics.
+        let batches = Box::new(batches);
+        self.append_impl(batches, params).await
     }
 
     /// Create a new version of [`Dataset`] from a collection of fragments.
@@ -1486,6 +1489,8 @@ mod tests {
         ds.append(batches, Some(write_params.clone()))
             .await
             .unwrap();
+
+        ds.validate().await.unwrap();
 
         let expected_batch = RecordBatch::try_new(
             schema.clone(),
