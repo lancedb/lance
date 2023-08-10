@@ -47,7 +47,7 @@ use self::write::{reader_to_stream, write_fragments};
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{pb, Fragment, Index, Manifest};
-use crate::io::commit::{commit_new_dataset, commit_transaction};
+use crate::io::commit::{commit_new_dataset, commit_transaction, CommitError};
 use crate::io::object_store::ObjectStoreParams;
 use crate::io::{
     object_reader::{read_message, read_struct},
@@ -374,12 +374,6 @@ impl Dataset {
         let fragments =
             write_fragments(object_store.clone(), &base, &schema, stream, params.clone()).await?;
 
-        // Inherit the index if we're just appending rows
-        let indices = match (&dataset, &params.mode) {
-            (Some(d), WriteMode::Append) => Some(d.load_indices().await?),
-            _ => None,
-        };
-
         let operation = match params.mode {
             WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite { schema, fragments },
             WriteMode::Append => Operation::Append { fragments },
@@ -396,20 +390,12 @@ impl Dataset {
                 dataset,
                 &object_store,
                 &transaction,
-                indices,
                 &Default::default(),
                 &Default::default(),
             )
             .await?
         } else {
-            commit_new_dataset(
-                &object_store,
-                &base,
-                &transaction,
-                indices,
-                &Default::default(),
-            )
-            .await?
+            commit_new_dataset(&object_store, &base, &transaction, &Default::default()).await?
         };
 
         Ok(Self {
@@ -620,9 +606,6 @@ impl Dataset {
             .try_collect::<Vec<_>>()
             .await?;
 
-        // Inherit the index, since we are just adding columns.
-        let indices = self.load_indices().await?;
-
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::Merge {
@@ -636,7 +619,6 @@ impl Dataset {
             self,
             &self.object_store,
             &transaction,
-            Some(indices),
             &Default::default(),
             &Default::default(),
         )
@@ -826,13 +808,6 @@ impl Dataset {
             })
             .await?;
 
-        // Inherit the index, unless we deleted all the fragments.
-        let indices = if updated_fragments.is_empty() {
-            None
-        } else {
-            Some(self.load_indices().await?)
-        };
-
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::Delete {
@@ -847,7 +822,6 @@ impl Dataset {
             self,
             &self.object_store,
             &transaction,
-            indices,
             &Default::default(),
             &Default::default(),
         )
@@ -868,14 +842,6 @@ impl Dataset {
 
     fn manifest_file(&self, version: u64) -> Path {
         self.versions_dir().child(format!("{version}.manifest"))
-    }
-
-    fn latest_manifest_path(&self) -> Path {
-        latest_manifest_path(&self.base)
-    }
-
-    pub(crate) async fn latest_manifest(&self) -> Result<Manifest> {
-        read_manifest(&self.object_store, &self.latest_manifest_path()).await
     }
 
     pub(crate) fn data_dir(&self) -> Path {
@@ -1015,7 +981,7 @@ pub(crate) async fn write_manifest_file(
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
     config: &ManifestWriteConfig,
-) -> Result<()> {
+) -> std::result::Result<(), CommitError> {
     if config.auto_set_feature_flags {
         apply_feature_flags(manifest);
     }
@@ -1040,7 +1006,8 @@ pub(crate) async fn write_manifest_file(
     object_store
         .inner
         .copy(&path, &latest_manifest_path(base_path))
-        .await?;
+        .await
+        .map_err(|err| CommitError::OtherError(err.into()))?;
 
     Ok(())
 }
@@ -1963,10 +1930,10 @@ mod tests {
             .unwrap();
         dataset.validate().await.unwrap();
 
-        // Check the version is set correctly
+        // The version should match the table version it was created from.
         let indices = dataset.load_indices().await.unwrap();
         let actual = indices.first().unwrap().dataset_version;
-        let expected = dataset.manifest.version;
+        let expected = dataset.manifest.version - 1;
         assert_eq!(actual, expected);
 
         // Append should inherit index
@@ -1981,7 +1948,7 @@ mod tests {
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
         let actual = indices.first().unwrap().dataset_version;
-        let expected = dataset.manifest.version - 1;
+        let expected = dataset.manifest.version - 2;
         assert_eq!(actual, expected);
         dataset.validate().await.unwrap();
 

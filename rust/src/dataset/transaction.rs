@@ -49,7 +49,11 @@ use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     datatypes::Schema,
-    format::{pb, Fragment, Manifest},
+    format::Index,
+    format::{
+        pb::{self, IndexMetadata},
+        Fragment, Manifest,
+    },
 };
 
 use super::{feature_flags::apply_feature_flags, ManifestWriteConfig};
@@ -90,7 +94,10 @@ pub enum Operation {
         schema: Schema,
     },
     /// A new index has been created.
-    CreateIndex,
+    CreateIndex {
+        /// The new secondary indices that are being added
+        new_indices: Vec<Index>,
+    },
     /// Data is rewritten but *not* modified. This is used for things like
     /// compaction or re-ordering. Contains the old fragments and the new
     /// ones that have been replaced.
@@ -112,7 +119,7 @@ impl Operation {
     fn modified_fragment_ids(&self) -> Box<dyn Iterator<Item = u64> + '_> {
         match self {
             // These operations add new fragments or don't modify any.
-            Self::Append { .. } | Self::Overwrite { .. } | Self::CreateIndex => {
+            Self::Append { .. } | Self::Overwrite { .. } | Self::CreateIndex { .. } => {
                 Box::new(std::iter::empty())
             }
             Self::Delete {
@@ -142,7 +149,7 @@ impl Operation {
             Self::Append { .. } => "Append",
             Self::Delete { .. } => "Delete",
             Self::Overwrite { .. } => "Overwrite",
-            Self::CreateIndex => "CreateIndex",
+            Self::CreateIndex { .. } => "CreateIndex",
             Self::Rewrite { .. } => "Rewrite",
             Self::Merge { .. } => "Merge",
         }
@@ -225,7 +232,7 @@ impl Transaction {
             },
             // Merge changes the schema, but preserves row ids, so the only operation
             // it's compatible with is CreateIndex.
-            Operation::Merge { .. } => !matches!(&other.operation, Operation::CreateIndex),
+            Operation::Merge { .. } => !matches!(&other.operation, Operation::CreateIndex { .. }),
         }
     }
 
@@ -249,9 +256,10 @@ impl Transaction {
     pub(crate) fn build_manifest(
         &self,
         current_manifest: Option<&Manifest>,
+        current_indices: Vec<Index>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
-    ) -> Result<Manifest> {
+    ) -> Result<(Manifest, Vec<Index>)> {
         // Get the schema and the final fragment list
         let schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
@@ -276,6 +284,7 @@ impl Transaction {
                 .unwrap_or(0)
         };
         let mut final_fragments = Vec::new();
+        let mut final_indices = current_indices;
 
         let maybe_existing_fragments =
             current_manifest
@@ -316,6 +325,7 @@ impl Transaction {
                     fragments.clone(),
                     &mut fragment_id,
                 ));
+                final_indices = Vec::new();
             }
             Operation::Rewrite {
                 ref new_fragments, ..
@@ -325,8 +335,14 @@ impl Transaction {
                     &mut fragment_id,
                 ));
             }
-            Operation::CreateIndex { .. } => {
-                final_fragments.extend(maybe_existing_fragments?.clone())
+            Operation::CreateIndex { new_indices } => {
+                final_fragments.extend(maybe_existing_fragments?.clone());
+                final_indices.retain(|existing_index| {
+                    !new_indices
+                        .iter()
+                        .any(|new_index| new_index.name == existing_index.name)
+                });
+                final_indices.extend(new_indices.clone());
             }
             Operation::Merge { ref fragments, .. } => {
                 final_fragments.extend(fragments.clone());
@@ -350,7 +366,7 @@ impl Transaction {
 
         manifest.transaction_file = Some(transaction_file_path.to_string());
 
-        Ok(manifest)
+        Ok((manifest, final_indices))
     }
 }
 
@@ -388,7 +404,14 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 old_fragments: old_fragments.iter().map(Fragment::from).collect(),
                 new_fragments: new_fragments.iter().map(Fragment::from).collect(),
             },
-            Some(pb::transaction::Operation::CreateIndex(_)) => Operation::CreateIndex,
+            Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
+                new_indices,
+            })) => Operation::CreateIndex {
+                new_indices: new_indices
+                    .iter()
+                    .map(Index::try_from)
+                    .collect::<Result<_>>()?,
+            },
             Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
                 fragments,
                 schema,
@@ -450,8 +473,10 @@ impl From<&Transaction> for pb::Transaction {
                 old_fragments: old_fragments.iter().map(pb::DataFragment::from).collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
             }),
-            Operation::CreateIndex => {
-                pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {})
+            Operation::CreateIndex { new_indices } => {
+                pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
+                    new_indices: new_indices.iter().map(IndexMetadata::from).collect(),
+                })
             }
             Operation::Merge { fragments, schema } => {
                 pb::transaction::Operation::Merge(pb::transaction::Merge {
@@ -477,6 +502,7 @@ mod tests {
 
     #[test]
     fn test_conflicts() {
+        let index0 = Index::new(uuid::Uuid::new_v4(), "test", &[0], 1);
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
         let fragment2 = Fragment::new(2);
@@ -485,7 +511,9 @@ mod tests {
             Operation::Append {
                 fragments: vec![fragment0.clone()],
             },
-            Operation::CreateIndex,
+            Operation::CreateIndex {
+                new_indices: vec![index0.clone()],
+            },
             Operation::Delete {
                 updated_fragments: vec![fragment0.clone()],
                 deleted_fragment_ids: vec![2],
@@ -546,7 +574,9 @@ mod tests {
                 [false, false, false, false, false, false],
             ),
             (
-                Operation::CreateIndex,
+                Operation::CreateIndex {
+                    new_indices: vec![index0],
+                },
                 // Will only conflict with operations that modify row ids.
                 [false, false, false, false, true, true],
             ),

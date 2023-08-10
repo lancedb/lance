@@ -78,7 +78,9 @@ message Transaction {
   }
 
   // Add a new secondary index.
-  message CreateIndex {}
+  message CreateIndex {
+    repeated IndexMetadata new_indices = 1;
+  }
 
   // An operation that rewrites but does not change the data in the table. These
   // kinds of operations just rearrange data.

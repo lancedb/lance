@@ -77,6 +77,7 @@ pub trait CommitHandler: Debug + Send + Sync {
 }
 
 /// Errors that can occur when committing a manifest.
+#[derive(Debug)]
 pub enum CommitError {
     /// Another transaction has already been written to the path
     CommitConflict,
@@ -329,7 +330,7 @@ fn check_transaction(
             version: other_version,
             source: format!(
                 "There was a concurrent commit that conflicts with this one and it \
-                cannot be automatically resolve. Please rerun the operation off the latest version \
+                cannot be automatically resolved. Please rerun the operation off the latest version \
                 of the table.\n Transaction: {:?}\n Conflicting Transaction: {:?}",
                 transaction, other_transaction
             )
@@ -344,18 +345,22 @@ pub(crate) async fn commit_new_dataset(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction: &Transaction,
-    indices: Option<Vec<Index>>,
     write_config: &ManifestWriteConfig,
 ) -> Result<Manifest> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
-    let mut manifest = transaction.build_manifest(None, &transaction_file, write_config)?;
+    let (mut manifest, indices) =
+        transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
 
     write_manifest_file(
         object_store,
         base_path,
         &mut manifest,
-        indices.clone(),
+        if indices.is_empty() {
+            None
+        } else {
+            Some(indices.clone())
+        },
         write_config,
     )
     .await?;
@@ -368,7 +373,6 @@ pub(crate) async fn commit_transaction(
     dataset: &Dataset,
     object_store: &ObjectStore,
     transaction: &Transaction,
-    indices: Option<Vec<Index>>,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
 ) -> Result<Manifest> {
@@ -384,8 +388,8 @@ pub(crate) async fn commit_transaction(
         version += 1;
         match dataset.checkout_version(version).await {
             Ok(next_dataset) => {
-                let other_txn = if let Some(txn_file) = &dataset.manifest.transaction_file {
-                    Some(read_transaction_file(object_store, &dataset.base, txn_file).await?)
+                let other_txn = if let Some(txn_file) = &next_dataset.manifest.transaction_file {
+                    Some(read_transaction_file(object_store, &next_dataset.base, txn_file).await?)
                 } else {
                     None
                 };
@@ -411,8 +415,9 @@ pub(crate) async fn commit_transaction(
 
     for _ in 0..commit_config.num_retries {
         // Build an up-to-date manifest from the transaction and current manifest
-        let mut manifest = transaction.build_manifest(
+        let (mut manifest, indices) = transaction.build_manifest(
             Some(dataset.manifest.as_ref()),
+            dataset.load_indices().await?,
             &transaction_file,
             write_config,
         )?;
@@ -422,7 +427,11 @@ pub(crate) async fn commit_transaction(
             object_store,
             &dataset.base,
             &mut manifest,
-            indices.clone(),
+            if indices.is_empty() {
+                None
+            } else {
+                Some(indices.clone())
+            },
             write_config,
         )
         .await;
@@ -431,7 +440,7 @@ pub(crate) async fn commit_transaction(
             Ok(()) => {
                 return Ok(manifest);
             }
-            Err(crate::Error::CommitConflict { .. }) => {
+            Err(CommitError::CommitConflict) => {
                 // See if we can retry the commit
                 dataset = dataset.checkout_version(target_version).await?;
 
@@ -444,7 +453,7 @@ pub(crate) async fn commit_transaction(
                 check_transaction(transaction, target_version, &other_transaction)?;
                 target_version += 1;
             }
-            Err(err) => {
+            Err(CommitError::OtherError(err)) => {
                 // If other error, return
                 return Err(err);
             }
@@ -472,9 +481,13 @@ mod tests {
 
     use super::*;
 
+    use crate::arrow::FixedSizeListArrayExt;
     use crate::dataset::transaction::Operation;
     use crate::dataset::WriteParams;
+    use crate::index::vector::{MetricType, VectorIndexParams};
+    use crate::index::{DatasetIndexExt, IndexType};
     use crate::io::object_store::ObjectStoreParams;
+    use crate::utils::testing::generate_random_array;
     use crate::Dataset;
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
@@ -631,5 +644,97 @@ mod tests {
             Operation::Append { .. }
         ));
         assert_eq!(transaction.tag, read_transaction.tag);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_create_index() {
+        // Create a table with two vector columns
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let dimension = 16;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(
+                "vector1",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimension,
+                ),
+                false,
+            ),
+            Field::new(
+                "vector2",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimension,
+                ),
+                false,
+            ),
+        ]));
+        let float_arr = generate_random_array(512 * dimension as usize);
+        let vectors = Arc::new(
+            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                float_arr, dimension,
+            )
+            .unwrap(),
+        );
+        let batches =
+            vec![
+                RecordBatch::try_new(schema.clone(), vec![vectors.clone(), vectors.clone()])
+                    .unwrap(),
+            ];
+
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // From initial version, concurrently call create index 3 times,
+        // two of which will be for the same column.
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 50);
+        let futures: Vec<_> = ["vector1", "vector1", "vector2"]
+            .iter()
+            .map(|col_name| {
+                let dataset = dataset.clone();
+                let params = params.clone();
+                tokio::spawn(async move {
+                    dataset
+                        .create_index(&[col_name], IndexType::Vector, None, &params, true)
+                        .await
+                })
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+        for result in results {
+            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
+        }
+
+        // Validate that each version has the anticipated number of indexes
+        let dataset = dataset.checkout_version(1).await.unwrap();
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+
+        let dataset = dataset.checkout_version(2).await.unwrap();
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+
+        let dataset = dataset.checkout_version(3).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(!indices.is_empty() && indices.len() <= 2);
+
+        // At this point, we have created two indices. If they are both for the same column,
+        // it must be vector1 and not vector2.
+        if indices.len() == 2 {
+            let mut fields: Vec<i32> = indices.iter().flat_map(|i| i.fields.clone()).collect();
+            fields.sort();
+            assert_eq!(fields, vec![0, 1]);
+        } else {
+            assert_eq!(indices[0].fields, vec![0]);
+        }
+
+        let dataset = dataset.checkout_version(4).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2);
+        let mut fields: Vec<i32> = indices.iter().flat_map(|i| i.fields.clone()).collect();
+        fields.sort();
+        assert_eq!(fields, vec![0, 1]);
     }
 }
