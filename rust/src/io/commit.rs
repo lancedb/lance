@@ -277,7 +277,7 @@ pub struct CommitConfig {
 
 impl Default for CommitConfig {
     fn default() -> Self {
-        Self { num_retries: 3 }
+        Self { num_retries: 5 }
     }
 }
 
@@ -405,7 +405,7 @@ pub(crate) async fn commit_transaction(
         }
     }
 
-    let mut target_version = version + 1;
+    let mut target_version = version;
 
     // If any of them conflict with the transaction, return an error
     for (version_offset, other_transaction) in other_transactions.iter().enumerate() {
@@ -421,6 +421,8 @@ pub(crate) async fn commit_transaction(
             &transaction_file,
             write_config,
         )?;
+
+        debug_assert_eq!(manifest.version, target_version);
 
         // Try to commit the manifest
         let result = write_manifest_file(
@@ -475,7 +477,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
-    use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
+    use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::future::join_all;
 
@@ -483,7 +485,7 @@ mod tests {
 
     use crate::arrow::FixedSizeListArrayExt;
     use crate::dataset::transaction::Operation;
-    use crate::dataset::WriteParams;
+    use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::{MetricType, VectorIndexParams};
     use crate::index::{DatasetIndexExt, IndexType};
     use crate::io::object_store::ObjectStoreParams;
@@ -736,5 +738,75 @@ mod tests {
         let mut fields: Vec<i32> = indices.iter().flat_map(|i| i.fields.clone()).collect();
         fields.sort();
         assert_eq!(fields, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_writes() {
+        for write_mode in [WriteMode::Append, WriteMode::Overwrite] {
+            // Create an empty table
+            let test_dir = tempfile::tempdir().unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "i",
+                DataType::Int32,
+                false,
+            )]));
+
+            let dataset = Dataset::write(
+                RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
+                test_uri,
+                None,
+            )
+            .await
+            .unwrap();
+
+            // Make some sample data
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap();
+
+            // Write data concurrently in 5 tasks
+            let futures: Vec<_> = (0..5)
+                .map(|_| {
+                    let batch = batch.clone();
+                    let schema = schema.clone();
+                    let uri = test_uri.to_string();
+                    tokio::spawn(async move {
+                        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+                        Dataset::write(
+                            reader,
+                            &uri,
+                            Some(WriteParams {
+                                mode: write_mode,
+                                ..Default::default()
+                            }),
+                        )
+                        .await
+                    })
+                })
+                .collect();
+            let results = join_all(futures).await;
+
+            // Assert all succeeded
+            for result in results {
+                assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
+            }
+
+            // Assert final fragments and versions expected
+            let dataset = dataset.checkout_version(6).await.unwrap();
+
+            match write_mode {
+                WriteMode::Append => {
+                    assert_eq!(dataset.get_fragments().len(), 5);
+                }
+                WriteMode::Overwrite => {
+                    assert_eq!(dataset.get_fragments().len(), 1);
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 }
