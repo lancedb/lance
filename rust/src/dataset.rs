@@ -441,7 +441,7 @@ impl Dataset {
         Self::write_impl(batches, uri, params).await
     }
 
-    pub async fn append_impl(
+    async fn append_impl(
         &mut self,
         batches: Box<dyn RecordBatchReader + Send>,
         params: Option<WriteParams>,
