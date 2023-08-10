@@ -270,7 +270,7 @@ it's changes are compatible with the changes made by the successful writer.
 
 The changes for a given commit are recorded as a transaction file, under the
 ``_transactions`` prefix in the dataset directory. The transaction file is a
-serialize ``Transaction`` protobuf message. See the ``transaction.proto`` file
+serialized ``Transaction`` protobuf message. See the ``transaction.proto`` file
 for its definition.
 
 .. image:: _static/conflict_resolution_flow.png
@@ -279,7 +279,7 @@ The commit process is as follows:
 
  1. The writer finishes writing all data files.
  2. The writer creates a transaction file in the ``_transactions`` directory.
-    This files describes the operation that was performed, which is used for two
+    This files describes the operations that were performed, which is used for two
     purposes: (1) to detect conflicts, and (2) to re-build the manifest during
     retries.
  3. Look for any new commits since the writer started writing. If there are any,

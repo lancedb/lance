@@ -19,6 +19,31 @@
 //! changes, we can detect whether concurrent operations are compatible with
 //! one another. We can also rebuild manifests when retrying committing a
 //! manifest.
+//!
+//! ## Conflict Resolution
+//!
+//! Transactions are compatible with one another if they don't conflict.
+//! Currently, conflict resolution always assumes a Serializable isolation
+//! level.
+//!
+//! Below are the compatibilities between conflicting transactions. The columns
+//! represent the operation that has been applied, while the rows represent the
+//! operation that is being checked for compatibility to see if it can retry.
+//! ✅ indicates that the operation is compatible, while ❌ indicates that it is
+//! a conflict. Some operations have additional conditions that must be met for
+//! them to be compatible.
+//!
+//! |                  | Append | Delete | Overwrite/Create | Create Index | Rewrite | Merge |
+//! |------------------|--------|--------|------------------|--------------|---------|-------|
+//! | Append           | ✅     | ✅     | ❌               | ✅           | ✅      | ❌    |
+//! | Delete           | ❌     | (1)    | ❌               | ✅           | (1)     | ❌    |
+//! | Overwrite/Create | ❌     | ❌     | ❌               | ❌           | ❌      | ❌    |
+//! | Create index     | ✅     | ✅     | ❌               | ✅           | ✅      | ✅    |
+//! | Rewrite          | ✅     | (1)    | ❌               | ❌           | (1)     | ❌    |
+//! | Merge            | ❌     | ❌     | ❌               | ❌           | ✅      | ❌    |
+//!
+//! (1) Delete and rewrite are compatible with each other and themselves only if
+//! they affect distinct fragments. Otherwise, they conflict.
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -80,6 +105,50 @@ pub enum Operation {
     },
 }
 
+impl Operation {
+    /// Returns the IDs of fragments that have been modified by this operation.
+    ///
+    /// This does not include new fragments.
+    fn modified_fragment_ids(&self) -> Box<dyn Iterator<Item = u64> + '_> {
+        match self {
+            // These operations add new fragments or don't modify any.
+            Self::Append { .. } | Self::Overwrite { .. } | Self::CreateIndex => {
+                Box::new(std::iter::empty())
+            }
+            Self::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                ..
+            } => Box::new(
+                updated_fragments
+                    .iter()
+                    .map(|f| f.id)
+                    .chain(deleted_fragment_ids.iter().copied()),
+            ),
+            Self::Rewrite { old_fragments, .. } => Box::new(old_fragments.iter().map(|f| f.id)),
+            Self::Merge { fragments, .. } => Box::new(fragments.iter().map(|f| f.id)),
+        }
+    }
+
+    /// Check whether another operation modifies the same fragment IDs as this one.
+    fn modifies_same_ids(&self, other: &Self) -> bool {
+        let self_ids = self.modified_fragment_ids().collect::<HashSet<_>>();
+        let mut other_ids = other.modified_fragment_ids();
+        other_ids.any(|id| self_ids.contains(&id))
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Append { .. } => "Append",
+            Self::Delete { .. } => "Delete",
+            Self::Overwrite { .. } => "Overwrite",
+            Self::CreateIndex => "CreateIndex",
+            Self::Rewrite { .. } => "Rewrite",
+            Self::Merge { .. } => "Merge",
+        }
+    }
+}
+
 impl Transaction {
     pub fn new(read_version: u64, operation: Operation, tag: Option<String>) -> Self {
         let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
@@ -91,22 +160,13 @@ impl Transaction {
         }
     }
 
-    pub fn name(&self) -> &str {
-        match &self.operation {
-            Operation::Append { .. } => "Append",
-            Operation::Delete { .. } => "Delete",
-            Operation::Overwrite { .. } => "Overwrite",
-            Operation::CreateIndex => "CreateIndex",
-            Operation::Rewrite { .. } => "Rewrite",
-            Operation::Merge { .. } => "Merge",
-        }
-    }
-
     /// Returns true if the transaction cannot be committed if the other
     /// transaction is committed first.
     pub fn conflicts_with(&self, other: &Self) -> bool {
         // TODO: this assume IsolationLevel is Serializable, but we could also
-        // support Snapshot Isolation, which is more permissive.
+        // support Snapshot Isolation, which is more permissive. In particular,
+        // it would allow a Delete transaction to succeed after a concurrent
+        // Append, even if the Append added rows that would be deleted.
         match &self.operation {
             Operation::Append { .. } => match &other.operation {
                 // Append is compatible with anything that doesn't change the schema
@@ -116,30 +176,20 @@ impl Transaction {
                 Operation::Delete { .. } => false,
                 _ => true,
             },
-            Operation::Rewrite { old_fragments, .. } => match &other.operation {
+            Operation::Rewrite { .. } => match &other.operation {
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments.
                 // TODO: it could also be compatible with operations that update
                 // fragments we don't touch.
                 Operation::Append { .. } => false,
-                Operation::Delete {
-                    updated_fragments,
-                    deleted_fragment_ids,
-                    ..
-                } => {
+                Operation::Delete { .. } => {
                     // If we rewrote any fragments that were modified by delete,
                     // we conflict.
-                    let left_ids: HashSet<u64> = old_fragments.iter().map(|f| f.id).collect();
-                    deleted_fragment_ids.iter().any(|f| left_ids.contains(f))
-                        || updated_fragments.iter().any(|f| left_ids.contains(&f.id))
+                    self.operation.modifies_same_ids(&other.operation)
                 }
-                Operation::Rewrite {
-                    old_fragments: right_fragments,
-                    ..
-                } => {
+                Operation::Rewrite { .. } => {
                     // As long as they rewrite disjoint fragments they shouldn't conflict.
-                    let left_ids: HashSet<u64> = old_fragments.iter().map(|f| f.id).collect();
-                    right_fragments.iter().any(|f| left_ids.contains(&f.id))
+                    self.operation.modifies_same_ids(&other.operation)
                 }
                 _ => true,
             },
@@ -161,23 +211,15 @@ impl Transaction {
                 Operation::Rewrite { .. } => true,
                 _ => true,
             },
-            Operation::Delete {
-                updated_fragments: left_fragments,
-                ..
-            } => match &other.operation {
+            Operation::Delete { .. } => match &other.operation {
                 Operation::CreateIndex { .. } => false,
-                Operation::Delete {
-                    updated_fragments: right_fragments,
-                    ..
-                } => {
+                Operation::Delete { .. } => {
                     // If we update the same fragments, we conflict.
-                    let left_ids: HashSet<u64> = left_fragments.iter().map(|f| f.id).collect();
-                    right_fragments.iter().any(|f| left_ids.contains(&f.id))
+                    self.operation.modifies_same_ids(&other.operation)
                 }
-                Operation::Rewrite { old_fragments, .. } => {
+                Operation::Rewrite { .. } => {
                     // If we update any fragments that were rewritten, we conflict.
-                    let left_ids: HashSet<u64> = left_fragments.iter().map(|f| f.id).collect();
-                    old_fragments.iter().any(|f| left_ids.contains(&f.id))
+                    self.operation.modifies_same_ids(&other.operation)
                 }
                 _ => true,
             },
@@ -241,7 +283,7 @@ impl Transaction {
                 .ok_or_else(|| Error::Internal {
                     message: format!(
                         "No current manifest was provided while building manifest for operation {}",
-                        self.name()
+                        self.operation.name()
                     ),
                 });
 
