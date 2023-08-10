@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use std::any::{Any, TypeId};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use lru_time_cache::LruCache;
+use moka::sync::Cache;
 use object_store::path::Path;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
@@ -28,7 +28,7 @@ pub struct Session {
     pub(crate) index_cache: IndexCache,
 
     /// Cache for file metadata
-    pub(crate) file_metadata_cache: FileMetadataCache,
+    pub file_metadata_cache: FileMetadataCache,
 }
 
 impl std::fmt::Debug for Session {
@@ -67,34 +67,24 @@ type ArcAny = Arc<dyn Any + Send + Sync>;
 /// The cache is keyed by the file path and the type of metadata.
 #[derive(Clone)]
 pub struct FileMetadataCache {
-    /// The maximum number of metadata to cache.
-    capacity: usize,
-
-    cache: Arc<Mutex<LruCache<(Path, TypeId), ArcAny>>>,
+    cache: Arc<Cache<(Path, TypeId), ArcAny>>,
 }
 
 impl FileMetadataCache {
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
-            capacity,
-            cache: Arc::new(Mutex::new(LruCache::with_capacity(capacity))),
+            cache: Arc::new(Cache::new(capacity as u64)),
         }
     }
 
-    pub(crate) fn get<T: Send + Sync + 'static>(&self, path: &Path) -> Option<Arc<T>> {
-        let mut cache = self.cache.lock().unwrap();
-        cache
+    pub fn get<T: Send + Sync + 'static>(&self, path: &Path) -> Option<Arc<T>> {
+        self.cache
             .get(&(path.to_owned(), TypeId::of::<T>()))
             .map(|metadata| metadata.clone().downcast::<T>().unwrap())
     }
 
-    pub(crate) fn insert<T: Send + Sync + 'static>(&self, path: Path, metadata: Arc<T>) {
-        if self.capacity == 0 {
-            // Work-around. lru_time_cache panics if capacity is 0.
-            return;
-        }
-        let mut cache = self.cache.lock().unwrap();
-        cache.insert((path, TypeId::of::<T>()), metadata);
+    pub fn insert<T: Send + Sync + 'static>(&self, path: Path, metadata: Arc<T>) {
+        self.cache.insert((path, TypeId::of::<T>()), metadata);
     }
 }
 
@@ -108,8 +98,8 @@ mod tests {
     };
     use std::sync::Arc;
 
-    #[tokio::test]
-    async fn test_disable_index_cache() {
+    #[test]
+    fn test_disable_index_cache() {
         let no_cache = Session::new(0, 0);
         assert!(no_cache.index_cache.get("abc").is_none());
         let no_cache = Arc::new(no_cache);
@@ -120,5 +110,32 @@ mod tests {
 
         assert!(no_cache.index_cache.get("abc").is_none());
         assert_eq!(no_cache.index_cache.len(), 0);
+    }
+
+    #[test]
+    fn test_basic() {
+        let session = Session::new(10, 1);
+        let session = Arc::new(session);
+
+        let pq = Arc::new(ProductQuantizer::new(1, 8, 1));
+        let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
+        session.index_cache.insert("abc", idx.clone());
+
+        let found = session.index_cache.get("abc");
+        assert!(found.is_some());
+        assert_eq!(format!("{:?}", found.unwrap()), format!("{:?}", idx));
+        assert!(session.index_cache.get("abc").is_some());
+        assert_eq!(session.index_cache.len(), 1);
+
+        for iter_idx in 0..100 {
+            let pq_other = Arc::new(ProductQuantizer::new(16, 8, 1));
+            let idx_other = Arc::new(PQIndex::new(pq_other, MetricType::L2));
+            session
+                .index_cache
+                .insert(format!("{iter_idx}").as_str(), idx_other.clone());
+        }
+
+        // Capacity is 10 so there should be at most 10 items
+        assert_eq!(session.index_cache.len(), 10);
     }
 }
