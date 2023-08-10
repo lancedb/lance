@@ -956,15 +956,14 @@ impl Dataset {
     }
 
     pub async fn statistics(&self, index_name: Option<String>) -> Result<String> {
-        // let index_name = index_name.unwrap_or_default();
-        let index_name = index_name.unwrap_or("".to_string());
-        let do_not_filter = index_name.eq(&"");
+        let do_filter = index_name.is_some();
+        let name = index_name.unwrap_or("".to_string());
         let index_ids = self
             .load_indices()
             .await
             .unwrap()
             .iter()
-            .filter(|idx| do_not_filter || idx.name.eq(&index_name))
+            .filter(|idx| !do_filter || idx.name.eq(&name))
             .map(|idx| idx.uuid.to_string())
             .collect::<Vec<_>>();
 
@@ -2004,12 +2003,30 @@ mod tests {
         assert_eq!(actual, expected);
         dataset.validate().await.unwrap();
 
-        let index_stats = dataset
+        let expected_stats = "[\n{\"index_type\":\"Ivf\",\"uuid\":\"";
+        assert!(dataset
             .statistics(Some("embeddings_idx".to_string()))
             .await
-            .unwrap();
-        let expected_stats = "[\n{\"index_type\":\"ivf\",\"uuid\":\"";
-        assert!(index_stats.starts_with(expected_stats));
+            .unwrap()
+            .starts_with(expected_stats));
+        assert!(dataset
+            .statistics(None)
+            .await
+            .unwrap()
+            .starts_with(expected_stats));
+
+        let empty_stats_set = "[\n\n]";
+        assert_eq!(
+            dataset
+                .statistics(Some("non-existent_idx".to_string()))
+                .await
+                .unwrap(),
+            empty_stats_set
+        );
+        assert_eq!(
+            dataset.statistics(Some("".to_string())).await.unwrap(),
+            empty_stats_set
+        );
 
         // Overwrite should invalidate index
         let write_params = WriteParams {

@@ -33,7 +33,7 @@ use super::object_reader::ObjectReader;
 use crate::{Error, Result};
 
 /// Convert an [`object_store::path::Path`] to a [`std::path::Path`].
-fn to_local_path(path: &Path) -> String {
+pub fn to_local_path(path: &Path) -> String {
     if cfg!(windows) {
         path.to_string()
     } else {

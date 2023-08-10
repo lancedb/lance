@@ -71,7 +71,7 @@ impl std::fmt::Debug for PQIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "PQ(num_sub_vectors={}, nbits={}, metric_type={})",
+            "PQ(m={}, nbits={}, {})",
             self.num_sub_vectors, self.nbits, self.metric_type
         )
     }
@@ -223,10 +223,11 @@ impl PQIndex {
 
 #[derive(Serialize)]
 pub struct PQIndexStats {
+    index_type: String,
     nbits: u32,
     num_sub_vectors: usize,
-    metric_type: String,
     dimension: usize,
+    metric_type: String,
 }
 
 impl Index for PQIndex {
@@ -236,10 +237,11 @@ impl Index for PQIndex {
 
     fn statistics(&self) -> Result<String> {
         Ok(serde_json::to_string(&PQIndexStats {
+            index_type: "PQ".to_string(),
             nbits: self.nbits,
             num_sub_vectors: self.num_sub_vectors,
-            metric_type: self.metric_type.to_string(),
             dimension: self.dimension,
+            metric_type: self.metric_type.to_string(),
         })?)
     }
 }

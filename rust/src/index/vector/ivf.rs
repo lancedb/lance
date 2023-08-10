@@ -49,7 +49,10 @@ use crate::{
     datatypes::Field,
     index::{pb, prefilter::PreFilter, vector::Transformer, Index},
 };
-use crate::{io::object_reader::ObjectReader, session::Session};
+use crate::{
+    io::{local::to_local_path, object_reader::ObjectReader},
+    session::Session,
+};
 use crate::{Error, Result};
 
 const PARTITION_ID_COLUMN: &str = "__ivf_part_id";
@@ -130,38 +133,17 @@ impl IVFIndex {
 
 impl std::fmt::Debug for IVFIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let partitions = self
-            .ivf
-            .lengths
-            .iter()
-            .enumerate()
-            .map(|(i, &len)| {
-                format!(
-                    "[{}]: length={}, centroid={:?}",
-                    i,
-                    len,
-                    self.ivf.centroids.value(i)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        write!(
-            f,
-            "Ivf({}) -> PQ={:?}, num_partitions={}, partition_info=\n{}",
-            self.metric_type,
-            self.sub_index,
-            self.ivf.num_partitions(),
-            partitions
-        )
+        write!(f, "Ivf({}) -> {:?}", self.metric_type, self.sub_index)
     }
 }
 
-// #[derive(Serialize)]
-// pub struct IvfIndexPartitionStats {
-//     length: u32,
-//     offset: usize,
-//     centroids: String,
-// }
+#[derive(Serialize)]
+pub struct IvfIndexPartitionStats {
+    index: usize,
+    length: u32,
+    offset: usize,
+    centroids: String,
+}
 
 #[derive(Serialize)]
 pub struct IvfIndexStats {
@@ -171,7 +153,7 @@ pub struct IvfIndexStats {
     metric_type: String,
     num_partitions: usize,
     sub_index: String,
-    // partitions: Vec<IvfIndexPartitionStats>,
+    partitions: Vec<IvfIndexPartitionStats>,
 }
 
 impl Index for IVFIndex {
@@ -180,26 +162,27 @@ impl Index for IVFIndex {
     }
 
     fn statistics(&self) -> Result<String> {
-        // let partitions_stats = self
-        //     .ivf
-        //     .lengths
-        //     .iter()
-        //     .enumerate()
-        //     .map(|(i, &len)| IvfIndexPartitionStats {
-        //         length: len,
-        //         offset: self.ivf.offsets[i],
-        //         centroids: format!("{:?}", self.ivf.centroids.value(i)),
-        //     })
-        //     .collect::<Vec<_>>();
+        let partitions_stats = self
+            .ivf
+            .lengths
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| IvfIndexPartitionStats {
+                index: i,
+                length: len,
+                offset: self.ivf.offsets[i],
+                centroids: format!("{:?}", self.ivf.centroids.value(i)),
+            })
+            .collect::<Vec<_>>();
 
         Ok(serde_json::to_string(&IvfIndexStats {
-            index_type: "ivf".to_string(),
+            index_type: "Ivf".to_string(),
             uuid: self.uuid.clone(),
-            uri: self.reader.path().to_string(),
+            uri: to_local_path(self.reader.path()),
             metric_type: self.metric_type.to_string(),
             num_partitions: self.ivf.num_partitions(),
             sub_index: self.sub_index.statistics()?,
-            // partitions: partitions_stats,
+            partitions: partitions_stats,
         })?)
     }
 }
