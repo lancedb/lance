@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::Path;
 use std::str;
 use std::sync::Arc;
 
@@ -31,7 +30,7 @@ use lance::index::vector::pq::PQBuildParams;
 use lance::io::object_store::ObjectStoreParams;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong};
+use pyo3::types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong, PyString};
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
@@ -116,28 +115,27 @@ impl Dataset {
         arrow_schema.to_pyarrow(self_.py())
     }
 
+    /// Get index stats
+    fn statistics(self_: PyRef<'_, Self>, index_name: Option<String>) -> PyResult<&PyString> {
+        let statistics = self_
+            .rt
+            .block_on(async { self_.ds.statistics(index_name).await })
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(PyString::new(self_.py(), &statistics))
+    }
+
     /// Load index metadata
-    fn load_indices(self_: PyRef<'_, Self>, index_name: Option<String>) -> PyResult<Vec<PyObject>> {
+    fn load_indices(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
         let index_metadata = self_
             .rt
             .block_on(async { self_.ds.load_indices().await })
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
-
         let py = self_.py();
-        let dataset_path = Path::new(&self_.uri);
-        let name = index_name.unwrap_or_default();
-        let do_not_filter = name.eq(&"");
-
         Ok(index_metadata
             .iter()
-            .filter(|idx| do_not_filter || idx.name.eq(&name))
             .map(|idx| {
                 let dict = PyDict::new(py);
                 let schema = self_.ds.schema();
-                let index_path = dataset_path
-                    .join("_indices")
-                    .join(idx.uuid.to_string())
-                    .join("index.idx");
                 let field_names = schema
                     .project_by_ids(idx.fields.as_slice())
                     .unwrap()
@@ -145,11 +143,6 @@ impl Dataset {
                     .iter()
                     .map(|f| f.name.clone())
                     .collect::<Vec<_>>();
-                let index_stats = self_
-                    .rt
-                    .block_on(async { self_.ds.index_stats(&idx.name).await })
-                    .map_err(|err| PyValueError::new_err(err.to_string()))
-                    .unwrap();
 
                 dict.set_item("name", idx.name.clone()).unwrap();
                 // TODO: once we add more than vector indices, we need to:
@@ -160,8 +153,6 @@ impl Dataset {
                 dict.set_item("uuid", idx.uuid.to_string()).unwrap();
                 dict.set_item("fields", field_names).unwrap();
                 dict.set_item("version", idx.dataset_version).unwrap();
-                dict.set_item("filepath", index_path).unwrap();
-                dict.set_item("index_stats", index_stats).unwrap();
                 dict.to_object(py)
             })
             .collect::<Vec<_>>())

@@ -226,6 +226,7 @@ pub struct PQIndexStats {
     nbits: u32,
     num_sub_vectors: usize,
     metric_type: String,
+    dimension: usize,
 }
 
 impl Index for PQIndex {
@@ -238,6 +239,7 @@ impl Index for PQIndex {
             nbits: self.nbits,
             num_sub_vectors: self.num_sub_vectors,
             metric_type: self.metric_type.to_string(),
+            dimension: self.dimension,
         })?)
     }
 }

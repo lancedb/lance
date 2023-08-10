@@ -26,7 +26,7 @@ use arrow_array::{
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;
-use futures::future::BoxFuture;
+use futures::future::{try_join_all, BoxFuture};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use log::warn;
 use object_store::path::Path;
@@ -955,24 +955,26 @@ impl Dataset {
         read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest).await
     }
 
-    pub async fn index_stats(&self, index_name: &str) -> Result<String> {
-        let indices = self.load_indices().await.unwrap();
-        let index_id = indices
+    pub async fn statistics(&self, index_name: Option<String>) -> Result<String> {
+        // let index_name = index_name.unwrap_or_default();
+        let index_name = index_name.unwrap_or("".to_string());
+        let do_not_filter = index_name.eq(&"");
+        let index_ids = self
+            .load_indices()
+            .await
+            .unwrap()
             .iter()
-            .find(|idx| idx.name == index_name)
+            .filter(|idx| do_not_filter || idx.name.eq(&index_name))
             .map(|idx| idx.uuid.to_string())
-            .ok_or_else(|| Error::Index {
-                message: format!("Index name '{index_name}' does not exists in dataset."),
-            })?;
-        if index_id.len() == 36 {
-            open_index(Arc::new(self.clone()), "vector", &index_id)
+            .collect::<Vec<_>>();
+
+        let statistics = try_join_all(index_ids.iter().map(|uuid| async move {
+            open_index(Arc::new(self.clone()), "vector", uuid)
                 .await?
                 .statistics()
-        } else {
-            Err(Error::Index {
-                message: format!("Index name '{index_name}' does not exists in dataset."),
-            })
-        }
+        }))
+        .await;
+        Ok(format!("[\n{}\n]", statistics?.join(",\n")))
     }
 
     pub async fn validate(&self) -> Result<()> {
@@ -2002,10 +2004,12 @@ mod tests {
         assert_eq!(actual, expected);
         dataset.validate().await.unwrap();
 
-        // TODO: check the stats
-        // let index_stats = dataset.index_stats("embeddings_idx").await.unwrap();
-        // let expected_stats = "";
-        // assert!(index_stats.starts_with(expected_stats));
+        let index_stats = dataset
+            .statistics(Some("embeddings_idx".to_string()))
+            .await
+            .unwrap();
+        let expected_stats = "[\n{\"index_type\":\"ivf\",\"uuid\":\"";
+        assert!(index_stats.starts_with(expected_stats));
 
         // Overwrite should invalidate index
         let write_params = WriteParams {

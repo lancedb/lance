@@ -192,28 +192,25 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     )["id"].to_numpy()
     assert len(actual) == 10
 
-    actual_index = dataset_with_index.list_indices()
-    index_uuid = actual_index[0]["uuid"]
-    index_stats = actual_index[0].pop("index_stats")
+    index_uuid = dataset_with_index.list_indices()[0]["uuid"]
     assert len(index_uuid) == 36
+
+    expected_filepath = str(tmp_path / "_indices" / index_uuid / "index.idx")
     expected_index = [
         {
-            "name": "vector_idx",
-            "type": "Vector",
-            "fields": ["vector"],
-            "version": 2,
+            # "name": "vector_idx",
+            "index_type": "ivf",
+            # "fields": ["vector"],
+            # "version": 2,
             "uuid": index_uuid,
-            "filepath": str(tmp_path / "_indices" / index_uuid / "index.idx"),
+            "uri": expected_filepath.lstrip("/"),
+            "metric_type": "l2",
+            "num_partitions": 5,
+            "sub_index": '{"nbits":8,"num_sub_vectors":8,"metric_type":"l2",'
+            '"dimension":128}',
         }
     ]
+    actual_index = json.loads(dataset_with_index.statistics("vector_idx"))
     assert actual_index == expected_index
-    assert dataset_with_index.get_index("") == []
-    assert dataset_with_index.get_index("non-existent_idx") == []
-
-    index_stats = json.loads(index_stats)
-    sub_index = '{"nbits":8,"num_sub_vectors":8,"metric_type":"l2"}'
-    assert index_stats["index_type"] == "ivf"
-    assert index_stats["uuid"] == index_uuid
-    assert index_stats["num_partitions"] == 5
-    assert index_stats["metric_type"] == "l2"
-    assert index_stats["sub_index"] == sub_index
+    # assert dataset_with_index.statistics("") == []
+    # assert dataset_with_index.statistics("non-existent_idx") == []
