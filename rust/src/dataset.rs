@@ -1490,8 +1490,6 @@ mod tests {
             .await
             .unwrap();
 
-        ds.validate().await.unwrap();
-
         let expected_batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from_iter_values(0..40))],
@@ -1500,6 +1498,17 @@ mod tests {
 
         let actual_ds = Dataset::open(test_uri).await.unwrap();
         assert_eq!(actual_ds.version().version, 2);
+        // validate fragment ids
+        assert_eq!(actual_ds.fragments().len(), 2);
+        assert_eq!(
+            actual_ds
+                .fragments()
+                .iter()
+                .map(|f| f.id)
+                .collect::<Vec<_>>(),
+            (0..2).collect::<Vec<_>>()
+        );
+
         let actual_schema = ArrowSchema::from(actual_ds.schema());
         assert_eq!(&actual_schema, schema.as_ref());
 
