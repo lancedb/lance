@@ -28,7 +28,7 @@ pub struct Session {
     pub(crate) index_cache: IndexCache,
 
     /// Cache for file metadata
-    pub file_metadata_cache: FileMetadataCache,
+    pub(crate) file_metadata_cache: FileMetadataCache,
 }
 
 impl std::fmt::Debug for Session {
@@ -71,19 +71,19 @@ pub struct FileMetadataCache {
 }
 
 impl FileMetadataCache {
-    pub fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         Self {
             cache: Arc::new(Cache::new(capacity as u64)),
         }
     }
 
-    pub fn get<T: Send + Sync + 'static>(&self, path: &Path) -> Option<Arc<T>> {
+    pub(crate) fn get<T: Send + Sync + 'static>(&self, path: &Path) -> Option<Arc<T>> {
         self.cache
             .get(&(path.to_owned(), TypeId::of::<T>()))
             .map(|metadata| metadata.clone().downcast::<T>().unwrap())
     }
 
-    pub fn insert<T: Send + Sync + 'static>(&self, path: Path, metadata: Arc<T>) {
+    pub(crate) fn insert<T: Send + Sync + 'static>(&self, path: Path, metadata: Arc<T>) {
         self.cache.insert((path, TypeId::of::<T>()), metadata);
     }
 }
