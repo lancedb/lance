@@ -340,6 +340,25 @@ impl From<&Vec<pb::Field>> for Schema {
     }
 }
 
+/// Convert list of protobuf `Field` and Metadata to a Schema.
+impl From<(&Vec<pb::Field>, HashMap<String, Vec<u8>>)> for Schema {
+    fn from((fields, metadata): (&Vec<pb::Field>, HashMap<String, Vec<u8>>)) -> Self {
+        let lance_metadata = metadata
+            .into_iter()
+            .map(|(key, value)| {
+                let string_value = String::from_utf8_lossy(&value).to_string();
+                (key, string_value)
+            })
+            .collect();
+
+        let schema_with_fields = Schema::from(fields);
+        Self {
+            fields: schema_with_fields.fields,
+            metadata: lance_metadata,
+        }
+    }
+}
+
 /// Convert a Schema to a list of protobuf Field.
 impl From<&Schema> for Vec<pb::Field> {
     fn from(schema: &Schema) -> Self {
@@ -348,6 +367,20 @@ impl From<&Schema> for Vec<pb::Field> {
             protos.extend(Self::from(f));
         });
         protos
+    }
+}
+
+/// Convert a Schema to a list of protobuf Field and Metadata
+impl From<&Schema> for (Vec<pb::Field>, HashMap<String, Vec<u8>>) {
+    fn from(schema: &Schema) -> Self {
+        let fields: Vec<pb::Field> = schema.into();
+        let pb_metadata = schema
+            .metadata
+            .clone()
+            .into_iter()
+            .map(|(key, value)| (key, value.into_bytes()))
+            .collect();
+        (fields, pb_metadata)
     }
 }
 
@@ -512,6 +545,24 @@ mod tests {
             protos.iter().map(|p| p.id).collect::<Vec<_>>(),
             (0..6).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_schema_metadata() {
+        let mut metadata: HashMap<String, String> = HashMap::new();
+        metadata.insert(String::from("k1"), String::from("v1"));
+        metadata.insert(String::from("k2"), String::from("v2"));
+
+        let arrow_schema = ArrowSchema::new_with_metadata(
+            vec![ArrowField::new("a", DataType::Int32, false)],
+            metadata,
+        );
+
+        let expected_schema = Schema::try_from(&arrow_schema).unwrap();
+        let (fields, meta): (Vec<pb::Field>, HashMap<String, Vec<u8>>) = (&expected_schema).into();
+
+        let schema = Schema::from((&fields, meta));
+        assert_eq!(expected_schema, schema);
     }
 
     #[test]
