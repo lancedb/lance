@@ -184,7 +184,7 @@ impl From<pb::Manifest> for Manifest {
             sec + nanos
         });
         Self {
-            schema: Schema::from(&p.fields),
+            schema: Schema::from((&p.fields, p.metadata)),
             version: p.version,
             fragments: Arc::new(p.fragments.iter().map(Fragment::from).collect()),
             version_aux_data: p.version_aux_data as usize,
@@ -210,11 +210,12 @@ impl From<&Manifest> for pb::Manifest {
                 nanos: nanos as i32,
             })
         };
+        let (fields, metadata): (Vec<pb::Field>, HashMap<String, Vec<u8>>) = (&m.schema).into();
         Self {
-            fields: (&m.schema).into(),
+            fields,
             version: m.version,
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
-            metadata: HashMap::default(),
+            metadata,
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
             timestamp: timestamp_nanos,

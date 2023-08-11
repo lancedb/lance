@@ -215,3 +215,10 @@ def test_roundtrip_types(tmp_path, sample_data_all_types):
     dataset = lance.write_dataset(sample_data_all_types, tmp_path)
     roundtripped = dataset.to_table()
     assert roundtripped == sample_data_all_types
+
+
+def test_roundtrip_schema(tmp_path):
+    schema = pa.schema([pa.field("a", pa.float64())], metadata={"key": "value"})
+    data = pa.table({"a": [1.0, 2.0]}).to_batches()
+    dataset = lance.write_dataset(data, tmp_path, schema=schema)
+    assert dataset.schema == schema
