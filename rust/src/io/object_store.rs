@@ -258,6 +258,21 @@ impl ObjectStore {
         ))
     }
 
+    pub fn with_params(&self, params: &ObjectStoreParams) -> Self {
+        Self {
+            inner: params
+                .object_store_wrapper
+                .as_ref()
+                .map(|w| w.wrap(self.inner.clone()))
+                .unwrap_or_else(|| self.inner.clone()),
+            commit_handler: params
+                .commit_handler
+                .clone()
+                .unwrap_or(self.commit_handler.clone()),
+            ..self.clone()
+        }
+    }
+
     fn new_from_path(str_path: &str, params: &ObjectStoreParams) -> Result<(Self, Path)> {
         let expanded = tilde(str_path).to_string();
         let expanded_path = StdPath::new(&expanded);
@@ -369,10 +384,6 @@ impl ObjectStore {
 
     pub fn base_path(&self) -> &Path {
         &self.base_path
-    }
-
-    pub fn base_uri(&self) -> String {
-        format!("{}://{}", self.scheme, self.base_path)
     }
 
     /// Open a file for path.

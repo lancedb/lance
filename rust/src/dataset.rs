@@ -434,12 +434,10 @@ impl Dataset {
         };
 
         // Need to include params here because it might include a commit mechanism.
-        let (object_store, _) = ObjectStore::from_uri_and_params(
-            &self.object_store.base_uri(),
-            params.store_params.clone().unwrap_or_default(),
-        )
-        .await?;
-        let object_store = Arc::new(object_store);
+        let object_store = Arc::new(
+            self.object_store()
+                .with_params(&params.store_params.clone().unwrap_or_default()),
+        );
 
         let (stream, schema) = reader_to_stream(batches)?;
 

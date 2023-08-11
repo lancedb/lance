@@ -807,6 +807,8 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
+
+            dataset.validate().await.unwrap()
         }
     }
 }
