@@ -433,6 +433,14 @@ impl Dataset {
             ..params.unwrap_or_default()
         };
 
+        // Need to include params here because it might include a commit mechanism.
+        let (object_store, _) = ObjectStore::from_uri_and_params(
+            &self.object_store.base_uri(),
+            params.store_params.clone().unwrap_or_default(),
+        )
+        .await?;
+        let object_store = Arc::new(object_store);
+
         let (stream, schema) = reader_to_stream(batches)?;
 
         // Return Error if append and input schema differ
@@ -443,46 +451,28 @@ impl Dataset {
             });
         }
 
-        let mut fragment_id = self
-            .manifest
-            .max_fragment_id()
-            .map(|max| max + 1)
-            .unwrap_or(0);
-
-        let mut fragments: Vec<Fragment> = self.manifest.fragments.as_ref().clone();
-
-        let object_store = self.object_store.clone();
-
-        let mut new_fragments = write_fragments(
+        let fragments = write_fragments(
             object_store.clone(),
-            object_store.base_path(),
+            &self.base,
             &schema,
             stream,
             params.clone(),
         )
         .await?;
 
-        // Assign IDs.
-        for fragment in &mut new_fragments {
-            fragment.id = fragment_id;
-            fragment_id += 1;
-        }
-        fragments.extend(new_fragments);
+        let transaction =
+            Transaction::new(self.manifest.version, Operation::Append { fragments }, None);
 
-        let mut manifest =
-            Manifest::new_from_previous(&self.manifest, &schema, Arc::new(fragments));
-
-        // inherit the indices
-        let indices = Some(self.load_indices().await?);
-
-        write_manifest_file(
+        let new_manifest = commit_transaction(
+            self,
             &object_store,
-            object_store.base_path(),
-            &mut manifest,
-            indices,
-            Default::default(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
         )
         .await?;
+
+        self.manifest = Arc::new(new_manifest);
 
         Ok(())
     }
