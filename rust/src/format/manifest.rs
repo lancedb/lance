@@ -212,10 +212,10 @@ impl From<&Manifest> for pb::Manifest {
         };
         let (fields, metadata): (Vec<pb::Field>, HashMap<String, Vec<u8>>) = (&m.schema).into();
         Self {
-            fields: fields,
+            fields,
             version: m.version,
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
-            metadata: metadata,
+            metadata,
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
             timestamp: timestamp_nanos,

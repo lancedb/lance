@@ -351,7 +351,7 @@ impl From<(&Vec<pb::Field>, HashMap<String, Vec<u8>>)> for Schema {
             })
             .collect();
 
-        let schema_with_fields = Schema::from(fields);
+        let schema_with_fields = Self::from(fields);
         Self {
             fields: schema_with_fields.fields,
             metadata: lance_metadata,
