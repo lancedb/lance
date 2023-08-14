@@ -338,7 +338,17 @@ impl Dataset {
         let dataset = if matches!(params.mode, WriteMode::Create) {
             None
         } else {
-            Some(Self::open(uri).await?)
+            // pull the store params from write params because there might be creds in there
+            Some(
+                Self::open_with_params(
+                    uri,
+                    &ReadParams {
+                        store_options: params.store_params.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await?,
+            )
         };
 
         // append + input schema different from existing schema = error
