@@ -2063,7 +2063,7 @@ mod test {
             .unwrap()];
 
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-            let dataset = Dataset::write(
+            let mut dataset = Dataset::write(
                 reader,
                 test_uri,
                 Some(WriteParams {
@@ -2073,7 +2073,7 @@ mod test {
             )
             .await
             .unwrap();
-            let mut dataset = dataset
+            dataset
                 .create_index(
                     &["vec"],
                     IndexType::Vector,
