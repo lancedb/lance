@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, RecordBatchReader};
+use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, FieldRef, Schema};
 use criterion::{criterion_group, criterion_main, Criterion};
 use lance::{
@@ -27,6 +27,7 @@ use lance::{
     utils::testing::generate_random_array,
     Dataset,
 };
+#[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
 async fn create_dataset(path: &std::path::Path, dim: usize, mode: WriteMode) {
