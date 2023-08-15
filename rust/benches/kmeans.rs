@@ -32,7 +32,7 @@ fn bench_train(c: &mut Criterion) {
 
     c.bench_function("train_128d_4k", |b| {
         b.to_async(&rt).iter(|| async {
-            KMeans::new(&array, 256, 25, 50).await;
+            KMeans::new(&array, 256, 25, 50).await.ok().unwrap();
         })
     });
 
@@ -51,7 +51,7 @@ fn bench_train(c: &mut Criterion) {
     let array = generate_random_array(1024 * 64 * dimension as usize);
     c.bench_function("train_128d_65535", |b| {
         b.to_async(&rt).iter(|| async {
-            KMeans::new(&array, 256, 25, 50).await;
+            KMeans::new(&array, 256, 25, 50).await.ok().unwrap();
         })
     });
 
@@ -71,7 +71,7 @@ fn bench_train(c: &mut Criterion) {
     let array = generate_random_array(1024 * 64 * dimension as usize);
     c.bench_function("train_8d_65535", |b| {
         b.to_async(&rt).iter(|| async {
-            KMeans::new(&array, 256, 25, 50).await;
+            KMeans::new(&array, 256, 25, 50).await.ok().unwrap();
         })
     });
 }
