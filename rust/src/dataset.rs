@@ -35,16 +35,19 @@ mod feature_flags;
 pub mod fragment;
 mod hash_joiner;
 pub mod scanner;
+pub mod transaction;
 pub mod updater;
 mod write;
 
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::Scanner;
+use self::transaction::{Operation, Transaction};
 use self::write::{reader_to_stream, write_fragments};
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{pb, Fragment, Index, Manifest};
+use crate::io::commit::{commit_new_dataset, commit_transaction, CommitError};
 use crate::io::object_store::ObjectStoreParams;
 use crate::io::{
     object_reader::{read_message, read_struct},
@@ -377,55 +380,33 @@ impl Dataset {
             }
         }
 
-        let mut fragment_id = if matches!(params.mode, WriteMode::Append) {
-            dataset.as_ref().map_or(0, |d| {
-                d.manifest.max_fragment_id().map(|max| max + 1).unwrap_or(0)
-            })
-        } else {
-            // Create or Overwrite.
-            // Overwrite resets the fragment ID to zero.
-            0
-        };
-
-        let mut fragments: Vec<Fragment> = if matches!(params.mode, WriteMode::Append) {
-            dataset
-                .as_ref()
-                .map_or(vec![], |d| d.manifest.fragments.as_ref().clone())
-        } else {
-            // Create or Overwrite create new fragments.
-            vec![]
-        };
-
         let object_store = Arc::new(object_store);
-        let mut new_fragments =
+        let fragments =
             write_fragments(object_store.clone(), &base, &schema, stream, params.clone()).await?;
 
-        // Assign IDs.
-        for fragment in &mut new_fragments {
-            fragment.id = fragment_id;
-            fragment_id += 1;
-        }
-        fragments.extend(new_fragments);
+        let operation = match params.mode {
+            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite { schema, fragments },
+            WriteMode::Append => Operation::Append { fragments },
+        };
 
-        let mut manifest = if let Some(dataset) = &dataset {
-            Manifest::new_from_previous(&dataset.manifest, &schema, Arc::new(fragments))
+        let transaction = Transaction::new(
+            dataset.as_ref().map(|ds| ds.manifest.version).unwrap_or(0),
+            operation,
+            None,
+        );
+
+        let manifest = if let Some(dataset) = &dataset {
+            commit_transaction(
+                dataset,
+                &object_store,
+                &transaction,
+                &Default::default(),
+                &Default::default(),
+            )
+            .await?
         } else {
-            Manifest::new(&schema, Arc::new(fragments))
+            commit_new_dataset(&object_store, &base, &transaction, &Default::default()).await?
         };
-
-        // Inherit the index if we're just appending rows
-        let indices = match (&dataset, &params.mode) {
-            (Some(d), WriteMode::Append) => Some(d.load_indices().await?),
-            _ => None,
-        };
-        write_manifest_file(
-            &object_store,
-            &base,
-            &mut manifest,
-            indices,
-            Default::default(),
-        )
-        .await?;
 
         Ok(Self {
             object_store,
@@ -462,6 +443,12 @@ impl Dataset {
             ..params.unwrap_or_default()
         };
 
+        // Need to include params here because it might include a commit mechanism.
+        let object_store = Arc::new(
+            self.object_store()
+                .with_params(&params.store_params.clone().unwrap_or_default()),
+        );
+
         let (stream, schema) = reader_to_stream(batches)?;
 
         // Return Error if append and input schema differ
@@ -472,46 +459,28 @@ impl Dataset {
             });
         }
 
-        let mut fragment_id = self
-            .manifest
-            .max_fragment_id()
-            .map(|max| max + 1)
-            .unwrap_or(0);
-
-        let mut fragments: Vec<Fragment> = self.manifest.fragments.as_ref().clone();
-
-        let object_store = self.object_store.clone();
-
-        let mut new_fragments = write_fragments(
+        let fragments = write_fragments(
             object_store.clone(),
-            object_store.base_path(),
+            &self.base,
             &schema,
             stream,
             params.clone(),
         )
         .await?;
 
-        // Assign IDs.
-        for fragment in &mut new_fragments {
-            fragment.id = fragment_id;
-            fragment_id += 1;
-        }
-        fragments.extend(new_fragments);
+        let transaction =
+            Transaction::new(self.manifest.version, Operation::Append { fragments }, None);
 
-        let mut manifest =
-            Manifest::new_from_previous(&self.manifest, &schema, Arc::new(fragments));
-
-        // inherit the indices
-        let indices = Some(self.load_indices().await?);
-
-        write_manifest_file(
+        let new_manifest = commit_transaction(
+            self,
             &object_store,
-            object_store.base_path(),
-            &mut manifest,
-            indices,
-            Default::default(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
         )
         .await?;
+
+        self.manifest = Arc::new(new_manifest);
 
         Ok(())
     }
@@ -563,7 +532,7 @@ impl Dataset {
             &base,
             &mut manifest,
             Some(indices),
-            Default::default(),
+            &Default::default(),
         )
         .await?;
         Ok(Self {
@@ -635,21 +604,21 @@ impl Dataset {
             .try_collect::<Vec<_>>()
             .await?;
 
-        // Inherit the index, since we are just adding columns.
-        let indices = self.load_indices().await?;
-
-        let mut manifest = Manifest::new_from_previous(
-            self.manifest.as_ref(),
-            &new_schema,
-            Arc::new(updated_fragments),
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Merge {
+                fragments: updated_fragments,
+                schema: new_schema,
+            },
+            None,
         );
 
-        write_manifest_file(
+        let manifest = commit_transaction(
+            self,
             &self.object_store,
-            &self.base,
-            &mut manifest,
-            Some(indices),
-            Default::default(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
         )
         .await?;
 
@@ -815,36 +784,44 @@ impl Dataset {
 
     /// Delete rows based on a predicate.
     pub async fn delete(&mut self, predicate: &str) -> Result<()> {
-        let mut updated_fragments = stream::iter(self.get_fragments())
-            .map(|f| async move { f.delete(predicate).await.map(|f| f.map(|f| f.metadata)) })
+        let mut updated_fragments: Vec<Fragment> = Vec::new();
+        let mut deleted_fragment_ids: Vec<u64> = Vec::new();
+        stream::iter(self.get_fragments())
+            .map(|f| async move {
+                let old_fragment = f.metadata.clone();
+                let new_fragment = f.delete(predicate).await?.map(|f| f.metadata);
+                Ok((old_fragment, new_fragment))
+            })
             .buffer_unordered(num_cpus::get())
             // Drop the fragments that were deleted.
-            .try_filter_map(|f| futures::future::ready(Ok(f)))
-            .try_collect::<Vec<_>>()
+            .try_for_each(|(old_fragment, new_fragment)| {
+                if let Some(new_fragment) = new_fragment {
+                    if new_fragment != old_fragment {
+                        updated_fragments.push(new_fragment);
+                    }
+                } else {
+                    deleted_fragment_ids.push(old_fragment.id);
+                }
+                futures::future::ready(Ok::<_, crate::Error>(()))
+            })
             .await?;
 
-        // Maintain the order of fragment IDs.
-        updated_fragments.sort_by_key(|f| f.id);
-
-        // Inherit the index, unless we deleted all the fragments.
-        let indices = if updated_fragments.is_empty() {
-            None
-        } else {
-            Some(self.load_indices().await?)
-        };
-
-        let mut manifest = Manifest::new_from_previous(
-            self.manifest.as_ref(),
-            self.schema(),
-            Arc::new(updated_fragments),
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                predicate: predicate.to_string(),
+            },
+            None,
         );
 
-        write_manifest_file(
+        let manifest = commit_transaction(
+            self,
             &self.object_store,
-            &self.base,
-            &mut manifest,
-            indices,
-            Default::default(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
         )
         .await?;
 
@@ -863,14 +840,6 @@ impl Dataset {
 
     fn manifest_file(&self, version: u64) -> Path {
         self.versions_dir().child(format!("{version}.manifest"))
-    }
-
-    fn latest_manifest_path(&self) -> Path {
-        latest_manifest_path(&self.base)
-    }
-
-    pub(crate) async fn latest_manifest(&self) -> Result<Manifest> {
-        read_manifest(&self.object_store, &self.latest_manifest_path()).await
     }
 
     pub(crate) fn data_dir(&self) -> Path {
@@ -1009,8 +978,8 @@ pub(crate) async fn write_manifest_file(
     base_path: &Path,
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
-    config: ManifestWriteConfig,
-) -> Result<()> {
+    config: &ManifestWriteConfig,
+) -> std::result::Result<(), CommitError> {
     if config.auto_set_feature_flags {
         apply_feature_flags(manifest);
     }
@@ -1035,7 +1004,8 @@ pub(crate) async fn write_manifest_file(
     object_store
         .inner
         .copy(&path, &latest_manifest_path(base_path))
-        .await?;
+        .await
+        .map_err(|err| CommitError::OtherError(err.into()))?;
 
     Ok(())
 }
@@ -1353,7 +1323,7 @@ mod tests {
             &dataset.base,
             &mut manifest,
             None,
-            ManifestWriteConfig {
+            &ManifestWriteConfig {
                 auto_set_feature_flags: false,
                 timestamp: None,
             },
@@ -1958,10 +1928,10 @@ mod tests {
             .unwrap();
         dataset.validate().await.unwrap();
 
-        // Check the version is set correctly
+        // The version should match the table version it was created from.
         let indices = dataset.load_indices().await.unwrap();
         let actual = indices.first().unwrap().dataset_version;
-        let expected = dataset.manifest.version;
+        let expected = dataset.manifest.version - 1;
         assert_eq!(actual, expected);
 
         // Append should inherit index
@@ -1976,7 +1946,7 @@ mod tests {
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
         let actual = indices.first().unwrap().dataset_version;
-        let expected = dataset.manifest.version - 1;
+        let expected = dataset.manifest.version - 2;
         assert_eq!(actual, expected);
         dataset.validate().await.unwrap();
 

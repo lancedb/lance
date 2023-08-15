@@ -260,3 +260,35 @@ put-if-not-exists, these operations should be used. This is true of local file
 systems and cloud object stores, with the notable except of AWS S3. For ones
 that lack this functionality, an external locking mechanism can be configured
 by the user.
+
+Conflict resolution
+~~~~~~~~~~~~~~~~~~~
+
+If two writers try to commit at the same time, one will succeed and the other
+will fail. The failed writer should attempt to retry the commit, but only if
+it's changes are compatible with the changes made by the successful writer.
+
+The changes for a given commit are recorded as a transaction file, under the
+``_transactions`` prefix in the dataset directory. The transaction file is a
+serialized ``Transaction`` protobuf message. See the ``transaction.proto`` file
+for its definition.
+
+.. image:: _static/conflict_resolution_flow.png
+
+The commit process is as follows:
+
+ 1. The writer finishes writing all data files.
+ 2. The writer creates a transaction file in the ``_transactions`` directory.
+    This files describes the operations that were performed, which is used for two
+    purposes: (1) to detect conflicts, and (2) to re-build the manifest during
+    retries.
+ 3. Look for any new commits since the writer started writing. If there are any,
+    read their transaction files and check for conflicts. If there are any
+    conflicts, abort the commit. Otherwise, continue.
+ 4. Build a manifest and attempt to commit it to the next version. If the commit
+    fails because another writer has already committed, go back to step 3.
+ 5. If the commit succeeds, update the ``_latest.manifest`` file.
+
+When checking whether two transactions conflict, be conservative. If the
+transaction file is missing, assume it conflicts. If the transaction file 
+has an unknown operation, assume it conflicts.
