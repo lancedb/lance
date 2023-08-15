@@ -27,7 +27,8 @@ use ::object_store::{
 use async_trait::async_trait;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_credential_types::provider::ProvideCredentials;
-use futures::{StreamExt, TryStreamExt};
+use futures::stream::BoxStream;
+use futures::{Stream, StreamExt, TryStreamExt};
 use object_store::aws::AwsCredential as ObjectStoreAwsCredential;
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
@@ -427,7 +428,6 @@ impl ObjectStore {
     /// Read a directory (start from base directory) and returns all sub-paths in the directory.
     pub async fn read_dir(&self, dir_path: impl Into<Path>) -> Result<Vec<String>> {
         let path = dir_path.into();
-        let path = Path::parse(&path)?;
         let output = self.inner.list_with_delimiter(Some(&path)).await?;
         Ok(output
             .common_prefixes
@@ -435,6 +435,22 @@ impl ObjectStore {
             .chain(output.objects.iter().map(|o| &o.location))
             .map(|s| s.filename().unwrap().to_string())
             .collect())
+    }
+
+    pub async fn read_dir_all(
+        &self,
+        dir_path: impl Into<&Path>,
+    ) -> Result<BoxStream<Result<Path>>> {
+        let output = self.inner.list(Some(dir_path.into())).await?;
+        Ok(output
+            .map(|file_result| Ok(file_result.map(|file| file.location)?))
+            .boxed())
+    }
+
+    pub async fn remove(&self, path: impl Into<Path>) -> Result<()> {
+        let path = path.into();
+        self.inner.delete(&path).await?;
+        Ok(())
     }
 
     /// Remove a directory recursively.

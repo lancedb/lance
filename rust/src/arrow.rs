@@ -182,6 +182,10 @@ where
     Ok(GenericListArray::from(data))
 }
 
+pub fn fixed_size_list_type(list_width: i32, inner_type: DataType) -> DataType {
+    DataType::FixedSizeList(Arc::new(Field::new("item", inner_type, true)), list_width)
+}
+
 pub trait FixedSizeListArrayExt {
     /// Create an [`FixedSizeListArray`] from values and list size.
     ///

@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use chrono::prelude::*;
 use prost_types::Timestamp;
@@ -26,6 +25,7 @@ use super::Fragment;
 use crate::datatypes::Schema;
 use crate::error::{Error, Result};
 use crate::format::{pb, ProtoStruct};
+use crate::utils::temporal::SystemTime;
 
 /// Manifest of a dataset
 ///
