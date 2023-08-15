@@ -94,7 +94,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.load_indices()
 
     @lru_cache(maxsize=None)
-    def statistics(self, index_name: Optional[str] = None) -> str:
+    def index_statistics(self, index_name: Optional[str] = None) -> str:
         return self._ds.statistics(index_name)
 
     @property

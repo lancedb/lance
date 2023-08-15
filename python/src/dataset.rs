@@ -116,12 +116,11 @@ impl Dataset {
     }
 
     /// Get index stats
-    fn statistics(self_: PyRef<'_, Self>, index_name: Option<String>) -> PyResult<&PyString> {
-        let statistics = self_
+    fn statistics(&self, index_name: Option<String>) -> PyResult<String> {
+        self
             .rt
-            .block_on(async { self_.ds.statistics(index_name).await })
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        Ok(PyString::new(self_.py(), &statistics))
+            .block_on(async { self.ds.statistics(index_name).await })
+            .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 
     /// Load index metadata
