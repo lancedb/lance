@@ -30,7 +30,7 @@ use lance::index::vector::pq::PQBuildParams;
 use lance::io::object_store::ObjectStoreParams;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong, PyString};
+use pyo3::types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong};
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
@@ -116,9 +116,8 @@ impl Dataset {
     }
 
     /// Get index stats
-    fn statistics(&self, index_name: Option<String>) -> PyResult<String> {
-        self
-            .rt
+    fn statistics(&self, index_name: String) -> PyResult<String> {
+        self.rt
             .block_on(async { self.ds.statistics(index_name).await })
             .map_err(|err| PyValueError::new_err(err.to_string()))
     }

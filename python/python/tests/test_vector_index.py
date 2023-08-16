@@ -11,8 +11,6 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import json
-import platform
 import random
 import string
 import time
@@ -197,32 +195,34 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     assert len(index_uuid) == 36
 
     expected_filepath = str(tmp_path / "_indices" / index_uuid / "index.idx")
-    if platform.system() == "Windows":
-        expected_filepath = expected_filepath.replace("\\", "/")
     expected_index = [
         {
-            "index_type": "Ivf",
+            "index_type": "IVF",
             "uuid": index_uuid,
             "uri": expected_filepath,
             "metric_type": "l2",
             "num_partitions": 5,
-            "sub_index": '{"index_type":"PQ","nbits":8,"num_sub_vectors":8,'
-            '"dimension":128,"metric_type":"l2"}',
+            "sub_index": {
+                "dimension": 128,
+                "index_type": "PQ",
+                "metric_type": "l2",
+                "nbits": 8,
+                "num_sub_vectors": 8,
+            },
         }
     ]
 
-    assert dataset_with_index.statistics("non-existent_idx") == "[\n\n]"
-    assert dataset_with_index.statistics("") == "[\n\n]"
+    assert dataset_with_index.index_statistics("non-existent_idx") == []
+    assert dataset_with_index.index_statistics("") == []
+    with pytest.raises(TypeError):
+        dataset_with_index.index_statistics()
 
-    actual_index = json.loads(dataset_with_index.statistics())
-    actual_index[0].pop("partitions")
-    assert actual_index == expected_index
-
-    actual_index = json.loads(dataset_with_index.statistics("vector_idx"))
+    actual_index = dataset_with_index.index_statistics("vector_idx")
     partitions = actual_index[0].pop("partitions")
     assert actual_index == expected_index
 
     assert len(partitions) == 5
-    partition_keys = ("index", "length", "offset", "centroids")
+    partition_keys = {"index", "length", "offset", "centroid"}
     assert all([p["index"] == i for i, p in enumerate(partitions)])
-    assert all([partition_keys == tuple(p.keys()) for p in partitions])
+    assert all([partition_keys == set(p.keys()) for p in partitions])
+    assert all([all([isinstance(c, float) for c in p["centroid"]]) for p in partitions])

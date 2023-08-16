@@ -142,7 +142,7 @@ pub struct IvfIndexPartitionStats {
     index: usize,
     length: u32,
     offset: usize,
-    centroids: String,
+    centroid: Vec<f32>,
 }
 
 #[derive(Serialize)]
@@ -152,7 +152,7 @@ pub struct IvfIndexStats {
     uri: String,
     metric_type: String,
     num_partitions: usize,
-    sub_index: String,
+    sub_index: serde_json::Value,
     partitions: Vec<IvfIndexPartitionStats>,
 }
 
@@ -161,22 +161,26 @@ impl Index for IVFIndex {
         self
     }
 
-    fn statistics(&self) -> Result<String> {
+    fn statistics(&self) -> Result<serde_json::Value> {
         let partitions_stats = self
             .ivf
             .lengths
             .iter()
             .enumerate()
-            .map(|(i, &len)| IvfIndexPartitionStats {
-                index: i,
-                length: len,
-                offset: self.ivf.offsets[i],
-                centroids: format!("{:?}", self.ivf.centroids.value(i)),
+            .map(|(i, &len)| {
+                let centroid = self.ivf.centroids.value(i);
+                let centroid_arr: &Float32Array = as_primitive_array(centroid.as_ref());
+                IvfIndexPartitionStats {
+                    index: i,
+                    length: len,
+                    offset: self.ivf.offsets[i],
+                    centroid: centroid_arr.values().to_vec(),
+                }
             })
             .collect::<Vec<_>>();
 
-        Ok(serde_json::to_string(&IvfIndexStats {
-            index_type: "Ivf".to_string(),
+        Ok(serde_json::to_value(IvfIndexStats {
+            index_type: "IVF".to_string(),
             uuid: self.uuid.clone(),
             uri: to_local_path(self.reader.path()),
             metric_type: self.metric_type.to_string(),

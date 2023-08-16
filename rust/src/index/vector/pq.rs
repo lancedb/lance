@@ -235,8 +235,8 @@ impl Index for PQIndex {
         self
     }
 
-    fn statistics(&self) -> Result<String> {
-        Ok(serde_json::to_string(&PQIndexStats {
+    fn statistics(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(PQIndexStats {
             index_type: "PQ".to_string(),
             nbits: self.nbits,
             num_sub_vectors: self.num_sub_vectors,

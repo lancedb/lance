@@ -212,8 +212,8 @@ impl Index for DiskANNIndex {
         self
     }
 
-    fn statistics(&self) -> Result<String> {
-        Ok(serde_json::to_string(&DiskANNIndexStats {
+    fn statistics(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(DiskANNIndexStats {
             index_type: "DiskANNIndex".to_string(),
             length: self.graph.len(),
         })?)

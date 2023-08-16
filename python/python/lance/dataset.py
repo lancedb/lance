@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -95,7 +96,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     @lru_cache(maxsize=None)
     def index_statistics(self, index_name: Optional[str] = None) -> str:
-        return self._ds.statistics(index_name)
+        return json.loads(self._ds.statistics(index_name))
 
     @property
     def has_index(self):
