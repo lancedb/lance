@@ -206,7 +206,7 @@ impl<'a> CleanupTask<'a> {
                 invalid_files.unref_delete_paths.remove(&relative_path);
             }
         }
-        let full_path = join_paths(&self.dataset.base, &manifest_path);
+        let full_path = join_paths(&self.dataset.base, manifest_path);
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &full_path, manifest).await?;
         for index in indexes {
