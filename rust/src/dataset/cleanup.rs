@@ -30,10 +30,10 @@ use crate::{
 
 #[derive(Default)]
 struct InvalidFiles {
-    unref_data_paths: HashSet<String>,
-    unref_delete_paths: HashSet<String>,
+    unref_data_paths: HashSet<Path>,
+    unref_delete_paths: HashSet<Path>,
     unref_index_uuids: HashSet<String>,
-    old_manifest_paths: Vec<String>,
+    old_manifest_paths: Vec<Path>,
 }
 
 impl InvalidFiles {
@@ -48,14 +48,14 @@ impl InvalidFiles {
 }
 
 impl InvalidFiles {
-    fn finish(self, dataset: &Dataset) -> (Vec<String>, Vec<String>) {
+    fn finish(self, dataset: &Dataset) -> (Vec<Path>, Vec<Path>) {
         let mut all_paths = self.old_manifest_paths;
         all_paths.extend(self.unref_data_paths);
         all_paths.extend(self.unref_delete_paths);
         let all_dirs = Vec::from_iter(
             self.unref_index_uuids
                 .into_iter()
-                .map(|uuid| index_dir(dataset, &uuid).to_string()),
+                .map(|uuid| index_dir(dataset, &uuid)),
         );
         (all_paths, all_dirs)
     }
@@ -63,10 +63,10 @@ impl InvalidFiles {
 
 #[derive(Default)]
 struct FilesList {
-    data_file_paths: Vec<String>,
-    manifest_file_paths: Vec<String>,
+    data_file_paths: Vec<Path>,
+    manifest_file_paths: Vec<Path>,
     index_uuids: HashSet<String>,
-    delete_file_paths: Vec<String>,
+    delete_file_paths: Vec<Path>,
 }
 
 fn join_paths(base: &Path, child: &Path) -> Path {
@@ -149,7 +149,7 @@ impl<'a> CleanupTask<'a> {
 
     async fn process_manifest_file(
         &self,
-        path: &String,
+        path: &Path,
         invalid_files: &mut InvalidFiles,
         has_valid_manifest: &mut bool,
     ) -> Result<bool> {
@@ -188,16 +188,14 @@ impl<'a> CleanupTask<'a> {
     async fn process_valid_manifest(
         &self,
         manifest: &Manifest,
-        manifest_path: &str,
+        manifest_path: &Path,
         invalid_files: &mut InvalidFiles,
     ) -> Result<()> {
         for fragment in manifest.fragments.iter() {
             for file in fragment.files.iter() {
                 let full_data_path = self.dataset.data_dir().child(file.path.as_str());
                 let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
-                invalid_files
-                    .unref_data_paths
-                    .remove(relative_data_path.as_ref());
+                invalid_files.unref_data_paths.remove(&relative_data_path);
             }
             let delpath = fragment
                 .deletion_file
@@ -205,12 +203,10 @@ impl<'a> CleanupTask<'a> {
                 .map(|delfile| deletion_file_path(&self.dataset.base, fragment.id, delfile));
             if delpath.is_some() {
                 let relative_path = remove_prefix(&delpath.unwrap(), &self.dataset.base);
-                invalid_files
-                    .unref_delete_paths
-                    .remove(relative_path.as_ref());
+                invalid_files.unref_delete_paths.remove(&relative_path);
             }
         }
-        let full_path = join_paths(&self.dataset.base, &Path::from(manifest_path));
+        let full_path = join_paths(&self.dataset.base, &manifest_path);
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &full_path, manifest).await?;
         for index in indexes {
@@ -237,32 +233,24 @@ impl<'a> CleanupTask<'a> {
         match path.extension() {
             Some("lance") => {
                 if relative_path.as_ref().starts_with("data") {
-                    files_list
-                        .data_file_paths
-                        .push(relative_path.as_ref().to_string());
+                    files_list.data_file_paths.push(relative_path);
                 }
             }
             Some("manifest") => {
                 // We intentionally ignore _latest.manifest.  We should never delete
                 // it and we can assume that it is a clone of one of the _versions/... files
                 if relative_path.as_ref().starts_with("_versions") {
-                    files_list
-                        .manifest_file_paths
-                        .push(relative_path.as_ref().to_string())
+                    files_list.manifest_file_paths.push(relative_path)
                 }
             }
             Some("arrow") => {
                 if relative_path.as_ref().starts_with("_deletions") {
-                    files_list
-                        .delete_file_paths
-                        .push(relative_path.as_ref().to_string());
+                    files_list.delete_file_paths.push(relative_path);
                 }
             }
             Some("bin") => {
                 if relative_path.as_ref().starts_with("_deletions") {
-                    files_list
-                        .delete_file_paths
-                        .push(relative_path.as_ref().to_string());
+                    files_list.delete_file_paths.push(relative_path);
                 }
             }
             _ => (),
@@ -339,7 +327,7 @@ mod tests {
         // This is a temporary directory that will be deleted when the fixture
         // is dropped
         _tmpdir: TempDir,
-        tmpdir_str: String,
+        tmpdir_str: Path,
         mock_store: Arc<MockObjectStore>,
         pub clock: MockClock<'a>,
     }
@@ -356,14 +344,14 @@ mod tests {
             }
             Ok(Self {
                 _tmpdir: tmpdir,
-                tmpdir_str: maybe_tmpdir_str.unwrap(),
+                tmpdir_str: Path::parse(maybe_tmpdir_str.unwrap())?,
                 mock_store: Arc::new(MockObjectStore::new()),
                 clock: MockClock::new(),
             })
         }
 
         fn dataset_uri(&self) -> String {
-            format!("file://{}/my_db", self.tmpdir_str)
+            format!("file:///{}/my_db", self.tmpdir_str)
         }
 
         fn os_params(&self) -> ObjectStoreParams {
