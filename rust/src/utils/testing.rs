@@ -61,6 +61,8 @@ pub fn generate_random_array(n: usize) -> Float32Array {
     )
 }
 
+/// Asserts that the expression returns an error and the error, when converted to
+/// a string, contains the given substring.
 macro_rules! assert_err_containing {
     ($expr: expr, $message: expr) => {
         match $expr {
@@ -80,37 +82,46 @@ macro_rules! assert_err_containing {
 
 pub(crate) use assert_err_containing;
 
+/// A policy function takes in the name of the operation (e.g. "put") and the location
+/// that is being accessed / modified and returns an optional error.
+type PolicyFn = fn(&str, &Path) -> Result<()>;
+
+/// A policy container, meant to be shared between test code and the proxy object store.
+///
+/// This container allows you to configure policies that should apply to the proxied calls.
+///
+/// Typically, you would use this to simulate I/O errors.
+///
+/// Currently, for simplicity, we only proxy calls that involve some kind of path.  Calls
+/// to copy functions, which have a src and dst, will provide the source to the policy
 #[derive(Debug)]
 pub(crate) struct ProxyObjectStorePolicy {
-    before_policies: HashMap<String, fn(&str, &Path) -> Result<()>>,
-    after_policies: HashMap<String, fn(&str, &Path) -> Result<()>>,
+    /// Policies which run before a method is invoked.  If the policy returns
+    /// an error then the target method will not be invoked and the error will
+    /// be returned instead.
+    before_policies: HashMap<String, PolicyFn>,
 }
 
 impl ProxyObjectStorePolicy {
     pub fn new() -> Self {
         Self {
             before_policies: HashMap::new(),
-            after_policies: HashMap::new(),
         }
     }
 
+    /// Set a new policy with the given name
+    ///
+    /// The name can be used to later remove this policy
     pub fn set_before_policy(&mut self, name: &str, policy: fn(&str, &Path) -> Result<()>) {
         self.before_policies.insert(name.to_string(), policy);
     }
-
-    pub fn set_after_policy(&mut self, name: &str, policy: fn(&str, &Path) -> Result<()>) {
-        self.after_policies.insert(name.to_string(), policy);
-    }
-
-    pub fn clear_before_policy(&mut self, name: &str) {
-        self.before_policies.remove(name);
-    }
-
-    pub fn clear_after_policy(&mut self, name: &str) {
-        self.after_policies.remove(name);
-    }
 }
 
+/// A proxy object store
+///
+/// This store wraps another object store and applies the given policy to all calls
+/// made to the underlying store.  This can be used to simulate failures or, perhaps
+/// in the future, to mock out results or provide other fine-grained control.
 #[derive(Debug)]
 pub(crate) struct ProxyObjectStore {
     target: Arc<dyn ObjectStore>,
@@ -135,17 +146,6 @@ impl ProxyObjectStore {
         }
         Ok(())
     }
-
-    fn after_method(&self, method: &str, location: &Path) -> OSResult<()> {
-        let policy = self.policy.lock().unwrap();
-        for policy in policy.after_policies.values() {
-            policy(method, location).map_err(|err| OSError::Generic {
-                store: "ProxyObjectStore::after",
-                source: Box::new(err),
-            })?;
-        }
-        Ok(())
-    }
 }
 
 impl std::fmt::Display for ProxyObjectStore {
@@ -158,9 +158,7 @@ impl std::fmt::Display for ProxyObjectStore {
 impl ObjectStore for ProxyObjectStore {
     async fn put(&self, location: &Path, bytes: Bytes) -> OSResult<()> {
         self.before_method("put", location)?;
-        let result = self.target.put(location, bytes).await;
-        self.after_method("put", location)?;
-        result
+        self.target.put(location, bytes).await
     }
 
     async fn put_multipart(
@@ -168,58 +166,42 @@ impl ObjectStore for ProxyObjectStore {
         location: &Path,
     ) -> OSResult<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
         self.before_method("put_multipart", location)?;
-        let result = self.target.put_multipart(location).await;
-        self.after_method("put_multipart", location)?;
-        result
+        self.target.put_multipart(location).await
     }
 
     async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> OSResult<()> {
         self.before_method("abort_multipart", location)?;
-        let result = self.target.abort_multipart(location, multipart_id).await;
-        self.after_method("abort_multipart", location)?;
-        result
+        self.target.abort_multipart(location, multipart_id).await
     }
 
     async fn append(&self, location: &Path) -> OSResult<Box<dyn AsyncWrite + Unpin + Send>> {
         self.before_method("append", location)?;
-        let result = self.target.append(location).await;
-        self.after_method("append", location)?;
-        result
+        self.target.append(location).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         self.before_method("get_opts", location)?;
-        let result = self.target.get_opts(location, options).await;
-        self.after_method("get_opts", location)?;
-        result
+        self.target.get_opts(location, options).await
     }
 
     async fn get_range(&self, location: &Path, range: Range<usize>) -> OSResult<Bytes> {
         self.before_method("get_range", location)?;
-        let result = self.target.get_range(location, range).await;
-        self.after_method("get_range", location)?;
-        result
+        self.target.get_range(location, range).await
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> OSResult<Vec<Bytes>> {
         self.before_method("get_ranges", location)?;
-        let result = self.target.get_ranges(location, ranges).await;
-        self.after_method("get_ranges", location)?;
-        result
+        self.target.get_ranges(location, ranges).await
     }
 
     async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
         self.before_method("head", location)?;
-        let result = self.target.head(location).await;
-        self.after_method("head", location)?;
-        result
+        self.target.head(location).await
     }
 
     async fn delete(&self, location: &Path) -> OSResult<()> {
         self.before_method("delete", location)?;
-        let result = self.target.delete(location).await;
-        self.after_method("delete", location)?;
-        result
+        self.target.delete(location).await
     }
 
     async fn list(&self, prefix: Option<&Path>) -> OSResult<BoxStream<'_, OSResult<ObjectMeta>>> {
@@ -232,23 +214,17 @@ impl ObjectStore for ProxyObjectStore {
 
     async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.before_method("copy", from)?;
-        let result = self.target.copy(from, to).await;
-        self.after_method("copy", from)?;
-        result
+        self.target.copy(from, to).await
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.before_method("rename", from)?;
-        let result = self.target.rename(from, to).await;
-        self.after_method("rename", from)?;
-        result
+        self.target.rename(from, to).await
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.before_method("copy_if_not_exists", from)?;
-        let result = self.target.copy_if_not_exists(from, to).await;
-        self.after_method("copy_if_not_exists", from)?;
-        result
+        self.target.copy_if_not_exists(from, to).await
     }
 }
 
@@ -257,17 +233,23 @@ impl ObjectStore for ProxyObjectStore {
 //
 // By using MockClock below (which wraps mock_instant::MockClock), we can prevent this from
 // happening, though there is a performance hit as this will prevent some potential test
-// parallelism.
+// parallelism in a rather negative way (blocking).
 static CLOCK_MUTEX: Mutex<()> = Mutex::new(());
 pub struct MockClock<'a> {
     _guard: MutexGuard<'a, ()>,
 }
 
-impl<'a> MockClock<'a> {
-    pub fn new() -> Self {
+impl Default for MockClock<'_> {
+    fn default() -> Self {
         Self {
             _guard: CLOCK_MUTEX.lock().unwrap(),
         }
+    }
+}
+
+impl<'a> MockClock<'a> {
+    pub fn new() -> Self {
+        Default::default()
     }
 
     pub fn set_system_time(&self, time: Duration) {

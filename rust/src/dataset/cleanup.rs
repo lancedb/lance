@@ -37,7 +37,7 @@ struct InvalidFiles {
 }
 
 impl InvalidFiles {
-    fn new(all_files: &FilesList) -> InvalidFiles {
+    fn new(all_files: &FilesList) -> Self {
         Self {
             unref_data_paths: HashSet::from_iter(all_files.data_file_paths.iter().cloned()),
             unref_delete_paths: HashSet::from_iter(all_files.delete_file_paths.iter().cloned()),
@@ -80,7 +80,7 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
     if relative_parts.is_none() {
         return path.clone();
     }
-    return Path::from_iter(relative_parts.unwrap());
+    Path::from_iter(relative_parts.unwrap())
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +123,7 @@ impl<'a> CleanupTask<'a> {
         }
         // For paths we get relative paths.  For index dirs we get fully qualified
         // paths.
-        let (paths_to_del, dirs_to_del) = invalid_files.finish(&self.dataset);
+        let (paths_to_del, dirs_to_del) = invalid_files.finish(self.dataset);
         for path in &paths_to_del {
             let full_path = join_paths(&self.dataset.base, &Path::parse(path)?);
             self.dataset.object_store.remove(full_path).await?;
@@ -188,7 +188,7 @@ impl<'a> CleanupTask<'a> {
     async fn process_valid_manifest(
         &self,
         manifest: &Manifest,
-        manifest_path: &String,
+        manifest_path: &str,
         invalid_files: &mut InvalidFiles,
     ) -> Result<()> {
         for fragment in manifest.fragments.iter() {
@@ -210,7 +210,7 @@ impl<'a> CleanupTask<'a> {
                     .remove(relative_path.as_ref());
             }
         }
-        let full_path = join_paths(&self.dataset.base, &Path::from(manifest_path.as_str()));
+        let full_path = join_paths(&self.dataset.base, &Path::from(manifest_path));
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &full_path, manifest).await?;
         for index in indexes {
@@ -221,17 +221,14 @@ impl<'a> CleanupTask<'a> {
     }
 
     fn discover_path(&mut self, path: &Path, files_list: &mut FilesList) -> Result<()> {
-        let relative_path = remove_prefix(&path, &self.dataset.base);
+        let relative_path = remove_prefix(path, &self.dataset.base);
         if relative_path.as_ref().starts_with("_indices") {
             // For indices we just grab the UUID because we want to delete the entire
             // folder if we determine an index is expired.
-            match relative_path.parts().nth(1) {
-                Some(uuid) => {
-                    files_list
-                        .index_uuids
-                        .insert(Path::parse(uuid)?.as_ref().to_owned());
-                }
-                None => (),
+            if let Some(uuid) = relative_path.parts().nth(1) {
+                files_list
+                    .index_uuids
+                    .insert(Path::parse(uuid)?.as_ref().to_owned());
             }
             // Intentionally returning early here.  We don't want data files in index directories
             // to be treated like normal data files.
@@ -442,7 +439,7 @@ mod tests {
                 metric_type: MetricType::L2,
             });
             db.create_index(
-                &vec!["indexable"],
+                &["indexable"],
                 IndexType::Vector,
                 Some("some_index".to_owned()),
                 &*index_params,

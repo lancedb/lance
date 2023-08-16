@@ -41,13 +41,19 @@ pub struct IncrementingInt32 {
     step: i32,
 }
 
-impl IncrementingInt32 {
-    pub fn new() -> Self {
+impl Default for IncrementingInt32 {
+    fn default() -> Self {
         Self {
             name: None,
             current: 0,
             step: 1,
         }
+    }
+}
+
+impl IncrementingInt32 {
+    pub fn new() -> Self {
+        Default::default()
     }
 
     pub fn start(mut self, start: i32) -> Self {
@@ -91,13 +97,19 @@ pub struct RandomVector {
     data_type: DataType,
 }
 
-impl RandomVector {
-    pub fn new() -> Self {
+impl Default for RandomVector {
+    fn default() -> Self {
         Self {
             name: None,
             vec_width: 4,
             data_type: fixed_size_list_type(4, DataType::Float32),
         }
+    }
+}
+
+impl RandomVector {
+    pub fn new() -> Self {
+        Default::default()
     }
 
     pub fn vec_width(mut self, vec_width: i32) -> Self {
@@ -132,15 +144,14 @@ impl ArrayGenerator for RandomVector {
     }
 }
 
+#[derive(Default)]
 pub struct BatchGenerator {
     generators: Vec<Box<dyn ArrayGenerator>>,
 }
 
 impl BatchGenerator {
     pub fn new() -> Self {
-        Self {
-            generators: Vec::new(),
-        }
+        Default::default()
     }
 
     pub fn col(mut self, gen: Box<dyn ArrayGenerator>) -> Self {

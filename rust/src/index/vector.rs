@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use arrow_array::Float32Array;
 use object_store::path::Path;
-use uuid::Uuid;
 
 pub mod diskann;
 pub mod flat;

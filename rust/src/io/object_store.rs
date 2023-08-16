@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_credential_types::provider::ProvideCredentials;
 use futures::stream::BoxStream;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use object_store::aws::AwsCredential as ObjectStoreAwsCredential;
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
@@ -437,6 +437,7 @@ impl ObjectStore {
             .collect())
     }
 
+    /// Read all files (start from base directory) recursively
     pub async fn read_dir_all(
         &self,
         dir_path: impl Into<&Path>,
@@ -447,6 +448,7 @@ impl ObjectStore {
             .boxed())
     }
 
+    /// Remove a single file
     pub async fn remove(&self, path: impl Into<Path>) -> Result<()> {
         let path = path.into();
         self.inner.delete(&path).await?;
