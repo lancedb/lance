@@ -92,6 +92,7 @@ pub enum Operation {
     Overwrite {
         fragments: Vec<Fragment>,
         schema: Schema,
+        indices: Vec<Index>,
     },
     /// A new index has been created.
     CreateIndex {
@@ -320,12 +321,16 @@ impl Transaction {
                     }
                 });
             }
-            Operation::Overwrite { ref fragments, .. } => {
+            Operation::Overwrite {
+                ref fragments,
+                ref indices,
+                ..
+            } => {
                 final_fragments.extend(Self::fragments_with_ids(
                     fragments.clone(),
                     &mut fragment_id,
                 ));
-                final_indices = Vec::new();
+                final_indices = indices.clone();
             }
             Operation::Rewrite {
                 ref new_fragments, ..
@@ -391,10 +396,12 @@ impl TryFrom<&pb::Transaction> for Transaction {
             },
             Some(pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
                 fragments,
+                indices,
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
             })) => Operation::Overwrite {
                 fragments: fragments.iter().map(Fragment::from).collect(),
+                indices: indices.iter().map(Index::try_from).collect::<Result<_>>()?,
                 schema: Schema::from(schema),
             },
             Some(pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
@@ -459,9 +466,14 @@ impl From<&Transaction> for pb::Transaction {
                 deleted_fragment_ids: deleted_fragment_ids.clone(),
                 predicate: predicate.clone(),
             }),
-            Operation::Overwrite { fragments, schema } => {
+            Operation::Overwrite {
+                fragments,
+                indices,
+                schema,
+            } => {
                 pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                    indices: indices.iter().map(IndexMetadata::from).collect(),
                     schema: schema.into(),
                     schema_metadata: Default::default(), // TODO: handle metadata
                 })
@@ -525,6 +537,7 @@ mod tests {
             },
             Operation::Overwrite {
                 fragments: vec![fragment0.clone(), fragment2.clone()],
+                indices: Vec::new(),
                 schema: Schema::default(),
             },
             Operation::Rewrite {
@@ -567,6 +580,7 @@ mod tests {
             (
                 Operation::Overwrite {
                     fragments: vec![fragment0.clone(), fragment2.clone()],
+                    indices: Vec::new(),
                     schema: Schema::default(),
                 },
                 // No conflicts: overwrite can always happen since it doesn't

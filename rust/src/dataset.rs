@@ -386,7 +386,11 @@ impl Dataset {
             write_fragments(object_store.clone(), &base, &schema, stream, params.clone()).await?;
 
         let operation = match params.mode {
-            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite { schema, fragments },
+            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
+                schema,
+                indices: Vec::new(),
+                fragments,
+            },
             WriteMode::Append => Operation::Append { fragments },
         };
 
@@ -500,24 +504,36 @@ impl Dataset {
         self.append_impl(batches, params).await
     }
 
+    async fn latest_manifest(&self) -> Result<Manifest> {
+        read_manifest(&self.object_store, &latest_manifest_path(&self.base)).await
+    }
+
     /// Restore the currently checked out version of the dataset as the latest version.
     ///
     /// Currently, `write_params` is just used to get additional store params.
     /// Other options are ignored.
     pub async fn restore(&mut self, write_params: Option<WriteParams>) -> Result<()> {
-        // TODO: once we merge conflict resolution, we should be able to remove
-        // this and just rely on the commit process.
-        let new_version = self.latest_manifest().await?.version + 1;
         let indices = self.load_indices().await?;
+
+        let latest_manifest = self.latest_manifest().await?;
+        let latest_version = latest_manifest.version;
 
         let mut manifest = Manifest::new_from_previous(
             &self.manifest,
             &self.manifest.schema,
             self.manifest.fragments.clone(),
         );
-        manifest.version = new_version;
+        manifest.version = latest_version + 1;
 
-        dbg!(&manifest.version);
+        let transaction = Transaction::new(
+            latest_version,
+            Operation::Overwrite {
+                fragments: (*manifest.fragments).clone(),
+                indices,
+                schema: manifest.schema,
+            },
+            None,
+        );
 
         let object_store =
             if let Some(store_params) = write_params.and_then(|params| params.store_params) {
@@ -526,16 +542,16 @@ impl Dataset {
                 self.object_store.clone()
             };
 
-        write_manifest_file(
-            object_store.as_ref(),
-            &self.base,
-            &mut manifest,
-            Some(indices),
-            Default::default(),
-        )
-        .await?;
-
-        self.manifest = Arc::new(manifest);
+        self.manifest = Arc::new(
+            commit_transaction(
+                &self,
+                &object_store,
+                &transaction,
+                &Default::default(),
+                &Default::default(),
+            )
+            .await?,
+        );
 
         Ok(())
     }

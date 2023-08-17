@@ -422,7 +422,7 @@ pub(crate) async fn commit_transaction(
             write_config,
         )?;
 
-        debug_assert_eq!(manifest.version, target_version);
+        manifest.version = target_version;
 
         // Try to commit the manifest
         let result = write_manifest_file(

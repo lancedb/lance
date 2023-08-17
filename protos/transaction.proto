@@ -71,10 +71,15 @@ message Transaction {
     //
     // Fragment IDs are not yet assigned.
     repeated DataFragment fragments = 1;
+    // The new indices
+    //
+    // Currently only provided when overwriting with an
+    // old version of the dataset.
+    repeated IndexMetadata indices = 2;
     // The new schema
-    repeated Field schema = 2;
+    repeated Field schema = 3;
     // Schema metadata.
-    map<string, bytes> schema_metadata = 3;
+    map<string, bytes> schema_metadata = 4;
   }
 
   // Add a new secondary index.
