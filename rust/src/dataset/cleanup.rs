@@ -327,7 +327,7 @@ mod tests {
         // This is a temporary directory that will be deleted when the fixture
         // is dropped
         _tmpdir: TempDir,
-        tmpdir_str: Path,
+        dataset_path: String,
         mock_store: Arc<MockObjectStore>,
         pub clock: MockClock<'a>,
     }
@@ -335,23 +335,16 @@ mod tests {
     impl<'a> MockDatasetFixture<'a> {
         fn try_new() -> Result<Self> {
             let tmpdir = tempdir()?;
-            let maybe_tmpdir_str = tmpdir.path().to_owned().into_os_string().into_string();
-            if maybe_tmpdir_str.is_err() {
-                return Err(Error::invalid_input(format!(
-                    "Temporary directory {:?} could not be converted to string",
-                    tmpdir.path()
-                )));
-            }
+            // let tmpdir_uri = to_obj_store_uri(tmpdir.path())?;
+            let tmpdir_path = tmpdir.path().as_os_str().to_str().unwrap().to_owned();
+            println!("A={tmpdir:?}");
+            println!("B={tmpdir_path:?}");
             Ok(Self {
                 _tmpdir: tmpdir,
-                tmpdir_str: Path::parse(maybe_tmpdir_str.unwrap())?,
+                dataset_path: format!("{}/my_db", tmpdir_path),
                 mock_store: Arc::new(MockObjectStore::new()),
                 clock: MockClock::new(),
             })
-        }
-
-        fn dataset_uri(&self) -> String {
-            format!("file:///{}/my_db", self.tmpdir_str)
         }
 
         fn os_params(&self) -> ObjectStoreParams {
@@ -368,7 +361,7 @@ mod tests {
         ) -> Result<()> {
             Dataset::write(
                 data,
-                &self.dataset_uri(),
+                &self.dataset_path,
                 Some(WriteParams {
                     store_params: Some(self.os_params()),
                     mode,
@@ -459,7 +452,7 @@ mod tests {
         async fn open(&self) -> Result<Box<Dataset>> {
             Ok(Box::new(
                 Dataset::open_with_params(
-                    &self.dataset_uri(),
+                    &self.dataset_path,
                     &ReadParams {
                         store_options: Some(self.os_params()),
                         ..Default::default()
@@ -471,7 +464,7 @@ mod tests {
 
         async fn count_files(&self) -> Result<FileCounts> {
             let (os, path) =
-                ObjectStore::from_uri_and_params(&self.dataset_uri(), self.os_params()).await?;
+                ObjectStore::from_uri_and_params(&self.dataset_path, self.os_params()).await?;
             let mut file_stream = os.read_dir_all(&path).await?;
             let mut file_count = FileCounts {
                 num_data_files: 0,
@@ -500,7 +493,7 @@ mod tests {
 
         async fn debug_print_files(&self) -> Result<()> {
             let (os, path) =
-                ObjectStore::from_uri_and_params(&self.dataset_uri(), self.os_params()).await?;
+                ObjectStore::from_uri_and_params(&self.dataset_path, self.os_params()).await?;
             let mut file_stream = os.read_dir_all(&path).await?;
             while let Some(path) = file_stream.try_next().await.unwrap() {
                 println!("File: {:?}", path);
