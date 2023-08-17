@@ -544,7 +544,7 @@ impl Dataset {
 
         self.manifest = Arc::new(
             commit_transaction(
-                &self,
+                self,
                 &object_store,
                 &transaction,
                 &Default::default(),
