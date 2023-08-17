@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::iter::Sum;
+
 use arrow_arith::aggregate::sum;
 use arrow_arith::arithmetic::multiply;
-use arrow_array::cast::as_primitive_array;
-use arrow_array::types::{Float16Type, Float32Type};
-use arrow_array::{Float16Array, Float32Array};
+use arrow_array::{
+    types::{Float16Type, Float32Type, Float64Type},
+    ArrowNumericType, Float16Array, Float32Array, NativeAdapter, PrimitiveArray,
+};
 use criterion::{criterion_group, criterion_main, Criterion};
+use num_traits::{real::Real, FromPrimitive};
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -26,61 +30,79 @@ use lance::linalg::dot::{dot, Dot};
 use lance::utils::testing::generate_random_array_with_seed;
 
 #[inline]
-fn dot_arrow_artiy(x: &Float32Array, y: &Float32Array) -> f32 {
+fn dot_arrow_artiy<T: ArrowNumericType>(x: &PrimitiveArray<T>, y: &PrimitiveArray<T>) -> T::Native {
     let m = multiply(x, y).unwrap();
     sum(&m).unwrap()
+}
+
+fn run_bench<T: ArrowNumericType>(c: &mut Criterion)
+where
+    T::Native: Real + FromPrimitive + Sum,
+    NativeAdapter<T>: From<T::Native>,
+{
+    const DIMENSION: usize = 1024;
+    const TOTAL: usize = 1024 * 1024; // 1M vectors
+
+    let key: PrimitiveArray<T> = generate_random_array_with_seed(DIMENSION, [0; 32]);
+    // 1M of 1024 D vectors
+    let target: PrimitiveArray<T> = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
+
+    let type_name = std::any::type_name::<T::Native>();
+
+    c.bench_function(format!("Dot({type_name}, arrow_artiy)").as_str(), |b| {
+        b.iter(|| unsafe {
+            PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+                let arr = target.slice(idx * DIMENSION, DIMENSION);
+                Some(dot_arrow_artiy(&key, &arr))
+            }))
+        });
+    });
+
+    c.bench_function(format!("Dot({type_name})").as_str(), |b| {
+        let x = key.values();
+        b.iter(|| unsafe {
+            PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+                let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
+                Some(dot(x, y))
+            }))
+        });
+    });
+
+    // TODO: SIMD needs generic specialization
 }
 
 fn bench_distance(c: &mut Criterion) {
     const DIMENSION: usize = 1024;
     const TOTAL: usize = 1024 * 1024; // 1M vectors
 
-    let key = generate_random_array_with_seed::<Float32Type>(DIMENSION, [0; 32]);
-    // 1M of 1024 D vectors. 4GB in memory.
-    let target = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, [42; 32]);
-
-    let f16_key = generate_random_array_with_seed::<Float16Type>(DIMENSION, [0; 32]);
-    // 1M of 1024 D float16 floats, 2GB in memory
-    let f16_target = generate_random_array_with_seed::<Float16Type>(TOTAL * DIMENSION, [42; 32]);
-
-    c.bench_function("Dot(f32, arrow_artiy)", |b| {
+    run_bench::<Float16Type>(c);
+    c.bench_function("Dot(f16, SIMD)", |b| {
+        let key: Float16Array = generate_random_array_with_seed(DIMENSION, [0; 32]);
+        // 1M of 1024 D vectors
+        let target: Float16Array = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
         b.iter(|| unsafe {
-            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
-                let arr = target.slice(idx * DIMENSION, DIMENSION);
-                Some(dot_arrow_artiy(&key, as_primitive_array(&arr)))
-            }))
-        });
-    });
-
-    c.bench_function("Dot(f32)", |b| {
-        let x = key.values();
-        b.iter(|| unsafe {
-            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+            let x = key.values().as_ref();
+            Float16Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                Some(dot(x, y))
+                Some(x.dot(y))
             }))
         });
     });
+    run_bench::<Float32Type>(c);
 
     c.bench_function("Dot(f32, SIMD)", |b| {
-        let x = key.values();
+        let key: Float32Array = generate_random_array_with_seed(DIMENSION, [0; 32]);
+        // 1M of 1024 D vectors
+        let target: Float32Array = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
         b.iter(|| unsafe {
+            let x = key.values().as_ref();
             Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
                 Some(x.dot(y))
             }))
         });
     });
-
-    c.bench_function("Dot(f16)", |b| {
-        let x = f16_key.values();
-        b.iter(|| unsafe {
-            Float16Array::from_trusted_len_iter((0..f16_target.len() / DIMENSION).map(|idx| {
-                let y = f16_target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                Some(dot(x, y))
-            }))
-        });
-    });
+    run_bench::<Float64Type>(c);
 }
 
 #[cfg(target_os = "linux")]
