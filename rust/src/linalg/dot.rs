@@ -128,14 +128,14 @@ mod tests {
         let x: Vec<f32> = (0..20).map(|v| v as f32).collect();
         let y: Vec<f32> = (100..120).map(|v| v as f32).collect();
 
-        assert_eq!((&x).dot(&y), dot(&x, &y));
+        assert_eq!(x.dot(&y), dot(&x, &y));
 
         let x: Vec<f16> = (0..20).map(|v| f16::from_i32(v).unwrap()).collect();
         let y: Vec<f16> = (100..120).map(|v| f16::from_i32(v).unwrap()).collect();
-        assert_eq!((&x).dot(&y), dot(&x, &y));
+        assert_eq!(x.dot(&y), dot(&x, &y));
 
         let x: Vec<f64> = (20..40).map(|v| f64::from_i32(v).unwrap()).collect();
         let y: Vec<f64> = (120..140).map(|v| f64::from_i32(v).unwrap()).collect();
-        assert_eq!((&x).dot(&y), dot(&x, &y));
+        assert_eq!(x.dot(&y), dot(&x, &y));
     }
 }
