@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use arrow_array::Float32Array;
 use criterion::{criterion_group, criterion_main, Criterion};
 
 use lance::linalg::cosine::cosine_distance_batch;
@@ -24,9 +25,9 @@ fn bench_distance(c: &mut Criterion) {
     const DIMENSION: usize = 1024;
     const TOTAL: usize = 1024 * 1024; // 1M vectors
 
-    let key = generate_random_array_with_seed(DIMENSION, [0; 32]);
+    let key: Float32Array = generate_random_array_with_seed(DIMENSION, [0; 32]);
     // 1M of 1024 D vectors. 4GB in memory.
-    let target = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
+    let target: Float32Array = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
 
     c.bench_function("Cosine(simd)", |b| {
         b.iter(|| {
@@ -34,9 +35,9 @@ fn bench_distance(c: &mut Criterion) {
         })
     });
 
-    let key = generate_random_array_with_seed(DIMENSION, [5; 32]);
+    let key: Float32Array = generate_random_array_with_seed(DIMENSION, [5; 32]);
     // 1M of 1024 D vectors. 4GB in memory.
-    let target = generate_random_array_with_seed(TOTAL * DIMENSION, [7; 32]);
+    let target: Float32Array = generate_random_array_with_seed(TOTAL * DIMENSION, [7; 32]);
 
     c.bench_function("Cosine(simd) second rng seed", |b| {
         b.iter(|| {

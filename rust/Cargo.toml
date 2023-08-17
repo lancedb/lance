@@ -113,6 +113,10 @@ name = "l2"
 harness = false
 
 [[bench]]
+name = "dot"
+harness = false
+
+[[bench]]
 name = "scan"
 harness = false
 
