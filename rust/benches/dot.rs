@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use arrow_arith::aggregate::sum;
-use arrow_arith::arithmetic::{multiply, subtract};
+use arrow_arith::arithmetic::multiply;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::types::{Float16Type, Float32Type};
 use arrow_array::{Float16Array, Float32Array};
@@ -22,7 +22,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance::linalg::dot::dot;
+use lance::linalg::dot::{dot, Dot};
 use lance::utils::testing::generate_random_array_with_seed;
 
 #[inline]
@@ -40,7 +40,8 @@ fn bench_distance(c: &mut Criterion) {
     let target = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, [42; 32]);
 
     let f16_key = generate_random_array_with_seed::<Float16Type>(DIMENSION, [0; 32]);
-    let f16_target = generate_random_array_with_seed::<Float16Type>(DIMENSION, [42; 32]);
+    // 1M of 1024 D float16 floats, 2GB in memory
+    let f16_target = generate_random_array_with_seed::<Float16Type>(TOTAL * DIMENSION, [42; 32]);
 
     c.bench_function("Dot(f32, arrow_artiy)", |b| {
         b.iter(|| unsafe {
@@ -61,10 +62,20 @@ fn bench_distance(c: &mut Criterion) {
         });
     });
 
+    c.bench_function("Dot(f32, SIMD)", |b| {
+        let x = key.values();
+        b.iter(|| unsafe {
+            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+                let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
+                Some(x.dot(y))
+            }))
+        });
+    });
+
     c.bench_function("Dot(f16)", |b| {
         let x = f16_key.values();
         b.iter(|| unsafe {
-            Float16Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+            Float16Array::from_trusted_len_iter((0..f16_target.len() / DIMENSION).map(|idx| {
                 let y = f16_target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
                 Some(dot(x, y))
             }))

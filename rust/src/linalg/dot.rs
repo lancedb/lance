@@ -21,11 +21,13 @@ use arrow_array::Float32Array;
 use half::{bf16, f16};
 use num_traits::real::Real;
 
+/// Naive implemenetation of dot product.
 #[inline]
 pub fn dot<T: Real + Sum>(from: &[T], to: &[T]) -> T {
     from.iter().zip(to.iter()).map(|(x, y)| x.mul(*y)).sum()
 }
 
+/// Dot product
 pub trait Dot {
     type Output;
 
@@ -53,6 +55,13 @@ impl Dot for [f32] {
     type Output = f32;
 
     fn dot(&self, other: &[f32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("fma") {
+                return x86_64::avx::dot_f32(&self, other);
+            }
+        }
+
         dot(self, other)
     }
 }
@@ -77,4 +86,33 @@ pub fn dot_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Flo
 
 pub fn dot_distance(from: &[f32], to: &[f32]) -> f32 {
     from.dot(to)
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86_64 {
+
+    pub mod avx {
+        use crate::linalg::x86_64::avx::*;
+        use std::arch::x86_64::*;
+
+        #[inline]
+        pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
+            let len = x.len() / 8 * 8;
+            let mut sum = unsafe {
+                let mut sums = _mm256_setzero_ps();
+                x.chunks_exact(8).zip(y.chunks_exact(8)).for_each(|(a, b)| {
+                    let x = _mm256_loadu_ps(a.as_ptr());
+                    let y = _mm256_loadu_ps(b.as_ptr());
+                    sums = _mm256_fmadd_ps(x, y, sums);
+                });
+                add_f32_register(sums)
+            };
+            sum += x[len..]
+                .iter()
+                .zip(y[len..].iter())
+                .map(|(a, b)| a * b)
+                .sum::<f32>();
+            sum
+        }
+    }
 }
