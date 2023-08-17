@@ -26,6 +26,7 @@ use num_traits::{real::Real, FromPrimitive};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
+use lance::arrow::bfloat16::BFloat16Array;
 use lance::linalg::dot::{dot, Dot};
 use lance::utils::testing::generate_random_array_with_seed;
 
@@ -103,6 +104,18 @@ fn bench_distance(c: &mut Criterion) {
         });
     });
     run_bench::<Float64Type>(c);
+
+    c.bench_function(format!("Dot({bf16})").as_str(), |b| {
+        let key: BFloat16Array = generate_random_array_with_seed(DIMENSION, [0; 32]);
+
+        let x = key.values();
+        b.iter(|| unsafe {
+            PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+                let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
+                Some(dot(x, y))
+            }))
+        });
+    });
 }
 
 #[cfg(target_os = "linux")]
