@@ -58,7 +58,7 @@ impl Dot for [f32] {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("fma") {
-                return x86_64::avx::dot_f32(&self, other);
+                return x86_64::avx::dot_f32(self, other);
             }
         }
 
