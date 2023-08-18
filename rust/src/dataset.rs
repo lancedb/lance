@@ -386,11 +386,7 @@ impl Dataset {
             write_fragments(object_store.clone(), &base, &schema, stream, params.clone()).await?;
 
         let operation = match params.mode {
-            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
-                schema,
-                indices: Vec::new(),
-                fragments,
-            },
+            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite { schema, fragments },
             WriteMode::Append => Operation::Append { fragments },
         };
 
@@ -513,8 +509,6 @@ impl Dataset {
     /// Currently, `write_params` is just used to get additional store params.
     /// Other options are ignored.
     pub async fn restore(&mut self, write_params: Option<WriteParams>) -> Result<()> {
-        let indices = self.load_indices().await?;
-
         let latest_manifest = self.latest_manifest().await?;
         let latest_version = latest_manifest.version;
 
@@ -525,15 +519,7 @@ impl Dataset {
         );
         manifest.version = latest_version + 1;
 
-        let transaction = Transaction::new(
-            latest_version,
-            Operation::Overwrite {
-                fragments: (*manifest.fragments).clone(),
-                indices,
-                schema: manifest.schema,
-            },
-            None,
-        );
+        let transaction = Transaction::new(latest_version, Operation::Restore { manifest }, None);
 
         let object_store =
             if let Some(store_params) = write_params.and_then(|params| params.store_params) {

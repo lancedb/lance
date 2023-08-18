@@ -71,11 +71,6 @@ message Transaction {
     //
     // Fragment IDs are not yet assigned.
     repeated DataFragment fragments = 1;
-    // The new indices
-    //
-    // Currently only provided when overwriting with an
-    // old version of the dataset.
-    repeated IndexMetadata indices = 2;
     // The new schema
     repeated Field schema = 3;
     // Schema metadata.
@@ -112,6 +107,11 @@ message Transaction {
     map<string, bytes> schema_metadata = 3;
   }
 
+  // An operation that restores a dataset to a previous version.
+  message Restore {
+    Manifest manifest = 1;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -120,5 +120,6 @@ message Transaction {
     CreateIndex create_index = 103;
     Rewrite rewrite = 104;
     Merge merge = 105;
+    Restore restore = 106;
   }
 }

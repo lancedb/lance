@@ -92,7 +92,6 @@ pub enum Operation {
     Overwrite {
         fragments: Vec<Fragment>,
         schema: Schema,
-        indices: Vec<Index>,
     },
     /// A new index has been created.
     CreateIndex {
@@ -111,6 +110,8 @@ pub enum Operation {
         fragments: Vec<Fragment>,
         schema: Schema,
     },
+    /// Restore an old version of the database
+    Restore { manifest: Manifest },
 }
 
 impl Operation {
@@ -120,9 +121,10 @@ impl Operation {
     fn modified_fragment_ids(&self) -> Box<dyn Iterator<Item = u64> + '_> {
         match self {
             // These operations add new fragments or don't modify any.
-            Self::Append { .. } | Self::Overwrite { .. } | Self::CreateIndex { .. } => {
-                Box::new(std::iter::empty())
-            }
+            Self::Append { .. }
+            | Self::Overwrite { .. }
+            | Self::CreateIndex { .. }
+            | Self::Restore { .. } => Box::new(std::iter::empty()),
             Self::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
@@ -153,6 +155,7 @@ impl Operation {
             Self::CreateIndex { .. } => "CreateIndex",
             Self::Rewrite { .. } => "Rewrite",
             Self::Merge { .. } => "Merge",
+            Self::Restore { .. } => "Restore",
         }
     }
 }
@@ -201,8 +204,9 @@ impl Transaction {
                 }
                 _ => true,
             },
-            // Overwrite always succeeds
+            // Overwrite and Restore always succeed
             Operation::Overwrite { .. } => false,
+            Operation::Restore { .. } => false,
             Operation::CreateIndex { .. } => match &other.operation {
                 Operation::Append { .. } => false,
                 // Indices are identified by UUIDs, so they shouldn't conflict.
@@ -261,6 +265,13 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
     ) -> Result<(Manifest, Vec<Index>)> {
+        match self.operation {
+            Operation::Restore { ref manifest } => {
+                return Ok((manifest.clone(), Vec::new()));
+            }
+            _ => (),
+        }
+
         // Get the schema and the final fragment list
         let schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
@@ -321,16 +332,12 @@ impl Transaction {
                     }
                 });
             }
-            Operation::Overwrite {
-                ref fragments,
-                ref indices,
-                ..
-            } => {
+            Operation::Overwrite { ref fragments, .. } => {
                 final_fragments.extend(Self::fragments_with_ids(
                     fragments.clone(),
                     &mut fragment_id,
                 ));
-                final_indices = indices.clone();
+                final_indices = Vec::new();
             }
             Operation::Rewrite {
                 ref new_fragments, ..
@@ -351,6 +358,9 @@ impl Transaction {
             }
             Operation::Merge { ref fragments, .. } => {
                 final_fragments.extend(fragments.clone());
+            }
+            Operation::Restore { .. } => {
+                unreachable!()
             }
         };
 
@@ -396,12 +406,10 @@ impl TryFrom<&pb::Transaction> for Transaction {
             },
             Some(pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
                 fragments,
-                indices,
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
             })) => Operation::Overwrite {
                 fragments: fragments.iter().map(Fragment::from).collect(),
-                indices: indices.iter().map(Index::try_from).collect::<Result<_>>()?,
                 schema: Schema::from(schema),
             },
             Some(pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
@@ -427,6 +435,15 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 fragments: fragments.iter().map(Fragment::from).collect(),
                 schema: Schema::from(schema),
             },
+            Some(pb::transaction::Operation::Restore(pb::transaction::Restore { manifest })) => {
+                Operation::Restore {
+                    manifest: Manifest::from(
+                        manifest
+                            .clone()
+                            .ok_or(Error::invalid_input("transaction file missing manifest"))?,
+                    ),
+                }
+            }
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),
@@ -466,14 +483,9 @@ impl From<&Transaction> for pb::Transaction {
                 deleted_fragment_ids: deleted_fragment_ids.clone(),
                 predicate: predicate.clone(),
             }),
-            Operation::Overwrite {
-                fragments,
-                indices,
-                schema,
-            } => {
+            Operation::Overwrite { fragments, schema } => {
                 pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                    indices: indices.iter().map(IndexMetadata::from).collect(),
                     schema: schema.into(),
                     schema_metadata: Default::default(), // TODO: handle metadata
                 })
@@ -495,6 +507,11 @@ impl From<&Transaction> for pb::Transaction {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
                     schema: schema.into(),
                     schema_metadata: Default::default(), // TODO: handle metadata
+                })
+            }
+            Operation::Restore { manifest } => {
+                pb::transaction::Operation::Restore(pb::transaction::Restore {
+                    manifest: Some(pb::Manifest::from(manifest)),
                 })
             }
         };
@@ -537,7 +554,6 @@ mod tests {
             },
             Operation::Overwrite {
                 fragments: vec![fragment0.clone(), fragment2.clone()],
-                indices: Vec::new(),
                 schema: Schema::default(),
             },
             Operation::Rewrite {
@@ -580,7 +596,6 @@ mod tests {
             (
                 Operation::Overwrite {
                     fragments: vec![fragment0.clone(), fragment2.clone()],
-                    indices: Vec::new(),
                     schema: Schema::default(),
                 },
                 // No conflicts: overwrite can always happen since it doesn't
