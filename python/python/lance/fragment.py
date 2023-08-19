@@ -145,8 +145,8 @@ class LanceFragment(pa.dataset.Fragment):
             The URI of the dataset.
         fragment_id: int
             The ID of the fragment.
-        data: pa.Table
-            The data to write to this fragment.
+        data: pa.Table or pa.RecordBatchReader
+            The data to be written to the fragment.
         schema: pa.Schema, optional
             The schema of the data. If not specified, the schema will be inferred
             from the data.

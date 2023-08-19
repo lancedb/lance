@@ -31,6 +31,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use log::warn;
 use object_store::path::Path;
 
+pub mod chunker;
 mod feature_flags;
 pub mod fragment;
 mod hash_joiner;
@@ -47,10 +48,10 @@ use self::write::{reader_to_stream, write_fragments};
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{pb, Fragment, Index, Manifest};
-use crate::io::commit::{commit_new_dataset, commit_transaction, CommitError};
-use crate::io::object_store::ObjectStoreParams;
 use crate::io::{
+    commit::{commit_new_dataset, commit_transaction, CommitError},
     object_reader::{read_message, read_struct},
+    object_store::ObjectStoreParams,
     read_manifest, read_metadata_offset, write_manifest, ObjectStore,
 };
 use crate::session::Session;
