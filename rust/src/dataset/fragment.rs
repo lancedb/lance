@@ -1016,4 +1016,64 @@ mod tests {
             i += 1;
         }
     }
+
+    #[tokio::test]
+    async fn test_write_batch_size() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            true,
+        )]));
+
+        let in_memory_batch = 1024;
+        let batches: Vec<RecordBatch> = (0..10)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(
+                        i * in_memory_batch..(i + 1) * in_memory_batch,
+                    ))],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let batch_iter = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        let fragment = FileFragment::create(
+            test_uri,
+            10,
+            batch_iter,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let (object_store, base_path) = ObjectStore::from_uri(test_uri).await.unwrap();
+        let file_reader = FileReader::try_new_with_fragment(
+            &object_store,
+            &base_path
+                .child("data")
+                .child(fragment.files[0].path.as_str()),
+            10,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        for i in 0..file_reader.num_batches() - 1 {
+            assert_eq!(file_reader.num_rows_in_batch(i as i32), 100);
+        }
+        assert_eq!(
+            file_reader.num_rows_in_batch(file_reader.num_batches() as i32 - 1) as i32,
+            in_memory_batch * 10 % 100
+        );
+    }
 }
