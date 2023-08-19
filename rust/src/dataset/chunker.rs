@@ -21,7 +21,7 @@ use futures::{Stream, StreamExt};
 
 use crate::Result;
 
-/// Wraps a RecordBatchReader into an iterator of RecordBatch chunks of a given size.
+/// Wraps a [`RecordBatchReader`] into an iterator of RecordBatch chunks of a given size.
 /// This slices but does not copy any buffers.
 struct BatchReaderChunker {
     /// The inner stream

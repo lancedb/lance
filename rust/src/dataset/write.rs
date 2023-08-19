@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{RecordBatchReader};
+use arrow_array::RecordBatchReader;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -186,7 +186,7 @@ impl WriterGenerator {
 mod tests {
     use super::*;
 
-    use arrow_array::{RecordBatch, Int32Array};
+    use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Schema as ArrowSchema};
 
     #[tokio::test]

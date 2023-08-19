@@ -31,7 +31,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use log::warn;
 use object_store::path::Path;
 
-pub mod chunker;
+mod chunker;
 mod feature_flags;
 pub mod fragment;
 mod hash_joiner;
