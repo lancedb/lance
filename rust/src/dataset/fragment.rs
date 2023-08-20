@@ -82,7 +82,7 @@ impl FileFragment {
         let filename = format!("{}.lance", Uuid::new_v4());
         let fragment = Fragment::with_file(id as u64, &filename, &schema);
 
-        progress.begin(&fragment)?;
+        progress.begin(&fragment).await?;
 
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
 
@@ -97,7 +97,7 @@ impl FileFragment {
         // Params.max_rows_per_file is ignored in this case.
         writer.finish().await?;
 
-        progress.complete(&fragment)?;
+        progress.complete(&fragment).await?;
 
         Ok(fragment)
     }

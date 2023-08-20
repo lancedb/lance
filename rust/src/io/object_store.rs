@@ -31,7 +31,7 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::aws::AwsCredential as ObjectStoreAwsCredential;
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
-use tokio::sync::RwLock;
+use tokio::{io::AsyncWriteExt, sync::RwLock};
 use url::Url;
 
 use crate::error::{Error, Result};
@@ -409,6 +409,19 @@ impl ObjectStore {
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<ObjectWriter> {
         ObjectWriter::new(self, path).await
+    }
+
+    /// A helper function to create a file and write content to it.
+    ///
+    pub async fn put(&self, path: &Path, content: &[u8]) -> Result<()> {
+        let mut writer = self.create(path).await?;
+        writer.write_all(content).await?;
+        writer.shutdown().await
+    }
+
+    pub async fn delete(&self, path: &Path) -> Result<()> {
+        self.inner.delete(path).await?;
+        Ok(())
     }
 
     /// Read a directory (start from base directory) and returns all sub-paths in the directory.

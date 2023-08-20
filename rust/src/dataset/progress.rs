@@ -12,19 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use async_trait::async_trait;
+use object_store::path::Path;
+
 use crate::format::Fragment;
 use crate::io::ObjectStore;
 use crate::Result;
 
-use object_store::path::Path;
-
 /// Progress of writing a [Fragment].
+#[async_trait]
 pub trait WriteFragmentProgress: std::fmt::Debug + Sync + Send {
     /// Indicate the beginning of writing a [Fragment].
-    fn begin(&mut self, fragment: &Fragment) -> Result<()>;
+    async fn begin(&mut self, fragment: &Fragment) -> Result<()>;
 
     /// Complete writing a [Fragment].
-    fn complete(&mut self, fragment: &Fragment) -> Result<()>;
+    async fn complete(&mut self, fragment: &Fragment) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
@@ -36,12 +38,15 @@ impl NoopFragmentWriteProgress {
     }
 }
 
+#[async_trait]
 impl WriteFragmentProgress for NoopFragmentWriteProgress {
-    fn begin(&mut self, _fragment: &Fragment) -> Result<()> {
+    #[inline]
+    async fn begin(&mut self, _fragment: &Fragment) -> Result<()> {
         Ok(())
     }
 
-    fn complete(&mut self, _fragment: &Fragment) -> Result<()> {
+    #[inline]
+    async fn complete(&mut self, _fragment: &Fragment) -> Result<()> {
         Ok(())
     }
 }
@@ -61,20 +66,33 @@ impl FSFragmentWriteProgress {
             base_path,
         })
     }
+
+    fn in_progress_file(&self, fragment: &Fragment) -> Path {
+        self.base_path
+            .child(format!("fragment_{}.inprogress", fragment.id))
+    }
+
+    fn fragment_file(&self, fragment: &Fragment) -> Path {
+        self.base_path
+            .child(format!("fragment_{}.json", fragment.id))
+    }
 }
 
+#[async_trait]
 impl WriteFragmentProgress for FSFragmentWriteProgress {
-    fn begin(&mut self, fragment: &Fragment) -> Result<()> {
-        let marker_path = self.base_path.child(format!("{}.inprogress", fragment.id));
-        self.object_store.put(marker, vec![])?;
-        let path = format!("{}/{}.json", self.base_dir, fragment.id);
-        std::fs::write(path, serde_json::to_string(fragment)?)?;
+    async fn begin(&mut self, fragment: &Fragment) -> Result<()> {
+        let in_progress_path = self.in_progress_file(fragment);
+        self.object_store.put(&in_progress_path, &vec![]).await?;
+        let fragment_file = self.fragment_file(fragment);
+        self.object_store
+            .put(&fragment_file, serde_json::to_string(fragment)?.as_bytes())
+            .await?;
         Ok(())
     }
 
-    fn complete(&mut self, fragment: &Fragment) -> Result<()> {
-        let path = format!("{}/{}.json", self.base_dir, fragment.id);
-        std::fs::remove_file(path)?;
+    async fn complete(&mut self, fragment: &Fragment) -> Result<()> {
+        let in_progress_path = self.in_progress_file(fragment);
+        self.object_store.delete(&in_progress_path).await?;
         Ok(())
     }
 }
