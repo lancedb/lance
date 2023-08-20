@@ -161,7 +161,7 @@ mod tests {
         // Check the version is set correctly
         let indices = dataset.load_indices().await.unwrap();
         let actual = indices.first().unwrap().dataset_version;
-        let expected = dataset.manifest.version - 1;
+        let expected = dataset.manifest.version;
         assert_eq!(actual, expected);
     }
 }

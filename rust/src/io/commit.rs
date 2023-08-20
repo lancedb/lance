@@ -35,15 +35,10 @@
 
 use std::{fmt::Debug, sync::atomic::AtomicBool};
 
-use crate::dataset::transaction::Transaction;
-use crate::dataset::{write_manifest_file, ManifestWriteConfig};
-use crate::Dataset;
-use crate::Result;
-use crate::{format::pb, format::Index, format::Manifest};
+use crate::{format::Index, format::Manifest};
 use futures::future::BoxFuture;
 use object_store::path::Path;
 use object_store::Error as ObjectStoreError;
-use prost::Message;
 
 use super::ObjectStore;
 
@@ -53,7 +48,7 @@ pub type ManifestWriter = for<'a> fn(
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,
-) -> BoxFuture<'a, Result<()>>;
+) -> BoxFuture<'a, crate::Result<()>>;
 
 /// Handle commits that prevent conflicting writes.
 ///
@@ -73,11 +68,10 @@ pub trait CommitHandler: Debug + Send + Sync {
         path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
-    ) -> std::result::Result<(), CommitError>;
+    ) -> Result<(), CommitError>;
 }
 
 /// Errors that can occur when committing a manifest.
-#[derive(Debug)]
 pub enum CommitError {
     /// Another transaction has already been written to the path
     CommitConflict,
@@ -119,7 +113,7 @@ impl CommitHandler for UnsafeCommitHandler {
         path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
-    ) -> std::result::Result<(), CommitError> {
+    ) -> Result<(), CommitError> {
         // Log a one-time warning
         if !WARNED_ON_UNSAFE_COMMIT.load(std::sync::atomic::Ordering::Relaxed) {
             WARNED_ON_UNSAFE_COMMIT.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -156,7 +150,7 @@ impl CommitHandler for RenameCommitHandler {
         path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
-    ) -> std::result::Result<(), CommitError> {
+    ) -> Result<(), CommitError> {
         // Create a temporary object, then use `rename_if_not_exists` to commit.
         // If failed, clean up the temporary object.
 
@@ -219,13 +213,13 @@ pub trait CommitLock {
     /// It is not required that the lock tracks the version. It is provided in
     /// case the locking is handled by a catalog service that needs to know the
     /// current version of the table.
-    async fn lock(&self, version: u64) -> std::result::Result<Self::Lease, CommitError>;
+    async fn lock(&self, version: u64) -> Result<Self::Lease, CommitError>;
 }
 
 #[async_trait::async_trait]
 pub trait CommitLease: Send + Sync {
     /// Return the lease, indicating whether the commit was successful.
-    async fn release(&self, success: bool) -> std::result::Result<(), CommitError>;
+    async fn release(&self, success: bool) -> Result<(), CommitError>;
 }
 
 #[async_trait::async_trait]
@@ -237,7 +231,7 @@ impl<T: CommitLock + Send + Sync + Debug> CommitHandler for T {
         path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
-    ) -> std::result::Result<(), CommitError> {
+    ) -> Result<(), CommitError> {
         // NOTE: once we have the lease we cannot use ? to return errors, since
         // we must release the lease before returning.
         let lease = self.lock(manifest.version).await?;
@@ -269,227 +263,19 @@ impl<T: CommitLock + Send + Sync + Debug> CommitHandler for T {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct CommitConfig {
-    pub num_retries: u32,
-    // TODO: add isolation_level
-}
-
-impl Default for CommitConfig {
-    fn default() -> Self {
-        Self { num_retries: 5 }
-    }
-}
-
-/// Read the transaction data from a transaction file.
-async fn read_transaction_file(
-    object_store: &ObjectStore,
-    base_path: &Path,
-    transaction_file: &str,
-) -> Result<Transaction> {
-    let path = base_path.child("_transactions").child(transaction_file);
-    let result = object_store.inner.get(&path).await?;
-    let data = result.bytes().await?;
-    let transaction = pb::Transaction::decode(data)?;
-    (&transaction).try_into()
-}
-
-/// Write a transaction to a file and return the relative path.
-async fn write_transaction_file(
-    object_store: &ObjectStore,
-    base_path: &Path,
-    transaction: &Transaction,
-) -> Result<String> {
-    let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
-    let path = base_path.child("_transactions").child(file_name.as_str());
-
-    let message = pb::Transaction::from(transaction);
-    let buf = message.encode_to_vec();
-    object_store.inner.put(&path, buf.into()).await?;
-
-    Ok(file_name)
-}
-
-fn check_transaction(
-    transaction: &Transaction,
-    other_version: u64,
-    other_transaction: &Option<Transaction>,
-) -> Result<()> {
-    if other_transaction.is_none() {
-        return Err(crate::Error::Internal {
-            message: format!(
-                "There was a conflicting transaction at version {}, \
-                and it was missing transaction metadata.",
-                other_version
-            ),
-        });
-    }
-
-    if transaction.conflicts_with(other_transaction.as_ref().unwrap()) {
-        return Err(crate::Error::CommitConflict {
-            version: other_version,
-            source: format!(
-                "There was a concurrent commit that conflicts with this one and it \
-                cannot be automatically resolved. Please rerun the operation off the latest version \
-                of the table.\n Transaction: {:?}\n Conflicting Transaction: {:?}",
-                transaction, other_transaction
-            )
-            .into(),
-        });
-    }
-
-    Ok(())
-}
-
-pub(crate) async fn commit_new_dataset(
-    object_store: &ObjectStore,
-    base_path: &Path,
-    transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
-) -> Result<Manifest> {
-    let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
-
-    let (mut manifest, indices) =
-        transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
-
-    write_manifest_file(
-        object_store,
-        base_path,
-        &mut manifest,
-        if indices.is_empty() {
-            None
-        } else {
-            Some(indices.clone())
-        },
-        write_config,
-    )
-    .await?;
-
-    Ok(manifest)
-}
-
-/// Attempt to commit a transaction, with retries and conflict resolution.
-pub(crate) async fn commit_transaction(
-    dataset: &Dataset,
-    object_store: &ObjectStore,
-    transaction: &Transaction,
-    write_config: &ManifestWriteConfig,
-    commit_config: &CommitConfig,
-) -> Result<Manifest> {
-    // Note: object_store has been configured with WriteParams, but dataset.object_store()
-    // has not necessarily. So for anything involving writing, use `object_store`.
-    let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
-
-    let mut dataset = dataset.clone();
-    // First, get all transactions since read_version
-    let mut other_transactions = Vec::new();
-    let mut version = transaction.read_version;
-    loop {
-        version += 1;
-        match dataset.checkout_version(version).await {
-            Ok(next_dataset) => {
-                let other_txn = if let Some(txn_file) = &next_dataset.manifest.transaction_file {
-                    Some(read_transaction_file(object_store, &next_dataset.base, txn_file).await?)
-                } else {
-                    None
-                };
-                other_transactions.push(other_txn);
-                dataset = next_dataset;
-            }
-            Err(crate::Error::NotFound { .. }) | Err(crate::Error::DatasetNotFound { .. }) => {
-                break;
-            }
-            Err(e) => {
-                return Err(e);
-            }
-        }
-    }
-
-    let mut target_version = version;
-
-    // If any of them conflict with the transaction, return an error
-    for (version_offset, other_transaction) in other_transactions.iter().enumerate() {
-        let other_version = transaction.read_version + version_offset as u64 + 1;
-        check_transaction(transaction, other_version, other_transaction)?;
-    }
-
-    for _ in 0..commit_config.num_retries {
-        // Build an up-to-date manifest from the transaction and current manifest
-        let (mut manifest, indices) = transaction.build_manifest(
-            Some(dataset.manifest.as_ref()),
-            dataset.load_indices().await?,
-            &transaction_file,
-            write_config,
-        )?;
-
-        debug_assert_eq!(manifest.version, target_version);
-
-        // Try to commit the manifest
-        let result = write_manifest_file(
-            object_store,
-            &dataset.base,
-            &mut manifest,
-            if indices.is_empty() {
-                None
-            } else {
-                Some(indices.clone())
-            },
-            write_config,
-        )
-        .await;
-
-        match result {
-            Ok(()) => {
-                return Ok(manifest);
-            }
-            Err(CommitError::CommitConflict) => {
-                // See if we can retry the commit
-                dataset = dataset.checkout_version(target_version).await?;
-
-                let other_transaction =
-                    if let Some(txn_file) = dataset.manifest.transaction_file.as_ref() {
-                        Some(read_transaction_file(object_store, &dataset.base, txn_file).await?)
-                    } else {
-                        None
-                    };
-                check_transaction(transaction, target_version, &other_transaction)?;
-                target_version += 1;
-            }
-            Err(CommitError::OtherError(err)) => {
-                // If other error, return
-                return Err(err);
-            }
-        }
-    }
-
-    Err(crate::Error::CommitConflict {
-        version: target_version,
-        source: format!(
-            "Failed to commit the transaction after {} retries.",
-            commit_config.num_retries
-        )
-        .into(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
-    use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator};
+    use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::future::join_all;
 
     use super::*;
 
-    use crate::arrow::FixedSizeListArrayExt;
-    use crate::dataset::transaction::Operation;
-    use crate::dataset::{WriteMode, WriteParams};
-    use crate::index::vector::{MetricType, VectorIndexParams};
-    use crate::index::{DatasetIndexExt, IndexType};
+    use crate::dataset::WriteParams;
     use crate::io::object_store::ObjectStoreParams;
-    use crate::utils::testing::generate_random_array;
     use crate::Dataset;
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
@@ -549,9 +335,11 @@ mod tests {
                 task_results
             );
         } else {
-            // All we can promise here is at least one tasks succeeds, but multiple
-            // could in theory.
-            assert!(num_successes >= distinct_results.len(),);
+            assert!(
+                num_successes > distinct_results.len(),
+                "Expected some conflicts. Got {:?}",
+                task_results
+            );
         }
     }
 
@@ -578,7 +366,7 @@ mod tests {
         impl CommitLock for CustomCommitHandler {
             type Lease = CustomCommitLease;
 
-            async fn lock(&self, version: u64) -> std::result::Result<Self::Lease, CommitError> {
+            async fn lock(&self, version: u64) -> Result<Self::Lease, CommitError> {
                 let mut locked_version = self.locked_version.lock().unwrap();
                 if locked_version.is_some() {
                     // Already locked
@@ -597,7 +385,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl CommitLease for CustomCommitLease {
-            async fn release(&self, _success: bool) -> std::result::Result<(), CommitError> {
+            async fn release(&self, _success: bool) -> Result<(), CommitError> {
                 let mut locked_version = self.locked_version.lock().unwrap();
                 if *locked_version != Some(self.version) {
                     // Already released
@@ -620,195 +408,5 @@ mod tests {
     async fn test_unsafe_commit_handler() {
         let handler = Arc::new(UnsafeCommitHandler);
         test_commit_handler(handler, false).await;
-    }
-
-    #[tokio::test]
-    async fn test_roundtrip_transaction_file() {
-        let object_store = ObjectStore::memory();
-        let base_path = Path::from("test");
-        let transaction = Transaction::new(
-            42,
-            Operation::Append { fragments: vec![] },
-            Some("hello world".to_string()),
-        );
-
-        let file_name = write_transaction_file(&object_store, &base_path, &transaction)
-            .await
-            .unwrap();
-        let read_transaction = read_transaction_file(&object_store, &base_path, &file_name)
-            .await
-            .unwrap();
-
-        assert_eq!(transaction.read_version, read_transaction.read_version);
-        assert_eq!(transaction.uuid, read_transaction.uuid);
-        assert!(matches!(
-            read_transaction.operation,
-            Operation::Append { .. }
-        ));
-        assert_eq!(transaction.tag, read_transaction.tag);
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_create_index() {
-        // Create a table with two vector columns
-        let test_dir = tempfile::tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let dimension = 16;
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new(
-                "vector1",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    dimension,
-                ),
-                false,
-            ),
-            Field::new(
-                "vector2",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    dimension,
-                ),
-                false,
-            ),
-        ]));
-        let float_arr = generate_random_array(512 * dimension as usize);
-        let vectors = Arc::new(
-            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
-                float_arr, dimension,
-            )
-            .unwrap(),
-        );
-        let batches =
-            vec![
-                RecordBatch::try_new(schema.clone(), vec![vectors.clone(), vectors.clone()])
-                    .unwrap(),
-            ];
-
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
-        dataset.validate().await.unwrap();
-
-        // From initial version, concurrently call create index 3 times,
-        // two of which will be for the same column.
-        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 50);
-        let futures: Vec<_> = ["vector1", "vector1", "vector2"]
-            .iter()
-            .map(|col_name| {
-                let dataset = dataset.clone();
-                let params = params.clone();
-                tokio::spawn(async move {
-                    dataset
-                        .create_index(&[col_name], IndexType::Vector, None, &params, true)
-                        .await
-                })
-            })
-            .collect();
-
-        let results = join_all(futures).await;
-        for result in results {
-            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
-        }
-
-        // Validate that each version has the anticipated number of indexes
-        let dataset = dataset.checkout_version(1).await.unwrap();
-        assert!(dataset.load_indices().await.unwrap().is_empty());
-
-        let dataset = dataset.checkout_version(2).await.unwrap();
-        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
-
-        let dataset = dataset.checkout_version(3).await.unwrap();
-        let indices = dataset.load_indices().await.unwrap();
-        assert!(!indices.is_empty() && indices.len() <= 2);
-
-        // At this point, we have created two indices. If they are both for the same column,
-        // it must be vector1 and not vector2.
-        if indices.len() == 2 {
-            let mut fields: Vec<i32> = indices.iter().flat_map(|i| i.fields.clone()).collect();
-            fields.sort();
-            assert_eq!(fields, vec![0, 1]);
-        } else {
-            assert_eq!(indices[0].fields, vec![0]);
-        }
-
-        let dataset = dataset.checkout_version(4).await.unwrap();
-        let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 2);
-        let mut fields: Vec<i32> = indices.iter().flat_map(|i| i.fields.clone()).collect();
-        fields.sort();
-        assert_eq!(fields, vec![0, 1]);
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_writes() {
-        for write_mode in [WriteMode::Append, WriteMode::Overwrite] {
-            // Create an empty table
-            let test_dir = tempfile::tempdir().unwrap();
-            let test_uri = test_dir.path().to_str().unwrap();
-
-            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-                "i",
-                DataType::Int32,
-                false,
-            )]));
-
-            let dataset = Dataset::write(
-                RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
-                test_uri,
-                None,
-            )
-            .await
-            .unwrap();
-
-            // Make some sample data
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-            )
-            .unwrap();
-
-            // Write data concurrently in 5 tasks
-            let futures: Vec<_> = (0..5)
-                .map(|_| {
-                    let batch = batch.clone();
-                    let schema = schema.clone();
-                    let uri = test_uri.to_string();
-                    tokio::spawn(async move {
-                        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-                        Dataset::write(
-                            reader,
-                            &uri,
-                            Some(WriteParams {
-                                mode: write_mode,
-                                ..Default::default()
-                            }),
-                        )
-                        .await
-                    })
-                })
-                .collect();
-            let results = join_all(futures).await;
-
-            // Assert all succeeded
-            for result in results {
-                assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
-            }
-
-            // Assert final fragments and versions expected
-            let dataset = dataset.checkout_version(6).await.unwrap();
-
-            match write_mode {
-                WriteMode::Append => {
-                    assert_eq!(dataset.get_fragments().len(), 5);
-                }
-                WriteMode::Overwrite => {
-                    assert_eq!(dataset.get_fragments().len(), 1);
-                }
-                _ => unreachable!(),
-            }
-
-            dataset.validate().await.unwrap()
-        }
     }
 }

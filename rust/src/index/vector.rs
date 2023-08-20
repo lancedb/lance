@@ -173,7 +173,7 @@ impl TryFrom<&str> for MetricType {
 }
 
 /// Parameters of each index stage.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum StageParams {
     Ivf(IvfBuildParams),
 
@@ -183,7 +183,6 @@ pub enum StageParams {
 }
 
 /// The parameters to build vector index.
-#[derive(Debug, Clone)]
 pub struct VectorIndexParams {
     pub stages: Vec<StageParams>,
 

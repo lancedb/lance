@@ -32,9 +32,8 @@ pub(crate) mod cache;
 pub(crate) mod prefilter;
 pub mod vector;
 
-use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::write_manifest_file;
 use crate::format::Index as IndexMetadata;
-use crate::io::commit::commit_transaction;
 use crate::session::Session;
 use crate::{dataset::Dataset, Error, Result};
 
@@ -160,21 +159,27 @@ impl DatasetIndexExt for Dataset {
             }
         }
 
-        let new_idx = IndexMetadata::new(index_id, &index_name, &[field.id], self.manifest.version);
-        let transaction = Transaction::new(
-            self.manifest.version,
-            Operation::CreateIndex {
-                new_indices: vec![new_idx],
-            },
-            None,
-        );
+        let latest_manifest = self.latest_manifest().await?;
+        let mut new_manifest = self.manifest.as_ref().clone();
+        new_manifest.version = latest_manifest.version + 1;
 
-        let new_manifest = commit_transaction(
-            self,
-            self.object_store(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
+        // Write index metadata down
+        let new_idx = IndexMetadata::new(index_id, &index_name, &[field.id], new_manifest.version);
+        // Exclude the old index if it exists.
+        // We already checked that there is no index with the same name but on different fields.
+        let mut indices = indices
+            .iter()
+            .filter(|idx| idx.name != index_name)
+            .cloned()
+            .collect::<Vec<_>>();
+        indices.push(new_idx);
+
+        write_manifest_file(
+            &self.object_store,
+            &self.base,
+            &mut new_manifest,
+            Some(indices),
+            Default::default(),
         )
         .await?;
 

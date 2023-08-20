@@ -64,9 +64,6 @@ pub struct Manifest {
 
     /// The max fragment id used so far
     pub max_fragment_id: u32,
-
-    /// The path to the transaction file, relative to the root of the dataset
-    pub transaction_file: Option<String>,
 }
 
 impl Manifest {
@@ -82,7 +79,6 @@ impl Manifest {
             reader_feature_flags: 0,
             writer_feature_flags: 0,
             max_fragment_id: 0,
-            transaction_file: None,
         }
     }
 
@@ -102,7 +98,6 @@ impl Manifest {
             reader_feature_flags: 0, // These will be set on commit
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: previous.max_fragment_id,
-            transaction_file: None,
         }
     }
 
@@ -199,11 +194,6 @@ impl From<pb::Manifest> for Manifest {
             reader_feature_flags: p.reader_feature_flags,
             writer_feature_flags: p.writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
-            transaction_file: if p.transaction_file.is_empty() {
-                None
-            } else {
-                Some(p.transaction_file)
-            },
         }
     }
 }
@@ -229,11 +219,10 @@ impl From<&Manifest> for pb::Manifest {
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
             timestamp: timestamp_nanos,
-            tag: m.tag.clone().unwrap_or_default(),
+            tag: m.tag.clone().unwrap_or("".to_string()),
             reader_feature_flags: m.reader_feature_flags,
             writer_feature_flags: m.writer_feature_flags,
             max_fragment_id: m.max_fragment_id,
-            transaction_file: m.transaction_file.clone().unwrap_or_default(),
         }
     }
 }
