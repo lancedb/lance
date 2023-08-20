@@ -28,6 +28,7 @@ import pyarrow as pa
 
 from .lance import _Fragment
 from .lance import _FragmentMetadata as _FragmentMetadata
+from .progress import WriteProgressTracker
 
 if TYPE_CHECKING:
     from .dataset import LanceDataset, LanceScanner
@@ -130,6 +131,7 @@ class LanceFragment(pa.dataset.Fragment):
         fragment_id: Optional[int] = None,
         schema: Optional[pa.Schema] = None,
         max_rows_per_group: int = 1024,
+        progress_tracker: Optional[WriteProgressTracker] = None,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
