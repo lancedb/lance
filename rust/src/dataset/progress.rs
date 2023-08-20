@@ -16,7 +16,7 @@ use crate::format::Fragment;
 use crate::Result;
 
 /// Progress of writing a [Fragment].
-pub trait WriteFragmentProgress {
+pub trait WriteFragmentProgress: std::fmt::Debug + Sync + Send {
     /// Indicate the beginning of writing a [Fragment].
     fn begin(&mut self, fragment: &Fragment) -> Result<()>;
 
@@ -24,6 +24,7 @@ pub trait WriteFragmentProgress {
     fn complete(&mut self, fragment: &Fragment) -> Result<()>;
 }
 
+#[derive(Debug, Clone)]
 pub struct NoopFragmentWriteProgress {}
 
 impl NoopFragmentWriteProgress {

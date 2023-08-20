@@ -25,6 +25,7 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use uuid::Uuid;
 
+use super::progress::WriteFragmentProgress;
 use super::{chunker::chunk_stream, DATA_DIR};
 use crate::error::Result;
 use crate::Error;
@@ -58,6 +59,8 @@ pub struct WriteParams {
     pub mode: WriteMode,
 
     pub store_params: Option<ObjectStoreParams>,
+
+    pub progress: Option<Arc<dyn WriteFragmentProgress>>,
 }
 
 impl Default for WriteParams {
@@ -67,6 +70,7 @@ impl Default for WriteParams {
             max_rows_per_group: 1024,
             mode: WriteMode::Create,
             store_params: None,
+            progress: None,
         }
     }
 }
