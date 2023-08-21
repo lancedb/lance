@@ -66,6 +66,6 @@ class ProgressForTest(FragmentWriteProgress):
 def test_write_fragment_with_progress(tmp_path: Path):
     df = pd.DataFrame({"a": [10 * 10]})
     progress = ProgressForTest()
-    frag = LanceFragment.create(tmp_path, df, progress=progress)
+    LanceFragment.create(tmp_path, df, progress=progress)
     assert progress.begin_called == 1
     assert progress.complete_called == 1

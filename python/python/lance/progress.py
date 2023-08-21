@@ -12,6 +12,10 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+# ruff: noqa: F821
+
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 
 
