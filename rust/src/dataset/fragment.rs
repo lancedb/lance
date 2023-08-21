@@ -84,7 +84,7 @@ impl FileFragment {
 
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
 
-        let mut buffered_reader = chunk_stream(stream, params.max_rows_per_file);
+        let mut buffered_reader = chunk_stream(stream, params.max_rows_per_group);
         while let Some(batched_chunk) = buffered_reader.next().await {
             let batch = batched_chunk?;
             writer.write(&batch).await?;
@@ -1048,7 +1048,7 @@ mod tests {
             10,
             batch_iter,
             Some(WriteParams {
-                max_rows_per_file: 100,
+                max_rows_per_group: 100,
                 ..Default::default()
             }),
         )
