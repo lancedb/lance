@@ -18,6 +18,11 @@ use crate::format::Fragment;
 use crate::Result;
 
 /// Progress of writing a [Fragment].
+///
+/// When start writing a [`Fragment`], WriteProgress::begin() will be called before
+/// writing any data.
+///
+/// When stop writing a [`Fragment`], WriteProgress::complete() will be called after.
 #[async_trait]
 pub trait WriteFragmentProgress: std::fmt::Debug + Sync + Send {
     /// Indicate the beginning of writing a [Fragment].

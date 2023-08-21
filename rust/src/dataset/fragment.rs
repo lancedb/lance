@@ -638,6 +638,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::dataset::progress::NoopFragmentWriteProgress;
     use crate::dataset::{WriteParams, ROW_ID};
 
     async fn create_dataset(test_uri: &str) -> Dataset {
@@ -1057,6 +1058,7 @@ mod tests {
                 max_rows_per_group: 100,
                 ..Default::default()
             }),
+            &mut NoopFragmentWriteProgress::new(),
         )
         .await
         .unwrap();
