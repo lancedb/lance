@@ -137,12 +137,20 @@ async fn build_s3_object_store(
     uri: &str,
     credentials_refresh_offset: Duration,
     credentials: Option<Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>>,
+    region: Option<String>,
 ) -> Result<Arc<dyn OSObjectStore>> {
     use aws_config::meta::region::RegionProviderChain;
 
     const DEFAULT_REGION: &str = "us-west-2";
 
     let region_provider = RegionProviderChain::default_provider().or_else(DEFAULT_REGION);
+    let region = region.unwrap_or(
+        region_provider
+            .region()
+            .await
+            .map(|r| r.as_ref().to_string())
+            .unwrap_or(DEFAULT_REGION.to_string()),
+    );
 
     let creds = match credentials {
         Some(creds) => creds,
@@ -163,13 +171,7 @@ async fn build_s3_object_store(
         AmazonS3Builder::from_env() // from_env to capture AWS_ENDPOINT env var
             .with_url(uri)
             .with_credentials(creds)
-            .with_region(
-                region_provider
-                    .region()
-                    .await
-                    .map(|r| r.as_ref().to_string())
-                    .unwrap_or(DEFAULT_REGION.to_string()),
-            )
+            .with_region(region)
             .build()?,
     ))
 }
@@ -204,6 +206,7 @@ pub struct ObjectStoreParams {
 
     // Custom AWS Credentials
     pub aws_credentials: Option<Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>>,
+    pub aws_region: Option<String>,
 
     /// Custom commit handler
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
@@ -217,6 +220,7 @@ impl Default for ObjectStoreParams {
             s3_credentials_refresh_offset: Duration::from_secs(60),
             aws_credentials: None,
             commit_handler: None,
+            aws_region: None,
         }
     }
 }
@@ -311,6 +315,7 @@ impl ObjectStore {
                     url.to_string().as_str(),
                     params.s3_credentials_refresh_offset,
                     params.aws_credentials.clone(),
+                    params.aws_region.clone(),
                 )
                 .await?,
                 scheme: String::from("s3"),
