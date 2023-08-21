@@ -13,10 +13,8 @@
 // limitations under the License.
 
 use async_trait::async_trait;
-use object_store::path::Path;
 
 use crate::format::Fragment;
-use crate::io::ObjectStore;
 use crate::Result;
 
 /// Progress of writing a [Fragment].
@@ -47,52 +45,6 @@ impl WriteFragmentProgress for NoopFragmentWriteProgress {
 
     #[inline]
     async fn complete(&mut self, _fragment: &Fragment) -> Result<()> {
-        Ok(())
-    }
-}
-
-/// Keep track of the progress of writing a [Fragment] to object store.
-#[derive(Debug, Clone)]
-pub struct FSFragmentWriteProgress {
-    pub base_path: Path,
-    pub object_store: ObjectStore,
-}
-
-impl FSFragmentWriteProgress {
-    pub async fn try_new(uri: &str) -> Result<Self> {
-        let (object_store, base_path) = ObjectStore::from_uri(uri).await?;
-        Ok(Self {
-            object_store,
-            base_path,
-        })
-    }
-
-    fn in_progress_file(&self, fragment: &Fragment) -> Path {
-        self.base_path
-            .child(format!("fragment_{}.inprogress", fragment.id))
-    }
-
-    fn fragment_file(&self, fragment: &Fragment) -> Path {
-        self.base_path
-            .child(format!("fragment_{}.json", fragment.id))
-    }
-}
-
-#[async_trait]
-impl WriteFragmentProgress for FSFragmentWriteProgress {
-    async fn begin(&mut self, fragment: &Fragment) -> Result<()> {
-        let in_progress_path = self.in_progress_file(fragment);
-        self.object_store.put(&in_progress_path, &vec![]).await?;
-        let fragment_file = self.fragment_file(fragment);
-        self.object_store
-            .put(&fragment_file, serde_json::to_string(fragment)?.as_bytes())
-            .await?;
-        Ok(())
-    }
-
-    async fn complete(&mut self, fragment: &Fragment) -> Result<()> {
-        let in_progress_path = self.in_progress_file(fragment);
-        self.object_store.delete(&in_progress_path).await?;
         Ok(())
     }
 }

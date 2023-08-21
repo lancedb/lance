@@ -18,6 +18,7 @@ from pathlib import Path
 import pandas as pd
 import pyarrow as pa
 from lance import FragmentMetadata, LanceDataset, LanceFragment
+from lance.progress import FragmentWriteProgress
 
 
 def test_write_fragment(tmp_path: Path):
@@ -47,3 +48,16 @@ def test_write_fragment_two_phases(tmp_path: Path):
     pd.testing.assert_frame_equal(
         df, pd.DataFrame({"a": [i * 10 for i in range(num_files)]})
     )
+
+
+class ProgressTracker(FragmentWriteProgress):
+    def begin(self, fragment: FragmentMetadata):
+        print("Call form rust: ", fragment)
+
+    def complete(self, fragment: FragmentMetadata):
+        print(fragment)
+
+
+def test_write_fragment_with_progress(tmp_path: Path):
+    df = pd.DataFrame({"a": [10 * 10]})
+    frag = LanceFragment.create(tmp_path, df, progress=ProgressTracker())
