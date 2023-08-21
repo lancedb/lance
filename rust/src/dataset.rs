@@ -47,11 +47,11 @@ use self::transaction::{Operation, Transaction};
 use self::write::{reader_to_stream, write_fragments};
 use crate::datatypes::Schema;
 use crate::error::box_error;
-use crate::format::{pb, Fragment, Index, Manifest};
+use crate::format::{Fragment, Index, Manifest};
 use crate::io::reader::read_manifest_indexes;
 use crate::io::{
     commit::{commit_new_dataset, commit_transaction, CommitError},
-    object_reader::{read_message, read_struct},
+    object_reader::read_struct,
     object_store::ObjectStoreParams,
     read_manifest, read_metadata_offset, write_manifest, ObjectStore,
 };
