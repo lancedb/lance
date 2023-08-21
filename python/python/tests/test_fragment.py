@@ -50,14 +50,22 @@ def test_write_fragment_two_phases(tmp_path: Path):
     )
 
 
-class ProgressTracker(FragmentWriteProgress):
+class ProgressForTest(FragmentWriteProgress):
+    def __init__(self):
+        super().__init__()
+        self.begin_called = 0
+        self.complete_called = 0
+
     def begin(self, fragment: FragmentMetadata):
-        print("Call form rust: ", fragment)
+        self.begin_called += 1
 
     def complete(self, fragment: FragmentMetadata):
-        print(fragment)
+        self.complete_called += 1
 
 
 def test_write_fragment_with_progress(tmp_path: Path):
     df = pd.DataFrame({"a": [10 * 10]})
-    frag = LanceFragment.create(tmp_path, df, progress=ProgressTracker())
+    progress = ProgressForTest()
+    frag = LanceFragment.create(tmp_path, df, progress=progress)
+    assert progress.begin_called == 1
+    assert progress.complete_called == 1
