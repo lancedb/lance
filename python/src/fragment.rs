@@ -15,13 +15,13 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
+use async_trait::async_trait;
 use lance::dataset::fragment::FileFragment as LanceFragment;
-use lance::dataset::progress::{WriteFragmentProgress, NoopFragmentWriteProgress};
+use lance::dataset::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use lance::datatypes::Schema;
 use lance::format::{pb, DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance::io::deletion_file_path;
@@ -42,14 +42,12 @@ use crate::Scanner;
 #[derive(Debug)]
 pub struct PyWriteProgress {
     /// A Python object that implements the `WriteFragmentProgress` trait.
-    py_obj: PyObject
+    py_obj: PyObject,
 }
 
 impl PyWriteProgress {
     fn new(obj: PyObject) -> Self {
-        Self {
-            py_obj: obj,
-        }
+        Self { py_obj: obj }
     }
 }
 
@@ -59,12 +57,17 @@ impl WriteFragmentProgress for PyWriteProgress {
         let json_str = serde_json::to_string(fragment)?;
 
         Python::with_gil(|py| -> PyResult<()> {
-            self.py_obj.call_method(py, "_do_begin", (json_str, ), None)?;
+            self.py_obj
+                .call_method(py, "_do_begin", (json_str,), None)?;
             Ok(())
-        }).map_err(|e| {
+        })
+        .map_err(|e| {
             return lance::Error::IO {
-                message: format!("Failed to call begin() on WriteFragmentProgress: {}", e.to_string())
-            }
+                message: format!(
+                    "Failed to call begin() on WriteFragmentProgress: {}",
+                    e.to_string()
+                ),
+            };
         })?;
         Ok(())
     }
@@ -73,12 +76,17 @@ impl WriteFragmentProgress for PyWriteProgress {
         let json_str = serde_json::to_string(fragment)?;
 
         Python::with_gil(|py| -> PyResult<()> {
-            self.py_obj.call_method(py, "_do_complete", (json_str, ), None)?;
+            self.py_obj
+                .call_method(py, "_do_complete", (json_str,), None)?;
             Ok(())
-        }).map_err(|e| {
+        })
+        .map_err(|e| {
             return lance::Error::IO {
-                message: format!("Failed to call begin() on WriteFragmentProgress: {}", e.to_string())
-            }
+                message: format!(
+                    "Failed to call begin() on WriteFragmentProgress: {}",
+                    e.to_string()
+                ),
+            };
         })?;
         Ok(())
     }
@@ -167,7 +175,7 @@ impl FileFragment {
                 let progress = PyWriteProgress::new(progress.to_object(reader.py()));
                 Box::new(progress) as Box<dyn WriteFragmentProgress>
             } else {
-                Box::new(NoopFragmentWriteProgress{}) as Box<dyn WriteFragmentProgress>
+                Box::new(NoopFragmentWriteProgress {}) as Box<dyn WriteFragmentProgress>
             };
 
             let (metadata, schema) = if reader.is_instance_of::<Scanner>() {
