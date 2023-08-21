@@ -47,6 +47,8 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use object_store::path::Path;
+
 use crate::{
     datatypes::Schema,
     format::Index,
@@ -54,9 +56,10 @@ use crate::{
         pb::{self, IndexMetadata},
         Fragment, Manifest,
     },
+    io::{read_manifest, reader::read_manifest_indexes, ObjectStore},
 };
 
-use super::{feature_flags::apply_feature_flags, ManifestWriteConfig};
+use super::{feature_flags::apply_feature_flags, manifest_path, ManifestWriteConfig};
 use crate::{Error, Result};
 
 /// A change to a dataset that can be retried
@@ -111,7 +114,7 @@ pub enum Operation {
         schema: Schema,
     },
     /// Restore an old version of the database
-    Restore { manifest: Manifest },
+    Restore { version: u64 },
 }
 
 impl Operation {
@@ -255,6 +258,21 @@ impl Transaction {
         })
     }
 
+    pub(crate) async fn restore_old_manifest(
+        object_store: &ObjectStore,
+        base_path: &Path,
+        version: u64,
+        config: &ManifestWriteConfig,
+        tx_path: &str,
+    ) -> Result<(Manifest, Vec<Index>)> {
+        let path = manifest_path(base_path, version);
+        let mut manifest = read_manifest(object_store, &path).await?;
+        manifest.set_timestamp(config.timestamp);
+        manifest.transaction_file = Some(tx_path.to_string());
+        let indices = read_manifest_indexes(object_store, &path, &manifest).await?;
+        return Ok((manifest, indices));
+    }
+
     /// Create a new manifest from the current manifest and the transaction.
     ///
     /// `current_manifest` should only be None if the dataset does not yet exist.
@@ -265,13 +283,6 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
     ) -> Result<(Manifest, Vec<Index>)> {
-        match self.operation {
-            Operation::Restore { ref manifest } => {
-                return Ok((manifest.clone(), Vec::new()));
-            }
-            _ => (),
-        }
-
         // Get the schema and the final fragment list
         let schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
@@ -435,14 +446,8 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 fragments: fragments.iter().map(Fragment::from).collect(),
                 schema: Schema::from(schema),
             },
-            Some(pb::transaction::Operation::Restore(pb::transaction::Restore { manifest })) => {
-                Operation::Restore {
-                    manifest: Manifest::from(
-                        manifest
-                            .clone()
-                            .ok_or(Error::invalid_input("transaction file missing manifest"))?,
-                    ),
-                }
+            Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
+                Operation::Restore { version: *version }
             }
             None => {
                 return Err(Error::Internal {
@@ -509,10 +514,8 @@ impl From<&Transaction> for pb::Transaction {
                     schema_metadata: Default::default(), // TODO: handle metadata
                 })
             }
-            Operation::Restore { manifest } => {
-                pb::transaction::Operation::Restore(pb::transaction::Restore {
-                    manifest: Some(pb::Manifest::from(manifest)),
-                })
+            Operation::Restore { version } => {
+                pb::transaction::Operation::Restore(pb::transaction::Restore { version: *version })
             }
         };
 

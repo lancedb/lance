@@ -31,7 +31,7 @@ pub mod local;
 pub mod object_reader;
 pub mod object_store;
 pub mod object_writer;
-mod reader;
+pub(crate) mod reader;
 mod stream;
 mod writer;
 

@@ -109,7 +109,8 @@ message Transaction {
 
   // An operation that restores a dataset to a previous version.
   message Restore {
-    Manifest manifest = 1;
+    // The version to restore to
+    uint64 version = 1;
   }
 
   // The operation of this transaction.

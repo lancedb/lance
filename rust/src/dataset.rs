@@ -48,6 +48,7 @@ use self::write::{reader_to_stream, write_fragments};
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{pb, Fragment, Index, Manifest};
+use crate::io::reader::read_manifest_indexes;
 use crate::io::{
     commit::{commit_new_dataset, commit_transaction, CommitError},
     object_reader::{read_message, read_struct},
@@ -102,7 +103,7 @@ impl From<&Manifest> for Version {
 }
 
 /// Get the manifest file path for a version.
-fn manifest_path(base: &Path, version: u64) -> Path {
+pub(crate) fn manifest_path(base: &Path, version: u64) -> Path {
     base.child(VERSIONS_DIR)
         .child(format!("{version}.manifest"))
 }
@@ -512,14 +513,13 @@ impl Dataset {
         let latest_manifest = self.latest_manifest().await?;
         let latest_version = latest_manifest.version;
 
-        let mut manifest = Manifest::new_from_previous(
-            &self.manifest,
-            &self.manifest.schema,
-            self.manifest.fragments.clone(),
+        let transaction = Transaction::new(
+            latest_version,
+            Operation::Restore {
+                version: self.manifest.version,
+            },
+            None,
         );
-        manifest.version = latest_version + 1;
-
-        let transaction = Transaction::new(latest_version, Operation::Restore { manifest }, None);
 
         let object_store =
             if let Some(store_params) = write_params.and_then(|params| params.store_params) {
@@ -950,20 +950,8 @@ impl Dataset {
 
     /// Read all indices of this Dataset version.
     pub async fn load_indices(&self) -> Result<Vec<Index>> {
-        if let Some(pos) = self.manifest.index_section.as_ref() {
-            let manifest_file = self.manifest_file(self.version().version);
-
-            let reader = self.object_store.open(&manifest_file).await?;
-            let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
-
-            Ok(section
-                .indices
-                .iter()
-                .map(Index::try_from)
-                .collect::<Result<Vec<_>>>()?)
-        } else {
-            Ok(vec![])
-        }
+        let manifest_file = self.manifest_file(self.version().version);
+        read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest).await
     }
 
     pub async fn validate(&self) -> Result<()> {

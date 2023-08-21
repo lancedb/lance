@@ -39,12 +39,13 @@ use object_store::path::Path;
 use prost::Message;
 
 use super::deletion::{read_deletion_file, DeletionVector};
+use super::object_reader::read_message;
 use super::{deletion_file_path, ReadBatchParams};
 use crate::arrow::*;
 use crate::dataset::ROW_ID;
 use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::error::{Error, Result};
-use crate::format::{pb, Metadata, PageTable};
+use crate::format::{pb, Index, Metadata, PageTable};
 use crate::format::{Fragment, Manifest};
 use crate::io::object_reader::{read_fixed_stride_array, read_struct, ObjectReader};
 use crate::io::{read_metadata_offset, read_struct_from_buf};
@@ -119,6 +120,25 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
 
     let proto = pb::Manifest::decode(buf)?;
     Ok(Manifest::from(proto))
+}
+
+pub async fn read_manifest_indexes(
+    object_store: &ObjectStore,
+    path: &Path,
+    manifest: &Manifest,
+) -> Result<Vec<Index>> {
+    if let Some(pos) = manifest.index_section.as_ref() {
+        let reader = object_store.open(path).await?;
+        let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
+
+        Ok(section
+            .indices
+            .iter()
+            .map(Index::try_from)
+            .collect::<Result<Vec<_>>>()?)
+    } else {
+        Ok(vec![])
+    }
 }
 
 /// Compute row id from `fragment_id` and the `offset` of the row in the fragment.
