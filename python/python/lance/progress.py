@@ -61,6 +61,7 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
 
     def __init__(self, base_uri: str):
         from pyarrow.fs import FileSystem
+
         fs, path = FileSystem.from_uri(base_uri)
         self._fs = fs
         self._base_path = path

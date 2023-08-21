@@ -27,7 +27,7 @@ pub trait WriteFragmentProgress: std::fmt::Debug + Sync + Send {
     async fn complete(&mut self, fragment: &Fragment) -> Result<()>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NoopFragmentWriteProgress {}
 
 impl NoopFragmentWriteProgress {
