@@ -64,11 +64,12 @@ class LanceDataset(pa.dataset.Dataset):
         block_size: Optional[int] = None,
         index_cache_size: Optional[int] = None,
         metadata_cache_size: Optional[int] = None,
+        commit_lock: Optional[CommitLock] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._ds = _Dataset(
-            uri, version, block_size, index_cache_size, metadata_cache_size
+            uri, version, block_size, index_cache_size, metadata_cache_size, commit_lock
         )
 
     def __reduce__(self):
