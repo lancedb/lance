@@ -175,19 +175,29 @@ impl FileFragment {
                     .await
                     .map_err(|err| PyValueError::new_err(err.to_string()))?;
                 let schema = batches.schema().clone();
-                let metadata =
-                    LanceFragment::create(dataset_uri, fragment_id.unwrap_or(0), batches, params,                 progress_wrapper.as_mut())
-                        .await
-                        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+                let metadata = LanceFragment::create(
+                    dataset_uri,
+                    fragment_id.unwrap_or(0),
+                    batches,
+                    params,
+                    progress_wrapper.as_mut(),
+                )
+                .await
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
                 (metadata, schema)
             } else {
                 let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
                 let schema = batches.schema().clone();
 
-                let metadata =
-                    LanceFragment::create(dataset_uri, fragment_id.unwrap_or(0), batches, params,                 progress_wrapper.as_mut())
-                        .await
-                        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+                let metadata = LanceFragment::create(
+                    dataset_uri,
+                    fragment_id.unwrap_or(0),
+                    batches,
+                    params,
+                    progress_wrapper.as_mut(),
+                )
+                .await
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
                 (metadata, schema)
             };
             let schema = Schema::try_from(schema.as_ref())
