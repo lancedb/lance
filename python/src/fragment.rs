@@ -61,13 +61,8 @@ impl WriteFragmentProgress for PyWriteProgress {
                 .call_method(py, "_do_begin", (json_str,), None)?;
             Ok(())
         })
-        .map_err(|e| {
-            return lance::Error::IO {
-                message: format!(
-                    "Failed to call begin() on WriteFragmentProgress: {}",
-                    e.to_string()
-                ),
-            };
+        .map_err(|e| lance::Error::IO {
+            message: format!("Failed to call begin() on WriteFragmentProgress: {}", e),
         })?;
         Ok(())
     }
@@ -80,13 +75,8 @@ impl WriteFragmentProgress for PyWriteProgress {
                 .call_method(py, "_do_complete", (json_str,), None)?;
             Ok(())
         })
-        .map_err(|e| {
-            return lance::Error::IO {
-                message: format!(
-                    "Failed to call begin() on WriteFragmentProgress: {}",
-                    e.to_string()
-                ),
-            };
+        .map_err(|e| lance::Error::IO {
+            message: format!("Failed to call complete() on WriteFragmentProgress: {}", e),
         })?;
         Ok(())
     }
