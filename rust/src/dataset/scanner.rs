@@ -16,19 +16,23 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::{Float32Array, RecordBatch};
+use arrow_array::{Float32Array, Int64Array, RecordBatch};
 use arrow_schema::DataType;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use datafusion::execution::{
     context::SessionState,
     runtime_env::{RuntimeConfig, RuntimeEnv},
 };
+use datafusion::logical_expr::AggregateFunction;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+use datafusion::physical_plan::expressions::{create_aggregate_expr, Literal};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{
     filter::FilterExec, limit::GlobalLimitExec, union::UnionExec, ExecutionPlan,
     SendableRecordBatchStream,
 };
 use datafusion::prelude::*;
+use datafusion::scalar::ScalarValue;
 use futures::stream::{Stream, StreamExt};
 use log::debug;
 
@@ -350,10 +354,7 @@ impl Scanner {
         Ok(Arc::new(schema))
     }
 
-    /// Create a stream from the Scanner.
-    pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
-        let plan = self.create_plan().await?;
-
+    fn execute_plan(&self, plan: Arc<dyn ExecutionPlan>) -> Result<SendableRecordBatchStream> {
         let session_config = SessionConfig::new();
         let runtime_config = RuntimeConfig::new();
         let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
@@ -361,9 +362,55 @@ impl Scanner {
         // NOTE: we are only executing the first partition here. Therefore, if
         // the plan has more than one partition, we will be missing data.
         assert_eq!(plan.output_partitioning().partition_count(), 1);
-        Ok(DatasetRecordBatchStream::new(
-            plan.execute(0, session_state.task_ctx())?,
-        ))
+        Ok(plan.execute(0, session_state.task_ctx())?)
+    }
+
+    /// Create a stream from the Scanner.
+    pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
+        let plan = self.create_plan().await?;
+        Ok(DatasetRecordBatchStream::new(self.execute_plan(plan)?))
+    }
+
+    /// Scan and return the number of matching rows
+    pub async fn count_rows(&self) -> Result<usize> {
+        let plan = self.create_plan().await?;
+        // Datafusion interprets COUNT(*) as COUNT(1)
+        let one = Arc::new(Literal::new(ScalarValue::UInt8(Some(1))));
+        let count_expr = create_aggregate_expr(
+            &AggregateFunction::Count,
+            false,
+            &[one],
+            &[],
+            &plan.schema(),
+            "",
+        )?;
+        let plan_schema = plan.schema().clone();
+        let count_plan = Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(Vec::new()),
+            vec![count_expr],
+            vec![None],
+            vec![None],
+            plan,
+            plan_schema,
+        )?);
+        let mut stream = self.execute_plan(count_plan)?;
+
+        // A count plan will always return a single batch with a single row.
+        if let Some(first_batch) = stream.next().await {
+            let batch = first_batch?;
+            dbg!(&batch);
+            let array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or(Error::IO {
+                    message: "Count plan did not return a UInt64Array".to_string(),
+                })?;
+            Ok(array.value(0) as usize)
+        } else {
+            Ok(0)
+        }
     }
 
     /// Create [`ExecutionPlan`] for Scan.
@@ -702,6 +749,8 @@ mod test {
         DatasetIndexExt,
         {vector::VectorIndexParams, IndexType},
     };
+    use crate::utils::datagen::BatchGenerator;
+    use crate::utils::datagen::IncrementingInt32;
 
     #[tokio::test]
     async fn test_batch_size() {
@@ -1853,5 +1902,30 @@ mod test {
                 .collect();
             assert_eq!(expected_i, actual_i);
         }
+    }
+
+    #[tokio::test]
+    async fn test_count_rows_with_filter() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut data_gen = BatchGenerator::new().col(Box::new(
+            IncrementingInt32::new().named("filter_me".to_owned()),
+        ));
+        Dataset::write(data_gen.batch(32).unwrap(), test_uri, None)
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(32, dataset.scan().count_rows().await.unwrap());
+        assert_eq!(
+            16,
+            dataset
+                .scan()
+                .filter("filter_me > 15")
+                .unwrap()
+                .count_rows()
+                .await
+                .unwrap()
+        );
     }
 }
