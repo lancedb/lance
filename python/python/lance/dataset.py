@@ -510,6 +510,14 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.version()
 
+    def restore(self):
+        """
+        Restore the currently checked out version as the latest version of the dataset.
+
+        This creates a new commit.
+        """
+        self._ds.restore()
+
     def create_index(
         self,
         column: str,
