@@ -270,7 +270,7 @@ impl Transaction {
         manifest.set_timestamp(config.timestamp);
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &path, &manifest).await?;
-        return Ok((manifest, indices));
+        Ok((manifest, indices))
     }
 
     /// Create a new manifest from the current manifest and the transaction.
