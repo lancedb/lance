@@ -26,9 +26,11 @@ use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
 use object_store::path::Path;
 use uuid::Uuid;
 
+use super::chunker::chunk_stream;
 use super::hash_joiner::HashJoiner;
 use super::scanner::Scanner;
 use super::updater::Updater;
+use super::write::reader_to_stream;
 use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
@@ -66,12 +68,14 @@ impl FileFragment {
     pub async fn create(
         dataset_uri: &str,
         id: usize,
-        reader: &mut dyn RecordBatchReader,
+        reader: impl RecordBatchReader + Send + 'static,
         params: Option<WriteParams>,
     ) -> Result<Fragment> {
         let params = params.unwrap_or_default();
 
-        let schema = Schema::try_from(reader.schema().as_ref())?;
+        let reader = Box::new(reader);
+        let (stream, schema) = reader_to_stream(reader)?;
+
         let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
         let filename = format!("{}.lance", Uuid::new_v4());
         let fragment = Fragment::with_file(id as u64, &filename, &schema);
@@ -79,22 +83,12 @@ impl FileFragment {
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
 
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut num_rows: usize = 0;
-        for rst in reader {
-            let batch: RecordBatch = rst?; // TODO: close writer on Error?
-            batches.push(batch.clone());
-            num_rows += batch.num_rows();
-            if num_rows >= params.max_rows_per_group {
-                writer.write(&batches).await?;
-                batches = Vec::new();
-                num_rows = 0;
-            }
-        }
 
-        if num_rows > 0 {
-            writer.write(&batches).await?;
-        };
+        let mut buffered_reader = chunk_stream(stream, params.max_rows_per_group);
+        while let Some(batched_chunk) = buffered_reader.next().await {
+            let batch = batched_chunk?;
+            writer.write(&batch).await?;
+        }
 
         // Params.max_rows_per_file is ignored in this case.
         writer.finish().await?;
@@ -1021,5 +1015,65 @@ mod tests {
             row_id += 1;
             i += 1;
         }
+    }
+
+    #[tokio::test]
+    async fn test_write_batch_size() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            true,
+        )]));
+
+        let in_memory_batch = 1024;
+        let batches: Vec<RecordBatch> = (0..10)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(
+                        i * in_memory_batch..(i + 1) * in_memory_batch,
+                    ))],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let batch_iter = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        let fragment = FileFragment::create(
+            test_uri,
+            10,
+            batch_iter,
+            Some(WriteParams {
+                max_rows_per_group: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let (object_store, base_path) = ObjectStore::from_uri(test_uri).await.unwrap();
+        let file_reader = FileReader::try_new_with_fragment(
+            &object_store,
+            &base_path
+                .child("data")
+                .child(fragment.files[0].path.as_str()),
+            10,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        for i in 0..file_reader.num_batches() - 1 {
+            assert_eq!(file_reader.num_rows_in_batch(i as i32), 100);
+        }
+        assert_eq!(
+            file_reader.num_rows_in_batch(file_reader.num_batches() as i32 - 1) as i32,
+            in_memory_batch * 10 % 100
+        );
     }
 }

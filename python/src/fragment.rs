@@ -108,34 +108,36 @@ impl FileFragment {
     ) -> PyResult<FragmentMetadata> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let mut batches: Box<dyn RecordBatchReader> = if reader.is_instance_of::<Scanner>() {
-                let scanner: Scanner = reader.extract()?;
-                Box::new(
-                    scanner
-                        .to_reader()
-                        .await
-                        .map_err(|err| PyValueError::new_err(err.to_string()))?,
-                )
-            } else {
-                Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
-            };
-            let schema = Schema::try_from(batches.schema().as_ref())
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
-
             let params = if let Some(kw_params) = kwargs {
                 get_write_params(kw_params)?
             } else {
                 None
             };
 
-            let metadata = LanceFragment::create(
-                dataset_uri,
-                fragment_id.unwrap_or(0),
-                batches.as_mut(),
-                params,
-            )
-            .await
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            let (metadata, schema) = if reader.is_instance_of::<Scanner>() {
+                let scanner: Scanner = reader.extract()?;
+                let batches = scanner
+                    .to_reader()
+                    .await
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                let schema = batches.schema().clone();
+                let metadata =
+                    LanceFragment::create(dataset_uri, fragment_id.unwrap_or(0), batches, params)
+                        .await
+                        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+                (metadata, schema)
+            } else {
+                let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
+                let schema = batches.schema().clone();
+
+                let metadata =
+                    LanceFragment::create(dataset_uri, fragment_id.unwrap_or(0), batches, params)
+                        .await
+                        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+                (metadata, schema)
+            };
+            let schema = Schema::try_from(schema.as_ref())
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
             Ok(FragmentMetadata::new(metadata, schema))
         })
     }
