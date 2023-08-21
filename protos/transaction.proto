@@ -72,9 +72,9 @@ message Transaction {
     // Fragment IDs are not yet assigned.
     repeated DataFragment fragments = 1;
     // The new schema
-    repeated Field schema = 3;
+    repeated Field schema = 2;
     // Schema metadata.
-    map<string, bytes> schema_metadata = 4;
+    map<string, bytes> schema_metadata = 3;
   }
 
   // Add a new secondary index.
