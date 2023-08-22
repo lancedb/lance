@@ -79,13 +79,14 @@ pub fn dot_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Flo
     debug_assert_eq!(to.len() % dimension, 0);
 
     let dists = unsafe {
-        Float32Array::from_trusted_len_iter(to.chunks_exact(dimension).map(|v| Some(from.dot(v))))
+        Float32Array::from_trusted_len_iter(to.chunks_exact(dimension).map(|v| Some(1.0 - from.dot(v))))
     };
     Arc::new(dists)
 }
 
+#[inline]
 pub fn dot_distance(from: &[f32], to: &[f32]) -> f32 {
-    from.dot(to)
+    1.0 - from.dot(to)
 }
 
 #[cfg(target_arch = "x86_64")]
