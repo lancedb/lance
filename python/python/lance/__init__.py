@@ -16,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
 
+from lance.commit import CommitLock
+
 try:
     import pandas as pd
 
@@ -47,6 +49,7 @@ def dataset(
     version: Optional[int] = None,
     asof: Optional[ts_types] = None,
     block_size: Optional[int] = None,
+    commit_lock: Optional[CommitLock] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -63,8 +66,12 @@ def dataset(
         argument value. If a version is already specified, this arg is ignored.
     block_size : optional, int
         Block size in bytes. Provide a hint for the size of the minimal I/O request.
+    commit_handler : optional, CommitLock
+        If specified, use the provided commit handler to lock the table while
+        committing a new version. Not necessary on object stores other than S3
+        or when there are no concurrent writers.
     """
-    ds = LanceDataset(uri, version, block_size)
+    ds = LanceDataset(uri, version, block_size, commit_lock=commit_lock)
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
         ver_cutoff = max(
@@ -76,6 +83,6 @@ def dataset(
                 f"{ts_cutoff} is earlier than the first version of this dataset"
             )
         else:
-            return LanceDataset(uri, ver_cutoff, block_size)
+            return LanceDataset(uri, ver_cutoff, block_size, commit_lock=commit_lock)
     else:
         return ds

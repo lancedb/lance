@@ -601,6 +601,10 @@ def test_custom_commit_lock(tmp_path: Path):
             pa.table({"a": range(100)}), tmp_path / "test3", commit_lock=commit_lock
         )
 
+    dataset = lance.dataset(tmp_path / "test1", commit_lock=commit_lock)
+    with pytest.raises(Exception, match="CommitConflictError"):
+        dataset.delete("a < 10")
+
 
 def test_dataset_restore(tmp_path: Path):
     data = pa.table({"a": range(100)})

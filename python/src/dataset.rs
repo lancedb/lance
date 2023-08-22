@@ -72,15 +72,26 @@ impl Dataset {
         block_size: Option<usize>,
         index_cache_size: Option<usize>,
         metadata_cache_size: Option<usize>,
+        commit_handler: Option<PyObject>,
     ) -> PyResult<Self> {
         let rt = Runtime::new()?;
-        let params = ReadParams {
+        let mut params = ReadParams {
             block_size,
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
             metadata_cache_size: metadata_cache_size.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
             session: None,
             store_options: None,
         };
+
+        if let Some(commit_handler) = commit_handler {
+            let py_commit_lock = PyCommitLock::new(commit_handler);
+            let object_store_params = ObjectStoreParams {
+                commit_handler: Some(Arc::new(py_commit_lock)),
+                ..Default::default()
+            };
+            params.store_options = Some(object_store_params);
+        }
+
         let dataset = rt.block_on(async {
             if let Some(ver) = version {
                 LanceDataset::checkout_with_params(uri.as_str(), ver, &params).await
