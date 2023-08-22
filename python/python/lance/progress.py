@@ -50,7 +50,8 @@ class FragmentWriteProgress(ABC):
             The fragment that is open to write to. The fragment id might not
             yet be assigned at this point.
         multipart_id : str, optional
-            The multipart id to upload this fragment to cloud storage.
+            The multipart id that will be uploaded to cloud storage. This may be
+            used later to abort incomplete uploads if this fragment write fails.
         kwargs: dict, optional
             Extra keyword arguments to pass to the implementation.
 
