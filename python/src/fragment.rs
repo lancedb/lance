@@ -53,12 +53,18 @@ impl PyWriteProgress {
 
 #[async_trait]
 impl WriteFragmentProgress for PyWriteProgress {
-    async fn begin(&mut self, fragment: &LanceFragmentMetadata) -> lance::Result<()> {
+    async fn begin(
+        &mut self,
+        fragment: &LanceFragmentMetadata,
+        multipart_id: &str,
+    ) -> lance::Result<()> {
         let json_str = serde_json::to_string(fragment)?;
 
         Python::with_gil(|py| -> PyResult<()> {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("multipart_id", multipart_id)?;
             self.py_obj
-                .call_method(py, "_do_begin", (json_str,), None)?;
+                .call_method(py, "_do_begin", (json_str,), Some(kwargs))?;
             Ok(())
         })
         .map_err(|e| lance::Error::IO {

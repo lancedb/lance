@@ -14,6 +14,7 @@
 
 import json
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import pyarrow as pa
@@ -56,7 +57,9 @@ class ProgressForTest(FragmentWriteProgress):
         self.begin_called = 0
         self.complete_called = 0
 
-    def begin(self, fragment: FragmentMetadata):
+    def begin(
+        self, fragment: FragmentMetadata, multipart_id: Optional[str] = None, **kwargs
+    ):
         self.begin_called += 1
 
     def complete(self, fragment: FragmentMetadata):

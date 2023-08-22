@@ -16,9 +16,9 @@
 
 from __future__ import annotations
 
-from typing import Optional, Dict
-from abc import ABC, abstractmethod
 import json
+from abc import ABC, abstractmethod
+from typing import Dict, Optional
 
 
 class FragmentWriteProgress(ABC):
@@ -29,12 +29,14 @@ class FragmentWriteProgress(ABC):
     This tracking class is experimental and may change in the future.
     """
 
-    def _do_begin(self, fragment_json: str, **kwargs):
+    def _do_begin(
+        self, fragment_json: str, multipart_id: Optional[str] = None, **kwargs
+    ):
         """Called when a new fragment is created"""
         from .fragment import FragmentMetadata
 
         fragment = FragmentMetadata.from_json(fragment_json)
-        return self.begin(fragment, **kwargs)
+        return self.begin(fragment, multipart_id, **kwargs)
 
     @abstractmethod
     def begin(
@@ -84,7 +86,9 @@ class NoopFragmentWriteProgress(FragmentWriteProgress):
     This is the default implementation.
     """
 
-    def begin(self, fragment: "FragmentMetadata", **kargs):
+    def begin(
+        self, fragment: "FragmentMetadata", multipart_id: Optional[str] = None, **kargs
+    ):
         pass
 
     def complete(self, fragment: "FragmentMetadata", **kwargs):
