@@ -42,7 +42,7 @@ class FragmentWriteProgress(ABC):
     def begin(
         self, fragment: "FragmentMetadata", multipart_id: Optional[str] = None, **kwargs
     ) -> None:
-        """Called when a new fragment is created.
+        """Called when a new fragment is about to be written.
 
         Parameters
         ----------
