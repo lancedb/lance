@@ -47,7 +47,8 @@ class FragmentWriteProgress(ABC):
         Parameters
         ----------
         fragment : FragmentMetadata
-            The fragment that is open to write to.
+            The fragment that is open to write to. The fragment id might not
+            yet be assigned at this point.
         multipart_id : str, optional
             The multipart id to upload this fragment to cloud storage.
         kwargs: dict, optional
