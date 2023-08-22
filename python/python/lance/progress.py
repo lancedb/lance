@@ -69,7 +69,7 @@ class FragmentWriteProgress(ABC):
 
     @abstractmethod
     def complete(self, fragment: "FragmentMetadata", **kwargs) -> None:
-        """Callback when a fragment is completed written.
+        """Callback when a fragment is completely written.
 
         Parameters
         ----------
