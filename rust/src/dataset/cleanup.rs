@@ -404,8 +404,6 @@ mod tests {
             let tmpdir = tempdir()?;
             // let tmpdir_uri = to_obj_store_uri(tmpdir.path())?;
             let tmpdir_path = tmpdir.path().as_os_str().to_str().unwrap().to_owned();
-            println!("A={tmpdir:?}");
-            println!("B={tmpdir_path:?}");
             Ok(Self {
                 _tmpdir: tmpdir,
                 dataset_path: format!("{}/my_db", tmpdir_path),
