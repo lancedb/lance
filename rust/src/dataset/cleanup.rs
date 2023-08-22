@@ -291,6 +291,18 @@ impl<'a> CleanupTask<'a> {
     }
 }
 
+/// Deletes old versions of a dataset, removing files that are no longer
+/// needed.
+///
+/// This function will remove old manifest files, data files, indexes,
+/// delete files, and transaction files.
+///
+/// It will only remove files that are not referenced by any valid manifest.
+///
+/// The latest manifest is always considered valid and will not be removed
+/// even if it is older than the `before` parameter.
+///
+/// The `before` parameter must be at least 7 days before the current date.
 pub async fn cleanup_old_versions(
     dataset: &Dataset,
     before: DateTime<Utc>,
