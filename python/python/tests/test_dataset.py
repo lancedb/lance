@@ -336,6 +336,8 @@ def test_get_fragments(tmp_path: Path):
     assert fragment.physical_rows == 100
     assert fragment.num_deletions == 0
 
+    assert fragment.metadata.id == 0
+
     head = fragment.head(10)
     tm.assert_frame_equal(head.to_pandas(), table.to_pandas()[0:10])
 

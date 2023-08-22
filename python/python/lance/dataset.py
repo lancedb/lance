@@ -754,6 +754,7 @@ class LanceDataset(pa.dataset.Dataset):
         -----
         This method is for internal use only.
         """
+        # TODO: mode is never used!
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
 
