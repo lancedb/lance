@@ -45,9 +45,12 @@ use super::commit::{CommitHandler, RenameCommitHandler, UnsafeCommitHandler};
 use super::local::LocalObjectReader;
 use super::object_reader::ObjectReader;
 
+// This is a bit odd but some object_store functions only accept
+// Stream<Result<T, ObjectStoreError>> and so we need to convert
+// to ObjectStoreError to call the methods.
 impl From<Error> for ObjectStoreError {
     fn from(err: Error) -> Self {
-        ObjectStoreError::Generic {
+        Self::Generic {
             store: "N/A",
             source: Box::new(err),
         }
@@ -439,6 +442,7 @@ impl ObjectStore {
     /// Read a directory (start from base directory) and returns all sub-paths in the directory.
     pub async fn read_dir(&self, dir_path: impl Into<Path>) -> Result<Vec<String>> {
         let path = dir_path.into();
+        let path = Path::parse(&path)?;
         let output = self.inner.list_with_delimiter(Some(&path)).await?;
         Ok(output
             .common_prefixes
@@ -465,13 +469,6 @@ impl ObjectStore {
         Ok(output
             .map(|file_result| Ok(file_result.map(|file| file.location)?))
             .boxed())
-    }
-
-    /// Remove a single file
-    pub async fn remove(&self, path: impl Into<Path>) -> Result<()> {
-        let path = path.into();
-        self.inner.delete(&path).await?;
-        Ok(())
     }
 
     /// Remove a directory recursively.

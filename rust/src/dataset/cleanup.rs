@@ -12,7 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A task to clean up a lance dataset
+//! A task to clean up a lance dataset, removing files that are no longer
+//! needed.
+//!
+//! Currently we try and be rather conservative about what we delete.
+//!
+//! The following types of files may be deleted by the cleanup function:
+//!
+//! * Old manifest files - If a manifest file is older than the threshold
+//!   and is not the latest manifest then it will be deleted.
+//! * Unreferenced data files - If a data file is not referenced by any
+//!   fragment in a valid manifest file then it will be deleted.
+//! * Unreferenced delete files - If a delete file is not referenced by
+//!   any fragment in a valid manifest file then it will be deleted.
+//! * Unreferenced index files - If an index file is not referenced by
+//!   any valid manifest file then it will be deleted.
+//!
+//! It is also impossible to distinguish between a data file which was
+//! leftover from an abandoned transaction and a data file which is part
+//! of an ongoing write operation (both will be unreferenced data files).
+//! To solve this problem we only delete data files that have been unmodified
+//! since the delete threshold.  The delete threshold must be at least 7
+//! days and we assume that any ongoing writes will complete within 7 days.
 
 use std::{
     collections::HashSet,
@@ -35,6 +56,7 @@ use crate::{
 struct ReferencedFiles {
     data_paths: HashSet<Path>,
     delete_paths: HashSet<Path>,
+    tx_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
 }
 
@@ -43,6 +65,7 @@ pub struct RemovalStats {
     unreferenced_data_paths: u64,
     unreferenced_delete_paths: u64,
     unreferenced_index_paths: u64,
+    unreferenced_tx_paths: u64,
     old_manifests: u64,
 }
 
@@ -63,6 +86,9 @@ struct CleanupTask<'a> {
     referenced_files: Arc<Mutex<ReferencedFiles>>,
 }
 
+/// The before parameter must be at least this many days before
+/// the current date.  This is to prevent accidentally deleting
+/// data that is still being written.
 const MINIMUM_CLEANUP_DAYS: i64 = 7;
 
 impl<'a> CleanupTask<'a> {
@@ -77,7 +103,11 @@ impl<'a> CleanupTask<'a> {
 
     async fn run(&self) -> Result<RemovalStats> {
         self.validate()?;
+        // First we process all manifest files in parallel to figure
+        // out which files are referenced by valid manifests
         self.process_manifests().await?;
+        // Then we scan all of the files and delete those that are
+        // not part of our valid set.
         self.delete_unreferenced_files().await
     }
 
@@ -111,7 +141,7 @@ impl<'a> CleanupTask<'a> {
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
 
-        let manifest = read_manifest(&self.dataset.object_store, &path).await?;
+        let manifest = read_manifest(&self.dataset.object_store, path).await?;
         let dataset_version = self.dataset.version().version;
         // Don't delete the latest version, even if it is old
         let is_latest = dataset_version == manifest.version;
@@ -130,6 +160,11 @@ impl<'a> CleanupTask<'a> {
         manifest: &Manifest,
         manifest_path: &Path,
     ) -> Result<()> {
+        // Read the indexes first as it is async and we want to avoid holding the referenced_files
+        // lock across an await point.
+        let indexes =
+            read_manifest_indexes(&self.dataset.object_store, manifest_path, manifest).await?;
+
         let mut referenced_files = self.referenced_files.lock().unwrap();
         for fragment in manifest.fragments.iter() {
             for file in fragment.files.iter() {
@@ -146,8 +181,12 @@ impl<'a> CleanupTask<'a> {
                 referenced_files.delete_paths.insert(relative_path);
             }
         }
-        let indexes =
-            read_manifest_indexes(&self.dataset.object_store, &manifest_path, manifest).await?;
+        if let Some(relative_tx_path) = &manifest.transaction_file {
+            referenced_files
+                .tx_paths
+                .insert(Path::parse("_transactions")?.child(relative_tx_path.as_str()));
+        }
+
         for index in indexes {
             let uuid_str = index.uuid.to_string();
             referenced_files.index_uuids.insert(uuid_str);
@@ -167,9 +206,7 @@ impl<'a> CleanupTask<'a> {
 
         let old_manifests = self.old_manifests.lock().unwrap().clone();
         let num_old_manifests = old_manifests.len();
-        let old_manifests_stream = stream::iter(old_manifests)
-            .map(|path| Result::<Path>::Ok(path))
-            .boxed();
+        let old_manifests_stream = stream::iter(old_manifests).map(Result::<Path>::Ok).boxed();
 
         let all_paths_to_remove =
             stream::iter(vec![unreferenced_paths, old_manifests_stream]).flatten();
@@ -194,8 +231,8 @@ impl<'a> CleanupTask<'a> {
         let referenced_files = self.referenced_files.lock().unwrap();
         let mut stats = stats.lock().unwrap();
         if relative_path.as_ref().starts_with("_indices") {
-            // For indices we just grab the UUID because we want to delete the entire
-            // folder if we determine an index is expired.
+            // Indices are referenced by UUID so we need to examine the UUID
+            // portion of the path.
             if let Some(uuid) = relative_path.parts().nth(1) {
                 if referenced_files.index_uuids.contains(uuid.as_ref()) {
                     return Ok(None);
@@ -231,6 +268,18 @@ impl<'a> CleanupTask<'a> {
                         Ok(None)
                     } else {
                         stats.unreferenced_delete_paths += 1;
+                        Ok(Some(path))
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            Some("txn") => {
+                if relative_path.as_ref().starts_with("_transactions") {
+                    if referenced_files.tx_paths.contains(&relative_path) {
+                        Ok(None)
+                    } else {
+                        stats.unreferenced_tx_paths += 1;
                         Ok(Some(path))
                     }
                 } else {
@@ -313,7 +362,6 @@ mod tests {
             policy.set_before_policy(
                 "record_file_time",
                 Arc::new(move |_, path| {
-                    dbg!("Recording time {} for {:?}", utc_now(), &path);
                     let mut times_map = times_map.lock().unwrap();
                     times_map.insert(path.clone(), utc_now());
                     Ok(())
@@ -325,7 +373,7 @@ mod tests {
                 Arc::new(move |_, meta| {
                     let mut meta = meta;
                     if let Some(recorded) = times_map.lock().unwrap().get(&meta.location) {
-                        meta.last_modified = recorded.clone();
+                        meta.last_modified = *recorded;
                     }
                     Ok(meta)
                 }),
@@ -339,6 +387,7 @@ mod tests {
         num_manifest_files: usize,
         num_index_files: usize,
         num_delete_files: usize,
+        num_tx_files: usize,
     }
 
     struct MockDatasetFixture<'a> {
@@ -490,14 +539,15 @@ mod tests {
                 num_delete_files: 0,
                 num_index_files: 0,
                 num_manifest_files: 0,
+                num_tx_files: 0,
             };
             while let Some(path) = file_stream.try_next().await? {
                 match path.extension() {
                     Some("lance") => file_count.num_data_files += 1,
                     Some("manifest") => file_count.num_manifest_files += 1,
-                    Some("arrow") => file_count.num_delete_files += 1,
-                    Some("bin") => file_count.num_delete_files += 1,
+                    Some("arrow") | Some("bin") => file_count.num_delete_files += 1,
                     Some("idx") => file_count.num_index_files += 1,
+                    Some("txn") => file_count.num_tx_files += 1,
                     _ => (),
                 }
             }
@@ -508,16 +558,6 @@ mod tests {
             let db = self.open().await?;
             let count = db.count_rows().await?;
             Ok(count)
-        }
-
-        async fn debug_print_files(&self) -> Result<()> {
-            let (os, path) =
-                ObjectStore::from_uri_and_params(&self.dataset_path, self.os_params()).await?;
-            let mut file_stream = os.read_dir_all(&path, None).await?;
-            while let Some(path) = file_stream.try_next().await.unwrap() {
-                println!("File: {:?}", path);
-            }
-            Ok(())
         }
     }
 
@@ -543,6 +583,7 @@ mod tests {
         assert_eq!(removed.unreferenced_data_paths, 1);
         assert_eq!(removed.unreferenced_delete_paths, 0);
         assert_eq!(removed.unreferenced_index_paths, 0);
+        assert_eq!(removed.unreferenced_tx_paths, 1);
 
         let after_count = fixture.count_files().await.unwrap();
         // There should be one less data file
@@ -552,11 +593,14 @@ mod tests {
             after_count.num_manifest_files,
             before_count.num_manifest_files
         );
+        assert_lt!(after_count.num_tx_files, before_count.num_tx_files);
 
         // The latest manifest should still be there, even if it is older than
         // the given time.
         assert_gt!(after_count.num_manifest_files, 0);
         assert_gt!(after_count.num_data_files, 0);
+        // We should keep referenced tx files
+        assert_gt!(after_count.num_tx_files, 0);
     }
 
     #[tokio::test]
@@ -582,6 +626,7 @@ mod tests {
         assert_eq!(removed.unreferenced_data_paths, 0);
         assert_eq!(removed.unreferenced_delete_paths, 0);
         assert_eq!(removed.unreferenced_index_paths, 0);
+        assert_eq!(removed.unreferenced_tx_paths, 1);
 
         let after_count = fixture.count_files().await.unwrap();
         // The data files should all remain since they are referenced by
@@ -589,6 +634,7 @@ mod tests {
         assert_eq!(after_count.num_data_files, 3);
         // Only the oldest manifest file should be removed
         assert_eq!(after_count.num_manifest_files, 3);
+        assert_eq!(after_count.num_tx_files, 2);
     }
 
     #[tokio::test]
@@ -609,8 +655,6 @@ mod tests {
         fixture.clock.set_system_time(Duration::days(10));
         fixture.overwrite_some_data().await.unwrap();
 
-        fixture.debug_print_files().await.unwrap();
-
         let before_count = fixture.count_files().await.unwrap();
         assert_eq!(before_count.num_index_files, 1);
         // Two user data files and one lance file for the index
@@ -625,13 +669,13 @@ mod tests {
         assert_eq!(removed.unreferenced_data_paths, 1);
         assert_eq!(removed.unreferenced_delete_paths, 0);
         assert_eq!(removed.unreferenced_index_paths, 2);
-
-        fixture.debug_print_files().await.unwrap();
+        assert_eq!(removed.unreferenced_tx_paths, 2);
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(after_count.num_index_files, 0);
         assert_eq!(after_count.num_data_files, 1);
         assert_eq!(after_count.num_manifest_files, 2);
+        assert_eq!(after_count.num_tx_files, 1);
     }
 
     #[tokio::test]
@@ -672,11 +716,13 @@ mod tests {
         assert_eq!(removed.unreferenced_data_paths, 2);
         assert_eq!(removed.unreferenced_delete_paths, 1);
         assert_eq!(removed.unreferenced_index_paths, 0);
+        assert_eq!(removed.unreferenced_tx_paths, 3);
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(after_count.num_data_files, 1);
         assert_eq!(after_count.num_delete_files, 1);
         assert_eq!(after_count.num_manifest_files, 3);
+        assert_eq!(after_count.num_tx_files, 2);
 
         // Ensure we can still read the dataset
         let row_count_after = fixture.count_rows().await.unwrap();
@@ -693,8 +739,6 @@ mod tests {
         fixture.create_some_data().await.unwrap();
         fixture.create_some_index().await.unwrap();
 
-        fixture.debug_print_files().await.unwrap();
-
         let before_count = fixture.count_files().await.unwrap();
         let before = utc_now() - Duration::days(8);
         let removed = fixture.run_cleanup(before).await.unwrap();
@@ -703,10 +747,9 @@ mod tests {
         assert_eq!(removed.unreferenced_data_paths, 0);
         assert_eq!(removed.unreferenced_delete_paths, 0);
         assert_eq!(removed.unreferenced_index_paths, 0);
+        assert_eq!(removed.unreferenced_tx_paths, 0);
 
         let after_count = fixture.count_files().await.unwrap();
-
-        fixture.debug_print_files().await.unwrap();
 
         assert_eq!(before_count, after_count);
     }
@@ -727,6 +770,7 @@ mod tests {
         // deposited a data file
         assert_eq!(before_count.num_data_files, 2);
         assert_eq!(before_count.num_manifest_files, 2);
+        assert_eq!(before_count.num_tx_files, 2);
 
         // All of our manifests are newer than the threshold but temp files
         // should still be deleted.
@@ -739,10 +783,12 @@ mod tests {
         assert_eq!(removed.unreferenced_data_paths, 1);
         assert_eq!(removed.unreferenced_delete_paths, 0);
         assert_eq!(removed.unreferenced_index_paths, 0);
+        assert_eq!(removed.unreferenced_tx_paths, 1);
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(after_count.num_data_files, 1);
         assert_eq!(after_count.num_manifest_files, 2);
+        assert_eq!(after_count.num_tx_files, 1);
     }
 
     #[tokio::test]
@@ -770,6 +816,7 @@ mod tests {
         assert_eq!(removed.unreferenced_data_paths, 0);
         assert_eq!(removed.unreferenced_delete_paths, 0);
         assert_eq!(removed.unreferenced_index_paths, 0);
+        assert_eq!(removed.unreferenced_tx_paths, 0);
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(before_count, after_count);

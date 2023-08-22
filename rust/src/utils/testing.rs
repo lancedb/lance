@@ -84,8 +84,8 @@ macro_rules! assert_err_containing {
 
 pub(crate) use assert_err_containing;
 
-/// A policy function takes in the name of the operation (e.g. "put") and the location
-/// that is being accessed / modified and returns an optional error.
+// A policy function takes in the name of the operation (e.g. "put") and the location
+// that is being accessed / modified and returns an optional error.
 pub trait PolicyFnT: Fn(&str, &Path) -> Result<()> + Send + Sync {}
 impl<F> PolicyFnT for F where F: Fn(&str, &Path) -> Result<()> + Send + Sync {}
 impl Debug for dyn PolicyFnT {
@@ -95,6 +95,8 @@ impl Debug for dyn PolicyFnT {
 }
 type PolicyFn = Arc<dyn PolicyFnT>;
 
+// These policy functions receive (and optionally transform) an ObjectMeta
+// They apply to functions that list file info
 pub trait ObjectMetaPolicyFnT: Fn(&str, ObjectMeta) -> Result<ObjectMeta> + Send + Sync {}
 impl<F> ObjectMetaPolicyFnT for F where F: Fn(&str, ObjectMeta) -> Result<ObjectMeta> + Send + Sync {}
 impl Debug for dyn ObjectMetaPolicyFnT {
@@ -108,7 +110,7 @@ type ObjectMetaPolicyFn = Arc<dyn ObjectMetaPolicyFnT>;
 ///
 /// This container allows you to configure policies that should apply to the proxied calls.
 ///
-/// Typically, you would use this to simulate I/O errors.
+/// Typically, you would use this to simulate I/O errors or mock out data.
 ///
 /// Currently, for simplicity, we only proxy calls that involve some kind of path.  Calls
 /// to copy functions, which have a src and dst, will provide the source to the policy
@@ -165,7 +167,7 @@ impl ProxyObjectStore {
     fn before_method(&self, method: &str, location: &Path) -> OSResult<()> {
         let policy = self.policy.lock().unwrap();
         for policy in policy.before_policies.values() {
-            policy(method, location).map_err(|err| OSError::from(err))?;
+            policy(method, location).map_err(OSError::from)?;
         }
         Ok(())
     }
@@ -174,7 +176,7 @@ impl ProxyObjectStore {
         let policy = self.policy.lock().unwrap();
         let mut meta = meta;
         for policy in policy.object_meta_policies.values() {
-            meta = policy(method, meta).map_err(|err| OSError::from(err))?;
+            meta = policy(method, meta).map_err(OSError::from)?;
         }
         Ok(meta)
     }
@@ -271,8 +273,11 @@ impl ObjectStore for ProxyObjectStore {
 // in parallel can interfere with each other if they both want to adjust the system clock.
 //
 // By using MockClock below (which wraps mock_instant::MockClock), we can prevent this from
-// happening, though there is a performance hit as this will prevent some potential test
+// happening, though there is a test time cost as this will prevent some potential test
 // parallelism in a rather negative way (blocking).
+//
+// It also means that if one clock-dependent test fails then all future clock-dependent
+// tests will fail because of mutex poisoning.
 static CLOCK_MUTEX: Mutex<()> = Mutex::new(());
 pub struct MockClock<'a> {
     _guard: MutexGuard<'a, ()>,
