@@ -107,6 +107,12 @@ message Transaction {
     map<string, bytes> schema_metadata = 3;
   }
 
+  // An operation that restores a dataset to a previous version.
+  message Restore {
+    // The version to restore to
+    uint64 version = 1;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -115,5 +121,6 @@ message Transaction {
     CreateIndex create_index = 103;
     Rewrite rewrite = 104;
     Merge merge = 105;
+    Restore restore = 106;
   }
 }

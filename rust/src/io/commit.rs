@@ -35,7 +35,7 @@
 
 use std::{fmt::Debug, sync::atomic::AtomicBool};
 
-use crate::dataset::transaction::Transaction;
+use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig};
 use crate::Dataset;
 use crate::Result;
@@ -415,14 +415,26 @@ pub(crate) async fn commit_transaction(
 
     for _ in 0..commit_config.num_retries {
         // Build an up-to-date manifest from the transaction and current manifest
-        let (mut manifest, indices) = transaction.build_manifest(
-            Some(dataset.manifest.as_ref()),
-            dataset.load_indices().await?,
-            &transaction_file,
-            write_config,
-        )?;
+        let (mut manifest, indices) = match transaction.operation {
+            Operation::Restore { version } => {
+                Transaction::restore_old_manifest(
+                    object_store,
+                    &dataset.base,
+                    version,
+                    write_config,
+                    &transaction_file,
+                )
+                .await?
+            }
+            _ => transaction.build_manifest(
+                Some(dataset.manifest.as_ref()),
+                dataset.load_indices().await?,
+                &transaction_file,
+                write_config,
+            )?,
+        };
 
-        debug_assert_eq!(manifest.version, target_version);
+        manifest.version = target_version;
 
         // Try to commit the manifest
         let result = write_manifest_file(

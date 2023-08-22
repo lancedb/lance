@@ -47,10 +47,11 @@ use self::transaction::{Operation, Transaction};
 use self::write::{reader_to_stream, write_fragments};
 use crate::datatypes::Schema;
 use crate::error::box_error;
-use crate::format::{pb, Fragment, Index, Manifest};
+use crate::format::{Fragment, Index, Manifest};
+use crate::io::reader::read_manifest_indexes;
 use crate::io::{
     commit::{commit_new_dataset, commit_transaction, CommitError},
-    object_reader::{read_message, read_struct},
+    object_reader::read_struct,
     object_store::ObjectStoreParams,
     read_manifest, read_metadata_offset, write_manifest, ObjectStore,
 };
@@ -102,7 +103,7 @@ impl From<&Manifest> for Version {
 }
 
 /// Get the manifest file path for a version.
-fn manifest_path(base: &Path, version: u64) -> Path {
+pub(crate) fn manifest_path(base: &Path, version: u64) -> Path {
     base.child(VERSIONS_DIR)
         .child(format!("{version}.manifest"))
 }
@@ -498,6 +499,47 @@ impl Dataset {
         // parameter for API ergonomics.
         let batches = Box::new(batches);
         self.append_impl(batches, params).await
+    }
+
+    async fn latest_manifest(&self) -> Result<Manifest> {
+        read_manifest(&self.object_store, &latest_manifest_path(&self.base)).await
+    }
+
+    /// Restore the currently checked out version of the dataset as the latest version.
+    ///
+    /// Currently, `write_params` is just used to get additional store params.
+    /// Other options are ignored.
+    pub async fn restore(&mut self, write_params: Option<WriteParams>) -> Result<()> {
+        let latest_manifest = self.latest_manifest().await?;
+        let latest_version = latest_manifest.version;
+
+        let transaction = Transaction::new(
+            latest_version,
+            Operation::Restore {
+                version: self.manifest.version,
+            },
+            None,
+        );
+
+        let object_store =
+            if let Some(store_params) = write_params.and_then(|params| params.store_params) {
+                Arc::new(self.object_store.with_params(&store_params))
+            } else {
+                self.object_store.clone()
+            };
+
+        self.manifest = Arc::new(
+            commit_transaction(
+                self,
+                &object_store,
+                &transaction,
+                &Default::default(),
+                &Default::default(),
+            )
+            .await?,
+        );
+
+        Ok(())
     }
 
     /// Create a new version of [`Dataset`] from a collection of fragments.
@@ -908,20 +950,8 @@ impl Dataset {
 
     /// Read all indices of this Dataset version.
     pub async fn load_indices(&self) -> Result<Vec<Index>> {
-        if let Some(pos) = self.manifest.index_section.as_ref() {
-            let manifest_file = self.manifest_file(self.version().version);
-
-            let reader = self.object_store.open(&manifest_file).await?;
-            let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
-
-            Ok(section
-                .indices
-                .iter()
-                .map(Index::try_from)
-                .collect::<Result<Vec<_>>>()?)
-        } else {
-            Ok(vec![])
-        }
+        let manifest_file = self.manifest_file(self.version().version);
+        read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest).await
     }
 
     pub async fn validate(&self) -> Result<()> {
@@ -2231,5 +2261,52 @@ mod tests {
         assert_eq!(fragments[0].id(), 0);
         assert_eq!(fragments[1].id(), 2);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_restore() {
+        // Create a table
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
+        );
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        assert_eq!(dataset.manifest.version, 1);
+        let original_manifest = dataset.manifest.clone();
+
+        // Delete some rows
+        dataset.delete("i > 50").await.unwrap();
+        assert_eq!(dataset.manifest.version, 2);
+
+        // Checkout a previous version
+        let mut dataset = dataset.checkout_version(1).await.unwrap();
+        assert_eq!(dataset.manifest.version, 1);
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].metadata.deletion_file, None);
+        assert_eq!(dataset.manifest, original_manifest);
+
+        // Restore to a previous version
+        dataset.restore(None).await.unwrap();
+        assert_eq!(dataset.manifest.version, 3);
+        assert_eq!(dataset.manifest.fragments, original_manifest.fragments);
+        assert_eq!(dataset.manifest.schema, original_manifest.schema);
+
+        // Delete some rows again (make sure we can still write as usual)
+        dataset.delete("i > 30").await.unwrap();
+        assert_eq!(dataset.manifest.version, 4);
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].metadata.deletion_file.is_some());
     }
 }

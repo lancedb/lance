@@ -600,3 +600,21 @@ def test_custom_commit_lock(tmp_path: Path):
         lance.write_dataset(
             pa.table({"a": range(100)}), tmp_path / "test3", commit_lock=commit_lock
         )
+
+
+def test_dataset_restore(tmp_path: Path):
+    data = pa.table({"a": range(100)})
+    dataset = lance.write_dataset(data, tmp_path)
+    assert dataset.version == 1
+    assert dataset.count_rows() == 100
+
+    dataset.delete("a >= 50")
+    assert dataset.count_rows() == 50
+    assert dataset.version == 2
+
+    dataset = lance.dataset(tmp_path, version=1)
+    assert dataset.version == 1
+
+    dataset.restore()
+    assert dataset.version == 3
+    assert dataset.count_rows() == 100

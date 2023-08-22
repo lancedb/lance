@@ -47,6 +47,8 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use object_store::path::Path;
+
 use crate::{
     datatypes::Schema,
     format::Index,
@@ -54,9 +56,10 @@ use crate::{
         pb::{self, IndexMetadata},
         Fragment, Manifest,
     },
+    io::{read_manifest, reader::read_manifest_indexes, ObjectStore},
 };
 
-use super::{feature_flags::apply_feature_flags, ManifestWriteConfig};
+use super::{feature_flags::apply_feature_flags, manifest_path, ManifestWriteConfig};
 use crate::{Error, Result};
 
 /// A change to a dataset that can be retried
@@ -110,6 +113,8 @@ pub enum Operation {
         fragments: Vec<Fragment>,
         schema: Schema,
     },
+    /// Restore an old version of the database
+    Restore { version: u64 },
 }
 
 impl Operation {
@@ -119,9 +124,10 @@ impl Operation {
     fn modified_fragment_ids(&self) -> Box<dyn Iterator<Item = u64> + '_> {
         match self {
             // These operations add new fragments or don't modify any.
-            Self::Append { .. } | Self::Overwrite { .. } | Self::CreateIndex { .. } => {
-                Box::new(std::iter::empty())
-            }
+            Self::Append { .. }
+            | Self::Overwrite { .. }
+            | Self::CreateIndex { .. }
+            | Self::Restore { .. } => Box::new(std::iter::empty()),
             Self::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
@@ -152,6 +158,7 @@ impl Operation {
             Self::CreateIndex { .. } => "CreateIndex",
             Self::Rewrite { .. } => "Rewrite",
             Self::Merge { .. } => "Merge",
+            Self::Restore { .. } => "Restore",
         }
     }
 }
@@ -200,8 +207,9 @@ impl Transaction {
                 }
                 _ => true,
             },
-            // Overwrite always succeeds
+            // Overwrite and Restore always succeed
             Operation::Overwrite { .. } => false,
+            Operation::Restore { .. } => false,
             Operation::CreateIndex { .. } => match &other.operation {
                 Operation::Append { .. } => false,
                 // Indices are identified by UUIDs, so they shouldn't conflict.
@@ -248,6 +256,21 @@ impl Transaction {
             *fragment_id += 1;
             f
         })
+    }
+
+    pub(crate) async fn restore_old_manifest(
+        object_store: &ObjectStore,
+        base_path: &Path,
+        version: u64,
+        config: &ManifestWriteConfig,
+        tx_path: &str,
+    ) -> Result<(Manifest, Vec<Index>)> {
+        let path = manifest_path(base_path, version);
+        let mut manifest = read_manifest(object_store, &path).await?;
+        manifest.set_timestamp(config.timestamp);
+        manifest.transaction_file = Some(tx_path.to_string());
+        let indices = read_manifest_indexes(object_store, &path, &manifest).await?;
+        Ok((manifest, indices))
     }
 
     /// Create a new manifest from the current manifest and the transaction.
@@ -347,6 +370,9 @@ impl Transaction {
             Operation::Merge { ref fragments, .. } => {
                 final_fragments.extend(fragments.clone());
             }
+            Operation::Restore { .. } => {
+                unreachable!()
+            }
         };
 
         let mut manifest = if let Some(current_manifest) = current_manifest {
@@ -420,6 +446,9 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 fragments: fragments.iter().map(Fragment::from).collect(),
                 schema: Schema::from(schema),
             },
+            Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
+                Operation::Restore { version: *version }
+            }
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),
@@ -484,6 +513,9 @@ impl From<&Transaction> for pb::Transaction {
                     schema: schema.into(),
                     schema_metadata: Default::default(), // TODO: handle metadata
                 })
+            }
+            Operation::Restore { version } => {
+                pb::transaction::Operation::Restore(pb::transaction::Restore { version: *version })
             }
         };
 

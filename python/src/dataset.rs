@@ -347,6 +347,17 @@ impl Dataset {
         Ok(self.ds.version().version)
     }
 
+    /// Restore the current version
+    fn restore(&mut self) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        let fut = new_self.restore(None);
+        self.rt.block_on(
+            async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
+        )?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     fn create_index(
         self_: PyRef<'_, Self>,
         columns: Vec<&str>,
