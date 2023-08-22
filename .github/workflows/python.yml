@@ -89,6 +89,9 @@ jobs:
         workspaces: python
     - uses: ./.github/workflows/build_linux_wheel
     - uses: ./.github/workflows/run_tests
+    # Make sure wheels are not included in the Rust cache
+    - name: Delete wheels
+      run: rm -rf target/wheels/pylance-*.whl
   linux-arm:
     timeout-minutes: 45
     strategy:
@@ -120,6 +123,9 @@ jobs:
       with:
         arm-build: "true"
     - uses: ./.github/workflows/run_tests
+    # Make sure wheels are not included in the Rust cache
+    - name: Delete wheels
+      run: rm -rf target/wheels/pylance-*.whl
   mac:
     timeout-minutes: 45
     runs-on: "macos-12"
@@ -141,6 +147,9 @@ jobs:
         workspaces: python
     - uses: ./.github/workflows/build_mac_wheel
     - uses: ./.github/workflows/run_tests
+    # Make sure wheels are not included in the Rust cache
+    - name: Delete wheels
+      run: rm -rf target/wheels/pylance-*.whl
   windows:
     runs-on: windows-latest
     timeout-minutes: 90
@@ -158,3 +167,6 @@ jobs:
           workspaces: python
       - uses: ./.github/workflows/build_windows_wheel
       - uses: ./.github/workflows/run_tests
+      # Make sure wheels are not included in the Rust cache
+      - name: Delete wheels
+        run: rm -rf target/wheels/pylance-*.whl
