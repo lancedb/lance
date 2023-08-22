@@ -19,7 +19,9 @@ use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
+use async_trait::async_trait;
 use lance::dataset::fragment::FileFragment as LanceFragment;
+use lance::dataset::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use lance::datatypes::Schema;
 use lance::format::{pb, DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance::io::deletion_file_path;
@@ -35,6 +37,56 @@ use tokio::runtime::Runtime;
 use crate::dataset::get_write_params;
 use crate::updater::Updater;
 use crate::Scanner;
+
+#[pyclass(name = "_FragmentWriteProgress", module = "_lib")]
+#[derive(Debug)]
+pub struct PyWriteProgress {
+    /// A Python object that implements the `WriteFragmentProgress` trait.
+    py_obj: PyObject,
+}
+
+impl PyWriteProgress {
+    fn new(obj: PyObject) -> Self {
+        Self { py_obj: obj }
+    }
+}
+
+#[async_trait]
+impl WriteFragmentProgress for PyWriteProgress {
+    async fn begin(
+        &mut self,
+        fragment: &LanceFragmentMetadata,
+        multipart_id: &str,
+    ) -> lance::Result<()> {
+        let json_str = serde_json::to_string(fragment)?;
+
+        Python::with_gil(|py| -> PyResult<()> {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("multipart_id", multipart_id)?;
+            self.py_obj
+                .call_method(py, "_do_begin", (json_str,), Some(kwargs))?;
+            Ok(())
+        })
+        .map_err(|e| lance::Error::IO {
+            message: format!("Failed to call begin() on WriteFragmentProgress: {}", e),
+        })?;
+        Ok(())
+    }
+
+    async fn complete(&mut self, fragment: &LanceFragmentMetadata) -> lance::Result<()> {
+        let json_str = serde_json::to_string(fragment)?;
+
+        Python::with_gil(|py| -> PyResult<()> {
+            self.py_obj
+                .call_method(py, "_do_complete", (json_str,), None)?;
+            Ok(())
+        })
+        .map_err(|e| lance::Error::IO {
+            message: format!("Failed to call complete() on WriteFragmentProgress: {}", e),
+        })?;
+        Ok(())
+    }
+}
 
 #[pyclass(name = "_Fragment", module = "_lib")]
 #[derive(Clone)]
@@ -99,11 +151,12 @@ impl FileFragment {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (dataset_uri, fragment_id, reader, **kwargs))]
+    #[pyo3(signature = (dataset_uri, fragment_id, reader, progress, **kwargs))]
     fn create(
         dataset_uri: &str,
         fragment_id: Option<usize>,
         reader: &PyAny,
+        progress: Option<&PyAny>,
         kwargs: Option<&PyDict>,
     ) -> PyResult<FragmentMetadata> {
         let rt = tokio::runtime::Runtime::new()?;
@@ -114,6 +167,13 @@ impl FileFragment {
                 None
             };
 
+            let mut progress_wrapper = if let Some(progress) = progress {
+                let progress = PyWriteProgress::new(progress.to_object(reader.py()));
+                Box::new(progress) as Box<dyn WriteFragmentProgress>
+            } else {
+                Box::new(NoopFragmentWriteProgress {}) as Box<dyn WriteFragmentProgress>
+            };
+
             let (metadata, schema) = if reader.is_instance_of::<Scanner>() {
                 let scanner: Scanner = reader.extract()?;
                 let batches = scanner
@@ -121,23 +181,34 @@ impl FileFragment {
                     .await
                     .map_err(|err| PyValueError::new_err(err.to_string()))?;
                 let schema = batches.schema().clone();
-                let metadata =
-                    LanceFragment::create(dataset_uri, fragment_id.unwrap_or(0), batches, params)
-                        .await
-                        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+                let metadata = LanceFragment::create(
+                    dataset_uri,
+                    fragment_id.unwrap_or(0),
+                    batches,
+                    params,
+                    progress_wrapper.as_mut(),
+                )
+                .await
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
                 (metadata, schema)
             } else {
                 let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
                 let schema = batches.schema().clone();
 
-                let metadata =
-                    LanceFragment::create(dataset_uri, fragment_id.unwrap_or(0), batches, params)
-                        .await
-                        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+                let metadata = LanceFragment::create(
+                    dataset_uri,
+                    fragment_id.unwrap_or(0),
+                    batches,
+                    params,
+                    progress_wrapper.as_mut(),
+                )
+                .await
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
                 (metadata, schema)
             };
             let schema = Schema::try_from(schema.as_ref())
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
             Ok(FragmentMetadata::new(metadata, schema))
         })
     }

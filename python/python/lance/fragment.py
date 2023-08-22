@@ -28,6 +28,7 @@ import pyarrow as pa
 
 from .lance import _Fragment
 from .lance import _FragmentMetadata as _FragmentMetadata
+from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 
 if TYPE_CHECKING:
     from .dataset import LanceDataset, LanceScanner
@@ -130,6 +131,7 @@ class LanceFragment(pa.dataset.Fragment):
         fragment_id: Optional[int] = None,
         schema: Optional[pa.Schema] = None,
         max_rows_per_group: int = 1024,
+        progress: Optional[FragmentWriteProgress] = None,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
@@ -152,6 +154,12 @@ class LanceFragment(pa.dataset.Fragment):
             from the data.
         max_rows_per_group: int, default 1024
             The maximum number of rows per group in the data file.
+        progress: FragmentWriteProgress, optional
+            *Experimental API*. Progress tracking for writing the fragment.
+
+        Returns
+        -------
+        FragmentMetadata
         """
         if pd and isinstance(data, pd.DataFrame):
             reader = pa.Table.from_pandas(data, schema=schema).to_reader()
@@ -166,8 +174,15 @@ class LanceFragment(pa.dataset.Fragment):
 
         if isinstance(dataset_uri, Path):
             dataset_uri = str(dataset_uri)
+        if progress is None:
+            progress = NoopFragmentWriteProgress()
+
         inner_meta = _Fragment.create(
-            dataset_uri, fragment_id, reader, max_rows_per_group=max_rows_per_group
+            dataset_uri,
+            fragment_id,
+            reader,
+            max_rows_per_group=max_rows_per_group,
+            progress=progress,
         )
         return FragmentMetadata(inner_meta.json())
 

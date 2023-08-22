@@ -14,10 +14,12 @@
 
 import json
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import pyarrow as pa
 from lance import FragmentMetadata, LanceDataset, LanceFragment
+from lance.progress import FragmentWriteProgress
 
 
 def test_write_fragment(tmp_path: Path):
@@ -47,3 +49,26 @@ def test_write_fragment_two_phases(tmp_path: Path):
     pd.testing.assert_frame_equal(
         df, pd.DataFrame({"a": [i * 10 for i in range(num_files)]})
     )
+
+
+class ProgressForTest(FragmentWriteProgress):
+    def __init__(self):
+        super().__init__()
+        self.begin_called = 0
+        self.complete_called = 0
+
+    def begin(
+        self, fragment: FragmentMetadata, multipart_id: Optional[str] = None, **kwargs
+    ):
+        self.begin_called += 1
+
+    def complete(self, fragment: FragmentMetadata):
+        self.complete_called += 1
+
+
+def test_write_fragment_with_progress(tmp_path: Path):
+    df = pd.DataFrame({"a": [10 * 10]})
+    progress = ProgressForTest()
+    LanceFragment.create(tmp_path, df, progress=progress)
+    assert progress.begin_called == 1
+    assert progress.complete_called == 1

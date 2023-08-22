@@ -158,6 +158,11 @@ impl FileWriter {
         self.metadata.len()
     }
 
+    /// Returns the in-flight multipart ID.
+    pub fn multipart_id(&self) -> &str {
+        &self.object_writer.multipart_id
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use super::chunker::chunk_stream;
 use super::hash_joiner::HashJoiner;
+use super::progress::WriteFragmentProgress;
 use super::scanner::Scanner;
 use super::updater::Updater;
 use super::write::reader_to_stream;
@@ -70,6 +71,7 @@ impl FileFragment {
         id: usize,
         reader: impl RecordBatchReader + Send + 'static,
         params: Option<WriteParams>,
+        progress: &mut dyn WriteFragmentProgress,
     ) -> Result<Fragment> {
         let params = params.unwrap_or_default();
 
@@ -79,10 +81,10 @@ impl FileFragment {
         let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
         let filename = format!("{}.lance", Uuid::new_v4());
         let fragment = Fragment::with_file(id as u64, &filename, &schema);
-
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
-
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
+
+        progress.begin(&fragment, writer.multipart_id()).await?;
 
         let mut buffered_reader = chunk_stream(stream, params.max_rows_per_group);
         while let Some(batched_chunk) = buffered_reader.next().await {
@@ -92,6 +94,8 @@ impl FileFragment {
 
         // Params.max_rows_per_file is ignored in this case.
         writer.finish().await?;
+
+        progress.complete(&fragment).await?;
 
         Ok(fragment)
     }
@@ -632,6 +636,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::dataset::progress::NoopFragmentWriteProgress;
     use crate::dataset::{WriteParams, ROW_ID};
 
     async fn create_dataset(test_uri: &str) -> Dataset {
@@ -1051,6 +1056,7 @@ mod tests {
                 max_rows_per_group: 100,
                 ..Default::default()
             }),
+            &mut NoopFragmentWriteProgress::new(),
         )
         .await
         .unwrap();
