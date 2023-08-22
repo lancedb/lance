@@ -19,7 +19,6 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow_array::Float32Array;
-use object_store::path::Path;
 
 pub mod diskann;
 pub mod flat;
@@ -330,10 +329,6 @@ pub(crate) async fn build_vector_index(
     }
 
     Ok(())
-}
-
-pub(crate) fn index_dir(dataset: &Dataset, uuid_str: &str) -> Path {
-    dataset.indices_dir().child(uuid_str)
 }
 
 /// Open the Vector index on dataset, specified by the `uuid`.

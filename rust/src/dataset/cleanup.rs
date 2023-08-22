@@ -14,65 +14,36 @@
 
 //! A task to clean up a lance dataset
 
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    future,
+    sync::{Arc, Mutex},
+};
 
 use chrono::{DateTime, Duration, Utc};
-use futures::TryStreamExt;
+use futures::{stream, StreamExt, TryStreamExt};
 use object_store::path::Path;
 
 use crate::{
     format::Manifest,
-    index::vector::index_dir,
     io::{deletion_file_path, read_manifest, reader::read_manifest_indexes},
     utils::temporal::utc_now,
     Dataset, Error, Result,
 };
 
-#[derive(Default)]
-struct InvalidFiles {
-    unref_data_paths: HashSet<Path>,
-    unref_delete_paths: HashSet<Path>,
-    unref_index_uuids: HashSet<String>,
-    old_manifest_paths: Vec<Path>,
-}
-
-impl InvalidFiles {
-    fn new(all_files: &FilesList) -> Self {
-        Self {
-            unref_data_paths: HashSet::from_iter(all_files.data_file_paths.iter().cloned()),
-            unref_delete_paths: HashSet::from_iter(all_files.delete_file_paths.iter().cloned()),
-            unref_index_uuids: HashSet::from_iter(all_files.index_uuids.iter().cloned()),
-            old_manifest_paths: Vec::new(),
-        }
-    }
-}
-
-impl InvalidFiles {
-    fn finish(self, dataset: &Dataset) -> (Vec<Path>, Vec<Path>) {
-        let mut all_paths = self.old_manifest_paths;
-        all_paths.extend(self.unref_data_paths);
-        all_paths.extend(self.unref_delete_paths);
-        let all_dirs = Vec::from_iter(
-            self.unref_index_uuids
-                .into_iter()
-                .map(|uuid| index_dir(dataset, &uuid)),
-        );
-        (all_paths, all_dirs)
-    }
-}
-
-#[derive(Default)]
-struct FilesList {
-    data_file_paths: Vec<Path>,
-    manifest_file_paths: Vec<Path>,
+#[derive(Clone, Debug, Default)]
+struct ReferencedFiles {
+    data_paths: HashSet<Path>,
+    delete_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
-    delete_file_paths: Vec<Path>,
 }
 
-fn join_paths(base: &Path, child: &Path) -> Path {
-    return child
-        .parts()
-        .fold(base.clone(), |joined, part| joined.child(part));
+#[derive(Clone, Debug, Default)]
+pub struct RemovalStats {
+    unreferenced_data_paths: u64,
+    unreferenced_delete_paths: u64,
+    unreferenced_index_paths: u64,
+    old_manifests: u64,
 }
 
 fn remove_prefix(path: &Path, prefix: &Path) -> Path {
@@ -83,58 +54,31 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
     Path::from_iter(relative_parts.unwrap())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 struct CleanupTask<'a> {
     dataset: &'a Dataset,
     /// Cleanup all versions before this time
     before: DateTime<Utc>,
+    old_manifests: Arc<Mutex<Vec<Path>>>,
+    referenced_files: Arc<Mutex<ReferencedFiles>>,
 }
 
 const MINIMUM_CLEANUP_DAYS: i64 = 7;
 
 impl<'a> CleanupTask<'a> {
     fn new(dataset: &'a Dataset, before: DateTime<Utc>) -> Self {
-        Self { dataset, before }
+        Self {
+            dataset,
+            before,
+            old_manifests: Arc::new(Mutex::new(Vec::default())),
+            referenced_files: Arc::new(Mutex::new(ReferencedFiles::default())),
+        }
     }
 
-    async fn run(&mut self) -> Result<()> {
+    async fn run(&self) -> Result<RemovalStats> {
         self.validate()?;
-        let all_paths: Vec<Path> = self
-            .dataset
-            .object_store
-            .read_dir_all(&self.dataset.base)
-            .await?
-            .try_collect()
-            .await?;
-        let mut files_list: FilesList = Default::default();
-        for path in all_paths {
-            self.discover_path(&path, &mut files_list)?;
-        }
-        let mut invalid_files = InvalidFiles::new(&files_list);
-        let mut has_valid_manifest = false;
-        for manifest in &files_list.manifest_file_paths {
-            self.process_manifest_file(manifest, &mut invalid_files, &mut has_valid_manifest)
-                .await?;
-        }
-        if !has_valid_manifest {
-            // If there are no valid manifest files then err on the side of
-            // not deleting anything.
-            return Ok(());
-        }
-        // For paths we get relative paths.  For index dirs we get fully qualified
-        // paths.
-        let (paths_to_del, dirs_to_del) = invalid_files.finish(self.dataset);
-        for path in &paths_to_del {
-            let full_path = join_paths(&self.dataset.base, &Path::parse(path)?);
-            self.dataset.object_store.remove(full_path).await?;
-        }
-        for dir in &dirs_to_del {
-            self.dataset
-                .object_store
-                .remove_dir_all(dir.to_owned())
-                .await?;
-        }
-        Ok(())
+        self.process_manifests().await?;
+        self.delete_unreferenced_files().await
     }
 
     fn validate(&self) -> Result<()> {
@@ -147,55 +91,51 @@ impl<'a> CleanupTask<'a> {
         Ok(())
     }
 
-    async fn process_manifest_file(
-        &self,
-        path: &Path,
-        invalid_files: &mut InvalidFiles,
-        has_valid_manifest: &mut bool,
-    ) -> Result<bool> {
+    async fn process_manifests(&self) -> Result<()> {
+        self.dataset
+            .object_store
+            .read_dir_all(&self.dataset.versions_dir(), None)
+            .await?
+            .try_filter(|path| future::ready(path.extension() == Some("manifest")))
+            .try_for_each_concurrent(
+                8,
+                |path| async move { self.process_manifest_file(&path).await },
+            )
+            .await
+    }
+
+    async fn process_manifest_file(&self, path: &Path) -> Result<()> {
         // TODO: We can't cleanup invalid manifests.  There is no way to distinguish
         // between an invalid manifest and a temporary I/O error.  It's also not safe
         // to ignore a manifest error because if it is a temporary I/O error and we
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
 
-        let manifest_path = join_paths(&self.dataset.base, &Path::parse(path)?);
-        let manifest = read_manifest(&self.dataset.object_store, &manifest_path).await?;
+        let manifest = read_manifest(&self.dataset.object_store, &path).await?;
         let dataset_version = self.dataset.version().version;
         // Don't delete the latest version, even if it is old
         let is_latest = dataset_version == manifest.version;
         if is_latest || manifest.timestamp() >= self.before {
-            println!(
-                "Skipping manifest {:?} because it is newer than the cutoff",
-                path
-            );
-            *has_valid_manifest = true;
-            self.process_valid_manifest(&manifest, path, invalid_files)
-                .await?;
-            return Ok(true);
+            self.process_valid_manifest(&manifest, path).await?;
+            return Ok(());
         } else {
-            println!(
-                "Found old manifest {:?} with timestamp {:?} but the cutoff is {:?}",
-                path,
-                manifest.timestamp(),
-                self.before
-            );
-            invalid_files.old_manifest_paths.push(path.clone());
+            let mut old_manifests = self.old_manifests.lock().unwrap();
+            old_manifests.push(path.clone());
         }
-        Ok(false)
+        Ok(())
     }
 
     async fn process_valid_manifest(
         &self,
         manifest: &Manifest,
         manifest_path: &Path,
-        invalid_files: &mut InvalidFiles,
     ) -> Result<()> {
+        let mut referenced_files = self.referenced_files.lock().unwrap();
         for fragment in manifest.fragments.iter() {
             for file in fragment.files.iter() {
                 let full_data_path = self.dataset.data_dir().child(file.path.as_str());
                 let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
-                invalid_files.unref_data_paths.remove(&relative_data_path);
+                referenced_files.data_paths.insert(relative_data_path);
             }
             let delpath = fragment
                 .deletion_file
@@ -203,70 +143,119 @@ impl<'a> CleanupTask<'a> {
                 .map(|delfile| deletion_file_path(&self.dataset.base, fragment.id, delfile));
             if delpath.is_some() {
                 let relative_path = remove_prefix(&delpath.unwrap(), &self.dataset.base);
-                invalid_files.unref_delete_paths.remove(&relative_path);
+                referenced_files.delete_paths.insert(relative_path);
             }
         }
-        let full_path = join_paths(&self.dataset.base, manifest_path);
         let indexes =
-            read_manifest_indexes(&self.dataset.object_store, &full_path, manifest).await?;
+            read_manifest_indexes(&self.dataset.object_store, &manifest_path, manifest).await?;
         for index in indexes {
             let uuid_str = index.uuid.to_string();
-            invalid_files.unref_index_uuids.remove(&uuid_str);
+            referenced_files.index_uuids.insert(uuid_str);
         }
         Ok(())
     }
 
-    fn discover_path(&mut self, path: &Path, files_list: &mut FilesList) -> Result<()> {
-        let relative_path = remove_prefix(path, &self.dataset.base);
+    async fn delete_unreferenced_files(&self) -> Result<RemovalStats> {
+        let removal_stats = Mutex::new(RemovalStats::default());
+        let unreferenced_paths = self
+            .dataset
+            .object_store
+            .read_dir_all(&self.dataset.base, Some(self.before))
+            .await?
+            .try_filter_map(|path| future::ready(self.path_if_not_referenced(path, &removal_stats)))
+            .boxed();
+
+        let old_manifests = self.old_manifests.lock().unwrap().clone();
+        let num_old_manifests = old_manifests.len();
+        let old_manifests_stream = stream::iter(old_manifests)
+            .map(|path| Result::<Path>::Ok(path))
+            .boxed();
+
+        let all_paths_to_remove =
+            stream::iter(vec![unreferenced_paths, old_manifests_stream]).flatten();
+
+        self.dataset
+            .object_store
+            .remove_stream(all_paths_to_remove.boxed())
+            .for_each(|_| future::ready(()))
+            .await;
+
+        let mut removal_stats = removal_stats.into_inner().unwrap();
+        removal_stats.old_manifests = num_old_manifests as u64;
+        Ok(removal_stats)
+    }
+
+    fn path_if_not_referenced(
+        &self,
+        path: Path,
+        stats: &Mutex<RemovalStats>,
+    ) -> Result<Option<Path>> {
+        let relative_path = remove_prefix(&path, &self.dataset.base);
+        let referenced_files = self.referenced_files.lock().unwrap();
+        let mut stats = stats.lock().unwrap();
         if relative_path.as_ref().starts_with("_indices") {
             // For indices we just grab the UUID because we want to delete the entire
             // folder if we determine an index is expired.
             if let Some(uuid) = relative_path.parts().nth(1) {
-                files_list
-                    .index_uuids
-                    .insert(Path::parse(uuid)?.as_ref().to_owned());
+                if referenced_files.index_uuids.contains(uuid.as_ref()) {
+                    return Ok(None);
+                } else {
+                    stats.unreferenced_index_paths += 1;
+                    return Ok(Some(path));
+                }
+            } else {
+                return Ok(None);
             }
-            // Intentionally returning early here.  We don't want data files in index directories
-            // to be treated like normal data files.
-            return Ok(());
         }
         match path.extension() {
             Some("lance") => {
                 if relative_path.as_ref().starts_with("data") {
-                    files_list.data_file_paths.push(relative_path);
+                    if referenced_files.data_paths.contains(&relative_path) {
+                        Ok(None)
+                    } else {
+                        stats.unreferenced_data_paths += 1;
+                        Ok(Some(path))
+                    }
+                } else {
+                    // If a .lance file isn't in the data directory we err on the side of leaving it alone
+                    Ok(None)
                 }
             }
             Some("manifest") => {
-                // We intentionally ignore _latest.manifest.  We should never delete
-                // it and we can assume that it is a clone of one of the _versions/... files
-                if relative_path.as_ref().starts_with("_versions") {
-                    files_list.manifest_file_paths.push(relative_path)
-                }
+                // We already scanned the manifest files
+                Ok(None)
             }
-            Some("arrow") => {
+            Some("arrow") | Some("bin") => {
                 if relative_path.as_ref().starts_with("_deletions") {
-                    files_list.delete_file_paths.push(relative_path);
+                    if referenced_files.delete_paths.contains(&relative_path) {
+                        Ok(None)
+                    } else {
+                        stats.unreferenced_delete_paths += 1;
+                        Ok(Some(path))
+                    }
+                } else {
+                    Ok(None)
                 }
             }
-            Some("bin") => {
-                if relative_path.as_ref().starts_with("_deletions") {
-                    files_list.delete_file_paths.push(relative_path);
-                }
-            }
-            _ => (),
-        };
-        Ok(())
+            _ => Ok(None),
+        }
     }
 }
 
-pub async fn cleanup_old_versions(dataset: &Dataset, before: DateTime<Utc>) -> Result<()> {
-    let mut cleanup = CleanupTask::new(dataset, before);
+pub async fn cleanup_old_versions(
+    dataset: &Dataset,
+    before: DateTime<Utc>,
+) -> Result<RemovalStats> {
+    let cleanup = CleanupTask::new(dataset, before);
     cleanup.run().await
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
 
     use arrow_array::RecordBatchReader;
     use chrono::Duration;
@@ -296,6 +285,7 @@ mod tests {
     #[derive(Debug)]
     struct MockObjectStore {
         policy: Arc<Mutex<ProxyObjectStorePolicy>>,
+        last_modified_times: Arc<Mutex<HashMap<Path, DateTime<Utc>>>>,
     }
 
     impl WrappingObjectStore for MockObjectStore {
@@ -309,9 +299,37 @@ mod tests {
 
     impl MockObjectStore {
         pub(crate) fn new() -> Self {
-            Self {
+            let instance = Self {
                 policy: Arc::new(Mutex::new(ProxyObjectStorePolicy::new())),
-            }
+                last_modified_times: Arc::new(Mutex::new(HashMap::new())),
+            };
+            instance.add_timestamp_policy();
+            instance
+        }
+
+        fn add_timestamp_policy(&self) {
+            let mut policy = self.policy.lock().unwrap();
+            let times_map = self.last_modified_times.clone();
+            policy.set_before_policy(
+                "record_file_time",
+                Arc::new(move |_, path| {
+                    dbg!("Recording time {} for {:?}", utc_now(), &path);
+                    let mut times_map = times_map.lock().unwrap();
+                    times_map.insert(path.clone(), utc_now());
+                    Ok(())
+                }),
+            );
+            let times_map = self.last_modified_times.clone();
+            policy.set_obj_meta_policy(
+                "add_recorded_file_time",
+                Arc::new(move |_, meta| {
+                    let mut meta = meta;
+                    if let Some(recorded) = times_map.lock().unwrap().get(&meta.location) {
+                        meta.last_modified = recorded.clone();
+                    }
+                    Ok(meta)
+                }),
+            );
         }
     }
 
@@ -432,21 +450,22 @@ mod tests {
 
         fn block_commits(&mut self) {
             let mut policy = self.mock_store.policy.lock().unwrap();
-            policy.set_before_policy("block_commit", |op, _| -> Result<()> {
-                if op.contains("copy") {
-                    return Err(Error::Internal {
-                        message: "Copy blocked".to_string(),
-                    });
-                }
-                Ok(())
-            });
+            policy.set_before_policy(
+                "block_commit",
+                Arc::new(|op, _| -> Result<()> {
+                    if op.contains("copy") {
+                        return Err(Error::Internal {
+                            message: "Copy blocked".to_string(),
+                        });
+                    }
+                    Ok(())
+                }),
+            );
         }
 
-        async fn run_cleanup(&self, before: DateTime<Utc>) -> Result<()> {
+        async fn run_cleanup(&self, before: DateTime<Utc>) -> Result<RemovalStats> {
             let db = self.open().await?;
-            let mut cleanup = CleanupTask::new(&db, before);
-            cleanup.run().await?;
-            Ok(())
+            cleanup_old_versions(&db, before).await
         }
 
         async fn open(&self) -> Result<Box<Dataset>> {
@@ -465,7 +484,7 @@ mod tests {
         async fn count_files(&self) -> Result<FileCounts> {
             let (os, path) =
                 ObjectStore::from_uri_and_params(&self.dataset_path, self.os_params()).await?;
-            let mut file_stream = os.read_dir_all(&path).await?;
+            let mut file_stream = os.read_dir_all(&path, None).await?;
             let mut file_count = FileCounts {
                 num_data_files: 0,
                 num_delete_files: 0,
@@ -494,7 +513,7 @@ mod tests {
         async fn debug_print_files(&self) -> Result<()> {
             let (os, path) =
                 ObjectStore::from_uri_and_params(&self.dataset_path, self.os_params()).await?;
-            let mut file_stream = os.read_dir_all(&path).await?;
+            let mut file_stream = os.read_dir_all(&path, None).await?;
             while let Some(path) = file_stream.try_next().await.unwrap() {
                 println!("File: {:?}", path);
             }
@@ -515,10 +534,15 @@ mod tests {
 
         let before_count = fixture.count_files().await.unwrap();
 
-        fixture
+        let removed = fixture
             .run_cleanup(utc_now() - Duration::days(8))
             .await
             .unwrap();
+
+        assert_eq!(removed.old_manifests, 1);
+        assert_eq!(removed.unreferenced_data_paths, 1);
+        assert_eq!(removed.unreferenced_delete_paths, 0);
+        assert_eq!(removed.unreferenced_index_paths, 0);
 
         let after_count = fixture.count_files().await.unwrap();
         // There should be one less data file
@@ -537,8 +561,8 @@ mod tests {
 
     #[tokio::test]
     async fn do_not_cleanup_newer_data() {
-        // Only manifest files older than the `before` parameter should
-        // be removed
+        // Even though an old manifest is removed the data files should
+        // remain if they are still referenced by newer manifests
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
         fixture.clock.set_system_time(Duration::days(10));
@@ -552,7 +576,12 @@ mod tests {
         assert_eq!(before_count.num_manifest_files, 4);
 
         let before = utc_now() - Duration::days(7);
-        fixture.run_cleanup(before).await.unwrap();
+        let removed = fixture.run_cleanup(before).await.unwrap();
+
+        assert_eq!(removed.old_manifests, 1);
+        assert_eq!(removed.unreferenced_data_paths, 0);
+        assert_eq!(removed.unreferenced_delete_paths, 0);
+        assert_eq!(removed.unreferenced_index_paths, 0);
 
         let after_count = fixture.count_files().await.unwrap();
         // The data files should all remain since they are referenced by
@@ -590,7 +619,12 @@ mod tests {
         assert_eq!(before_count.num_manifest_files, 4);
 
         let before = utc_now() - Duration::days(8);
-        fixture.run_cleanup(before).await.unwrap();
+        let removed = fixture.run_cleanup(before).await.unwrap();
+
+        assert_eq!(removed.old_manifests, 2);
+        assert_eq!(removed.unreferenced_data_paths, 1);
+        assert_eq!(removed.unreferenced_delete_paths, 0);
+        assert_eq!(removed.unreferenced_index_paths, 2);
 
         fixture.debug_print_files().await.unwrap();
 
@@ -632,7 +666,12 @@ mod tests {
         assert_eq!(before_count.num_manifest_files, 6);
 
         let before = utc_now() - Duration::days(8);
-        fixture.run_cleanup(before).await.unwrap();
+        let removed = fixture.run_cleanup(before).await.unwrap();
+
+        assert_eq!(removed.old_manifests, 3);
+        assert_eq!(removed.unreferenced_data_paths, 2);
+        assert_eq!(removed.unreferenced_delete_paths, 1);
+        assert_eq!(removed.unreferenced_index_paths, 0);
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(after_count.num_data_files, 1);
@@ -658,7 +697,13 @@ mod tests {
 
         let before_count = fixture.count_files().await.unwrap();
         let before = utc_now() - Duration::days(8);
-        fixture.run_cleanup(before).await.unwrap();
+        let removed = fixture.run_cleanup(before).await.unwrap();
+
+        assert_eq!(removed.old_manifests, 0);
+        assert_eq!(removed.unreferenced_data_paths, 0);
+        assert_eq!(removed.unreferenced_delete_paths, 0);
+        assert_eq!(removed.unreferenced_index_paths, 0);
+
         let after_count = fixture.count_files().await.unwrap();
 
         fixture.debug_print_files().await.unwrap();
@@ -672,10 +717,10 @@ mod tests {
         // for whatever reason
 
         let mut fixture = MockDatasetFixture::try_new().unwrap();
-        fixture.clock.set_system_time(Duration::days(10));
         fixture.create_some_data().await.unwrap();
         fixture.block_commits();
         assert!(fixture.append_some_data().await.is_err());
+        fixture.clock.set_system_time(Duration::days(10));
 
         let before_count = fixture.count_files().await.unwrap();
         // This append will fail since the commit is blocked but it should have
@@ -685,13 +730,48 @@ mod tests {
 
         // All of our manifests are newer than the threshold but temp files
         // should still be deleted.
-        fixture
+        let removed = fixture
             .run_cleanup(utc_now() - Duration::days(7))
             .await
             .unwrap();
 
+        assert_eq!(removed.old_manifests, 0);
+        assert_eq!(removed.unreferenced_data_paths, 1);
+        assert_eq!(removed.unreferenced_delete_paths, 0);
+        assert_eq!(removed.unreferenced_index_paths, 0);
+
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(after_count.num_data_files, 1);
         assert_eq!(after_count.num_manifest_files, 2);
+    }
+
+    #[tokio::test]
+    async fn dont_cleanup_in_progress_write() {
+        // We should not cleanup data files newer than our threshold as they might
+        // belong to in-progress writes
+
+        // For testing purposes we actually create these files with a failed write
+        // but the cleanup routine has no way of detecting this.  They should look
+        // just like an in-progress write.
+        let mut fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.clock.set_system_time(Duration::days(10));
+        fixture.create_some_data().await.unwrap();
+        fixture.block_commits();
+        assert!(fixture.append_some_data().await.is_err());
+
+        let before_count = fixture.count_files().await.unwrap();
+
+        let removed = fixture
+            .run_cleanup(utc_now() - Duration::days(7))
+            .await
+            .unwrap();
+
+        assert_eq!(removed.old_manifests, 0);
+        assert_eq!(removed.unreferenced_data_paths, 0);
+        assert_eq!(removed.unreferenced_delete_paths, 0);
+        assert_eq!(removed.unreferenced_index_paths, 0);
+
+        let after_count = fixture.count_files().await.unwrap();
+        assert_eq!(before_count, after_count);
     }
 }

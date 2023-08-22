@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Duration;
 use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use num_traits::real::Real;
 use num_traits::FromPrimitive;
 use object_store::path::Path;
@@ -30,6 +31,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::future;
 use std::iter::repeat_with;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -84,7 +86,23 @@ pub(crate) use assert_err_containing;
 
 /// A policy function takes in the name of the operation (e.g. "put") and the location
 /// that is being accessed / modified and returns an optional error.
-type PolicyFn = fn(&str, &Path) -> Result<()>;
+pub trait PolicyFnT: Fn(&str, &Path) -> Result<()> + Send + Sync {}
+impl<F> PolicyFnT for F where F: Fn(&str, &Path) -> Result<()> + Send + Sync {}
+impl Debug for dyn PolicyFnT {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PolicyFn")
+    }
+}
+type PolicyFn = Arc<dyn PolicyFnT>;
+
+pub trait ObjectMetaPolicyFnT: Fn(&str, ObjectMeta) -> Result<ObjectMeta> + Send + Sync {}
+impl<F> ObjectMetaPolicyFnT for F where F: Fn(&str, ObjectMeta) -> Result<ObjectMeta> + Send + Sync {}
+impl Debug for dyn ObjectMetaPolicyFnT {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PolicyFn")
+    }
+}
+type ObjectMetaPolicyFn = Arc<dyn ObjectMetaPolicyFnT>;
 
 /// A policy container, meant to be shared between test code and the proxy object store.
 ///
@@ -100,20 +118,28 @@ pub(crate) struct ProxyObjectStorePolicy {
     /// an error then the target method will not be invoked and the error will
     /// be returned instead.
     before_policies: HashMap<String, PolicyFn>,
+    /// Policies which run after calls that return ObjectMeta.  The policy can
+    /// tranform the returned ObjectMeta to mock out file listing results.
+    object_meta_policies: HashMap<String, ObjectMetaPolicyFn>,
 }
 
 impl ProxyObjectStorePolicy {
     pub fn new() -> Self {
         Self {
             before_policies: HashMap::new(),
+            object_meta_policies: HashMap::new(),
         }
     }
 
     /// Set a new policy with the given name
     ///
     /// The name can be used to later remove this policy
-    pub fn set_before_policy(&mut self, name: &str, policy: fn(&str, &Path) -> Result<()>) {
+    pub fn set_before_policy(&mut self, name: &str, policy: PolicyFn) {
         self.before_policies.insert(name.to_string(), policy);
+    }
+
+    pub fn set_obj_meta_policy(&mut self, name: &str, policy: ObjectMetaPolicyFn) {
+        self.object_meta_policies.insert(name.to_string(), policy);
     }
 }
 
@@ -139,12 +165,18 @@ impl ProxyObjectStore {
     fn before_method(&self, method: &str, location: &Path) -> OSResult<()> {
         let policy = self.policy.lock().unwrap();
         for policy in policy.before_policies.values() {
-            policy(method, location).map_err(|err| OSError::Generic {
-                store: "ProxyObjectStore::before",
-                source: Box::new(err),
-            })?;
+            policy(method, location).map_err(|err| OSError::from(err))?;
         }
         Ok(())
+    }
+
+    fn transform_meta(&self, method: &str, meta: ObjectMeta) -> OSResult<ObjectMeta> {
+        let policy = self.policy.lock().unwrap();
+        let mut meta = meta;
+        for policy in policy.object_meta_policies.values() {
+            meta = policy(method, meta).map_err(|err| OSError::from(err))?;
+        }
+        Ok(meta)
     }
 }
 
@@ -196,7 +228,8 @@ impl ObjectStore for ProxyObjectStore {
 
     async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
         self.before_method("head", location)?;
-        self.target.head(location).await
+        let meta = self.target.head(location).await?;
+        self.transform_meta("head", meta)
     }
 
     async fn delete(&self, location: &Path) -> OSResult<()> {
@@ -205,7 +238,13 @@ impl ObjectStore for ProxyObjectStore {
     }
 
     async fn list(&self, prefix: Option<&Path>) -> OSResult<BoxStream<'_, OSResult<ObjectMeta>>> {
-        self.target.list(prefix).await
+        OSResult::Ok(
+            self.target
+                .list(prefix)
+                .await?
+                .and_then(|meta| future::ready(self.transform_meta("list", meta)))
+                .boxed(),
+        )
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
