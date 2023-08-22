@@ -16,59 +16,112 @@
 
 from __future__ import annotations
 
+from typing import Optional, Dict
 from abc import ABC, abstractmethod
+import json
 
 
 class FragmentWriteProgress(ABC):
-    """Progress tracking for Writing a Dataset or Fragment"""
+    """Progress tracking for Writing a Dataset or Fragment.
 
-    def _do_begin(self, fragment_json: str):
+    Warns
+    -----
+    This tracking class is experimental and may change in the future.
+    """
+
+    def _do_begin(self, fragment_json: str, **kwargs):
         """Called when a new fragment is created"""
         from .fragment import FragmentMetadata
 
         fragment = FragmentMetadata.from_json(fragment_json)
-        return self.begin(fragment)
+        return self.begin(fragment, **kwargs)
 
     @abstractmethod
-    def begin(self, fragment: "FragmentMetadata"):
-        """Called when a new fragment is created"""
+    def begin(
+        self, fragment: "FragmentMetadata", multipart_id: Optional[str] = None, **kwargs
+    ) -> None:
+        """Called when a new fragment is created.
+
+        Parameters
+        ----------
+        fragment : FragmentMetadata
+            The fragment that is open to write to.
+        multipart_id : str, optional
+            The multipart id to upload this fragment to cloud storage.
+        kwargs: dict, optional
+            Extra keyword arguments to pass to the implementation.
+
+        Returns
+        -------
+        None
+        """
         pass
 
-    def _do_complete(self, fragment_json: str):
+    def _do_complete(self, fragment_json: str, **kwargs):
         """Called when a fragment is completed"""
         from .fragment import FragmentMetadata
 
         fragment = FragmentMetadata.from_json(fragment_json)
-        return self.complete(fragment)
+        return self.complete(fragment, **kwargs)
 
     @abstractmethod
-    def complete(self, fragment: "FragmentMetadata"):
-        """Called when a fragment is completed"""
+    def complete(self, fragment: "FragmentMetadata", **kwargs) -> None:
+        """Callback when a fragment is completed written.
+
+        Parameters
+        ----------
+        fragment : FragmentMetadata
+            The fragment that is open to write to.
+        kwargs: dict, optional
+            Extra keyword arguments to pass to the implementation.
+        """
         pass
 
 
 class NoopFragmentWriteProgress(FragmentWriteProgress):
-    """No-op implementation of WriteProgressTracker"""
+    """No-op implementation of WriteProgressTracker.
 
-    def begin(self, fragment: "FragmentMetadata"):
+    This is the default implementation.
+    """
+
+    def begin(self, fragment: "FragmentMetadata", **kargs):
         pass
 
-    def complete(self, fragment: "FragmentMetadata"):
+    def complete(self, fragment: "FragmentMetadata", **kwargs):
         pass
 
 
 class FileSystemFragmentWriteProgress(FragmentWriteProgress):
     """Progress tracking for Writing a Dataset or Fragment.
 
-    This implementation writes a JSON file to the filesystem for each fragment.
+    Warns
+    -----
+    This tracking class is experimental and will change in the future.
+
+    This implementation writes a JSON file to track in-progress state
+    to the filesystem for each fragment.
+
+
     """
 
-    def __init__(self, base_uri: str):
+    def __init__(self, base_uri: str, metadata: Optional[Dict[str, str]] = None):
+        """Create a FileSystemFragmentWriteProgress tracker.
+
+        Parameters
+        ----------
+        base_uri : str
+            The base directory to write the progress files to. Two files will be created
+            under this directory: a Fragment file, and a JSON file to track progress.
+        metadata : dict, optional
+            Extra metadata for this Progress tracker instance. Can be used to track
+            distributed worker where this tracker is running.
+        """
         from pyarrow.fs import FileSystem
 
         fs, path = FileSystem.from_uri(base_uri)
         self._fs = fs
         self._base_path = path
+        self._metadata = metadata if metadata else {}
 
     def _in_progress_path(self, fragment: "FragmentMetadata"):
         return self._base_path / f"fragment_{fragment.id}.in_progress"
@@ -76,15 +129,30 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
     def _fragment_file(self, fragment: "FragmentMetadata"):
         return self._base_path / f"fragment_{fragment.id}.json"
 
-    def begin(self, fragment: "FragmentMetadata"):
-        """Called when a new fragment is created"""
+    def begin(
+        self, fragment: "FragmentMetadata", multipart_id: Optional[str] = None, **kwargs
+    ):
+        """Called when a new fragment is created.
+
+        Parameters
+        ----------
+        fragment : FragmentMetadata
+            The fragment that is open to write to.
+        multipart_id : str, optional
+            The multipart id to upload this fragment to cloud storage.
+        """
 
         self._fs.create_dir(self._base_path)
         with self._fs.open_output_stream(self._in_progress_path(fragment)) as out:
-            out.write(str(fragment.id).encode("utf-8"))
+            progress_data = {
+                "fragment_id": fragment.id,
+                "multipart_id": multipart_id if multipart_id else "",
+                "metadata": self._metadata,
+            }
+            json.dump(progress_data, out)
         with self._fs.open_input_stream(self._fragment_file(fragment)) as out:
             out.write(fragment.to_json()).encode("utf-8")
 
-    def complete(self, fragment: "FragmentMetadata"):
+    def complete(self, fragment: "FragmentMetadata", **kwargs):
         """Called when a fragment is completed"""
         self._fs.delete(self._in_progress_path(fragment))

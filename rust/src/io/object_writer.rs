@@ -35,7 +35,9 @@ pub struct ObjectWriter {
     // TODO: wrap writer with a BufWriter.
     #[pin]
     writer: Box<dyn AsyncWrite + Unpin + Send>,
-    multipart_id: MultipartId,
+
+    pub(crate) multipart_id: MultipartId,
+
     cursor: usize,
 }
 

@@ -81,12 +81,10 @@ impl FileFragment {
         let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
         let filename = format!("{}.lance", Uuid::new_v4());
         let fragment = Fragment::with_file(id as u64, &filename, &schema);
-
-        progress.begin(&fragment).await?;
-
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
-
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
+
+        progress.begin(&fragment, writer.multipart_id()).await?;
 
         let mut buffered_reader = chunk_stream(stream, params.max_rows_per_group);
         while let Some(batched_chunk) = buffered_reader.next().await {

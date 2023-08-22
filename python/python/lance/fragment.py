@@ -26,8 +26,7 @@ except ImportError:
     pd = None
 import pyarrow as pa
 
-from .lance import _Fragment
-from .lance import _FragmentMetadata as _FragmentMetadata
+from .lance import _Fragment, _FragmentMetadata as _FragmentMetadata
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 
 if TYPE_CHECKING:
@@ -154,6 +153,12 @@ class LanceFragment(pa.dataset.Fragment):
             from the data.
         max_rows_per_group: int, default 1024
             The maximum number of rows per group in the data file.
+        progress: FragmentWriteProgress, optional
+            *Experimental API*. Progress tracking for writing the fragment.
+
+        Returns
+        -------
+        FragmentMetadata
         """
         if pd and isinstance(data, pd.DataFrame):
             reader = pa.Table.from_pandas(data, schema=schema).to_reader()
