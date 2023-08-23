@@ -193,6 +193,14 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.schema
 
+    @property
+    def schema_metadata(self):
+        """
+        The pyarrow Schema for this dataset
+        """
+        return self._ds.schema_metadata
+
+
     def to_table(
         self,
         columns: Optional[list[str]] = None,

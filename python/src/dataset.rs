@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::str;
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::{Float32Array, RecordBatch};
 use arrow_data::ArrayData;
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::arrow::as_fixed_size_list_array;
 use lance::dataset::fragment::FileFragment as LanceFileFragment;
 use lance::dataset::ReadParams;
@@ -100,8 +101,16 @@ impl Dataset {
 
     #[getter(schema)]
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
-        let arrow_schema = ArrowSchema::from(self_.ds.schema());
-        arrow_schema.to_pyarrow(self_.py())
+        let metadata: HashMap<String, String> = vec![("dataset".to_string(), "vector".to_string())]
+            .into_iter()
+            .collect();
+        ArrowSchema::new_with_metadata(vec![
+                Field::new("i", DataType::Int32, true)], metadata).to_pyarrow(self_.py())
+    }
+
+    #[getter(schema_metadata)]
+    fn schema_metadata(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+        Ok(vec![("dataset".to_string(), "vector".to_string())].into_py_dict(self_.py()).into())
     }
 
     /// Load index metadata
