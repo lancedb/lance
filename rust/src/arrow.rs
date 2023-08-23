@@ -292,6 +292,11 @@ pub trait RecordBatchExt {
     /// ```
     fn try_with_column(&self, field: Field, arr: ArrayRef) -> Result<RecordBatch>;
 
+    /// Creates a new [`RecordBatch`] from the provided  [`StructArray`].
+    ///
+    /// The fields on the [`StructArray`] need to match this [`RecordBatch`] schema
+    fn try_new_from_struct_array(&self, arr: StructArray) -> Result<RecordBatch>;
+
     /// Merge with another [`RecordBatch`] and returns a new one.
     ///
     /// ```
@@ -352,6 +357,14 @@ impl RecordBatchExt for RecordBatch {
         Ok(Self::try_new(new_schema, new_columns)?)
     }
 
+    fn try_new_from_struct_array(&self, arr: StructArray) -> Result<Self> {
+        let schema = Arc::new(Schema::new_with_metadata(
+            arr.fields().to_vec(),
+            self.schema().metadata.clone(),
+        ));
+        Ok(Self::try_new(schema, arr.columns().to_vec())?)
+    }
+
     fn merge(&self, other: &Self) -> Result<Self> {
         if self.num_rows() != other.num_rows() {
             return Err(Error::Arrow {
@@ -364,7 +377,7 @@ impl RecordBatchExt for RecordBatch {
         }
         let left_struct_array: StructArray = self.clone().into();
         let right_struct_array: StructArray = other.clone().into();
-        merge(&left_struct_array, &right_struct_array).map(|arr| arr.into())
+        self.try_new_from_struct_array(merge(&left_struct_array, &right_struct_array)?)
     }
 
     fn drop_column(&self, name: &str) -> Result<Self> {
@@ -397,7 +410,7 @@ impl RecordBatchExt for RecordBatch {
 
     fn project_by_schema(&self, schema: &Schema) -> Result<Self> {
         let struct_array: StructArray = self.clone().into();
-        project(&struct_array, schema.fields()).map(Self::from)
+        self.try_new_from_struct_array(project(&struct_array, schema.fields())?)
     }
 }
 
