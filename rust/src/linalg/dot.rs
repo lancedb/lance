@@ -74,19 +74,24 @@ impl Dot for [f64] {
     }
 }
 
+/// Negative dot product, to present the relative order of dot distance.
 pub fn dot_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Float32Array> {
     debug_assert_eq!(from.len(), dimension);
     debug_assert_eq!(to.len() % dimension, 0);
 
     let dists = unsafe {
-        Float32Array::from_trusted_len_iter(to.chunks_exact(dimension).map(|v| Some(1.0 - from.dot(v))))
+        Float32Array::from_trusted_len_iter(
+            to.chunks_exact(dimension)
+                .map(|v| Some(dot_distance(from, v))),
+        )
     };
     Arc::new(dists)
 }
 
+/// Negative dot distance.
 #[inline]
 pub fn dot_distance(from: &[f32], to: &[f32]) -> f32 {
-    1.0 - from.dot(to)
+    - from.dot(to)
 }
 
 #[cfg(target_arch = "x86_64")]
