@@ -1,6 +1,6 @@
 <div align="center">
 <p align="center">
- 
+
 <img width="257" alt="Lance Logo" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
 **Modern columnar data format for ML. Convert from Parquet in 2-lines of code for 100x faster random access, a vector index, data versioning, and more.<br/>**
@@ -125,7 +125,7 @@ Build the index
 
 ```python
 sift1m.create_index("vector",
-                    index_type="IVF_PQ", 
+                    index_type="IVF_PQ",
                     num_partitions=256,  # IVF
                     num_sub_vectors=16)  # PQ
 ```
@@ -143,7 +143,7 @@ sample = duckdb.query("SELECT vector FROM dataset USING SAMPLE 100").to_df()
 query_vectors = np.array([np.array(x) for x in sample.vector])
 
 # Get nearest neighbors for all of them
-rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})      
+rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
       for q in query_vectors]
 ```
 
@@ -169,7 +169,7 @@ Here we will highlight a few aspects of Lance’s design. For more details, see 
 
 **Fast updates** (ROADMAP): Updates will be supported via write-ahead logs.
 
-**Rich secondary indices** (ROADMAP): 
+**Rich secondary indices** (ROADMAP):
   - Inverted index for fuzzy search over many label / annotation fields.
 
 ## Benchmarks
@@ -242,4 +242,5 @@ Lance is currently used in production by:
 
 ## Presentations and Talks
 
+* [Lance Deep Dive](https://drive.google.com/file/d/1Orh9rK0Mpj9zN_gnQF1eJJFpAc6lStGm/view?usp=drive_link). July 2023.
 * [Lance: A New Columnar Data Format](https://docs.google.com/presentation/d/1a4nAiQAkPDBtOfXFpPg7lbeDAxcNDVKgoUkw3cUs2rE/edit#slide=id.p), [Scipy 2022, Austin, TX](https://www.scipy2022.scipy.org/posters). July, 2022.
