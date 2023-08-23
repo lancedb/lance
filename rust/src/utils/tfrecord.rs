@@ -17,15 +17,34 @@
 use crate::error::{Error, Result};
 use crate::io::ObjectStore;
 use arrow::record_batch::RecordBatch;
-use arrow_array::builder::ArrayBuilder;
-use arrow_schema::Schema as ArrowSchema;
-use object_store::path::Path;
+use arrow_array::builder::{make_builder, ArrayBuilder, BinaryBuilder};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use tfrecord::protobuf::TensorProto;
 use tfrecord::record_reader::RecordIter;
 use tfrecord::Example;
 
+/// Infer the Arrow schema from a TFRecord file.
+///
+/// The featured named by `tensor_features` will be assumed to be binary fields
+/// containing serialized tensors (TensorProto messages). Currently only
+/// fixed-shape tensors are supported.
+///
+/// The features named by `string_features` will be assumed to be UTF-8 encoded
+/// strings.
+pub async fn infer_tfrecord_schema(
+    uri: &str,
+    tensor_features: &[&str],
+    string_features: &[&str],
+) -> Result<ArrowSchema> {
+    todo!()
+}
+
 pub async fn read_tfrecord(uri: &str, schema: ArrowSchema) -> Result<RecordBatch> {
-    // TODO: Use schema to create builders
+    let mut builders = schema
+        .fields
+        .iter()
+        .map(|field| make_builder(field.data_type(), 10))
+        .collect::<Vec<_>>();
 
     let (store, path) = ObjectStore::from_uri(uri).await?;
     // TODO: should we avoid reading the entire file into memory?
@@ -37,13 +56,26 @@ pub async fn read_tfrecord(uri: &str, schema: ArrowSchema) -> Result<RecordBatch
             message: err.to_string(),
         })?;
         if let Some(features) = record.features {
-            for field in &schema.fields {
+            for (i, field) in schema.fields.iter().enumerate() {
+                let builder = builders.get_mut(i).unwrap();
                 if let Some(feature) = features.feature.get(field.name()) {
                     todo!("append feature to appropriate builder")
+                } else {
+                    // TODO: do we care about nulls / missing values?
+                    return Err(Error::IO {
+                        message: format!("missing feature {}", field.name()),
+                    });
                 }
             }
         }
     }
+
+    // Start with:
+    // * string
+    // * fixed shape tensor
+    // * int64
+    // * float32
+    // * binary list
 
     // TODO: support reading:
     // Binary
@@ -57,13 +89,27 @@ pub async fn read_tfrecord(uri: &str, schema: ArrowSchema) -> Result<RecordBatch
     todo!()
 }
 
-/// Infer the Arrow schema from a TFRecord file.
-///
-/// The featured named by `tensor_features` will be assumed to be binary fields
-/// containing serialized tensors (TensorProto messages). Currently only
-/// fixed-shape tensors are supported.
-pub async fn infer_tfrecord_schema(uri: &str, tensor_features: &[&str]) -> Result<ArrowSchema> {
-    todo!()
+fn append_feature(
+    field: &ArrowField,
+    builder: &mut dyn ArrayBuilder,
+    feature: &tfrecord::Feature,
+) -> Result<()> {
+    match (field.data_type(), feature.kind.as_ref().unwrap()) {
+        (DataType::Binary, tfrecord::protobuf::feature::Kind::BytesList(bytes_list)) => {
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<BinaryBuilder>()
+                .unwrap();
+            builder.append_value(&bytes_list.value[0]);
+        }
+        (_, _) => {
+            return Err(Error::IO {
+                message: format!("invalid feature type for field {}", field.name()),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Convert TensorProto message into an element of a FixedShapeTensor array and
@@ -74,6 +120,10 @@ pub async fn infer_tfrecord_schema(uri: &str, tensor_features: &[&str]) -> Resul
 ///
 /// FixedShapeTensor definition:
 /// https://arrow.apache.org/docs/format/CanonicalExtensions.html#fixed-shape-tensor
-pub fn append_fixedshape_tensor(builder: &dyn ArrayBuilder, tensor: &TensorProto) -> Result<()> {
+pub fn append_fixedshape_tensor(
+    field: &ArrowField,
+    builder: &dyn ArrayBuilder,
+    tensor: &TensorProto,
+) -> Result<()> {
     todo!()
 }

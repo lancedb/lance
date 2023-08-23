@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 import pandas as pd
+import numpy as np
 import pyarrow as pa
 import pytest
 
@@ -28,6 +29,7 @@ except ImportError:
 import lance
 from lance.fragment import LanceFragment
 from lance.tf.data import from_lance, lance_fragments
+from lance.tf.tfrecord import infer_tfrecord_schema, read_tfrecord
 
 
 @pytest.fixture
@@ -148,3 +150,64 @@ def test_var_length_list(tmp_path):
         assert batch["a"].numpy()[0] == idx * 8
         assert batch["l"].shape == (8, None)
         assert isinstance(batch["l"], tf.RaggedTensor)
+
+
+def test_tfrecord_parsing(tmp_path):
+    # Create a TFRecord with a string, float, int, and a tensor
+    tensor = tf.constant(np.array([list(range(3)), list(range(3, 6))]))
+
+    feature = {
+        'int': tf.train.Feature(int64_list = tf.train.Int64List(value=[1])),
+        'int_list': tf.train.Feature(int64_list = tf.train.Int64List(value=[1, 2, 3])),
+        'float': tf.train.Feature(float_list = tf.train.FloatList(value=[1.0])),
+        'float_list': tf.train.Feature(float_list = tf.train.FloatList(value=[1.0, 2.0, 3.0])),
+        'bytes': tf.train.Feature(bytes_list = tf.train.BytesList(value=[b'Hello, TensorFlow!'])),
+        'bytes_list': tf.train.Feature(bytes_list = tf.train.BytesList(value=[b'Hello, TensorFlow!', b'Hello, Lance!'])),
+        'string': tf.train.Feature(bytes_list = tf.train.BytesList(value=[b'Hello, TensorFlow!'])),
+        'tensor': tf.train.Feature(bytes_list = tf.train.BytesList(value=[tf.io.serialize_tensor(tensor).numpy()])),
+    }
+
+    example_proto = tf.train.Example(features=tf.train.Features(feature=feature))
+    serialized = example_proto.SerializeToString()
+
+    path = tmp_path / 'test.tfrecord'
+    with tf.io.TFRecordWriter(str(path)) as writer:
+        writer.write(serialized)
+
+    inferred_schema = infer_tfrecord_schema(str(path))
+    
+    assert inferred_schema == pa.schema({
+        'int': pa.int64(),
+        'int_list': pa.list_(pa.int64()),
+        'float': pa.float32(),
+        'float_list': pa.list_(pa.float32()),
+        'bytes': pa.binary(),
+        'bytes_list': pa.list_(pa.binary()),
+        # Will all be binary since we didn't specify which ones are tensors or strings
+        'string': pa.binary(),
+        'tensor': pa.binary()
+    })
+
+    inferred_schema = infer_tfrecord_schema(
+        str(path),
+        tensor_features=['tensor'],
+        string_features=['string'],
+    )
+    assert inferred_schema == pa.schema({
+        'int': pa.int64(),
+        'int_list': pa.list_(pa.int64()),
+        'float': pa.float32(),
+        'float_list': pa.list_(pa.float32()),
+        'bytes': pa.binary(),
+        'bytes_list': pa.list_(pa.binary()),
+        'string': pa.string(),
+        'tensor': pa.fixed_shape_tensor(pa.int32(), [3, 2]),
+    })
+
+    batch = read_tfrecord(str(path), inferred_schema)
+    assert batch.num_rows == 1
+    assert batch.num_columns == 3
+    assert batch.column_names == ['bytes', 'string', 'tensor']
+    assert batch['bytes'].to_pylist() == [b'Hello, TensorFlow!']
+    assert batch['string'].to_pylist() == ['Hello, TensorFlow!']
+    assert batch['tensor'].to_pylist() == [tensor.numpy().tolist()]

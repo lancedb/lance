@@ -20,10 +20,14 @@
 
 use std::env;
 
+use ::arrow::pyarrow::PyArrowType;
 use ::arrow::pyarrow::{FromPyArrow, ToPyArrow};
+use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
+use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use env_logger::Env;
+use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 
 #[macro_use]
@@ -70,6 +74,8 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
     m.add_wrapped(wrap_pyfunction!(json_to_schema))?;
+    m.add_wrapped(wrap_pyfunction!(infer_tfrecord_schema))?;
+    m.add_wrapped(wrap_pyfunction!(read_tfrecord))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
@@ -91,4 +97,46 @@ fn json_to_schema(py: Python<'_>, json: &str) -> PyResult<PyObject> {
         ))
     })?;
     schema.to_pyarrow(py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (uri, *, tensor_features = None, string_features = None))]
+fn infer_tfrecord_schema(
+    uri: &str,
+    tensor_features: Option<Vec<String>>,
+    string_features: Option<Vec<String>>,
+) -> PyResult<PyArrowType<ArrowSchema>> {
+    let tensor_features = tensor_features.unwrap_or_default();
+    let tensor_features = tensor_features
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>();
+    let string_features = string_features.unwrap_or_default();
+    let string_features = string_features
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>();
+    let schema = RT
+        .runtime
+        .block_on(::lance::utils::tfrecord::infer_tfrecord_schema(
+            uri,
+            &tensor_features,
+            &string_features,
+        ))
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+    Ok(PyArrowType(schema))
+}
+
+#[pyfunction]
+fn read_tfrecord(
+    uri: String,
+    schema: PyArrowType<ArrowSchema>,
+) -> PyResult<PyArrowType<RecordBatch>> {
+    let schema = schema.0;
+    let record_batch = RT
+        .spawn(None, async move {
+            ::lance::utils::tfrecord::read_tfrecord(&uri, schema).await
+        })
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+    Ok(PyArrowType(record_batch))
 }
