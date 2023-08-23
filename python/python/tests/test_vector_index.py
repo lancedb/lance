@@ -11,6 +11,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import platform
 import random
 import string
 import time
@@ -195,31 +196,33 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     assert len(index_uuid) == 36
 
     expected_filepath = str(tmp_path / "_indices" / index_uuid / "index.idx")
-    expected_index = [
-        {
-            "index_type": "IVF",
-            "uuid": index_uuid,
-            "uri": expected_filepath,
+    if platform.system() == "Windows":
+        expected_filepath = expected_filepath.replace("\\", "/")
+    expected_statistics = {
+        "index_type": "IVF",
+        "uuid": index_uuid,
+        "uri": expected_filepath,
+        "metric_type": "l2",
+        "num_partitions": 5,
+        "sub_index": {
+            "dimension": 128,
+            "index_type": "PQ",
             "metric_type": "l2",
-            "num_partitions": 5,
-            "sub_index": {
-                "dimension": 128,
-                "index_type": "PQ",
-                "metric_type": "l2",
-                "nbits": 8,
-                "num_sub_vectors": 8,
-            },
-        }
-    ]
+            "nbits": 8,
+            "num_sub_vectors": 8,
+        },
+    }
 
-    assert dataset_with_index.index_statistics("non-existent_idx") == []
-    assert dataset_with_index.index_statistics("") == []
+    with pytest.raises(KeyError, match='Index "non-existent_idx" not found'):
+        assert dataset_with_index.index_statistics("non-existent_idx")
+    with pytest.raises(KeyError, match='Index "" not found'):
+        assert dataset_with_index.index_statistics("")
     with pytest.raises(TypeError):
         dataset_with_index.index_statistics()
 
-    actual_index = dataset_with_index.index_statistics("vector_idx")
-    partitions = actual_index[0].pop("partitions")
-    assert actual_index == expected_index
+    actual_statistics = dataset_with_index.index_statistics("vector_idx")
+    partitions = actual_statistics.pop("partitions")
+    assert actual_statistics == expected_statistics
 
     assert len(partitions) == 5
     partition_keys = {"index", "length", "offset", "centroid"}

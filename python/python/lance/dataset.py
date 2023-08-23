@@ -95,7 +95,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.load_indices()
 
     def index_statistics(self, index_name: Optional[str] = None) -> Dict[str, Any]:
-        return json.loads(self._ds.statistics(index_name))
+        return json.loads(self._ds.index_statistics(index_name))
 
     @property
     def has_index(self):

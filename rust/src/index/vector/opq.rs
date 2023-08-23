@@ -273,7 +273,7 @@ impl std::fmt::Debug for OPQIndex {
 }
 
 #[derive(Serialize)]
-pub struct OPQIndexStats {
+pub struct OPQIndexStatistics {
     index_type: String,
     dim: usize,
     sub_index: serde_json::Value,
@@ -285,7 +285,7 @@ impl Index for OPQIndex {
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        Ok(serde_json::to_value(OPQIndexStats {
+        Ok(serde_json::to_value(OPQIndexStatistics {
             index_type: "OPQIndex".to_string(),
             dim: self
                 .opq

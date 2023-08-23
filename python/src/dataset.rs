@@ -115,11 +115,20 @@ impl Dataset {
         arrow_schema.to_pyarrow(self_.py())
     }
 
-    /// Get index stats
+    /// Get index statistics
     fn index_statistics(&self, index_name: String) -> PyResult<String> {
-        self.rt
-            .block_on(self.ds.statistics(index_name))
-            .map_err(|err| PyValueError::new_err(err.to_string()))
+        let index_statistics = self
+            .rt
+            .block_on(self.ds.index_statistics(index_name.clone()))
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        if let Some(s) = index_statistics {
+            Ok(s)
+        } else {
+            Err(PyKeyError::new_err(format!(
+                "Index \"{}\" not found",
+                index_name
+            )))
+        }
     }
 
     /// Load index metadata

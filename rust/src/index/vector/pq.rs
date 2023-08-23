@@ -222,7 +222,7 @@ impl PQIndex {
 }
 
 #[derive(Serialize)]
-pub struct PQIndexStats {
+pub struct PQIndexStatistics {
     index_type: String,
     nbits: u32,
     num_sub_vectors: usize,
@@ -236,7 +236,7 @@ impl Index for PQIndex {
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        Ok(serde_json::to_value(PQIndexStats {
+        Ok(serde_json::to_value(PQIndexStatistics {
             index_type: "PQ".to_string(),
             nbits: self.nbits,
             num_sub_vectors: self.num_sub_vectors,

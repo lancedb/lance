@@ -26,7 +26,7 @@ use arrow_array::{
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;
-use futures::future::{try_join_all, BoxFuture};
+use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use log::warn;
 use object_store::path::Path;
@@ -956,23 +956,25 @@ impl Dataset {
         read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest).await
     }
 
+    /// Find index with a given index_name and return its serialized statistics.
     pub async fn index_statistics(&self, index_name: String) -> Result<Option<String>> {
-        let index_ids = self
+        let index_uuid = self
             .load_indices()
             .await
             .unwrap()
             .iter()
-            .filter(|idx| idx.name.eq(&index_name))
-            .map(|idx| idx.uuid.to_string())
-            .collect::<Vec<_>>();
+            .find(|idx| idx.name.eq(&index_name))
+            .map(|idx| idx.uuid.to_string());
 
-        try_join_all(index_ids.iter().map(|uuid| async move {
-            open_index(Arc::new(self.clone()), "vector", uuid)
+        if let Some(index_uuid) = index_uuid {
+            let index_statistics = open_index(Arc::new(self.clone()), "vector", &index_uuid)
                 .await?
                 .statistics()
-        }))
-        .await
-        .map(|v| serde_json::to_string(&v).unwrap())
+                .unwrap();
+            Ok(Some(serde_json::to_string(&index_statistics).unwrap()))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn validate(&self) -> Result<()> {
@@ -2002,25 +2004,25 @@ mod tests {
         assert_eq!(actual, expected);
         dataset.validate().await.unwrap();
 
-        // TODO
-        // let expected_stats = "[\n{\"index_type\":\"IVF\",\"uuid\":\"";
-        // assert!(dataset
-        //     .statistics("embeddings_idx".to_string())
-        //     .await
-        //     .unwrap()
-        //     .starts_with(expected_stats));
+        let expected_statistics =
+            "{\"index_type\":\"IVF\",\"metric_type\":\"l2\",\"num_partitions\":10";
+        let actual_statistics = dataset
+            .index_statistics("embeddings_idx".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(actual_statistics.starts_with(expected_statistics));
 
-        let empty_stats_set = "[]";
         assert_eq!(
             dataset
-                .statistics("non-existent_idx".to_string())
+                .index_statistics("non-existent_idx".to_string())
                 .await
                 .unwrap(),
-            empty_stats_set
+            None
         );
         assert_eq!(
-            dataset.statistics("".to_string()).await.unwrap(),
-            empty_stats_set
+            dataset.index_statistics("".to_string()).await.unwrap(),
+            None
         );
 
         // Overwrite should invalidate index

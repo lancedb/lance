@@ -202,7 +202,7 @@ impl DiskANNIndex {
 }
 
 #[derive(Serialize)]
-pub struct DiskANNIndexStats {
+pub struct DiskANNIndexStatistics {
     index_type: String,
     length: usize,
 }
@@ -213,7 +213,7 @@ impl Index for DiskANNIndex {
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        Ok(serde_json::to_value(DiskANNIndexStats {
+        Ok(serde_json::to_value(DiskANNIndexStatistics {
             index_type: "DiskANNIndex".to_string(),
             length: self.graph.len(),
         })?)
