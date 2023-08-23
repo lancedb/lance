@@ -151,7 +151,7 @@ impl Schema {
         }
         Ok(Self {
             fields,
-            metadata: HashMap::default(),
+            metadata: self.metadata.clone(),
         })
     }
 

@@ -547,7 +547,12 @@ impl Scanner {
                 // To do a union, we need to make the schemas match. Right now
                 // knn_node: _distance, _rowid, vector
                 // topk_appended: vector, _rowid, _distance
-                let new_schema = Schema::try_from(&topk_appended.schema().project(&[2, 1, 0])?)?;
+                let new_schema = Schema::try_from(
+                    &topk_appended
+                        .schema()
+                        .project(&[2, 1, 0])?
+                        .with_metadata(knn_node.schema().metadata.clone()),
+                )?;
                 let topk_appended = ProjectionExec::try_new(topk_appended, Arc::new(new_schema))?;
                 assert_eq!(topk_appended.schema(), knn_node.schema());
                 // union
@@ -670,7 +675,7 @@ impl Stream for DatasetRecordBatchStream {
 #[cfg(test)]
 mod test {
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
     use std::vec;
 
@@ -855,18 +860,26 @@ mod test {
     }
 
     async fn create_vector_dataset(path: &str, build_index: bool) -> Arc<Dataset> {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", DataType::Int32, true),
-            ArrowField::new("s", DataType::Utf8, true),
-            ArrowField::new(
-                "vec",
-                DataType::FixedSizeList(
-                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                    32,
+        // Make sure the schema has metadata so it tests all paths that re-construct the schema along the way
+        let metadata: HashMap<String, String> = vec![("dataset".to_string(), "vector".to_string())]
+            .into_iter()
+            .collect();
+
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![
+                ArrowField::new("i", DataType::Int32, true),
+                ArrowField::new("s", DataType::Utf8, true),
+                ArrowField::new(
+                    "vec",
+                    DataType::FixedSizeList(
+                        Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                        32,
+                    ),
+                    true,
                 ),
-                true,
-            ),
-        ]));
+            ],
+            metadata,
+        ));
 
         let batches: Vec<RecordBatch> = (0..5)
             .map(|i| {

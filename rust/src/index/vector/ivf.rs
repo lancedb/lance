@@ -828,6 +828,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::tempdir;
 
+    use std::collections::HashMap;
+
     use crate::{
         index::{vector::VectorIndexParams, DatasetIndexExt, IndexType},
         utils::testing::generate_random_array,
@@ -837,15 +839,21 @@ mod tests {
     async fn test_create_ivf_pq_with_centroids() {
         const DIM: usize = 32;
         let vectors = generate_random_array(1000 * DIM);
+        let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
+            .into_iter()
+            .collect();
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                DIM as i32,
-            ),
-            true,
-        )]));
+        let schema = Arc::new(
+            Schema::new(vec![Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                true,
+            )])
+            .with_metadata(metadata),
+        );
         let array = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
         let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
 
