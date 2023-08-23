@@ -91,7 +91,7 @@ pub fn dot_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Flo
 /// Negative dot distance.
 #[inline]
 pub fn dot_distance(from: &[f32], to: &[f32]) -> f32 {
-    - from.dot(to)
+    -from.dot(to)
 }
 
 #[cfg(target_arch = "x86_64")]
