@@ -94,8 +94,7 @@ class LanceDataset(pa.dataset.Dataset):
     def list_indices(self) -> List[Dict[str, Any]]:
         return self._ds.load_indices()
 
-    @lru_cache(maxsize=None)
-    def index_statistics(self, index_name: Optional[str] = None) -> str:
+    def index_statistics(self, index_name: Optional[str] = None) -> Dict[str, Any]:
         return json.loads(self._ds.statistics(index_name))
 
     @property

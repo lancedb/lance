@@ -956,7 +956,7 @@ impl Dataset {
         read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest).await
     }
 
-    pub async fn statistics(&self, index_name: String) -> Result<String> {
+    pub async fn index_statistics(&self, index_name: String) -> Result<Option<String>> {
         let index_ids = self
             .load_indices()
             .await

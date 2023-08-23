@@ -116,9 +116,9 @@ impl Dataset {
     }
 
     /// Get index stats
-    fn statistics(&self, index_name: String) -> PyResult<String> {
+    fn index_statistics(&self, index_name: String) -> PyResult<String> {
         self.rt
-            .block_on(async { self.ds.statistics(index_name).await })
+            .block_on(self.ds.statistics(index_name))
             .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 
