@@ -13,6 +13,9 @@
 // limitations under the License.
 
 //! Reading TFRecord files into Arrow data
+//!
+//! Use [infer_tfrecord_schema] to infer the schema of a TFRecord file, then use
+//! [read_tfrecord] to read the file into an Arrow record batch stream.
 
 use arrow::buffer::OffsetBuffer;
 use arrow_array::builder::PrimitiveBuilder;
@@ -37,180 +40,6 @@ use tfrecord::protobuf::feature::Kind;
 use tfrecord::protobuf::{DataType as TensorDataType, TensorProto};
 use tfrecord::record_reader::RecordStream;
 use tfrecord::{Example, Feature};
-
-fn feature_is_repeated(feature: &tfrecord::Feature) -> bool {
-    match feature.kind.as_ref().unwrap() {
-        Kind::BytesList(bytes_list) => bytes_list.value.len() > 1,
-        Kind::FloatList(float_list) => float_list.value.len() > 1,
-        Kind::Int64List(int64_list) => int64_list.value.len() > 1,
-    }
-}
-
-#[derive(Clone, PartialEq, Debug)]
-enum FeatureType {
-    Integer,
-    Float,
-    Binary,
-    String,
-    Tensor {
-        shape: Vec<i64>,
-        dtype: TensorDataType,
-    },
-}
-
-struct FeatureMeta {
-    repeated: bool,
-    feature_type: FeatureType,
-}
-
-impl FeatureMeta {
-    pub fn new(feature: &Feature, is_tensor: bool, is_string: bool) -> Self {
-        let feature_type = match feature.kind.as_ref().unwrap() {
-            Kind::BytesList(data) => {
-                if is_tensor {
-                    let val = &data.value[0];
-                    let tensor_proto = TensorProto::decode(val.as_slice()).unwrap();
-                    FeatureType::Tensor {
-                        shape: tensor_proto
-                            .tensor_shape
-                            .as_ref()
-                            .unwrap()
-                            .dim
-                            .iter()
-                            .map(|d| d.size)
-                            .collect(),
-                        dtype: tensor_proto.dtype(),
-                    }
-                } else if is_string {
-                    FeatureType::String
-                } else {
-                    FeatureType::Binary
-                }
-            }
-            Kind::FloatList(_) => FeatureType::Float,
-            Kind::Int64List(_) => FeatureType::Integer,
-        };
-        Self {
-            repeated: feature_is_repeated(feature),
-            feature_type,
-        }
-    }
-
-    pub fn try_update(&mut self, feature: &Feature) -> Result<()> {
-        let feature_type = match feature.kind.as_ref().unwrap() {
-            Kind::BytesList(data) => {
-                let val = &data.value[0];
-                let tensor_proto = TensorProto::decode(val.as_slice()).unwrap();
-                FeatureType::Tensor {
-                    shape: tensor_proto
-                        .tensor_shape
-                        .as_ref()
-                        .unwrap()
-                        .dim
-                        .iter()
-                        .map(|d| d.size)
-                        .collect(),
-                    dtype: tensor_proto.dtype(),
-                }
-            }
-            Kind::FloatList(_) => FeatureType::Float,
-            Kind::Int64List(_) => FeatureType::Integer,
-        };
-        if self.feature_type != feature_type {
-            return Err(Error::IO {
-                message: format!("inconsistent feature type for field {:?}", feature_type),
-            });
-        }
-        if feature_is_repeated(feature) {
-            self.repeated = true;
-        }
-        Ok(())
-    }
-}
-
-#[derive(serde::Serialize)]
-struct ArrowTensorMetadata {
-    shape: Vec<i64>,
-}
-
-fn tensor_dtype_to_arrow(tensor_dtype: &TensorDataType) -> Result<DataType> {
-    Ok(match tensor_dtype {
-        TensorDataType::DtBfloat16 => DataType::FixedSizeBinary(2),
-        TensorDataType::DtHalf => DataType::Float16,
-        TensorDataType::DtFloat => DataType::Float32,
-        TensorDataType::DtDouble => DataType::Float64,
-        _ => {
-            return Err(Error::IO {
-                message: format!("unsupported tensor data type {:?}", tensor_dtype),
-            });
-        }
-    })
-}
-
-fn make_field(name: &str, feature_meta: &FeatureMeta) -> Result<ArrowField> {
-    let data_type = match &feature_meta.feature_type {
-        FeatureType::Integer => DataType::Int64,
-        FeatureType::Float => DataType::Float32,
-        FeatureType::Binary => DataType::Binary,
-        FeatureType::String => DataType::Utf8,
-        FeatureType::Tensor { shape, dtype } => {
-            let list_size = shape.iter().map(|x| *x as i32).product();
-            let inner_type = tensor_dtype_to_arrow(dtype)?;
-
-            let inner_meta = match dtype {
-                TensorDataType::DtBfloat16 => Some(
-                    [("ARROW:extension:name", "lance.bfloat16")]
-                        .into_iter()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .collect::<HashMap<String, String>>(),
-                ),
-                _ => None,
-            };
-            let mut inner_field = ArrowField::new("value", inner_type, false);
-            if let Some(metadata) = inner_meta {
-                inner_field.set_metadata(metadata);
-            }
-
-            DataType::FixedSizeList(Arc::new(inner_field), list_size)
-        }
-    };
-
-    let metadata = match &feature_meta.feature_type {
-        FeatureType::Tensor { shape, dtype: _ } => {
-            let mut metadata = HashMap::new();
-            let tensor_metadata = ArrowTensorMetadata {
-                shape: shape.clone(),
-            };
-            metadata.insert(
-                "ARROW:extension:name".to_string(),
-                "arrow.fixed_shape_tensor".to_string(),
-            );
-            metadata.insert(
-                "ARROW:extension:metadata".to_string(),
-                serde_json::to_string(&tensor_metadata)?,
-            );
-            Some(metadata)
-        }
-        _ => None,
-    };
-
-    let mut field = if feature_meta.repeated {
-        ArrowField::new("item", data_type, true)
-    } else {
-        ArrowField::new(name, data_type, true)
-    };
-    if let Some(metadata) = metadata {
-        field.set_metadata(metadata);
-    }
-
-    let field = if feature_meta.repeated {
-        ArrowField::new(name, DataType::List(Arc::new(field)), true)
-    } else {
-        field
-    };
-
-    Ok(field)
-}
 
 /// Infer the Arrow schema from a TFRecord file.
 ///
@@ -300,6 +129,204 @@ pub async fn read_tfrecord(uri: &str, schema: ArrowSchemaRef) -> Result<Sendable
         schema,
         batch_stream,
     )))
+}
+
+/// Check if a feature has more than 1 value.
+fn feature_is_repeated(feature: &tfrecord::Feature) -> bool {
+    match feature.kind.as_ref().unwrap() {
+        Kind::BytesList(bytes_list) => bytes_list.value.len() > 1,
+        Kind::FloatList(float_list) => float_list.value.len() > 1,
+        Kind::Int64List(int64_list) => int64_list.value.len() > 1,
+    }
+}
+
+/// Simplified representation of a features data type.
+#[derive(Clone, PartialEq, Debug)]
+enum FeatureType {
+    Integer,
+    Float,
+    Binary,
+    String,
+    Tensor {
+        shape: Vec<i64>,
+        dtype: TensorDataType,
+    },
+}
+
+/// General type information about a single feature.
+struct FeatureMeta {
+    /// Whether the feature contains multiple values per example. Ones that do
+    /// will be converted to Arrow lists. Otherwise they will be primitive arrays.
+    repeated: bool,
+    feature_type: FeatureType,
+}
+
+impl FeatureMeta {
+    /// Create a new FeatureMeta from a single example.
+    pub fn new(feature: &Feature, is_tensor: bool, is_string: bool) -> Self {
+        let feature_type = match feature.kind.as_ref().unwrap() {
+            Kind::BytesList(data) => {
+                if is_tensor {
+                    let val = &data.value[0];
+                    let tensor_proto = TensorProto::decode(val.as_slice()).unwrap();
+                    FeatureType::Tensor {
+                        shape: tensor_proto
+                            .tensor_shape
+                            .as_ref()
+                            .unwrap()
+                            .dim
+                            .iter()
+                            .map(|d| d.size)
+                            .collect(),
+                        dtype: tensor_proto.dtype(),
+                    }
+                } else if is_string {
+                    FeatureType::String
+                } else {
+                    FeatureType::Binary
+                }
+            }
+            Kind::FloatList(_) => FeatureType::Float,
+            Kind::Int64List(_) => FeatureType::Integer,
+        };
+        Self {
+            repeated: feature_is_repeated(feature),
+            feature_type,
+        }
+    }
+
+    /// Update the FeatureMeta with a new example, or return an error if the
+    /// example is inconsistent with the existing FeatureMeta.
+    pub fn try_update(&mut self, feature: &Feature) -> Result<()> {
+        let feature_type = match feature.kind.as_ref().unwrap() {
+            Kind::BytesList(data) => match self.feature_type {
+                FeatureType::String => FeatureType::String,
+                FeatureType::Binary => FeatureType::Binary,
+                FeatureType::Tensor { .. } => {
+                    let val = &data.value[0];
+                    let tensor_proto = TensorProto::decode(val.as_slice()).unwrap();
+                    FeatureType::Tensor {
+                        shape: tensor_proto
+                            .tensor_shape
+                            .as_ref()
+                            .unwrap()
+                            .dim
+                            .iter()
+                            .map(|d| d.size)
+                            .collect(),
+                        dtype: tensor_proto.dtype(),
+                    }
+                }
+                _ => {
+                    return Err(Error::IO {
+                        message: format!(
+                            "Data type mismatch: expected {:?}, got {:?}",
+                            self.feature_type,
+                            feature.kind.as_ref().unwrap()
+                        ),
+                    })
+                }
+            },
+            Kind::FloatList(_) => FeatureType::Float,
+            Kind::Int64List(_) => FeatureType::Integer,
+        };
+        if self.feature_type != feature_type {
+            return Err(Error::IO {
+                message: format!("inconsistent feature type for field {:?}", feature_type),
+            });
+        }
+        if feature_is_repeated(feature) {
+            self.repeated = true;
+        }
+        Ok(())
+    }
+}
+
+/// Metadata for a fixed-shape tensor.
+#[derive(serde::Serialize)]
+struct ArrowTensorMetadata {
+    shape: Vec<i64>,
+}
+
+fn tensor_dtype_to_arrow(tensor_dtype: &TensorDataType) -> Result<DataType> {
+    Ok(match tensor_dtype {
+        TensorDataType::DtBfloat16 => DataType::FixedSizeBinary(2),
+        TensorDataType::DtHalf => DataType::Float16,
+        TensorDataType::DtFloat => DataType::Float32,
+        TensorDataType::DtDouble => DataType::Float64,
+        _ => {
+            return Err(Error::IO {
+                message: format!("unsupported tensor data type {:?}", tensor_dtype),
+            });
+        }
+    })
+}
+
+fn make_field(name: &str, feature_meta: &FeatureMeta) -> Result<ArrowField> {
+    let data_type = match &feature_meta.feature_type {
+        FeatureType::Integer => DataType::Int64,
+        FeatureType::Float => DataType::Float32,
+        FeatureType::Binary => DataType::Binary,
+        FeatureType::String => DataType::Utf8,
+        FeatureType::Tensor { shape, dtype } => {
+            let list_size = shape.iter().map(|x| *x as i32).product();
+            let inner_type = tensor_dtype_to_arrow(dtype)?;
+
+            let inner_meta = match dtype {
+                TensorDataType::DtBfloat16 => Some(
+                    [("ARROW:extension:name", "lance.bfloat16")]
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect::<HashMap<String, String>>(),
+                ),
+                _ => None,
+            };
+            let mut inner_field = ArrowField::new("value", inner_type, false);
+            if let Some(metadata) = inner_meta {
+                inner_field.set_metadata(metadata);
+            }
+
+            DataType::FixedSizeList(Arc::new(inner_field), list_size)
+        }
+    };
+
+    // This metadata marks the field as a tensor column, which PyArrow can
+    // recognize.
+    let metadata = match &feature_meta.feature_type {
+        FeatureType::Tensor { shape, dtype: _ } => {
+            let mut metadata = HashMap::new();
+            let tensor_metadata = ArrowTensorMetadata {
+                shape: shape.clone(),
+            };
+            metadata.insert(
+                "ARROW:extension:name".to_string(),
+                "arrow.fixed_shape_tensor".to_string(),
+            );
+            metadata.insert(
+                "ARROW:extension:metadata".to_string(),
+                serde_json::to_string(&tensor_metadata)?,
+            );
+            Some(metadata)
+        }
+        _ => None,
+    };
+
+    let mut field = if feature_meta.repeated {
+        ArrowField::new("item", data_type, true)
+    } else {
+        ArrowField::new(name, data_type, true)
+    };
+    if let Some(metadata) = metadata {
+        field.set_metadata(metadata);
+    }
+
+    let field = if feature_meta.repeated {
+        ArrowField::new(name, DataType::List(Arc::new(field)), true)
+    } else {
+        field
+    };
+
+    Ok(field)
 }
 
 /// Convert a vector of TFRecord examples into an Arrow record batch.

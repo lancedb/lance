@@ -102,6 +102,25 @@ fn json_to_schema(py: Python<'_>, json: &str) -> PyResult<PyObject> {
     schema.to_pyarrow(py)
 }
 
+/// Infer schema from tfrecord file
+///
+/// Parameters
+/// ----------
+/// uri: str
+///     URI of the tfrecord file
+/// tensor_features: Optional[List[str]]
+///     Names of features that should be treated as tensors. Currently only
+///     fixed-shape tensors are supported.
+/// string_features: Optional[List[str]]
+///     Names of features that should be treated as strings. Otherwise they
+///     will be treated as binary.
+///
+/// Returns
+/// -------
+/// pyarrow.Schema
+///     An Arrow schema inferred from the tfrecord file. The schema is
+///     alphabetically sorted by field names, since TFRecord doesn't have
+///     a concept of field order.
 #[pyfunction]
 #[pyo3(signature = (uri, *, tensor_features = None, string_features = None))]
 fn infer_tfrecord_schema(
@@ -130,6 +149,23 @@ fn infer_tfrecord_schema(
     Ok(PyArrowType(schema))
 }
 
+/// Read tfrecord file as an Arrow stream
+///
+/// Parameters
+/// ----------
+/// uri: str
+///     URI of the tfrecord file
+/// schema: pyarrow.Schema
+///     Arrow schema of the tfrecord file. Use :py:func:`infer_tfrecord_schema`
+///     to infer the schema. The schema is allowed to be a subset of fields; the
+///     reader will only parse the fields that are present in the schema.
+///
+/// Returns
+/// -------
+/// pyarrow.RecordBatchReader
+///     An Arrow reader, which can be passed directly to
+///     :py:func:`lance.write_dataset`. The output schema will match the schema
+///     provided, including field order.
 #[pyfunction]
 fn read_tfrecord(
     uri: String,
