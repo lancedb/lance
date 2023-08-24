@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pytest
-from lance.arrow import BFloat16Type
+from lance.arrow import BFloat16Type, bfloat16_array
 
 try:
     import tensorflow as tf  # noqa: F401
@@ -208,7 +208,7 @@ def test_tfrecord_parsing(tmp_path):
             "4_float_list": pa.list_(pa.float32()),
             "5_bytes": pa.binary(),
             "6_bytes_list": pa.list_(pa.binary()),
-            # Will all be binary since we didn't specify which ones are tensors or strings
+            # tensors and strings assumed binary
             "7_string": pa.binary(),
             "8_tensor": pa.binary(),
             "9_tensor_bf16": pa.binary(),
@@ -217,22 +217,22 @@ def test_tfrecord_parsing(tmp_path):
 
     inferred_schema = infer_tfrecord_schema(
         str(path),
-        # tensor_features=["8_tensor", "9_tensor_bf16"],
+        tensor_features=["8_tensor", "9_tensor_bf16"],
         string_features=["7_string"],
     )
-    # assert inferred_schema == pa.schema(
-    #     {
-    #         "1_int": pa.int64(),
-    #         "2_int_list": pa.list_(pa.int64()),
-    #         "3_float": pa.float32(),
-    #         "4_float_list": pa.list_(pa.float32()),
-    #         "5_bytes": pa.binary(),
-    #         "6_bytes_list": pa.list_(pa.binary()),
-    #         "7_string": pa.string(),
-    #         "8_tensor": pa.fixed_shape_tensor(pa.float32(), [2, 3]),
-    #         "9_tensor_bf16": pa.fixed_shape_tensor(BFloat16Type(), [2, 3]),
-    #     }
-    # )
+    assert inferred_schema == pa.schema(
+        {
+            "1_int": pa.int64(),
+            "2_int_list": pa.list_(pa.int64()),
+            "3_float": pa.float32(),
+            "4_float_list": pa.list_(pa.float32()),
+            "5_bytes": pa.binary(),
+            "6_bytes_list": pa.list_(pa.binary()),
+            "7_string": pa.string(),
+            "8_tensor": pa.fixed_shape_tensor(pa.float32(), [2, 3]),
+            "9_tensor_bf16": pa.fixed_shape_tensor(BFloat16Type(), [2, 3]),
+        }
+    )
 
     reader = read_tfrecord(str(path), inferred_schema)
     assert reader.schema == inferred_schema
@@ -240,18 +240,27 @@ def test_tfrecord_parsing(tmp_path):
 
     assert table.schema == inferred_schema
 
+    tensor_type = pa.fixed_shape_tensor(pa.float32(), [2, 3])
+    inner = pa.array([float(x) for x in range(1, 7)], pa.float32())
+    storage = pa.FixedSizeListArray.from_arrays(inner, 6)
+    f32_array = pa.ExtensionArray.from_storage(tensor_type, storage)
+
+    tensor_type = pa.fixed_shape_tensor(BFloat16Type(), [2, 3])
+    bf16_array = bfloat16_array([float(x) for x in range(1, 7)])
+    storage = pa.FixedSizeListArray.from_arrays(bf16_array, 6)
+    bf16_array = pa.ExtensionArray.from_storage(tensor_type, storage)
+
     expected_data = pa.table(
         {
             "1_int": pa.array([1]),
             "2_int_list": pa.array([[1, 2, 3]]),
             "3_float": pa.array([1.0], pa.float32()),
-            "4_float_list": pa.array([[1.0, 2.0, 2.0]], pa.list_(pa.float32())),
+            "4_float_list": pa.array([[1.0, 2.0, 3.0]], pa.list_(pa.float32())),
             "5_bytes": pa.array([b"Hello, TensorFlow!"]),
             "6_bytes_list": pa.array([[b"Hello, TensorFlow!", b"Hello, Lance!"]]),
-            # Will all be binary since we didn't specify which ones are tensors or strings
             "7_string": pa.array(["Hello, TensorFlow!"]),
-            # "8_tensor": pa.FixedShapeTensorArray.from_numpy_ndarray(tensor.numpy()),
-            # "9_tensor_bf16": pa.FixedShapeTensorArray.from_numpy_ndarray(tensor_bf16.numpy()),
+            "8_tensor": f32_array,
+            "9_tensor_bf16": bf16_array,
         }
     )
 
