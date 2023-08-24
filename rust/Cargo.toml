@@ -52,8 +52,8 @@ object_store = { version = "0.6.1", features = ["aws", "gcp", "azure"] }
 aws-config = "0.54"
 aws-credential-types = "0.54.1"
 pin-project = "1.0"
-prost = "0.11"
-prost-types = "0.11"
+prost = "0.10"
+prost-types = "0.10"
 roaring = "0.10.1"
 tokio = { version = "1.23", features = ["rt-multi-thread"] }
 url = "2.3"

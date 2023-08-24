@@ -12,8 +12,10 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import pandas as pd
+from lance.arrow import BFloat16Type
+import ml_dtypes
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pytest
 
@@ -154,60 +156,90 @@ def test_var_length_list(tmp_path):
 
 def test_tfrecord_parsing(tmp_path):
     # Create a TFRecord with a string, float, int, and a tensor
-    tensor = tf.constant(np.array([list(range(3)), list(range(3, 6))]))
+    tensor = tf.constant(
+        np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
+    )
+    tensor_bf16 = tf.constant(
+        np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=ml_dtypes.bfloat16)
+    )
 
     feature = {
-        'int': tf.train.Feature(int64_list = tf.train.Int64List(value=[1])),
-        'int_list': tf.train.Feature(int64_list = tf.train.Int64List(value=[1, 2, 3])),
-        'float': tf.train.Feature(float_list = tf.train.FloatList(value=[1.0])),
-        'float_list': tf.train.Feature(float_list = tf.train.FloatList(value=[1.0, 2.0, 3.0])),
-        'bytes': tf.train.Feature(bytes_list = tf.train.BytesList(value=[b'Hello, TensorFlow!'])),
-        'bytes_list': tf.train.Feature(bytes_list = tf.train.BytesList(value=[b'Hello, TensorFlow!', b'Hello, Lance!'])),
-        'string': tf.train.Feature(bytes_list = tf.train.BytesList(value=[b'Hello, TensorFlow!'])),
-        'tensor': tf.train.Feature(bytes_list = tf.train.BytesList(value=[tf.io.serialize_tensor(tensor).numpy()])),
+        "1_int": tf.train.Feature(int64_list=tf.train.Int64List(value=[1])),
+        "2_int_list": tf.train.Feature(int64_list=tf.train.Int64List(value=[1, 2, 3])),
+        "3_float": tf.train.Feature(float_list=tf.train.FloatList(value=[1.0])),
+        "4_float_list": tf.train.Feature(
+            float_list=tf.train.FloatList(value=[1.0, 2.0, 3.0])
+        ),
+        "5_bytes": tf.train.Feature(
+            bytes_list=tf.train.BytesList(value=[b"Hello, TensorFlow!"])
+        ),
+        "6_bytes_list": tf.train.Feature(
+            bytes_list=tf.train.BytesList(
+                value=[b"Hello, TensorFlow!", b"Hello, Lance!"]
+            )
+        ),
+        "7_string": tf.train.Feature(
+            bytes_list=tf.train.BytesList(value=[b"Hello, TensorFlow!"])
+        ),
+        "8_tensor": tf.train.Feature(
+            bytes_list=tf.train.BytesList(
+                value=[tf.io.serialize_tensor(tensor).numpy()]
+            )
+        ),
+        "9_tensor_bf16": tf.train.Feature(
+            bytes_list=tf.train.BytesList(
+                value=[tf.io.serialize_tensor(tensor_bf16).numpy()]
+            )
+        ),
     }
 
     example_proto = tf.train.Example(features=tf.train.Features(feature=feature))
     serialized = example_proto.SerializeToString()
 
-    path = tmp_path / 'test.tfrecord'
+    path = tmp_path / "test.tfrecord"
     with tf.io.TFRecordWriter(str(path)) as writer:
         writer.write(serialized)
 
     inferred_schema = infer_tfrecord_schema(str(path))
-    
-    assert inferred_schema == pa.schema({
-        'int': pa.int64(),
-        'int_list': pa.list_(pa.int64()),
-        'float': pa.float32(),
-        'float_list': pa.list_(pa.float32()),
-        'bytes': pa.binary(),
-        'bytes_list': pa.list_(pa.binary()),
-        # Will all be binary since we didn't specify which ones are tensors or strings
-        'string': pa.binary(),
-        'tensor': pa.binary()
-    })
+
+    assert inferred_schema == pa.schema(
+        {
+            "1_int": pa.int64(),
+            "2_int_list": pa.list_(pa.int64()),
+            "3_float": pa.float32(),
+            "4_float_list": pa.list_(pa.float32()),
+            "5_bytes": pa.binary(),
+            "6_bytes_list": pa.list_(pa.binary()),
+            # Will all be binary since we didn't specify which ones are tensors or strings
+            "7_string": pa.binary(),
+            "8_tensor": pa.binary(),
+            "9_tensor_bf16": pa.binary(),
+        }
+    )
 
     inferred_schema = infer_tfrecord_schema(
         str(path),
-        tensor_features=['tensor'],
-        string_features=['string'],
+        tensor_features=["8_tensor", "9_tensor_bf16"],
+        string_features=["7_string"],
     )
-    assert inferred_schema == pa.schema({
-        'int': pa.int64(),
-        'int_list': pa.list_(pa.int64()),
-        'float': pa.float32(),
-        'float_list': pa.list_(pa.float32()),
-        'bytes': pa.binary(),
-        'bytes_list': pa.list_(pa.binary()),
-        'string': pa.string(),
-        'tensor': pa.fixed_shape_tensor(pa.int32(), [3, 2]),
-    })
+    assert inferred_schema == pa.schema(
+        {
+            "1_int": pa.int64(),
+            "2_int_list": pa.list_(pa.int64()),
+            "3_float": pa.float32(),
+            "4_float_list": pa.list_(pa.float32()),
+            "5_bytes": pa.binary(),
+            "6_bytes_list": pa.list_(pa.binary()),
+            "7_string": pa.string(),
+            "8_tensor": pa.fixed_shape_tensor(pa.float32(), [2, 3]),
+            "9_tensor_bf16": pa.fixed_shape_tensor(BFloat16Type(), [2, 3]),
+        }
+    )
 
     batch = read_tfrecord(str(path), inferred_schema)
     assert batch.num_rows == 1
     assert batch.num_columns == 3
-    assert batch.column_names == ['bytes', 'string', 'tensor']
-    assert batch['bytes'].to_pylist() == [b'Hello, TensorFlow!']
-    assert batch['string'].to_pylist() == ['Hello, TensorFlow!']
-    assert batch['tensor'].to_pylist() == [tensor.numpy().tolist()]
+    assert batch.column_names == ["bytes", "string", "tensor"]
+    assert batch["bytes"].to_pylist() == [b"Hello, TensorFlow!"]
+    assert batch["string"].to_pylist() == ["Hello, TensorFlow!"]
+    assert batch["tensor"].to_pylist() == [tensor.numpy().tolist()]

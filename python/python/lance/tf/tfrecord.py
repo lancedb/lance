@@ -12,4 +12,5 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from lance.lance import infer_tfrecord_schema as infer_tfrecord_schema, read_tfrecord as read_tfrecord
+from lance.lance import infer_tfrecord_schema as infer_tfrecord_schema
+from lance.lance import read_tfrecord as read_tfrecord
