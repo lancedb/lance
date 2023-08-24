@@ -14,6 +14,9 @@
 
 //! Reading TFRecord files into Arrow data
 
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::SendableRecordBatchStream;
+use futures::{StreamExt, TryStreamExt};
 use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,7 +28,7 @@ use arrow_array::builder::{make_builder, ArrayBuilder, BinaryBuilder};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use tfrecord::protobuf::feature::Kind;
 use tfrecord::protobuf::{DataType as TensorDataType, TensorProto};
-use tfrecord::record_reader::RecordIter;
+use tfrecord::record_reader::RecordStream;
 use tfrecord::{Example, Feature};
 
 fn feature_is_repeated(feature: &tfrecord::Feature) -> bool {
@@ -157,10 +160,7 @@ fn make_field(name: &str, feature_meta: &FeatureMeta) -> Result<ArrowField> {
                 inner_field.set_metadata(metadata);
             }
 
-            DataType::FixedSizeList(
-                Arc::new(inner_field),
-                list_size,
-            )
+            DataType::FixedSizeList(Arc::new(inner_field), list_size)
         }
     };
 
@@ -218,9 +218,15 @@ pub async fn infer_tfrecord_schema(
 
     let (store, path) = ObjectStore::from_uri(uri).await?;
     // TODO: should we avoid reading the entire file into memory?
-    let data = store.inner.get(&path).await?.bytes().await?;
-    let records = RecordIter::<Example, _>::from_reader(data.as_ref(), Default::default());
-    for record in records {
+    let data = store
+        .inner
+        .get(&path)
+        .await?
+        .into_stream()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+        .into_async_read();
+    let mut records = RecordStream::<Example, _>::from_reader(data, Default::default());
+    while let Some(record) = records.next().await {
         let record = record.map_err(|err| Error::IO {
             message: err.to_string(),
         })?;
@@ -253,55 +259,110 @@ pub async fn infer_tfrecord_schema(
     Ok(ArrowSchema::new(fields))
 }
 
-pub async fn read_tfrecord(uri: &str, schema: ArrowSchema) -> Result<RecordBatch> {
-    todo!();
+/// Read a TFRecord file into an Arrow record batch stream.
+///
+/// Reads 10k rows at a time.
+///
+/// The schema may be a partial schema, in which case only the fields present in
+/// the schema will be read.
+pub async fn read_tfrecord(
+    uri: &str,
+    schema: Arc<ArrowSchema>,
+) -> Result<SendableRecordBatchStream> {
     let mut builders = schema
         .fields
         .iter()
         .map(|field| make_builder(field.data_type(), 10))
         .collect::<Vec<_>>();
 
-    let (store, path) = ObjectStore::from_uri(uri).await?;
-    // TODO: should we avoid reading the entire file into memory?
-    let data = store.inner.get(&path).await?.bytes().await?;
-    let records = RecordIter::<Example, _>::from_reader(data.as_ref(), Default::default());
+    let batch_size = 10_000;
 
-    for record in records {
-        let record = record.map_err(|err| Error::IO {
-            message: err.to_string(),
-        })?;
-        if let Some(features) = record.features {
-            for (i, field) in schema.fields.iter().enumerate() {
-                let builder = builders.get_mut(i).unwrap();
-                if let Some(feature) = features.feature.get(field.name()) {
-                    todo!("append feature to appropriate builder")
+    let (store, path) = ObjectStore::from_uri(uri).await?;
+    let data = store
+        .inner
+        .get(&path)
+        .await?
+        .into_stream()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+        .into_async_read();
+    let records = RecordStream::<Example, _>::from_reader(data, Default::default());
+
+    let builder = TFRecordBatchBuilder::new(schema.clone());
+    let batch_stream = futures::stream::try_unfold(
+        (records, builder),
+        move |(mut records, mut builder)| async move {
+            if let Some(record) = records.next().await {
+                let record = record.map_err(|err| Error::IO {
+                    message: err.to_string(),
+                })?;
+                builder.append(record)?;
+                if builder.num_rows == batch_size {
+                    // A batch is ready
+                    let batch = builder.finish()?;
+                    Ok(Some((Some(batch), (records, builder))))
                 } else {
-                    // TODO: do we care about nulls / missing values?
-                    return Err(Error::IO {
-                        message: format!("missing feature {}", field.name()),
-                    });
+                    Ok(Some((None, (records, builder))))
+                }
+            } else {
+                if builder.num_rows > 0 {
+                    // output the last (partial) batch
+                    let batch = builder.finish()?;
+                    Ok(Some((Some(batch), (records, builder))))
+                } else {
+                    Ok(None)
                 }
             }
+        },
+    )
+    .filter_map(|x| async { x.transpose() });
+
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        batch_stream,
+    )))
+}
+
+struct TFRecordBatchBuilder {
+    schema: Arc<ArrowSchema>,
+    builders: Vec<Box<dyn ArrayBuilder>>,
+    num_rows: usize,
+}
+
+impl TFRecordBatchBuilder {
+    pub fn new(schema: Arc<ArrowSchema>) -> Self {
+        // TODO: handle builders for list columns.
+        let builders = schema
+            .fields
+            .iter()
+            .map(|field| make_builder(field.data_type(), 10))
+            .collect::<Vec<_>>();
+        Self {
+            schema,
+            builders,
+            num_rows: 0,
         }
     }
 
-    // Start with:
-    // * string
-    // * fixed shape tensor
-    // * int64
-    // * float32
-    // * binary list
+    pub fn append(&mut self, record: Example) -> Result<()> {
+        todo!();
 
-    // TODO: support reading:
-    // Binary
-    // Binary list
-    // int64
-    // int64 list
-    // float32
-    // float32 list
-    // Then also tensors based on https://github.com/tensorflow/tensorboard/blob/master/tensorboard/compat/proto/tensor.proto
+        self.num_rows += 1;
+    }
 
-    todo!()
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    pub fn finish(&mut self) -> Result<RecordBatch> {
+        let columns = self
+            .builders
+            .iter_mut()
+            .map(|builder| builder.finish())
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
+        self.num_rows = 0;
+        Ok(batch)
+    }
 }
 
 fn append_feature(

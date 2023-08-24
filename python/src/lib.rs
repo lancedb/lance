@@ -19,15 +19,18 @@
 //! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
 
 use std::env;
+use std::sync::Arc;
 
+use ::arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use ::arrow::pyarrow::PyArrowType;
 use ::arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
-use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use arrow_array::{RecordBatch, RecordBatchIterator};
+use arrow_schema::{ArrowError, Schema};
 use env_logger::Env;
-use pyo3::exceptions::PyIOError;
+use futures::StreamExt;
+use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 
 #[macro_use]
@@ -131,12 +134,44 @@ fn infer_tfrecord_schema(
 fn read_tfrecord(
     uri: String,
     schema: PyArrowType<ArrowSchema>,
-) -> PyResult<PyArrowType<RecordBatch>> {
-    let schema = schema.0;
-    let record_batch = RT
-        .spawn(None, async move {
-            ::lance::utils::tfrecord::read_tfrecord(&uri, schema).await
-        })
-        .map_err(|err| PyIOError::new_err(err.to_string()))?;
-    Ok(PyArrowType(record_batch))
+) -> PyResult<PyArrowType<ArrowArrayStreamReader>> {
+    let schema = Arc::new(schema.0);
+
+    let (init_sender, init_receiver) = std::sync::mpsc::channel::<Result<(), ::lance::Error>>();
+    let (batch_sender, batch_receiver) =
+        std::sync::mpsc::channel::<std::result::Result<RecordBatch, ArrowError>>();
+
+    let schema_ref = schema.clone();
+    RT.spawn_background(None, async move {
+        let mut stream = match ::lance::utils::tfrecord::read_tfrecord(&uri, schema_ref).await {
+            Ok(stream) => {
+                init_sender.send(Ok(())).unwrap();
+                stream
+            }
+            Err(err) => {
+                init_sender.send(Err(err)).unwrap();
+                return;
+            }
+        };
+
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|err| ArrowError::ExternalError(Box::new(err)));
+            batch_sender.send(batch).unwrap();
+        }
+    });
+
+    // Verify initialization happened successfully
+    init_receiver.recv().unwrap().map_err(|err| {
+        PyIOError::new_err(format!("Failed to initialize tfrecord reader: {}", err))
+    })?;
+
+    let batch_reader = RecordBatchIterator::new(batch_receiver, schema);
+
+    // TODO: this should be handled by upstream
+    let stream = FFI_ArrowArrayStream::new(Box::new(batch_reader));
+    let stream_reader = ArrowArrayStreamReader::try_new(stream).map_err(|err| {
+        PyValueError::new_err(format!("Failed to export record batch reader: {}", err))
+    })?;
+
+    Ok(PyArrowType(stream_reader))
 }

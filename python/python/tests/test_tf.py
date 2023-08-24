@@ -236,7 +236,9 @@ def test_tfrecord_parsing(tmp_path):
         }
     )
 
-    batch = read_tfrecord(str(path), inferred_schema)
+    reader = read_tfrecord(str(path), inferred_schema)
+    assert reader.schema == inferred_schema
+    batch = pa.Table.from_batches(reader).to_batches()[0]
     assert batch.num_rows == 1
     assert batch.num_columns == 3
     assert batch.column_names == ["bytes", "string", "tensor"]
