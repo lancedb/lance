@@ -15,8 +15,9 @@
 //! Reading TFRecord files into Arrow data
 
 use arrow::buffer::OffsetBuffer;
-use arrow_array::{FixedSizeListArray, ListArray};
+use arrow_array::{ArrayRef, FixedSizeListArray, ListArray};
 use arrow_buffer::ScalarBuffer;
+use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
@@ -28,10 +29,9 @@ use crate::arrow::FixedSizeListArrayExt;
 use crate::error::{Error, Result};
 use crate::io::ObjectStore;
 use arrow::record_batch::RecordBatch;
-use arrow_array::builder::{
-    make_builder, ArrayBuilder, BinaryBuilder, Int32BufferBuilder, Int32Builder, ListBuilder,
+use arrow_schema::{
+    DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use tfrecord::protobuf::feature::Kind;
 use tfrecord::protobuf::{DataType as TensorDataType, TensorProto};
 use tfrecord::record_reader::RecordStream;
@@ -271,10 +271,14 @@ pub async fn infer_tfrecord_schema(
 ///
 /// The schema may be a partial schema, in which case only the fields present in
 /// the schema will be read.
+<<<<<<< HEAD
 pub async fn read_tfrecord(
     uri: &str,
     schema: Arc<ArrowSchema>,
 ) -> Result<SendableRecordBatchStream> {
+=======
+pub async fn read_tfrecord(uri: &str, schema: ArrowSchemaRef) -> Result<SendableRecordBatchStream> {
+>>>>>>> a8f81ad6 (get basic types working)
     let batch_size = 10_000;
 
     let (store, path) = ObjectStore::from_uri(uri).await?;
@@ -285,36 +289,43 @@ pub async fn read_tfrecord(
         .into_stream()
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
         .into_async_read();
-    let records = RecordStream::<Example, _>::from_reader(data, Default::default());
+    let schema_ref = schema.clone();
+    let batch_stream = RecordStream::<Example, _>::from_reader(data, Default::default())
+        .try_chunks(batch_size)
+        .map(move |chunk| {
+            let chunk = chunk.map_err(|err| DataFusionError::External(Box::new(err.1)))?;
+            let batch = convert_batch(chunk, &schema_ref)?;
+            Ok(batch)
+        });
 
-    let builder = TFRecordBatchBuilder::new(schema.clone());
-    let batch_stream = futures::stream::try_unfold(
-        (records, builder),
-        move |(mut records, mut builder)| async move {
-            if let Some(record) = records.next().await {
-                let record = record.map_err(|err| Error::IO {
-                    message: err.to_string(),
-                })?;
-                builder.append(record)?;
-                if builder.num_rows() == batch_size {
-                    // A batch is ready
-                    let batch = builder.finish()?;
-                    Ok(Some((Some(batch), (records, builder))))
-                } else {
-                    Ok(Some((None, (records, builder))))
-                }
-            } else {
-                if builder.num_rows() > 0 {
-                    // output the last (partial) batch
-                    let batch = builder.finish()?;
-                    Ok(Some((Some(batch), (records, builder))))
-                } else {
-                    Ok(None)
-                }
-            }
-        },
-    )
-    .filter_map(|x| async { x.transpose() });
+    // let builder = TFRecordBatchBuilder::new(schema.clone());
+    // let batch_stream = futures::stream::try_unfold(
+    //     (records, builder),
+    //     move |(mut records, mut builder)| async move {
+    //         if let Some(record) = records.next().await {
+    //             let record = record.map_err(|err| Error::IO {
+    //                 message: err.to_string(),
+    //             })?;
+    //             builder.append(record)?;
+    //             if builder.num_rows() == batch_size {
+    //                 // A batch is ready
+    //                 let batch = builder.finish()?;
+    //                 Ok(Some((Some(batch), (records, builder))))
+    //             } else {
+    //                 Ok(Some((None, (records, builder))))
+    //             }
+    //         } else {
+    //             if builder.num_rows() > 0 {
+    //                 // output the last (partial) batch
+    //                 let batch = builder.finish()?;
+    //                 Ok(Some((Some(batch), (records, builder))))
+    //             } else {
+    //                 Ok(None)
+    //             }
+    //         }
+    //     },
+    // )
+    // .filter_map(|x| async { x.transpose() });
 
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         schema,
@@ -322,6 +333,7 @@ pub async fn read_tfrecord(
     )))
 }
 
+<<<<<<< HEAD
 struct TFRecordBatchBuilder {
     schema: Arc<ArrowSchema>,
     builders: Vec<Box<dyn ArrayBuilder>>,
@@ -336,49 +348,121 @@ impl TFRecordBatchBuilder {
         // offsets manually.
         let mut builders = Vec::with_capacity(schema.fields.len());
         let mut offset_builders = Vec::with_capacity(schema.fields.len());
+=======
+/// Convert a vector of TFRecord examples into an Arrow record batch.
+fn convert_batch(records: Vec<Example>, schema: &ArrowSchema) -> Result<RecordBatch> {
+    // TODO: do this in parallel?
+    let columns = schema
+        .fields
+        .iter()
+        .map(|field| convert_column(&records, field))
+        .collect::<Result<Vec<_>>>()?;
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), columns)?;
+    Ok(batch)
+}
 
-        for field in schema.fields() {
-            let leaf_type = match field.data_type() {
-                DataType::List(inner_field) => {
-                    offset_builders.push(Some(vec![0]));
-                    match inner_field.data_type() {
-                        DataType::FixedSizeList(inner_field, _) => inner_field.data_type(),
-                        _ => inner_field.data_type(),
-                    }
-                }
-                DataType::FixedSizeList(inner_field, _) => {
-                    offset_builders.push(None);
-                    inner_field.data_type()
-                }
-                _ => {
-                    offset_builders.push(None);
-                    field.data_type()
-                }
-            };
-            builders.push(make_builder(leaf_type, 1024));
-        }
+/// Convert a single column of TFRecord examples into an Arrow array.
+fn convert_column(records: &Vec<Example>, field: &ArrowField) -> Result<ArrayRef> {
+    let type_info = parse_type(field.data_type());
+    // Make leaf type
+    let (mut column, offsets) = convert_leaf(records, field.name(), &type_info)?;
+>>>>>>> a8f81ad6 (get basic types working)
 
-        Self {
-            schema,
-            builders,
-            offset_builders,
-            num_rows: 0,
-        }
+    if let Some(fsl_size) = type_info.fsl_size {
+        // Wrap in a FSL
+        column = Arc::new(FixedSizeListArray::try_new(
+            Arc::new(ArrowField::new("item", type_info.leaf_type, true)),
+            fsl_size,
+            column,
+            None,
+        )?);
     }
 
-    pub fn append(&mut self, record: Example) -> Result<()> {
-        let features = record.features.unwrap().feature;
+    if type_info.in_list {
+        column = Arc::new(ListArray::try_new(
+            Arc::new(ArrowField::new("item", column.data_type().clone(), true)),
+            offsets.unwrap(),
+            column,
+            None,
+        )?);
+    }
 
-        for (i, field) in self.schema.fields().iter().enumerate() {
-            // TODO: right now we have to downcast the builder for every cell, which
-            // might be inefficient.
-            if let Some(feature) = features.get(field.name()) {
-                Self::append_values(field, &mut self.builders[i], feature)?;
-                Self::append_offsets(field, &mut self.offset_builders[i], feature)?;
-            } else {
-                Self::append_nulls(field, &mut self.builders[i], &mut self.offset_builders[i])?;
+    Ok(column)
+}
+
+/// Representation of a field in the TFRecord file. It can be a leaf type, a
+/// tensor, or a list of either.
+struct TypeInfo {
+    leaf_type: DataType,
+    fsl_size: Option<i32>,
+    in_list: bool,
+}
+
+fn parse_type(data_type: &DataType) -> TypeInfo {
+    match data_type {
+        DataType::FixedSizeList(inner_field, list_size) => {
+            let inner_type = parse_type(inner_field.data_type());
+            TypeInfo {
+                leaf_type: inner_type.leaf_type,
+                fsl_size: Some(*list_size),
+                in_list: false,
             }
         }
+        DataType::List(inner_field) => {
+            let inner_type = parse_type(inner_field.data_type());
+            TypeInfo {
+                leaf_type: inner_type.leaf_type,
+                fsl_size: inner_type.fsl_size,
+                in_list: true,
+            }
+        }
+        _ => TypeInfo {
+            leaf_type: data_type.clone(),
+            fsl_size: None,
+            in_list: false,
+        },
+    }
+}
+
+fn convert_leaf(
+    records: &Vec<Example>,
+    name: &str,
+    type_info: &TypeInfo,
+) -> Result<(ArrayRef, Option<OffsetBuffer<i32>>)> {
+    use arrow::array::*;
+    let features: Vec<Option<&Feature>> = records
+        .iter()
+        .map(|record| {
+            let features = record.features.as_ref().unwrap();
+            features.feature.get(name)
+        })
+        .collect();
+    let (values, offsets): (ArrayRef, Option<OffsetBuffer<i32>>) = match type_info {
+        // First, the Non-tensor leaf types
+        TypeInfo {
+            leaf_type: DataType::Int64,
+            fsl_size: None,
+            in_list,
+        } => {
+            let mut values = Int64Builder::with_capacity(features.len());
+            for feature in features.iter() {
+                if let Some(Feature {
+                    kind: Some(Kind::Int64List(list)),
+                }) = feature
+                {
+                    values.append_slice(&list.value);
+                } else if !type_info.in_list {
+                    values.append_null();
+                }
+            }
+            let offsets = if *in_list {
+                Some(compute_offsets(&features, &type_info))
+            } else {
+                None
+            };
+            (Arc::new(values.finish()), offsets)
+        }
+<<<<<<< HEAD
 
         self.num_rows += 1;
         Ok(())
@@ -474,10 +558,119 @@ impl TFRecordBatchBuilder {
                         column.clone(),
                         None,
                     )?);
+=======
+        TypeInfo {
+            leaf_type: DataType::Float32,
+            fsl_size: None,
+            in_list,
+        } => {
+            let mut values = Float32Builder::with_capacity(features.len());
+            for feature in features.iter() {
+                if let Some(Feature {
+                    kind: Some(Kind::FloatList(list)),
+                }) = feature
+                {
+                    values.append_slice(&list.value);
+                } else if !type_info.in_list {
+                    values.append_null();
+>>>>>>> a8f81ad6 (get basic types working)
                 }
-                _ => {} // Leave column as-is
+            }
+            let offsets = if *in_list {
+                Some(compute_offsets(&features, &type_info))
+            } else {
+                None
+            };
+            (Arc::new(values.finish()), offsets)
+        }
+        TypeInfo {
+            leaf_type: DataType::Binary,
+            fsl_size: None,
+            in_list,
+        } => {
+            let mut values = BinaryBuilder::with_capacity(features.len(), 1024);
+            for feature in features.iter() {
+                if let Some(Feature {
+                    kind: Some(Kind::BytesList(list)),
+                }) = feature
+                {
+                    for value in &list.value {
+                        values.append_value(&value);
+                    }
+                } else if !type_info.in_list {
+                    values.append_null();
+                }
+            }
+            let offsets = if *in_list {
+                Some(compute_offsets(&features, &type_info))
+            } else {
+                None
+            };
+            (Arc::new(values.finish()), offsets)
+        }
+        TypeInfo {
+            leaf_type: DataType::Utf8,
+            fsl_size: None,
+            in_list,
+        } => {
+            let mut values = StringBuilder::with_capacity(features.len(), 1024);
+            for feature in features.iter() {
+                if let Some(Feature {
+                    kind: Some(Kind::BytesList(list)),
+                }) = feature
+                {
+                    for value in &list.value {
+                        values.append_value(String::from_utf8_lossy(&value));
+                    }
+                } else if !type_info.in_list {
+                    values.append_null();
+                }
+            }
+            let offsets = if *in_list {
+                Some(compute_offsets(&features, &type_info))
+            } else {
+                None
+            };
+            (Arc::new(values.finish()), offsets)
+        }
+        // Now, handle tensors
+        TypeInfo {
+            leaf_type,
+            fsl_size: Some(list_size),
+            ..
+        } => {
+            todo!()
+        }
+        _ => unimplemented!("unsupported leaf type {:?}", type_info.leaf_type),
+    };
+
+    Ok((values, offsets))
+}
+
+fn compute_offsets(features: &Vec<Option<&Feature>>, type_info: &TypeInfo) -> OffsetBuffer<i32> {
+    let mut offsets: Vec<i32> = Vec::with_capacity(features.len() + 1);
+    offsets.push(0);
+
+    let mut current = 0;
+    for feature in features.iter() {
+        if let Some(feature) = feature {
+            match (&type_info.leaf_type, feature.kind.as_ref().unwrap()) {
+                (DataType::Binary, Kind::BytesList(list)) => {
+                    current += list.value.len() as i32;
+                }
+                (DataType::Utf8, Kind::BytesList(list)) => {
+                    current += list.value.len() as i32;
+                }
+                (DataType::Float32, Kind::FloatList(list)) => {
+                    current += list.value.len() as i32;
+                }
+                (DataType::Int64, Kind::Int64List(list)) => {
+                    current += list.value.len() as i32;
+                }
+                _ => {} // Ignore mismatched types
             }
         }
+<<<<<<< HEAD
         let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
         self.num_rows = 0;
         Ok(batch)
@@ -502,23 +695,27 @@ fn append_feature(
                 message: format!("invalid feature type for field {}", field.name()),
             });
         }
+=======
+        offsets.push(current);
+>>>>>>> a8f81ad6 (get basic types working)
     }
 
-    Ok(())
+    OffsetBuffer::new(ScalarBuffer::from(offsets))
 }
 
-/// Convert TensorProto message into an element of a FixedShapeTensor array and
-/// append it to the builder.
-///
-/// TensorProto definition:
-/// https://github.com/tensorflow/tensorboard/blob/master/tensorboard/compat/proto/tensor.proto
-///
-/// FixedShapeTensor definition:
-/// https://arrow.apache.org/docs/format/CanonicalExtensions.html#fixed-shape-tensor
-pub fn append_fixedshape_tensor(
-    field: &ArrowField,
-    builder: &dyn ArrayBuilder,
-    tensor: &TensorProto,
-) -> Result<()> {
-    todo!()
-}
+
+// /// Convert TensorProto message into an element of a FixedShapeTensor array and
+// /// append it to the builder.
+// ///
+// /// TensorProto definition:
+// /// https://github.com/tensorflow/tensorboard/blob/master/tensorboard/compat/proto/tensor.proto
+// ///
+// /// FixedShapeTensor definition:
+// /// https://arrow.apache.org/docs/format/CanonicalExtensions.html#fixed-shape-tensor
+// pub fn append_fixedshape_tensor(
+//     field: &ArrowField,
+//     builder: &dyn ArrayBuilder,
+//     tensor: &TensorProto,
+// ) -> Result<()> {
+//     todo!()
+// }
