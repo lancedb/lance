@@ -193,7 +193,11 @@ impl<'a> AsyncIndex<usize> for DictionaryDecoder<'a> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, _index: usize) -> Self::Output {
-        todo!()
+        Err(Error::NotSupported {
+            source: "DictionaryDecoder does not support get()"
+                .to_string()
+                .into(),
+        })
     }
 }
 

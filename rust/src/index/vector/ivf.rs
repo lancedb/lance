@@ -431,10 +431,12 @@ impl TryFrom<&pb::Ivf> for Ivf {
 
 fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
     let Some(field) = dataset.schema().field(column) else {
-        return Err(Error::IO{message:format!(
-            "Building index: column {} does not exist in dataset: {:?}",
-            column, dataset
-        )});
+        return Err(Error::IO {
+            message: format!(
+                "Building index: column {} does not exist in dataset: {:?}",
+                column, dataset
+            ),
+        });
     };
     if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
         if !matches!(elem_type.data_type(), DataType::Float32) {

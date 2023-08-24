@@ -294,13 +294,13 @@ pub(crate) async fn build_vector_index(
         // This is a IVF PQ index.
         let len = stages.len();
         let StageParams::Ivf(ivf_params) = &stages[len - 2] else {
-            return Err(Error::Index{message:
-                format!("Build Vector Index: invalid stages: {:?}", stages),
+            return Err(Error::Index {
+                message: format!("Build Vector Index: invalid stages: {:?}", stages),
             });
         };
         let StageParams::PQ(pq_params) = &stages[len - 1] else {
-            return Err(Error::Index{message:
-                format!("Build Vector Index: invalid stages: {:?}", stages),
+            return Err(Error::Index {
+                message: format!("Build Vector Index: invalid stages: {:?}", stages),
             });
         };
         build_ivf_pq_index(
@@ -317,8 +317,8 @@ pub(crate) async fn build_vector_index(
         // This is DiskANN index.
         use self::diskann::build_diskann_index;
         let StageParams::DiskANN(params) = stages.last().unwrap() else {
-            return Err(Error::Index{message:
-                format!("Build Vector Index: invalid stages: {:?}", stages),
+            return Err(Error::Index {
+                message: format!("Build Vector Index: invalid stages: {:?}", stages),
             });
         };
         build_diskann_index(dataset, column, name, uuid, params.clone()).await?;
@@ -372,7 +372,9 @@ pub(crate) async fn open_index(
     assert_eq!(proto.index_type, pb::IndexType::Vector as i32);
 
     let Some(idx_impl) = proto.implementation.as_ref() else {
-        return Err(Error::Index{message:"Invalid protobuf for VectorIndex metadata".to_string()});
+        return Err(Error::Index {
+            message: "Invalid protobuf for VectorIndex metadata".to_string(),
+        });
     };
 
     let pb::index::Implementation::VectorIndex(vec_idx) = idx_impl;

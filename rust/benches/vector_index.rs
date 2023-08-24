@@ -130,20 +130,24 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
 
     let test_uri = path.to_str().unwrap();
     std::fs::remove_dir_all(test_uri).map_or_else(|_| println!("{} not exists", test_uri), |_| {});
-    let mut write_params = WriteParams::default();
-    write_params.max_rows_per_file = num_rows as usize;
-    write_params.max_rows_per_group = batch_size as usize;
-    write_params.mode = mode;
+    let write_params = WriteParams {
+        max_rows_per_file: num_rows as usize,
+        max_rows_per_group: batch_size as usize,
+        mode: mode,
+        ..Default::default()
+    };
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
     let dataset = Dataset::write(reader, test_uri, Some(write_params))
         .await
         .unwrap();
     let mut ivf_params = IvfBuildParams::default();
     ivf_params.num_partitions = 32;
-    let mut pq_params = PQBuildParams::default();
-    pq_params.num_bits = 8;
-    pq_params.num_sub_vectors = 16;
-    pq_params.use_opq = false;
+    let pq_params = PQBuildParams {
+        num_bits: 8,
+        num_sub_vectors: 16,
+        use_opq: false,
+        ..Default::default()
+    };
     let m_type = MetricType::L2;
     let params = VectorIndexParams::with_ivf_pq_params(m_type, ivf_params, pq_params);
     dataset

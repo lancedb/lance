@@ -466,7 +466,9 @@ impl Scanner {
     // KNN search execution node.
     async fn knn(&self) -> Result<Arc<dyn ExecutionPlan>> {
         let Some(q) = self.nearest.as_ref() else {
-            return Err(Error::IO{message:"No nearest query".to_string()});
+            return Err(Error::IO {
+                message: "No nearest query".to_string(),
+            });
         };
 
         let column_id = self.dataset.schema().field_id(q.column.as_str())?;

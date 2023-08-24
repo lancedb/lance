@@ -263,7 +263,7 @@ pub async fn read_deletion_file(
     object_store: &ObjectStore,
 ) -> Result<Option<DeletionVector>> {
     let Some(deletion_file) = &fragment.deletion_file else {
-        return Ok(None)
+        return Ok(None);
     };
 
     match deletion_file.file_type {
