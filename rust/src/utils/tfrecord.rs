@@ -14,6 +14,9 @@
 
 //! Reading TFRecord files into Arrow data
 
+use arrow::buffer::OffsetBuffer;
+use arrow_array::{FixedSizeListArray, ListArray};
+use arrow_buffer::ScalarBuffer;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
@@ -21,10 +24,13 @@ use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::arrow::FixedSizeListArrayExt;
 use crate::error::{Error, Result};
 use crate::io::ObjectStore;
 use arrow::record_batch::RecordBatch;
-use arrow_array::builder::{make_builder, ArrayBuilder, BinaryBuilder};
+use arrow_array::builder::{
+    make_builder, ArrayBuilder, BinaryBuilder, Int32BufferBuilder, Int32Builder, ListBuilder,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use tfrecord::protobuf::feature::Kind;
 use tfrecord::protobuf::{DataType as TensorDataType, TensorProto};
@@ -269,12 +275,6 @@ pub async fn read_tfrecord(
     uri: &str,
     schema: Arc<ArrowSchema>,
 ) -> Result<SendableRecordBatchStream> {
-    let mut builders = schema
-        .fields
-        .iter()
-        .map(|field| make_builder(field.data_type(), 10))
-        .collect::<Vec<_>>();
-
     let batch_size = 10_000;
 
     let (store, path) = ObjectStore::from_uri(uri).await?;
@@ -296,7 +296,7 @@ pub async fn read_tfrecord(
                     message: err.to_string(),
                 })?;
                 builder.append(record)?;
-                if builder.num_rows == batch_size {
+                if builder.num_rows() == batch_size {
                     // A batch is ready
                     let batch = builder.finish()?;
                     Ok(Some((Some(batch), (records, builder))))
@@ -304,7 +304,7 @@ pub async fn read_tfrecord(
                     Ok(Some((None, (records, builder))))
                 }
             } else {
-                if builder.num_rows > 0 {
+                if builder.num_rows() > 0 {
                     // output the last (partial) batch
                     let batch = builder.finish()?;
                     Ok(Some((Some(batch), (records, builder))))
@@ -325,28 +325,100 @@ pub async fn read_tfrecord(
 struct TFRecordBatchBuilder {
     schema: Arc<ArrowSchema>,
     builders: Vec<Box<dyn ArrayBuilder>>,
+    /// For fields that are lists, we also have offset builders
+    offset_builders: Vec<Option<Vec<i32>>>,
     num_rows: usize,
 }
 
 impl TFRecordBatchBuilder {
     pub fn new(schema: Arc<ArrowSchema>) -> Self {
-        // TODO: handle builders for list columns.
-        let builders = schema
-            .fields
-            .iter()
-            .map(|field| make_builder(field.data_type(), 10))
-            .collect::<Vec<_>>();
+        // make_builder is not implemented for list types yet, so we handle
+        // offsets manually.
+        let mut builders = Vec::with_capacity(schema.fields.len());
+        let mut offset_builders = Vec::with_capacity(schema.fields.len());
+
+        for field in schema.fields() {
+            let leaf_type = match field.data_type() {
+                DataType::List(inner_field) => {
+                    offset_builders.push(Some(vec![0]));
+                    match inner_field.data_type() {
+                        DataType::FixedSizeList(inner_field, _) => inner_field.data_type(),
+                        _ => inner_field.data_type(),
+                    }
+                }
+                DataType::FixedSizeList(inner_field, _) => {
+                    offset_builders.push(None);
+                    inner_field.data_type()
+                }
+                _ => {
+                    offset_builders.push(None);
+                    field.data_type()
+                }
+            };
+            builders.push(make_builder(leaf_type, 1024));
+        }
+
         Self {
             schema,
             builders,
+            offset_builders,
             num_rows: 0,
         }
     }
 
     pub fn append(&mut self, record: Example) -> Result<()> {
-        todo!();
+        let features = record.features.unwrap().feature;
+
+        for (i, field) in self.schema.fields().iter().enumerate() {
+            // TODO: right now we have to downcast the builder for every cell, which
+            // might be inefficient.
+            if let Some(feature) = features.get(field.name()) {
+                Self::append_values(field, &mut self.builders[i], feature)?;
+                Self::append_offsets(field, &mut self.offset_builders[i], feature)?;
+            } else {
+                Self::append_nulls(field, &mut self.builders[i], &mut self.offset_builders[i])?;
+            }
+        }
 
         self.num_rows += 1;
+        Ok(())
+    }
+
+    fn append_values(
+        field: &ArrowField,
+        builder: &mut dyn ArrayBuilder,
+        feature: &tfrecord::Feature,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    fn append_offsets(
+        field: &ArrowField,
+        builder: &mut Option<Vec<i32>>,
+        feature: &tfrecord::Feature,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    fn append_nulls(
+        field: &ArrowField,
+        builder: &mut dyn ArrayBuilder,
+        offset_builder: &mut Option<Vec<i32>>,
+    ) -> Result<()> {
+        let num_null_values = match field.data_type() {
+            DataType::List(inner_field) => match inner_field.data_type() {
+                DataType::FixedSizeList(_, size) => *size as usize,
+                _ => 1,
+            },
+            DataType::FixedSizeList(_, size) => *size as usize,
+            _ => 1,
+        };
+        // TODO: append nulls
+        builder.append_nulls(num_null_values);
+        if let Some(offset_builder) = offset_builder {
+            offset_builder.push(*offset_builder.last().unwrap());
+        }
+        Ok(())
     }
 
     pub fn num_rows(&self) -> usize {
@@ -354,11 +426,58 @@ impl TFRecordBatchBuilder {
     }
 
     pub fn finish(&mut self) -> Result<RecordBatch> {
-        let columns = self
+        // Handle the list and fixed-size list types
+        let mut columns = self
             .builders
             .iter_mut()
             .map(|builder| builder.finish())
             .collect::<Vec<_>>();
+        let offsets = self
+            .offset_builders
+            .iter_mut()
+            .map(|builder| {
+                let data = builder.take();
+                data.map(|builder| OffsetBuffer::new(ScalarBuffer::from(builder)))
+            })
+            .collect::<Vec<_>>();
+
+        for (column, offsets) in columns.iter_mut().zip(offsets.into_iter()) {
+            match column.data_type() {
+                DataType::List(inner_field) => match inner_field.data_type() {
+                    DataType::FixedSizeList(fsl_field, size) => {
+                        let fsl_column = FixedSizeListArray::try_new(
+                            fsl_field.clone(),
+                            *size,
+                            column.clone(),
+                            None,
+                        )?;
+                        *column = Arc::new(ListArray::try_new(
+                            inner_field.clone(),
+                            offsets.unwrap(),
+                            Arc::new(fsl_column),
+                            None,
+                        )?);
+                    }
+                    _ => {
+                        *column = Arc::new(ListArray::try_new(
+                            inner_field.clone(),
+                            offsets.unwrap(),
+                            column.clone(),
+                            None,
+                        )?);
+                    }
+                },
+                DataType::FixedSizeList(fsl_field, size) => {
+                    *column = Arc::new(FixedSizeListArray::try_new(
+                        fsl_field.clone(),
+                        *size,
+                        column.clone(),
+                        None,
+                    )?);
+                }
+                _ => {} // Leave column as-is
+            }
+        }
         let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
         self.num_rows = 0;
         Ok(batch)
