@@ -214,8 +214,8 @@ impl<'a> CleanupTask<'a> {
         self.dataset
             .object_store
             .remove_stream(all_paths_to_remove.boxed())
-            .for_each(|_| future::ready(()))
-            .await;
+            .try_for_each(|_| future::ready(Ok(())))
+            .await?;
 
         let mut removal_stats = removal_stats.into_inner().unwrap();
         removal_stats.old_manifests = num_old_manifests as u64;
