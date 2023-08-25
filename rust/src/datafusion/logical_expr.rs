@@ -83,7 +83,12 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
             match (left.as_ref(), right.as_ref()) {
                 (Expr::Column(l), Expr::Literal(_)) => {
                     let Some(field) = schema.field(&l.flat_name()) else {
-                        return Err(Error::IO{message: format!("Column {} does not exist in the dataset.", l.flat_name())})
+                        return Err(Error::IO {
+                            message: format!(
+                                "Column {} does not exist in the dataset.",
+                                l.flat_name()
+                            ),
+                        });
                     };
                     Ok(Expr::BinaryExpr(BinaryExpr {
                         left: left.clone(),
@@ -93,7 +98,12 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                 }
                 (Expr::Literal(_), Expr::Column(l)) => {
                     let Some(field) = schema.field(&l.flat_name()) else {
-                        return Err(Error::IO{message: format!("Column {} does not exist in the dataset.", l.flat_name())})
+                        return Err(Error::IO {
+                            message: format!(
+                                "Column {} does not exist in the dataset.",
+                                l.flat_name()
+                            ),
+                        });
                     };
                     Ok(Expr::BinaryExpr(BinaryExpr {
                         left: Box::new(resolve_value(right.as_ref(), &field.data_type())?),
@@ -104,7 +114,12 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                 // For cases complex expressions (not just literals) on right hand side like x = 1 + 1 + -2*2
                 (Expr::Column(l), Expr::BinaryExpr(r)) => {
                     let Some(field) = schema.field(&l.flat_name()) else {
-                        return Err(Error::IO{message: format!("Column {} does not exist in the dataset.", l.flat_name())})
+                        return Err(Error::IO {
+                            message: format!(
+                                "Column {} does not exist in the dataset.",
+                                l.flat_name()
+                            ),
+                        });
                     };
                     Ok(Expr::BinaryExpr(BinaryExpr {
                         left: left.clone(),

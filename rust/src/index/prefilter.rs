@@ -43,9 +43,13 @@ impl PreFilter {
     pub async fn check_one(&self, row_id: u64) -> Result<bool> {
         let fragment_id = (row_id >> 32) as u32;
         // If the fragment isn't found, then it must have been deleted.
-        let Some(fragment) = self.dataset.get_fragment(fragment_id as usize) else { return Ok(false) };
+        let Some(fragment) = self.dataset.get_fragment(fragment_id as usize) else {
+            return Ok(false);
+        };
         // If the fragment has no deletion vector, then the row must be there.
-        let Some(deletion_vector) = fragment.get_deletion_vector().await? else { return Ok(true) };
+        let Some(deletion_vector) = fragment.get_deletion_vector().await? else {
+            return Ok(true);
+        };
         let local_row_id = row_id as u32;
         Ok(!deletion_vector.contains(local_row_id))
     }

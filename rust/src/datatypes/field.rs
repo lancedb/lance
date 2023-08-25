@@ -217,9 +217,12 @@ impl Field {
                 let mut fields = vec![];
                 for other_field in other.children.iter() {
                     let Some(child) = self.child(&other_field.name) else {
-                        return Err(Error::Schema{message:format!(
-                            "Attempt to project non-existed field: {} on {}", other_field.name, self,
-                        )});
+                        return Err(Error::Schema {
+                            message: format!(
+                                "Attempt to project non-existed field: {} on {}",
+                                other_field.name, self,
+                            ),
+                        });
                     };
                     fields.push(child.project_by_field(other_field)?);
                 }

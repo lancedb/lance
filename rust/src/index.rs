@@ -117,9 +117,9 @@ impl DatasetIndexExt for Dataset {
         }
         let column = columns[0];
         let Some(field) = self.schema().field(column) else {
-            return Err(Error::Index{message: format!(
-                "CreateIndex: column '{column}' does not exist"
-            )});
+            return Err(Error::Index {
+                message: format!("CreateIndex: column '{column}' does not exist"),
+            });
         };
 
         // Load indices from the disk.
