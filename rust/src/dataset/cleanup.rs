@@ -128,7 +128,7 @@ impl<'a> CleanupTask<'a> {
             .await?
             .try_filter(|path| future::ready(path.extension() == Some("manifest")))
             .try_for_each_concurrent(
-                8,
+                num_cpus::get(),
                 |path| async move { self.process_manifest_file(&path).await },
             )
             .await
