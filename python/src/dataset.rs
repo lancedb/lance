@@ -91,11 +91,13 @@ impl Dataset {
         }
         let uri_ref = uri.clone();
         let dataset = if let Some(ver) = version {
-            RT.block_on(
-                async move { LanceDataset::checkout_with_params(&uri_ref, ver, &params).await },
-            )
+            RT.block_on_py(None, async move {
+                LanceDataset::checkout_with_params(&uri_ref, ver, &params).await
+            })
         } else {
-            RT.block_on(async move { LanceDataset::open_with_params(&uri_ref, &params).await })
+            RT.block_on_py(None, async move {
+                LanceDataset::open_with_params(&uri_ref, &params).await
+            })
         };
         match dataset {
             Ok(ds) => Ok(Self {
@@ -133,9 +135,9 @@ impl Dataset {
     fn load_indices(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
         let ds = self_.ds.clone();
         let py = self_.py();
-        let index_metadata =
-            Python::allow_threads(py, || RT.block_on(async move { ds.load_indices().await }))
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let index_metadata = RT
+            .block_on_py(Some(py), async move { ds.load_indices().await })
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         Ok(index_metadata
             .iter()
@@ -304,6 +306,8 @@ impl Dataset {
 
     fn count_rows(&self) -> PyResult<usize> {
         let ds = self.ds.clone();
+        // Methods that take &self shouldn't hold the GIL, so safe to call
+        // block_on() without releasing the GIL.
         RT.block_on(async move {
             ds.count_rows()
                 .await
@@ -328,13 +332,11 @@ impl Dataset {
         py: Python<'_>,
     ) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        let new_self = Python::allow_threads(py, || {
-            RT.block_on(async move {
-                match new_self.merge(reader.0, &left_on, &right_on).await {
-                    Ok(()) => Ok(new_self),
-                    Err(err) => Err(PyIOError::new_err(err.to_string())),
-                }
-            })
+        let new_self = RT.block_on_py(Some(py), async move {
+            match new_self.merge(reader.0, &left_on, &right_on).await {
+                Ok(()) => Ok(new_self),
+                Err(err) => Err(PyIOError::new_err(err.to_string())),
+            }
         })?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -342,13 +344,11 @@ impl Dataset {
 
     fn delete(&mut self, predicate: String, py: Python<'_>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        let new_self = Python::allow_threads(py, || {
-            RT.block_on(async move {
-                match new_self.delete(&predicate).await {
-                    Ok(()) => Ok(new_self),
-                    Err(err) => Err(PyIOError::new_err(err.to_string())),
-                }
-            })
+        let new_self = RT.block_on_py(Some(py), async move {
+            match new_self.delete(&predicate).await {
+                Ok(()) => Ok(new_self),
+                Err(err) => Err(PyIOError::new_err(err.to_string())),
+            }
         })?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -385,13 +385,11 @@ impl Dataset {
     /// Restore the current version
     fn restore(&mut self, py: Python<'_>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        let new_self = Python::allow_threads(py, || {
-            RT.block_on(async move {
-                match new_self.restore(None).await {
-                    Ok(()) => Ok(new_self),
-                    Err(err) => Err(PyIOError::new_err(err.to_string())),
-                }
-            })
+        let new_self = RT.block_on_py(Some(py), async move {
+            match new_self.restore(None).await {
+                Ok(()) => Ok(new_self),
+                Err(err) => Err(PyIOError::new_err(err.to_string())),
+            }
         })?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -495,7 +493,8 @@ impl Dataset {
             }
         };
         let ds = self_.ds.clone();
-        RT.block_on(async move {
+
+        RT.block_on_py(Some(self_.py()), async move {
             let cols_slice: Vec<&str> = columns.iter().map(|col| col.as_str()).collect();
             ds.create_index(cols_slice.as_slice(), idx_type, name, &params, replace)
                 .await
@@ -545,12 +544,11 @@ impl Dataset {
             .collect::<PyResult<Vec<Fragment>>>()?;
         let mode = parse_write_mode(mode.unwrap_or("create"))?;
         let uri = dataset_uri.clone();
-        let ds = Python::allow_threads(py, || {
-            RT.block_on(async move {
+        let ds = RT
+            .block_on_py(Some(py), async move {
                 LanceDataset::commit(&dataset_uri, &schema, &fragment_metadata, mode).await
             })
-        })
-        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
             ds: Arc::new(ds),
             uri,
@@ -570,24 +568,24 @@ pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<
     let params = get_write_params(options)?;
     if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
-        let batches = Python::allow_threads(reader.py(), || {
-            RT.block_on(async move { scanner.to_reader().await })
-        })
-        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let batches = RT
+            .block_on_py(Some(reader.py()), async move { scanner.to_reader().await })
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        Python::allow_threads(reader.py(), || {
-            RT.block_on(async move { LanceDataset::write(batches, &uri, params).await })
-                .map_err(|err| PyIOError::new_err(err.to_string()))
-        })?;
+        RT.block_on_py(Some(reader.py()), async move {
+            LanceDataset::write(batches, &uri, params).await
+        })
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(true)
     } else {
         let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
         // The reader itself might try to acquire the GIL, so it's imperative we
         // aren't holding it when we call `LanceDataset::write`.
-        Python::allow_threads(reader.py(), || {
-            RT.block_on(async move { LanceDataset::write(batches, &uri, params).await })
-                .map_err(|err| PyIOError::new_err(err.to_string()))
-        })?;
+
+        RT.block_on_py(Some(reader.py()), async move {
+            LanceDataset::write(batches, &uri, params).await
+        })
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(true)
     }
 }

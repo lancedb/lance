@@ -19,6 +19,7 @@
 use std::sync::{Arc, Mutex};
 
 use futures::{future::BoxFuture, Future};
+use pyo3::Python;
 
 /// A background executor which allows running tasks on a tokio runtime
 /// in a separate thread.
@@ -67,6 +68,22 @@ impl BackgroundExecutor {
 
         Self {
             state: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    /// Send a future to the background executor and wait for it to complete.
+    ///
+    /// This variant makes sure the GIL is released while blocking on the task.
+    pub fn block_on_py<T>(&self, py: Option<Python<'_>>, task: T) -> T::Output
+    where
+        T: Future + Send + 'static,
+        T::Output: Send + 'static,
+    {
+        if let Some(py) = py {
+            py.allow_threads(|| self.block_on(task))
+        } else {
+            // Python::with_gil is a no-op if the GIL is already held by the thread.
+            Python::with_gil(|py| py.allow_threads(|| self.block_on(task)))
         }
     }
 
