@@ -24,6 +24,7 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
+use serde::Serialize;
 
 use super::row_vertex::{RowVertex, RowVertexSerDe};
 use crate::{
@@ -200,9 +201,22 @@ impl DiskANNIndex {
     }
 }
 
+#[derive(Serialize)]
+pub struct DiskANNIndexStatistics {
+    index_type: String,
+    length: usize,
+}
+
 impl Index for DiskANNIndex {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn statistics(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(DiskANNIndexStatistics {
+            index_type: "DiskANNIndex".to_string(),
+            length: self.graph.len(),
+        })?)
     }
 }
 

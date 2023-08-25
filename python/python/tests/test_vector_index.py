@@ -11,6 +11,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import platform
 import random
 import string
 import time
@@ -176,7 +177,7 @@ def test_create_dot_index(dataset, tmp_path):
 
 def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     centroids = np.random.randn(5, 128).astype(np.float32)  # IVF5
-    dataset.create_index(
+    dataset_with_index = dataset.create_index(
         ["vector"],
         index_type="IVF_PQ",
         ivf_centroids=centroids,
@@ -185,8 +186,46 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     )
 
     q = np.random.randn(128)
-    actual = dataset.to_table(
+    actual = dataset_with_index.to_table(
         columns=["id"],
         nearest={"column": "vector", "q": q, "k": 10, "use_index": False},
     )["id"].to_numpy()
     assert len(actual) == 10
+
+    index_uuid = dataset_with_index.list_indices()[0]["uuid"]
+    assert len(index_uuid) == 36
+
+    expected_filepath = str(tmp_path / "_indices" / index_uuid / "index.idx")
+    if platform.system() == "Windows":
+        expected_filepath = expected_filepath.replace("\\", "/")
+    expected_statistics = {
+        "index_type": "IVF",
+        "uuid": index_uuid,
+        "uri": expected_filepath,
+        "metric_type": "l2",
+        "num_partitions": 5,
+        "sub_index": {
+            "dimension": 128,
+            "index_type": "PQ",
+            "metric_type": "l2",
+            "nbits": 8,
+            "num_sub_vectors": 8,
+        },
+    }
+
+    with pytest.raises(KeyError, match='Index "non-existent_idx" not found'):
+        assert dataset_with_index.index_statistics("non-existent_idx")
+    with pytest.raises(KeyError, match='Index "" not found'):
+        assert dataset_with_index.index_statistics("")
+    with pytest.raises(TypeError):
+        dataset_with_index.index_statistics()
+
+    actual_statistics = dataset_with_index.index_statistics("vector_idx")
+    partitions = actual_statistics.pop("partitions")
+    assert actual_statistics == expected_statistics
+
+    assert len(partitions) == 5
+    partition_keys = {"index", "length", "offset", "centroid"}
+    assert all([p["index"] == i for i, p in enumerate(partitions)])
+    assert all([partition_keys == set(p.keys()) for p in partitions])
+    assert all([all([isinstance(c, float) for c in p["centroid"]]) for p in partitions])

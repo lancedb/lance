@@ -49,6 +49,7 @@ use self::write::{reader_to_stream, write_fragments};
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{Fragment, Index, Manifest};
+use crate::index::vector::open_index;
 use crate::io::reader::read_manifest_indexes;
 use crate::io::{
     commit::{commit_new_dataset, commit_transaction, CommitError},
@@ -953,6 +954,27 @@ impl Dataset {
     pub async fn load_indices(&self) -> Result<Vec<Index>> {
         let manifest_file = self.manifest_file(self.version().version);
         read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest).await
+    }
+
+    /// Find index with a given index_name and return its serialized statistics.
+    pub async fn index_statistics(&self, index_name: String) -> Result<Option<String>> {
+        let index_uuid = self
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|idx| idx.name.eq(&index_name))
+            .map(|idx| idx.uuid.to_string());
+
+        if let Some(index_uuid) = index_uuid {
+            let index_statistics = open_index(Arc::new(self.clone()), "vector", &index_uuid)
+                .await?
+                .statistics()
+                .unwrap();
+            Ok(Some(serde_json::to_string(&index_statistics).unwrap()))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn validate(&self) -> Result<()> {
@@ -1981,6 +2003,27 @@ mod tests {
         let expected = dataset.manifest.version - 2;
         assert_eq!(actual, expected);
         dataset.validate().await.unwrap();
+
+        let expected_statistics =
+            "{\"index_type\":\"IVF\",\"metric_type\":\"l2\",\"num_partitions\":10";
+        let actual_statistics = dataset
+            .index_statistics("embeddings_idx".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(actual_statistics.starts_with(expected_statistics));
+
+        assert_eq!(
+            dataset
+                .index_statistics("non-existent_idx".to_string())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            dataset.index_statistics("".to_string()).await.unwrap(),
+            None
+        );
 
         // Overwrite should invalidate index
         let write_params = WriteParams {

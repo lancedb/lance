@@ -34,6 +34,7 @@ use futures::{
 };
 use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
+use serde::Serialize;
 
 #[cfg(feature = "opq")]
 use super::opq::train_opq;
@@ -48,7 +49,10 @@ use crate::{
     datatypes::Field,
     index::{pb, prefilter::PreFilter, vector::Transformer, Index},
 };
-use crate::{io::object_reader::ObjectReader, session::Session};
+use crate::{
+    io::{local::to_local_path, object_reader::ObjectReader},
+    session::Session,
+};
 use crate::{Error, Result};
 
 const PARTITION_ID_COLUMN: &str = "__ivf_part_id";
@@ -133,9 +137,57 @@ impl std::fmt::Debug for IVFIndex {
     }
 }
 
+#[derive(Serialize)]
+pub struct IvfIndexPartitionStatistics {
+    index: usize,
+    length: u32,
+    offset: usize,
+    centroid: Vec<f32>,
+}
+
+#[derive(Serialize)]
+pub struct IvfIndexStatistics {
+    index_type: String,
+    uuid: String,
+    uri: String,
+    metric_type: String,
+    num_partitions: usize,
+    sub_index: serde_json::Value,
+    partitions: Vec<IvfIndexPartitionStatistics>,
+}
+
 impl Index for IVFIndex {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn statistics(&self) -> Result<serde_json::Value> {
+        let partitions_statistics = self
+            .ivf
+            .lengths
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| {
+                let centroid = self.ivf.centroids.value(i);
+                let centroid_arr: &Float32Array = as_primitive_array(centroid.as_ref());
+                IvfIndexPartitionStatistics {
+                    index: i,
+                    length: len,
+                    offset: self.ivf.offsets[i],
+                    centroid: centroid_arr.values().to_vec(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Ok(serde_json::to_value(IvfIndexStatistics {
+            index_type: "IVF".to_string(),
+            uuid: self.uuid.clone(),
+            uri: to_local_path(self.reader.path()),
+            metric_type: self.metric_type.to_string(),
+            num_partitions: self.ivf.num_partitions(),
+            sub_index: self.sub_index.statistics()?,
+            partitions: partitions_statistics,
+        })?)
     }
 }
 

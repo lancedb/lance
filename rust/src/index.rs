@@ -44,6 +44,10 @@ use self::vector::{build_vector_index, VectorIndexParams};
 pub(crate) trait Index: Send + Sync {
     /// Cast to [Any].
     fn as_any(&self) -> &dyn Any;
+
+    // TODO: if we ever make this public, do so in such a way that `serde_json`
+    // isn't exposed at the interface. That way mismatched versions isn't an issue.
+    fn statistics(&self) -> Result<serde_json::Value>;
 }
 
 /// Index Type
