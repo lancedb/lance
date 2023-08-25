@@ -83,7 +83,6 @@ impl CommitLock for PyCommitLock {
     type Lease = PyCommitLease;
 
     async fn lock(&self, version: u64) -> Result<Self::Lease, CommitError> {
-        println!("locking!");
         let lease = Python::with_gil(|py| -> Result<_, CommitError> {
             let lease = self
                 .inner
@@ -94,7 +93,6 @@ impl CommitLock for PyCommitLock {
                 .map_err(|err| handle_error(err, py))?;
             Ok(lease)
         })?;
-        println!("Got lease");
         Ok(PyCommitLease { inner: lease })
     }
 }
@@ -106,7 +104,6 @@ pub struct PyCommitLease {
 #[async_trait::async_trait]
 impl CommitLease for PyCommitLease {
     async fn release(&self, success: bool) -> Result<(), CommitError> {
-        println!("Releasing!");
         Python::with_gil(|py| {
             if success {
                 self.inner
@@ -136,7 +133,6 @@ impl CommitLease for PyCommitLease {
                     .map_err(|err| handle_error(err, py))
             }
         })?;
-        println!("Finished release");
         Ok(())
     }
 }

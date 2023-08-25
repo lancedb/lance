@@ -27,6 +27,7 @@ use lance::datatypes::Schema;
 use lance::format::Fragment;
 use lance::index::vector::ivf::IvfBuildParams;
 use lance::index::vector::pq::PQBuildParams;
+use lance::index::DatasetIndexExt;
 use lance::io::object_store::ObjectStoreParams;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;

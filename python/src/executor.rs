@@ -79,7 +79,6 @@ impl BackgroundExecutor {
         let (tx, rx) = std::sync::mpsc::channel::<T::Output>();
 
         let fut = Box::pin(async move {
-            println!("Running task on background thread");
             let task_output = task.await;
             tokio::task::spawn_blocking(move || {
                 tx.send(task_output).ok();
@@ -89,7 +88,6 @@ impl BackgroundExecutor {
         });
 
         let mut state = self.state.lock().unwrap();
-        println!("Sending task to background thread");
         if let Some(requests) = &mut state.requests {
             requests.send(fut).unwrap();
         } else {
@@ -99,11 +97,7 @@ impl BackgroundExecutor {
         // Drop the lock while we wait for the task to complete
         std::mem::drop(state);
 
-        println!("Waiting for task to complete");
-
         let out = rx.recv().unwrap();
-
-        println!("Task completed");
 
         out
     }
