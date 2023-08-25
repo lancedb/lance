@@ -127,10 +127,9 @@ impl<'a> CleanupTask<'a> {
             .read_dir_all(&self.dataset.versions_dir(), None)
             .await?
             .try_filter(|path| future::ready(path.extension() == Some("manifest")))
-            .try_for_each_concurrent(
-                num_cpus::get(),
-                |path| async move { self.process_manifest_file(&path).await },
-            )
+            .try_for_each_concurrent(num_cpus::get(), |path| async move {
+                self.process_manifest_file(&path).await
+            })
             .await
     }
 
