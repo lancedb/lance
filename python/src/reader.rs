@@ -18,10 +18,12 @@ use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
+use futures::lock::Mutex;
 use futures::stream::StreamExt;
-use tokio::runtime::Runtime;
 
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner as LanceScanner};
+
+use crate::RT;
 
 /// Lance's RecordBatchReader
 /// This implements Arrow's RecordBatchReader trait
@@ -29,19 +31,14 @@ use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner as LanceScanner}
 /// an ArrowArrayStream in the Arrow C Data Interface
 pub struct LanceReader {
     schema: SchemaRef,
-    stream: DatasetRecordBatchStream,
-    rt: Arc<Runtime>,
+    stream: Arc<Mutex<DatasetRecordBatchStream>>,
 }
 
 impl LanceReader {
-    pub async fn try_new(
-        scanner: Arc<LanceScanner>,
-        rt: Arc<Runtime>,
-    ) -> ::lance::error::Result<Self> {
+    pub async fn try_new(scanner: Arc<LanceScanner>) -> ::lance::error::Result<Self> {
         Ok(Self {
             schema: scanner.schema()?,
-            stream: scanner.try_into_stream().await?, // needs tokio Runtime
-            rt,
+            stream: Arc::new(Mutex::new(scanner.try_into_stream().await?)), // needs tokio Runtime
         })
     }
 }
@@ -50,9 +47,12 @@ impl Iterator for LanceReader {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let stream = &mut self.stream;
-        self.rt
-            .block_on(async { stream.next().await.map(|rs| rs.map_err(ArrowError::from)) })
+        let stream = self.stream.clone();
+        RT.block_on(async move {
+            let mut stream = stream.lock().await;
+            stream.next().await
+        })
+        .map(|rs| rs.map_err(ArrowError::from))
     }
 }
 

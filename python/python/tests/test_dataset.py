@@ -622,3 +622,10 @@ def test_dataset_restore(tmp_path: Path):
     dataset.restore()
     assert dataset.version == 3
     assert dataset.count_rows() == 100
+
+
+def test_roundtrip_reader(tmp_path: Path):
+    data = pa.table({"a": range(100)})
+    dataset = lance.write_dataset(data, tmp_path)
+    reader = dataset.to_batches()
+    lance.write_dataset(reader, tmp_path / "test2", schema=dataset.schema)

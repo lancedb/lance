@@ -104,9 +104,10 @@ pub trait DatasetIndexExt {
     ) -> Result<Dataset>;
 }
 
-#[async_trait]
-impl DatasetIndexExt for Dataset {
-    async fn create_index(
+// #[async_trait]
+impl Dataset {
+    // TODO: make our futures not tied to lifetime of basic parameters.
+    pub async fn create_index(
         &self,
         columns: &[&str],
         index_type: IndexType,
@@ -159,7 +160,7 @@ impl DatasetIndexExt for Dataset {
                         message: "Vector index type must take a VectorIndexParams".to_string(),
                     })?;
 
-                build_vector_index(self, column, &index_name, &index_id.to_string(), vec_params)
+                build_vector_index(self, &column, &index_name, &index_id.to_string(), vec_params)
                     .await?;
             }
         }

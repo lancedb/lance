@@ -19,19 +19,24 @@ use lance::Error;
 
 use pyo3::{exceptions::PyIOError, prelude::*};
 
-lazy_static! {
-    static ref PY_CONFLICT_ERROR: PyResult<PyObject> = {
-        Python::with_gil(|py| {
-            py.import("lance")
-                .and_then(|lance| lance.getattr("commit"))
-                .and_then(|commit| commit.getattr("CommitConflictError"))
-                .map(|error| error.to_object(py))
-        })
-    };
-}
+// lazy_static! {
+//     static ref PY_CONFLICT_ERROR: PyResult<PyObject> = {
+//         Python::with_gil(|py| {
+//             py.import("lance")
+//                 .and_then(|lance| lance.getattr("commit"))
+//                 .and_then(|commit| commit.getattr("CommitConflictError"))
+//                 .map(|error| error.to_object(py))
+//         })
+//     };
+// }
 
 fn handle_error(py_err: PyErr, py: Python) -> CommitError {
-    let conflict_err_type = match &*PY_CONFLICT_ERROR {
+    let py_conflict_error = py
+        .import("lance")
+        .and_then(|lance| lance.getattr("commit"))
+        .and_then(|commit| commit.getattr("CommitConflictError"))
+        .map(|error| error.to_object(py));
+    let conflict_err_type = match &py_conflict_error {
         Ok(err) => err.as_ref(py).get_type(),
         Err(import_error) => {
             return CommitError::OtherError(Error::Internal {
@@ -78,6 +83,7 @@ impl CommitLock for PyCommitLock {
     type Lease = PyCommitLease;
 
     async fn lock(&self, version: u64) -> Result<Self::Lease, CommitError> {
+        println!("locking!");
         let lease = Python::with_gil(|py| -> Result<_, CommitError> {
             let lease = self
                 .inner
@@ -88,6 +94,7 @@ impl CommitLock for PyCommitLock {
                 .map_err(|err| handle_error(err, py))?;
             Ok(lease)
         })?;
+        println!("Got lease");
         Ok(PyCommitLease { inner: lease })
     }
 }
@@ -99,6 +106,7 @@ pub struct PyCommitLease {
 #[async_trait::async_trait]
 impl CommitLease for PyCommitLease {
     async fn release(&self, success: bool) -> Result<(), CommitError> {
+        println!("Releasing!");
         Python::with_gil(|py| {
             if success {
                 self.inner
@@ -128,6 +136,7 @@ impl CommitLease for PyCommitLease {
                     .map_err(|err| handle_error(err, py))
             }
         })?;
+        println!("Finished release");
         Ok(())
     }
 }
