@@ -104,8 +104,6 @@ all_asserts = "2.3.1"
 mock_instant = { version = "0.3.1", features = ["sync"] }
 
 [features]
-# TODO: remove this
-default = ["tensorflow"]
 cli = ["clap"]
 opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
 tensorflow = ["tfrecord"]

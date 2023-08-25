@@ -299,12 +299,7 @@ impl ObjectStore {
         if !expanded_path.try_exists()? {
             std::fs::create_dir_all(expanded_path)?;
         }
-        // TODO: do we really need this? It is leaky.
-        // else if !expanded_path.is_dir() {
-        //     return Err(Error::IO {
-        //         message: format!("{} is not a lance directory", str_path),
-        //     });
-        // }
+
         let expanded_path = expanded_path.canonicalize()?;
 
         Ok((

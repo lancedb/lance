@@ -265,3 +265,82 @@ def test_tfrecord_parsing(tmp_path):
     )
 
     assert table == expected_data
+
+
+def test_tfrecord_parsing_nulls(tmp_path):
+    # Make sure we don't trip up on missing values
+    tensor = tf.constant(np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32))
+
+    features = [
+        {
+            "a": tf.train.Feature(int64_list=tf.train.Int64List(value=[1])),
+            "b": tf.train.Feature(int64_list=tf.train.Int64List(value=[1])),
+            "c": tf.train.Feature(float_list=tf.train.FloatList(value=[1.0])),
+            "d": tf.train.Feature(
+                bytes_list=tf.train.BytesList(
+                    value=[tf.io.serialize_tensor(tensor).numpy()]
+                )
+            ),
+        },
+        {
+            "a": tf.train.Feature(int64_list=tf.train.Int64List(value=[1])),
+        },
+        {
+            "a": tf.train.Feature(int64_list=tf.train.Int64List(value=[1])),
+            "b": tf.train.Feature(int64_list=tf.train.Int64List(value=[1, 2, 3])),
+            "c": tf.train.Feature(float_list=tf.train.FloatList(value=[1.0])),
+        },
+    ]
+
+    path = tmp_path / "test.tfrecord"
+    with tf.io.TFRecordWriter(str(path)) as writer:
+        for feature in features:
+            example_proto = tf.train.Example(
+                features=tf.train.Features(feature=feature)
+            )
+            serialized = example_proto.SerializeToString()
+            writer.write(serialized)
+
+    inferred_schema = infer_tfrecord_schema(str(path), tensor_features=["d"])
+    assert inferred_schema == pa.schema(
+        {
+            "a": pa.int64(),
+            "b": pa.list_(pa.int64()),
+            "c": pa.float32(),
+            "d": pa.fixed_shape_tensor(pa.float32(), [2, 3]),
+        }
+    )
+
+    tensor_type = pa.fixed_shape_tensor(pa.float32(), [2, 3])
+    inner = pa.array([float(x) for x in range(1, 7)] + [None] * 12, pa.float32())
+    storage = pa.FixedSizeListArray.from_arrays(inner, 6)
+    f32_array = pa.ExtensionArray.from_storage(tensor_type, storage)
+
+    data = read_tfrecord(str(path), inferred_schema).read_all()
+    expected = pa.table(
+        {
+            "a": pa.array([1, 1, 1]),
+            "b": pa.array([[1], [], [1, 2, 3]]),
+            "c": pa.array([1.0, None, 1.0], pa.float32()),
+            "d": f32_array,
+        }
+    )
+
+    assert data == expected
+
+    # can do projection
+    read_schema = pa.schema(
+        {
+            "a": pa.int64(),
+            "c": pa.float32(),
+        }
+    )
+    expected = pa.table(
+        {
+            "a": pa.array([1, 1, 1]),
+            "c": pa.array([1.0, None, 1.0], pa.float32()),
+        }
+    )
+
+    data = read_tfrecord(str(path), read_schema).read_all()
+    assert data == expected

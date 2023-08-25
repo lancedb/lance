@@ -612,6 +612,8 @@ fn convert_fixedshape_tensor(
         None
     };
 
+    let list_size = type_info.fsl_size.unwrap() as usize;
+
     let values: ArrayRef = match type_info.leaf_type {
         DataType::Float16 => {
             let mut values = Float16Builder::with_capacity(features.len());
@@ -634,7 +636,7 @@ fn convert_fixedshape_tensor(
                         }
                     }
                 } else {
-                    values.append_null();
+                    values.append_nulls(list_size);
                 }
             }
             Arc::new(values.finish())
@@ -662,7 +664,9 @@ fn convert_fixedshape_tensor(
                         }
                     }
                 } else {
-                    values.append_null();
+                    for _ in 0..list_size {
+                        values.append_null();
+                    }
                 }
             }
             Arc::new(values.finish())
@@ -684,7 +688,7 @@ fn convert_fixedshape_tensor(
                         }
                     }
                 } else {
-                    values.append_null();
+                    values.append_nulls(list_size);
                 }
             }
             Arc::new(values.finish())
@@ -706,7 +710,7 @@ fn convert_fixedshape_tensor(
                         };
                     }
                 } else {
-                    values.append_null();
+                    values.append_nulls(list_size);
                 }
             }
             Arc::new(values.finish())
