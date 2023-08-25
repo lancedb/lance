@@ -521,6 +521,27 @@ mod tests {
             );
         }
 
+        fn block_delete_manifest(&mut self) {
+            let mut policy = self.mock_store.policy.lock().unwrap();
+            policy.set_before_policy(
+                "block_delete_manifest",
+                Arc::new(|op, path| -> Result<()> {
+                    if op.contains("delete") && path.extension() == Some("manifest") {
+                        Err(Error::Internal {
+                            message: "Delete manifest blocked".to_string(),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                }),
+            );
+        }
+
+        fn unblock_delete_manifest(&mut self) {
+            let mut policy = self.mock_store.policy.lock().unwrap();
+            policy.clear_before_policy("block_delete_manifest");
+        }
+
         async fn run_cleanup(&self, before: DateTime<Utc>) -> Result<RemovalStats> {
             let db = self.open().await?;
             cleanup_old_versions(&db, before).await
@@ -829,5 +850,47 @@ mod tests {
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(before_count, after_count);
+    }
+
+    #[tokio::test]
+    async fn can_recover_delete_failure() {
+        let mut fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.clock.set_system_time(Duration::days(10));
+        fixture.overwrite_some_data().await.unwrap();
+
+        // The delete operation should delete the first version and its
+        // data file.  However, we will block the manifest file from getting
+        // cleaned up by simulating an I/O error.
+        fixture.block_delete_manifest();
+
+        let before_count = fixture.count_files().await.unwrap();
+        assert_eq!(before_count.num_data_files, 2);
+        assert_eq!(before_count.num_manifest_files, 3);
+
+        assert!(fixture
+            .run_cleanup(utc_now() - Duration::days(7))
+            .await
+            .is_err());
+
+        // This test currently relies on us sending in manifest files after
+        // data files.  Also, the delete process is run in parallel.  However,
+        // it seems stable to stably delete the data file even though the manifest delete fails.
+        // My guess is that it is not possible to interrupt a task in flight and so it still
+        // has to finish the buffered tasks even if they are ignored.
+        let after_count = fixture.count_files().await.unwrap();
+        assert_eq!(after_count.num_data_files, 1);
+        assert_eq!(after_count.num_manifest_files, 3);
+
+        fixture.unblock_delete_manifest();
+
+        let removed = fixture
+            .run_cleanup(utc_now() - Duration::days(7))
+            .await
+            .unwrap();
+        assert_eq!(removed.old_manifests, 1);
+        let after_count = fixture.count_files().await.unwrap();
+        assert_eq!(after_count.num_data_files, 1);
+        assert_eq!(after_count.num_manifest_files, 2);
     }
 }
