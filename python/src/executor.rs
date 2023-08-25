@@ -27,17 +27,16 @@ pub struct BackgroundExecutor {
 }
 
 struct State {
-    /// Channel for requests -- the dedicated executor takes requests                                                                  
-    /// from here and runs them.                                                                                                       
+    /// Channel for requests. The executor takes futures off this channel
+    /// and spawns them on the runtime.                                                                                                    
     requests: Option<std::sync::mpsc::Sender<BoxFuture<'static, ()>>>,
 
-    /// Thread which has a different Tokio runtime
-    /// installed and spawns tasks there                                                                                            
+    /// Thread which contains a tokio runtime.
     _thread: std::thread::JoinHandle<()>,
 }
 
 impl BackgroundExecutor {
-    /// Creates a tokio runtime and spawns a thread to run it.                                                                                      
+    /// Creates a tokio runtime and spawns a thread to run it.
     pub fn new() -> Self {
         let thread_name = "lance_background_thread".to_string();
 
@@ -71,6 +70,10 @@ impl BackgroundExecutor {
         }
     }
 
+    /// Send a future to the background executor and wait for it to complete.
+    ///
+    /// Note: you should make sure the GIL is not being held before calling this.
+    /// Otherwise, the background thread might get held up by a GIL deadlock.
     pub fn block_on<T>(&self, task: T) -> T::Output
     where
         T: Future + Send + 'static,
@@ -97,8 +100,6 @@ impl BackgroundExecutor {
         // Drop the lock while we wait for the task to complete
         std::mem::drop(state);
 
-        let out = rx.recv().unwrap();
-
-        out
+        rx.recv().unwrap()
     }
 }

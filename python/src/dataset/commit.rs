@@ -19,24 +19,19 @@ use lance::Error;
 
 use pyo3::{exceptions::PyIOError, prelude::*};
 
-// lazy_static! {
-//     static ref PY_CONFLICT_ERROR: PyResult<PyObject> = {
-//         Python::with_gil(|py| {
-//             py.import("lance")
-//                 .and_then(|lance| lance.getattr("commit"))
-//                 .and_then(|commit| commit.getattr("CommitConflictError"))
-//                 .map(|error| error.to_object(py))
-//         })
-//     };
-// }
+lazy_static! {
+    static ref PY_CONFLICT_ERROR: PyResult<PyObject> = {
+        Python::with_gil(|py| {
+            py.import("lance")
+                .and_then(|lance| lance.getattr("commit"))
+                .and_then(|commit| commit.getattr("CommitConflictError"))
+                .map(|error| error.to_object(py))
+        })
+    };
+}
 
 fn handle_error(py_err: PyErr, py: Python) -> CommitError {
-    let py_conflict_error = py
-        .import("lance")
-        .and_then(|lance| lance.getattr("commit"))
-        .and_then(|commit| commit.getattr("CommitConflictError"))
-        .map(|error| error.to_object(py));
-    let conflict_err_type = match &py_conflict_error {
+    let conflict_err_type = match &*PY_CONFLICT_ERROR {
         Ok(err) => err.as_ref(py).get_type(),
         Err(import_error) => {
             return CommitError::OtherError(Error::Internal {

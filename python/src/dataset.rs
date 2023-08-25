@@ -27,7 +27,6 @@ use lance::datatypes::Schema;
 use lance::format::Fragment;
 use lance::index::vector::ivf::IvfBuildParams;
 use lance::index::vector::pq::PQBuildParams;
-use lance::index::DatasetIndexExt;
 use lance::io::object_store::ObjectStoreParams;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
@@ -43,7 +42,7 @@ use lance::dataset::{
 use lance::index::{
     vector::diskann::DiskANNParams,
     vector::{MetricType, VectorIndexParams},
-    IndexType,
+    DatasetIndexExt, IndexType,
 };
 
 use self::commit::PyCommitLock;
@@ -115,9 +114,10 @@ impl Dataset {
 
     /// Get index statistics
     fn index_statistics(&self, index_name: String) -> PyResult<String> {
-        let index_statistics = self
-            .rt
-            .block_on(self.ds.index_statistics(index_name.clone()))
+        let ds = self.ds.clone();
+        let name_ref = index_name.clone();
+        let index_statistics = RT
+            .block_on(async move { ds.index_statistics(name_ref).await })
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
         if let Some(s) = index_statistics {
             Ok(s)
@@ -130,38 +130,38 @@ impl Dataset {
     }
 
     /// Load index metadata
-    fn load_indices(&self) -> PyResult<Vec<PyObject>> {
-        let ds = self.ds.clone();
-        let index_metadata = RT
-            .block_on(async move { ds.load_indices().await })
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        Python::with_gil(|py| {
-            Ok(index_metadata
-                .iter()
-                .map(|idx| {
-                    let dict = PyDict::new(py);
-                    let schema = self.ds.schema();
-                    let field_names = schema
-                        .project_by_ids(idx.fields.as_slice())
-                        .unwrap()
-                        .fields
-                        .iter()
-                        .map(|f| f.name.clone())
-                        .collect::<Vec<_>>();
+    fn load_indices(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
+        let ds = self_.ds.clone();
+        let py = self_.py();
+        let index_metadata =
+            Python::allow_threads(py, || RT.block_on(async move { ds.load_indices().await }))
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-                    dict.set_item("name", idx.name.clone()).unwrap();
-                    // TODO: once we add more than vector indices, we need to:
-                    // 1. Change protos and write path to persist index type
-                    // 2. Use the new field from idx instead of hard coding it to Vector
-                    dict.set_item("type", IndexType::Vector.to_string())
-                        .unwrap();
-                    dict.set_item("uuid", idx.uuid.to_string()).unwrap();
-                    dict.set_item("fields", field_names).unwrap();
-                    dict.set_item("version", idx.dataset_version).unwrap();
-                    dict.to_object(py)
-                })
-                .collect::<Vec<_>>())
-        })
+        Ok(index_metadata
+            .iter()
+            .map(|idx| {
+                let dict = PyDict::new(py);
+                let schema = self_.ds.schema();
+                let field_names = schema
+                    .project_by_ids(idx.fields.as_slice())
+                    .unwrap()
+                    .fields
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .collect::<Vec<_>>();
+
+                dict.set_item("name", idx.name.clone()).unwrap();
+                // TODO: once we add more than vector indices, we need to:
+                // 1. Change protos and write path to persist index type
+                // 2. Use the new field from idx instead of hard coding it to Vector
+                dict.set_item("type", IndexType::Vector.to_string())
+                    .unwrap();
+                dict.set_item("uuid", idx.uuid.to_string()).unwrap();
+                dict.set_item("fields", field_names).unwrap();
+                dict.set_item("version", idx.dataset_version).unwrap();
+                dict.to_object(py)
+            })
+            .collect::<Vec<_>>())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -383,13 +383,15 @@ impl Dataset {
     }
 
     /// Restore the current version
-    fn restore(&mut self) -> PyResult<()> {
+    fn restore(&mut self, py: Python<'_>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        let new_self = RT.block_on(async move {
-            match new_self.restore(None).await {
-                Ok(()) => Ok(new_self),
-                Err(err) => Err(PyIOError::new_err(err.to_string())),
-            }
+        let new_self = Python::allow_threads(py, || {
+            RT.block_on(async move {
+                match new_self.restore(None).await {
+                    Ok(()) => Ok(new_self),
+                    Err(err) => Err(PyIOError::new_err(err.to_string())),
+                }
+            })
         })?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -398,7 +400,7 @@ impl Dataset {
     fn create_index(
         self_: PyRef<'_, Self>,
         columns: Vec<String>,
-        index_type: String,
+        index_type: &str,
         name: Option<String>,
         metric_type: Option<&str>,
         kwargs: Option<&PyDict>,
@@ -527,9 +529,10 @@ impl Dataset {
         dataset_uri: String,
         schema: &PyAny,
         fragments: Vec<&PyAny>,
-        mode: Option<String>,
+        mode: Option<&str>,
     ) -> PyResult<Self> {
         let arrow_schema = ArrowSchema::from_pyarrow(schema)?;
+        let py = schema.py();
         let schema = Schema::try_from(&arrow_schema).map_err(|e| {
             PyValueError::new_err(format!(
                 "Failed to convert Arrow schema to Lance schema: {}",
@@ -540,13 +543,14 @@ impl Dataset {
             .iter()
             .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
             .collect::<PyResult<Vec<Fragment>>>()?;
-        let mode = parse_write_mode(mode.as_deref().unwrap_or("create"))?;
+        let mode = parse_write_mode(mode.unwrap_or("create"))?;
         let uri = dataset_uri.clone();
-        let ds = RT
-            .block_on(async move {
+        let ds = Python::allow_threads(py, || {
+            RT.block_on(async move {
                 LanceDataset::commit(&dataset_uri, &schema, &fragment_metadata, mode).await
             })
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        })
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
             ds: Arc::new(ds),
             uri,
@@ -566,9 +570,11 @@ pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<
     let params = get_write_params(options)?;
     if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
-        let batches = RT
-            .block_on(async move { scanner.to_reader().await })
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let batches = Python::allow_threads(reader.py(), || {
+            RT.block_on(async move { scanner.to_reader().await })
+        })
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
         Python::allow_threads(reader.py(), || {
             RT.block_on(async move { LanceDataset::write(batches, &uri, params).await })
                 .map_err(|err| PyIOError::new_err(err.to_string()))

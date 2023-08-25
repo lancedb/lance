@@ -31,6 +31,8 @@ use crate::RT;
 /// an ArrowArrayStream in the Arrow C Data Interface
 pub struct LanceReader {
     schema: SchemaRef,
+    /// We wrap stream in a mutex so we can call `next` in the background
+    /// executor while we still have a reference to the stream on the main thread.
     stream: Arc<Mutex<DatasetRecordBatchStream>>,
 }
 
