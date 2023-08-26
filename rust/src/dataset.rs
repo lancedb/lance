@@ -958,13 +958,13 @@ impl Dataset {
     }
 
     /// Find index with a given index_name and return its serialized statistics.
-    pub async fn index_statistics(&self, index_name: String) -> Result<Option<String>> {
+    pub async fn index_statistics(&self, index_name: &str) -> Result<Option<String>> {
         let index_uuid = self
             .load_indices()
             .await
             .unwrap()
             .iter()
-            .find(|idx| idx.name.eq(&index_name))
+            .find(|idx| idx.name.eq(index_name))
             .map(|idx| idx.uuid.to_string());
 
         if let Some(index_uuid) = index_uuid {
@@ -2008,7 +2008,7 @@ mod tests {
         let expected_statistics =
             "{\"index_type\":\"IVF\",\"metric_type\":\"l2\",\"num_partitions\":10";
         let actual_statistics = dataset
-            .index_statistics("embeddings_idx".to_string())
+            .index_statistics("embeddings_idx")
             .await
             .unwrap()
             .unwrap();
@@ -2016,13 +2016,13 @@ mod tests {
 
         assert_eq!(
             dataset
-                .index_statistics("non-existent_idx".to_string())
+                .index_statistics("non-existent_idx")
                 .await
                 .unwrap(),
             None
         );
         assert_eq!(
-            dataset.index_statistics("".to_string()).await.unwrap(),
+            dataset.index_statistics("").await.unwrap(),
             None
         );
 

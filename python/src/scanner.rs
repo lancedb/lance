@@ -59,8 +59,11 @@ impl Scanner {
     }
 
     fn to_pyarrow(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+        let scanner = self_.scanner.clone();
         let reader = RT
-            .block_on(LanceReader::try_new(self_.scanner.clone()))
+            .spawn(Some(self_.py()), async move {
+                LanceReader::try_new(scanner).await
+            })
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         // Export a `RecordBatchReader` through `FFI_ArrowArrayStream`

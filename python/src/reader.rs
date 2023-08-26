@@ -50,7 +50,7 @@ impl Iterator for LanceReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         let stream = self.stream.clone();
-        RT.block_on(async move {
+        RT.spawn(None, async move {
             let mut stream = stream.lock().await;
             stream.next().await
         })
