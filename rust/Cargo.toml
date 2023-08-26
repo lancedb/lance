@@ -99,6 +99,8 @@ criterion = { version = "0.4", features = ["async", "async_tokio"] }
 tempfile = "3.3.0"
 approx = "0.5.1"
 dirs = "5.0.0"
+all_asserts = "2.3.1"
+mock_instant = { version = "0.3.1", features = ["sync"] }
 
 [features]
 cli = ["clap"]

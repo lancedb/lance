@@ -18,7 +18,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use arrow_array::{
     cast::as_struct_array, RecordBatch, RecordBatchReader, StructArray, UInt64Array,
@@ -32,6 +31,7 @@ use log::warn;
 use object_store::path::Path;
 
 mod chunker;
+pub mod cleanup;
 mod feature_flags;
 pub mod fragment;
 mod hash_joiner;
@@ -58,6 +58,7 @@ use crate::io::{
     read_manifest, read_metadata_offset, write_manifest, ObjectStore,
 };
 use crate::session::Session;
+use crate::utils::temporal::SystemTime;
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use scanner::ROW_ID;

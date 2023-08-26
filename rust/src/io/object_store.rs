@@ -15,6 +15,7 @@
 //! Wraps [ObjectStore](object_store::ObjectStore)
 
 use std::collections::HashMap;
+use std::future;
 use std::path::Path as StdPath;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -22,11 +23,13 @@ use std::time::{Duration, SystemTime};
 use ::object_store::{
     aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
     local::LocalFileSystem, memory::InMemory, path::Path, ClientOptions, CredentialProvider,
-    ObjectStore as OSObjectStore, Result as ObjectStoreResult,
+    Error as ObjectStoreError, ObjectStore as OSObjectStore, Result as ObjectStoreResult,
 };
 use async_trait::async_trait;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_credential_types::provider::ProvideCredentials;
+use chrono::{DateTime, Utc};
+use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::aws::AwsCredential as ObjectStoreAwsCredential;
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
@@ -41,6 +44,18 @@ use crate::io::object_writer::ObjectWriter;
 use super::commit::{CommitHandler, RenameCommitHandler, UnsafeCommitHandler};
 use super::local::LocalObjectReader;
 use super::object_reader::ObjectReader;
+
+// This is a bit odd but some object_store functions only accept
+// Stream<Result<T, ObjectStoreError>> and so we need to convert
+// to ObjectStoreError to call the methods.
+impl From<Error> for ObjectStoreError {
+    fn from(err: Error) -> Self {
+        Self::Generic {
+            store: "N/A",
+            source: Box::new(err),
+        }
+    }
+}
 
 /// Wraps [ObjectStore](object_store::ObjectStore)
 #[derive(Debug, Clone)]
@@ -437,6 +452,25 @@ impl ObjectStore {
             .collect())
     }
 
+    /// Read all files (start from base directory) recursively
+    ///
+    /// unmodified_since can be specified to only return files that have not been modified since the given time.
+    pub async fn read_dir_all(
+        &self,
+        dir_path: impl Into<&Path>,
+        unmodified_since: Option<DateTime<Utc>>,
+    ) -> Result<BoxStream<Result<Path>>> {
+        let mut output = self.inner.list(Some(dir_path.into())).await?;
+        if let Some(unmodified_since_val) = unmodified_since {
+            output = output
+                .try_filter(move |file| future::ready(file.last_modified < unmodified_since_val))
+                .boxed();
+        }
+        Ok(output
+            .map(|file_result| Ok(file_result.map(|file| file.location)?))
+            .boxed())
+    }
+
     /// Remove a directory recursively.
     pub async fn remove_dir_all(&self, dir_path: impl Into<Path>) -> Result<()> {
         let path = dir_path.into();
@@ -457,6 +491,16 @@ impl ObjectStore {
             .try_collect::<Vec<_>>()
             .await?;
         Ok(())
+    }
+
+    pub fn remove_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, Result<Path>>,
+    ) -> BoxStream<Result<Path>> {
+        self.inner
+            .delete_stream(locations.err_into::<ObjectStoreError>().boxed())
+            .err_into::<Error>()
+            .boxed()
     }
 
     /// Check a file exists.
