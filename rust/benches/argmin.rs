@@ -17,7 +17,7 @@ use std::{sync::Arc, time::Duration};
 use arrow_array::{Float32Array, UInt32Array};
 use criterion::{criterion_group, criterion_main, Criterion};
 
-use lance::utils::testing::generate_random_array_with_seed;
+use lance::utils::datagen::generate_random_array_with_seed;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 

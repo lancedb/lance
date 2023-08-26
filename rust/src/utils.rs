@@ -17,7 +17,6 @@
 
 //! Various utilities
 
-#[cfg(test)]
 pub mod datagen;
 pub mod kmeans;
 pub mod sql;

@@ -23,7 +23,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance::linalg::l2::l2_distance_batch;
-use lance::utils::testing::generate_random_array_with_seed;
+use lance::utils::datagen::generate_random_array_with_seed;
 
 #[inline]
 fn l2_arrow(x: &Float32Array, y: &Float32Array) -> f32 {

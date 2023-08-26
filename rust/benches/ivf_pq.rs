@@ -24,7 +24,7 @@ use lance::{
         vector::{MetricType, VectorIndexParams},
         DatasetIndexExt, IndexType,
     },
-    utils::testing::generate_random_array,
+    utils::datagen::generate_random_array,
     Dataset,
 };
 #[cfg(target_os = "linux")]

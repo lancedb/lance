@@ -501,7 +501,7 @@ mod tests {
     use crate::index::vector::{MetricType, VectorIndexParams};
     use crate::index::{DatasetIndexExt, IndexType};
     use crate::io::object_store::ObjectStoreParams;
-    use crate::utils::testing::generate_random_array;
+    use crate::utils::datagen::generate_random_array;
     use crate::Dataset;
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {

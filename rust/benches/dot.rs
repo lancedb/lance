@@ -26,7 +26,7 @@ use num_traits::{real::Real, FromPrimitive};
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance::linalg::dot::{dot, Dot};
-use lance::utils::testing::generate_random_array_with_seed;
+use lance::utils::datagen::generate_random_array_with_seed;
 
 #[inline]
 fn dot_arrow_artiy<T: ArrowNumericType>(x: &PrimitiveArray<T>, y: &PrimitiveArray<T>) -> T::Native {
@@ -53,17 +53,17 @@ where
             PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let arr = target.slice(idx * DIMENSION, DIMENSION);
                 Some(dot_arrow_artiy(&key, &arr))
-            }))
+            }));
         });
     });
 
     c.bench_function(format!("Dot({type_name})").as_str(), |b| {
         let x = key.values();
         b.iter(|| unsafe {
-            PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+            PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
                 let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
                 Some(dot(x, y))
-            }))
+            }));
         });
     });
 

@@ -20,48 +20,17 @@ use bytes::Bytes;
 use chrono::Duration;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use num_traits::real::Real;
-use num_traits::FromPrimitive;
 use object_store::path::Path;
 use object_store::{
     Error as OSError, GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore,
     Result as OSResult,
 };
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future;
-use std::iter::repeat_with;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::io::AsyncWrite;
-
-use arrow_array::{ArrowNumericType, Float32Array, NativeAdapter, PrimitiveArray};
-
-/// Create a random float32 array.
-pub fn generate_random_array_with_seed<T: ArrowNumericType>(
-    n: usize,
-    seed: [u8; 32],
-) -> PrimitiveArray<T>
-where
-    T::Native: Real + FromPrimitive,
-    NativeAdapter<T>: From<T::Native>,
-{
-    let mut rng = StdRng::from_seed(seed);
-
-    PrimitiveArray::<T>::from_iter(repeat_with(|| T::Native::from_f32(rng.gen::<f32>())).take(n))
-}
-
-/// Create a random float32 array.
-pub fn generate_random_array(n: usize) -> Float32Array {
-    let mut rng = rand::thread_rng();
-    Float32Array::from(
-        repeat_with(|| rng.gen::<f32>())
-            .take(n)
-            .collect::<Vec<f32>>(),
-    )
-}
 
 /// Asserts that the expression returns an error and the error, when converted to
 /// a string, contains the given substring.

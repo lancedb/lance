@@ -439,7 +439,7 @@ mod tests {
     use crate::dataset::{Dataset, WriteParams};
     use crate::index::vector::MetricType;
     use crate::io::exec::testing::TestingExec;
-    use crate::utils::testing::generate_random_array;
+    use crate::utils::datagen::generate_random_array;
 
     #[tokio::test]
     async fn knn_flat_search() {

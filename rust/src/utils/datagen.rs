@@ -17,6 +17,7 @@
 
 //! Data generation utilities for unit tests
 
+use std::iter::repeat_with;
 use std::sync::Arc;
 
 use crate::{
@@ -24,10 +25,15 @@ use crate::{
     Result,
 };
 
-use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader};
+use arrow_array::{
+    ArrowNumericType, Float32Array, Int32Array, NativeAdapter, PrimitiveArray, RecordBatch,
+    RecordBatchIterator, RecordBatchReader,
+};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-
-use super::testing::generate_random_array;
+use num_traits::real::Real;
+use num_traits::FromPrimitive;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 pub trait ArrayGenerator {
     fn generate(&mut self, length: usize) -> Result<Arc<dyn arrow_array::Array>>;
@@ -198,4 +204,28 @@ pub fn some_indexable_batch() -> Result<impl RecordBatchReader> {
 /// There are no other assumptions it is safe to make about the returned reader
 pub fn some_batch() -> Result<impl RecordBatchReader> {
     some_indexable_batch()
+}
+
+/// Create a random float32 array.
+pub fn generate_random_array_with_seed<T: ArrowNumericType>(
+    n: usize,
+    seed: [u8; 32],
+) -> PrimitiveArray<T>
+where
+    T::Native: Real + FromPrimitive,
+    NativeAdapter<T>: From<T::Native>,
+{
+    let mut rng = StdRng::from_seed(seed);
+
+    PrimitiveArray::<T>::from_iter(repeat_with(|| T::Native::from_f32(rng.gen::<f32>())).take(n))
+}
+
+/// Create a random float32 array.
+pub fn generate_random_array(n: usize) -> Float32Array {
+    let mut rng = rand::thread_rng();
+    Float32Array::from(
+        repeat_with(|| rng.gen::<f32>())
+            .take(n)
+            .collect::<Vec<f32>>(),
+    )
 }

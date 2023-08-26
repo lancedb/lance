@@ -123,7 +123,7 @@ mod tests {
             DatasetIndexExt,
             {vector::VectorIndexParams, IndexType},
         },
-        utils::testing::generate_random_array,
+        utils::datagen::generate_random_array,
     };
 
     #[tokio::test]

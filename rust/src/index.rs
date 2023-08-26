@@ -199,7 +199,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::tempdir;
 
-    use crate::{arrow::*, index::vector::MetricType, utils::testing::generate_random_array};
+    use crate::{arrow::*, index::vector::MetricType, utils::datagen::generate_random_array};
 
     #[tokio::test]
     async fn test_recreate_index() {
