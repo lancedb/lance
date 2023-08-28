@@ -25,6 +25,7 @@ use lance::dataset::progress::{NoopFragmentWriteProgress, WriteFragmentProgress}
 use lance::datatypes::Schema;
 use lance::format::{pb, DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance::io::deletion_file_path;
+use lance::io::object_store::Path;
 use prost::Message;
 use pyo3::prelude::*;
 use pyo3::{
@@ -36,7 +37,7 @@ use tokio::runtime::Runtime;
 
 use crate::dataset::get_write_params;
 use crate::updater::Updater;
-use crate::Scanner;
+use crate::{Dataset, Scanner};
 
 #[pyclass(name = "_FragmentWriteProgress", module = "_lib")]
 #[derive(Debug)]
@@ -473,4 +474,24 @@ impl FragmentMetadata {
                 .map(|d| deletion_file_path(&Default::default(), self.inner.id, &d).to_string()),
         )
     }
+}
+
+#[pyfunction(name = "_cleanup_partial_writes")]
+pub fn cleanup_partial_writes(dataset: Dataset, files: Vec<(String, String)>) -> PyResult<()> {
+    let files: Vec<(Path, String)> = files
+        .into_iter()
+        .map(|(path, multipart_id)| (Path::from(path.as_str()), multipart_id))
+        .collect();
+    let files_iter = files
+        .iter()
+        .map(|(path, multipart_id)| (path, multipart_id));
+
+    // TODO: move to main runtime
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|err| PyIOError::new_err(format!("Failed to create tokio runtime: {}", err)))?;
+    rt.block_on(lance::dataset::cleanup::cleanup_partial_writes(
+        &dataset.ds,
+        files_iter,
+    ))
+    .map_err(|err| PyIOError::new_err(format!("Failed to cleanup files: {}", err)))
 }

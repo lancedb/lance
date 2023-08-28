@@ -310,6 +310,38 @@ pub async fn cleanup_old_versions(
     cleanup.run().await
 }
 
+/// Force cleanup of specific partial writes.
+///
+/// These files can be cleaned up easily with [cleanup_old_versions()] after 7 days,
+/// but if you know specific partial writes have been made, you can call this
+/// function to clean them up immediately.
+///
+/// To find partial writes, you can use the
+/// [crate::dataset::progress::WriteFragmentProgress] trait to track which files
+/// have been started but never finished.
+pub async fn cleanup_partial_writes(
+    dataset: &Dataset,
+    objects: impl Iterator<Item = (&Path, &String)>,
+) -> Result<()> {
+    let store = dataset.object_store();
+    futures::stream::iter(objects)
+        .map(|(path, multipart_id)| async move {
+            match store.inner.abort_multipart(path, multipart_id).await {
+                Ok(_) => Ok(()),
+                // We don't care if it's not there.
+                Err(object_store::Error::NotFound { .. }) => {
+                    log::warn!("Partial write not found: {} {}", path, multipart_id);
+                    Ok(())
+                }
+                Err(e) => Err(Error::from(e)),
+            }
+        })
+        .buffer_unordered(10)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
