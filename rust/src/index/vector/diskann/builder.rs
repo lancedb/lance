@@ -380,7 +380,7 @@ mod tests {
     use tempfile;
 
     use crate::dataset::WriteParams;
-    use crate::utils::testing::generate_random_array;
+    use crate::utils::datagen::generate_random_array;
 
     async fn create_dataset(uri: &str, n: usize, dim: usize) -> Arc<Dataset> {
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(

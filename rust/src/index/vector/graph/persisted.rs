@@ -343,7 +343,7 @@ mod tests {
         dataset::WriteParams,
         index::vector::diskann::row_vertex::RowVertexSerDe,
         index::vector::MetricType,
-        utils::testing::generate_random_array,
+        utils::datagen::generate_random_array,
     };
 
     #[derive(Clone, Debug)]

@@ -886,7 +886,7 @@ mod tests {
 
     use crate::{
         index::{vector::VectorIndexParams, DatasetIndexExt, IndexType},
-        utils::testing::generate_random_array,
+        utils::datagen::generate_random_array,
     };
 
     #[tokio::test]

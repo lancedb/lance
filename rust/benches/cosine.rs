@@ -19,7 +19,7 @@ use lance::linalg::cosine::cosine_distance_batch;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance::utils::testing::generate_random_array_with_seed;
+use lance::utils::datagen::generate_random_array_with_seed;
 
 fn bench_distance(c: &mut Criterion) {
     const DIMENSION: usize = 1024;

@@ -20,8 +20,8 @@ use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
+use lance::utils::datagen::generate_random_array;
 use lance::utils::kmeans::KMeans;
-use lance::utils::testing::generate_random_array;
 
 fn bench_train(c: &mut Criterion) {
     // default tokio runtime

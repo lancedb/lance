@@ -1092,7 +1092,7 @@ mod tests {
     use crate::index::IndexType;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
     use crate::io::deletion::read_deletion_file;
-    use crate::{datatypes::Schema, utils::testing::generate_random_array};
+    use crate::{datatypes::Schema, utils::datagen::generate_random_array};
 
     use crate::dataset::WriteMode::Overwrite;
     use arrow_array::{
