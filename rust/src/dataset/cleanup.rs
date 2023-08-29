@@ -321,7 +321,7 @@ pub async fn cleanup_old_versions(
 /// have been started but never finished.
 pub async fn cleanup_partial_writes(
     dataset: &Dataset,
-    objects: impl Iterator<Item = (&Path, &String)>,
+    objects: impl IntoIterator<Item = (&Path, &String)>,
 ) -> Result<()> {
     let store = dataset.object_store();
     futures::stream::iter(objects)
@@ -329,7 +329,10 @@ pub async fn cleanup_partial_writes(
             match store.inner.abort_multipart(path, multipart_id).await {
                 Ok(_) => Ok(()),
                 // We don't care if it's not there.
-                Err(object_store::Error::NotFound { .. }) => {
+                // TODO: once this issue is addressed, we should just use teh error
+                // variant. https://github.com/apache/arrow-rs/issues/4749
+                // Err(object_store::Error::NotFound { .. }) => {
+                Err(e) if e.to_string().contains("No such file or directory") => {
                     log::warn!("Partial write not found: {} {}", path, multipart_id);
                     Ok(())
                 }
@@ -349,8 +352,10 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use arrow_array::RecordBatchReader;
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use arrow_array::{RecordBatchIterator, RecordBatchReader};
     use chrono::Duration;
+    use tokio::io::AsyncWriteExt;
 
     use crate::{
         dataset::{ReadParams, WriteMode, WriteParams},
@@ -924,5 +929,43 @@ mod tests {
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(after_count.num_data_files, 1);
         assert_eq!(after_count.num_manifest_files, 2);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_partial_writes() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = ArrowSchema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let reader = RecordBatchIterator::new(vec![], Arc::new(schema));
+        let dataset = Dataset::write(reader, test_uri, Default::default())
+            .await
+            .unwrap();
+        let store = dataset.object_store();
+
+        // Create a partial write
+        let path1 = dataset.base.child("test");
+        let (multipart_id, mut writer) = store.inner.put_multipart(&path1).await.unwrap();
+        writer.write_all(b"test").await.unwrap();
+
+        // Add a non-existant path and id
+        let path2 = dataset.base.child("test2");
+        let non_existent_multipart_id = "non-existant-id".to_string();
+
+        let objects = vec![
+            (&path1, &multipart_id),
+            (&path2, &non_existent_multipart_id),
+        ];
+
+        cleanup_partial_writes(&dataset, objects.into_iter())
+            .await
+            .unwrap();
+
+        // Assert directly calling abort returns not found on first one.
+        assert!(store
+            .inner
+            .abort_multipart(&path1, &multipart_id)
+            .await
+            .is_err());
     }
 }
