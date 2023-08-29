@@ -114,6 +114,9 @@ fn json_to_schema(py: Python<'_>, json: &str) -> PyResult<PyObject> {
 /// string_features: Optional[List[str]]
 ///     Names of features that should be treated as strings. Otherwise they
 ///     will be treated as binary.
+/// batch_size: Optional[int], default None
+///     Number of records to read to infer the schema. If None, will read the
+///    entire file.
 ///
 /// Returns
 /// -------
@@ -122,11 +125,12 @@ fn json_to_schema(py: Python<'_>, json: &str) -> PyResult<PyObject> {
 ///     alphabetically sorted by field names, since TFRecord doesn't have
 ///     a concept of field order.
 #[pyfunction]
-#[pyo3(signature = (uri, *, tensor_features = None, string_features = None))]
+#[pyo3(signature = (uri, *, tensor_features = None, string_features = None, num_rows = None))]
 fn infer_tfrecord_schema(
     uri: &str,
     tensor_features: Option<Vec<String>>,
     string_features: Option<Vec<String>>,
+    num_rows: Option<usize>,
 ) -> PyResult<PyArrowType<ArrowSchema>> {
     let tensor_features = tensor_features.unwrap_or_default();
     let tensor_features = tensor_features
@@ -144,6 +148,7 @@ fn infer_tfrecord_schema(
             uri,
             &tensor_features,
             &string_features,
+            num_rows,
         ))
         .map_err(|err| PyIOError::new_err(err.to_string()))?;
     Ok(PyArrowType(schema))
@@ -159,6 +164,8 @@ fn infer_tfrecord_schema(
 ///     Arrow schema of the tfrecord file. Use :py:func:`infer_tfrecord_schema`
 ///     to infer the schema. The schema is allowed to be a subset of fields; the
 ///     reader will only parse the fields that are present in the schema.
+/// batch_size: int, default 10k
+///     Number of records to read per batch.
 ///
 /// Returns
 /// -------
@@ -167,9 +174,11 @@ fn infer_tfrecord_schema(
 ///     :py:func:`lance.write_dataset`. The output schema will match the schema
 ///     provided, including field order.
 #[pyfunction]
+#[pyo3(signature = (uri, schema, *, batch_size = 10_000))]
 fn read_tfrecord(
     uri: String,
     schema: PyArrowType<ArrowSchema>,
+    batch_size: usize,
 ) -> PyResult<PyArrowType<ArrowArrayStreamReader>> {
     let schema = Arc::new(schema.0);
 
@@ -179,7 +188,7 @@ fn read_tfrecord(
 
     let schema_ref = schema.clone();
     RT.spawn_background(None, async move {
-        let mut stream = match ::lance::utils::tfrecord::read_tfrecord(&uri, schema_ref).await {
+        let mut stream = match ::lance::utils::tfrecord::read_tfrecord(&uri, schema_ref, Some(batch_size)).await {
             Ok(stream) => {
                 init_sender.send(Ok(())).unwrap();
                 stream

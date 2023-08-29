@@ -49,10 +49,14 @@ use tfrecord::{Example, Feature};
 ///
 /// The features named by `string_features` will be assumed to be UTF-8 encoded
 /// strings.
+///
+/// `num_rows` determines the number of rows to read from the file to infer the
+/// schema. If `None`, the entire file will be read.
 pub async fn infer_tfrecord_schema(
     uri: &str,
     tensor_features: &[&str],
     string_features: &[&str],
+    num_rows: Option<usize>,
 ) -> Result<ArrowSchema> {
     let mut columns: HashMap<String, FeatureMeta> = HashMap::new();
 
@@ -66,6 +70,7 @@ pub async fn infer_tfrecord_schema(
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
         .into_async_read();
     let mut records = RecordStream::<Example, _>::from_reader(data, Default::default());
+    let mut i = 0;
     while let Some(record) = records.next().await {
         let record = record.map_err(|err| Error::IO {
             message: err.to_string(),
@@ -78,13 +83,20 @@ pub async fn infer_tfrecord_schema(
                 } else {
                     columns.insert(
                         name.clone(),
-                        FeatureMeta::new(
+                        FeatureMeta::try_new(
                             &feature,
                             tensor_features.contains(&name.as_str()),
                             string_features.contains(&name.as_str()),
-                        ),
+                        )?,
                     );
                 }
+            }
+        }
+
+        i += 1;
+        if let Some(num_rows) = num_rows {
+            if i >= num_rows {
+                break;
             }
         }
     }
@@ -101,12 +113,17 @@ pub async fn infer_tfrecord_schema(
 
 /// Read a TFRecord file into an Arrow record batch stream.
 ///
-/// Reads 10k rows at a time.
+/// Reads `batch_size` rows at a time. If `batch_size` is `None`, a default
+/// batch size of 10,000 is used.
 ///
 /// The schema may be a partial schema, in which case only the fields present in
 /// the schema will be read.
-pub async fn read_tfrecord(uri: &str, schema: ArrowSchemaRef) -> Result<SendableRecordBatchStream> {
-    let batch_size = 10_000;
+pub async fn read_tfrecord(
+    uri: &str,
+    schema: ArrowSchemaRef,
+    batch_size: Option<usize>,
+) -> Result<SendableRecordBatchStream> {
+    let batch_size = batch_size.unwrap_or(10_000);
 
     let (store, path) = ObjectStore::from_uri(uri).await?;
     let data = store
@@ -163,23 +180,11 @@ struct FeatureMeta {
 
 impl FeatureMeta {
     /// Create a new FeatureMeta from a single example.
-    pub fn new(feature: &Feature, is_tensor: bool, is_string: bool) -> Self {
+    pub fn try_new(feature: &Feature, is_tensor: bool, is_string: bool) -> Result<Self> {
         let feature_type = match feature.kind.as_ref().unwrap() {
             Kind::BytesList(data) => {
                 if is_tensor {
-                    let val = &data.value[0];
-                    let tensor_proto = TensorProto::decode(val.as_slice()).unwrap();
-                    FeatureType::Tensor {
-                        shape: tensor_proto
-                            .tensor_shape
-                            .as_ref()
-                            .unwrap()
-                            .dim
-                            .iter()
-                            .map(|d| d.size)
-                            .collect(),
-                        dtype: tensor_proto.dtype(),
-                    }
+                    Self::extract_tensor(data.value[0].as_slice())?
                 } else if is_string {
                     FeatureType::String
                 } else {
@@ -189,10 +194,10 @@ impl FeatureMeta {
             Kind::FloatList(_) => FeatureType::Float,
             Kind::Int64List(_) => FeatureType::Integer,
         };
-        Self {
+        Ok(Self {
             repeated: feature_is_repeated(feature),
             feature_type,
-        }
+        })
     }
 
     /// Update the FeatureMeta with a new example, or return an error if the
@@ -202,21 +207,7 @@ impl FeatureMeta {
             Kind::BytesList(data) => match self.feature_type {
                 FeatureType::String => FeatureType::String,
                 FeatureType::Binary => FeatureType::Binary,
-                FeatureType::Tensor { .. } => {
-                    let val = &data.value[0];
-                    let tensor_proto = TensorProto::decode(val.as_slice()).unwrap();
-                    FeatureType::Tensor {
-                        shape: tensor_proto
-                            .tensor_shape
-                            .as_ref()
-                            .unwrap()
-                            .dim
-                            .iter()
-                            .map(|d| d.size)
-                            .collect(),
-                        dtype: tensor_proto.dtype(),
-                    }
-                }
+                FeatureType::Tensor { .. } => Self::extract_tensor(data.value[0].as_slice())?,
                 _ => {
                     return Err(Error::IO {
                         message: format!(
@@ -239,6 +230,21 @@ impl FeatureMeta {
             self.repeated = true;
         }
         Ok(())
+    }
+
+    fn extract_tensor(data: &[u8]) -> Result<FeatureType> {
+        let tensor_proto = TensorProto::decode(data)?;
+        Ok(FeatureType::Tensor {
+            shape: tensor_proto
+                .tensor_shape
+                .as_ref()
+                .unwrap()
+                .dim
+                .iter()
+                .map(|d| d.size)
+                .collect(),
+            dtype: tensor_proto.dtype(),
+        })
     }
 }
 
