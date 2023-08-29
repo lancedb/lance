@@ -188,16 +188,18 @@ fn read_tfrecord(
 
     let schema_ref = schema.clone();
     RT.spawn_background(None, async move {
-        let mut stream = match ::lance::utils::tfrecord::read_tfrecord(&uri, schema_ref, Some(batch_size)).await {
-            Ok(stream) => {
-                init_sender.send(Ok(())).unwrap();
-                stream
-            }
-            Err(err) => {
-                init_sender.send(Err(err)).unwrap();
-                return;
-            }
-        };
+        let mut stream =
+            match ::lance::utils::tfrecord::read_tfrecord(&uri, schema_ref, Some(batch_size)).await
+            {
+                Ok(stream) => {
+                    init_sender.send(Ok(())).unwrap();
+                    stream
+                }
+                Err(err) => {
+                    init_sender.send(Err(err)).unwrap();
+                    return;
+                }
+            };
 
         while let Some(batch) = stream.next().await {
             let batch = batch.map_err(|err| ArrowError::ExternalError(Box::new(err)));
