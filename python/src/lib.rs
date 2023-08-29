@@ -32,6 +32,7 @@ extern crate lazy_static;
 pub(crate) mod arrow;
 pub(crate) mod dataset;
 pub(crate) mod errors;
+pub(crate) mod executor;
 pub(crate) mod fragment;
 pub(crate) mod reader;
 pub(crate) mod scanner;
@@ -44,6 +45,13 @@ pub use fragment::FragmentMetadata;
 use fragment::{DataFile, FileFragment};
 pub use reader::LanceReader;
 pub use scanner::Scanner;
+
+use crate::executor::BackgroundExecutor;
+
+// TODO: make this runtime configurable (e.g. num threads)
+lazy_static! {
+    static ref RT: BackgroundExecutor = BackgroundExecutor::new();
+}
 
 #[pymodule]
 fn lance(_py: Python, m: &PyModule) -> PyResult<()> {

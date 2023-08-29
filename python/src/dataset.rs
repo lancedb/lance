@@ -32,10 +32,10 @@ use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong};
 use pyo3::{pyclass, PyObject, PyResult};
-use tokio::runtime::Runtime;
 
 use crate::fragment::{FileFragment, FragmentMetadata};
 use crate::Scanner;
+use crate::RT;
 use lance::dataset::{
     scanner::Scanner as LanceScanner, Dataset as LanceDataset, Version, WriteMode, WriteParams,
 };
@@ -60,7 +60,6 @@ pub struct Dataset {
     #[pyo3(get)]
     uri: String,
     ds: Arc<LanceDataset>,
-    rt: Arc<Runtime>,
 }
 
 #[pymethods]
@@ -74,7 +73,6 @@ impl Dataset {
         metadata_cache_size: Option<usize>,
         commit_handler: Option<PyObject>,
     ) -> PyResult<Self> {
-        let rt = Runtime::new()?;
         let mut params = ReadParams {
             block_size,
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
@@ -91,19 +89,17 @@ impl Dataset {
             };
             params.store_options = Some(object_store_params);
         }
-
-        let dataset = rt.block_on(async {
-            if let Some(ver) = version {
-                LanceDataset::checkout_with_params(uri.as_str(), ver, &params).await
-            } else {
-                LanceDataset::open_with_params(uri.as_str(), &params).await
-            }
-        });
+        let dataset = if let Some(ver) = version {
+            RT.runtime
+                .block_on(LanceDataset::checkout_with_params(&uri, ver, &params))
+        } else {
+            RT.runtime
+                .block_on(LanceDataset::open_with_params(&uri, &params))
+        };
         match dataset {
             Ok(ds) => Ok(Self {
                 uri,
                 ds: Arc::new(ds),
-                rt: Arc::new(rt),
             }),
             Err(err) => Err(PyValueError::new_err(err.to_string())),
         }
@@ -117,9 +113,9 @@ impl Dataset {
 
     /// Get index statistics
     fn index_statistics(&self, index_name: String) -> PyResult<String> {
-        let index_statistics = self
-            .rt
-            .block_on(self.ds.index_statistics(index_name.clone()))
+        let index_statistics = RT
+            .runtime
+            .block_on(self.ds.index_statistics(&index_name))
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
         if let Some(s) = index_statistics {
             Ok(s)
@@ -133,9 +129,8 @@ impl Dataset {
 
     /// Load index metadata
     fn load_indices(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
-        let index_metadata = self_
-            .rt
-            .block_on(async { self_.ds.load_indices().await })
+        let index_metadata = RT
+            .block_on(Some(self_.py()), self_.ds.load_indices())
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
         let py = self_.py();
         Ok(index_metadata
@@ -299,24 +294,20 @@ impl Dataset {
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 
-        let scn = Arc::new(scanner);
-        Ok(Scanner::new(scn, self_.rt.clone()))
+        let scan = Arc::new(scanner);
+        Ok(Scanner::new(scan))
     }
 
     fn count_rows(&self) -> PyResult<usize> {
-        self.rt.block_on(async {
-            self.ds
-                .count_rows()
-                .await
-                .map_err(|err| PyIOError::new_err(err.to_string()))
-        })
+        RT.runtime
+            .block_on(self.ds.count_rows())
+            .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
     fn take(self_: PyRef<'_, Self>, row_indices: Vec<usize>) -> PyResult<PyObject> {
         let projection = self_.ds.schema();
-        let batch = self_
-            .rt
-            .block_on(async { self_.ds.take(&row_indices, projection).await })
+        let batch = RT
+            .block_on(Some(self_.py()), self_.ds.take(&row_indices, projection))
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         batch.to_pyarrow(self_.py())
     }
@@ -328,20 +319,16 @@ impl Dataset {
         right_on: &str,
     ) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        let fut = new_self.merge(reader.0, left_on, right_on);
-        self.rt.block_on(
-            async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
-        )?;
+        RT.block_on(None, new_self.merge(reader.0, left_on, right_on))
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
 
     fn delete(&mut self, predicate: String) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        let fut = new_self.delete(&predicate);
-        self.rt.block_on(
-            async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
-        )?;
+        RT.block_on(None, new_self.delete(&predicate))
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -377,10 +364,8 @@ impl Dataset {
     /// Restore the current version
     fn restore(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        let fut = new_self.restore(None);
-        self.rt.block_on(
-            async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
-        )?;
+        RT.block_on(None, new_self.restore(None))
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -483,15 +468,13 @@ impl Dataset {
             }
         };
 
-        self_
-            .rt
-            .block_on(async {
-                self_
-                    .ds
-                    .create_index(columns.as_slice(), idx_type, name, &params, replace)
-                    .await
-            })
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        RT.block_on(
+            Some(self_.py()),
+            self_
+                .ds
+                .create_index(&columns, idx_type, name, &params, replace),
+        )
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(())
     }
 
@@ -522,8 +505,8 @@ impl Dataset {
         fragments: Vec<&PyAny>,
         mode: Option<&str>,
     ) -> PyResult<Self> {
-        let rt = Arc::new(Runtime::new()?);
         let arrow_schema = ArrowSchema::from_pyarrow(schema)?;
+        let py = schema.py();
         let schema = Schema::try_from(&arrow_schema).map_err(|e| {
             PyValueError::new_err(format!(
                 "Failed to convert Arrow schema to Lance schema: {}",
@@ -535,14 +518,14 @@ impl Dataset {
             .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
             .collect::<PyResult<Vec<Fragment>>>()?;
         let mode = parse_write_mode(mode.unwrap_or("create"))?;
-        let ds = rt
-            .block_on(async {
-                LanceDataset::commit(dataset_uri, &schema, &fragment_metadata, mode).await
-            })
+        let ds = RT
+            .block_on(
+                Some(py),
+                LanceDataset::commit(dataset_uri, &schema, &fragment_metadata, mode),
+            )
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
             ds: Arc::new(ds),
-            rt,
             uri: dataset_uri.to_string(),
         })
     }
@@ -550,32 +533,29 @@ impl Dataset {
 
 impl Dataset {
     fn list_versions(&self) -> ::lance::error::Result<Vec<Version>> {
-        self.rt.block_on(async { self.ds.versions().await })
+        RT.runtime.block_on(self.ds.versions())
     }
 }
 
 #[pyfunction(name = "_write_dataset")]
-pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bool> {
+pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<bool> {
     let params = get_write_params(options)?;
-    Runtime::new()?.block_on(async move {
-        if reader.is_instance_of::<Scanner>() {
-            let scanner: Scanner = reader.extract()?;
-            let batches = scanner
-                .to_reader()
-                .await
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
-            LanceDataset::write(batches, uri, params)
-                .await
-                .map_err(|err| PyIOError::new_err(err.to_string()))?;
-            Ok(true)
-        } else {
-            let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
-            LanceDataset::write(batches, uri, params)
-                .await
-                .map_err(|err| PyIOError::new_err(err.to_string()))?;
-            Ok(true)
-        }
-    })
+    let py = options.py();
+    if reader.is_instance_of::<Scanner>() {
+        let scanner: Scanner = reader.extract()?;
+        let batches = RT
+            .block_on(Some(py), scanner.to_reader())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(true)
+    } else {
+        let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
+        RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(true)
+    }
 }
 
 fn parse_write_mode(mode: &str) -> PyResult<WriteMode> {

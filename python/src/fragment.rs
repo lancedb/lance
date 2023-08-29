@@ -263,7 +263,6 @@ impl FileFragment {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> PyResult<Scanner> {
-        let rt = Arc::new(tokio::runtime::Runtime::new()?);
         let mut scanner = self_.fragment.scan();
         if let Some(cols) = columns {
             scanner
@@ -281,7 +280,7 @@ impl FileFragment {
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         let scn = Arc::new(scanner);
-        Ok(Scanner::new(scn, rt))
+        Ok(Scanner::new(scn))
     }
 
     fn updater(self_: PyRef<'_, Self>, columns: Option<Vec<String>>) -> PyResult<Updater> {

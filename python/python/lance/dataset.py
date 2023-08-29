@@ -1016,6 +1016,8 @@ def _coerce_reader(
         return data_obj.to_reader()
     elif isinstance(data_obj, pa.RecordBatch):
         return pa.Table.from_batches([data_obj]).to_reader()
+    elif isinstance(data_obj, LanceDataset):
+        return data_obj.scanner().to_reader()
     elif isinstance(data_obj, pa.dataset.Dataset):
         return pa.dataset.Scanner.from_dataset(data_obj).to_reader()
     elif isinstance(data_obj, pa.dataset.Scanner):
