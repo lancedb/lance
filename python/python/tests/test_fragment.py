@@ -83,10 +83,6 @@ def test_dataset_progress(tmp_path: Path):
     # In-progress file should be deleted
     assert not (tmp_path / "fragment_0.in_progress").exists()
 
-    import os
-
-    print(os.listdir(tmp_path))
-
     # Metadata should be written
     with open(tmp_path / "fragment_0.json") as f:
         metadata = json.load(f)

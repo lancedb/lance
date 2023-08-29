@@ -957,9 +957,7 @@ mod tests {
             (&path2, &non_existent_multipart_id),
         ];
 
-        cleanup_partial_writes(&dataset, objects.into_iter())
-            .await
-            .unwrap();
+        cleanup_partial_writes(&dataset, objects).await.unwrap();
 
         // Assert directly calling abort returns not found on first one.
         assert!(store

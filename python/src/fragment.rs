@@ -37,7 +37,7 @@ use tokio::runtime::Runtime;
 
 use crate::dataset::get_write_params;
 use crate::updater::Updater;
-use crate::{Dataset, Scanner};
+use crate::{Dataset, Scanner, RT};
 
 #[pyclass(name = "_FragmentWriteProgress", module = "_lib")]
 #[derive(Debug)]
@@ -487,16 +487,15 @@ pub fn cleanup_partial_writes(dataset: Dataset, files: Vec<(String, String)>) ->
         .into_iter()
         .map(|(path, multipart_id)| (Path::from(path.as_str()), multipart_id))
         .collect();
-    let files_iter = files
-        .iter()
-        .map(|(path, multipart_id)| (path, multipart_id));
 
-    // TODO: move to main runtime
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|err| PyIOError::new_err(format!("Failed to create tokio runtime: {}", err)))?;
-    rt.block_on(lance::dataset::cleanup::cleanup_partial_writes(
-        &dataset.ds,
-        files_iter,
-    ))
-    .map_err(|err| PyIOError::new_err(format!("Failed to cleanup files: {}", err)))
+    async fn inner(dataset: Dataset, files: Vec<(Path, String)>) -> Result<(), ::lance::Error> {
+        let files_iter = files
+            .iter()
+            .map(|(path, multipart_id)| (path, multipart_id));
+        lance::dataset::cleanup::cleanup_partial_writes(&dataset.ds, files_iter).await
+    }
+
+    RT.runtime
+        .block_on(inner(dataset, files))
+        .map_err(|err| PyIOError::new_err(format!("Failed to cleanup files: {}", err)))
 }
