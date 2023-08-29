@@ -19,7 +19,7 @@ from typing import Optional
 import pandas as pd
 import pyarrow as pa
 from lance import FragmentMetadata, LanceDataset, LanceFragment
-from lance.progress import FragmentWriteProgress
+from lance.progress import FileSystemFragmentWriteProgress, FragmentWriteProgress
 
 
 def test_write_fragment(tmp_path: Path):
@@ -72,3 +72,26 @@ def test_write_fragment_with_progress(tmp_path: Path):
     LanceFragment.create(tmp_path, df, progress=progress)
     assert progress.begin_called == 1
     assert progress.complete_called == 1
+
+
+def test_dataset_progress(tmp_path: Path):
+    data = pa.table({"a": range(100)})
+    fragment = LanceFragment.create(
+        tmp_path, data, progress=FileSystemFragmentWriteProgress(tmp_path)
+    )
+
+    # In-progress file should be deleted
+    assert not (tmp_path / "fragment_0.in_progress").exists()
+
+    import os
+
+    print(os.listdir(tmp_path))
+
+    # Metadata should be written
+    with open(tmp_path / "fragment_0.json") as f:
+        metadata = json.load(f)
+
+    assert metadata["id"] == 0
+    assert len(metadata["files"]) == 1
+
+    assert fragment == FragmentMetadata.from_json(json.dumps(metadata))

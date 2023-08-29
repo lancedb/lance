@@ -474,6 +474,11 @@ impl FragmentMetadata {
                 .map(|d| deletion_file_path(&Default::default(), self.inner.id, &d).to_string()),
         )
     }
+
+    #[getter]
+    fn id(&self) -> PyResult<u64> {
+        Ok(self.inner.id)
+    }
 }
 
 #[pyfunction(name = "_cleanup_partial_writes")]

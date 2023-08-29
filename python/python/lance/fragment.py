@@ -72,6 +72,10 @@ class FragmentMetadata:
         """Return the deletion file, if any"""
         return self._metadata.deletion_file()
 
+    @property
+    def id(self) -> int:
+        return self._metadata.id
+
 
 class LanceFragment(pa.dataset.Fragment):
     def __init__(

@@ -126,14 +126,14 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
 
         fs, path = FileSystem.from_uri(base_uri)
         self._fs = fs
-        self._base_path = path
+        self._base_path: str = path
         self._metadata = metadata if metadata else {}
 
-    def _in_progress_path(self, fragment: "FragmentMetadata"):
-        return self._base_path / f"fragment_{fragment.id}.in_progress"
+    def _in_progress_path(self, fragment: "FragmentMetadata") -> str:
+        return self._base_path + f"/fragment_{fragment.id}.in_progress"
 
-    def _fragment_file(self, fragment: "FragmentMetadata"):
-        return self._base_path / f"fragment_{fragment.id}.json"
+    def _fragment_file(self, fragment: "FragmentMetadata") -> str:
+        return self._base_path + f"/fragment_{fragment.id}.json"
 
     def begin(
         self, fragment: "FragmentMetadata", multipart_id: Optional[str] = None, **kwargs
@@ -148,17 +148,19 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
             The multipart id to upload this fragment to cloud storage.
         """
 
-        self._fs.create_dir(self._base_path)
+        self._fs.create_dir(self._base_path, recursive=True)
+
         with self._fs.open_output_stream(self._in_progress_path(fragment)) as out:
             progress_data = {
                 "fragment_id": fragment.id,
                 "multipart_id": multipart_id if multipart_id else "",
                 "metadata": self._metadata,
             }
-            json.dump(progress_data, out)
-        with self._fs.open_input_stream(self._fragment_file(fragment)) as out:
-            out.write(fragment.to_json()).encode("utf-8")
+            out.write(json.dumps(progress_data).encode("utf-8"))
+
+        with self._fs.open_output_stream(self._fragment_file(fragment)) as out:
+            out.write(json.dumps(fragment.to_json()).encode("utf-8"))
 
     def complete(self, fragment: "FragmentMetadata", **kwargs):
         """Called when a fragment is completed"""
-        self._fs.delete(self._in_progress_path(fragment))
+        self._fs.delete_file(self._in_progress_path(fragment))
