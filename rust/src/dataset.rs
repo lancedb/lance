@@ -2015,16 +2015,10 @@ mod tests {
         assert!(actual_statistics.starts_with(expected_statistics));
 
         assert_eq!(
-            dataset
-                .index_statistics("non-existent_idx")
-                .await
-                .unwrap(),
+            dataset.index_statistics("non-existent_idx").await.unwrap(),
             None
         );
-        assert_eq!(
-            dataset.index_statistics("").await.unwrap(),
-            None
-        );
+        assert_eq!(dataset.index_statistics("").await.unwrap(), None);
 
         // Overwrite should invalidate index
         let write_params = WriteParams {
