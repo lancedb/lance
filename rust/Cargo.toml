@@ -47,8 +47,8 @@ clap = { version = "4.1.1", features = ["derive"], optional = true }
 dashmap = "5"
 # matches arrow-rs use
 half = { version = "2.2.1", default-features = false, features = ["num-traits"] }
+http = "0.2.9"
 object_store = { version = "0.6.1", features = ["aws", "gcp", "azure"] }
-reqwest = { version = "0.11.16" }
 aws-config = "0.54"
 aws-credential-types = "0.54.1"
 pin-project = "1.0"
