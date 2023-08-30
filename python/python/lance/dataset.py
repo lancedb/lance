@@ -989,6 +989,7 @@ def write_dataset(
 
     """
     reader = _coerce_reader(data_obj, schema)
+    _validate_schema(reader.schema)
     # TODO add support for passing in LanceDataset and LanceScanner here
 
     params = {
@@ -1045,6 +1046,31 @@ def _coerce_reader(
             "https://lancedb.github.io/lance/read_and_write.html "
             "to see supported types."
         )
+
+
+def _validate_schema(schema: pa.Schema):
+    """
+    Make sure the metadata is valid utf8
+    """
+    if schema.metadata is not None:
+        _validate_metadata(schema.metadata)
+
+
+def _validate_metadata(metadata: dict):
+    """
+    Make sure the metadata values are valid utf8 (can be nested)
+    """
+    for k, v in metadata.items():
+        if isinstance(v, bytes):
+            try:
+                v.decode("utf8")
+            except UnicodeDecodeError:
+                raise ValueError(
+                    f"Metadata key {k} is not valid utf8. "
+                    "Consider base64 encode for generic binary metadata."
+                )
+        elif isinstance(v, dict):
+            _validate_metadata(v)
 
 
 def _casting_recordbatch_iter(

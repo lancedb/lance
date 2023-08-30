@@ -11,7 +11,7 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-
+import base64
 import contextlib
 import os
 import pickle
@@ -633,3 +633,13 @@ def test_roundtrip_reader(tmp_path: Path):
 
     # Can roundtrip a whole dataset
     lance.write_dataset(dataset, tmp_path / "test3")
+
+
+def test_metadata(tmp_path: Path):
+    data = pa.table({"a": range(100)})
+    data = data.replace_schema_metadata({"foo": pickle.dumps("foo")})
+    with pytest.raises(ValueError):
+        lance.write_dataset(data, tmp_path)
+
+    data = data.replace_schema_metadata({"foo": base64.b64encode(pickle.dumps("foo"))})
+    lance.write_dataset(data, tmp_path)
