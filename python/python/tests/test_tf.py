@@ -154,7 +154,8 @@ def test_var_length_list(tmp_path):
         assert isinstance(batch["l"], tf.RaggedTensor)
 
 
-def test_tfrecord_parsing(tmp_path):
+@pytest.fixture
+def sample_tf_example():
     # Create a TFRecord with a string, float, int, and a tensor
     tensor = tf.constant(np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32))
     tensor_bf16 = tf.constant(
@@ -191,8 +192,11 @@ def test_tfrecord_parsing(tmp_path):
         ),
     }
 
-    example_proto = tf.train.Example(features=tf.train.Features(feature=feature))
-    serialized = example_proto.SerializeToString()
+    return tf.train.Example(features=tf.train.Features(feature=feature))
+
+
+def test_tfrecord_parsing(tmp_path, sample_tf_example):
+    serialized = sample_tf_example.SerializeToString()
 
     path = tmp_path / "test.tfrecord"
     with tf.io.TFRecordWriter(str(path)) as writer:
@@ -266,11 +270,32 @@ def test_tfrecord_parsing(tmp_path):
 
     assert table == expected_data
 
+
+def test_tfrecord_roundtrip(tmp_path, sample_tf_example):
+    del sample_tf_example.features.feature["9_tensor_bf16"]
+
+    serialized = sample_tf_example.SerializeToString()
+
+    path = tmp_path / "test.tfrecord"
+    with tf.io.TFRecordWriter(str(path)) as writer:
+        writer.write(serialized)
+
+    schema = infer_tfrecord_schema(
+        str(path),
+        tensor_features=["8_tensor", "9_tensor_bf16"],
+        string_features=["7_string"],
+    )
+
+    table = read_tfrecord(str(path), schema).read_all()
+
     # Can roundtrip to lance
     dataset_uri = tmp_path / "dataset"
     dataset = lance.write_dataset(table, dataset_uri)
-    assert dataset.schema == expected_data.schema
-    assert dataset.to_table() == expected_data
+    assert dataset.schema == table.schema
+    assert dataset.to_table() == table
+
+    # TODO: validate we can roundtrip with from_lance()
+    # tf_ds = from_lance(dataset, batch_size=1)
 
 
 def test_tfrecord_parsing_nulls(tmp_path):
