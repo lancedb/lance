@@ -36,7 +36,7 @@
 use std::{fmt::Debug, sync::atomic::AtomicBool};
 
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::{write_manifest_file, ManifestWriteConfig};
+use crate::dataset::{latest_manifest_path, write_manifest_file, ManifestWriteConfig};
 use crate::Dataset;
 use crate::Result;
 use crate::{format::pb, format::Index, format::Manifest};
@@ -45,7 +45,7 @@ use object_store::path::Path;
 use object_store::Error as ObjectStoreError;
 use prost::Message;
 
-use super::ObjectStore;
+use super::{read_manifest, ObjectStore};
 
 /// Function that writes the manifest to the object store.
 pub type ManifestWriter = for<'a> fn(
@@ -62,6 +62,19 @@ pub type ManifestWriter = for<'a> fn(
 /// to work, all writers must use the same commit handler type.
 #[async_trait::async_trait]
 pub trait CommitHandler: Debug + Send + Sync {
+    /// Get the latest version of a dataset at the path
+    async fn get_latest_version(
+        &self,
+        path: &Path,
+        object_store: &ObjectStore,
+    ) -> std::result::Result<u64, crate::Error> {
+        // use the _latest.manifest file to get the latest version
+        // TODO: this isn't 100% safe, we should list the /_versions directory and find the latest version
+        // TODO: we need to pade 0's to the version number on the manifest file path
+        read_manifest(object_store, &latest_manifest_path(path))
+            .await
+            .map(|m| m.version)
+    }
     /// Commit a manifest to a path.
     ///
     /// This function should return an [CommitError::CommitConflict] if another

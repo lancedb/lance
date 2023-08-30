@@ -189,7 +189,14 @@ impl Dataset {
             object_store.set_block_size(block_size);
         }
 
-        let latest_manifest_path = latest_manifest_path(&base_path);
+        let lateset_version = object_store
+            .commit_handler
+            .get_latest_version(&base_path, &object_store)
+            .await
+            .map_err(|e| Error::DatasetNotFound {
+                path: base_path.to_string(),
+                source: Box::new(e),
+            })?;
 
         let session = if let Some(session) = params.session.as_ref() {
             session.clone()
@@ -199,10 +206,11 @@ impl Dataset {
                 params.metadata_cache_size,
             ))
         };
+
         Self::checkout_manifest(
             Arc::new(object_store),
-            base_path,
-            &latest_manifest_path,
+            base_path.clone(),
+            &manifest_path(&base_path, lateset_version),
             session,
         )
         .await

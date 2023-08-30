@@ -48,7 +48,9 @@ build-backend = "maturin"
 
 [project.optional-dependencies]
 tests = [
-    "pandas>=1.4",
+    # Can't use pandas 2.1 in tests until this duckdb bug is fixed:
+    # https://github.com/duckdb/duckdb/issues/8735
+    "pandas>=1.4,<2.1",
     "pytest",
     "duckdb",
     "polars[pyarrow,pandas]",
