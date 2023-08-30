@@ -75,6 +75,26 @@ impl BackgroundExecutor {
         rx.recv().unwrap()
     }
 
+    /// Spawn a task in the background
+    pub fn spawn_background<T>(&self, py: Option<Python<'_>>, task: T)
+    where
+        T: Future + Send + 'static,
+        T::Output: Send + 'static,
+    {
+        if let Some(py) = py {
+            py.allow_threads(|| {
+                self.runtime.spawn(task);
+            })
+        } else {
+            // Python::with_gil is a no-op if the GIL is already held by the thread.
+            Python::with_gil(|py| {
+                py.allow_threads(|| {
+                    self.runtime.spawn(task);
+                })
+            })
+        }
+    }
+
     /// Block on a future and wait for it to complete.
     ///
     /// This helper method also frees the GIL before blocking.

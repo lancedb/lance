@@ -23,3 +23,5 @@ pub mod sql;
 pub mod temporal;
 #[cfg(test)]
 pub mod testing;
+#[cfg(feature = "tfrecord")]
+pub mod tfrecord;
