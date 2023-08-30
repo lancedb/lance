@@ -76,8 +76,11 @@ def test_write_fragment_with_progress(tmp_path: Path):
 
 def test_dataset_progress(tmp_path: Path):
     data = pa.table({"a": range(100)})
+    progress = FileSystemFragmentWriteProgress(tmp_path)
     fragment = LanceFragment.create(
-        tmp_path, data, progress=FileSystemFragmentWriteProgress(tmp_path)
+        tmp_path,
+        data,
+        progress=progress,
     )
 
     # In-progress file should be deleted
@@ -91,3 +94,23 @@ def test_dataset_progress(tmp_path: Path):
     assert len(metadata["files"]) == 1
 
     assert fragment == FragmentMetadata.from_json(json.dumps(metadata))
+
+    mock_in_progress = {
+        "fragment_id": 1,
+        "multipart_id": "whatever",
+        "metadata": {
+            "id": 0,
+            "files": [
+                {
+                    "path": "fragment_0.parquet",
+                    "fields": [0],
+                }
+            ],
+        },
+    }
+    with open(tmp_path / "fragment_1.in_progress", "w") as f:
+        json.dump(mock_in_progress, f)
+
+    progress.cleanup_partial_writes()
+
+    assert not (tmp_path / "fragment_1.in_progress").exists()

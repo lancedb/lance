@@ -47,7 +47,7 @@ use object_store::path::Path;
 
 use crate::{
     format::Manifest,
-    io::{deletion_file_path, read_manifest, reader::read_manifest_indexes},
+    io::{deletion_file_path, read_manifest, reader::read_manifest_indexes, ObjectStore},
     utils::temporal::utc_now,
     Dataset, Error, Result,
 };
@@ -320,16 +320,16 @@ pub async fn cleanup_old_versions(
 /// [crate::dataset::progress::WriteFragmentProgress] trait to track which files
 /// have been started but never finished.
 pub async fn cleanup_partial_writes(
-    dataset: &Dataset,
+    store: &ObjectStore,
     objects: impl IntoIterator<Item = (&Path, &String)>,
 ) -> Result<()> {
-    let store = dataset.object_store();
     futures::stream::iter(objects)
-        .map(|(path, multipart_id)| async move {
+        .map(Ok)
+        .try_for_each_concurrent(num_cpus::get() * 2, |(path, multipart_id)| async move {
             match store.inner.abort_multipart(path, multipart_id).await {
                 Ok(_) => Ok(()),
                 // We don't care if it's not there.
-                // TODO: once this issue is addressed, we should just use teh error
+                // TODO: once this issue is addressed, we should just use the error
                 // variant. https://github.com/apache/arrow-rs/issues/4749
                 // Err(object_store::Error::NotFound { .. }) => {
                 Err(e) if e.to_string().contains("No such file or directory") => {
@@ -339,8 +339,6 @@ pub async fn cleanup_partial_writes(
                 Err(e) => Err(Error::from(e)),
             }
         })
-        .buffer_unordered(10)
-        .try_collect::<Vec<_>>()
         .await?;
     Ok(())
 }
@@ -957,7 +955,9 @@ mod tests {
             (&path2, &non_existent_multipart_id),
         ];
 
-        cleanup_partial_writes(&dataset, objects).await.unwrap();
+        cleanup_partial_writes(dataset.object_store(), objects)
+            .await
+            .unwrap();
 
         // Assert directly calling abort returns not found on first one.
         assert!(store

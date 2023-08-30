@@ -24,8 +24,8 @@ use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use lance::datatypes::Schema;
 use lance::format::{pb, DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
-use lance::io::deletion_file_path;
 use lance::io::object_store::Path;
+use lance::io::{deletion_file_path, ObjectStore};
 use prost::Message;
 use pyo3::prelude::*;
 use pyo3::{
@@ -37,7 +37,7 @@ use tokio::runtime::Runtime;
 
 use crate::dataset::get_write_params;
 use crate::updater::Updater;
-use crate::{Dataset, Scanner, RT};
+use crate::{Scanner, RT};
 
 #[pyclass(name = "_FragmentWriteProgress", module = "_lib")]
 #[derive(Debug)]
@@ -482,20 +482,25 @@ impl FragmentMetadata {
 }
 
 #[pyfunction(name = "_cleanup_partial_writes")]
-pub fn cleanup_partial_writes(dataset: Dataset, files: Vec<(String, String)>) -> PyResult<()> {
+pub fn cleanup_partial_writes(base_uri: &str, files: Vec<(String, String)>) -> PyResult<()> {
+    let (store, _) = RT
+        .runtime
+        .block_on(ObjectStore::from_uri(base_uri))
+        .map_err(|err| PyIOError::new_err(format!("Failed to create object store: {}", err)))?;
+
     let files: Vec<(Path, String)> = files
         .into_iter()
         .map(|(path, multipart_id)| (Path::from(path.as_str()), multipart_id))
         .collect();
 
-    async fn inner(dataset: Dataset, files: Vec<(Path, String)>) -> Result<(), ::lance::Error> {
+    async fn inner(store: ObjectStore, files: Vec<(Path, String)>) -> Result<(), ::lance::Error> {
         let files_iter = files
             .iter()
             .map(|(path, multipart_id)| (path, multipart_id));
-        lance::dataset::cleanup::cleanup_partial_writes(&dataset.ds, files_iter).await
+        lance::dataset::cleanup::cleanup_partial_writes(&store, files_iter).await
     }
 
     RT.runtime
-        .block_on(inner(dataset, files))
+        .block_on(inner(store, files))
         .map_err(|err| PyIOError::new_err(format!("Failed to cleanup files: {}", err)))
 }

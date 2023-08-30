@@ -59,7 +59,7 @@ const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 pub struct Dataset {
     #[pyo3(get)]
     uri: String,
-    pub(crate) ds: Arc<LanceDataset>,
+    ds: Arc<LanceDataset>,
 }
 
 #[pymethods]
