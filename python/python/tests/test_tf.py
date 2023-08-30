@@ -266,6 +266,12 @@ def test_tfrecord_parsing(tmp_path):
 
     assert table == expected_data
 
+    # Can roundtrip to lance
+    dataset_uri = tmp_path / "dataset"
+    dataset = lance.write_dataset(table, dataset_uri)
+    assert dataset.schema == expected_data.schema
+    assert dataset.to_table() == expected_data
+
 
 def test_tfrecord_parsing_nulls(tmp_path):
     # Make sure we don't trip up on missing values
