@@ -568,7 +568,6 @@ impl From<&pb::Field> for Field {
                 field.extension_name.clone(),
             );
         }
-        // TODO (check extension_name)
         Self {
             name: field.name.clone(),
             id: field.id,
