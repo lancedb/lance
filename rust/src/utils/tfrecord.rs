@@ -764,6 +764,10 @@ fn append_primitive_from_slice<T>(
 ) where
     T: arrow::datatypes::ArrowPrimitiveType,
 {
+    // Safety: we are trusting that the data in the buffer are valid for the
+    // datatype T::Native, as claimed by the file. There isn't anywhere for
+    // TensorProto to tell us the original endianness, so it's possible there
+    // could be a mismatch here.
     let (prefix, middle, suffix) = unsafe { slice.align_to::<T::Native>() };
     for val in prefix.chunks_exact(T::get_byte_width()) {
         builder.append_value(parse_val(val));
