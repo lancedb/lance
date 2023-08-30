@@ -95,22 +95,29 @@ def test_dataset_progress(tmp_path: Path):
 
     assert fragment == FragmentMetadata.from_json(json.dumps(metadata))
 
+    mock_fragment = {
+        "id": 0,
+        "files": [
+            {
+                "path": "fragment_0.parquet",
+                "fields": [0],
+            }
+        ],
+    }
+
     mock_in_progress = {
         "fragment_id": 1,
         "multipart_id": "whatever",
-        "metadata": {
-            "id": 0,
-            "files": [
-                {
-                    "path": "fragment_0.parquet",
-                    "fields": [0],
-                }
-            ],
-        },
+        "metadata": mock_fragment,
     }
+
+    with open(tmp_path / "fragment_1.json", "w") as f:
+        json.dump(mock_fragment, f)
+
     with open(tmp_path / "fragment_1.in_progress", "w") as f:
         json.dump(mock_in_progress, f)
 
     progress.cleanup_partial_writes()
 
+    assert not (tmp_path / "fragment_1.json").exists()
     assert not (tmp_path / "fragment_1.in_progress").exists()

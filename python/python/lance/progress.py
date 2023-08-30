@@ -200,5 +200,7 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
 
         for path in marker_paths:
             self._fs.delete_file(path)
+            json_path = path.rstrip(".in_progress") + ".json"
+            self._fs.delete_file(json_path)
 
         return len(objects)
