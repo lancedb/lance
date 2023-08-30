@@ -1059,6 +1059,8 @@ def _validate_schema(schema: pa.Schema):
 def _validate_metadata(metadata: dict):
     """
     Make sure the metadata values are valid utf8 (can be nested)
+
+    Raises ValueError if not valid utf8
     """
     for k, v in metadata.items():
         if isinstance(v, bytes):
