@@ -197,6 +197,12 @@ def test_schema_to_json():
 @pytest.fixture
 def sample_data_all_types():
     nrows = 10
+
+    tensor_type = pa.fixed_shape_tensor(pa.float32(), [2, 3])
+    inner = pa.array([float(x) for x in range(60)], pa.float32())
+    storage = pa.FixedSizeListArray.from_arrays(inner, 6)
+    tensor_array = pa.ExtensionArray.from_storage(tensor_type, storage)
+
     return pa.table(
         {
             # TODO: add remaining types
@@ -207,6 +213,7 @@ def sample_data_all_types():
             "bfloat16": lance.arrow.bfloat16_array(
                 [1.0 + i / 10 for i in range(nrows)]
             ),
+            "tensor": tensor_array,
         }
     )
 

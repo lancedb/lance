@@ -304,6 +304,9 @@ message Field {
   /// The logic type presents the value type of the column, i.e., string value.
   Dictionary dictionary = 8;
 
-  // optional extension type name
+  // Deprecated: optional extension type name, use metadata field ARROW:extension:name
   string extension_name = 9;
+
+  // optional field metadata (e.g. extension type name/parameters)
+  map<string, bytes> metadata = 10;
 }

@@ -14,7 +14,7 @@
 
 //! Lance Schema Field
 
-use std::{cmp::max, fmt, sync::Arc};
+use std::{cmp::max, collections::HashMap, fmt, sync::Arc};
 
 use arrow_array::{
     cast::AsArray,
@@ -43,7 +43,7 @@ pub struct Field {
     pub id: i32,
     parent_id: i32,
     logical_type: LogicalType,
-    extension_name: String,
+    metadata: HashMap<String, String>,
     pub(crate) encoding: Option<Encoding>,
     pub nullable: bool,
 
@@ -66,6 +66,12 @@ impl Field {
             }
             lt => DataType::try_from(lt).unwrap(),
         }
+    }
+
+    pub fn extension_name(&self) -> Option<&str> {
+        self.metadata
+            .get("ARROW:extension:name")
+            .map(String::as_str)
     }
 
     pub fn child(&self, name: &str) -> Option<&Self> {
@@ -163,7 +169,7 @@ impl Field {
             id: self.id,
             parent_id: self.parent_id,
             logical_type: self.logical_type.clone(),
-            extension_name: self.extension_name.clone(),
+            metadata: self.metadata.clone(),
             encoding: self.encoding.clone(),
             nullable: self.nullable,
             children: vec![],
@@ -292,7 +298,7 @@ impl Field {
                 id: self.id,
                 parent_id: self.parent_id,
                 logical_type: self.logical_type.clone(),
-                extension_name: self.extension_name.clone(),
+                metadata: self.metadata.clone(),
                 encoding: self.encoding.clone(),
                 nullable: self.nullable,
                 children,
@@ -338,7 +344,7 @@ impl Field {
                 id: self.id,
                 parent_id: self.parent_id,
                 logical_type: self.logical_type.clone(),
-                extension_name: self.extension_name.clone(),
+                metadata: self.metadata.clone(),
                 encoding: self.encoding.clone(),
                 nullable: self.nullable,
                 children,
@@ -523,11 +529,7 @@ impl TryFrom<&ArrowField> for Field {
                 DataType::List(_) | DataType::LargeList(_) => Some(Encoding::Plain),
                 _ => None,
             },
-            extension_name: field
-                .metadata()
-                .get("ARROW:extension:name")
-                .map(|name| name.to_owned())
-                .unwrap_or_else(|| "".to_string()),
+            metadata: field.metadata().clone(),
             nullable: field.is_nullable(),
             children,
             dictionary: None,
@@ -546,30 +548,32 @@ impl TryFrom<ArrowField> for Field {
 impl From<&Field> for ArrowField {
     fn from(field: &Field) -> Self {
         let out = Self::new(&field.name, field.data_type(), field.nullable);
-
-        if !field.extension_name.is_empty() {
-            out.with_metadata(
-                vec![(
-                    "ARROW:extension:name".to_string(),
-                    field.extension_name.clone(),
-                )]
-                .into_iter()
-                .collect(),
-            )
-        } else {
-            out
-        }
+        out.with_metadata(field.metadata.clone())
     }
 }
 
 impl From<&pb::Field> for Field {
     fn from(field: &pb::Field) -> Self {
+        let mut lance_metadata: HashMap<String, String> = field
+            .metadata
+            .iter()
+            .map(|(key, value)| {
+                let string_value = String::from_utf8_lossy(value).to_string();
+                (key.clone(), string_value)
+            })
+            .collect();
+        if !field.extension_name.is_empty() {
+            lance_metadata.insert(
+                "ARROW:extension:name".to_string(),
+                field.extension_name.clone(),
+            );
+        }
         Self {
             name: field.name.clone(),
             id: field.id,
             parent_id: field.parent_id,
             logical_type: LogicalType(field.logical_type.clone()),
-            extension_name: field.extension_name.clone(),
+            metadata: lance_metadata,
             encoding: match field.encoding {
                 1 => Some(Encoding::Plain),
                 2 => Some(Encoding::VarBinary),
@@ -586,6 +590,12 @@ impl From<&pb::Field> for Field {
 
 impl From<&Field> for pb::Field {
     fn from(field: &Field) -> Self {
+        let pb_metadata = field
+            .metadata
+            .clone()
+            .into_iter()
+            .map(|(key, value)| (key, value.into_bytes()))
+            .collect();
         Self {
             id: field.id,
             parent_id: field.parent_id,
@@ -600,7 +610,11 @@ impl From<&Field> for pb::Field {
             },
             nullable: field.nullable,
             dictionary: field.dictionary.as_ref().map(pb::Dictionary::from),
-            extension_name: field.extension_name.clone(),
+            metadata: pb_metadata,
+            extension_name: field
+                .extension_name()
+                .map(|name| name.to_owned())
+                .unwrap_or(String::new()),
             r#type: 0,
         }
     }
