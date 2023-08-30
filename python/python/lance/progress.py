@@ -19,9 +19,13 @@ from __future__ import annotations
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 from .lance import _cleanup_partial_writes
+
+if TYPE_CHECKING:
+    # We don't import directly because of circular import
+    from .fragment import FragmentMetadata
 
 
 class FragmentWriteProgress(ABC):
@@ -168,10 +172,15 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
         """Called when a fragment is completed"""
         self._fs.delete_file(self._in_progress_path(fragment))
 
-    def cleanup_partial_writes(self) -> int:
+    def cleanup_partial_writes(self, dataset_uri: str) -> int:
         """
         Finds all in-progress files and cleans up any partially written data
         files. This is useful for cleaning up after a failed write.
+
+        Parameters
+        ----------
+        dataset_uri : str
+            The URI of the table to clean up.
 
         Returns
         -------
@@ -179,6 +188,8 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
             The number of partial writes cleaned up.
         """
         from pyarrow.fs import FileSelector
+
+        from .fragment import FragmentMetadata
 
         marker_paths = []
         objects = []
@@ -189,14 +200,20 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
                 marker_paths.append(path)
                 with self._fs.open_input_stream(path) as f:
                     progress_data = json.loads(f.read().decode("utf-8"))
+
+                json_path = path.rstrip(".in_progress") + ".json"
+                with self._fs.open_input_stream(json_path) as f:
+                    fragment_metadata = FragmentMetadata.from_json(
+                        f.read().decode("utf-8")
+                    )
                 objects.append(
                     (
-                        progress_data["metadata"]["files"][0]["path"],
+                        fragment_metadata.data_files()[0].path(),
                         progress_data["multipart_id"],
                     )
                 )
 
-        _cleanup_partial_writes(self._base_path, objects)
+        _cleanup_partial_writes(dataset_uri, objects)
 
         for path in marker_paths:
             self._fs.delete_file(path)
