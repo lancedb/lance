@@ -64,7 +64,7 @@ lazy_static! {
 #[pymodule]
 fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     let env = Env::new()
-        .filter("LANCE_LOG")
+        .filter_or("LANCE_LOG", "warn")
         .write_style("LANCE_LOG_STYLE");
     env_logger::init_from_env(env);
 

@@ -326,7 +326,13 @@ pub async fn cleanup_partial_writes(
     futures::stream::iter(objects)
         .map(Ok)
         .try_for_each_concurrent(num_cpus::get() * 2, |(path, multipart_id)| async move {
-            match store.inner.abort_multipart(path, multipart_id).await {
+            let path: Path = store
+                .base_path()
+                .child("data")
+                .parts()
+                .chain(path.parts())
+                .collect();
+            match store.inner.abort_multipart(&path, multipart_id).await {
                 Ok(_) => Ok(()),
                 // We don't care if it's not there.
                 // TODO: once this issue is addressed, we should just use the error
@@ -942,14 +948,15 @@ mod tests {
         let store = dataset.object_store();
 
         // Create a partial write
-        let path1 = dataset.base.child("test");
+        let path1 = dataset.base.child("data").child("test");
         let (multipart_id, mut writer) = store.inner.put_multipart(&path1).await.unwrap();
         writer.write_all(b"test").await.unwrap();
 
+        // paths are relative to the store data path
+        let path1 = Path::from("test");
         // Add a non-existant path and id
-        let path2 = dataset.base.child("test2");
+        let path2 = Path::from("test2");
         let non_existent_multipart_id = "non-existant-id".to_string();
-
         let objects = vec![
             (&path1, &multipart_id),
             (&path2, &non_existent_multipart_id),
