@@ -13,13 +13,15 @@
 #  limitations under the License.
 
 import json
+import multiprocessing
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 import pyarrow as pa
+import pytest
 from lance import FragmentMetadata, LanceDataset, LanceFragment
-from lance.progress import FragmentWriteProgress
+from lance.progress import FileSystemFragmentWriteProgress, FragmentWriteProgress
 
 
 def test_write_fragment(tmp_path: Path):
@@ -72,3 +74,76 @@ def test_write_fragment_with_progress(tmp_path: Path):
     LanceFragment.create(tmp_path, df, progress=progress)
     assert progress.begin_called == 1
     assert progress.complete_called == 1
+
+
+def failing_write(progress_uri: str, dataset_uri: str):
+    # re-create progress so we don't have to pickle it
+    progress = FileSystemFragmentWriteProgress(
+        progress_uri, metadata={"test_key": "test_value"}
+    )
+    arr = pa.array(range(100))
+    batch = pa.record_batch([arr], names=["a"])
+
+    def data():
+        yield batch
+        raise Exception("Something went wrong!")
+
+    reader = pa.RecordBatchReader.from_batches(batch.schema, data())
+    with pytest.raises(Exception):
+        LanceFragment.create(
+            dataset_uri,
+            reader,
+            fragment_id=1,
+            progress=progress,
+        )
+
+
+def test_dataset_progress(tmp_path: Path):
+    dataset_uri = tmp_path / "dataset"
+    progress_uri = tmp_path / "progress"
+    data = pa.table({"a": range(100)})
+    progress = FileSystemFragmentWriteProgress(progress_uri)
+    fragment = LanceFragment.create(
+        dataset_uri,
+        data,
+        progress=progress,
+    )
+
+    # In-progress file should be deleted
+    assert not (progress_uri / "fragment_0.in_progress").exists()
+
+    # Metadata should be written
+    with open(progress_uri / "fragment_0.json") as f:
+        metadata = json.load(f)
+
+    assert metadata["id"] == 0
+    assert len(metadata["files"]) == 1
+
+    assert fragment == FragmentMetadata.from_json(json.dumps(metadata))
+
+    p = multiprocessing.Process(target=failing_write, args=(progress_uri, dataset_uri))
+    p.start()
+    try:
+        p.join()
+    except Exception as e:
+        # Allow a crash to happen
+        print(e)
+        pass
+
+    # In-progress file should be present
+    with open(progress_uri / "fragment_1.in_progress") as f:
+        progress_data = json.load(f)
+    assert progress_data["fragment_id"] == 1
+    assert isinstance(progress_data["multipart_id"], str)
+    # progress contains custom metadata
+    assert progress_data["metadata"]["test_key"] == "test_value"
+
+    # Metadata should be written
+    with open(progress_uri / "fragment_1.json") as f:
+        metadata = json.load(f)
+    assert metadata["id"] == 1
+
+    progress.cleanup_partial_writes(str(dataset_uri))
+
+    assert not (progress_uri / "fragment_1.json").exists()
+    assert not (progress_uri / "fragment_1.in_progress").exists()

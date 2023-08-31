@@ -46,6 +46,7 @@ pub(crate) mod scanner;
 pub(crate) mod updater;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
+use crate::fragment::cleanup_partial_writes;
 pub use dataset::write_dataset;
 pub use dataset::Dataset;
 pub use fragment::FragmentMetadata;
@@ -63,7 +64,7 @@ lazy_static! {
 #[pymodule]
 fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     let env = Env::new()
-        .filter("LANCE_LOG")
+        .filter_or("LANCE_LOG", "warn")
         .write_style("LANCE_LOG_STYLE");
     env_logger::init_from_env(env);
 
@@ -79,6 +80,7 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(json_to_schema))?;
     m.add_wrapped(wrap_pyfunction!(infer_tfrecord_schema))?;
     m.add_wrapped(wrap_pyfunction!(read_tfrecord))?;
+    m.add_wrapped(wrap_pyfunction!(cleanup_partial_writes))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

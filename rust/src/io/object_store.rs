@@ -20,9 +20,10 @@ use std::path::Path as StdPath;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+pub use ::object_store::path::Path;
 use ::object_store::{
     aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
-    local::LocalFileSystem, memory::InMemory, path::Path, ClientOptions, CredentialProvider,
+    local::LocalFileSystem, memory::InMemory, ClientOptions, CredentialProvider,
     Error as ObjectStoreError, ObjectStore as OSObjectStore, Result as ObjectStoreResult,
 };
 use async_trait::async_trait;
