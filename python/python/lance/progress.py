@@ -17,8 +17,15 @@
 from __future__ import annotations
 
 import json
+import os
 from abc import ABC, abstractmethod
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
+
+from .lance import _cleanup_partial_writes
+
+if TYPE_CHECKING:
+    # We don't import directly because of circular import
+    from .fragment import FragmentMetadata
 
 
 class FragmentWriteProgress(ABC):
@@ -110,6 +117,8 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
 
     """
 
+    PROGRESS_EXT: str = ".in_progress"
+
     def __init__(self, base_uri: str, metadata: Optional[Dict[str, str]] = None):
         """Create a FileSystemFragmentWriteProgress tracker.
 
@@ -126,14 +135,16 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
 
         fs, path = FileSystem.from_uri(base_uri)
         self._fs = fs
-        self._base_path = path
+        self._base_path: str = path
         self._metadata = metadata if metadata else {}
 
-    def _in_progress_path(self, fragment: "FragmentMetadata"):
-        return self._base_path / f"fragment_{fragment.id}.in_progress"
+    def _in_progress_path(self, fragment: "FragmentMetadata") -> str:
+        return os.path.join(
+            self._base_path, f"fragment_{fragment.id}{self.PROGRESS_EXT}"
+        )
 
-    def _fragment_file(self, fragment: "FragmentMetadata"):
-        return self._base_path / f"fragment_{fragment.id}.json"
+    def _fragment_file(self, fragment: "FragmentMetadata") -> str:
+        return os.path.join(self._base_path, f"fragment_{fragment.id}.json")
 
     def begin(
         self, fragment: "FragmentMetadata", multipart_id: Optional[str] = None, **kwargs
@@ -148,17 +159,69 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
             The multipart id to upload this fragment to cloud storage.
         """
 
-        self._fs.create_dir(self._base_path)
+        self._fs.create_dir(self._base_path, recursive=True)
+
         with self._fs.open_output_stream(self._in_progress_path(fragment)) as out:
             progress_data = {
                 "fragment_id": fragment.id,
                 "multipart_id": multipart_id if multipart_id else "",
                 "metadata": self._metadata,
             }
-            json.dump(progress_data, out)
-        with self._fs.open_input_stream(self._fragment_file(fragment)) as out:
-            out.write(fragment.to_json()).encode("utf-8")
+            out.write(json.dumps(progress_data).encode("utf-8"))
+
+        with self._fs.open_output_stream(self._fragment_file(fragment)) as out:
+            out.write(json.dumps(fragment.to_json()).encode("utf-8"))
 
     def complete(self, fragment: "FragmentMetadata", **kwargs):
         """Called when a fragment is completed"""
-        self._fs.delete(self._in_progress_path(fragment))
+        self._fs.delete_file(self._in_progress_path(fragment))
+
+    def cleanup_partial_writes(self, dataset_uri: str) -> int:
+        """
+        Finds all in-progress files and cleans up any partially written data
+        files. This is useful for cleaning up after a failed write.
+
+        Parameters
+        ----------
+        dataset_uri : str
+            The URI of the table to clean up.
+
+        Returns
+        -------
+        int
+            The number of partial writes cleaned up.
+        """
+        from pyarrow.fs import FileSelector
+
+        from .fragment import FragmentMetadata
+
+        marker_paths = []
+        objects = []
+        selector = FileSelector(self._base_path)
+        for info in self._fs.get_file_info(selector):
+            path = info.path
+            if path.endswith(self.PROGRESS_EXT):
+                marker_paths.append(path)
+                with self._fs.open_input_stream(path) as f:
+                    progress_data = json.loads(f.read().decode("utf-8"))
+
+                json_path = path.rstrip(self.PROGRESS_EXT) + ".json"
+                with self._fs.open_input_stream(json_path) as f:
+                    fragment_metadata = FragmentMetadata.from_json(
+                        f.read().decode("utf-8")
+                    )
+                objects.append(
+                    (
+                        fragment_metadata.data_files()[0].path(),
+                        progress_data["multipart_id"],
+                    )
+                )
+
+        _cleanup_partial_writes(dataset_uri, objects)
+
+        for path in marker_paths:
+            self._fs.delete_file(path)
+            json_path = path.rstrip(self.PROGRESS_EXT) + ".json"
+            self._fs.delete_file(json_path)
+
+        return len(objects)
