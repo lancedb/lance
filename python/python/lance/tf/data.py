@@ -79,8 +79,13 @@ def data_type_to_tensor_spec(dt: pa.DataType) -> tf.TensorSpec:
         or pa.types.is_integer(dt)
         or pa.types.is_floating(dt)
         or pa.types.is_string(dt)
+        or pa.types.is_binary(dt)
     ):
         return tf.TensorSpec(shape=(None,), dtype=arrow_data_type_to_tf(dt))
+    elif isinstance(dt, pa.FixedShapeTensorType):
+        return tf.TensorSpec(
+            shape=(None, *dt.shape), dtype=arrow_data_type_to_tf(dt.value_type)
+        )
     elif pa.types.is_fixed_size_list(dt):
         return tf.TensorSpec(
             shape=(None, dt.list_size), dtype=arrow_data_type_to_tf(dt.value_type)
@@ -93,6 +98,8 @@ def data_type_to_tensor_spec(dt: pa.DataType) -> tf.TensorSpec:
             ),
             dtype=arrow_data_type_to_tf(dt.value_type),
         )
+    elif pa.types.is_struct(dt):
+        return {field.name: data_type_to_tensor_spec(field.type) for field in dt}
 
     raise TypeError("Unsupported data type: ", dt)
 
@@ -106,11 +113,19 @@ def schema_to_spec(schema: pa.Schema) -> tf.TypeSpec:
     return signature
 
 
-def column_to_tensor(column: pa.Array, tensor_spec: tf.TensorSpec) -> tf.Tensor:
+def column_to_tensor(array: pa.Array, tensor_spec: tf.TensorSpec) -> tf.Tensor:
+    """Convert a PyArrow array into a TensorFlow tensor."""
     if isinstance(tensor_spec, tf.RaggedTensorSpec):
-        return tf.ragged.constant(column, dtype=tensor_spec.dtype)
+        return tf.ragged.constant(array.to_pylist(), dtype=tensor_spec.dtype)
+    elif isinstance(array.type, pa.FixedShapeTensorType):
+        return tf.constant(array.to_numpy_ndarray(), dtype=tensor_spec.dtype)
+    elif isinstance(array.type, pa.StructType):
+        return {
+            field.name: column_to_tensor(array.field(i), tensor_spec[field.name])
+            for (i, field) in enumerate(array.type)
+        }
     else:
-        return tf.constant(column, dtype=tensor_spec.dtype)
+        return tf.constant(array.to_pylist(), dtype=tensor_spec.dtype)
 
 
 def from_lance(
@@ -201,10 +216,9 @@ def from_lance(
 
     def generator():
         for batch in scanner.to_batches():
-            data = batch.to_pydict()
             yield {
-                name: column_to_tensor(column, output_signature[name])
-                for name, column in data.items()
+                name: column_to_tensor(batch[name], output_signature[name])
+                for name in batch.schema.names
             }
 
     return tf.data.Dataset.from_generator(generator, output_signature=output_signature)
