@@ -154,7 +154,39 @@ def test_var_length_list(tmp_path):
         assert isinstance(batch["l"], tf.RaggedTensor)
 
 
-# TODO: we also need to test nested structs
+def test_nested_struct(tmp_path):
+    table = pa.table(
+        {
+            "x": pa.array(
+                [
+                    {
+                        "a": 1,
+                        "json": {"b": "hello", "x": b"abc"},
+                    },
+                    {
+                        "a": 24,
+                        "json": {"b": "world", "x": b"def"},
+                    },
+                ]
+            )
+        }
+    )
+    uri = tmp_path / "dataset.lance"
+    dataset = lance.write_dataset(table, uri)
+
+    ds = tf.data.Dataset.from_lance(
+        dataset,
+        batch_size=8,
+    )
+
+    for batch in ds:
+        tf.debugging.assert_equal(batch["x"]["a"], tf.constant([1, 24], dtype=tf.int64))
+        tf.debugging.assert_equal(
+            batch["x"]["json"]["b"], tf.constant(["hello", "world"])
+        )
+        tf.debugging.assert_equal(
+            batch["x"]["json"]["x"], tf.constant([b"abc", b"def"])
+        )
 
 
 def test_tensor(tmp_path):
@@ -163,11 +195,9 @@ def test_tensor(tmp_path):
 
     uri = tmp_path / "dataset.lance"
     dataset = lance.write_dataset(table, uri)
-    ds = tf.data.Dataset.from_lance(
-        dataset,
-        batch_size=8,
-    )
-    for idx, batch in enumerate(ds):
+    ds = tf.data.Dataset.from_lance(dataset)
+
+    for batch in ds:
         assert batch["x"].shape == (2, 2, 3)
         assert batch["x"].dtype == tf.float32
         assert batch["x"].numpy().tolist() == arr.tolist()
