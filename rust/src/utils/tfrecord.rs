@@ -287,7 +287,7 @@ fn make_field(name: &str, feature_meta: &FeatureMeta) -> Result<ArrowField> {
                 ),
                 _ => None,
             };
-            let mut inner_field = ArrowField::new("value", inner_type, false);
+            let mut inner_field = ArrowField::new("item", inner_type, true);
             if let Some(metadata) = inner_meta {
                 inner_field.set_metadata(metadata);
             }
