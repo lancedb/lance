@@ -246,30 +246,34 @@ impl ObjectStore {
     ///
     /// Returns the ObjectStore instance and the absolute path to the object.
     pub async fn from_uri(uri: &str) -> Result<(Self, Path)> {
-        Self::from_uri_and_params(uri, ObjectStoreParams::default()).await
+        Self::from_uri_and_params(uri, &ObjectStoreParams::default()).await
     }
 
     /// Parse from a string URI.
     ///
     /// Returns the ObjectStore instance and the absolute path to the object.
-    pub async fn from_uri_and_params(uri: &str, params: ObjectStoreParams) -> Result<(Self, Path)> {
+    pub async fn from_uri_and_params(
+        uri: &str,
+        params: &ObjectStoreParams,
+    ) -> Result<(Self, Path)> {
         let (object_store, base_path) = match Url::parse(uri) {
             Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
                 // On Windows, the drive is parsed as a scheme
-                Self::new_from_path(uri, &params)
+                Self::new_from_path(uri, params)
             }
             Ok(url) => {
-                let store = Self::new_from_url(url.clone(), &params).await?;
+                let store = Self::new_from_url(url.clone(), params).await?;
                 let path = Path::from(url.path());
                 Ok((store, path))
             }
-            Err(_) => Self::new_from_path(uri, &params),
+            Err(_) => Self::new_from_path(uri, params),
         }?;
 
         Ok((
             Self {
                 inner: params
                     .object_store_wrapper
+                    .as_ref()
                     .map(|w| w.wrap(object_store.inner.clone()))
                     .unwrap_or(object_store.inner),
                 ..object_store
@@ -676,7 +680,7 @@ mod tests {
         // not called yet
         assert!(!wrapper.called());
 
-        let _ = ObjectStore::from_uri_and_params("memory:///", params)
+        let _ = ObjectStore::from_uri_and_params("memory:///", &params)
             .await
             .unwrap();
 
@@ -720,7 +724,7 @@ mod tests {
         // Not called yet
         assert!(!mock_provider.called.load(Ordering::Relaxed));
 
-        let (store, _) = ObjectStore::from_uri_and_params("s3://not-a-bucket", params)
+        let (store, _) = ObjectStore::from_uri_and_params("s3://not-a-bucket", &params)
             .await
             .unwrap();
 
