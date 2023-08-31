@@ -338,7 +338,10 @@ pub async fn cleanup_partial_writes(
                 // TODO: once this issue is addressed, we should just use the error
                 // variant. https://github.com/apache/arrow-rs/issues/4749
                 // Err(object_store::Error::NotFound { .. }) => {
-                Err(e) if e.to_string().contains("No such file or directory") => {
+                Err(e)
+                    if e.to_string().contains("No such file or directory")
+                        || e.to_string().contains("cannot find the file") =>
+                {
                     log::warn!("Partial write not found: {} {}", path, multipart_id);
                     Ok(())
                 }

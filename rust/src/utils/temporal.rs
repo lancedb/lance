@@ -19,7 +19,7 @@
 //! unit tests.  Anywhere in production code where we need to get the current time
 //! we should use the below methods and types instead of the builtin methods and types
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 #[cfg(test)]
 use mock_instant::{SystemTime as NativeSystemTime, UNIX_EPOCH};
 
@@ -36,5 +36,5 @@ pub fn utc_now() -> DateTime<Utc> {
         .expect("system time before Unix epoch");
     let naive =
         NaiveDateTime::from_timestamp_opt(now.as_secs() as i64, now.subsec_nanos()).unwrap();
-    DateTime::from_utc(naive, Utc)
+    Utc.from_utc_datetime(&naive)
 }
