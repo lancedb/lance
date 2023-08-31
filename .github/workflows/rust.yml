@@ -53,7 +53,7 @@ jobs:
         run: |
           cargo test --all-features
       - name: Build benchmarks
-          cargo build --benches
+        run: cargo build --benches
   linux-arm:
     runs-on: buildjet-4vcpu-ubuntu-2204-arm
     timeout-minutes: 30
