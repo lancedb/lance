@@ -20,7 +20,7 @@ from typing import Optional
 import pandas as pd
 import pyarrow as pa
 import pytest
-from lance import FragmentMetadata, LanceDataset, LanceFragment
+from lance import FragmentMetadata, LanceDataset, LanceFragment, LanceOperation
 from lance.progress import FileSystemFragmentWriteProgress, FragmentWriteProgress
 
 
@@ -50,7 +50,9 @@ def test_write_fragment_two_phases(tmp_path: Path):
     fragments = [FragmentMetadata.from_json(j) for j in json_array]
 
     schema = pa.schema([pa.field("a", pa.int64())])
-    dataset = LanceDataset._commit(tmp_path, schema, fragments)
+
+    operation = LanceOperation.overwrite(schema, fragments)
+    dataset = LanceDataset._commit(tmp_path, operation)
 
     df = dataset.to_table().to_pandas()
     pd.testing.assert_frame_equal(

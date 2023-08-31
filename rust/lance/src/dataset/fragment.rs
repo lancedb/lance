@@ -639,6 +639,7 @@ mod tests {
 
     use super::*;
     use crate::dataset::progress::NoopFragmentWriteProgress;
+    use crate::dataset::transaction::Operation;
     use crate::dataset::{WriteParams, ROW_ID};
 
     async fn create_dataset(test_uri: &str) -> Dataset {
@@ -845,14 +846,12 @@ mod tests {
             fragments.push(f)
         }
 
-        let new_dataset = Dataset::commit(
-            test_uri,
-            schema,
-            &fragments,
-            crate::dataset::WriteMode::Create,
-        )
-        .await
-        .unwrap();
+        let op = Operation::Overwrite {
+            schema: schema.clone(),
+            fragments,
+        };
+
+        let new_dataset = Dataset::commit(test_uri, None, op, None).await.unwrap();
 
         assert_eq!(new_dataset.count_rows().await.unwrap(), dataset_rows);
     }
@@ -918,14 +917,13 @@ mod tests {
             // Scan again
             let full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
             let before_version = dataset.version().version;
-            let dataset = Dataset::commit(
-                test_uri,
-                &full_schema,
-                &[new_fragment],
-                crate::dataset::WriteMode::Create,
-            )
-            .await
-            .unwrap();
+
+            let op = Operation::Overwrite {
+                fragments: vec![new_fragment],
+                schema: full_schema.clone(),
+            };
+
+            let dataset = Dataset::commit(test_uri, None, op, None).await.unwrap();
 
             // We only kept the first fragment of 40 rows
             assert_eq!(

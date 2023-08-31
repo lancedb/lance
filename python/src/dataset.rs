@@ -37,7 +37,8 @@ use crate::fragment::{FileFragment, FragmentMetadata};
 use crate::Scanner;
 use crate::RT;
 use lance::dataset::{
-    scanner::Scanner as LanceScanner, Dataset as LanceDataset, Version, WriteMode, WriteParams,
+    scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
+    Dataset as LanceDataset, Version, WriteMode, WriteParams,
 };
 use lance::index::{
     vector::diskann::DiskANNParams,
@@ -52,6 +53,36 @@ pub mod commit;
 const DEFAULT_NPROBS: usize = 1;
 const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
+
+#[pyclass(name = "_Operation", module = "_lib")]
+#[derive(Clone)]
+pub struct Operation {
+    inner: LanceOperation,
+}
+
+#[pymethods]
+impl Operation {
+    fn __repr__(&self) -> String {
+        "".to_string()
+    }
+
+    #[staticmethod]
+    fn overwrite(schema: &PyAny, fragments: Vec<&PyAny>) -> PyResult<Self> {
+        let arrow_schema = ArrowSchema::from_pyarrow(schema)?;
+        let schema = Schema::try_from(&arrow_schema).map_err(|e| {
+            PyValueError::new_err(format!(
+                "Failed to convert Arrow schema to Lance schema: {}",
+                e
+            ))
+        })?;
+        let fragments = fragments
+            .iter()
+            .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
+            .collect::<PyResult<Vec<Fragment>>>()?;
+        let op = LanceOperation::Overwrite { fragments, schema };
+        Ok(Self { inner: op })
+    }
+}
 
 /// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib")]
@@ -499,27 +530,15 @@ impl Dataset {
     #[staticmethod]
     fn commit(
         dataset_uri: &str,
-        schema: &PyAny,
-        fragments: Vec<&PyAny>,
-        mode: Option<&str>,
+        operation: Operation,
+        read_version: Option<u64>,
+        options: Option<&PyDict>,
     ) -> PyResult<Self> {
-        let arrow_schema = ArrowSchema::from_pyarrow(schema)?;
-        let py = schema.py();
-        let schema = Schema::try_from(&arrow_schema).map_err(|e| {
-            PyValueError::new_err(format!(
-                "Failed to convert Arrow schema to Lance schema: {}",
-                e
-            ))
-        })?;
-        let fragment_metadata = fragments
-            .iter()
-            .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
-            .collect::<PyResult<Vec<Fragment>>>()?;
-        let mode = parse_write_mode(mode.unwrap_or("create"))?;
+        let write_params = options.map(get_write_params).unwrap_or(Ok(None))?;
         let ds = RT
             .block_on(
-                Some(py),
-                LanceDataset::commit(dataset_uri, &schema, &fragment_metadata, mode),
+                options.map(|opts| opts.py()),
+                LanceDataset::commit(dataset_uri, read_version, operation.inner, write_params),
             )
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {

@@ -362,7 +362,8 @@ def test_add_columns(tmp_path: Path):
     fragment_metadata = fragment.add_columns(adder, columns=["a"])
     schema = dataset.schema.append(pa.field("c", pa.int64()))
 
-    dataset = lance.LanceDataset._commit(base_dir, schema, [fragment_metadata])
+    operation = lance.LanceOperation.overwrite(schema, [fragment_metadata])
+    dataset = lance.LanceDataset._commit(base_dir, operation)
     assert dataset.schema == schema
 
     tbl = dataset.to_table()
@@ -376,7 +377,8 @@ def test_create_from_fragments(tmp_path: Path):
     base_dir = tmp_path / "test"
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
 
-    dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment])
+    operation = lance.LanceOperation.overwrite(table.schema, [fragment])
+    dataset = lance.LanceDataset._commit(base_dir, operation)
     tbl = dataset.to_table()
     assert tbl == table
 
@@ -411,7 +413,8 @@ def test_deletion_file(tmp_path: Path):
     assert new_fragment.deletion_file() is not None
     assert re.match("_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file())
     print(type(new_fragment), new_fragment)
-    dataset = lance.LanceDataset._commit(base_dir, table.schema, [new_fragment])
+    operation = lance.LanceOperation.overwrite(table.schema, [new_fragment])
+    dataset = lance.LanceDataset._commit(base_dir, operation)
     assert dataset.count_rows() == 90
 
 
@@ -429,7 +432,8 @@ def test_commit_fragments_via_scanner(tmp_path: Path):
     unpickled = pickle.loads(pickled)
     assert fragment_metadata == unpickled
 
-    dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment_metadata])
+    operation = lance.LanceOperation.overwrite(table.schema, [fragment_metadata])
+    dataset = lance.LanceDataset._commit(base_dir, operation)
     assert dataset.schema == table.schema
 
     tbl = dataset.to_table()

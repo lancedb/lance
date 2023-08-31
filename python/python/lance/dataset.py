@@ -31,7 +31,7 @@ from pyarrow._compute import Expression
 from .commit import CommitLock
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import __version__ as __version__
-from .lance import _Dataset, _Scanner, _write_dataset
+from .lance import _Dataset, _Operation, _Scanner, _write_dataset
 
 try:
     import pandas as pd
@@ -680,9 +680,9 @@ class LanceDataset(pa.dataset.Dataset):
     @staticmethod
     def _commit(
         base_uri: Union[str, Path],
-        new_schema: pa.Schema,
-        fragments: Iterable[FragmentMetadata],
-        mode: str = "append",
+        operation: LanceOperation,
+        read_version: Optional[int] = None,
+        options: Optional[Dict[str, Any]] = None,
     ) -> LanceDataset:
         """Create a new version of dataset with collected fragments.
 
@@ -708,6 +708,18 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
+            
+        _Dataset.commit(base_uri, operation, read_version, options)
+        return LanceDataset(base_uri)
+
+
+class LanceOperation:
+
+    @staticmethod
+    def overwrite(
+        new_schema: pa.Schema,
+        fragments: Iterable[FragmentMetadata],
+    ) -> LanceOperation:
         if not isinstance(new_schema, pa.Schema):
             raise TypeError(f"schema must be pyarrow.Schema, got {type(new_schema)}")
         if not isinstance(fragments, list):
@@ -722,8 +734,8 @@ class LanceDataset(pa.dataset.Dataset):
             )
         raw_fragments = [f._metadata for f in fragments]
         # TODO: make fragments as a generator
-        _Dataset.commit(base_uri, new_schema, raw_fragments)
-        return LanceDataset(base_uri)
+        return _Operation.overwrite(new_schema, raw_fragments)
+        
 
 
 class ScannerBuilder:

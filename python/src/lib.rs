@@ -48,7 +48,7 @@ pub(crate) mod updater;
 pub use crate::arrow::{bfloat16_array, BFloat16};
 use crate::fragment::cleanup_partial_writes;
 pub use dataset::write_dataset;
-pub use dataset::Dataset;
+pub use dataset::{Dataset, Operation};
 pub use fragment::FragmentMetadata;
 use fragment::{DataFile, FileFragment};
 pub use reader::LanceReader;
@@ -70,6 +70,7 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
 
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
+    m.add_class::<Operation>()?;
     m.add_class::<FileFragment>()?;
     m.add_class::<FragmentMetadata>()?;
     m.add_class::<DataFile>()?;
