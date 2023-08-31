@@ -82,6 +82,57 @@ impl Operation {
         let op = LanceOperation::Overwrite { fragments, schema };
         Ok(Self { inner: op })
     }
+
+    #[staticmethod]
+    fn append(fragments: Vec<&PyAny>) -> PyResult<Self> {
+        let fragments = fragments
+            .iter()
+            .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
+            .collect::<PyResult<Vec<Fragment>>>()?;
+        let op = LanceOperation::Append { fragments };
+        Ok(Self { inner: op })
+    }
+
+    #[staticmethod]
+    fn delete(
+        updated_fragments: Vec<&PyAny>,
+        deleted_fragment_ids: Vec<u64>,
+        predicate: String,
+    ) -> PyResult<Self> {
+        let updated_fragments = updated_fragments
+            .iter()
+            .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
+            .collect::<PyResult<Vec<Fragment>>>()?;
+        let op = LanceOperation::Delete {
+            updated_fragments,
+            deleted_fragment_ids,
+            predicate,
+        };
+        Ok(Self { inner: op })
+    }
+
+    #[staticmethod]
+    fn rewrite(old_fragments: Vec<&PyAny>, new_fragments: Vec<&PyAny>) -> PyResult<Self> {
+        let old_fragments = old_fragments
+            .iter()
+            .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
+            .collect::<PyResult<Vec<Fragment>>>()?;
+        let new_fragments = new_fragments
+            .iter()
+            .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
+            .collect::<PyResult<Vec<Fragment>>>()?;
+        let op = LanceOperation::Rewrite {
+            old_fragments,
+            new_fragments,
+        };
+        Ok(Self { inner: op })
+    }
+
+    #[staticmethod]
+    fn restore(version: u64) -> PyResult<Self> {
+        let op = LanceOperation::Restore { version };
+        Ok(Self { inner: op })
+    }
 }
 
 /// Lance Dataset that will be wrapped by another class in Python
@@ -534,11 +585,11 @@ impl Dataset {
         read_version: Option<u64>,
         options: Option<&PyDict>,
     ) -> PyResult<Self> {
-        let write_params = options.map(get_write_params).unwrap_or(Ok(None))?;
+        let store_params = options.map(get_object_store_params).unwrap_or(None);
         let ds = RT
             .block_on(
                 options.map(|opts| opts.py()),
-                LanceDataset::commit(dataset_uri, read_version, operation.inner, write_params),
+                LanceDataset::commit(dataset_uri, operation.inner, read_version, store_params),
             )
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
@@ -584,6 +635,21 @@ fn parse_write_mode(mode: &str) -> PyResult<WriteMode> {
     }
 }
 
+pub(crate) fn get_object_store_params(options: &PyDict) -> Option<ObjectStoreParams> {
+    if options.is_none() {
+        None
+    } else {
+        if let Some(commit_handler) = options.get_item("commit_handler") {
+            let py_commit_lock = PyCommitLock::new(commit_handler.to_object(options.py()));
+            let mut object_store_params = ObjectStoreParams::default();
+            object_store_params.set_commit_lock(Arc::new(py_commit_lock));
+            Some(object_store_params)
+        } else {
+            None
+        }
+    }
+}
+
 pub(crate) fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
     let params = if options.is_none() {
         None
@@ -598,13 +664,7 @@ pub(crate) fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>
         if let Some(maybe_nrows) = options.get_item("max_rows_per_group") {
             p.max_rows_per_group = usize::extract(maybe_nrows)?;
         }
-
-        if let Some(commit_handler) = options.get_item("commit_handler") {
-            let py_commit_lock = PyCommitLock::new(commit_handler.to_object(options.py()));
-            let mut object_store_params = ObjectStoreParams::default();
-            object_store_params.set_commit_lock(Arc::new(py_commit_lock));
-            p.store_params = Some(object_store_params);
-        }
+        p.store_params = get_object_store_params(options);
 
         Some(p)
     };

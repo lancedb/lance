@@ -577,40 +577,33 @@ impl Dataset {
     /// can be None.  An error will be returned if the `read_version` is needed for an operation and
     /// it is not specified.
     ///
+    /// All operations except Overwrite will fail if the dataset does not already exist.
+    ///
     /// # Arguments
     ///
     /// * `base_uri` - The base URI of the dataset
-    /// * `read_version` - The version of the dataset that this change is based on
     /// * `operation` - A description of the change to commit
-    /// * `write_params` Parameters controlling how the manifest is written
+    /// * `read_version` - The version of the dataset that this change is based on
+    /// * `store_params` Parameters controlling object store access to the manifest
     pub async fn commit(
         base_uri: &str,
-        read_version: Option<u64>,
         operation: Operation,
-        write_params: Option<WriteParams>,
+        read_version: Option<u64>,
+        store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let read_version = read_version.map_or_else(
             || match operation {
-                Operation::Append { .. }
-                | Operation::CreateIndex { .. }
-                | Operation::Delete { .. }
-                | Operation::Rewrite { .. }
-                | Operation::Merge { .. } => Err(Error::invalid_input(
+                Operation::Overwrite { .. } | Operation::Restore { .. } => Ok(0),
+                _ => Err(Error::invalid_input(
                     "read_version must be specified for this operation",
                 )),
-                _ => Ok(0),
             },
             Ok,
         )?;
 
-        let (object_store, base) = ObjectStore::from_uri_and_params(
-            base_uri,
-            &write_params
-                .clone()
-                .map(|params| params.store_params.unwrap_or_default())
-                .unwrap_or_default(),
-        )
-        .await?;
+        let (object_store, base) =
+            ObjectStore::from_uri_and_params(base_uri, &store_params.clone().unwrap_or_default())
+                .await?;
 
         // Test if the dataset exists
         let latest_manifest = object_store
@@ -619,8 +612,6 @@ impl Dataset {
             .await?;
         let flag_dataset_exists = object_store.exists(&latest_manifest).await?;
 
-        // Running checks for the different write modes
-        // create + dataset already exists = error
         if !flag_dataset_exists && !matches!(operation, Operation::Overwrite { .. }) {
             return Err(Error::DatasetNotFound {
                 path: base.to_string(),
@@ -629,12 +620,11 @@ impl Dataset {
         }
 
         let dataset = if flag_dataset_exists {
-            // pull the store params from write params because there might be creds in there
             Some(
                 Self::open_with_params(
                     base_uri,
                     &ReadParams {
-                        store_options: write_params.unwrap_or_default().store_params.clone(),
+                        store_options: store_params.clone(),
                         ..Default::default()
                     },
                 )

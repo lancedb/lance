@@ -51,7 +51,7 @@ def test_write_fragment_two_phases(tmp_path: Path):
 
     schema = pa.schema([pa.field("a", pa.int64())])
 
-    operation = LanceOperation.overwrite(schema, fragments)
+    operation = LanceOperation.Overwrite(schema, fragments)
     dataset = LanceDataset._commit(tmp_path, operation)
 
     df = dataset.to_table().to_pandas()

@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import os
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -680,7 +682,7 @@ class LanceDataset(pa.dataset.Dataset):
     @staticmethod
     def _commit(
         base_uri: Union[str, Path],
-        operation: LanceOperation,
+        operation: LanceOperation.Overwrite,
         read_version: Optional[int] = None,
         options: Optional[Dict[str, Any]] = None,
     ) -> LanceDataset:
@@ -709,19 +711,17 @@ class LanceDataset(pa.dataset.Dataset):
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
             
-        _Dataset.commit(base_uri, operation, read_version, options)
+        _Dataset.commit(base_uri, operation._to_inner(), read_version, options)
         return LanceDataset(base_uri)
 
 
-class LanceOperation:
-
+class BaseOperation(ABC):
+    @abstractmethod
+    def _to_inner(self):
+        raise NotImplementedError()
+    
     @staticmethod
-    def overwrite(
-        new_schema: pa.Schema,
-        fragments: Iterable[FragmentMetadata],
-    ) -> LanceOperation:
-        if not isinstance(new_schema, pa.Schema):
-            raise TypeError(f"schema must be pyarrow.Schema, got {type(new_schema)}")
+    def _validate_fragments(fragments):
         if not isinstance(fragments, list):
             raise TypeError(
                 f"fragments must be list[FragmentMetadata], got {type(fragments)}"
@@ -731,11 +731,72 @@ class LanceOperation:
         ):
             raise TypeError(
                 f"fragments must be list[FragmentMetadata], got {type(fragments[0])}"
-            )
-        raw_fragments = [f._metadata for f in fragments]
-        # TODO: make fragments as a generator
-        return _Operation.overwrite(new_schema, raw_fragments)
+            )        
+
+
+# LanceOperation is a namespace for operations that can be applied to a dataset.
+class LanceOperation:
+
+    @dataclass
+    class Overwrite(BaseOperation):
+        new_schema: pa.Schema
+        fragments: Iterable[FragmentMetadata]
+
+        def __post_init__(self):
+            if not isinstance(self.new_schema, pa.Schema):
+                raise TypeError(f"schema must be pyarrow.Schema, got {type(self.new_schema)}")
+            BaseOperation._validate_fragments(self.fragments)
+            
+        def _to_inner(self):
+            raw_fragments = [f._metadata for f in self.fragments]
+            # TODO: make fragments as a generator
+            return _Operation.overwrite(self.new_schema, raw_fragments)
+
+    @dataclass
+    class Append(BaseOperation):
+        fragments: Iterable[FragmentMetadata]
+
+        def __post_init__(self):
+            BaseOperation._validate_fragments(self.fragments)
         
+        def _to_inner(self):
+            raw_fragments = [f._metadata for f in self.fragments]
+            return _Operation.append(raw_fragments)
+        
+    @dataclass
+    class Delete(BaseOperation):
+        updated_fragments: Iterable[FragmentMetadata]
+        deleted_fragment_ids: Iterable[int]
+        predicate: str
+
+        def __post_init__(self):
+            BaseOperation._validate_fragments(self.updated_fragments)
+
+        def _to_inner(self):
+            raw_updated_fragments = [f._metadata for f in self.updated_fragments]
+            return _Operation.delete(raw_updated_fragments, self.deleted_fragment_ids, self.predicate)
+
+
+    @dataclass
+    class Rewrite(BaseOperation):
+        old_fragments: Iterable[FragmentMetadata]
+        new_fragments: Iterable[FragmentMetadata]
+
+        def __post_init__(self):
+            BaseOperation._validate_fragments(self.old_fragments)
+            BaseOperation._validate_fragments(self.new_fragments)
+
+        def _to_inner(self):
+            raw_old_fragments = [f._metadata for f in self.old_fragments]
+            raw_new_fragments = [f._metadata for f in self.new_fragments]
+            return _Operation.rewrite(raw_old_fragments, raw_new_fragments)
+        
+    @dataclass
+    class Restore(BaseOperation):
+        version: int
+
+        def _to_inner(self):
+            return _Operation.restore(self.version)
 
 
 class ScannerBuilder:
