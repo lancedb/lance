@@ -60,6 +60,23 @@ pub struct Operation {
     inner: LanceOperation,
 }
 
+fn convert_fragments(fragments: Vec<&PyAny>) -> PyResult<Vec<Fragment>> {
+    fragments
+        .iter()
+        .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
+        .collect::<PyResult<Vec<Fragment>>>()
+}
+
+fn convert_schema(schema: &PyAny) -> PyResult<Schema> {
+    let arrow_schema = ArrowSchema::from_pyarrow(schema)?;
+    Schema::try_from(&arrow_schema).map_err(|e| {
+        PyValueError::new_err(format!(
+            "Failed to convert Arrow schema to Lance schema: {}",
+            e
+        ))
+    })
+}
+
 #[pymethods]
 impl Operation {
     fn __repr__(&self) -> String {
@@ -68,27 +85,15 @@ impl Operation {
 
     #[staticmethod]
     fn overwrite(schema: &PyAny, fragments: Vec<&PyAny>) -> PyResult<Self> {
-        let arrow_schema = ArrowSchema::from_pyarrow(schema)?;
-        let schema = Schema::try_from(&arrow_schema).map_err(|e| {
-            PyValueError::new_err(format!(
-                "Failed to convert Arrow schema to Lance schema: {}",
-                e
-            ))
-        })?;
-        let fragments = fragments
-            .iter()
-            .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
-            .collect::<PyResult<Vec<Fragment>>>()?;
+        let schema = convert_schema(schema)?;
+        let fragments = convert_fragments(fragments)?;
         let op = LanceOperation::Overwrite { fragments, schema };
         Ok(Self { inner: op })
     }
 
     #[staticmethod]
     fn append(fragments: Vec<&PyAny>) -> PyResult<Self> {
-        let fragments = fragments
-            .iter()
-            .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
-            .collect::<PyResult<Vec<Fragment>>>()?;
+        let fragments = convert_fragments(fragments)?;
         let op = LanceOperation::Append { fragments };
         Ok(Self { inner: op })
     }
@@ -99,10 +104,7 @@ impl Operation {
         deleted_fragment_ids: Vec<u64>,
         predicate: String,
     ) -> PyResult<Self> {
-        let updated_fragments = updated_fragments
-            .iter()
-            .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
-            .collect::<PyResult<Vec<Fragment>>>()?;
+        let updated_fragments = convert_fragments(updated_fragments)?;
         let op = LanceOperation::Delete {
             updated_fragments,
             deleted_fragment_ids,
@@ -113,18 +115,20 @@ impl Operation {
 
     #[staticmethod]
     fn rewrite(old_fragments: Vec<&PyAny>, new_fragments: Vec<&PyAny>) -> PyResult<Self> {
-        let old_fragments = old_fragments
-            .iter()
-            .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
-            .collect::<PyResult<Vec<Fragment>>>()?;
-        let new_fragments = new_fragments
-            .iter()
-            .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
-            .collect::<PyResult<Vec<Fragment>>>()?;
+        let old_fragments = convert_fragments(old_fragments)?;
+        let new_fragments = convert_fragments(new_fragments)?;
         let op = LanceOperation::Rewrite {
             old_fragments,
             new_fragments,
         };
+        Ok(Self { inner: op })
+    }
+
+    #[staticmethod]
+    fn merge(fragments: Vec<&PyAny>, schema: &PyAny) -> PyResult<Self> {
+        let schema = convert_schema(schema)?;
+        let fragments = convert_fragments(fragments)?;
+        let op = LanceOperation::Merge { fragments, schema };
         Ok(Self { inner: op })
     }
 

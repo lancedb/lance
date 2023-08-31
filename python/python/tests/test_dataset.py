@@ -461,6 +461,23 @@ def test_restore_with_commit(tmp_path: Path):
     assert tbl == table
 
 
+def test_merge_with_commit(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    lance.write_dataset(table, base_dir)
+
+    fragment = lance.dataset(base_dir).get_fragments()[0]
+    merged = fragment.add_columns(lambda _: pa.RecordBatch.from_pydict({"c": range(100)}))
+
+    expected = pa.Table.from_pydict({"a": range(100), "b": range(100), "c": range(100)})
+
+    merge = lance.LanceOperation.Merge([merged], expected.schema)
+    dataset = lance.LanceDataset._commit(base_dir, merge, read_version=1)
+
+    tbl = dataset.to_table()
+    assert tbl == expected
+
 def test_data_files(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

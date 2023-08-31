@@ -792,6 +792,19 @@ class LanceOperation:
             return _Operation.rewrite(raw_old_fragments, raw_new_fragments)
         
     @dataclass
+    class Merge(BaseOperation):
+        fragments: Iterable[FragmentMetadata]
+        schema: pa.Schema
+
+        def __post_init__(self):
+            BaseOperation._validate_fragments(self.fragments)
+
+        def _to_inner(self):
+            raw_fragments = [f._metadata for f in self.fragments]
+            return _Operation.merge(raw_fragments, self.schema)
+
+
+    @dataclass
     class Restore(BaseOperation):
         version: int
 
