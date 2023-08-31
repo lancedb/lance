@@ -83,10 +83,8 @@ impl Dataset {
 
         if let Some(commit_handler) = commit_handler {
             let py_commit_lock = PyCommitLock::new(commit_handler);
-            let object_store_params = ObjectStoreParams {
-                commit_handler: Some(Arc::new(py_commit_lock)),
-                ..Default::default()
-            };
+            let mut object_store_params = ObjectStoreParams::default();
+            object_store_params.set_commit_lock(Arc::new(py_commit_lock));
             params.store_options = Some(object_store_params);
         }
         let dataset = if let Some(ver) = version {
@@ -584,10 +582,8 @@ pub(crate) fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>
 
         if let Some(commit_handler) = options.get_item("commit_handler") {
             let py_commit_lock = PyCommitLock::new(commit_handler.to_object(options.py()));
-            let object_store_params = ObjectStoreParams {
-                commit_handler: Some(Arc::new(py_commit_lock)),
-                ..Default::default()
-            };
+            let mut object_store_params = ObjectStoreParams::default();
+            object_store_params.set_commit_lock(Arc::new(py_commit_lock));
             p.store_params = Some(object_store_params);
         }
 

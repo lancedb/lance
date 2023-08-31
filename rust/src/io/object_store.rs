@@ -42,7 +42,7 @@ use crate::error::{Error, Result};
 use crate::io::object_reader::CloudObjectReader;
 use crate::io::object_writer::ObjectWriter;
 
-use super::commit::{CommitHandler, RenameCommitHandler, UnsafeCommitHandler};
+use super::commit::{CommitHandler, CommitLock, RenameCommitHandler, UnsafeCommitHandler};
 use super::local::LocalObjectReader;
 use super::object_reader::ObjectReader;
 
@@ -66,7 +66,7 @@ pub struct ObjectStore {
     scheme: String,
     base_path: Path,
     block_size: usize,
-    pub commit_handler: Arc<dyn CommitHandler>,
+    pub(crate) commit_handler: Arc<dyn CommitHandler>,
 }
 
 impl std::fmt::Display for ObjectStore {
@@ -224,8 +224,7 @@ pub struct ObjectStoreParams {
     pub aws_credentials: Option<Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>>,
     pub aws_region: Option<String>,
 
-    /// Custom commit handler
-    pub commit_handler: Option<Arc<dyn CommitHandler>>,
+    pub(crate) commit_handler: Option<Arc<dyn CommitHandler>>,
 }
 
 // Need this for setting a non-zero default duration
@@ -238,6 +237,13 @@ impl Default for ObjectStoreParams {
             commit_handler: None,
             aws_region: None,
         }
+    }
+}
+
+impl ObjectStoreParams {
+    /// Set a commit lock for the object store.
+    pub fn set_commit_lock<T: CommitLock + Send + Sync + 'static>(&mut self, lock: Arc<T>) {
+        self.commit_handler = Some(Arc::new(lock));
     }
 }
 

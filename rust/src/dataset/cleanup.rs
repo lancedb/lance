@@ -124,9 +124,9 @@ impl<'a> CleanupTask<'a> {
     async fn process_manifests(&self) -> Result<()> {
         self.dataset
             .object_store
-            .read_dir_all(&self.dataset.versions_dir(), None)
+            .commit_handler
+            .list_manifests(&self.dataset.base, &self.dataset.object_store)
             .await?
-            .try_filter(|path| future::ready(path.extension() == Some("manifest")))
             .try_for_each_concurrent(num_cpus::get(), |path| async move {
                 self.process_manifest_file(&path).await
             })
