@@ -110,9 +110,8 @@ impl Manifest {
     pub fn timestamp(&self) -> DateTime<Utc> {
         let nanos = self.timestamp_nanos % 1_000_000_000;
         let seconds = ((self.timestamp_nanos - nanos) / 1_000_000_000) as i64;
-        DateTime::<Utc>::from_utc(
-            NaiveDateTime::from_timestamp_opt(seconds, nanos as u32).unwrap_or(NaiveDateTime::MIN),
-            Utc,
+        Utc.from_utc_datetime(
+            &NaiveDateTime::from_timestamp_opt(seconds, nanos as u32).unwrap_or(NaiveDateTime::MIN),
         )
     }
 
