@@ -180,7 +180,7 @@ impl Dataset {
 
     /// Open a dataset with read params.
     pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
-        let (mut object_store, base_path) = match params.store_options.clone() {
+        let (mut object_store, base_path) = match params.store_options.as_ref() {
             Some(store_options) => ObjectStore::from_uri_and_params(uri, store_options).await?,
             None => ObjectStore::from_uri(uri).await?,
         };
@@ -321,7 +321,7 @@ impl Dataset {
         let mut params = params.unwrap_or_default();
 
         let (object_store, base) =
-            ObjectStore::from_uri_and_params(uri, params.store_params.clone().unwrap_or_default())
+            ObjectStore::from_uri_and_params(uri, &params.store_params.clone().unwrap_or_default())
                 .await?;
 
         // Read expected manifest path for the dataset

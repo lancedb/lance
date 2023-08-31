@@ -603,7 +603,7 @@ mod tests {
 
         async fn count_files(&self) -> Result<FileCounts> {
             let (os, path) =
-                ObjectStore::from_uri_and_params(&self.dataset_path, self.os_params()).await?;
+                ObjectStore::from_uri_and_params(&self.dataset_path, &self.os_params()).await?;
             let mut file_stream = os.read_dir_all(&path, None).await?;
             let mut file_count = FileCounts {
                 num_data_files: 0,
