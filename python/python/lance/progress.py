@@ -117,6 +117,8 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
 
     """
 
+    PROGRESS_EXT: str = ".in_progress"
+
     def __init__(self, base_uri: str, metadata: Optional[Dict[str, str]] = None):
         """Create a FileSystemFragmentWriteProgress tracker.
 
@@ -137,7 +139,9 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
         self._metadata = metadata if metadata else {}
 
     def _in_progress_path(self, fragment: "FragmentMetadata") -> str:
-        return os.path.join(self._base_path, f"fragment_{fragment.id}.in_progress")
+        return os.path.join(
+            self._base_path, f"fragment_{fragment.id}{self.PROGRESS_EXT}"
+        )
 
     def _fragment_file(self, fragment: "FragmentMetadata") -> str:
         return os.path.join(self._base_path, f"fragment_{fragment.id}.json")
@@ -196,12 +200,12 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
         selector = FileSelector(self._base_path)
         for info in self._fs.get_file_info(selector):
             path = info.path
-            if path.endswith(".in_progress"):
+            if path.endswith(self.PROGRESS_EXT):
                 marker_paths.append(path)
                 with self._fs.open_input_stream(path) as f:
                     progress_data = json.loads(f.read().decode("utf-8"))
 
-                json_path = path.rstrip(".in_progress") + ".json"
+                json_path = path.rstrip(self.PROGRESS_EXT) + ".json"
                 with self._fs.open_input_stream(json_path) as f:
                     fragment_metadata = FragmentMetadata.from_json(
                         f.read().decode("utf-8")
@@ -217,7 +221,7 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
 
         for path in marker_paths:
             self._fs.delete_file(path)
-            json_path = path.rstrip(".in_progress") + ".json"
+            json_path = path.rstrip(self.PROGRESS_EXT) + ".json"
             self._fs.delete_file(json_path)
 
         return len(objects)
