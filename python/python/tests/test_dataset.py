@@ -157,17 +157,19 @@ def test_asof_checkout(tmp_path: Path):
 
     lance.write_dataset(table, base_dir)
     assert len(lance.dataset(base_dir).versions()) == 1
-    time.sleep(0.01)
+    time.sleep(0.1)
     ts_1 = datetime.now()
-    time.sleep(0.01)
+    time.sleep(0.1)
 
     lance.write_dataset(table, base_dir, mode="append")
     assert len(lance.dataset(base_dir).versions()) == 2
+    time.sleep(0.1)
     ts_2 = datetime.now()
-    time.sleep(0.01)
+    time.sleep(0.1)
 
     lance.write_dataset(table, base_dir, mode="append")
     assert len(lance.dataset(base_dir).versions()) == 3
+    time.sleep(0.1)
     ts_3 = datetime.now()
 
     # check that only the first batch is present
