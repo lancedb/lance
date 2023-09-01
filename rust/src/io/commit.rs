@@ -37,6 +37,8 @@ use std::future;
 use std::sync::Arc;
 use std::{fmt::Debug, sync::atomic::AtomicBool};
 
+pub(crate) mod external_manifest;
+
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig};
 use crate::Dataset;
