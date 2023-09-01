@@ -642,15 +642,13 @@ fn parse_write_mode(mode: &str) -> PyResult<WriteMode> {
 pub(crate) fn get_object_store_params(options: &PyDict) -> Option<ObjectStoreParams> {
     if options.is_none() {
         None
+    } else if let Some(commit_handler) = options.get_item("commit_handler") {
+        let py_commit_lock = PyCommitLock::new(commit_handler.to_object(options.py()));
+        let mut object_store_params = ObjectStoreParams::default();
+        object_store_params.set_commit_lock(Arc::new(py_commit_lock));
+        Some(object_store_params)
     } else {
-        if let Some(commit_handler) = options.get_item("commit_handler") {
-            let py_commit_lock = PyCommitLock::new(commit_handler.to_object(options.py()));
-            let mut object_store_params = ObjectStoreParams::default();
-            object_store_params.set_commit_lock(Arc::new(py_commit_lock));
-            Some(object_store_params)
-        } else {
-            None
-        }
+        None
     }
 }
 
