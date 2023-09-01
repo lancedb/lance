@@ -440,7 +440,7 @@ def test_rewrite_with_commit(tmp_path: Path):
     lance.write_dataset(table, base_dir)
     lance.write_dataset(table, base_dir, mode="append")
 
-    combined = expected = pa.Table.from_pydict(
+    combined = pa.Table.from_pydict(
         {
             "a": list(range(100)) + list(range(100)),
             "b": list(range(100)) + list(range(100)),
