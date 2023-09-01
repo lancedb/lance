@@ -710,7 +710,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
-            
+
         _Dataset.commit(base_uri, operation._to_inner(), read_version, options)
         return LanceDataset(base_uri)
 
@@ -719,7 +719,7 @@ class BaseOperation(ABC):
     @abstractmethod
     def _to_inner(self):
         raise NotImplementedError()
-    
+
     @staticmethod
     def _validate_fragments(fragments):
         if not isinstance(fragments, list):
@@ -731,12 +731,11 @@ class BaseOperation(ABC):
         ):
             raise TypeError(
                 f"fragments must be list[FragmentMetadata], got {type(fragments[0])}"
-            )        
+            )
 
 
 # LanceOperation is a namespace for operations that can be applied to a dataset.
 class LanceOperation:
-
     @dataclass
     class Overwrite(BaseOperation):
         new_schema: pa.Schema
@@ -744,9 +743,11 @@ class LanceOperation:
 
         def __post_init__(self):
             if not isinstance(self.new_schema, pa.Schema):
-                raise TypeError(f"schema must be pyarrow.Schema, got {type(self.new_schema)}")
+                raise TypeError(
+                    f"schema must be pyarrow.Schema, got {type(self.new_schema)}"
+                )
             BaseOperation._validate_fragments(self.fragments)
-            
+
         def _to_inner(self):
             raw_fragments = [f._metadata for f in self.fragments]
             # TODO: make fragments as a generator
@@ -758,11 +759,11 @@ class LanceOperation:
 
         def __post_init__(self):
             BaseOperation._validate_fragments(self.fragments)
-        
+
         def _to_inner(self):
             raw_fragments = [f._metadata for f in self.fragments]
             return _Operation.append(raw_fragments)
-        
+
     @dataclass
     class Delete(BaseOperation):
         updated_fragments: Iterable[FragmentMetadata]
@@ -774,8 +775,9 @@ class LanceOperation:
 
         def _to_inner(self):
             raw_updated_fragments = [f._metadata for f in self.updated_fragments]
-            return _Operation.delete(raw_updated_fragments, self.deleted_fragment_ids, self.predicate)
-
+            return _Operation.delete(
+                raw_updated_fragments, self.deleted_fragment_ids, self.predicate
+            )
 
     @dataclass
     class Rewrite(BaseOperation):
@@ -790,7 +792,7 @@ class LanceOperation:
             raw_old_fragments = [f._metadata for f in self.old_fragments]
             raw_new_fragments = [f._metadata for f in self.new_fragments]
             return _Operation.rewrite(raw_old_fragments, raw_new_fragments)
-        
+
     @dataclass
     class Merge(BaseOperation):
         fragments: Iterable[FragmentMetadata]
@@ -802,7 +804,6 @@ class LanceOperation:
         def _to_inner(self):
             raw_fragments = [f._metadata for f in self.fragments]
             return _Operation.merge(raw_fragments, self.schema)
-
 
     @dataclass
     class Restore(BaseOperation):
