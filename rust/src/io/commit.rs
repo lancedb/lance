@@ -33,19 +33,23 @@
 //! terms of a lock. The trait [CommitLock] can be implemented as a simpler
 //! alternative to [CommitHandler].
 
+use std::future;
+use std::sync::Arc;
 use std::{fmt::Debug, sync::atomic::AtomicBool};
 
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::{latest_manifest_path, write_manifest_file, ManifestWriteConfig};
+use crate::dataset::{write_manifest_file, ManifestWriteConfig};
 use crate::Dataset;
 use crate::Result;
 use crate::{format::pb, format::Index, format::Manifest};
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::Error as ObjectStoreError;
 use prost::Message;
 
-use super::{read_manifest, ObjectStore};
+use super::ObjectStore;
 
 /// Function that writes the manifest to the object store.
 pub type ManifestWriter = for<'a> fn(
@@ -55,27 +59,90 @@ pub type ManifestWriter = for<'a> fn(
     path: &'a Path,
 ) -> BoxFuture<'a, Result<()>>;
 
+const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
+const VERSIONS_DIR: &str = "_versions";
+
+/// Get the manifest file path for a version.
+fn manifest_path(base: &Path, version: u64) -> Path {
+    base.child(VERSIONS_DIR)
+        .child(format!("{version}.manifest"))
+}
+
+/// Get the latest manifest path
+fn latest_manifest_path(base: &Path) -> Path {
+    base.child(LATEST_MANIFEST_NAME)
+}
+
+async fn list_manifests<'a>(
+    base_path: &Path,
+    object_store: &'a ObjectStore,
+) -> Result<BoxStream<'a, Result<Path>>> {
+    let base_path = base_path.clone();
+    Ok(object_store
+        .read_dir_all(&base_path.child(VERSIONS_DIR), None)
+        .await?
+        .try_filter(|path| future::ready(path.extension() == Some("manifest")))
+        .boxed())
+}
+
+async fn write_latest_manifest(
+    commit_handler: &dyn CommitHandler,
+    from_path: &Path,
+    base_path: &Path,
+    object_store: &ObjectStore,
+) -> Result<()> {
+    let latest_path = commit_handler
+        .resolve_latest_version(base_path, object_store)
+        .await?;
+    // Then, create a copy at the latest manifest path
+    object_store
+        .inner
+        .copy(from_path, &latest_path)
+        .await
+        .map_err(|err| CommitError::OtherError(err.into()))?;
+    Ok(())
+}
+
 /// Handle commits that prevent conflicting writes.
 ///
 /// Commit implementations ensure that if there are multiple concurrent writers
 /// attempting to write the next version of a table, only one will win. In order
 /// to work, all writers must use the same commit handler type.
+/// This trait is also responsible for resolving where the manifests live.
 #[async_trait::async_trait]
-pub trait CommitHandler: Debug + Send + Sync {
-    /// Get the latest version of a dataset at the path
-    async fn get_latest_version(
+pub(crate) trait CommitHandler: Debug + Send + Sync {
+    /// Get the path to the latest version manifest of a dataset at the base_path
+    async fn resolve_latest_version(
         &self,
-        path: &Path,
-        object_store: &ObjectStore,
-    ) -> std::result::Result<u64, crate::Error> {
+        base_path: &Path,
+        _object_store: &ObjectStore,
+    ) -> std::result::Result<Path, crate::Error> {
         // use the _latest.manifest file to get the latest version
         // TODO: this isn't 100% safe, we should list the /_versions directory and find the latest version
         // TODO: we need to pade 0's to the version number on the manifest file path
-        read_manifest(object_store, &latest_manifest_path(path))
-            .await
-            .map(|m| m.version)
+        Ok(latest_manifest_path(base_path))
     }
-    /// Commit a manifest to a path.
+
+    /// Get the path to a specific versioned manifest of a dataset at the base_path
+    async fn resolve_version(
+        &self,
+        base_path: &Path,
+        version: u64,
+        _object_store: &ObjectStore,
+    ) -> std::result::Result<Path, crate::Error> {
+        Ok(manifest_path(base_path, version))
+    }
+
+    /// List manifests that are available for a dataset at the base_path
+    async fn list_manifests<'a>(
+        &self,
+        base_path: &Path,
+        object_store: &'a ObjectStore,
+    ) -> Result<BoxStream<'a, Result<Path>>> {
+        list_manifests(base_path, object_store).await
+    }
+
+    /// Commit a manifest.
     ///
     /// This function should return an [CommitError::CommitConflict] if another
     /// transaction has already been committed to the path.
@@ -83,7 +150,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         &self,
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
-        path: &Path,
+        base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError>;
@@ -129,7 +196,7 @@ impl CommitHandler for UnsafeCommitHandler {
         &self,
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
-        path: &Path,
+        base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError> {
@@ -142,8 +209,13 @@ impl CommitHandler for UnsafeCommitHandler {
             );
         }
 
+        let version_path = self
+            .resolve_version(base_path, manifest.version, object_store)
+            .await?;
         // Write the manifest naively
-        manifest_writer(object_store, manifest, indices, path).await?;
+        manifest_writer(object_store, manifest, indices, &version_path).await?;
+
+        write_latest_manifest(self, &version_path, base_path, object_store).await?;
 
         Ok(())
     }
@@ -166,12 +238,16 @@ impl CommitHandler for RenameCommitHandler {
         &self,
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
-        path: &Path,
+        base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError> {
         // Create a temporary object, then use `rename_if_not_exists` to commit.
         // If failed, clean up the temporary object.
+
+        let path = self
+            .resolve_version(base_path, manifest.version, object_store)
+            .await?;
 
         // Add .tmp_ prefix to the path
         let mut parts: Vec<_> = path.parts().collect();
@@ -188,9 +264,9 @@ impl CommitHandler for RenameCommitHandler {
         // Write the manifest to the temporary path
         manifest_writer(object_store, manifest, indices, &tmp_path).await?;
 
-        match object_store
+        let res = match object_store
             .inner
-            .rename_if_not_exists(&tmp_path, path)
+            .rename_if_not_exists(&tmp_path, &path)
             .await
         {
             Ok(_) => Ok(()),
@@ -205,7 +281,11 @@ impl CommitHandler for RenameCommitHandler {
                 // Something else went wrong
                 return Err(CommitError::OtherError(e.into()));
             }
-        }
+        };
+
+        write_latest_manifest(self, &path, base_path, object_store).await?;
+
+        res
     }
 }
 
@@ -217,7 +297,7 @@ impl Debug for RenameCommitHandler {
 
 /// A commit implementation that uses a lock to prevent conflicting writes.
 #[async_trait::async_trait]
-pub trait CommitLock {
+pub trait CommitLock: Debug {
     type Lease: CommitLease;
 
     /// Attempt to lock the table for the given version.
@@ -242,21 +322,24 @@ pub trait CommitLease: Send + Sync {
 }
 
 #[async_trait::async_trait]
-impl<T: CommitLock + Send + Sync + Debug> CommitHandler for T {
+impl<T: CommitLock + Send + Sync> CommitHandler for T {
     async fn commit(
         &self,
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
-        path: &Path,
+        base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError> {
+        let path = self
+            .resolve_version(base_path, manifest.version, object_store)
+            .await?;
         // NOTE: once we have the lease we cannot use ? to return errors, since
         // we must release the lease before returning.
         let lease = self.lock(manifest.version).await?;
 
         // Head the location and make sure it's not already committed
-        match object_store.inner.head(path).await {
+        match object_store.inner.head(&path).await {
             Ok(_) => {
                 // The path already exists, so it's already committed
                 // Release the lock
@@ -273,12 +356,30 @@ impl<T: CommitLock + Send + Sync + Debug> CommitHandler for T {
                 return Err(CommitError::OtherError(e.into()));
             }
         }
-        let res = manifest_writer(object_store, manifest, indices, path).await;
+        let res = manifest_writer(object_store, manifest, indices, &path).await;
+
+        write_latest_manifest(self, &path, base_path, object_store).await?;
 
         // Release the lock
         lease.release(res.is_ok()).await?;
 
         res.map_err(|err| err.into())
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
+    async fn commit(
+        &self,
+        manifest: &mut Manifest,
+        indices: Option<Vec<Index>>,
+        base_path: &Path,
+        object_store: &ObjectStore,
+        manifest_writer: ManifestWriter,
+    ) -> std::result::Result<(), CommitError> {
+        self.as_ref()
+            .commit(manifest, indices, base_path, object_store, manifest_writer)
+            .await
     }
 }
 

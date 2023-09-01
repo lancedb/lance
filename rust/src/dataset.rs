@@ -64,8 +64,6 @@ use hash_joiner::HashJoiner;
 pub use scanner::ROW_ID;
 pub use write::{WriteMode, WriteParams};
 
-const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
-const VERSIONS_DIR: &str = "_versions";
 const INDICES_DIR: &str = "_indices";
 pub(crate) const DELETION_DIRS: &str = "_deletions";
 const DATA_DIR: &str = "data";
@@ -103,17 +101,6 @@ impl From<&Manifest> for Version {
             metadata: BTreeMap::default(),
         }
     }
-}
-
-/// Get the manifest file path for a version.
-pub(crate) fn manifest_path(base: &Path, version: u64) -> Path {
-    base.child(VERSIONS_DIR)
-        .child(format!("{version}.manifest"))
-}
-
-/// Get the latest manifest path
-pub(crate) fn latest_manifest_path(base: &Path) -> Path {
-    base.child(LATEST_MANIFEST_NAME)
 }
 
 /// Customize read behavior of a dataset.
@@ -189,9 +176,9 @@ impl Dataset {
             object_store.set_block_size(block_size);
         }
 
-        let lateset_version = object_store
+        let latest_manifest = object_store
             .commit_handler
-            .get_latest_version(&base_path, &object_store)
+            .resolve_latest_version(&base_path, &object_store)
             .await
             .map_err(|e| Error::DatasetNotFound {
                 path: base_path.to_string(),
@@ -210,7 +197,7 @@ impl Dataset {
         Self::checkout_manifest(
             Arc::new(object_store),
             base_path.clone(),
-            &manifest_path(&base_path, lateset_version),
+            &latest_manifest,
             session,
         )
         .await
@@ -233,7 +220,11 @@ impl Dataset {
             object_store.set_block_size(block_size);
         };
 
-        let manifest_file = manifest_path(&base_path, version);
+        let manifest_file = object_store
+            .commit_handler
+            .resolve_version(&base_path, version, &object_store)
+            .await?;
+
         let session = if let Some(session) = params.session.as_ref() {
             session.clone()
         } else {
@@ -248,7 +239,11 @@ impl Dataset {
     /// Check out the specified version of this dataset
     pub async fn checkout_version(&self, version: u64) -> Result<Self> {
         let base_path = self.base.clone();
-        let manifest_file = manifest_path(&base_path, version);
+        let manifest_file = self
+            .object_store
+            .commit_handler
+            .resolve_version(&base_path, version, &self.object_store)
+            .await?;
         Self::checkout_manifest(
             self.object_store.clone(),
             base_path,
@@ -325,7 +320,10 @@ impl Dataset {
                 .await?;
 
         // Read expected manifest path for the dataset
-        let latest_manifest_path = latest_manifest_path(&base);
+        let latest_manifest_path = object_store
+            .commit_handler
+            .resolve_latest_version(&base, &object_store)
+            .await?;
         let flag_dataset_exists = object_store.exists(&latest_manifest_path).await?;
 
         let (stream, schema) = reader_to_stream(batches)?;
@@ -513,7 +511,15 @@ impl Dataset {
     }
 
     async fn latest_manifest(&self) -> Result<Manifest> {
-        read_manifest(&self.object_store, &latest_manifest_path(&self.base)).await
+        read_manifest(
+            &self.object_store,
+            &self
+                .object_store
+                .commit_handler
+                .resolve_latest_version(&self.base, &self.object_store)
+                .await?,
+        )
+        .await
     }
 
     /// Restore the currently checked out version of the dataset as the latest version.
@@ -561,7 +567,10 @@ impl Dataset {
         mode: WriteMode,
     ) -> Result<Self> {
         let (object_store, base) = ObjectStore::from_uri(base_uri).await?;
-        let latest_manifest = latest_manifest_path(&base);
+        let latest_manifest = object_store
+            .commit_handler
+            .resolve_latest_version(&base, &object_store)
+            .await?;
         let mut indices = vec![];
         let mut manifest = if object_store.exists(&latest_manifest).await? {
             let dataset = Self::open(base_uri).await?;
@@ -888,12 +897,11 @@ impl Dataset {
         &self.object_store
     }
 
-    fn versions_dir(&self) -> Path {
-        self.base.child(VERSIONS_DIR)
-    }
-
-    fn manifest_file(&self, version: u64) -> Path {
-        self.versions_dir().child(format!("{version}.manifest"))
+    async fn manifest_file(&self, version: u64) -> Result<Path> {
+        self.object_store
+            .commit_handler
+            .resolve_version(&self.base, version, &self.object_store)
+            .await
     }
 
     pub(crate) fn data_dir(&self) -> Path {
@@ -910,22 +918,23 @@ impl Dataset {
 
     /// Get all versions.
     pub async fn versions(&self) -> Result<Vec<Version>> {
-        let paths: Vec<Path> = self
+        let mut versions: Vec<Version> = self
             .object_store
-            .inner
-            .list_with_delimiter(Some(&self.versions_dir()))
+            .commit_handler
+            .list_manifests(&self.base, &self.object_store)
             .await?
-            .objects
-            .iter()
-            .filter(|&obj| obj.location.as_ref().ends_with(".manifest"))
-            .map(|o| o.location.clone())
-            .collect();
-        let mut versions = vec![];
-        for path in paths.iter() {
-            let manifest = read_manifest(&self.object_store, path).await?;
-            versions.push(Version::from(&manifest));
-        }
+            .try_filter_map(|path| async move {
+                match read_manifest(&self.object_store, &path).await {
+                    Ok(manifest) => Ok(Some(Version::from(&manifest))),
+                    Err(e) => Err(e),
+                }
+            })
+            .try_collect()
+            .await?;
+
+        // TODO: this API should support pagination
         versions.sort_by_key(|v| v.version);
+
         Ok(versions)
     }
 
@@ -961,7 +970,7 @@ impl Dataset {
 
     /// Read all indices of this Dataset version.
     pub async fn load_indices(&self) -> Result<Vec<Index>> {
-        let manifest_file = self.manifest_file(self.version().version);
+        let manifest_file = self.manifest_file(self.version().version).await?;
         read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest).await
     }
 
@@ -1050,25 +1059,16 @@ pub(crate) async fn write_manifest_file(
 
     manifest.update_max_fragment_id();
 
-    // First, commit the new manifest file.
-    let path = manifest_path(base_path, manifest.version);
     object_store
         .commit_handler
         .commit(
             manifest,
             indices,
-            &path,
+            base_path,
             object_store,
             write_manifest_file_to_path,
         )
         .await?;
-
-    // Then, create a copy at the latest manifest path
-    object_store
-        .inner
-        .copy(&path, &latest_manifest_path(base_path))
-        .await
-        .map_err(|err| CommitError::OtherError(err.into()))?;
 
     Ok(())
 }
@@ -1353,9 +1353,17 @@ mod tests {
         let mut dataset = write_fut.await.unwrap();
 
         // Check it has no flags
-        let manifest = read_manifest(dataset.object_store(), &latest_manifest_path(&dataset.base))
-            .await
-            .unwrap();
+        let manifest = read_manifest(
+            dataset.object_store(),
+            &dataset
+                .object_store()
+                .commit_handler
+                .resolve_latest_version(&dataset.base, dataset.object_store())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(manifest.writer_feature_flags, 0);
         assert_eq!(manifest.reader_feature_flags, 0);
 
@@ -1364,10 +1372,17 @@ mod tests {
         dataset.validate().await.unwrap();
 
         // Check it set the flag
-        let mut manifest =
-            read_manifest(dataset.object_store(), &latest_manifest_path(&dataset.base))
+        let mut manifest = read_manifest(
+            dataset.object_store(),
+            &dataset
+                .object_store()
+                .commit_handler
+                .resolve_latest_version(&dataset.base, dataset.object_store())
                 .await
-                .unwrap();
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             manifest.writer_feature_flags,
             feature_flags::FLAG_DELETION_FILES

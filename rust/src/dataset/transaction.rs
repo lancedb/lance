@@ -59,7 +59,7 @@ use crate::{
     io::{read_manifest, reader::read_manifest_indexes, ObjectStore},
 };
 
-use super::{feature_flags::apply_feature_flags, manifest_path, ManifestWriteConfig};
+use super::{feature_flags::apply_feature_flags, ManifestWriteConfig};
 use crate::{Error, Result};
 
 /// A change to a dataset that can be retried
@@ -265,7 +265,10 @@ impl Transaction {
         config: &ManifestWriteConfig,
         tx_path: &str,
     ) -> Result<(Manifest, Vec<Index>)> {
-        let path = manifest_path(base_path, version);
+        let path = object_store
+            .commit_handler
+            .resolve_version(base_path, version, object_store)
+            .await?;
         let mut manifest = read_manifest(object_store, &path).await?;
         manifest.set_timestamp(config.timestamp);
         manifest.transaction_file = Some(tx_path.to_string());
