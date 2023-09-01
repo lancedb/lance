@@ -375,7 +375,10 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["limit"] = num_rows
         return self.scanner(**kwargs).to_table()
 
-    def count_rows(self, **kwargs):
+    def count_rows(self,
+        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        **kwargs) -> int:
+
         """Count rows matching the scanner filter.
 
         Parameters
@@ -389,7 +392,10 @@ class LanceDataset(pa.dataset.Dataset):
             The total number of rows in the dataset.
 
         """
-        return self._ds.count_rows()
+        if filter is None:
+            return self._ds.count_rows()
+        else:
+            return self.scanner(filter=filter).count_rows()
 
     def join(
         self,
@@ -953,7 +959,7 @@ class LanceScanner(pa.dataset.Scanner):
         count : int
 
         """
-        return self._ds.count_rows()
+        return self._scanner.count_rows()
 
 
 def write_dataset(

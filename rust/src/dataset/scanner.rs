@@ -372,7 +372,7 @@ impl Scanner {
     }
 
     /// Scan and return the number of matching rows
-    pub async fn count_rows(&self) -> Result<usize> {
+    pub async fn count_rows(&self) -> Result<u64> {
         let plan = self.create_plan().await?;
         // Datafusion interprets COUNT(*) as COUNT(1)
         let one = Arc::new(Literal::new(ScalarValue::UInt8(Some(1))));
@@ -399,7 +399,6 @@ impl Scanner {
         // A count plan will always return a single batch with a single row.
         if let Some(first_batch) = stream.next().await {
             let batch = first_batch?;
-            dbg!(&batch);
             let array = batch
                 .column(0)
                 .as_any()
@@ -407,7 +406,7 @@ impl Scanner {
                 .ok_or(Error::IO {
                     message: "Count plan did not return a UInt64Array".to_string(),
                 })?;
-            Ok(array.value(0) as usize)
+            Ok(array.value(0) as u64)
         } else {
             Ok(0)
         }
