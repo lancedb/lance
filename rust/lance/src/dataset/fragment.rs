@@ -851,7 +851,7 @@ mod tests {
             fragments,
         };
 
-        let new_dataset = Dataset::commit(test_uri, None, op, None).await.unwrap();
+        let new_dataset = Dataset::commit(test_uri, op, None, None).await.unwrap();
 
         assert_eq!(new_dataset.count_rows().await.unwrap(), dataset_rows);
     }
@@ -923,7 +923,7 @@ mod tests {
                 schema: full_schema.clone(),
             };
 
-            let dataset = Dataset::commit(test_uri, None, op, None).await.unwrap();
+            let dataset = Dataset::commit(test_uri, op, None, None).await.unwrap();
 
             // We only kept the first fragment of 40 rows
             assert_eq!(
