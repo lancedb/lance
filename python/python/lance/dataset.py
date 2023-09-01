@@ -375,10 +375,9 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["limit"] = num_rows
         return self.scanner(**kwargs).to_table()
 
-    def count_rows(self,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
-        **kwargs) -> int:
-
+    def count_rows(
+        self, filter: Optional[Union[str, pa.compute.Expression]] = None, **kwargs
+    ) -> int:
         """Count rows matching the scanner filter.
 
         Parameters

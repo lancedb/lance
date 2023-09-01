@@ -549,6 +549,7 @@ def test_scan_with_batch_size(tmp_path: Path):
         df = batch.to_pandas()
         assert df["a"].iloc[0] == idx * 16
 
+
 def test_scan_count_rows(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     df = pd.DataFrame({"a": range(42), "b": range(42)})
