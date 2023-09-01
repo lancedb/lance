@@ -66,7 +66,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
 /// for detailed design, see https://github.com/lancedb/lance/issues/1183
 #[derive(Debug)]
 pub struct ExternalManifestCommitHandler {
-    external_manifest_store: Arc<dyn ExternalManifestStore>,
+    pub external_manifest_store: Arc<dyn ExternalManifestStore>,
 }
 
 #[async_trait]

@@ -4,5 +4,7 @@
     ],
     "rust-analyzer.cargo.features": [
         "clap",
+        "dynamodb",
+        "dynamodb_tests",
     ]
 }
