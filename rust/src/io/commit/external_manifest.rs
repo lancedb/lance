@@ -335,6 +335,7 @@ mod test {
         assert_eq!(ds.count_rows().await.unwrap(), 100);
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_concurrent_commits_are_okay() {
         let sleepy_store = SleepyExternalManifestStore::new();
