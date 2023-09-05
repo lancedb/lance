@@ -26,6 +26,7 @@ use crate::encodings::Decoder;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
+use crate::Error;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageInfo {
@@ -81,14 +82,20 @@ impl PageTable {
     }
 
     pub async fn write(&self, writer: &mut ObjectWriter) -> Result<usize> {
+        if self.pages.is_empty() {
+            return Err(Error::InvalidInput {
+                source: "empty page table".into(),
+            });
+        }
+
         let pos = writer.tell();
-        let num_columns = self.pages.keys().max().unwrap_or(&-1) + 1;
+        let num_columns = self.pages.keys().max().unwrap() + 1;
         let num_batches = self
             .pages
             .values()
             .flat_map(|c_map| c_map.keys().max())
             .max()
-            .unwrap_or(&-1)
+            .unwrap()
             + 1;
 
         let mut builder = Int64Builder::with_capacity((num_columns * num_batches) as usize);
