@@ -25,6 +25,11 @@ from lance.progress import FileSystemFragmentWriteProgress, FragmentWriteProgres
 
 
 def test_write_fragment(tmp_path: Path):
+    with pytest.raises(OSError):
+        LanceFragment.create(tmp_path, pd.DataFrame([]))
+    with pytest.raises(OSError):
+        LanceFragment.create(tmp_path, pd.DataFrame([{}]))
+
     df = pd.DataFrame({"a": [1, 2, 3, 4, 5]})
     frag = LanceFragment.create(tmp_path, df)
     meta = frag.to_json()
