@@ -163,6 +163,16 @@ def test_escaped_name(tmp_path: Path, provide_pandas: bool):
         result, pd.DataFrame({"outer field": [{"inner field": 2}]})
     )
 
+    # test uppercase name
+    table = pa.table({"ALLCAPSNAME": pa.array([0, 1]), "other": pa.array([2, 3])})
+    _ = lance.write_dataset(table, tmp_path / "test_uppercase_name")
+
+    dataset = lance.dataset(tmp_path / "test_uppercase_name")
+    result = dataset.to_table(filter="`ALLCAPSNAME` == 0").to_pandas()
+    pd.testing.assert_frame_equal(
+        result, pd.DataFrame([{"ALLCAPSNAME": 0, "other": 2}])
+    )
+
 
 def test_negative_expressions(tmp_path: Path):
     table = pa.table({"x": [-1, 0, 1, 1], "y": [1, 2, 3, 4]})
