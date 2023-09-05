@@ -27,7 +27,10 @@ use crate::io::ObjectStore;
 
 use crate::{Error, Result};
 
-use super::{latest_manifest_path, manifest_path, write_latest_manifest};
+use super::{
+    latest_manifest_path, make_staging_manifest_path, manifest_path, write_latest_manifest,
+    MANIFEST_EXTENSION,
+};
 
 /// External manifest store
 ///
@@ -46,11 +49,16 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
     /// Get the manifest path for a given base_uri and version
     async fn get(&self, base_uri: &str, version: u64) -> Result<String>;
 
-    /// Get the latest version of a dataset at the base_uri
-    async fn get_latest_version(&self, base_uri: &str) -> Result<Option<u64>>;
+    /// Get the latest version of a dataset at the base_uri, and the path to the manifest.
+    /// The path is provided as an optimization. The path is deterministic based on
+    /// the version and the store should not customize it.
+    async fn get_latest_version(&self, base_uri: &str) -> Result<Option<(u64, String)>>;
 
     /// Put the manifest path for a given base_uri and version, should fail if the version already exists
-    async fn put_if_not_exists(&self, base_uri: &str, version: u64, path: String) -> Result<()>;
+    async fn put_if_not_exists(&self, base_uri: &str, version: u64, path: &str) -> Result<()>;
+
+    /// Put the manifest path for a given base_uri and version, should fail if the version **does not** already exist
+    async fn put_if_exists(&self, base_uri: &str, version: u64, path: &str) -> Result<()>;
 }
 
 /// External manifest commit handler
@@ -59,13 +67,6 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
 #[derive(Debug)]
 pub struct ExternalManifestCommitHandler {
     external_manifest_store: Arc<dyn ExternalManifestStore>,
-}
-
-fn make_staging_manifest_path(base: &Path) -> Result<Path> {
-    let id = uuid::Uuid::new_v4().to_string();
-    Path::parse(format!("{base}-{id}")).map_err(|e| Error::IO {
-        message: format!("failed to parse path: {}", e),
-    })
 }
 
 #[async_trait]
@@ -82,34 +83,36 @@ impl CommitHandler for ExternalManifestCommitHandler {
             .await?;
 
         match version {
-            Some(version) => {
-                let object_store_manifest_path = manifest_path(base_path, version);
-
-                // external store and object store are out of sync
-                // try to sync them
-                // if sync fails, return error
-                if !object_store.exists(&object_store_manifest_path).await? {
-                    let manifest_location = self
-                        .external_manifest_store
-                        .get(base_path.as_ref(), version)
-                        .await?;
-
-                    let manifest_path = Path::parse(manifest_location)?;
-                    let staging = make_staging_manifest_path(&manifest_path)?;
-                    object_store.inner.copy(&manifest_path, &staging).await?;
-                    object_store
-                        .inner
-                        .rename(&staging, &object_store_manifest_path)
-                        .await?;
-
-                    write_latest_manifest(self, &manifest_path, base_path, object_store).await?;
-                    // Also copy for _latest.manifest
-                    object_store.inner.copy(&manifest_path, &staging).await?;
-                    object_store
-                        .inner
-                        .rename(&staging, &latest_manifest_path(base_path))
-                        .await?;
+            Some((version, path)) => {
+                // The path is finalized, no need to check object store
+                if path.ends_with(&format!(".{MANIFEST_EXTENSION}")) {
+                    return Ok(Path::parse(path)?);
                 }
+                // path is not finalized yet, we should try to finalize the path before loading
+                // if sync/finalize fails, return error
+                //
+                // step 1: copy path -> object_store_manifest_path
+                let object_store_manifest_path = manifest_path(base_path, version);
+                let manifest_path = Path::parse(path)?;
+                let staging = make_staging_manifest_path(&manifest_path)?;
+                // TODO: remove copy-rename once we upgrade object_store crate
+                object_store.inner.copy(&manifest_path, &staging).await?;
+                object_store
+                    .inner
+                    .rename(&staging, &object_store_manifest_path)
+                    .await?;
+
+                // step 2: write _latest.manifest
+                write_latest_manifest(&manifest_path, base_path, object_store).await?;
+
+                // step 3: update external store to finalize path
+                self.external_manifest_store
+                    .put_if_exists(
+                        base_path.as_ref(),
+                        version,
+                        object_store_manifest_path.as_ref(),
+                    )
+                    .await?;
 
                 Ok(object_store_manifest_path)
             }
@@ -125,28 +128,38 @@ impl CommitHandler for ExternalManifestCommitHandler {
         version: u64,
         object_store: &ObjectStore,
     ) -> std::result::Result<Path, crate::Error> {
-        let manifest_path = manifest_path(base_path, version);
-        // found in object store
-        if object_store.exists(&manifest_path).await? {
-            return Ok(manifest_path);
-        }
-
-        // not found in object store, try to get from external store
-        let physical_path = self
+        let path = self
             .external_manifest_store
             .get(base_path.as_ref(), version)
             .await
             .map_err(|_| Error::NotFound {
-                uri: manifest_path.to_string(),
+                uri: manifest_path(base_path, version).to_string(),
             })?;
 
-        // try to materialize the manifest from external store to object store
+        // finalized path, just return
+        if path.ends_with(&format!(".{MANIFEST_EXTENSION}")) {
+            return Ok(Path::parse(path)?);
+        }
+
+        let manifest_path = manifest_path(base_path, version);
+        let staging_path = make_staging_manifest_path(&manifest_path)?;
+
+        // step1: try to materialize the manifest from external store to object store
         // multiple writers could try to copy at the same time, this is okay
         // as the content is immutable and copy is atomic
         // We can't use `copy_if_not_exists` here because not all store supports it
         object_store
             .inner
-            .copy(&Path::parse(physical_path)?, &manifest_path)
+            .copy(&Path::parse(path)?, &staging_path)
+            .await?;
+        object_store
+            .inner
+            .rename(&staging_path, &manifest_path)
+            .await?;
+
+        // finalize the external store
+        self.external_manifest_store
+            .put_if_exists(base_path.as_ref(), version, manifest_path.as_ref())
             .await?;
 
         Ok(manifest_path)
@@ -172,11 +185,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         // TODO: add logic to clean up orphaned staged manifests, the ones that failed to commit to external store
         // https://github.com/lancedb/lance/issues/1201
         self.external_manifest_store
-            .put_if_not_exists(
-                object_store.base_path().as_ref(),
-                manifest.version,
-                staging_path.to_string(),
-            )
+            .put_if_not_exists(base_path.as_ref(), manifest.version, staging_path.as_ref())
             .await
             .map_err(|_| CommitError::CommitConflict {})?;
 
@@ -188,6 +197,14 @@ impl CommitHandler for ExternalManifestCommitHandler {
             Error::IO { message: format!("commit to external store is successful, but could not copy manifest to object store, with error: {}.", e) }
         ))?;
 
+        // update the _latest.manifest pointer
+        write_latest_manifest(&path, base_path, object_store).await?;
+
+        // step 5: flip the external store to point to the final location
+        self.external_manifest_store
+            .put_if_exists(base_path.as_ref(), manifest.version, path.as_ref())
+            .await?;
+
         Ok(())
     }
 }
@@ -196,7 +213,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
 mod test {
     use std::{collections::HashMap, time::Duration};
 
-    use futures::future::join_all;
+    use futures::{future::join_all, StreamExt, TryStreamExt};
     use object_store::local::LocalFileSystem;
     use tokio::sync::Mutex;
 
@@ -237,24 +254,25 @@ mod test {
         }
 
         /// Get the latest version of a dataset at the path
-        async fn get_latest_version(&self, uri: &str) -> Result<Option<u64>> {
+        async fn get_latest_version(&self, uri: &str) -> Result<Option<(u64, String)>> {
             let store = self.store.lock().await;
-            Ok(store
-                .keys()
-                .filter_map(|(stored_uri, version)| {
+            let max_version = store
+                .iter()
+                .filter_map(|((stored_uri, version), manifest_uri)| {
                     if stored_uri == uri {
-                        Some(version)
+                        Some((version, manifest_uri))
                     } else {
                         None
                     }
                 })
-                .max()
-                .copied())
+                .max_by_key(|v| v.0);
+
+            Ok(max_version.map(|(version, uri)| (*version, uri.clone())))
         }
 
         /// Put the manifest path for a given uri and version, should fail if the version already exists
-        async fn put_if_not_exists(&self, uri: &str, version: u64, path: String) -> Result<()> {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        async fn put_if_not_exists(&self, uri: &str, version: u64, path: &str) -> Result<()> {
+            tokio::time::sleep(Duration::from_millis(100)).await;
 
             let mut store = self.store.lock().await;
             match store.get(&(uri.to_string(), version)) {
@@ -265,9 +283,28 @@ mod test {
                     ),
                 }),
                 None => {
-                    store.insert((uri.to_string(), version), path);
+                    store.insert((uri.to_string(), version), path.to_string());
                     Ok(())
                 }
+            }
+        }
+
+        /// Put the manifest path for a given uri and version, should fail if the version already exists
+        async fn put_if_exists(&self, uri: &str, version: u64, path: &str) -> Result<()> {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let mut store = self.store.lock().await;
+            match store.get(&(uri.to_string(), version)) {
+                Some(_) => {
+                    store.insert((uri.to_string(), version), path.to_string());
+                    Ok(())
+                }
+                None => Err(Error::IO {
+                    message: format!(
+                        "manifest already exists for uri: {}, version: {}",
+                        uri, version
+                    ),
+                }),
             }
         }
     }
@@ -340,55 +377,59 @@ mod test {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn test_concurrent_commits_are_okay() {
-        let sleepy_store = SleepyExternalManifestStore::new();
-        let handler = ExternalManifestCommitHandler {
-            external_manifest_store: Arc::new(sleepy_store),
-        };
-        let handler = Arc::new(handler);
+        // Run test 20 times to have a higher chance of catching race conditions
+        for _ in 0..20 {
+            let sleepy_store = SleepyExternalManifestStore::new();
+            let handler = ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(sleepy_store),
+            };
+            let handler = Arc::new(handler);
 
-        let mut data_gen =
-            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
-        let dir = tempfile::tempdir().unwrap();
-        let ds_uri = dir.path().to_str().unwrap();
+            let mut data_gen =
+                BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
+            let dir = tempfile::tempdir().unwrap();
+            let ds_uri = dir.path().to_str().unwrap();
 
-        Dataset::write(
-            data_gen.batch(10).unwrap(),
-            ds_uri,
-            Some(write_params(handler.clone())),
-        )
-        .await
-        .unwrap();
-
-        // we have 5 retries by default, more than this will just fail
-        let write_futs = (0..5)
-            .map(|_| data_gen.batch(10).unwrap())
-            .map(|data| {
-                let mut params = write_params(handler.clone());
-                params.mode = WriteMode::Append;
-                Dataset::write(data, ds_uri, Some(params))
-            })
-            .collect::<Vec<_>>();
-
-        let res = join_all(write_futs).await;
-
-        let errors = res
-            .into_iter()
-            .filter(|r| r.is_err())
-            .map(|r| r.unwrap_err())
-            .collect::<Vec<_>>();
-
-        assert!(errors.is_empty(), "{:?}", errors);
-
-        // load the data and check the content
-        let ds = Dataset::open_with_params(ds_uri, &read_params(handler))
+            Dataset::write(
+                data_gen.batch(10).unwrap(),
+                ds_uri,
+                Some(write_params(handler.clone())),
+            )
             .await
             .unwrap();
-        assert_eq!(ds.count_rows().await.unwrap(), 60);
+
+            // we have 5 retries by default, more than this will just fail
+            let write_futs = (0..5)
+                .map(|_| data_gen.batch(10).unwrap())
+                .map(|data| {
+                    let mut params = write_params(handler.clone());
+                    params.mode = WriteMode::Append;
+                    Dataset::write(data, ds_uri, Some(params))
+                })
+                .collect::<Vec<_>>();
+
+            let res = join_all(write_futs).await;
+
+            let errors = res
+                .into_iter()
+                .filter(|r| r.is_err())
+                .map(|r| r.unwrap_err())
+                .collect::<Vec<_>>();
+
+            assert!(errors.is_empty(), "{:?}", errors);
+
+            // load the data and check the content
+            let ds = Dataset::open_with_params(ds_uri, &read_params(handler))
+                .await
+                .unwrap();
+            assert_eq!(ds.count_rows().await.unwrap(), 60);
+        }
     }
 
     #[tokio::test]
     async fn test_out_of_sync_dataset_can_recover() {
         let sleepy_store = SleepyExternalManifestStore::new();
+        let inner_store = sleepy_store.store.clone();
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: Arc::new(sleepy_store),
         };
@@ -421,6 +462,26 @@ mod test {
             .copy(&manifest_path(&ds.base, 5), &latest_manifest_path(&ds.base))
             .await
             .unwrap();
+        // set the store back to dataset path with -{uuid} suffix
+        let mut version_six = localfs
+            .list(Some(&ds.base))
+            .await
+            .unwrap()
+            .try_filter(|p| {
+                let p = p.clone();
+                async move { p.location.filename().unwrap().starts_with("6.manifest-") }
+            })
+            .take(1)
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(version_six.len(), 1);
+        let version_six_staging_location = version_six.pop().unwrap().unwrap().location;
+        {
+            inner_store.lock().await.insert(
+                (ds.base.to_string(), 6),
+                version_six_staging_location.to_string(),
+            );
+        }
 
         // Open without external store handler, should not see the out-of-sync commit
         let params = ReadParams::default();
