@@ -82,14 +82,13 @@ impl PageTable {
 
     pub async fn write(&self, writer: &mut ObjectWriter) -> Result<usize> {
         let pos = writer.tell();
-        assert!(!self.pages.is_empty());
-        let num_columns = self.pages.keys().max().unwrap() + 1;
+        let num_columns = self.pages.keys().max().unwrap_or(&-1) + 1;
         let num_batches = self
             .pages
             .values()
             .flat_map(|c_map| c_map.keys().max())
             .max()
-            .unwrap()
+            .unwrap_or(&-1)
             + 1;
 
         let mut builder = Int64Builder::with_capacity((num_columns * num_batches) as usize);

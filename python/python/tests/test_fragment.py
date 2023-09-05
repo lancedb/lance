@@ -25,13 +25,14 @@ from lance.progress import FileSystemFragmentWriteProgress, FragmentWriteProgres
 
 
 def test_write_fragment(tmp_path: Path):
-    df = pd.DataFrame({"a": [1, 2, 3, 4, 5]})
-    frag = LanceFragment.create(tmp_path, df)
-    meta = frag.to_json()
+    dfs = [pd.DataFrame({"a": [1, 2, 3, 4, 5]}), pd.DataFrame({})]
+    for df in dfs:
+        frag = LanceFragment.create(tmp_path, df)
+        meta = frag.to_json()
 
-    assert "id" in meta
-    assert "files" in meta
-    assert meta["files"][0]["fields"] == [0]
+        assert "id" in meta
+        assert "files" in meta
+        assert meta["files"][0]["fields"] == [0]
 
 
 def test_write_fragment_two_phases(tmp_path: Path):
