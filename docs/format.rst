@@ -292,3 +292,40 @@ The commit process is as follows:
 When checking whether two transactions conflict, be conservative. If the
 transaction file is missing, assume it conflicts. If the transaction file 
 has an unknown operation, assume it conflicts.
+
+
+External Manifest Store
+~~~~~~~~~~~~~~~~~~~~~~~
+
+If the backing object store does not support \*-if-not-exists operations, an
+external manifest store can be used to allow concurrent writers. An external
+manifest store is a KV store that supports put-if-not-exists operation. The
+external manifest store supplements but does not replace the manifests in
+object storage. A reader unaware of the external manifest store could read a
+table that uses it, but it might be up to one version behind the true latest
+version of the table.
+
+.. image:: _static/external_store_commit.png
+
+The commit process is as follows:
+
+1. ``PUT_OBJECT_STORE mydataset.lance/_versions/{version}.manifest-{uuid``} stage a new manifest in object store under a unique path determined by new uuid
+2. ``PUT_EXTERNAL_STORE base_uri, version, mydataset.lance/_versions/{version}.manifest-{uuid}`` commit the path of the staged manifest to the external store.
+3. ``COPY_OBJECT_STORE mydataset.lance/_versions/{version}.manifest-{uuid} mydataset.lance/_versions/{version}.manifest`` copy the staged manifest to the final path
+4. ``PUT_EXTERNAL_STORE base_uri, version, mydataset.lance/_versions/{version}.manifest`` update the external store to point to the final manifest
+
+Note that the commit is effectively complete after step 2. If the writer fails
+after step 2, a reader will be able to detect the external store and object store
+are out-of-sync, and will try to synchronize the two stores. If the reattempt at
+synchronization fails, the reader will refuse to load. This is to ensure the that
+the dataset is always portable by copying the dataset directory without special
+tool.
+
+.. image:: _static/external_store_reader.png
+
+The reader load process is as follows:
+
+1. ``GET_EXTERNAL_STORE base_uri, version, path`` then, if path does not end in a UUID return the path
+2. ``COPY_OBJECT_STORE mydataset.lance/_versions/{version}.manifest-{uuid} mydataset.lance/_versions/{version}.manifest`` reattempt synchronization
+3. ``PUT_EXTERNAL_STORE base_uri, version, mydataset.lance/_versions/{version}.manifest`` update the external store to point to the final manifest
+4. ``RETURN mydataset.lance/_versions/{version}.manifest`` always return the finalized path, return error if synchronization fails

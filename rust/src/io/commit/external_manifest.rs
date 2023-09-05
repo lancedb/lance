@@ -39,6 +39,8 @@ use super::{latest_manifest_path, manifest_path, write_latest_manifest};
 /// expected to work in tandem with the object store. We are only leveraging
 /// the external store for concurrent commit. Any manifest committed thru this
 /// trait should ultimately be materialized in the object store.
+/// For a visual explaination of the commit loop see
+/// https://github.com/lancedb/lance/assets/12615154/b0822312-0826-432a-b554-3965f8d48d04
 #[async_trait]
 pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
     /// Get the manifest path for a given base_uri and version
