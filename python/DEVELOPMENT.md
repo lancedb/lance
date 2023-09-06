@@ -91,7 +91,7 @@ To filter benchmarks by name, use the usual pytest `-k` flag (this can be a
 substring match, so you don't need to type the full name):
 
 ```shell
-pytest python/benchmarks -k benchmark_name
+pytest python/benchmarks -k test_ivf_pq_index_search
 ```
 
 ### Profile a benchmark
@@ -102,7 +102,31 @@ create a flamegraph of a benchmark by running:
 ```shell
 py-spy record --native \
   --output flamegraph.svg \
-  -- python -m pytest benchmarks -k benchmark_name
+  -- python -m pytest python/benchmarks \
+    --benchmark-min-time=3 \
+    -k test_ivf_pq_index_search
+```
+
+Note the parameter `--benchmark-min-time`: this controls how many seconds to run
+the benchmark in each round (default 5 rounds). The default is very low but you
+can increase this so that the profile gets more samples.
+
+```shell
+py-spy record --native \
+  --threads \
+  --idle \
+  --output profile.txt \
+  --format speedscope \
+  -- python -m pytest python/benchmarks \
+    --benchmark-min-time=3 \
+    -k test_ivf_pq_index_search
+```
+
+```shell
+perf record -a -F 100 \
+  python -m pytest python/benchmarks \
+    --benchmark-min-time=3 \
+    -k test_ivf_pq_index_search > perf.data
 ```
 
 This will only work on Linux.
@@ -112,11 +136,16 @@ the setup is complete and not captured as part of profiling.
 
 ### Compare benchmarks against previous version
 
-```shell
-pip uninstall pylance # uninstall dev veresion
-pip install pylance
-pytest benchmarks
-EXTRA_MATURIN_ARGS="--profile bench" maturin develop
-pytest benchmarks
-```
+You can easily compare the performance of the current version against a previous
+version of pylance. Install the previous version, run the benchmarks, and save
+the output using `--benchmark-save`. Then install the current version and run
+the benchmarks again with `--benchmark-compare`.
 
+```shell
+pip uninstall -y pylance
+pip install pylance==0.4.18
+pytest --benchmark-save=baseline python/benchmarks
+COMPARE_ID=$(ls .benchmarks/*/ | tail -1 | cut -c1-4)
+maturin develop --profile release-with-debug
+pytest --benchmark-compare=$COMPARE_ID python/benchmarks
+```
