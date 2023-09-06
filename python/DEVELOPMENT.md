@@ -96,38 +96,19 @@ pytest python/benchmarks -k test_ivf_pq_index_search
 
 ### Profile a benchmark
 
-If you have [py-spy](https://github.com/benfred/py-spy) installed, you can
-create a flamegraph of a benchmark by running:
+If you have [cargo-flamegraph](https://github.com/flamegraph-rs/flamegraph)
+installed, you can create a flamegraph of a benchmark by running:
 
 ```shell
-py-spy record --native \
-  --output flamegraph.svg \
-  -- python -m pytest python/benchmarks \
-    --benchmark-min-time=3 \
+flamegraph -F 100 --no-inline -- $(which python) \
+    -m pytest python/benchmarks \
+    --benchmark-min-time=2 \
     -k test_ivf_pq_index_search
 ```
 
 Note the parameter `--benchmark-min-time`: this controls how many seconds to run
 the benchmark in each round (default 5 rounds). The default is very low but you
 can increase this so that the profile gets more samples.
-
-```shell
-py-spy record --native \
-  --threads \
-  --idle \
-  --output profile.txt \
-  --format speedscope \
-  -- python -m pytest python/benchmarks \
-    --benchmark-min-time=3 \
-    -k test_ivf_pq_index_search
-```
-
-```shell
-perf record -a -F 100 \
-  python -m pytest python/benchmarks \
-    --benchmark-min-time=3 \
-    -k test_ivf_pq_index_search > perf.data
-```
 
 This will only work on Linux.
 
