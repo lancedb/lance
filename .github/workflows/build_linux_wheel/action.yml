@@ -25,13 +25,13 @@ runs:
       shell: bash
       working-directory: python
       run: |
-        docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2014 tools/
+        docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2_28 tools/
     - name: Build manylinux image (arm)
       if: ${{ inputs.arm-build == 'true' }}
       shell: bash
       working-directory: python
       run: |
-        docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2014_aarch64 tools/
+        docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2_28_aarch64 tools/
     - name: Build wheel
       uses: PyO3/maturin-action@v1
       with:
