@@ -56,3 +56,67 @@ Some lints can be fixed automatically:
 ```shell
 cargo clippy --all-features --fix
 ```
+
+## Benchmarks
+
+The benchmarks in `python/benchmarks` can be used to identify and diagnose 
+performance issues. They are run with [pytest-benchmark](https://pytest-benchmark.readthedocs.io/en/latest/).
+These benchmarks aren't mean to showcase performance on full-scale real world
+datasets; rather they are meant to be useful for developers to iterate on
+performance improvements and to catch performance regressions. Therefore, any
+benchmarks added there should run in less than 5 seconds.
+
+Before running benchmarks, you should build pylance in release mode:
+
+```shell
+maturin develop --profile release-with-debug --extras benchmarks
+```
+
+(You can also use `--release` or `--profile release`, but `--profile release-with-debug`
+will provide debug symbols for profiling.)
+
+Then you can run the benchmarks with
+
+```shell
+pytest python/benchmarks
+```
+
+Note: the first time you run the benchmarks, they may take a while, since they
+will write out test datasets and build vector indices. Once these are built,
+they are re-used between benchmark runs.
+
+### Run a particular benchmark
+
+To filter benchmarks by name, use the usual pytest `-k` flag (this can be a 
+substring match, so you don't need to type the full name):
+
+```shell
+pytest python/benchmarks -k benchmark_name
+```
+
+### Profile a benchmark
+
+If you have [py-spy](https://github.com/benfred/py-spy) installed, you can
+create a flamegraph of a benchmark by running:
+
+```shell
+py-spy record --native \
+  --output flamegraph.svg \
+  -- python -m pytest benchmarks -k benchmark_name
+```
+
+This will only work on Linux.
+
+Note that you'll want to run the benchmarks once prior to profiling, so that
+the setup is complete and not captured as part of profiling.
+
+### Compare benchmarks against previous version
+
+```shell
+pip uninstall pylance # uninstall dev veresion
+pip install pylance
+pytest benchmarks
+EXTRA_MATURIN_ARGS="--profile bench" maturin develop
+pytest benchmarks
+```
+
