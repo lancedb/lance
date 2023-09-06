@@ -17,6 +17,7 @@
 
 use std::marker::PhantomData;
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
@@ -27,7 +28,7 @@ use arrow_array::{
     types::{BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, Utf8Type},
     Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, UInt32Array,
 };
-use arrow_buffer::{bit_util, ArrowNativeType, MutableBuffer};
+use arrow_buffer::{bit_util, ArrowNativeType, Buffer, MutableBuffer};
 use arrow_cast::cast::cast;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -230,9 +231,22 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
                 .null_bit_buffer(Some(null_buf.into()));
         }
 
+        // TODO: replace this with safe method once arrow-rs 47.0.0 comes out.
+        // https://github.com/lancedb/lance/issues/1237
+        // Zero-copy conversion from bytes
+        // Safety: the bytes are owned by the `data` value, so the pointer
+        // will be valid for the lifetime of the Arc we are passing in.
+        let buf = unsafe {
+            Buffer::from_custom_allocation(
+                NonNull::new(bytes.as_ptr() as _).unwrap(),
+                bytes.len(),
+                Arc::new(bytes),
+            )
+        };
+
         let array_data = data_builder
             .add_buffer(offset_data.buffers()[0].clone())
-            .add_buffer(bytes.into())
+            .add_buffer(buf)
             .build()?;
 
         Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
