@@ -63,16 +63,24 @@ pub type ManifestWriter = for<'a> fn(
 
 const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
+const MANIFEST_EXTENSION: &str = "manifest";
 
 /// Get the manifest file path for a version.
 fn manifest_path(base: &Path, version: u64) -> Path {
     base.child(VERSIONS_DIR)
-        .child(format!("{version}.manifest"))
+        .child(format!("{version}.{MANIFEST_EXTENSION}"))
 }
 
 /// Get the latest manifest path
 fn latest_manifest_path(base: &Path) -> Path {
     base.child(LATEST_MANIFEST_NAME)
+}
+
+fn make_staging_manifest_path(base: &Path) -> Result<Path> {
+    let id = uuid::Uuid::new_v4().to_string();
+    Path::parse(format!("{base}-{id}")).map_err(|e| crate::Error::IO {
+        message: format!("failed to parse path: {}", e),
+    })
 }
 
 async fn list_manifests<'a>(
@@ -88,20 +96,21 @@ async fn list_manifests<'a>(
 }
 
 async fn write_latest_manifest(
-    commit_handler: &dyn CommitHandler,
     from_path: &Path,
     base_path: &Path,
     object_store: &ObjectStore,
 ) -> Result<()> {
-    let latest_path = commit_handler
-        .resolve_latest_version(base_path, object_store)
-        .await?;
-    // Then, create a copy at the latest manifest path
+    let latest_path = latest_manifest_path(base_path);
+    let staging_path = make_staging_manifest_path(from_path)?;
     object_store
         .inner
-        .copy(from_path, &latest_path)
+        .copy(from_path, &staging_path)
         .await
         .map_err(|err| CommitError::OtherError(err.into()))?;
+    object_store
+        .inner
+        .rename(&staging_path, &latest_path)
+        .await?;
     Ok(())
 }
 
@@ -217,7 +226,7 @@ impl CommitHandler for UnsafeCommitHandler {
         // Write the manifest naively
         manifest_writer(object_store, manifest, indices, &version_path).await?;
 
-        write_latest_manifest(self, &version_path, base_path, object_store).await?;
+        write_latest_manifest(&version_path, base_path, object_store).await?;
 
         Ok(())
     }
@@ -285,7 +294,7 @@ impl CommitHandler for RenameCommitHandler {
             }
         };
 
-        write_latest_manifest(self, &path, base_path, object_store).await?;
+        write_latest_manifest(&path, base_path, object_store).await?;
 
         res
     }
@@ -360,7 +369,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         }
         let res = manifest_writer(object_store, manifest, indices, &path).await;
 
-        write_latest_manifest(self, &path, base_path, object_store).await?;
+        write_latest_manifest(&path, base_path, object_store).await?;
 
         // Release the lock
         lease.release(res.is_ok()).await?;
