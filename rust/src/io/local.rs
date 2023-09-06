@@ -96,16 +96,26 @@ impl ObjectReader for LocalObjectReader {
     }
 
     /// Reads a range of data.
-    ///
-    /// TODO: return [arrow_buffer::Buffer] to avoid one memory copy from Bytes to Buffer.
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
         let file = self.file.clone();
         tokio::task::spawn_blocking(move || {
-            let mut buf = BytesMut::zeroed(range.len());
+            let mut buf = BytesMut::with_capacity(range.len());
+            // Safety: `buf` is set with appropriate capacity above. It is
+            // written to below and we check all data is initialized at that point.
+            unsafe { buf.set_len(range.len()) };
             #[cfg(unix)]
-            file.read_at(buf.as_mut(), range.start as u64)?;
+            let bytes_read = file.read_at(buf.as_mut(), range.start as u64)?;
             #[cfg(windows)]
-            file.seek_read(buf.as_mut(), range.start as u64)?;
+            let bytes_read = file.seek_read(buf.as_mut(), range.start as u64)?;
+            if bytes_read != range.len() {
+                return Err(Error::IO {
+                    message: format!(
+                        "failed to read all bytes from file: expected {}, got {}",
+                        range.len(),
+                        bytes_read
+                    ),
+                });
+            }
             Ok(buf.freeze())
         })
         .await?
