@@ -293,6 +293,7 @@ When checking whether two transactions conflict, be conservative. If the
 transaction file is missing, assume it conflicts. If the transaction file 
 has an unknown operation, assume it conflicts.
 
+.. _external-manifest-store:
 
 External Manifest Store
 ~~~~~~~~~~~~~~~~~~~~~~~
