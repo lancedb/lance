@@ -14,6 +14,7 @@
 
 //! Wraps [ObjectStore](object_store::ObjectStore)
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future;
 use std::path::Path as StdPath;
@@ -28,6 +29,7 @@ use ::object_store::{
 };
 use async_trait::async_trait;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_credential_types::provider::error::CredentialsError;
 use aws_credential_types::provider::ProvideCredentials;
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
@@ -42,6 +44,7 @@ use crate::error::{Error, Result};
 use crate::io::object_reader::CloudObjectReader;
 use crate::io::object_writer::ObjectWriter;
 
+use super::commit::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore};
 use super::commit::{CommitHandler, CommitLock, RenameCommitHandler, UnsafeCommitHandler};
 use super::local::LocalObjectReader;
 use super::object_reader::ObjectReader;
@@ -76,6 +79,8 @@ impl std::fmt::Display for ObjectStore {
 }
 
 const AWS_CREDS_CACHE_KEY: &str = "aws_credentials";
+
+/// Adapt an AWS SDK cred into object_store credentials
 #[derive(Debug)]
 struct AwsCredentialAdapter {
     pub inner: Arc<dyn ProvideCredentials>,
@@ -94,6 +99,42 @@ impl AwsCredentialAdapter {
             cache: Arc::new(RwLock::new(HashMap::new())),
             credentials_refresh_offset,
         }
+    }
+}
+
+/// Adapt an object_store credentials into AWS SDK creds
+#[derive(Debug)]
+struct OSObjectStoreToAwsCredAdaptor(
+    Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>,
+);
+
+impl ProvideCredentials for OSObjectStoreToAwsCredAdaptor {
+    fn provide_credentials<'a>(
+        &'a self,
+    ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+    where
+        Self: 'a,
+    {
+        aws_credential_types::provider::future::ProvideCredentials::new(async {
+            let creds = self
+                .0
+                .get_credential()
+                .await
+                .map_err(|e| CredentialsError::provider_error(Box::new(e)))?;
+            Ok(aws_credential_types::Credentials::new(
+                &creds.key_id,
+                &creds.secret_key,
+                creds.token.clone(),
+                Some(
+                    SystemTime::now()
+                        .checked_add(Duration::from_secs(
+                            60 * 10, //  10 min
+                        ))
+                        .expect("overflow"),
+                ),
+                "",
+            ))
+        })
     }
 }
 
@@ -147,18 +188,18 @@ impl CredentialProvider for AwsCredentialAdapter {
     }
 }
 
-/// Build S3 ObjectStore using default credential chain.
+/// Build AWS credentials
 /// `credentials_refresh_offset` is the amount of time before expiry to refresh credentials.
-async fn build_s3_object_store(
-    uri: &str,
+async fn build_aws_credential(
     credentials_refresh_offset: Duration,
     credentials: Option<Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>>,
     region: Option<String>,
-) -> Result<Arc<dyn OSObjectStore>> {
+) -> Result<(
+    Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>,
+    String,
+)> {
     use aws_config::meta::region::RegionProviderChain;
-
     const DEFAULT_REGION: &str = "us-west-2";
-
     let region_provider = RegionProviderChain::default_provider().or_else(DEFAULT_REGION);
     let region = region.unwrap_or(
         region_provider
@@ -183,13 +224,49 @@ async fn build_s3_object_store(
         }
     };
 
+    Ok((creds, region))
+}
+
+/// Build S3 ObjectStore using default credential chain.
+async fn build_s3_object_store(
+    uri: &str,
+    creds: Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>,
+    region: &str,
+) -> Result<Arc<dyn OSObjectStore>> {
     Ok(Arc::new(
         AmazonS3Builder::from_env() // from_env to capture AWS_ENDPOINT env var
             .with_url(uri)
             .with_credentials(creds)
             .with_region(region)
+            .with_allow_http(true)
             .build()?,
     ))
+}
+
+#[cfg(feature = "dynamodb")]
+async fn build_dynamodb_external_store(
+    table_name: &str,
+    creds: Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>,
+    region: &str,
+    app_name: &str,
+) -> Result<Arc<dyn ExternalManifestStore>> {
+    use std::env;
+
+    use aws_sdk_dynamodb::{config::Region, Client};
+
+    use super::commit::dynamodb::DynamoDBExternalManifestStore;
+
+    let dynamodb_config = aws_sdk_dynamodb::config::Builder::new()
+        .region(Some(Region::new(region.to_string())))
+        .credentials_provider(OSObjectStoreToAwsCredAdaptor(creds));
+    let dynamodb_config = match env::var("DYNAMODB_ENDPOINT") {
+        Ok(endpoint) => dynamodb_config.endpoint_url(endpoint),
+        _ => dynamodb_config,
+    };
+
+    let client = Client::from_conf(dynamodb_config.build());
+
+    DynamoDBExternalManifestStore::new_external_store(client.into(), table_name, app_name).await
 }
 
 async fn build_gcs_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
@@ -246,6 +323,8 @@ impl ObjectStoreParams {
         self.commit_handler = Some(Arc::new(lock));
     }
 }
+
+static DDB_URL_QUERY_KEY: &str = "ddbTableName";
 
 impl ObjectStore {
     /// Parse from a string URI.
@@ -328,27 +407,97 @@ impl ObjectStore {
         ))
     }
 
-    async fn new_from_url(url: Url, params: &ObjectStoreParams) -> Result<Self> {
+    async fn new_from_url(mut url: Url, params: &ObjectStoreParams) -> Result<Self> {
         // Block size: On local file systems, we use 4KB block size. On cloud
         // object stores, we use 64KB block size. This is generally the largest
         // block size where we don't see a latency penalty.
         match url.scheme() {
-            "s3" => Ok(Self {
-                inner: build_s3_object_store(
-                    url.to_string().as_str(),
+            "s3" | "s3+ddb" => {
+                if url.scheme() == "s3+ddb" && params.commit_handler.is_some() {
+                    return Err(Error::InvalidInput {
+                        source:
+                            "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
+                                .into(),
+                    });
+                }
+
+                let ddb_table_name = if url.scheme() == "s3" {
+                    None
+                } else {
+                    if url.query_pairs().count() != 1 {
+                        return Err(Error::InvalidInput {
+                            source:
+                                "`s3+ddb://` scheme and expects exactly one query `ddbTableName`"
+                                    .into(),
+                        });
+                    }
+                    match url.query_pairs().next() {
+                        Some((Cow::Borrowed(key), Cow::Borrowed(table_name)))
+                            if key == DDB_URL_QUERY_KEY =>
+                        {
+                            if table_name.is_empty() {
+                                return Err(Error::InvalidInput {
+                                    source:
+                                        "`s3+ddb://` scheme requires non empty dynamodb table name"
+                                            .into(),
+                                });
+                            }
+                            Some(table_name)
+                        }
+                        _ => {
+                            return Err(Error::InvalidInput {
+                                source: "`s3+ddb://` scheme and expects exactly one query `ddbTableName`".into()
+                            });
+                        }
+                    }
+                };
+
+                let (aws_creds, region) = build_aws_credential(
                     params.s3_credentials_refresh_offset,
                     params.aws_credentials.clone(),
                     params.aws_region.clone(),
                 )
-                .await?,
-                scheme: String::from("s3"),
-                base_path: Path::from(url.path()),
-                block_size: 64 * 1024,
-                commit_handler: params
-                    .commit_handler
-                    .clone()
-                    .unwrap_or_else(|| Arc::new(UnsafeCommitHandler)),
-            }),
+                .await?;
+
+                let commit_handler = match ddb_table_name {
+                    #[cfg(feature = "dynamodb")]
+                    Some(table_name) => Arc::new(ExternalManifestCommitHandler {
+                        external_manifest_store: build_dynamodb_external_store(
+                            table_name,
+                            aws_creds.clone(),
+                            &region,
+                            "lancedb",
+                        )
+                        .await?,
+                    }),
+                    #[cfg(not(feature = "dynamodb"))]
+                    Some(_) => {
+                        return Err(Error::InvalidInput {
+                            source: "`s3+ddb://` scheme requires `dynamodb` feature to be enabled"
+                                .into(),
+                        });
+                    }
+                    None => params
+                        .commit_handler
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(UnsafeCommitHandler)),
+                };
+
+                // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
+                url.set_scheme("s3").map_err(|()| Error::Internal {
+                    message: "could not set scheme".into(),
+                })?;
+                url.set_query(None);
+
+                Ok(Self {
+                    inner: build_s3_object_store(url.to_string().as_str(), aws_creds, &region)
+                        .await?,
+                    scheme: String::from(url.scheme()),
+                    base_path: Path::from(url.path()),
+                    block_size: 64 * 1024,
+                    commit_handler,
+                })
+            }
             "gs" => Ok(Self {
                 inner: build_gcs_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("gs"),
