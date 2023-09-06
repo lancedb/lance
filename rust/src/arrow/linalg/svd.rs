@@ -139,7 +139,7 @@ mod tests {
 
         let (u, sigma, vt) = a.svd().unwrap();
         // Results obtained from `numpy.linalg.svd()`.
-        let expected_u = vec![
+        let expected_u = [
             -0.59114238,
             0.263_167_8,
             0.35543017,
