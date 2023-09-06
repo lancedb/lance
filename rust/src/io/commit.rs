@@ -37,6 +37,8 @@ use std::future;
 use std::sync::Arc;
 use std::{fmt::Debug, sync::atomic::AtomicBool};
 
+#[cfg(feature = "dynamodb")]
+pub(crate) mod dynamodb;
 pub(crate) mod external_manifest;
 
 use crate::dataset::transaction::{Operation, Transaction};
