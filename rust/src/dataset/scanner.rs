@@ -1826,12 +1826,13 @@ mod test {
                 schema.clone(),
                 vec![
                     Arc::new(Int32Array::from_iter_values(0..512)),
-                    Arc::new(vectors),
+                    Arc::new(vectors.clone()),
                 ],
             )
             .unwrap()];
 
-            let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+            let reader =
+                RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone());
             let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
             let mut dataset = dataset
@@ -1893,6 +1894,68 @@ mod test {
 
             // i=1 was deleted, and 5 is the next best, the reset shouldn't change
             let expected_i = BTreeSet::from_iter(vec![0, 2, 3, 4, 5]);
+            let column_i = batch.column_by_name("i").unwrap();
+            let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(expected_i, actual_i);
+
+            // Add a second fragment and test the case where there are no deletion
+            // files but there are missing fragments.
+            let batches = vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(512..1024)),
+                    Arc::new(vectors),
+                ],
+            )
+            .unwrap()];
+
+            let reader =
+                RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone());
+            let dataset = Dataset::write(
+                reader,
+                test_uri,
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let mut dataset = dataset
+                .create_index(
+                    &["vec"],
+                    IndexType::Vector,
+                    Some("idx".to_string()),
+                    &params,
+                    true,
+                )
+                .await
+                .unwrap();
+
+            dataset.delete("i < 512").await.unwrap();
+
+            let mut scan = dataset.scan();
+            scan.nearest("vec", &key, 5).unwrap();
+            scan.refine(100);
+            scan.nprobs(100);
+
+            let results = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+
+            assert_eq!(results.len(), 1);
+            let batch = &results[0];
+
+            // It should not pick up any results from the first fragment
+            let expected_i = BTreeSet::from_iter(vec![512, 513, 514, 515, 516]);
             let column_i = batch.column_by_name("i").unwrap();
             let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
                 .values()
