@@ -167,3 +167,61 @@ jobs:
           workspaces: python
       - uses: ./.github/workflows/build_windows_wheel
       - uses: ./.github/workflows/run_tests
+  aws-integtest:
+    timeout-minutes: 45
+    runs-on: "ubuntu-22.04"
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    services:
+      minio:
+        image: lazybit/minio
+        ports:
+          - 9000:9000
+        env:
+          MINIO_ACCESS_KEY: ACCESSKEY
+          MINIO_SECRET_KEY: SECRETKEY
+        options: --name=minio --health-cmd "curl http://localhost:9000/minio/health/live"
+      dynamodb-local:
+        image: amazon/dynamodb-local
+        ports:
+          - 8000:8000
+        env:
+          AWS_ACCESS_KEY_ID: ACCESSKEY
+          AWS_SECRET_ACCESS_KEY: SECRETKEY
+    env:
+      AWS_ACCESS_KEY_ID: ACCESSKEY
+      AWS_SECRET_ACCESS_KEY: SECRETKEY
+      AWS_REGION: us-west-2
+      # this one is for s3
+      AWS_ENDPOINT: http://localhost:9000
+      # this one is for dynamodb
+      DYNAMODB_ENDPOINT: http://localhost:8000
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        lfs: true
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+    - name: create s3
+      run: aws s3 mb s3://lance-integtest --endpoint http://localhost:9000
+    - name: create ddb
+      run: |
+        aws dynamodb create-table \
+          --table-name lance-integtest \
+          --attribute-definitions '[{"AttributeName": "base_uri", "AttributeType": "S"}, {"AttributeName": "version", "AttributeType": "N"}]' \
+          --key-schema '[{"AttributeName": "base_uri", "KeyType": "HASH"}, {"AttributeName": "version", "KeyType": "RANGE"}]' \
+          --provisioned-throughput '{"ReadCapacityUnits": 10, "WriteCapacityUnits": 10}' \
+          --endpoint-url http://localhost:8000
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: python
+    - uses: ./.github/workflows/build_linux_wheel
+    - uses: ./.github/workflows/run_integtests
+    # Make sure wheels are not included in the Rust cache
+    - name: Delete wheels
+      run: sudo rm -rf target/wheels

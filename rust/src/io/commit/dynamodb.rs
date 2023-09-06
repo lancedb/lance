@@ -56,7 +56,7 @@ impl<E> From<SdkError<E>> for Error {
 /// Transaction Safty: This store uses DynamoDB conditional write to ensure
 /// only one writer can win per version.
 #[derive(Debug)]
-struct DynamoDBExternalManifestStore {
+pub struct DynamoDBExternalManifestStore {
     client: Arc<Client>,
     table_name: String,
     commiter_name: String,
@@ -85,7 +85,6 @@ macro_rules! commiter {
 }
 
 impl DynamoDBExternalManifestStore {
-    #[allow(dead_code)]
     pub async fn new_external_store(
         client: Arc<Client>,
         table_name: &str,

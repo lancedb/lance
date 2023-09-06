@@ -1,10 +1,6 @@
 name: run-tests
 
-description: "Install lance wheel and run unit tests"
-inputs:
-  python-minor-version:
-    required: true
-    description: "8 9 10 11"
+description: "Install lance wheel and run integ tests"
 runs:
   using: "composite"
   steps:
@@ -17,4 +13,4 @@ runs:
     shell: bash
     working-directory: python
     run: |
-      pytest -x -v --durations=30 -m "not integration" python/tests
+      pytest -x -v --durations=30 -m "integration" python/tests
