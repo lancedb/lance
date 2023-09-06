@@ -160,11 +160,26 @@ failed. This might be because of a network error or if the version has already
 been written. Either way, the context manager should release the lock. Use a 
 try/finally block to ensure that the lock is released.
 
+Concurrent Writer on S3 using DynamoDB
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
 .. warning::
 
-  Lance _detects_ but does not yet resolve conflicts. So if there are multiple
-  writers, only one will succeed if they try to commit at exactly the same time.
-  This will be fixed in future releases.
+  This feature is experimental at the moment
+
+Lance has native support for concurrent writers on S3 using DynamoDB instead of locking.
+User may pass in a DynamoDB table name alone with the S3 URI to their dataset to enable this feature.
+
+.. code-block:: python
+
+  import lance
+  # s3+ddb:// URL scheme let's lance know that you want to use DynamoDB for writing to S3 concurrently
+  ds = lance.dataset("s3+ddb://my-bucket/mydataset.lance?ddbTableName=mytable")
+
+The DynamoDB table is expected to have a primary hash key of ``base_uri`` and a range key ``version``.
+The key ``base_uri`` should be string type, and the key ``version`` should be number type.
+
+For details on how this feature works, please see :ref:`external-manifest-store`.
 
 
 Reading Lance Dataset
