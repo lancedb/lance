@@ -20,9 +20,9 @@ use arrow_array::UInt32Array;
 use async_trait::async_trait;
 
 use super::{Graph, Vertex};
-use crate::arrow::linalg::matrix::MatrixView;
 use crate::index::vector::{DistanceFunc, MetricType};
 use crate::{Error, Result};
+use lance_linalg::matrix::MatrixView;
 
 /// A graph node to hold the vertex data and its neighbors.
 #[derive(Debug)]

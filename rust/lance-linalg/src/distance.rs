@@ -21,3 +21,6 @@ pub mod norm_l2;
 mod x86_64;
 
 pub use l2::*;
+pub use dot::*;
+pub use cosine::*;
+pub use norm_l2::*;

@@ -88,7 +88,6 @@ pub mod error;
 pub mod format;
 pub mod index;
 pub mod io;
-pub mod linalg;
 pub mod session;
 pub mod utils;
 

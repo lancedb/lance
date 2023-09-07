@@ -32,6 +32,8 @@ use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
 };
+use lance_arrow::*;
+use lance_linalg::{kernels::argmin, matrix::MatrixView};
 use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
@@ -44,7 +46,6 @@ use super::{
     MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
 use crate::{
-    arrow::{linalg::matrix::MatrixView, *},
     dataset::{Dataset, ROW_ID},
     datatypes::Field,
     index::{pb, prefilter::PreFilter, vector::Transformer, Index},

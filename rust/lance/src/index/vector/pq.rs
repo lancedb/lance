@@ -26,18 +26,21 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
+use lance_linalg::{
+    distance::{l2::l2_distance_batch, norm_l2::norm_l2},
+    matrix::MatrixView,
+    kernels::argmin,
+};
 use rand::SeedableRng;
 use serde::Serialize;
 
 use super::{MetricType, Query, VectorIndex};
-use crate::arrow::linalg::matrix::MatrixView;
 use crate::arrow::*;
 use crate::dataset::ROW_ID;
 use crate::index::prefilter::PreFilter;
 use crate::index::Index;
 use crate::index::{pb, vector::kmeans::train_kmeans, vector::DIST_COL};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
-use crate::linalg::{l2::l2_distance_batch, norm_l2::norm_l2};
 use crate::{Error, Result};
 
 /// Product Quantization Index.
@@ -496,7 +499,7 @@ impl ProductQuantizer {
         })
         .await??;
 
-        FixedSizeListArray::try_new_from_values(values, self.num_sub_vectors as i32)
+        Ok(FixedSizeListArray::try_new_from_values(values, self.num_sub_vectors as i32)?)
     }
 
     /// Train [`ProductQuantizer`] using vectors.

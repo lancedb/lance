@@ -26,15 +26,15 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
 use lru_time_cache::LruCache;
 use object_store::path::Path;
+use lance_arrow::{as_fixed_size_list_array, as_fixed_size_binary_array};
+use lance_linalg::distance::l2::L2;
 
 use super::{builder::GraphBuilder, Graph};
 use super::{Vertex, VertexSerDe};
-use crate::arrow::as_fixed_size_list_array;
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 use crate::index::vector::diskann::RowVertex;
 use crate::io::{FileReader, FileWriter, ObjectStore};
-use crate::{arrow::as_fixed_size_binary_array, linalg::l2::L2};
 use crate::{Error, Result};
 
 const NEIGHBORS_COL: &str = "neighbors";
