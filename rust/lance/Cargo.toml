@@ -135,15 +135,3 @@ harness = false
 [[bench]]
 name = "kmeans"
 harness = false
-
-
-
-[profile.release]
-strip = true
-lto = true
-codegen-units = 1
-
-[profile.bench]
-opt-level = 3
-debug = true
-strip = false

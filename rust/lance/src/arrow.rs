@@ -21,3 +21,5 @@ pub use lance_arrow::schema::*;
 pub use lance_arrow::*;
 
 pub mod json;
+#[cfg(feature = "opq")]
+pub(crate) mod svd;
