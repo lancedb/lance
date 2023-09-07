@@ -1831,8 +1831,7 @@ mod test {
             )
             .unwrap()];
 
-            let reader =
-                RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone());
+            let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
             let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
             let mut dataset = dataset
@@ -1913,8 +1912,7 @@ mod test {
             )
             .unwrap()];
 
-            let reader =
-                RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone());
+            let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
             let dataset = Dataset::write(
                 reader,
                 test_uri,
