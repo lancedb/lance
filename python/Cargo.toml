@@ -20,7 +20,7 @@ chrono = "0.4.23"
 env_logger = "0.10"
 futures = "0.3"
 half = { version = "2.1", default-features = false, features = ["num-traits"] }
-lance = { path = "../rust", features = ["tensorflow", "dynamodb"] }
+lance = { path = "../rust/lance", features = ["tensorflow", "dynamodb"] }
 lazy_static = "1"
 log = "0.4"
 prost = "0.10"
