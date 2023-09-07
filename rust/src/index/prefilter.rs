@@ -32,11 +32,37 @@ use crate::Dataset;
 /// is just deleted rows.
 pub struct PreFilter {
     dataset: Arc<Dataset>,
+    has_deletion_vectors: bool,
+    has_missing_fragments: bool,
 }
 
 impl PreFilter {
     pub fn new(dataset: Arc<Dataset>) -> Self {
-        Self { dataset }
+        let dataset_ref = dataset.as_ref();
+        let mut has_fragment = Vec::new();
+        let mut has_deletion_vectors = false;
+        has_fragment.resize(
+            (dataset
+                .manifest
+                .max_fragment_id()
+                .map(|id| id + 1)
+                .unwrap_or(0)) as usize,
+            false,
+        );
+        for frag in dataset_ref.manifest.fragments.iter() {
+            has_fragment[frag.id as usize] = true;
+            has_deletion_vectors |= frag.deletion_file.is_some();
+        }
+        let has_missing_fragments = has_fragment.iter().any(|&x| !x);
+        Self {
+            dataset,
+            has_deletion_vectors,
+            has_missing_fragments,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.has_deletion_vectors && !self.has_missing_fragments
     }
 
     /// Check whether a single row id should be included in the query.

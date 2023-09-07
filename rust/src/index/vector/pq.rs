@@ -257,9 +257,14 @@ impl VectorIndex for PQIndex {
             });
         }
 
-        let (code, row_ids) = self.filter_arrays(pre_filter).await?;
-
-        assert_eq!(code.len() % self.num_sub_vectors, 0);
+        let (code, row_ids) = if pre_filter.is_empty() {
+            (
+                self.code.as_ref().unwrap().clone(),
+                self.row_ids.as_ref().unwrap().clone(),
+            )
+        } else {
+            self.filter_arrays(pre_filter).await?
+        };
 
         let distances = if self.metric_type == MetricType::L2 {
             self.fast_l2_distances(&query.key, code.as_ref())?
