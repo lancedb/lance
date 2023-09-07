@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::matrix::MatrixView;
+use lance_linalg::matrix::MatrixView;
 use arrow_array::Float32Array;
 
 #[allow(unused_imports)]

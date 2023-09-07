@@ -111,7 +111,7 @@ lance-testing = { path = "../lance-testing" }
 
 [features]
 cli = ["clap"]
-opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
+# opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
 tensorflow = ["tfrecord"]
 dynamodb = ["aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]

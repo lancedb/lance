@@ -22,7 +22,7 @@ use arrow::array::{as_primitive_array, Float32Builder};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use lance_linalg::MatrixView;
+use lance_linalg::{MatrixView, distance::*};
 use serde::Serialize;
 
 use super::{
@@ -35,7 +35,7 @@ use crate::io::{
     object_reader::{read_fixed_stride_array, ObjectReader},
     object_writer::ObjectWriter,
 };
-use crate::{arrow::linalg::svd::*, index::Index};
+use crate::{arrow::svd::*, index::Index};
 use crate::{Error, Result};
 
 const OPQ_PQ_INIT_ITERATIONS: usize = 10;
