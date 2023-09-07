@@ -39,4 +39,4 @@ runs:
         args: ${{ inputs.args }}
         working-directory: python
         container: pylance_manylinux
-        docker-options: "-e CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG=true"
+        docker-options: "-e SOME_FLAG_TO_INVALIDATE_CACHE=1"
