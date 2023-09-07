@@ -46,12 +46,13 @@ def test_dataset(data_dir: Path) -> lance.LanceDataset:
 
 @pytest.mark.benchmark(group="query_ann")
 def test_knn_search(test_dataset, benchmark):
-    q = pa.FixedSizeListArray.from_arrays(pc.random(N_DIMS).cast(pa.float32()), N_DIMS)
+    q = pc.random(N_DIMS).cast(pa.float32())
     result = benchmark(
         test_dataset.to_table,
         nearest=dict(
+            column="vector",
             q=q,
-            k=10,
+            k=100,
             nprobes=10,
             use_index=False,
         ),
@@ -61,12 +62,13 @@ def test_knn_search(test_dataset, benchmark):
 
 @pytest.mark.benchmark(group="query_ann")
 def test_flat_index_search(test_dataset, benchmark):
-    q = pa.FixedSizeListArray.from_arrays(pc.random(N_DIMS).cast(pa.float32()), N_DIMS)
+    q = pc.random(N_DIMS).cast(pa.float32())
     result = benchmark(
         test_dataset.to_table,
         nearest=dict(
+            column="vector",
             q=q,
-            k=10,
+            k=100,
             nprobes=10,
         ),
     )
@@ -75,12 +77,13 @@ def test_flat_index_search(test_dataset, benchmark):
 
 @pytest.mark.benchmark(group="query_ann")
 def test_ivf_pq_index_search(test_dataset, benchmark):
-    q = pa.FixedSizeListArray.from_arrays(pc.random(N_DIMS).cast(pa.float32()), N_DIMS)
+    q = pc.random(N_DIMS).cast(pa.float32())
     result = benchmark(
         test_dataset.to_table,
         nearest=dict(
+            column="vector",
             q=q,
-            k=10,
+            k=100,
             nprobes=10,
             refine_factor=2,
         ),

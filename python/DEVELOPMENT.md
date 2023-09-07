@@ -110,6 +110,10 @@ Note the parameter `--benchmark-min-time`: this controls how many seconds to run
 the benchmark in each round (default 5 rounds). The default is very low but you
 can increase this so that the profile gets more samples.
 
+You can drop the `--no-inline` to have the program try to identify which functions
+were inlined to get more detail, though this will make the processing take
+considerably longer.
+
 This will only work on Linux.
 
 Note that you'll want to run the benchmarks once prior to profiling, so that
