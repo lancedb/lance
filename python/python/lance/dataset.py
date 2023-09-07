@@ -176,20 +176,21 @@ class LanceDataset(pa.dataset.Dataset):
             }
 
         """
-        return (
+        builder = (
             ScannerBuilder(self)
             .columns(columns)
             .filter(filter)
             .limit(limit)
             .offset(offset)
-            .nearest(**(nearest or {}))
             .batch_size(batch_size)
             .batch_readahead(batch_readahead)
             .fragment_readahead(fragment_readahead)
             .scan_in_order(scan_in_order)
             .with_fragments(fragments)
-            .to_scanner()
         )
+        if nearest is not None:
+            builder = builder.nearest(**nearest)
+        return builder.to_scanner()
 
     @property
     def schema(self) -> pa.Schema:
@@ -812,18 +813,14 @@ class ScannerBuilder:
 
     def nearest(
         self,
-        column: Optional[str] = None,
-        q: Optional[pa.FloatingPointArray] = None,
+        column: str,
+        q: pa.FloatingPointArray | List[float] | np.ndarray,
         k: Optional[int] = None,
         metric: Optional[str] = None,
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
         use_index: bool = True,
     ) -> ScannerBuilder:
-        if column is None or q is None:
-            self._nearest = None
-            return self
-
         if self.ds.schema.get_field_index(column) < 0:
             raise ValueError(f"Embedding column {column} not in dataset")
         if isinstance(q, (np.ndarray, list, tuple)):
