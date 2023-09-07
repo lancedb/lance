@@ -1,0 +1,24 @@
+[workspace]
+members = ["lance"]
+# Python package needs to be built by maturin.
+resolver = "2"
+
+[workspace.dependencies]
+# Note that this one does not include pyarrow
+arrow = { version = "43.0.0", optional = false }
+arrow-arith = "43.0"
+arrow-array = "43.0"
+arrow-buffer = "43.0"
+arrow-cast = "43.0"
+arrow-data = "43.0"
+arrow-ipc = "43.0"
+arrow-ord = "43.0"
+arrow-row = "43.0"
+arrow-schema = "43.0"
+arrow-select = "43.0"
+half = { "version" = "=2.2.1", default-features = false, features = [
+    "num-traits"
+] }
+log = "0.4"
+object_store = { version = "0.6.1", features = ["aws", "gcp", "azure"] }
+snafu = "0.7.4"

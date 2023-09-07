@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 45
     defaults:
       run:
-        working-directory: ./rust
+        working-directory: ./rust/lance
     steps:
       - uses: actions/checkout@v3
       - uses: Swatinem/rust-cache@v2
@@ -100,7 +100,7 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
-        working-directory: ./rust
+        working-directory: ./rust/lance
     steps:
       - uses: actions/checkout@v3
       - name: CPU features
@@ -118,7 +118,7 @@ jobs:
     runs-on: windows-latest
     defaults:
       run:
-        working-directory: rust
+        working-directory: rust/lance
     steps:
       - uses: actions/checkout@v3
       - uses: Swatinem/rust-cache@v2
