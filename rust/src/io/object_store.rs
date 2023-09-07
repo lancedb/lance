@@ -325,10 +325,11 @@ impl ObjectStoreParams {
         credentials: Option<Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>>,
         region: Option<String>,
     ) -> Self {
-        let mut params = Self::default();
-        params.aws_credentials = credentials;
-        params.aws_region = region;
-        params
+        Self {
+            aws_credentials: credentials,
+            aws_region: region,
+            ..Self::default()
+        }
     }
 
     /// Set a commit lock for the object store.
