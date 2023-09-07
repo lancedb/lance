@@ -15,8 +15,6 @@ inputs:
     default: 'false'
 runs:
   using: "composite"
-  env:
-    CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "true"
   steps:
     - name: CONFIRM ARM BUILD
       shell: bash
@@ -41,3 +39,5 @@ runs:
         args: ${{ inputs.args }}
         working-directory: python
         container: pylance_manylinux
+        env:
+          CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "true"
