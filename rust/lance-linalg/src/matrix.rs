@@ -17,8 +17,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{as_primitive_array, Float32Builder};
-use arrow_array::{Array, FixedSizeListArray, Float32Array};
+use arrow_array::{
+    builder::Float32Builder, cast::AsArray, Array, FixedSizeListArray, Float32Array,
+};
 use arrow_schema::DataType;
 use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
 
@@ -269,16 +270,14 @@ impl TryFrom<&FixedSizeListArray> for MatrixView {
 
     fn try_from(fsl: &FixedSizeListArray) -> Result<Self> {
         if !matches!(fsl.value_type(), DataType::Float32) {
-            return Err(Error::Arrow {
-                message: format!(
-                    "Only support convert f32 FixedSizeListArray to MatrixView, got {}",
-                    fsl.data_type()
-                ),
-            });
+            return Err(Error::ComputeError(format!(
+                "Only support convert f32 FixedSizeListArray to MatrixView, got {}",
+                fsl.data_type()
+            )));
         }
         let values = fsl.values();
         Ok(Self {
-            data: Arc::new(as_primitive_array(values.as_ref()).clone()),
+            data: Arc::new(values.as_primitive().clone()),
             num_columns: fsl.value_length() as usize,
             transpose: false,
         })

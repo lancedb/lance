@@ -13,3 +13,12 @@
 // limitations under the License.
 
 pub mod distance;
+pub mod kernels;
+pub mod matrix;
+
+pub use matrix::MatrixView;
+
+use arrow_schema::ArrowError;
+
+type Error = ArrowError;
+pub type Result<T> = std::result::Result<T, Error>;

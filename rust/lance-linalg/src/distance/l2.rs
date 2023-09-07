@@ -248,7 +248,7 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
-    use arrow_array::{types::Float32Type, FixedSizeListArray, cast::AsArray};
+    use arrow_array::{cast::AsArray, types::Float32Type, FixedSizeListArray};
 
     #[test]
     fn test_euclidean_distance() {

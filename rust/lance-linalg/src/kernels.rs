@@ -15,18 +15,17 @@
 use std::cmp::Ordering;
 use std::{collections::hash_map::DefaultHasher, hash::Hash, hash::Hasher};
 
-use arrow::array::{as_largestring_array, as_string_array};
 use arrow_array::{
-    cast::as_primitive_array,
+    cast::{as_largestring_array, as_primitive_array, as_string_array},
     types::{
         Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
     Array, ArrowNumericType, GenericStringArray, OffsetSizeTrait, PrimitiveArray, UInt64Array,
 };
-use arrow_schema::DataType;
+use arrow_schema::{ArrowError, DataType};
 use num_traits::bounds::Bounded;
 
-use crate::{Result};
+use crate::Result;
 
 /// Argmax on a [PrimitiveArray].
 ///
@@ -112,12 +111,10 @@ pub fn hash(array: &dyn Array) -> Result<UInt64Array> {
         DataType::Int64 => hash_numeric_type(as_primitive_array::<Int64Type>(array)),
         DataType::Utf8 => hash_string_type(as_string_array(array)),
         DataType::LargeUtf8 => hash_string_type(as_largestring_array(array)),
-        _ => Err(Error::Arrow {
-            message: format!(
-                "Hash only supports integer or string array, got: {}",
-                array.data_type()
-            ),
-        }),
+        _ => Err(ArrowError::SchemaError(format!(
+            "Hash only supports integer or string array, got: {}",
+            array.data_type()
+        ))),
     }
 }
 
