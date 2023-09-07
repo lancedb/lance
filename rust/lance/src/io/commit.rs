@@ -619,16 +619,15 @@ mod tests {
     use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::future::join_all;
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_testing::datagen::generate_random_array;
 
     use super::*;
 
-    use crate::arrow::FixedSizeListArrayExt;
-    use crate::dataset::transaction::Operation;
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{transaction::Operation, WriteMode, WriteParams};
     use crate::index::vector::{MetricType, VectorIndexParams};
     use crate::index::{DatasetIndexExt, IndexType};
     use crate::io::object_store::ObjectStoreParams;
-    use crate::utils::datagen::generate_random_array;
     use crate::Dataset;
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {

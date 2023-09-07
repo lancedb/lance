@@ -28,8 +28,8 @@ use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_linalg::{
     distance::{l2::l2_distance_batch, norm_l2::norm_l2},
-    matrix::MatrixView,
     kernels::argmin,
+    matrix::MatrixView,
 };
 use rand::SeedableRng;
 use serde::Serialize;
@@ -499,7 +499,10 @@ impl ProductQuantizer {
         })
         .await??;
 
-        Ok(FixedSizeListArray::try_new_from_values(values, self.num_sub_vectors as i32)?)
+        Ok(FixedSizeListArray::try_new_from_values(
+            values,
+            self.num_sub_vectors as i32,
+        )?)
     }
 
     /// Train [`ProductQuantizer`] using vectors.

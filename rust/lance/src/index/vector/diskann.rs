@@ -113,6 +113,7 @@ mod tests {
 
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
     use super::*;
@@ -123,7 +124,6 @@ mod tests {
             DatasetIndexExt,
             {vector::VectorIndexParams, IndexType},
         },
-        utils::datagen::generate_random_array,
     };
 
     #[tokio::test]

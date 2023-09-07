@@ -434,12 +434,12 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use tempfile::tempdir;
+    use lance_testing::datagen::generate_random_array;
 
     use crate::arrow::*;
     use crate::dataset::{Dataset, WriteParams};
     use crate::index::vector::MetricType;
     use crate::io::exec::testing::TestingExec;
-    use crate::utils::datagen::generate_random_array;
 
     #[tokio::test]
     async fn knn_flat_search() {
