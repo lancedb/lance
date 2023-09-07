@@ -188,7 +188,7 @@ async fn create_index(
         }
     };
     #[cfg(not(feature = "opq"))]
-    let _ = match use_opq {
+    match use_opq {
         false => (),
         true => {
             return Err(Error::Index {

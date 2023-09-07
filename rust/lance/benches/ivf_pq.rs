@@ -17,6 +17,7 @@ use std::sync::Arc;
 use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, FieldRef, Schema};
 use criterion::{criterion_group, criterion_main, Criterion};
+use lance_testing::datagen::generate_random_array;
 use lance::{
     arrow::*,
     dataset::{WriteMode, WriteParams},
@@ -24,7 +25,6 @@ use lance::{
         vector::{MetricType, VectorIndexParams},
         DatasetIndexExt, IndexType,
     },
-    utils::datagen::generate_random_array,
     Dataset,
 };
 #[cfg(target_os = "linux")]
@@ -61,7 +61,7 @@ async fn create_dataset(path: &std::path::Path, dim: usize, mode: WriteMode) {
     let write_params = WriteParams {
         max_rows_per_file: num_rows,
         max_rows_per_group: batch_size,
-        mode: mode,
+        mode,
         ..Default::default()
     };
 

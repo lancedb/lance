@@ -123,7 +123,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
     let write_params = WriteParams {
         max_rows_per_file: num_rows as usize,
         max_rows_per_group: batch_size as usize,
-        mode: mode,
+        mode,
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());

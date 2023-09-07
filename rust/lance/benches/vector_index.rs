@@ -133,15 +133,17 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
     let write_params = WriteParams {
         max_rows_per_file: num_rows as usize,
         max_rows_per_group: batch_size as usize,
-        mode: mode,
+        mode,
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
     let dataset = Dataset::write(reader, test_uri, Some(write_params))
         .await
         .unwrap();
-    let mut ivf_params = IvfBuildParams::default();
-    ivf_params.num_partitions = 32;
+    let ivf_params = IvfBuildParams {
+        num_partitions: 32,
+        ..Default::default()
+    };
     let pq_params = PQBuildParams {
         num_bits: 8,
         num_sub_vectors: 16,
