@@ -21,7 +21,7 @@ use arrow_array::Float32Array;
 use half::{bf16, f16};
 use num_traits::real::Real;
 
-/// Naive implemenetation of dot product.
+/// Naive implementation of dot product.
 #[inline]
 pub fn dot<T: Real + Sum>(from: &[T], to: &[T]) -> T {
     from.iter().zip(to.iter()).map(|(x, y)| x.mul(*y)).sum()
@@ -98,7 +98,7 @@ pub fn dot_distance(from: &[f32], to: &[f32]) -> f32 {
 mod x86_64 {
 
     pub mod avx {
-        use crate::linalg::x86_64::avx::*;
+        use crate::x86_64::avx::*;
         use std::arch::x86_64::*;
 
         #[inline]
