@@ -19,7 +19,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 
-N_DIMS = 128
+N_DIMS = 768
 
 
 @pytest.fixture(scope="module")

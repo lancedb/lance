@@ -43,7 +43,7 @@ def test_create_ivf_pq(test_dataset, benchmark):
         column="vector",
         index_type="IVF_PQ",
         metric_type="L2",
-        num_partitions=256,
-        num_sub_vectors=96,
+        num_partitions=8,
+        num_sub_vectors=2,
         num_bits=8,
     )
