@@ -19,23 +19,17 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray, GenericListArray,
-    OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray, UInt8Array, cast::AsArray,
+    cast::AsArray, Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray,
+    GenericListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray, UInt8Array,
 };
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, ArrowError};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema};
 
-mod kernels;
-pub mod linalg;
-mod error;
-pub use kernels::*;
 pub mod schema;
 pub use schema::*;
 pub mod bfloat16;
-pub mod json;
 
 type Result<T> = std::result::Result<T, ArrowError>;
-
 
 pub trait DataTypeExt {
     /// Returns true if the data type is binary-like, such as (Large)Utf8 and (Large)Binary.
@@ -218,7 +212,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
         let field = Arc::new(Field::new("item", values.data_type().clone(), true));
         let values = Arc::new(values);
 
-        Ok(Self::try_new(field, list_size, values, None)?)
+        Self::try_new(field, list_size, values, None)
     }
 }
 
@@ -360,7 +354,7 @@ impl RecordBatchExt for RecordBatch {
         ));
         let mut new_columns = self.columns().to_vec();
         new_columns.push(arr);
-        Ok(Self::try_new(new_schema, new_columns)?)
+        Self::try_new(new_schema, new_columns)
     }
 
     fn try_new_from_struct_array(&self, arr: StructArray) -> Result<Self> {
@@ -368,18 +362,16 @@ impl RecordBatchExt for RecordBatch {
             arr.fields().to_vec(),
             self.schema().metadata.clone(),
         ));
-        Ok(Self::try_new(schema, arr.columns().to_vec())?)
+        Self::try_new(schema, arr.columns().to_vec())
     }
 
     fn merge(&self, other: &Self) -> Result<Self> {
         if self.num_rows() != other.num_rows() {
-            return Err(ArrowError::InvalidArgumentError(
-                format!(
-                    "Attempt to merge two RecordBatch with different sizes: {} != {}",
-                    self.num_rows(),
-                    other.num_rows()
-                ),
-            ));
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Attempt to merge two RecordBatch with different sizes: {} != {}",
+                self.num_rows(),
+                other.num_rows()
+            )));
         }
         let left_struct_array: StructArray = self.clone().into();
         let right_struct_array: StructArray = other.clone().into();
@@ -395,13 +387,13 @@ impl RecordBatchExt for RecordBatch {
                 columns.push(self.column(i).clone());
             }
         }
-        Ok(Self::try_new(
+        Self::try_new(
             Arc::new(Schema::new_with_metadata(
                 fields,
                 self.schema().metadata().clone(),
             )),
             columns,
-        )?)
+        )
     }
 
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef> {
@@ -435,9 +427,10 @@ fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
                 }
             }
         } else {
-            return Err(ArrowError::SchemaError(
-                format!("field {} does not exist in the RecordBatch", field.name()),
-            ));
+            return Err(ArrowError::SchemaError(format!(
+                "field {} does not exist in the RecordBatch",
+                field.name()
+            )));
         }
     }
     Ok(StructArray::from(
@@ -516,9 +509,8 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> R
         .map(Arc::new)
         .zip(columns.iter().cloned())
         .collect::<Vec<_>>();
-    StructArray::try_from(zipped).map_err(|e| ArrowError::ComputeError(
-        format!("Failed to merge RecordBatch: {}", e)
-    ))
+    StructArray::try_from(zipped)
+        .map_err(|e| ArrowError::ComputeError(format!("Failed to merge RecordBatch: {}", e)))
 }
 
 fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a ArrayRef> {

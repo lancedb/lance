@@ -17,13 +17,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema, ArrowError};
+use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 
 use crate::datatypes::LogicalType;
-use crate::Result;
+use crate::error::{Error, Result};
 
-impl From<serde_json::Error> for ArrowError {
+impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Self::Arrow {
             message: e.to_string(),

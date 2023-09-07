@@ -17,17 +17,14 @@
 use std::iter::repeat_with;
 use std::sync::Arc;
 
-use crate::{
-    arrow::{fixed_size_list_type, FixedSizeListArrayExt},
-};
-
 use arrow_array::{
     ArrowNumericType, Float32Array, Int32Array, NativeAdapter, PrimitiveArray, RecordBatch,
     RecordBatchIterator, RecordBatchReader,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use lance_arrow::{fixed_size_list_type, FixedSizeListArrayExt};
 use num_traits::{real::Real, FromPrimitive};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 pub trait ArrayGenerator {
     fn generate(&mut self, length: usize) -> Arc<dyn arrow_array::Array>;
@@ -127,12 +124,12 @@ impl RandomVector {
 impl ArrayGenerator for RandomVector {
     fn generate(&mut self, length: usize) -> Arc<dyn arrow_array::Array> {
         let values = generate_random_array(length * (self.vec_width as usize));
-        Ok(Arc::new(
+        Arc::new(
             <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
                 values,
                 self.vec_width,
-            )?,
-        ))
+            ).expect("Create fixed size list"),
+        )
     }
 
     fn name(&self) -> Option<&str> {
@@ -171,10 +168,7 @@ impl BatchGenerator {
         }
         let schema = Arc::new(ArrowSchema::new(fields));
         let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
-        RecordBatchIterator::new(
-            vec![batch].into_iter().map(Ok),
-            schema.clone(),
-        )
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone())
     }
 }
 
