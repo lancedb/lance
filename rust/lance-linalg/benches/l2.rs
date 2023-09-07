@@ -12,17 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow_arith::aggregate::sum;
-use arrow_arith::arithmetic::{multiply, subtract};
-use arrow_arith::arity::binary;
-use arrow_array::cast::as_primitive_array;
-use arrow_array::Float32Array;
+use arrow_arith::{aggregate::sum, arithmetic::{multiply, subtract}, arity::binary};
+use arrow_array::{cast::as_primitive_array, Float32Array};
 use criterion::{criterion_group, criterion_main, Criterion};
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance::linalg::l2::l2_distance_batch;
+use lance_linalg::distance::l2_distance_batch;
 use lance::utils::datagen::generate_random_array_with_seed;
 
 #[inline]

@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Lance Devs <dev@eto.ai>"]
 description = "A columnar data format that is 100x faster than Parquet for random access."
 license = "Apache-2.0"
-repository = "https://github.com/eto-ai/lance"
+repository = "https://github.com/lancedb/lance"
 readme = "README.md"
 rust-version = "1.65"
 keywords = [
@@ -87,7 +87,7 @@ accelerate-src = { version = "0.3.2", optional = true }
 openblas-src = { version = "0.10.8", default-features= false, features = ["static", "cblas"], optional = true}
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
+pprof = { version = "0.12", features = ["flamegraph", "criterion"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 openblas-src = { version = "0.10.8", default-features= false, features = ["system"], optional = true}
@@ -97,7 +97,7 @@ prost-build = "0.11"
 
 [dev-dependencies]
 clap = { version = "4.1.1", features = ["derive"] }
-criterion = { version = "0.4", features = ["async", "async_tokio"] }
+criterion = { workspace = true }
 tempfile = "3.3.0"
 approx = "0.5.1"
 dirs = "5.0.0"
@@ -115,9 +115,6 @@ dynamodb_tests = ["dynamodb"]
 name = "lq"
 required-features = ["cli"]
 
-[[bench]]
-name = "l2"
-harness = false
 
 [[bench]]
 name = "dot"
