@@ -12,10 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod cosine;
-pub mod dot;
-pub mod l2;
-pub mod norm_l2;
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

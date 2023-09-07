@@ -30,10 +30,8 @@ use arrow_array::{
     RecordBatchIterator, RecordBatchReader,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use num_traits::real::Real;
-use num_traits::FromPrimitive;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use num_traits::{real::Real, FromPrimitive};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 pub trait ArrayGenerator {
     fn generate(&mut self, length: usize) -> Result<Arc<dyn arrow_array::Array>>;

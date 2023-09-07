@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow_arith::{aggregate::sum, arithmetic::{multiply, subtract}, arity::binary};
+use arrow_arith::{
+    aggregate::sum,
+    arithmetic::{multiply, subtract},
+    arity::binary,
+};
 use arrow_array::{cast::as_primitive_array, Float32Array};
 use criterion::{criterion_group, criterion_main, Criterion};
 
@@ -20,7 +24,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance_linalg::distance::l2_distance_batch;
-use lance::utils::datagen::generate_random_array_with_seed;
+use lance_testing::datagen::generate_random_array_with_seed;
 
 #[inline]
 fn l2_arrow(x: &Float32Array, y: &Float32Array) -> f32 {

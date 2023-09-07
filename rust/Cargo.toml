@@ -1,5 +1,5 @@
 [workspace]
-members = ["lance", "lance-linalg"]
+members = ["lance", "lance-linalg", "lance-testing"]
 # Python package needs to be built by maturin.
 resolver = "2"
 
@@ -33,3 +33,4 @@ num-traits = "0.2"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
 approx = "0.5.1"
 pprof = { version = "0.12", features = ["flamegraph", "criterion"] }
+rand = { version = "0.8.3", features = ["small_rng"] }
