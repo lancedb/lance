@@ -44,6 +44,7 @@ use crate::error::{Error, Result};
 use crate::io::object_reader::CloudObjectReader;
 use crate::io::object_writer::ObjectWriter;
 
+#[cfg(feature = "dynamodb")]
 use super::commit::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore};
 use super::commit::{CommitHandler, CommitLock, RenameCommitHandler, UnsafeCommitHandler};
 use super::local::LocalObjectReader;
@@ -291,6 +292,8 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
 }
 
+/// Parameters to create an [ObjectStore]
+///
 #[derive(Debug, Clone)]
 pub struct ObjectStoreParams {
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
@@ -318,6 +321,17 @@ impl Default for ObjectStoreParams {
 }
 
 impl ObjectStoreParams {
+    pub fn with_aws_credentials(
+        credentials: Option<Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>>,
+        region: Option<String>,
+    ) -> Self {
+        Self {
+            aws_credentials: credentials,
+            aws_region: region,
+            ..Self::default()
+        }
+    }
+
     /// Set a commit lock for the object store.
     pub fn set_commit_lock<T: CommitLock + Send + Sync + 'static>(&mut self, lock: Arc<T>) {
         self.commit_handler = Some(Arc::new(lock));
