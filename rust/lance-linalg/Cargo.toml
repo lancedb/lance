@@ -24,3 +24,15 @@ pprof = { workspace = true }
 [[bench]]
 name = "l2"
 harness = false
+
+[[bench]]
+name = "dot"
+harness = false
+
+[[bench]]
+name = "argmin"
+harness = false
+
+[[bench]]
+name = "cosine"
+harness = false

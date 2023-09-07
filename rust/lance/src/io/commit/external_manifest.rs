@@ -214,9 +214,9 @@ mod test {
     use std::{collections::HashMap, time::Duration};
 
     use futures::{future::join_all, StreamExt, TryStreamExt};
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
     use tokio::sync::Mutex;
-    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
     use crate::{
         dataset::{ReadParams, WriteMode, WriteParams},

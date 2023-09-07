@@ -120,11 +120,6 @@ dynamodb_tests = ["dynamodb"]
 name = "lq"
 required-features = ["cli"]
 
-
-[[bench]]
-name = "dot"
-harness = false
-
 [[bench]]
 name = "scan"
 harness = false
@@ -141,13 +136,7 @@ harness = false
 name = "kmeans"
 harness = false
 
-[[bench]]
-name = "argmin"
-harness = false
 
-[[bench]]
-name = "cosine"
-harness = false
 
 [profile.release]
 strip = true

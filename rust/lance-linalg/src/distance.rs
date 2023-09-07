@@ -20,7 +20,7 @@ pub mod norm_l2;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
-pub use l2::*;
-pub use dot::*;
 pub use cosine::*;
+pub use dot::*;
+pub use l2::*;
 pub use norm_l2::*;

@@ -128,7 +128,8 @@ impl ArrayGenerator for RandomVector {
             <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
                 values,
                 self.vec_width,
-            ).expect("Create fixed size list"),
+            )
+            .expect("Create fixed size list"),
         )
     }
 
