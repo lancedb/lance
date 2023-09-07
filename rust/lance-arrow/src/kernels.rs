@@ -26,7 +26,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use num_traits::bounds::Bounded;
 
-use crate::{Error, Result};
+use crate::{Result};
 
 /// Argmax on a [PrimitiveArray].
 ///
