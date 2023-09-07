@@ -306,11 +306,11 @@ object storage. A reader unaware of the external manifest store could read a
 table that uses it, but it might be up to one version behind the true latest
 version of the table.
 
-.. image:: _static/external_store_commit.png
+.. image:: _static/external_store_commit.gif
 
 The commit process is as follows:
 
-1. ``PUT_OBJECT_STORE mydataset.lance/_versions/{version}.manifest-{uuid``} stage a new manifest in object store under a unique path determined by new uuid
+1. ``PUT_OBJECT_STORE mydataset.lance/_versions/{version}.manifest-{uuid}`` stage a new manifest in object store under a unique path determined by new uuid
 2. ``PUT_EXTERNAL_STORE base_uri, version, mydataset.lance/_versions/{version}.manifest-{uuid}`` commit the path of the staged manifest to the external store.
 3. ``COPY_OBJECT_STORE mydataset.lance/_versions/{version}.manifest-{uuid} mydataset.lance/_versions/{version}.manifest`` copy the staged manifest to the final path
 4. ``PUT_EXTERNAL_STORE base_uri, version, mydataset.lance/_versions/{version}.manifest`` update the external store to point to the final manifest
@@ -322,7 +322,7 @@ synchronization fails, the reader will refuse to load. This is to ensure the tha
 the dataset is always portable by copying the dataset directory without special
 tool.
 
-.. image:: _static/external_store_reader.png
+.. image:: _static/external_store_reader.gif
 
 The reader load process is as follows:
 
