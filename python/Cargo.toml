@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 authors = ["Lance Devs <dev@eto.ai>"]
 rust-version = "1.65"
