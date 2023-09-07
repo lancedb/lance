@@ -152,7 +152,7 @@ mod x86_64 {
         #[inline]
         pub fn cosine_f32(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -> f32 {
             unsafe {
-                use crate::x86_64::avx::add_f32_register;
+                use crate::distance::x86_64::avx::add_f32_register;
 
                 let len = x_vector.len() / 8 * 8;
                 let mut xy = _mm256_setzero_ps();
