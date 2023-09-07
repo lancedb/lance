@@ -39,5 +39,4 @@ runs:
         args: ${{ inputs.args }}
         working-directory: python
         container: pylance_manylinux
-        env:
-          CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "true"
+        docker-options: "-e CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG=true"
