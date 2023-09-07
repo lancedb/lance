@@ -22,8 +22,8 @@ use arrow::array::{as_primitive_array, Float32Builder};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use serde::Serialize;
 use lance_linalg::MatrixView;
+use serde::Serialize;
 
 use super::{
     pq::{PQBuildParams, ProductQuantizer},
