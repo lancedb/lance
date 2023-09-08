@@ -341,14 +341,21 @@ class LanceDataset(pa.dataset.Dataset):
             scan_in_order=scan_in_order,
         ).to_batches()
 
-    def take(self, indices, **kwargs):
-        """
-        Select rows of data by index.
+    def take(
+        self,
+        indices: Union[List[int], pa.Array],
+        columns: Optional[List[str]] = None,
+        **kwargs,
+    ) -> pa.Table:
+        """Select rows of data by index.
 
         Parameters
         ----------
         indices : Array or array-like
             indices of rows to select in the dataset.
+        columns: list of strings, optional
+            List of column names to be fetched. All columns are fetched
+            if not specified.
         **kwargs : dict, optional
             See scanner() method for full parameter description.
 
@@ -357,7 +364,7 @@ class LanceDataset(pa.dataset.Dataset):
         table : Table
         """
         # kwargs['take'] = indices
-        return pa.Table.from_batches([self._ds.take(indices)])
+        return pa.Table.from_batches([self._ds.take(indices, columns)])
 
     def head(self, num_rows, **kwargs):
         """
@@ -629,7 +636,8 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             ):
                 raise TypeError(
-                    f"Vector column {c} must be FixedSizeListArray or TensorArray, got {field.type}"
+                    f"Vector column {c} must be FixedSizeListArray or TensorArray,"
+                    f"got {field.type}"
                 )
             if not pa.types.is_float32(field.type.value_type):
                 raise TypeError(
