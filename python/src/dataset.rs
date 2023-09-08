@@ -400,7 +400,8 @@ impl Dataset {
             self_.ds.schema().project(&columns)
         } else {
             Ok(self_.ds.schema().clone())
-        }.map_err(|err| PyIOError::new_err(err.to_string()))?;
+        }
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
         let batch = RT
             .block_on(Some(self_.py()), self_.ds.take(&row_indices, &projection))
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
