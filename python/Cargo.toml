@@ -1,8 +1,8 @@
 [package]
 name = "pylance"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
-authors = ["Lance Devs <dev@eto.ai>"]
+authors = ["Lance Devs <dev@lancedb.com>"]
 rust-version = "1.65"
 exclude = ["python/lance/conftest.py"]
 
