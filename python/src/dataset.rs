@@ -590,12 +590,19 @@ impl Dataset {
         dataset_uri: &str,
         operation: Operation,
         read_version: Option<u64>,
-        options: Option<&PyDict>,
+        commit_lock: Option<&PyAny>,
     ) -> PyResult<Self> {
-        let store_params = options.map(get_object_store_params).unwrap_or(None);
+        let store_params = if let Some(commit_handler) = commit_lock {
+            let py_commit_lock = PyCommitLock::new(commit_handler.to_object(commit_handler.py()));
+            let mut object_store_params = ObjectStoreParams::default();
+            object_store_params.set_commit_lock(Arc::new(py_commit_lock));
+            Some(object_store_params)
+        } else {
+            None
+        };
         let ds = RT
             .block_on(
-                options.map(|opts| opts.py()),
+                commit_lock.map(|cl| cl.py()),
                 LanceDataset::commit(dataset_uri, operation.0, read_version, store_params),
             )
             .map_err(|e| PyIOError::new_err(e.to_string()))?;

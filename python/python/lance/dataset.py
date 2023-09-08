@@ -684,7 +684,7 @@ class LanceDataset(pa.dataset.Dataset):
         base_uri: Union[str, Path],
         operation: LanceOperation.BaseOperation,
         read_version: Optional[int] = None,
-        options: Optional[Dict[str, Any]] = None,
+        commit_lock: Optional[CommitLock] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -709,9 +709,9 @@ class LanceDataset(pa.dataset.Dataset):
         read_version: int, optional
             The version of the dataset that was used as the base for the changes.
             This is not needed for overwrite or restore operations.
-        options : dict, optional
-            Options for controlling how the commit is performed.  For example,
-            what object store to use to access the manifest.
+        commit_lock : CommitLock, optional
+            A custom commit lock.  Only needed if your object store does not support
+            atomic commits.  See the user guide for more details.
 
         Returns
         -------
@@ -726,7 +726,13 @@ class LanceDataset(pa.dataset.Dataset):
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
 
-        _Dataset.commit(base_uri, operation._to_inner(), read_version, options)
+        if commit_lock:
+            if not callable(commit_lock):
+                raise TypeError(
+                    f"commit_lock must be a function, got {type(commit_lock)}"
+                )
+
+        _Dataset.commit(base_uri, operation._to_inner(), read_version, commit_lock)
         return LanceDataset(base_uri)
 
 
@@ -1091,6 +1097,9 @@ def write_dataset(
         The max number of rows to write before starting a new file
     max_rows_per_group: int, default 1024
         The max number of rows before starting a new group (in the same file)
+    commit_lock : CommitLock, optional
+        A custom commit lock.  Only needed if your object store does not support
+        atomic commits.  See the user guide for more details.
 
     """
     reader = _coerce_reader(data_obj, schema)
