@@ -54,8 +54,8 @@ def test_scan_integer(tmp_path: Path, benchmark, array_factory):
     assert result.num_rows == NUM_ROWS
 
 
-@pytest.mark.benchmark(group="scan_table")
-def test_scan_table(tmp_path: Path, benchmark):
+@pytest.fixture
+def sample_dataset(tmp_path: Path):
     table = pa.table(
         {
             "i": pa.array(range(NUM_ROWS), type=pa.int32()),
@@ -77,10 +77,42 @@ def test_scan_table(tmp_path: Path, benchmark):
         }
     )
 
-    dataset = lance.write_dataset(table, tmp_path)
+    return lance.write_dataset(table, tmp_path)
 
+
+@pytest.mark.benchmark(group="scan_table")
+def test_scan_table_full(benchmark, sample_dataset):
     result = benchmark(
-        dataset.to_table,
+        sample_dataset.to_table,
     )
 
     assert result.num_rows == NUM_ROWS
+
+
+@pytest.mark.benchmark(group="scan_table")
+def test_scan_table_project(benchmark, sample_dataset):
+    result = benchmark(sample_dataset.to_table, columns=["i", "f"])
+
+    assert result.schema.names == ["i", "f"]
+    assert result.num_rows == NUM_ROWS
+
+
+@pytest.mark.benchmark(group="scan_table")
+def test_scan_table_filter_project(benchmark, sample_dataset):
+    result = benchmark(
+        sample_dataset.to_table,
+        filter="i >= 400 AND s = 'hello'",
+        columns=["i", "blob"],
+    )
+
+    assert result.schema.names == ["i", "blob"]
+
+
+@pytest.mark.benchmark(group="scan_table")
+def test_scan_table_filter_full(benchmark, sample_dataset):
+    result = benchmark(
+        sample_dataset.to_table,
+        filter="i >= 400 AND s = 'hello'",
+    )
+
+    assert result.schema.names == ["i", "f", "s", "fsl", "blob"]
