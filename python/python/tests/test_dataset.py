@@ -200,6 +200,17 @@ def test_take(tmp_path: Path):
     assert table2 == table1
 
 
+def test_take_with_columns(tmp_path: Path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table1, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    table2 = dataset.take([0], columns=["b"])
+
+    assert table2 == pa.Table.from_pylist([{"b": 2}])
+
+
 def test_filter(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
