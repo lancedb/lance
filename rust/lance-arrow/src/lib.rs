@@ -35,7 +35,7 @@ pub trait DataTypeExt {
     /// Returns true if the data type is binary-like, such as (Large)Utf8 and (Large)Binary.
     ///
     /// ```
-    /// use lance::arrow::*;
+    /// use lance_arrow::*;
     /// use arrow_schema::DataType;
     ///
     /// assert!(DataType::Utf8.is_binary_like());
@@ -137,7 +137,7 @@ impl DataTypeExt for DataType {
 /// ```
 /// use arrow_array::{Int32Array, Int64Array, ListArray};
 /// use arrow_array::types::Int64Type;
-/// use lance::arrow::try_new_generic_list_array;
+/// use lance_arrow::try_new_generic_list_array;
 ///
 /// let offsets = Int32Array::from_iter([0, 2, 7, 10]);
 /// let int_values = Int64Array::from_iter(0..10);
@@ -188,7 +188,7 @@ pub trait FixedSizeListArrayExt {
     /// ```
     /// use arrow_array::{Int64Array, FixedSizeListArray};
     /// use arrow_array::types::Int64Type;
-    /// use lance::arrow::FixedSizeListArrayExt;
+    /// use lance_arrow::FixedSizeListArrayExt;
     ///
     /// let int_values = Int64Array::from_iter(0..10);
     /// let fixed_size_list_arr = FixedSizeListArray::try_new_from_values(int_values, 2).unwrap();
@@ -228,7 +228,7 @@ pub trait FixedSizeBinaryArrayExt {
     /// ```
     /// use arrow_array::{UInt8Array, FixedSizeBinaryArray};
     /// use arrow_array::types::UInt8Type;
-    /// use lance::arrow::FixedSizeBinaryArrayExt;
+    /// use lance_arrow::FixedSizeBinaryArrayExt;
     ///
     /// let int_values = UInt8Array::from_iter(0..10);
     /// let fixed_size_list_arr = FixedSizeBinaryArray::try_new_from_values(&int_values, 2).unwrap();
@@ -267,7 +267,7 @@ pub trait RecordBatchExt {
     /// use std::sync::Arc;
     /// use arrow_array::{RecordBatch, Int32Array, StringArray};
     /// use arrow_schema::{Schema, Field, DataType};
-    /// use lance::arrow::*;
+    /// use lance_arrow::*;
     ///
     /// let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
     /// let int_arr = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
@@ -303,7 +303,7 @@ pub trait RecordBatchExt {
     /// use std::sync::Arc;
     /// use arrow_array::*;
     /// use arrow_schema::{Schema, Field, DataType};
-    /// use lance::arrow::*;
+    /// use lance_arrow::*;
     ///
     /// let left_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
     /// let int_arr = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
