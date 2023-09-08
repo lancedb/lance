@@ -19,7 +19,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 
-NUM_ROWS = 1_000_000
+NUM_ROWS = 10_000
 
 
 @pytest.mark.parametrize(
@@ -54,8 +54,9 @@ def test_scan_integer(tmp_path: Path, benchmark, array_factory):
     assert result.num_rows == NUM_ROWS
 
 
-@pytest.fixture
-def sample_dataset(tmp_path: Path):
+@pytest.fixture(scope = "module")
+def sample_dataset(tmpdir_factory):
+    tmp_path = Path(tmpdir_factory.mktemp('data'))
     table = pa.table(
         {
             "i": pa.array(range(NUM_ROWS), type=pa.int32()),
@@ -69,7 +70,7 @@ def sample_dataset(tmp_path: Path):
             ),
             "blob": pa.array(
                 [
-                    random.choice([b"hello", b"world", b"today"])
+                    random.choice([random.randbytes(100 * 1024), random.randbytes(1024), random.randbytes(1024)])
                     for _ in range(NUM_ROWS)
                 ],
                 type=pa.binary(),
@@ -97,22 +98,23 @@ def test_scan_table_project(benchmark, sample_dataset):
     assert result.num_rows == NUM_ROWS
 
 
+@pytest.mark.parametrize("keep_percent", [0.1, 0.5, 0.9])
 @pytest.mark.benchmark(group="scan_table")
-def test_scan_table_filter_project(benchmark, sample_dataset):
+def test_scan_table_filter_project(benchmark, sample_dataset, keep_percent):
     result = benchmark(
         sample_dataset.to_table,
-        filter="i >= 400 AND s = 'hello'",
+        filter=f"f < {keep_percent}",
         columns=["i", "blob"],
     )
 
     assert result.schema.names == ["i", "blob"]
 
-
+@pytest.mark.parametrize("keep_percent", [0.1, 0.5, 0.9])
 @pytest.mark.benchmark(group="scan_table")
-def test_scan_table_filter_full(benchmark, sample_dataset):
+def test_scan_table_filter_full(benchmark, sample_dataset, keep_percent):
     result = benchmark(
         sample_dataset.to_table,
-        filter="i >= 400 AND s = 'hello'",
+        filter=f"f < {keep_percent}",
     )
 
     assert result.schema.names == ["i", "f", "s", "fsl", "blob"]

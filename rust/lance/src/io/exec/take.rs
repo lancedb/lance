@@ -63,7 +63,7 @@ impl Take {
                 .zip(stream::repeat_with(|| {
                     (dataset.clone(), projection.clone())
                 }))
-                .then(|(batch, (dataset, extra))| async move {
+                .map(|(batch, (dataset, extra))| async move {
                     let batch = batch?;
                     let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
                     let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
@@ -76,6 +76,7 @@ impl Take {
                     };
                     Ok::<RecordBatch, Error>(rows)
                 })
+                .buffered(num_cpus::get())
                 .map(|r| r.map_err(|e| DataFusionError::Execution(e.to_string())))
                 .try_for_each(|b| async {
                     if tx.is_closed() {

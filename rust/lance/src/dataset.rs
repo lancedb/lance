@@ -823,77 +823,146 @@ impl Dataset {
         row_ids: &[u64],
         projection: &Schema,
     ) -> Result<RecordBatch> {
-        let mut sorted_row_ids = Vec::from(row_ids);
-        sorted_row_ids.sort();
+        if row_ids.len() == 0 {
+            return Ok(RecordBatch::new_empty(Arc::new(projection.into())));
+        }
 
-        // Group ROW Ids by the fragment
-        let mut row_ids_per_fragment: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-        sorted_row_ids.iter().for_each(|row_id| {
-            let fragment_id = row_id >> 32;
-            let offset = (row_id - (fragment_id << 32)) as u32;
-            row_ids_per_fragment
-                .entry(fragment_id)
-                .and_modify(|v| v.push(offset))
-                .or_insert_with(|| vec![offset]);
-        });
+        let row_id_meta = check_row_ids(row_ids);
 
-        let fragments = self.get_fragments();
-        let fragment_and_indices = fragments.iter().filter_map(|f| {
-            let local_row_ids = row_ids_per_fragment.get(&(f.id() as u64))?;
-            Some((f, local_row_ids))
-        });
+        if row_id_meta.contiguous {
+            // Fastest path: Can use `read_range` directly
+            let start = row_ids.first().expect("empty range passed to take_rows");
+            let fragment_id = (start >> 32) as usize;
+            let range_start = *start as u32 as usize;
+            let range_end =
+                *row_ids.last().expect("empty range passed to take_rows") as u32 as usize;
+            let range = range_start..(range_end + 1);
 
-        let projection_with_row_id = Schema::merge(
-            projection,
-            &ArrowSchema::new(vec![ArrowField::new(
-                ROW_ID,
-                arrow::datatypes::DataType::UInt64,
-                false,
-            )]),
-        )?;
-        let schema_with_row_id = Arc::new(ArrowSchema::from(&projection_with_row_id));
+            let fragment = self.get_fragment(fragment_id).ok_or_else(|| {
+                Error::invalid_input(format!("row_id belongs to non-existant fragment: {start}"))
+            })?;
 
-        let batches = stream::iter(fragment_and_indices)
-            .then(|(fragment, indices)| fragment.take_rows(indices, projection, true))
-            .try_collect::<Vec<_>>()
-            .await?;
+            let reader = fragment.open(projection).await?;
+            reader.read_range(range).await
+        } else if row_id_meta.sorted {
+            // Don't need to re-arrange data, just concatenate
 
-        let one_batch = concat_batches(&schema_with_row_id, &batches)?;
-        // Note: one_batch may contains fewer rows than the number of requested
-        // row ids because some rows may have been deleted. Because of this, we
-        // get the results with row ids so that we can re-order the results
-        // to match the requested order.
+            let mut batches: Vec<RecordBatch> = Vec::new();
+            let mut current_fragment = row_ids[0] >> 32;
+            let mut current_start = 0;
+            let mut row_ids_iter = row_ids.iter().enumerate();
+            'outer: loop {
+                let (fragment_id, range) = loop {
+                    if let Some((i, row_id)) = row_ids_iter.next() {
+                        let fragment_id = row_id >> 32;
+                        if fragment_id != current_fragment {
+                            let next = (current_fragment, current_start..i);
+                            current_fragment = fragment_id;
+                            current_start = i;
+                            break next;
+                        }
+                    } else {
+                        if current_start != row_ids.len() {
+                            let next = (current_fragment, current_start..row_ids.len());
+                            current_start = row_ids.len();
+                            break next;
+                        } else {
+                            break 'outer;
+                        }
+                    }
+                };
 
-        let returned_row_ids = one_batch
-            .column_by_name(ROW_ID)
-            .ok_or_else(|| Error::Internal {
-                message: "ROW_ID column not found".into(),
-            })?
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal {
-                message: "ROW_ID column is not UInt64Array".into(),
-            })?
-            .values();
+                let fragment = self.get_fragment(fragment_id as usize).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "row_id belongs to non-existant fragment: {}",
+                        row_ids[current_start]
+                    ))
+                })?;
+                let row_ids: Vec<u32> = row_ids[range].iter().map(|x| *x as u32).collect();
+                let batch = fragment.take_rows(&row_ids, projection, false).await?;
+                batches.push(batch);
+            }
+            Ok(concat_batches(&batches[0].schema(), &batches)?)
+        } else {
+            let projection_with_row_id = Schema::merge(
+                projection,
+                &ArrowSchema::new(vec![ArrowField::new(
+                    ROW_ID,
+                    arrow::datatypes::DataType::UInt64,
+                    false,
+                )]),
+            )?;
+            let schema_with_row_id = Arc::new(ArrowSchema::from(&projection_with_row_id));
 
-        let remapping_index: UInt64Array = row_ids
-            .iter()
-            .filter_map(|o| {
-                returned_row_ids
-                    .iter()
-                    .position(|id| id == o)
-                    .map(|pos| pos as u64)
-            })
-            .collect();
+            // Slow case: need to re-map data into expected order
+            let mut sorted_row_ids = Vec::from(row_ids);
+            sorted_row_ids.sort();
+            // Group ROW Ids by the fragment
+            let mut row_ids_per_fragment: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+            sorted_row_ids.iter().for_each(|row_id| {
+                let fragment_id = row_id >> 32;
+                let offset = (row_id - (fragment_id << 32)) as u32;
+                row_ids_per_fragment
+                    .entry(fragment_id)
+                    .and_modify(|v| v.push(offset))
+                    .or_insert_with(|| vec![offset]);
+            });
 
-        debug_assert_eq!(remapping_index.len(), one_batch.num_rows());
+            let fragments = self.get_fragments();
+            let fragment_and_indices = fragments.iter().filter_map(|f| {
+                let local_row_ids = row_ids_per_fragment.get(&(f.id() as u64))?;
+                Some((f, local_row_ids))
+            });
 
-        // Remove the row id column.
-        let keep_indices = (0..one_batch.num_columns() - 1).collect::<Vec<_>>();
-        let one_batch = one_batch.project(&keep_indices)?;
-        let struct_arr: StructArray = one_batch.into();
-        let reordered = take(&struct_arr, &remapping_index, None)?;
-        Ok(as_struct_array(&reordered).into())
+            let mut batches = stream::iter(fragment_and_indices)
+                .then(|(fragment, indices)| fragment.take_rows(indices, projection, true))
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            let one_batch = if batches.len() > 1 {
+                concat_batches(&schema_with_row_id, &batches)?
+            } else {
+                batches.pop().unwrap()
+            };
+            // Note: one_batch may contains fewer rows than the number of requested
+            // row ids because some rows may have been deleted. Because of this, we
+            // get the results with row ids so that we can re-order the results
+            // to match the requested order.
+
+            let returned_row_ids = one_batch
+                .column_by_name(ROW_ID)
+                .ok_or_else(|| Error::Internal {
+                    message: "ROW_ID column not found".into(),
+                })?
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal {
+                    message: "ROW_ID column is not UInt64Array".into(),
+                })?
+                .values();
+
+            
+
+            let remapping_index: UInt64Array = row_ids
+                .iter()
+                .filter_map(|o| {
+                    returned_row_ids
+                        .iter()
+                        .position(|id| id == o)
+                        .map(|pos| pos as u64)
+                })
+                .collect();
+
+            debug_assert_eq!(remapping_index.len(), one_batch.num_rows());
+
+
+            // Remove the row id column.
+            let keep_indices = (0..one_batch.num_columns() - 1).collect::<Vec<_>>();
+            let one_batch = one_batch.project(&keep_indices)?;
+            let struct_arr: StructArray = one_batch.into();
+            let reordered = take(&struct_arr, &remapping_index, None)?;
+            Ok(as_struct_array(&reordered).into())
+        }
     }
 
     /// Sample `n` rows from the dataset.
@@ -1145,6 +1214,30 @@ fn write_manifest_file_to_path<'a>(
         object_writer.shutdown().await?;
         Ok(())
     })
+}
+
+struct RowIdMeta {
+    sorted: bool,
+    contiguous: bool,
+}
+
+fn check_row_ids(row_ids: &[u64]) -> RowIdMeta {
+    let mut sorted = true;
+    let mut contiguous = true;
+
+    if row_ids.is_empty() {
+        return RowIdMeta { sorted, contiguous };
+    }
+
+    let mut last_id = row_ids[0];
+
+    for id in row_ids.iter().skip(1) {
+        sorted &= *id > last_id;
+        contiguous &= *id == last_id + 1;
+        last_id = *id;
+    }
+
+    RowIdMeta { sorted, contiguous }
 }
 
 #[cfg(test)]
