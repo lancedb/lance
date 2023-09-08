@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import os
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -31,7 +33,7 @@ from pyarrow._compute import Expression
 from .commit import CommitLock
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import __version__ as __version__
-from .lance import _Dataset, _Scanner, _write_dataset
+from .lance import _Dataset, _Operation, _Scanner, _write_dataset
 
 try:
     import pandas as pd
@@ -680,21 +682,37 @@ class LanceDataset(pa.dataset.Dataset):
     @staticmethod
     def _commit(
         base_uri: Union[str, Path],
-        new_schema: pa.Schema,
-        fragments: Iterable[FragmentMetadata],
-        mode: str = "append",
+        operation: LanceOperation.BaseOperation,
+        read_version: Optional[int] = None,
+        commit_lock: Optional[CommitLock] = None,
     ) -> LanceDataset:
-        """Create a new version of dataset with collected fragments.
+        """Create a new version of dataset
 
-        This method allows users to commit a version of dataset in a distributed
-        environment.
+        This method is an advanced method which allows users to describe a change
+        that has been made to the data files.  This method is not needed when using
+        Lance to apply changes (e.g. when using :py:class:`LanceDataset` or
+        :py:func:`write_dataset`.)
+
+        It's current purpose is to allow for changes being made in a distributed
+        environment where no single process is doing all of the work.  For example,
+        a distributed bulk update or a distributed bulk modify operation.
+
+        Once all of the changes have been made, this method can be called to make
+        the changes visible by updating the dataset manifest.
 
         Parameters
         ----------
-        new_schema : pa.Schema
-            The schema for the new version of dataset.
-        fragments : list[FragmentMetadata]
-            The fragments to create new version of dataset.
+        base_uri: str or Path
+            The base uri of the dataset
+        operation: BaseOperation
+            The operation to apply to the dataset.  This describes what changes
+            have been made.
+        read_version: int, optional
+            The version of the dataset that was used as the base for the changes.
+            This is not needed for overwrite or restore operations.
+        commit_lock : CommitLock, optional
+            A custom commit lock.  Only needed if your object store does not support
+            atomic commits.  See the user guide for more details.
 
         Returns
         -------
@@ -708,8 +726,21 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
-        if not isinstance(new_schema, pa.Schema):
-            raise TypeError(f"schema must be pyarrow.Schema, got {type(new_schema)}")
+
+        if commit_lock:
+            if not callable(commit_lock):
+                raise TypeError(
+                    f"commit_lock must be a function, got {type(commit_lock)}"
+                )
+
+        _Dataset.commit(base_uri, operation._to_inner(), read_version, commit_lock)
+        return LanceDataset(base_uri)
+
+
+# LanceOperation is a namespace for operations that can be applied to a dataset.
+class LanceOperation:
+    @staticmethod
+    def _validate_fragments(fragments):
         if not isinstance(fragments, list):
             raise TypeError(
                 f"fragments must be list[FragmentMetadata], got {type(fragments)}"
@@ -720,10 +751,86 @@ class LanceDataset(pa.dataset.Dataset):
             raise TypeError(
                 f"fragments must be list[FragmentMetadata], got {type(fragments[0])}"
             )
-        raw_fragments = [f._metadata for f in fragments]
-        # TODO: make fragments as a generator
-        _Dataset.commit(base_uri, new_schema, raw_fragments)
-        return LanceDataset(base_uri)
+
+    class BaseOperation(ABC):
+        @abstractmethod
+        def _to_inner(self):
+            raise NotImplementedError()
+
+    @dataclass
+    class Overwrite(BaseOperation):
+        new_schema: pa.Schema
+        fragments: Iterable[FragmentMetadata]
+
+        def __post_init__(self):
+            if not isinstance(self.new_schema, pa.Schema):
+                raise TypeError(
+                    f"schema must be pyarrow.Schema, got {type(self.new_schema)}"
+                )
+            LanceOperation._validate_fragments(self.fragments)
+
+        def _to_inner(self):
+            raw_fragments = [f._metadata for f in self.fragments]
+            return _Operation.overwrite(self.new_schema, raw_fragments)
+
+    @dataclass
+    class Append(BaseOperation):
+        fragments: Iterable[FragmentMetadata]
+
+        def __post_init__(self):
+            LanceOperation._validate_fragments(self.fragments)
+
+        def _to_inner(self):
+            raw_fragments = [f._metadata for f in self.fragments]
+            return _Operation.append(raw_fragments)
+
+    @dataclass
+    class Delete(BaseOperation):
+        updated_fragments: Iterable[FragmentMetadata]
+        deleted_fragment_ids: Iterable[int]
+        predicate: str
+
+        def __post_init__(self):
+            LanceOperation._validate_fragments(self.updated_fragments)
+
+        def _to_inner(self):
+            raw_updated_fragments = [f._metadata for f in self.updated_fragments]
+            return _Operation.delete(
+                raw_updated_fragments, self.deleted_fragment_ids, self.predicate
+            )
+
+    @dataclass
+    class Rewrite(BaseOperation):
+        old_fragments: Iterable[FragmentMetadata]
+        new_fragments: Iterable[FragmentMetadata]
+
+        def __post_init__(self):
+            LanceOperation._validate_fragments(self.old_fragments)
+            LanceOperation._validate_fragments(self.new_fragments)
+
+        def _to_inner(self):
+            raw_old_fragments = [f._metadata for f in self.old_fragments]
+            raw_new_fragments = [f._metadata for f in self.new_fragments]
+            return _Operation.rewrite(raw_old_fragments, raw_new_fragments)
+
+    @dataclass
+    class Merge(BaseOperation):
+        fragments: Iterable[FragmentMetadata]
+        schema: pa.Schema
+
+        def __post_init__(self):
+            LanceOperation._validate_fragments(self.fragments)
+
+        def _to_inner(self):
+            raw_fragments = [f._metadata for f in self.fragments]
+            return _Operation.merge(raw_fragments, self.schema)
+
+    @dataclass
+    class Restore(BaseOperation):
+        version: int
+
+        def _to_inner(self):
+            return _Operation.restore(self.version)
 
 
 class ScannerBuilder:
@@ -991,6 +1098,9 @@ def write_dataset(
         The max number of rows to write before starting a new file
     max_rows_per_group: int, default 1024
         The max number of rows before starting a new group (in the same file)
+    commit_lock : CommitLock, optional
+        A custom commit lock.  Only needed if your object store does not support
+        atomic commits.  See the user guide for more details.
 
     """
     reader = _coerce_reader(data_obj, schema)

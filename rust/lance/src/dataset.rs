@@ -559,45 +559,96 @@ impl Dataset {
         Ok(())
     }
 
-    /// Create a new version of [`Dataset`] from a collection of fragments.
+    /// Commit changes to the dataset
+    ///
+    /// This operation is not needed if you are using append/write/delete to manipulate the dataset.
+    /// It is used to commit changes to the dataset that are made externally.  For example, a bulk
+    /// import tool may import large amounts of new data and write the appropriate lance files
+    /// directly instead of using the write function.
+    ///
+    /// This method can be used to commit this change to the dataset's manifest.  This method will
+    /// not verify that the provided fragments exist and correct, that is the caller's responsibility.
+    ///
+    /// If this commit is a change to an existing dataset then it will often need to be based on an
+    /// existing version of the dataset.  For example, if this change is a `delete` operation then
+    /// the caller will have read in the existing data (at some version) to determine which fragments
+    /// need to be deleted.  The base version that the caller used should be supplied as the `read_version`
+    /// parameter.  Some operations (e.g. Overwrite) do not depend on a previous version and `read_version`
+    /// can be None.  An error will be returned if the `read_version` is needed for an operation and
+    /// it is not specified.
+    ///
+    /// All operations except Overwrite will fail if the dataset does not already exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_uri` - The base URI of the dataset
+    /// * `operation` - A description of the change to commit
+    /// * `read_version` - The version of the dataset that this change is based on
+    /// * `store_params` Parameters controlling object store access to the manifest
     pub async fn commit(
         base_uri: &str,
-        schema: &Schema,
-        fragments: &[Fragment],
-        mode: WriteMode,
+        operation: Operation,
+        read_version: Option<u64>,
+        store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        let (object_store, base) = ObjectStore::from_uri(base_uri).await?;
+        let read_version = read_version.map_or_else(
+            || match operation {
+                Operation::Overwrite { .. } | Operation::Restore { .. } => Ok(0),
+                _ => Err(Error::invalid_input(
+                    "read_version must be specified for this operation",
+                )),
+            },
+            Ok,
+        )?;
+
+        let (object_store, base) =
+            ObjectStore::from_uri_and_params(base_uri, &store_params.clone().unwrap_or_default())
+                .await?;
+
+        // Test if the dataset exists
         let latest_manifest = object_store
             .commit_handler
             .resolve_latest_version(&base, &object_store)
             .await?;
-        let mut indices = vec![];
-        let mut manifest = if object_store.exists(&latest_manifest).await? {
-            let dataset = Self::open(base_uri).await?;
+        let flag_dataset_exists = object_store.exists(&latest_manifest).await?;
 
-            if matches!(mode, WriteMode::Append) {
-                // Append mode: inherit indices from previous version.
-                indices = dataset.load_indices().await?;
-            }
+        if !flag_dataset_exists && !matches!(operation, Operation::Overwrite { .. }) {
+            return Err(Error::DatasetNotFound {
+                path: base.to_string(),
+                source: "The dataset must already exist unless the operation is Overwrite".into(),
+            });
+        }
 
-            let dataset_schema = dataset.schema();
-            let added_on_schema = schema.exclude(dataset_schema)?;
-            let schema = dataset_schema.merge(&added_on_schema)?;
-
-            Manifest::new_from_previous(&dataset.manifest, &schema, Arc::new(fragments.to_vec()))
+        let dataset = if flag_dataset_exists {
+            Some(
+                Self::open_with_params(
+                    base_uri,
+                    &ReadParams {
+                        store_options: store_params.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await?,
+            )
         } else {
-            Manifest::new(schema, Arc::new(fragments.to_vec()))
+            None
         };
 
-        // Preserve indices.
-        write_manifest_file(
-            &object_store,
-            &base,
-            &mut manifest,
-            Some(indices),
-            &Default::default(),
-        )
-        .await?;
+        let transaction = Transaction::new(read_version, operation, None);
+
+        let manifest = if let Some(dataset) = &dataset {
+            commit_transaction(
+                dataset,
+                &object_store,
+                &transaction,
+                &Default::default(),
+                &Default::default(),
+            )
+            .await?
+        } else {
+            commit_new_dataset(&object_store, &base, &transaction, &Default::default()).await?
+        };
+
         Ok(Self {
             object_store: Arc::new(object_store),
             base,

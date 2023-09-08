@@ -347,4 +347,4 @@ class LanceFragment(pa.dataset.Fragment):
         FragmentMetadata
         """
 
-        return FragmentMetadata(self._fragment.metadata())
+        return FragmentMetadata(self._fragment.metadata().json())
