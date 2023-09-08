@@ -420,11 +420,9 @@ def test_delete_with_commit(tmp_path: Path):
 
     fragments = lance.dataset(base_dir).get_fragments()
 
-    fragment = lance.fragment.LanceFragment.create(
-        base_dir, half_table, fragment_id=fragments[0].fragment_id
-    )
+    updated_fragment = fragments[0].delete("a >= 50")
     delete = lance.LanceOperation.Delete(
-        [fragment], [fragments[1].fragment_id], "hello"
+        [updated_fragment], [fragments[1].fragment_id], "hello"
     )
 
     dataset = lance.LanceDataset._commit(base_dir, delete, read_version=2)

@@ -56,20 +56,17 @@ const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 
 #[pyclass(name = "_Operation", module = "_lib")]
 #[derive(Clone)]
-pub struct Operation {
-    inner: LanceOperation,
-}
+pub struct Operation(LanceOperation);
 
-fn convert_fragments(fragments: Vec<&PyAny>) -> PyResult<Vec<Fragment>> {
+fn into_fragments(fragments: Vec<FragmentMetadata>) -> Vec<Fragment> {
     fragments
-        .iter()
-        .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
-        .collect::<PyResult<Vec<Fragment>>>()
+        .into_iter()
+        .map(|f| f.inner)
+        .collect::<Vec<Fragment>>()
 }
 
-fn convert_schema(schema: &PyAny) -> PyResult<Schema> {
-    let arrow_schema = ArrowSchema::from_pyarrow(schema)?;
-    Schema::try_from(&arrow_schema).map_err(|e| {
+fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
+    Schema::try_from(arrow_schema).map_err(|e| {
         PyValueError::new_err(format!(
             "Failed to convert Arrow schema to Lance schema: {}",
             e
@@ -80,62 +77,68 @@ fn convert_schema(schema: &PyAny) -> PyResult<Schema> {
 #[pymethods]
 impl Operation {
     fn __repr__(&self) -> String {
-        "".to_string()
+        format!("{:?}", self.0)
     }
 
     #[staticmethod]
-    fn overwrite(schema: &PyAny, fragments: Vec<&PyAny>) -> PyResult<Self> {
-        let schema = convert_schema(schema)?;
-        let fragments = convert_fragments(fragments)?;
+    fn overwrite(
+        schema: PyArrowType<ArrowSchema>,
+        fragments: Vec<FragmentMetadata>,
+    ) -> PyResult<Self> {
+        let schema = convert_schema(&schema.0)?;
+        let fragments = into_fragments(fragments);
         let op = LanceOperation::Overwrite { fragments, schema };
-        Ok(Self { inner: op })
+        Ok(Self(op))
     }
 
     #[staticmethod]
-    fn append(fragments: Vec<&PyAny>) -> PyResult<Self> {
-        let fragments = convert_fragments(fragments)?;
+    fn append(fragments: Vec<FragmentMetadata>) -> PyResult<Self> {
+        let fragments = into_fragments(fragments);
         let op = LanceOperation::Append { fragments };
-        Ok(Self { inner: op })
+        Ok(Self(op))
     }
 
     #[staticmethod]
     fn delete(
-        updated_fragments: Vec<&PyAny>,
+        updated_fragments: Vec<FragmentMetadata>,
         deleted_fragment_ids: Vec<u64>,
         predicate: String,
     ) -> PyResult<Self> {
-        let updated_fragments = convert_fragments(updated_fragments)?;
+        let updated_fragments = into_fragments(updated_fragments);
         let op = LanceOperation::Delete {
             updated_fragments,
             deleted_fragment_ids,
             predicate,
         };
-        Ok(Self { inner: op })
+        Ok(Self(op))
     }
 
     #[staticmethod]
-    fn rewrite(old_fragments: Vec<&PyAny>, new_fragments: Vec<&PyAny>) -> PyResult<Self> {
-        let old_fragments = convert_fragments(old_fragments)?;
-        let new_fragments = convert_fragments(new_fragments)?;
+    fn rewrite(
+        old_fragments: Vec<FragmentMetadata>,
+        new_fragments: Vec<FragmentMetadata>,
+    ) -> PyResult<Self> {
+        let old_fragments = into_fragments(old_fragments);
+        let new_fragments = into_fragments(new_fragments);
         let op = LanceOperation::Rewrite {
             old_fragments,
             new_fragments,
         };
-        Ok(Self { inner: op })
+        Ok(Self(op))
     }
 
     #[staticmethod]
-    fn merge(fragments: Vec<&PyAny>, schema: &PyAny) -> PyResult<Self> {
-        let schema = convert_schema(schema)?;
-        let fragments = convert_fragments(fragments)?;
+    fn merge(fragments: Vec<FragmentMetadata>, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
+        let schema = convert_schema(&schema.0)?;
+        let fragments = into_fragments(fragments);
         let op = LanceOperation::Merge { fragments, schema };
-        Ok(Self { inner: op })
+        Ok(Self(op))
     }
 
     #[staticmethod]
     fn restore(version: u64) -> PyResult<Self> {
         let op = LanceOperation::Restore { version };
-        Ok(Self { inner: op })
+        Ok(Self(op))
     }
 }
 
@@ -593,7 +596,7 @@ impl Dataset {
         let ds = RT
             .block_on(
                 options.map(|opts| opts.py()),
-                LanceDataset::commit(dataset_uri, operation.inner, read_version, store_params),
+                LanceDataset::commit(dataset_uri, operation.0, read_version, store_params),
             )
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {

@@ -682,21 +682,36 @@ class LanceDataset(pa.dataset.Dataset):
     @staticmethod
     def _commit(
         base_uri: Union[str, Path],
-        operation: LanceOperation.Overwrite,
+        operation: LanceOperation.BaseOperation,
         read_version: Optional[int] = None,
         options: Optional[Dict[str, Any]] = None,
     ) -> LanceDataset:
-        """Create a new version of dataset with collected fragments.
+        """Create a new version of dataset
 
-        This method allows users to commit a version of dataset in a distributed
-        environment.
+        This method is an advanced method which allows users to describe a change
+        that has been made to the data files.  This method is not needed when using
+        lancedb to apply changes (e.g. when using the Dataset class)
+
+        It's current purpose is to allow for changes being made in a distributed
+        environment where no single process is doing all of the work.  For example,
+        a distributed bulk update or a distributed bulk modify operation.
+
+        Once all of the changes have been made, this method can be called to make
+        the changes visible by updating the dataset manifest.
 
         Parameters
         ----------
-        new_schema : pa.Schema
-            The schema for the new version of dataset.
-        fragments : list[FragmentMetadata]
-            The fragments to create new version of dataset.
+        base_uri: str or Path
+            The base uri of the dataset
+        operation: BaseOperation
+            The operation to apply to the dataset.  This describes what changes
+            have been made.
+        read_version: int, optional
+            The version of the dataset that was used as the base for the changes.
+            This is not needed for overwrite or restore operations.
+        options : dict, optional
+            Options for controlling how the commit is performed.  For example,
+            what object store to use to access the manifest.
 
         Returns
         -------
@@ -715,11 +730,8 @@ class LanceDataset(pa.dataset.Dataset):
         return LanceDataset(base_uri)
 
 
-class BaseOperation(ABC):
-    @abstractmethod
-    def _to_inner(self):
-        raise NotImplementedError()
-
+# LanceOperation is a namespace for operations that can be applied to a dataset.
+class LanceOperation:
     @staticmethod
     def _validate_fragments(fragments):
         if not isinstance(fragments, list):
@@ -733,9 +745,11 @@ class BaseOperation(ABC):
                 f"fragments must be list[FragmentMetadata], got {type(fragments[0])}"
             )
 
+    class BaseOperation(ABC):
+        @abstractmethod
+        def _to_inner(self):
+            raise NotImplementedError()
 
-# LanceOperation is a namespace for operations that can be applied to a dataset.
-class LanceOperation:
     @dataclass
     class Overwrite(BaseOperation):
         new_schema: pa.Schema
@@ -746,11 +760,10 @@ class LanceOperation:
                 raise TypeError(
                     f"schema must be pyarrow.Schema, got {type(self.new_schema)}"
                 )
-            BaseOperation._validate_fragments(self.fragments)
+            LanceOperation._validate_fragments(self.fragments)
 
         def _to_inner(self):
             raw_fragments = [f._metadata for f in self.fragments]
-            # TODO: make fragments as a generator
             return _Operation.overwrite(self.new_schema, raw_fragments)
 
     @dataclass
@@ -758,7 +771,7 @@ class LanceOperation:
         fragments: Iterable[FragmentMetadata]
 
         def __post_init__(self):
-            BaseOperation._validate_fragments(self.fragments)
+            LanceOperation._validate_fragments(self.fragments)
 
         def _to_inner(self):
             raw_fragments = [f._metadata for f in self.fragments]
@@ -771,7 +784,7 @@ class LanceOperation:
         predicate: str
 
         def __post_init__(self):
-            BaseOperation._validate_fragments(self.updated_fragments)
+            LanceOperation._validate_fragments(self.updated_fragments)
 
         def _to_inner(self):
             raw_updated_fragments = [f._metadata for f in self.updated_fragments]
@@ -785,8 +798,8 @@ class LanceOperation:
         new_fragments: Iterable[FragmentMetadata]
 
         def __post_init__(self):
-            BaseOperation._validate_fragments(self.old_fragments)
-            BaseOperation._validate_fragments(self.new_fragments)
+            LanceOperation._validate_fragments(self.old_fragments)
+            LanceOperation._validate_fragments(self.new_fragments)
 
         def _to_inner(self):
             raw_old_fragments = [f._metadata for f in self.old_fragments]
@@ -799,7 +812,7 @@ class LanceOperation:
         schema: pa.Schema
 
         def __post_init__(self):
-            BaseOperation._validate_fragments(self.fragments)
+            LanceOperation._validate_fragments(self.fragments)
 
         def _to_inner(self):
             raw_fragments = [f._metadata for f in self.fragments]
