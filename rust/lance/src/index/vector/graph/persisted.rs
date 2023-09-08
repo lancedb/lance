@@ -15,26 +15,24 @@
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{as_list_array, as_primitive_array};
-use arrow_array::cast::AsArray;
-use arrow_array::Float32Array;
 use arrow_array::{
     builder::{FixedSizeBinaryBuilder, ListBuilder, UInt32Builder},
-    Array, RecordBatch, UInt32Array,
+    cast::{as_list_array, as_primitive_array, AsArray},
+    Array, Float32Array, RecordBatch, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
+use lance_arrow::{as_fixed_size_binary_array, as_fixed_size_list_array};
+use lance_linalg::distance::l2::L2;
 use lru_time_cache::LruCache;
 use object_store::path::Path;
 
 use super::{builder::GraphBuilder, Graph};
 use super::{Vertex, VertexSerDe};
-use crate::arrow::as_fixed_size_list_array;
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 use crate::index::vector::diskann::RowVertex;
 use crate::io::{FileReader, FileWriter, ObjectStore};
-use crate::{arrow::as_fixed_size_binary_array, linalg::l2::L2};
 use crate::{Error, Result};
 
 const NEIGHBORS_COL: &str = "neighbors";
@@ -336,14 +334,14 @@ pub async fn write_graph<V: Vertex + Clone + Sync + Send>(
 #[cfg(test)]
 mod tests {
     use arrow_array::{FixedSizeListArray, RecordBatchIterator};
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_linalg::MatrixView;
+    use lance_testing::datagen::generate_random_array;
 
     use super::*;
     use crate::{
-        arrow::{linalg::matrix::MatrixView, FixedSizeListArrayExt},
-        dataset::WriteParams,
-        index::vector::diskann::row_vertex::RowVertexSerDe,
+        dataset::WriteParams, index::vector::diskann::row_vertex::RowVertexSerDe,
         index::vector::MetricType,
-        utils::datagen::generate_random_array,
     };
 
     #[derive(Clone, Debug)]

@@ -26,11 +26,12 @@ use log::{info, warn};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 
-use crate::arrow::linalg::matrix::MatrixView;
 use crate::index::vector::MetricType;
-use crate::linalg::{cosine::Cosine, dot::Dot, l2::L2};
-use crate::Error;
-use crate::Result;
+use crate::{Error, Result};
+use lance_linalg::{
+    distance::{Cosine, Dot, L2},
+    matrix::MatrixView,
+};
 
 /// KMean initialization method.
 #[derive(Debug, PartialEq, Eq)]

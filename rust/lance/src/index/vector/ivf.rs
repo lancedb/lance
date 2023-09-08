@@ -32,6 +32,8 @@ use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
 };
+use lance_arrow::*;
+use lance_linalg::{kernels::argmin, matrix::MatrixView};
 use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
@@ -44,7 +46,6 @@ use super::{
     MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
 use crate::{
-    arrow::{linalg::matrix::MatrixView, *},
     dataset::{Dataset, ROW_ID},
     datatypes::Field,
     index::{pb, prefilter::PreFilter, vector::Transformer, Index},
@@ -880,14 +881,12 @@ mod tests {
 
     use arrow_array::{cast::AsArray, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
+    use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
     use std::collections::HashMap;
 
-    use crate::{
-        index::{vector::VectorIndexParams, DatasetIndexExt, IndexType},
-        utils::datagen::generate_random_array,
-    };
+    use crate::index::{vector::VectorIndexParams, DatasetIndexExt, IndexType};
 
     #[tokio::test]
     async fn test_create_ivf_pq_with_centroids() {

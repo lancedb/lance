@@ -214,13 +214,13 @@ mod test {
     use std::{collections::HashMap, time::Duration};
 
     use futures::{future::join_all, StreamExt, TryStreamExt};
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
     use tokio::sync::Mutex;
 
     use crate::{
         dataset::{ReadParams, WriteMode, WriteParams},
         io::object_store::ObjectStoreParams,
-        utils::datagen::{BatchGenerator, IncrementingInt32},
         Dataset,
     };
 
@@ -334,7 +334,7 @@ mod test {
         // First write a dataset WITHOUT external store
         let mut data_gen =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
-        let reader = data_gen.batch(100).unwrap();
+        let reader = data_gen.batch(100);
         let dir = tempfile::tempdir().unwrap();
         let ds_uri = dir.path().to_str().unwrap();
         Dataset::write(reader, ds_uri, None).await.unwrap();
@@ -360,7 +360,7 @@ mod test {
 
         let mut data_gen =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
-        let reader = data_gen.batch(100).unwrap();
+        let reader = data_gen.batch(100);
         let dir = tempfile::tempdir().unwrap();
         let ds_uri = dir.path().to_str().unwrap();
         Dataset::write(reader, ds_uri, Some(write_params(handler.clone())))
@@ -391,7 +391,7 @@ mod test {
             let ds_uri = dir.path().to_str().unwrap();
 
             Dataset::write(
-                data_gen.batch(10).unwrap(),
+                data_gen.batch(10),
                 ds_uri,
                 Some(write_params(handler.clone())),
             )
@@ -400,7 +400,7 @@ mod test {
 
             // we have 5 retries by default, more than this will just fail
             let write_futs = (0..5)
-                .map(|_| data_gen.batch(10).unwrap())
+                .map(|_| data_gen.batch(10))
                 .map(|data| {
                     let mut params = write_params(handler.clone());
                     params.mode = WriteMode::Append;
@@ -441,7 +441,7 @@ mod test {
         let ds_uri = dir.path().to_str().unwrap();
 
         let mut ds = Dataset::write(
-            data_gen.batch(10).unwrap(),
+            data_gen.batch(10),
             ds_uri,
             Some(write_params(handler.clone())),
         )
@@ -449,7 +449,7 @@ mod test {
         .unwrap();
 
         for _ in 0..5 {
-            let data = data_gen.batch(10).unwrap();
+            let data = data_gen.batch(10);
             let mut params = write_params(handler.clone());
             params.mode = WriteMode::Append;
             ds = Dataset::write(data, ds_uri, Some(params)).await.unwrap();

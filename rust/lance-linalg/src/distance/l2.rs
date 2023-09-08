@@ -248,8 +248,7 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
-    use arrow::array::{as_primitive_array, FixedSizeListArray};
-    use arrow_array::types::Float32Type;
+    use arrow_array::{cast::AsArray, types::Float32Type, FixedSizeListArray};
 
     #[test]
     fn test_euclidean_distance() {
@@ -265,7 +264,7 @@ mod tests {
         let point = Float32Array::from((2..10).map(|v| Some(v as f32)).collect::<Vec<_>>());
         let distances = l2_distance_batch(
             point.values(),
-            as_primitive_array::<Float32Type>(mat.values().as_ref()).values(),
+            mat.values().as_primitive::<Float32Type>().values(),
             8,
         );
 

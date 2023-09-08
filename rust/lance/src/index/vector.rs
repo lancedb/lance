@@ -32,6 +32,8 @@ pub mod pq;
 mod traits;
 mod utils;
 
+use lance_linalg::distance::*;
+
 use self::{
     ivf::{build_ivf_pq_index, IVFIndex, IvfBuildParams},
     pq::{PQBuildParams, PQIndex},
@@ -53,11 +55,6 @@ use crate::{
     io::{
         object_reader::{read_message, ObjectReader},
         read_message_from_buf, read_metadata_offset,
-    },
-    linalg::{
-        cosine::{cosine_distance, cosine_distance_batch},
-        dot::{dot_distance, dot_distance_batch},
-        l2::{l2_distance, l2_distance_batch},
     },
     Error, Result,
 };

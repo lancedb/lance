@@ -1,42 +1,33 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Data generation utilities for unit tests
 
 use std::iter::repeat_with;
 use std::sync::Arc;
 
-use crate::{
-    arrow::{fixed_size_list_type, FixedSizeListArrayExt},
-    Result,
-};
-
 use arrow_array::{
     ArrowNumericType, Float32Array, Int32Array, NativeAdapter, PrimitiveArray, RecordBatch,
     RecordBatchIterator, RecordBatchReader,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use num_traits::real::Real;
-use num_traits::FromPrimitive;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use lance_arrow::{fixed_size_list_type, FixedSizeListArrayExt};
+use num_traits::{real::Real, FromPrimitive};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 pub trait ArrayGenerator {
-    fn generate(&mut self, length: usize) -> Result<Arc<dyn arrow_array::Array>>;
+    fn generate(&mut self, length: usize) -> Arc<dyn arrow_array::Array>;
     fn data_type(&self) -> &DataType;
     fn name(&self) -> Option<&str>;
 }
@@ -79,13 +70,13 @@ impl IncrementingInt32 {
 }
 
 impl ArrayGenerator for IncrementingInt32 {
-    fn generate(&mut self, length: usize) -> Result<Arc<dyn arrow_array::Array>> {
+    fn generate(&mut self, length: usize) -> Arc<dyn arrow_array::Array> {
         let mut values = Vec::with_capacity(length);
         for _ in 0..length {
             values.push(self.current);
             self.current += self.step;
         }
-        Ok(Arc::new(Int32Array::from(values)))
+        Arc::new(Int32Array::from(values))
     }
 
     fn name(&self) -> Option<&str> {
@@ -131,14 +122,15 @@ impl RandomVector {
 }
 
 impl ArrayGenerator for RandomVector {
-    fn generate(&mut self, length: usize) -> Result<Arc<dyn arrow_array::Array>> {
+    fn generate(&mut self, length: usize) -> Arc<dyn arrow_array::Array> {
         let values = generate_random_array(length * (self.vec_width as usize));
-        Ok(Arc::new(
+        Arc::new(
             <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
                 values,
                 self.vec_width,
-            )?,
-        ))
+            )
+            .expect("Create fixed size list"),
+        )
     }
 
     fn name(&self) -> Option<&str> {
@@ -165,22 +157,19 @@ impl BatchGenerator {
         self
     }
 
-    pub fn batch(&mut self, num_rows: i32) -> Result<impl RecordBatchReader> {
+    pub fn batch(&mut self, num_rows: i32) -> impl RecordBatchReader {
         let mut fields = Vec::with_capacity(self.generators.len());
         let mut arrays = Vec::with_capacity(self.generators.len());
         for (field_index, gen) in self.generators.iter_mut().enumerate() {
-            let arr = gen.generate(num_rows as usize)?;
+            let arr = gen.generate(num_rows as usize);
             let default_name = format!("field_{}", field_index);
             let name = gen.name().unwrap_or(&default_name);
             fields.push(Field::new(name, arr.data_type().clone(), true));
             arrays.push(arr);
         }
         let schema = Arc::new(ArrowSchema::new(fields));
-        let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-        Ok(RecordBatchIterator::new(
-            vec![batch].into_iter().map(Ok),
-            schema.clone(),
-        ))
+        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone())
     }
 }
 
@@ -191,7 +180,7 @@ impl BatchGenerator {
 /// There will only be one batch
 ///
 /// There are no other assumptions it is safe to make about the returned reader
-pub fn some_indexable_batch() -> Result<impl RecordBatchReader> {
+pub fn some_indexable_batch() -> impl RecordBatchReader {
     let x = Box::new(RandomVector::new().named("indexable".to_string()));
     BatchGenerator::new().col(x).batch(512)
 }
@@ -202,7 +191,7 @@ pub fn some_indexable_batch() -> Result<impl RecordBatchReader> {
 /// There will only be one batch
 ///
 /// There are no other assumptions it is safe to make about the returned reader
-pub fn some_batch() -> Result<impl RecordBatchReader> {
+pub fn some_batch() -> impl RecordBatchReader {
     some_indexable_batch()
 }
 

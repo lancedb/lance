@@ -24,9 +24,9 @@ use lance::{
         vector::{MetricType, VectorIndexParams},
         DatasetIndexExt, IndexType,
     },
-    utils::datagen::generate_random_array,
     Dataset,
 };
+use lance_testing::datagen::generate_random_array;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
@@ -61,7 +61,7 @@ async fn create_dataset(path: &std::path::Path, dim: usize, mode: WriteMode) {
     let write_params = WriteParams {
         max_rows_per_file: num_rows,
         max_rows_per_group: batch_size,
-        mode: mode,
+        mode,
         ..Default::default()
     };
 

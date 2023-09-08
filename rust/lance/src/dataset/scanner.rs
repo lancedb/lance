@@ -738,6 +738,7 @@ mod test {
     use arrow_schema::DataType;
     use arrow_select::take;
     use futures::TryStreamExt;
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use tempfile::tempdir;
 
     use super::*;
@@ -748,8 +749,6 @@ mod test {
         DatasetIndexExt,
         {vector::VectorIndexParams, IndexType},
     };
-    use crate::utils::datagen::BatchGenerator;
-    use crate::utils::datagen::IncrementingInt32;
 
     #[tokio::test]
     async fn test_batch_size() {
@@ -1971,7 +1970,7 @@ mod test {
         let mut data_gen = BatchGenerator::new().col(Box::new(
             IncrementingInt32::new().named("filter_me".to_owned()),
         ));
-        Dataset::write(data_gen.batch(32).unwrap(), test_uri, None)
+        Dataset::write(data_gen.batch(32), test_uri, None)
             .await
             .unwrap();
 

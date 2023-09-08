@@ -362,6 +362,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow_array::{RecordBatchIterator, RecordBatchReader};
     use chrono::Duration;
+    use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
     use tokio::io::AsyncWriteExt;
 
     use crate::{
@@ -375,7 +376,6 @@ mod tests {
             ObjectStore,
         },
         utils::{
-            datagen::{some_batch, BatchGenerator, IncrementingInt32},
             temporal::utc_now,
             testing::{assert_err_containing, MockClock, ProxyObjectStore, ProxyObjectStorePolicy},
         },
@@ -493,7 +493,7 @@ mod tests {
         }
 
         async fn write_some_data_impl(&self, mode: WriteMode) -> Result<()> {
-            self.write_data_impl(some_batch().unwrap(), mode).await?;
+            self.write_data_impl(some_batch(), mode).await?;
             Ok(())
         }
 
@@ -759,22 +759,13 @@ mod tests {
             IncrementingInt32::new().named("filter_me".to_owned()),
         ));
 
-        fixture
-            .create_with_data(data_gen.batch(16).unwrap())
-            .await
-            .unwrap();
-        fixture
-            .append_data(data_gen.batch(16).unwrap())
-            .await
-            .unwrap();
+        fixture.create_with_data(data_gen.batch(16)).await.unwrap();
+        fixture.append_data(data_gen.batch(16)).await.unwrap();
         // This will keep some data from the appended file and should
         // completely remove the first file
         fixture.delete_data("filter_me < 20").await.unwrap();
         fixture.clock.set_system_time(Duration::days(10));
-        fixture
-            .overwrite_data(data_gen.batch(16).unwrap())
-            .await
-            .unwrap();
+        fixture.overwrite_data(data_gen.batch(16)).await.unwrap();
         // This will delete half of the last fragment
         fixture.delete_data("filter_me >= 40").await.unwrap();
 

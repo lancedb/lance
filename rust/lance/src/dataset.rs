@@ -1096,24 +1096,23 @@ mod tests {
 
     use super::*;
     use crate::arrow::FixedSizeListArrayExt;
+    use crate::datatypes::Schema;
     use crate::index::vector::MetricType;
     use crate::index::IndexType;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
     use crate::io::deletion::read_deletion_file;
-    use crate::{datatypes::Schema, utils::datagen::generate_random_array};
 
     use crate::dataset::WriteMode::Overwrite;
     use arrow_array::{
         cast::{as_string_array, as_struct_array},
-        DictionaryArray, Int32Array, RecordBatch, StringArray, UInt16Array,
-    };
-    use arrow_array::{
-        Float32Array, Int64Array, Int8Array, Int8DictionaryArray, RecordBatchIterator, UInt32Array,
+        DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array, Int8DictionaryArray,
+        RecordBatch, RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
+    use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
     // Used to validate that futures returned are Send.

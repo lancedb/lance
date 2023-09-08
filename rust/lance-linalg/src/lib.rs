@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Extend Arrow Functionality
-//!
-//! To improve Arrow-RS ergonomic
+pub mod distance;
+pub mod kernels;
+pub mod matrix;
 
-pub use lance_arrow::bfloat16;
-pub use lance_arrow::schema::*;
-pub use lance_arrow::*;
+pub use matrix::MatrixView;
 
-pub mod json;
-#[cfg(feature = "opq")]
-pub(crate) mod svd;
+use arrow_schema::ArrowError;
+
+type Error = ArrowError;
+pub type Result<T> = std::result::Result<T, Error>;

@@ -100,7 +100,7 @@ pub fn norm_l2(vector: &[f32]) -> f32 {
 mod x86_64 {
 
     pub mod avx {
-        use crate::linalg::x86_64::avx::*;
+        use crate::distance::x86_64::avx::*;
         use std::arch::x86_64::*;
 
         #[inline]

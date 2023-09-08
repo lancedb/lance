@@ -25,8 +25,8 @@ use num_traits::{real::Real, FromPrimitive};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance::linalg::dot::{dot, Dot};
-use lance::utils::datagen::generate_random_array_with_seed;
+use lance_linalg::distance::dot::{dot, Dot};
+use lance_testing::datagen::generate_random_array_with_seed;
 
 #[inline]
 fn dot_arrow_artiy<T: ArrowNumericType>(x: &PrimitiveArray<T>, y: &PrimitiveArray<T>) -> T::Native {

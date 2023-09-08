@@ -16,8 +16,10 @@
 
 use std::fmt::Formatter;
 
-use arrow::array::{Array, FixedSizeBinaryArray};
-use arrow_array::{builder::BooleanBufferBuilder, iterator::ArrayIter, ArrayAccessor, ArrayRef};
+use arrow_array::{
+    builder::BooleanBufferBuilder, iterator::ArrayIter, Array, ArrayAccessor, ArrayRef,
+    FixedSizeBinaryArray,
+};
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType};

@@ -20,9 +20,10 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 
+use lance_linalg::MatrixView;
+
 use super::Query;
 use crate::{
-    arrow::linalg::matrix::MatrixView,
     index::{pb::Transform, prefilter::PreFilter, Index},
     io::{object_reader::ObjectReader, object_writer::ObjectWriter},
     Result,

@@ -17,7 +17,6 @@
 
 //! Various utilities
 
-pub mod datagen;
 pub mod kmeans;
 pub mod sql;
 pub mod temporal;

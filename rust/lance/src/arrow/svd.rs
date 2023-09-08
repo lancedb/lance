@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use super::matrix::MatrixView;
 use arrow_array::Float32Array;
+use lance_linalg::matrix::MatrixView;
 
 #[allow(unused_imports)]
 #[cfg(target_os = "macos")]

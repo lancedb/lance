@@ -19,12 +19,13 @@ use arrow_array::UInt32Array;
 use arrow_array::{cast::as_primitive_array, types::UInt64Type};
 use arrow_select::concat::concat_batches;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use lance_arrow::*;
+use lance_linalg::{distance::l2_distance, kernels::argmin, matrix::MatrixView};
 use ordered_float::OrderedFloat;
 use rand::distributions::Uniform;
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
 
-use crate::arrow::{linalg::matrix::MatrixView, *};
 use crate::dataset::{Dataset, ROW_ID};
 use crate::index::pb;
 use crate::index::vector::diskann::row_vertex::RowVertexSerDe;
@@ -34,7 +35,6 @@ use crate::index::vector::graph::{
 };
 use crate::index::vector::graph::{Graph, Vertex};
 use crate::index::vector::{MetricType, INDEX_FILE_NAME};
-use crate::linalg::l2::l2_distance;
 use crate::{Error, Result};
 
 use super::row_vertex::RowVertex;
@@ -380,7 +380,7 @@ mod tests {
     use tempfile;
 
     use crate::dataset::WriteParams;
-    use crate::utils::datagen::generate_random_array;
+    use lance_testing::datagen::generate_random_array;
 
     async fn create_dataset(uri: &str, n: usize, dim: usize) -> Arc<Dataset> {
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(

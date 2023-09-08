@@ -18,7 +18,9 @@ use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat_batches;
 use futures::stream::TryStreamExt;
 
-use crate::arrow::{linalg::matrix::MatrixView, *};
+use lance_arrow::as_fixed_size_list_array;
+use lance_linalg::MatrixView;
+
 use crate::dataset::Dataset;
 use crate::{Error, Result};
 
@@ -50,5 +52,5 @@ pub async fn maybe_sample_training_data(
         ),
     })?;
     let fixed_size_array = as_fixed_size_list_array(array);
-    fixed_size_array.try_into()
+    Ok(fixed_size_array.try_into()?)
 }
