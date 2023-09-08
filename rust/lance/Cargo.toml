@@ -1,6 +1,6 @@
 [package]
 name = "lance"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
 authors = ["Lance Devs <dev@eto.ai>"]
 description = "A columnar data format that is 100x faster than Parquet for random access."
