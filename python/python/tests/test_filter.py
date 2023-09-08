@@ -168,7 +168,7 @@ def test_escaped_name(tmp_path: Path, provide_pandas: bool):
     _ = lance.write_dataset(table, tmp_path / "test_uppercase_name")
 
     dataset = lance.dataset(tmp_path / "test_uppercase_name")
-    result = dataset.to_table(filter="`ALLCAPSNAME` == 0").to_pandas()
+    result = dataset.to_table(filter="`ALLCAPSNAME` > 0").to_pandas()
     pd.testing.assert_frame_equal(
         result, pd.DataFrame([{"ALLCAPSNAME": 0, "other": 2}])
     )

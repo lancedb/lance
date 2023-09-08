@@ -297,6 +297,8 @@ impl Planner {
             SQLExpr::Identifier(id) => {
                 if id.quote_style == Some('"') {
                     Ok(Expr::Literal(ScalarValue::Utf8(Some(id.value.clone()))))
+                } else if id.quote_style == Some('`') {
+                    Ok(Expr::Literal(ScalarValue::Utf8(Some(id.value.clone()))))
                 } else {
                     self.column(vec![id.clone()].as_slice())
                 }

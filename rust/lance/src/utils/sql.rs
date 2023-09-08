@@ -42,7 +42,7 @@ impl Dialect for LanceDialect {
     }
 
     fn is_delimited_identifier_start(&self, ch: char) -> bool {
-        ch == '`'
+        ch == '`' || ch == '"'
     }
 }
 
