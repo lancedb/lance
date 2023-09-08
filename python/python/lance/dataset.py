@@ -690,7 +690,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         This method is an advanced method which allows users to describe a change
         that has been made to the data files.  This method is not needed when using
-        lancedb to apply changes (e.g. when using the Dataset class)
+        Lance to apply changes (e.g. when using :py:class:`LanceDataset` or
+        :py:func:`write_dataset`.)
 
         It's current purpose is to allow for changes being made in a distributed
         environment where no single process is doing all of the work.  For example,
