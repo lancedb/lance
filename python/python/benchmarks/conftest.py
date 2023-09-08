@@ -11,24 +11,14 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-import os
-import sys
+from pathlib import Path
 
 import pytest
 
 
-@pytest.fixture(params=(True, False))
-def provide_pandas(request, monkeypatch):
-    if not request.param:
-        monkeypatch.setitem(sys.modules, "pd", None)
-    return request.param
+@pytest.fixture(scope="session")
+def data_dir():
+    """Return the path to the benchmark data directory.
 
-
-@pytest.fixture
-def s3_bucket() -> str:
-    return os.environ.get("TEST_S3_BUCKET", "lance-integtest")
-
-
-@pytest.fixture
-def ddb_table() -> str:
-    return os.environ.get("TEST_DDB_TABLE", "lance-integtest")
+    This directory holds tests datasets so they can be cached between runs."""
+    return Path(__file__).parent.parent.parent / "benchmark_data"

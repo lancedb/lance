@@ -57,6 +57,9 @@ tests = [
     "ml_dtypes",
     "tensorflow",
 ]
+benchmarks = [
+    "pytest-benchmark",
+]
 
 [tool.isort]
 profile = "black"
