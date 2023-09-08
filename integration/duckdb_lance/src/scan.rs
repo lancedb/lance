@@ -70,7 +70,7 @@ unsafe extern "C" fn read_lance(info: duckdb_function_info, output: duckdb_data_
     let info = FunctionInfo::from(info);
     let mut output = DataChunk::from(output);
 
-    let mut init_data = info.init_data::<ScanInitData>();
+    let init_data = info.init_data::<ScanInitData>();
     let batch = match crate::RUNTIME.block_on(async { (*(*init_data).stream).next().await }) {
         Some(Ok(b)) => Some(b),
         Some(Err(e)) => {

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-lance = { path = "../../rust" }
+lance = { path = "../../rust/lance" }
 duckdb-ext = { path = "./duckdb-ext" }
 lazy_static = "1.4.0"
 tokio = { version = "1.23", features = ["rt-multi-thread"] }
