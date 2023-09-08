@@ -363,7 +363,6 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         table : Table
         """
-        # kwargs['take'] = indices
         return pa.Table.from_batches([self._ds.take(indices, columns)])
 
     def head(self, num_rows, **kwargs):
