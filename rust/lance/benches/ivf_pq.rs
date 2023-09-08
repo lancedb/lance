@@ -17,7 +17,6 @@ use std::sync::Arc;
 use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, FieldRef, Schema};
 use criterion::{criterion_group, criterion_main, Criterion};
-use lance_testing::datagen::generate_random_array;
 use lance::{
     arrow::*,
     dataset::{WriteMode, WriteParams},
@@ -27,6 +26,7 @@ use lance::{
     },
     Dataset,
 };
+use lance_testing::datagen::generate_random_array;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 

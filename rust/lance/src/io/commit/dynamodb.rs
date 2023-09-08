@@ -313,8 +313,8 @@ mod test {
         },
     };
     use futures::{future::join_all, StreamExt, TryStreamExt};
-    use object_store::local::LocalFileSystem;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+    use object_store::local::LocalFileSystem;
 
     use crate::{
         dataset::{ReadParams, WriteMode, WriteParams},
