@@ -751,6 +751,10 @@ class LanceDataset(pa.dataset.Dataset):
         _Dataset.commit(base_uri, operation._to_inner(), read_version, commit_lock)
         return LanceDataset(base_uri)
 
+    @property
+    def optimize(self) -> "DatasetOptimizer":
+        return DatasetOptimizer(self)
+
 
 # LanceOperation is a namespace for operations that can be applied to a dataset.
 class LanceOperation:
@@ -816,17 +820,35 @@ class LanceOperation:
 
     @dataclass
     class Rewrite(BaseOperation):
-        old_fragments: Iterable[FragmentMetadata]
-        new_fragments: Iterable[FragmentMetadata]
+        """
+        Operation that rewrites fragments but does not change the data within them.
 
-        def __post_init__(self):
-            LanceOperation._validate_fragments(self.old_fragments)
-            LanceOperation._validate_fragments(self.new_fragments)
+        This is for rearranging the data.
+
+        The data are grouped, such that each group contains the old fragments
+        and the new fragments those are rewritten into.
+        """
+
+        groups: Iterable[RewriteGroup]
+
+        @dataclass
+        class RewriteGroup:
+            old_fragments: Iterable[FragmentMetadata]
+            new_fragments: Iterable[FragmentMetadata]
+
+            def __post_init__(self):
+                LanceOperation._validate_fragments(self.old_fragments)
+                LanceOperation._validate_fragments(self.new_fragments)
 
         def _to_inner(self):
-            raw_old_fragments = [f._metadata for f in self.old_fragments]
-            raw_new_fragments = [f._metadata for f in self.new_fragments]
-            return _Operation.rewrite(raw_old_fragments, raw_new_fragments)
+            groups = [
+                (
+                    [f._metadata for f in g.old_fragments],
+                    [f._metadata for f in g.new_fragments],
+                )
+                for g in self.groups
+            ]
+            return _Operation.rewrite(groups)
 
     @dataclass
     class Merge(BaseOperation):
@@ -846,10 +868,6 @@ class LanceOperation:
 
         def _to_inner(self):
             return _Operation.restore(self.version)
-
-    @property
-    def optimize(self) -> "DatasetOptimizer":
-        return DatasetOptimizer(self)
 
 
 class ScannerBuilder:

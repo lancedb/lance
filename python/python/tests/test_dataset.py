@@ -460,7 +460,8 @@ def test_rewrite_with_commit(tmp_path: Path):
     to_be_rewrote = [lf.metadata for lf in lance.dataset(base_dir).get_fragments()]
 
     fragment = lance.fragment.LanceFragment.create(base_dir, combined)
-    rewrite = lance.LanceOperation.Rewrite(to_be_rewrote, [fragment])
+    group = lance.LanceOperation.Rewrite.RewriteGroup(to_be_rewrote, [fragment])
+    rewrite = lance.LanceOperation.Rewrite([group])
 
     dataset = lance.LanceDataset._commit(base_dir, rewrite, read_version=1)
 

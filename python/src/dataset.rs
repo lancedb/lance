@@ -21,7 +21,7 @@ use arrow_array::{Float32Array, RecordBatch};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use lance::arrow::as_fixed_size_list_array;
-
+use lance::dataset::transaction::RewriteGroup;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, scanner::Scanner as LanceScanner,
     transaction::Operation as LanceOperation, Dataset as LanceDataset, ReadParams, Version,
@@ -116,16 +116,15 @@ impl Operation {
     }
 
     #[staticmethod]
-    fn rewrite(
-        old_fragments: Vec<FragmentMetadata>,
-        new_fragments: Vec<FragmentMetadata>,
-    ) -> PyResult<Self> {
-        let old_fragments = into_fragments(old_fragments);
-        let new_fragments = into_fragments(new_fragments);
-        let op = LanceOperation::Rewrite {
-            old_fragments,
-            new_fragments,
-        };
+    fn rewrite(groups: Vec<(Vec<FragmentMetadata>, Vec<FragmentMetadata>)>) -> PyResult<Self> {
+        let groups = groups
+            .into_iter()
+            .map(|(old_fragments, new_fragments)| RewriteGroup {
+                old_fragments: into_fragments(old_fragments),
+                new_fragments: into_fragments(new_fragments),
+            })
+            .collect::<Vec<_>>();
+        let op = LanceOperation::Rewrite { groups };
         Ok(Self(op))
     }
 
