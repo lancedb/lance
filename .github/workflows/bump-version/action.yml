@@ -23,5 +23,5 @@ runs:
     working-directory: rust
     shell: bash
     run: |
-      cargo install cargo-bump
-      cargo bump ${{ inputs.part }}
+      cargo install cargo-workspaces
+      cargo ws version --no-git-commit --no-git-push --no-git-tag ${{ inputs.part }}
