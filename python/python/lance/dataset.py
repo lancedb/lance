@@ -621,9 +621,15 @@ class LanceDataset(pa.dataset.Dataset):
             if c not in self.schema.names:
                 raise KeyError(f"{c} not found in schema")
             field = self.schema.field(c)
-            if not pa.types.is_fixed_size_list(field.type):
+            if not (
+                pa.types.is_fixed_size_list(field.type)
+                or (
+                    isinstance(field.type, pa.FixedShapeTensorType)
+                    and len(field.type.shape) == 1
+                )
+            ):
                 raise TypeError(
-                    f"Vector column {c} must be FixedSizeListArray, got {field.type}"
+                    f"Vector column {c} must be FixedSizeListArray or TensorArray, got {field.type}"
                 )
             if not pa.types.is_float32(field.type.value_type):
                 raise TypeError(
