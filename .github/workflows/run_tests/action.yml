@@ -16,5 +16,4 @@ runs:
   - name: Run python tests
     shell: bash
     working-directory: python
-    run: |
-      pytest -x -v --durations=30 -m "not integration" python/tests
+    run: make test
