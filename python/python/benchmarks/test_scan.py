@@ -54,9 +54,9 @@ def test_scan_integer(tmp_path: Path, benchmark, array_factory):
     assert result.num_rows == NUM_ROWS
 
 
-@pytest.fixture(scope = "module")
+@pytest.fixture(scope="module")
 def sample_dataset(tmpdir_factory):
-    tmp_path = Path(tmpdir_factory.mktemp('data'))
+    tmp_path = Path(tmpdir_factory.mktemp("data"))
     table = pa.table(
         {
             "i": pa.array(range(NUM_ROWS), type=pa.int32()),
@@ -70,7 +70,13 @@ def sample_dataset(tmpdir_factory):
             ),
             "blob": pa.array(
                 [
-                    random.choice([random.randbytes(100 * 1024), random.randbytes(1024), random.randbytes(1024)])
+                    random.choice(
+                        [
+                            random.randbytes(100 * 1024),
+                            random.randbytes(1024),
+                            random.randbytes(1024),
+                        ]
+                    )
                     for _ in range(NUM_ROWS)
                 ],
                 type=pa.binary(),
@@ -108,6 +114,7 @@ def test_scan_table_filter_project(benchmark, sample_dataset, keep_percent):
     )
 
     assert result.schema.names == ["i", "blob"]
+
 
 @pytest.mark.parametrize("keep_percent", [0.1, 0.5, 0.9])
 @pytest.mark.benchmark(group="scan_table")
