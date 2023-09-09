@@ -349,19 +349,13 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
             })
             .sum();
         let mut buffer = MutableBuffer::with_capacity(capacity);
-        let offsets_capacity = if T::Offset::IS_LARGE {
-            8 * (indices.len() + 1) // i64
-        } else {
-            4 * (indices.len() + 1) // i32
-        };
+
+        let offsets_capacity = std::mem::size_of::<T::Offset>() * (indices.len() + 1);
         let mut offsets = MutableBuffer::with_capacity(offsets_capacity);
+        let mut offset = T::Offset::from_usize(0).unwrap();
         // Safety: We allocated appropriate capacity just above.
         unsafe {
-            if T::Offset::IS_LARGE {
-                offsets.push_unchecked::<i64>(0);
-            } else {
-                offsets.push_unchecked::<i32>(0);
-            }
+            offsets.push_unchecked(offset);
         }
 
         let chunks = plan_take_chunks(&positions, indices, MIN_IO_SIZE)?;
@@ -393,14 +387,11 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
                         buffer.extend_from_slice(value_ref);
                     }
 
+                    offset += array.value_length((index - start) as usize);
                     // Append next offset
                     // Safety: We allocated appropriate capacity on initialization
                     unsafe {
-                        if T::Offset::IS_LARGE {
-                            offsets.push_unchecked(buffer.len() as i64);
-                        } else {
-                            offsets.push_unchecked(buffer.len() as i32);
-                        }
+                        offsets.push_unchecked(offset);
                     }
                 }
                 futures::future::ready(Ok(()))
