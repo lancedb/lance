@@ -22,6 +22,7 @@ env:
   # "1" means line tables only, which is useful for panic tracebacks.
   RUSTFLAGS: "-C debuginfo=1"
   RUST_BACKTRACE: "1"
+  CI: "true"
 
 jobs:
   lint:

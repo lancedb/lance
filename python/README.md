@@ -125,6 +125,8 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 
 Install from PyPI: `pip install pylance`  # >=0.3.0 is the new rust-based implementation
 Install from source: `maturin develop` (under the `/python` directory)
+Run unit tests: `make test`
+Run integration tests: `make integtest`
 
 Import via: `import lance`
 
