@@ -40,7 +40,7 @@ impl DataFile {
     }
 
     pub(crate) fn schema(&self, full_schema: &Schema) -> Schema {
-        full_schema.project_by_ids(&self.fields).unwrap()
+        full_schema.project_by_ids(&self.fields)
     }
 }
 

@@ -35,6 +35,60 @@ pub struct Schema {
     pub metadata: HashMap<String, String>,
 }
 
+/// State for a pre-order DFS iterator over the fields of a schema.
+struct SchemaFieldIterPreOrder<'a> {
+    schema: &'a Schema,
+    field_stack: Vec<&'a Field>,
+    idx_stack: Vec<usize>,
+    top_level_idx: usize,
+}
+
+impl<'a> SchemaFieldIterPreOrder<'a> {
+    fn new(schema: &'a Schema) -> Self {
+        Self {
+            schema,
+            field_stack: Vec::new(),
+            idx_stack: Vec::new(),
+            top_level_idx: 0,
+        }
+    }
+}
+
+/// Iterator implementation for a pre-order traversal of fields
+impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
+    type Item = &'a Field;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.field_stack.is_empty() {
+                if self.top_level_idx < self.schema.fields.len() {
+                    self.field_stack
+                        .push(&self.schema.fields[self.top_level_idx]);
+                    self.idx_stack.push(0);
+                    self.top_level_idx += 1;
+                    return Some(self.field_stack.last().unwrap());
+                } else {
+                    return None;
+                }
+            } else {
+                let field = self.field_stack.last().unwrap();
+                let idx = self.idx_stack.last_mut().unwrap();
+                if *idx < field.children.len() {
+                    // Field has more children
+                    self.field_stack.push(&field.children[*idx]);
+                    *idx += 1;
+                    self.idx_stack.push(0);
+                    return Some(self.field_stack.last().unwrap());
+                } else {
+                    // Field has no more children
+                    self.idx_stack.pop();
+                    self.field_stack.pop();
+                }
+            }
+        }
+    }
+}
+
 impl Schema {
     /// Project the columns over the schema.
     ///
@@ -96,15 +150,27 @@ impl Schema {
         })
     }
 
-    pub fn project_by_ids(&self, column_ids: &[i32]) -> Result<Self> {
-        let protos: Vec<pb::Field> = self.into();
+    /// Iterates over the fields using a pre-order traversal
+    ///
+    /// This is a DFS traversal where the parent is visited
+    /// before its children
+    fn fields_pre_order(&self) -> SchemaFieldIterPreOrder {
+        SchemaFieldIterPreOrder::new(self)
+    }
 
-        let filtered_protos: Vec<pb::Field> = protos
+    /// Returns a new schema that only contains the fields in `column_ids`.
+    ///
+    /// This projection can filter out both top-level and nested fields
+    pub fn project_by_ids(&self, column_ids: &[i32]) -> Self {
+        let filtered_fields = self
+            .fields
             .iter()
-            .filter(|p| column_ids.contains(&p.id))
-            .cloned()
+            .filter_map(|f| f.project_by_filter(&|f| column_ids.contains(&f.id)))
             .collect();
-        Ok(Self::from(&filtered_protos))
+        Self {
+            fields: filtered_fields,
+            metadata: self.metadata.clone(),
+        }
     }
 
     /// Project the schema by another schema, and preserves field metadata, i.e., Field IDs.
@@ -172,11 +238,9 @@ impl Schema {
             })
     }
 
-    /// Recursively collect all the field IDs,
+    /// Recursively collect all the field IDs, in pre-order traversal order.
     pub(crate) fn field_ids(&self) -> Vec<i32> {
-        // TODO: make a tree traversal iterator.
-        let protos: Vec<pb::Field> = self.into();
-        protos.iter().map(|f| f.id).collect()
+        self.fields_pre_order().map(|f| f.id).collect()
     }
 
     pub(crate) fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
@@ -442,7 +506,7 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let projected = schema.project_by_ids(&[1, 2, 4, 5]).unwrap();
+        let projected = schema.project_by_ids(&[1, 2, 4, 5]);
 
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
