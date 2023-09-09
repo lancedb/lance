@@ -823,7 +823,7 @@ impl Dataset {
         row_ids: &[u64],
         projection: &Schema,
     ) -> Result<RecordBatch> {
-        if row_ids.len() == 0 {
+        if row_ids.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(projection.into())));
         }
 
@@ -861,14 +861,12 @@ impl Dataset {
                             current_start = i;
                             break next;
                         }
+                    } else if current_start != row_ids.len() {
+                        let next = (current_fragment, current_start..row_ids.len());
+                        current_start = row_ids.len();
+                        break next;
                     } else {
-                        if current_start != row_ids.len() {
-                            let next = (current_fragment, current_start..row_ids.len());
-                            current_start = row_ids.len();
-                            break next;
-                        } else {
-                            break 'outer;
-                        }
+                        break 'outer;
                     }
                 };
 
