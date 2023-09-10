@@ -16,17 +16,26 @@ use std::str;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow::pyarrow::*;
-use arrow_array::{Float32Array, RecordBatch};
+use arrow::pyarrow::{ToPyArrow, *};
+use arrow_array::{Float32Array, RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use lance::arrow::as_fixed_size_list_array;
-use lance::dataset::fragment::FileFragment as LanceFileFragment;
-use lance::dataset::ReadParams;
+
+use lance::dataset::{
+    fragment::FileFragment as LanceFileFragment, scanner::Scanner as LanceScanner,
+    transaction::Operation as LanceOperation, Dataset as LanceDataset, ReadParams, Version,
+    WriteMode, WriteParams,
+};
 use lance::datatypes::Schema;
 use lance::format::Fragment;
-use lance::index::vector::ivf::IvfBuildParams;
-use lance::index::vector::pq::PQBuildParams;
+use lance::index::{
+    vector::{
+        diskann::DiskANNParams, ivf::IvfBuildParams, pq::PQBuildParams, MetricType,
+        VectorIndexParams,
+    },
+    DatasetIndexExt, IndexType,
+};
 use lance::io::object_store::ObjectStoreParams;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
@@ -36,15 +45,6 @@ use pyo3::{pyclass, PyObject, PyResult};
 use crate::fragment::{FileFragment, FragmentMetadata};
 use crate::Scanner;
 use crate::RT;
-use lance::dataset::{
-    scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
-    Dataset as LanceDataset, Version, WriteMode, WriteParams,
-};
-use lance::index::{
-    vector::diskann::DiskANNParams,
-    vector::{MetricType, VectorIndexParams},
-    DatasetIndexExt, IndexType,
-};
 
 use self::commit::PyCommitLock;
 
@@ -405,7 +405,8 @@ impl Dataset {
         let batch = RT
             .block_on(Some(self_.py()), self_.ds.take(&row_indices, &projection))
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        batch.to_pyarrow(self_.py())
+
+        crate::arrow::record_batch_to_pyarrow(self_.py(), &batch)
     }
 
     fn merge(
