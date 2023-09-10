@@ -1,10 +1,5 @@
 [workspace]
-members = [
-    "lance-arrow",
-    "lance-linalg",
-    "lance-testing",
-    "lance",
-]
+members = ["lance-arrow", "lance-linalg", "lance-testing", "lance"]
 # Python package needs to be built by maturin.
 resolver = "2"
 
@@ -43,7 +38,7 @@ rand = { version = "0.8.3", features = ["small_rng"] }
 serde = { version = "^1" }
 serde_json = { version = "1" }
 snafu = "0.7.4"
-tokio = { version = "1.23", features = ["rt-multi-thread"] }
+tokio = { version = "1.23", features = ["rt-multi-thread", "macros"] }
 
 [profile.bench]
 opt-level = 3

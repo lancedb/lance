@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Cosine distance
+//!
+//! <https://en.wikipedia.org/wiki/Cosine_similarity>
+//!
+//! `bf16, f16, f32, f64` types are supported.
+
 use std::iter::Sum;
 use std::sync::Arc;
 
