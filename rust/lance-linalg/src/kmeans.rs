@@ -19,19 +19,18 @@ use std::sync::Arc;
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, new_empty_array, Array, Float32Array,
 };
-use arrow_schema::DataType;
+use arrow_schema::{ArrowError, DataType};
 use arrow_select::concat::concat;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use log::{info, warn};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 
-use crate::index::vector::MetricType;
-use crate::{Error, Result};
-use lance_linalg::{
-    distance::{Cosine, Dot, L2},
+use crate::{
+    distance::{Cosine, Dot, MetricType, L2},
     matrix::MatrixView,
 };
+use crate::{Error, Result};
 
 /// KMean initialization method.
 #[derive(Debug, PartialEq, Eq)]
@@ -231,7 +230,12 @@ impl KMeanMembership {
             )
             .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
-            .await?;
+            .await.map_err(|e| {
+                ArrowError::ComputeError(format!(
+                    "KMeans: failed to compute new centroids: {}",
+                    e
+                ))
+            })?;
 
         // TODO: concat requires `&[&dyn Array]`. Are there cheaper way to pass Vec<Float32Array> to `concat`?
         let mut mean_refs: Vec<&dyn Array> = vec![];
@@ -345,12 +349,12 @@ impl KMeans {
     ) -> Result<Self> {
         let n = data.len() / dimension;
         if n < k {
-            return Err(Error::Index {
-                message: format!(
+            return Err(ArrowError::ComputeError(
+                format!(
                     "KMeans: training does not have sufficient data points: n({}) is smaller than k({})",
                     n, k
-                ),
-            });
+                )
+            ));
         }
 
         // TODO: refactor kmeans to work with reference instead of Arc?
@@ -471,7 +475,10 @@ impl KMeans {
                         })
                         .collect::<Vec<_>>()
                 })
-                .await?;
+                .await
+                .map_err(|e| {
+                    ArrowError::ComputeError(format!("KMeans: failed to compute membership: {}", e))
+                })?;
                 Ok::<Vec<_>, Error>(data)
             })
             .buffered(num_cpus::get())

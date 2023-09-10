@@ -17,10 +17,12 @@
 
 //! Various utilities
 
-pub mod kmeans;
 pub mod sql;
 pub mod temporal;
 #[cfg(test)]
 pub mod testing;
 #[cfg(feature = "tfrecord")]
 pub mod tfrecord;
+
+// Re-export
+pub use lance_linalg::kmeans;

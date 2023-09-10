@@ -89,51 +89,6 @@ pub struct Query {
     pub use_index: bool,
 }
 
-/// Distance metrics type.
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum MetricType {
-    L2,
-    Cosine,
-    Dot, // Dot product
-}
-
-type DistanceFunc = dyn Fn(&[f32], &[f32]) -> f32 + Send + Sync + 'static;
-type BatchDistanceFunc = dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync + 'static;
-
-impl MetricType {
-    /// Compute the distance from one vector to a batch of vectors.
-    pub fn batch_func(&self) -> Arc<BatchDistanceFunc> {
-        match self {
-            Self::L2 => Arc::new(l2_distance_batch),
-            Self::Cosine => Arc::new(cosine_distance_batch),
-            Self::Dot => Arc::new(dot_distance_batch),
-        }
-    }
-
-    /// Returns the distance function between two vectors.
-    pub fn func(&self) -> Arc<DistanceFunc> {
-        match self {
-            Self::L2 => Arc::new(l2_distance),
-            Self::Cosine => Arc::new(cosine_distance),
-            Self::Dot => Arc::new(dot_distance),
-        }
-    }
-}
-
-impl std::fmt::Display for MetricType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::L2 => "l2",
-                Self::Cosine => "cosine",
-                Self::Dot => "dot",
-            }
-        )
-    }
-}
-
 impl From<super::pb::VectorMetricType> for MetricType {
     fn from(proto: super::pb::VectorMetricType) -> Self {
         match proto {
@@ -150,21 +105,6 @@ impl From<MetricType> for super::pb::VectorMetricType {
             MetricType::L2 => Self::L2,
             MetricType::Cosine => Self::Cosine,
             MetricType::Dot => Self::Dot,
-        }
-    }
-}
-
-impl TryFrom<&str> for MetricType {
-    type Error = Error;
-
-    fn try_from(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "l2" | "euclidean" => Ok(Self::L2),
-            "cosine" => Ok(Self::Cosine),
-            "dot" => Ok(Self::Dot),
-            _ => Err(Error::Index {
-                message: format!("Metric type '{s}' is not supported"),
-            }),
         }
     }
 }
