@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::{ToPyArrow, *};
-use arrow_array::{Float32Array, RecordBatch, RecordBatchIterator, RecordBatchReader};
+use arrow_array::{Float32Array, RecordBatch};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use lance::arrow::as_fixed_size_list_array;
@@ -37,10 +37,13 @@ use lance::index::{
     DatasetIndexExt, IndexType,
 };
 use lance::io::object_store::ObjectStoreParams;
-use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong};
-use pyo3::{pyclass, PyObject, PyResult};
+use pyo3::{
+    exceptions::{PyIOError, PyKeyError, PyValueError},
+    pyclass,
+    types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong},
+    PyObject, PyResult,
+};
 
 use crate::fragment::{FileFragment, FragmentMetadata};
 use crate::Scanner;
