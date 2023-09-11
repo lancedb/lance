@@ -13,6 +13,10 @@ jobs:
       - uses: actions/setup-node@v3
         with:
           node-version: "18"
+      # These rules are disabled because Github will always ensure there
+      # is a blank line between the title and the body and Github will
+      # word wrap the description field to ensure a reasonable max line
+      # length.
       - run: npm install @commitlint/config-conventional
       - run: >
           echo 'module.exports = {
