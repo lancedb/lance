@@ -21,6 +21,8 @@ env_logger = "0.10"
 futures = "0.3"
 half = { version = "2.1", default-features = false, features = ["num-traits"] }
 lance = { path = "../rust/lance", features = ["tensorflow", "dynamodb"] }
+lance-arrow = { path = "../rust/lance-arrow" }
+lance-linalg = { path = "../rust/lance-linalg" }
 lazy_static = "1"
 log = "0.4"
 prost = "0.10"

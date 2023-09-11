@@ -15,23 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::RecordBatchIterator;
-use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Float32Array, RecordBatch};
+use std::sync::Arc;
+
+use arrow_array::{
+    cast::as_primitive_array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
+};
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::TryStreamExt;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use rand::{self, Rng};
-use std::sync::Arc;
 
-use lance::arrow::FixedSizeListArrayExt;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::ivf::IvfBuildParams;
 use lance::index::vector::pq::PQBuildParams;
-use lance::index::vector::{MetricType, VectorIndexParams};
+use lance::index::vector::VectorIndexParams;
 use lance::index::{DatasetIndexExt, IndexType};
 use lance::{arrow::as_fixed_size_list_array, dataset::Dataset};
+use lance_arrow::FixedSizeListArrayExt;
+use lance_linalg::distance::MetricType;
 
 fn bench_ivf_pq_index(c: &mut Criterion) {
     // default tokio runtime

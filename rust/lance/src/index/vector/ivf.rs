@@ -20,7 +20,7 @@ use arrow::datatypes::Float32Type;
 use arrow_arith::arithmetic::subtract_dyn;
 use arrow_array::{
     builder::{Float32Builder, UInt32Builder},
-    cast::{as_primitive_array, as_struct_array},
+    cast::{as_primitive_array, as_struct_array, AsArray},
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, StructArray,
     UInt32Array,
 };
@@ -371,7 +371,7 @@ impl Ivf {
         let centroid_values = self.centroids.values();
         let distances = dist_func(
             query.values(),
-            as_primitive_array::<Float32Type>(centroid_values.as_ref()).values(),
+            centroid_values.as_primitive::<Float32Type>().values(),
             self.dimension(),
         ) as ArrayRef;
         let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;

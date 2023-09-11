@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! High-performance [Apache Arrow](https://docs.rs/arrow/latest/arrow/) native Linear Algebra algorithms.
+
 pub mod distance;
 pub mod kernels;
+pub mod kmeans;
 pub mod matrix;
 
 pub use matrix::MatrixView;

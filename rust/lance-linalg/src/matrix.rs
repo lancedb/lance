@@ -23,14 +23,6 @@ use arrow_array::{
 use arrow_schema::DataType;
 use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
 
-#[allow(unused_imports)]
-#[cfg(all(feature = "opq", target_os = "macos"))]
-use accelerate_src;
-
-#[allow(unused_imports)]
-#[cfg(all(feature = "opq", any(target_os = "linux", target_os = "windows")))]
-use openblas_src;
-
 use crate::{Error, Result};
 
 /// Transpose a matrix.

@@ -14,7 +14,9 @@
 
 use std::sync::Arc;
 
+use arrow_array::FixedSizeListArray;
 use arrow_array::{builder::Float32Builder, Float32Array};
+use lance_arrow::FixedSizeListArrayExt;
 use rand::{seq::IteratorRandom, Rng};
 
 use crate::index::vector::MetricType;
@@ -69,6 +71,7 @@ pub async fn train_kmeans(
         redos,
         ..Default::default()
     };
-    let model = KMeans::new_with_params(&data, dimension, k, &params).await?;
+    let data = FixedSizeListArray::try_new_from_values(data, dimension as i32)?;
+    let model = KMeans::new_with_params(&data, k, &params).await?;
     Ok(model.centroids.as_ref().clone())
 }

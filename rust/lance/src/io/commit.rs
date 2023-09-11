@@ -620,13 +620,13 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::future::join_all;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
 
     use super::*;
 
     use crate::dataset::{transaction::Operation, WriteMode, WriteParams};
-    use crate::index::vector::{MetricType, VectorIndexParams};
-    use crate::index::{DatasetIndexExt, IndexType};
+    use crate::index::{vector::VectorIndexParams, DatasetIndexExt, IndexType};
     use crate::io::object_store::ObjectStoreParams;
     use crate::Dataset;
 

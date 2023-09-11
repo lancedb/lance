@@ -362,13 +362,14 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow_array::{RecordBatchIterator, RecordBatchReader};
     use chrono::Duration;
+    use lance_linalg::distance::MetricType;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
     use tokio::io::AsyncWriteExt;
 
     use crate::{
         dataset::{ReadParams, WriteMode, WriteParams},
         index::{
-            vector::{MetricType, StageParams, VectorIndexParams},
+            vector::{StageParams, VectorIndexParams},
             DatasetIndexExt, IndexType,
         },
         io::{

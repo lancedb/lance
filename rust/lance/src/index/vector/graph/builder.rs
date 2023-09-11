@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use arrow_array::UInt32Array;
 use async_trait::async_trait;
+use lance_linalg::distance::{DistanceFunc, MetricType};
 
 use super::{Graph, Vertex};
-use crate::index::vector::{DistanceFunc, MetricType};
 use crate::{Error, Result};
 use lance_linalg::matrix::MatrixView;
 

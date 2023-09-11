@@ -30,13 +30,11 @@ use lance::dataset::{
 use lance::datatypes::Schema;
 use lance::format::Fragment;
 use lance::index::{
-    vector::{
-        diskann::DiskANNParams, ivf::IvfBuildParams, pq::PQBuildParams, MetricType,
-        VectorIndexParams,
-    },
+    vector::{diskann::DiskANNParams, ivf::IvfBuildParams, pq::PQBuildParams, VectorIndexParams},
     DatasetIndexExt, IndexType,
 };
 use lance::io::object_store::ObjectStoreParams;
+use lance_linalg::distance::MetricType;
 use pyo3::prelude::*;
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
