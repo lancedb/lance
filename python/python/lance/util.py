@@ -29,6 +29,16 @@ except ImportError:
     ts_types = Union[datetime, str]
 
 
+try:
+    from pyarrow import FixedShapeTensorType
+
+    CENTROIDS_TYPE = FixedShapeTensorType
+    has_fixed_shape_tensor = True
+except ImportError:
+    has_fixed_shape_tensor = False
+    CENTROIDS_TYPE = pa.FixedSizeListType
+
+
 def sanitize_ts(ts: ts_types) -> datetime:
     """Returns a python datetime object from various timestamp input types."""
     if pd and isinstance(ts, str):
@@ -102,7 +112,7 @@ class KMeans:
         return f"lance.KMeans(k={self.k}, metric_type={self._metric_type})"
 
     @property
-    def centroids(self) -> Optional[pa.FixedShapeTensorArray]:
+    def centroids(self) -> Optional[CENTROIDS_TYPE]:
         """Returns the centroids of the model,
 
         Returns None if the model is not trained.
@@ -110,9 +120,12 @@ class KMeans:
         ret = self._kmeans.centroids()
         if ret is None:
             return None
-        shape = (ret.type.list_size,)
-        tensor_type = pa.fixed_shape_tensor(ret.type.value_type, shape)
-        return pa.FixedShapeTensorArray.from_storage(tensor_type, ret)
+        if has_fixed_shape_tensor:
+            # Pyarrow compatibility
+            shape = (ret.type.list_size,)
+            tensor_type = pa.fixed_shape_tensor(ret.type.value_type, shape)
+            ret = pa.FixedShapeTensorArray.from_storage(tensor_type, ret)
+        return ret
 
     def _to_fixed_size_list(self, data: pa.Array) -> pa.FixedSizeListArray:
         if isinstance(data, pa.FixedSizeListArray):
@@ -121,7 +134,7 @@ class KMeans:
                     f"Array must be float32 type, got: {data.type.value_type}"
                 )
             return data
-        elif isinstance(data, pa.FixedShapeTensorArray):
+        elif has_fixed_shape_tensor and isinstance(data, pa.FixedShapeTensorArray):
             if len(data.type.shape) != 1:
                 raise ValueError(
                     f"Fixed shape tensor array must be a 1-D array, "
@@ -142,7 +155,7 @@ class KMeans:
             raise ValueError("Data must be a FixedSizeListArray, Tensor or numpy array")
 
     def fit(
-        self, data: Union[pa.FixedSizeListArray, pa.FixedShapeTensorArray, np.ndarray]
+        self, data: Union[pa.FixedSizeListArray, "pa.FixedShapeTensorArray", np.ndarray]
     ):
         """Fit the model to the data.
 
@@ -155,7 +168,7 @@ class KMeans:
         self._kmeans.fit(arr)
 
     def predict(
-        self, data: Union[pa.FixedSizeListArray, pa.FixedShapeTensorArray, np.ndarray]
+        self, data: Union[pa.FixedSizeListArray, "pa.FixedShapeTensorArray", np.ndarray]
     ) -> pa.UInt32Array:
         """Predict the cluster for each vector in the data."""
         arr = self._to_fixed_size_list(data)

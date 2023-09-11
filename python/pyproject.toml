@@ -1,6 +1,6 @@
 [project]
 name = "pylance"
-dependencies = ["pyarrow>=13", "numpy>=1.22"]
+dependencies = ["pyarrow>=10", "numpy>=1.22"]
 description = "python wrapper for Lance columnar format"
 authors = [
     { name = "Lance Devs", email = "dev@lancedb.com" },
@@ -56,6 +56,7 @@ tests = [
     "polars[pyarrow,pandas]",
     "ml_dtypes",
     "tensorflow",
+    "semver",
 ]
 benchmarks = [
     "pytest-benchmark",
