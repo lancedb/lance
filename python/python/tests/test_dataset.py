@@ -33,6 +33,7 @@ import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
 from lance.commit import CommitConflictError
+from lance.lance import Compaction
 
 # Various valid inputs for write_dataset
 input_schema = pa.schema([pa.field("a", pa.float64()), pa.field("b", pa.int64())])
@@ -459,7 +460,8 @@ def test_rewrite_with_commit(tmp_path: Path):
     to_be_rewrote = [lf.metadata for lf in lance.dataset(base_dir).get_fragments()]
 
     fragment = lance.fragment.LanceFragment.create(base_dir, combined)
-    rewrite = lance.LanceOperation.Rewrite(to_be_rewrote, [fragment])
+    group = lance.LanceOperation.Rewrite.RewriteGroup(to_be_rewrote, [fragment])
+    rewrite = lance.LanceOperation.Rewrite([group])
 
     dataset = lance.LanceDataset._commit(base_dir, rewrite, read_version=1)
 
@@ -779,3 +781,64 @@ def test_metadata(tmp_path: Path):
 
     data = data.replace_schema_metadata({"foo": base64.b64encode(pickle.dumps("foo"))})
     lance.write_dataset(data, tmp_path)
+
+
+def test_dataset_optimize(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"a": range(1000), "b": range(1000)})
+
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=100)
+    assert dataset.version == 1
+    assert len(dataset.get_fragments()) == 10
+
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=1000,
+        materialize_deletions=False,
+        num_threads=1,
+    )
+
+    assert metrics.fragments_removed == 10
+    assert metrics.fragments_added == 1
+    assert metrics.files_removed == 10
+    assert metrics.files_added == 1
+
+    assert dataset.version == 2
+
+
+def test_dataset_distributed_optimize(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"a": range(800), "b": range(800)})
+
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=200)
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 4
+
+    plan = Compaction.plan(
+        dataset, options=dict(target_rows_per_fragment=400, num_threads=None)
+    )
+    assert plan.read_version == 1
+    assert plan.num_tasks() == 2
+    assert plan.tasks[0].fragments == [frag.metadata for frag in fragments[0:2]]
+    assert plan.tasks[1].fragments == [frag.metadata for frag in fragments[2:4]]
+    assert repr(plan) == "CompactionPlan(read_version=1, tasks=<2 compaction tasks>)"
+
+    pickled_task = pickle.dumps(plan.tasks[0])
+    task = pickle.loads(pickled_task)
+    assert task == plan.tasks[0]
+
+    result1 = plan.tasks[0].execute(dataset)
+    result1.metrics.fragments_removed == 2
+    result1.metrics.fragments_added == 1
+
+    pickled_result = pickle.dumps(result1)
+    result = pickle.loads(pickled_result)
+    assert result == result1
+    assert re.match(
+        r"RewriteResult\(read_version=1, new_fragments=\[.+\], old_fragments=\[.+\]\)",
+        repr(result),
+    )
+
+    metrics = Compaction.commit(dataset, [result1])
+    assert metrics.fragments_removed == 2
+    assert metrics.fragments_added == 1
+    assert dataset.version == 2

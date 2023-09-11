@@ -23,7 +23,7 @@ use crate::format::pb;
 /// Lance Data File
 ///
 /// A data file is one piece of file storing data.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataFile {
     /// Relative path of the data file to dataset root.
     pub path: String,
@@ -62,7 +62,7 @@ impl From<&pb::DataFile> for DataFile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeletionFileType {
     Array,
@@ -78,7 +78,7 @@ impl DeletionFileType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeletionFile {
     pub read_version: u64,
     pub id: u64,
@@ -106,7 +106,7 @@ impl From<&pb::DeletionFile> for DeletionFile {
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
 /// If column exists in the schema, but the related file does not exist, treat this column as `nulls`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fragment {
     /// Fragment ID
     pub id: u64,

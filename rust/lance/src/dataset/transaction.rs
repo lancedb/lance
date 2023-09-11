@@ -104,10 +104,7 @@ pub enum Operation {
     /// Data is rewritten but *not* modified. This is used for things like
     /// compaction or re-ordering. Contains the old fragments and the new
     /// ones that have been replaced.
-    Rewrite {
-        old_fragments: Vec<Fragment>,
-        new_fragments: Vec<Fragment>,
-    },
+    Rewrite { groups: Vec<RewriteGroup> },
     /// Merge a new column in
     Merge {
         fragments: Vec<Fragment>,
@@ -115,6 +112,12 @@ pub enum Operation {
     },
     /// Restore an old version of the database
     Restore { version: u64 },
+}
+
+#[derive(Debug, Clone)]
+pub struct RewriteGroup {
+    pub old_fragments: Vec<Fragment>,
+    pub new_fragments: Vec<Fragment>,
 }
 
 impl Operation {
@@ -138,7 +141,11 @@ impl Operation {
                     .map(|f| f.id)
                     .chain(deleted_fragment_ids.iter().copied()),
             ),
-            Self::Rewrite { old_fragments, .. } => Box::new(old_fragments.iter().map(|f| f.id)),
+            Self::Rewrite { groups } => Box::new(
+                groups
+                    .iter()
+                    .flat_map(|f| f.old_fragments.iter().map(|f| f.id)),
+            ),
             Self::Merge { fragments, .. } => Box::new(fragments.iter().map(|f| f.id)),
         }
     }
@@ -353,13 +360,15 @@ impl Transaction {
                 ));
                 final_indices = Vec::new();
             }
-            Operation::Rewrite {
-                ref new_fragments, ..
-            } => {
-                final_fragments.extend(Self::fragments_with_ids(
-                    new_fragments.clone(),
-                    &mut fragment_id,
-                ));
+            Operation::Rewrite { ref groups, .. } => {
+                final_fragments.extend(maybe_existing_fragments?.clone());
+                let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
+                Self::handle_rewrite_fragments(
+                    &mut final_fragments,
+                    groups,
+                    fragment_id,
+                    current_version,
+                )?;
             }
             Operation::CreateIndex { new_indices } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -397,6 +406,48 @@ impl Transaction {
 
         Ok((manifest, final_indices))
     }
+
+    fn handle_rewrite_fragments(
+        final_fragments: &mut Vec<Fragment>,
+        groups: &[RewriteGroup],
+        mut fragment_id: u64,
+        version: u64,
+    ) -> Result<()> {
+        for group in groups {
+            // If the old fragments are contiguous, find the range
+            let replace_range = {
+                let start = final_fragments.iter().enumerate().find(|(_, f)| f.id == group.old_fragments[0].id)
+                    .ok_or_else(|| Error::CommitConflict { version, source:
+                        format!("dataset does not contain a fragment a rewrite operation wants to replace: id={}", group.old_fragments[0].id).into() })?.0;
+
+                // Verify old_fragments matches contiguous range
+                let mut i = 1;
+                loop {
+                    if i == group.old_fragments.len() {
+                        break Some(start..start + i);
+                    }
+                    if final_fragments[start + i].id != group.old_fragments[i].id {
+                        break None;
+                    }
+                    i += 1;
+                }
+            };
+
+            let new_fragments =
+                Self::fragments_with_ids(group.new_fragments.clone(), &mut fragment_id);
+            if let Some(replace_range) = replace_range {
+                // Efficiently path using slice
+                final_fragments.splice(replace_range, new_fragments);
+            } else {
+                // Slower path for non-contiguous ranges
+                for fragment in group.old_fragments.iter() {
+                    final_fragments.retain(|f| f.id != fragment.id);
+                }
+                final_fragments.extend(new_fragments);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl TryFrom<&pb::Transaction> for Transaction {
@@ -429,10 +480,21 @@ impl TryFrom<&pb::Transaction> for Transaction {
             Some(pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
                 old_fragments,
                 new_fragments,
-            })) => Operation::Rewrite {
-                old_fragments: old_fragments.iter().map(Fragment::from).collect(),
-                new_fragments: new_fragments.iter().map(Fragment::from).collect(),
-            },
+                groups,
+            })) => {
+                let groups = if !groups.is_empty() {
+                    groups
+                        .iter()
+                        .map(RewriteGroup::try_from)
+                        .collect::<Result<_>>()?
+                } else {
+                    vec![RewriteGroup {
+                        old_fragments: old_fragments.iter().map(Fragment::from).collect(),
+                        new_fragments: new_fragments.iter().map(Fragment::from).collect(),
+                    }]
+                };
+                Operation::Rewrite { groups }
+            }
             Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
                 new_indices,
             })) => Operation::CreateIndex {
@@ -471,6 +533,17 @@ impl TryFrom<&pb::Transaction> for Transaction {
     }
 }
 
+impl TryFrom<&pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
+    type Error = Error;
+
+    fn try_from(message: &pb::transaction::rewrite::RewriteGroup) -> Result<Self> {
+        Ok(Self {
+            old_fragments: message.old_fragments.iter().map(Fragment::from).collect(),
+            new_fragments: message.new_fragments.iter().map(Fragment::from).collect(),
+        })
+    }
+}
+
 impl From<&Transaction> for pb::Transaction {
     fn from(value: &Transaction) -> Self {
         let operation = match &value.operation {
@@ -498,13 +571,15 @@ impl From<&Transaction> for pb::Transaction {
                     schema_metadata: Default::default(), // TODO: handle metadata
                 })
             }
-            Operation::Rewrite {
-                old_fragments,
-                new_fragments,
-            } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
-                old_fragments: old_fragments.iter().map(pb::DataFragment::from).collect(),
-                new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
-            }),
+            Operation::Rewrite { groups } => {
+                pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
+                    groups: groups
+                        .iter()
+                        .map(pb::transaction::rewrite::RewriteGroup::from)
+                        .collect(),
+                    ..Default::default()
+                })
+            }
             Operation::CreateIndex { new_indices } => {
                 pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
                     new_indices: new_indices.iter().map(IndexMetadata::from).collect(),
@@ -527,6 +602,23 @@ impl From<&Transaction> for pb::Transaction {
             uuid: value.uuid.clone(),
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
+        }
+    }
+}
+
+impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
+    fn from(value: &RewriteGroup) -> Self {
+        Self {
+            old_fragments: value
+                .old_fragments
+                .iter()
+                .map(pb::DataFragment::from)
+                .collect(),
+            new_fragments: value
+                .new_fragments
+                .iter()
+                .map(pb::DataFragment::from)
+                .collect(),
         }
     }
 }
@@ -563,8 +655,10 @@ mod tests {
                 schema: Schema::default(),
             },
             Operation::Rewrite {
-                old_fragments: vec![fragment0.clone()],
-                new_fragments: vec![fragment2.clone()],
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![fragment0.clone()],
+                    new_fragments: vec![fragment1.clone()],
+                }],
             },
         ];
         let other_transactions = other_operations
@@ -618,16 +712,20 @@ mod tests {
             (
                 // Rewrite that affects different fragments
                 Operation::Rewrite {
-                    old_fragments: vec![fragment1.clone()],
-                    new_fragments: vec![fragment0.clone()],
+                    groups: vec![RewriteGroup {
+                        old_fragments: vec![fragment1.clone()],
+                        new_fragments: vec![fragment0.clone()],
+                    }],
                 },
                 [false, true, false, true, true, false],
             ),
             (
                 // Rewrite that affects the same fragments
                 Operation::Rewrite {
-                    old_fragments: vec![fragment0.clone(), fragment2.clone()],
-                    new_fragments: vec![fragment0.clone()],
+                    groups: vec![RewriteGroup {
+                        old_fragments: vec![fragment0.clone(), fragment2.clone()],
+                        new_fragments: vec![fragment0.clone()],
+                    }],
                 },
                 [false, true, true, true, true, true],
             ),

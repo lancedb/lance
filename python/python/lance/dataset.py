@@ -27,11 +27,13 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 import numpy as np
 import pyarrow as pa
 import pyarrow.dataset
+from lance.optimize import Compaction
 from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
 from .commit import CommitLock
 from .fragment import FragmentMetadata, LanceFragment
+from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .lance import _Dataset, _Operation, _Scanner, _write_dataset
 
@@ -749,6 +751,10 @@ class LanceDataset(pa.dataset.Dataset):
         _Dataset.commit(base_uri, operation._to_inner(), read_version, commit_lock)
         return LanceDataset(base_uri)
 
+    @property
+    def optimize(self) -> "DatasetOptimizer":
+        return DatasetOptimizer(self)
+
 
 # LanceOperation is a namespace for operations that can be applied to a dataset.
 class LanceOperation:
@@ -814,17 +820,35 @@ class LanceOperation:
 
     @dataclass
     class Rewrite(BaseOperation):
-        old_fragments: Iterable[FragmentMetadata]
-        new_fragments: Iterable[FragmentMetadata]
+        """
+        Operation that rewrites fragments but does not change the data within them.
 
-        def __post_init__(self):
-            LanceOperation._validate_fragments(self.old_fragments)
-            LanceOperation._validate_fragments(self.new_fragments)
+        This is for rearranging the data.
+
+        The data are grouped, such that each group contains the old fragments
+        and the new fragments those are rewritten into.
+        """
+
+        groups: Iterable[RewriteGroup]
+
+        @dataclass
+        class RewriteGroup:
+            old_fragments: Iterable[FragmentMetadata]
+            new_fragments: Iterable[FragmentMetadata]
+
+            def __post_init__(self):
+                LanceOperation._validate_fragments(self.old_fragments)
+                LanceOperation._validate_fragments(self.new_fragments)
 
         def _to_inner(self):
-            raw_old_fragments = [f._metadata for f in self.old_fragments]
-            raw_new_fragments = [f._metadata for f in self.new_fragments]
-            return _Operation.rewrite(raw_old_fragments, raw_new_fragments)
+            groups = [
+                (
+                    [f._metadata for f in g.old_fragments],
+                    [f._metadata for f in g.new_fragments],
+                )
+                for g in self.groups
+            ]
+            return _Operation.rewrite(groups)
 
     @dataclass
     class Merge(BaseOperation):
@@ -1079,6 +1103,70 @@ class LanceScanner(pa.dataset.Scanner):
 
         """
         return self._scanner.count_rows()
+
+
+class DatasetOptimizer:
+    def __init__(self, dataset: LanceDataset):
+        self._dataset = dataset
+
+    def compact_files(
+        self,
+        *,
+        target_rows_per_fragment: int = 1024 * 1024,
+        max_rows_per_group: int = 1024,
+        materialize_deletions: bool = True,
+        materialize_deletions_threshold: float = 0.1,
+        num_threads: Optional[int] = None,
+    ) -> CompactionMetrics:
+        """Compacts small files in the dataset, reducing total number of files.
+
+        This does a few things:
+         * Removes deleted rows from fragments
+         * Removes dropped columns from fragments
+         * Merges small fragments into larger ones
+
+        This method preserves the insertion order of the dataset. This may mean
+        it leaves small fragments in the dataset if they are not adjacent to
+        other fragments that need compaction. For example, if you have fragments
+        with row counts 5 million, 100, and 5 million, the middle fragment will
+        not be compacted because the fragments it is adjacent to do not need
+        compaction.
+
+        Parameters
+        ----------
+        target_rows_per_fragment: int, default 1024*1024
+            The target number of rows per fragment. This is the number of rows
+            that will be in each fragment after compaction.
+        max_rows_per_group: int, default 1024
+            Max number of rows per group. This does not affect which fragments
+            need compaction, but does affect how they are re-written if selected.
+        materialize_deletions: bool, default True
+            Whether to compact fragments with soft deleted rows so they are no
+            longer present in the file.
+        materialize_deletions_threshold: float, default 0.1
+            The fraction of original rows that are soft deleted in a fragment
+            before the fragment is a candidate for compaction.
+        num_threads: int, optional
+            The number of threads to use when performing compaction. If not
+            specified, defaults to the number of cores on the machine.
+
+        Returns
+        -------
+        CompactionMetrics
+            Metrics about the compaction process
+
+        See Also
+        --------
+        lance.optimize.Compaction
+        """
+        opts = dict(
+            target_rows_per_fragment=target_rows_per_fragment,
+            max_rows_per_group=max_rows_per_group,
+            materialize_deletions=materialize_deletions,
+            materialize_deletions_threshold=materialize_deletions_threshold,
+            num_threads=num_threads,
+        )
+        return Compaction.execute(self._dataset, opts)
 
 
 def write_dataset(
