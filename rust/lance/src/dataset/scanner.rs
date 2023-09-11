@@ -25,6 +25,7 @@ use datafusion::execution::{
 };
 use datafusion::logical_expr::AggregateFunction;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::expressions::{create_aggregate_expr, Literal};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{
@@ -681,6 +682,13 @@ impl Scanner {
             *self.offset.as_ref().unwrap_or(&0) as usize,
             self.limit.map(|l| l as usize),
         ))
+    }
+
+    pub async fn explain_plan(&self, verbose: bool) -> Result<String> {
+        let plan = self.create_plan().await?;
+        let display = DisplayableExecutionPlan::new(plan.as_ref());
+
+        Ok(format!("{}", display.indent(verbose)))
     }
 }
 
