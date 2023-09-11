@@ -102,13 +102,17 @@ class KMeans:
         return f"lance.KMeans(k={self.k}, metric_type={self._metric_type})"
 
     @property
-    def centroids(self) -> Optional[pa.FixedSizeListArray]:
+    def centroids(self) -> Optional[pa.FixedShapeTensorArray]:
         """Returns the centroids of the model,
 
         Returns None if the model is not trained.
         """
         ret = self._kmeans.centroids()
-        return ret
+        if ret is None:
+            return None
+        shape = (ret.type.list_size,)
+        tensor_type = pa.fixed_shape_tensor(ret.type.value_type, shape)
+        return pa.FixedShapeTensorArray.from_storage(tensor_type, ret)
 
     def _to_fixed_size_list(self, data: pa.Array) -> pa.FixedSizeListArray:
         if isinstance(data, pa.FixedSizeListArray):
