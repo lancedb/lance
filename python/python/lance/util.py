@@ -13,7 +13,7 @@
 #  limitations under the License.
 
 from datetime import datetime
-from typing import Union
+from typing import Union, Optional
 
 import numpy as np
 import pyarrow as pa
@@ -53,6 +53,9 @@ class KMeans:
         self._metric_type = metric_type
         self._kmeans = _KMeans(k, metric_type)
 
+    def __repr__(self) -> str:
+        return f"lance.KMeans(k={self.k}, metric_type={self._metric_type})"
+
     def fit(
         self, data: Union[pa.FixedSizeListArray, pa.FixedShapeTensorArray, np.ndarray]
     ):
@@ -86,3 +89,8 @@ class KMeans:
 
         batch = pa.RecordBatch.from_arrays([data], ["_kmeans_data"])
         self._kmeans.fit(batch)
+
+    @property
+    def centroids(self) -> Optional[pa.FixedSizeListArray]:
+        """Returns the centroids of the model."""
+        return self._kmeans.centroids()

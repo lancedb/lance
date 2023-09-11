@@ -13,11 +13,14 @@
 // limitations under the License.
 
 use arrow::pyarrow::FromPyArrow;
-use arrow_array::{FixedSizeListArray, RecordBatch, cast::AsArray};
+use arrow_array::{cast::AsArray, RecordBatch};
 use arrow_schema::DataType;
 use pyo3::{exceptions::PyValueError, prelude::*};
 
-use lance_linalg::{distance::MetricType, kmeans::KMeans as LanceKMeans};
+use lance_linalg::{
+    distance::MetricType,
+    kmeans::{KMeans as LanceKMeans, KMeansParams},
+};
 
 #[pyclass(name = "_KMeans")]
 pub struct KMeans {
@@ -26,6 +29,8 @@ pub struct KMeans {
 
     /// Metric type
     metric_type: MetricType,
+
+    max_iters: usize,
 }
 
 #[pymethods]
@@ -36,6 +41,7 @@ impl KMeans {
         Ok(Self {
             k,
             metric_type: metric_type.try_into().unwrap(),
+            max_iters,
         })
     }
 
@@ -54,7 +60,12 @@ impl KMeans {
             }
         };
         let fixed_size_arr = array.as_fixed_size_list();
-        let kmeans = LanceKMeans::new(self.k, dim as usize, self.metric_type);
+        let params = KMeansParams {
+            metric_type: self.metric_type,
+            max_iters: self.max_iters as u32,
+            ..Default::default()
+        };
+        let kmeans = LanceKMeans::new_with_params(fixed_size_arr, self.k, &params);
         Ok(())
     }
 

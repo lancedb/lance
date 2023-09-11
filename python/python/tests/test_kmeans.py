@@ -21,4 +21,4 @@ def test_train_cosine():
     data = np.random.randn(1000, 128).astype(np.float32)
 
     kmeans.fit(data)
-    print(kmeans)
+    print(kmeans, kmeans.centroids)
