@@ -13,7 +13,7 @@
 #  limitations under the License.
 
 from datetime import datetime
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 import numpy as np
 import pyarrow as pa
@@ -70,7 +70,13 @@ class KMeans:
     >>> centroids = np.stack(kmeans.centroids.to_numpy(zero_copy_only=False))
     >>> clusters = kmeans.predict(data)
     """
-    def __init__(self, k: int, metric_type: str = "l2", max_iters: int = 50):
+
+    def __init__(
+        self,
+        k: int,
+        metric_type: Literal["l2", "dot", "cosine"] = "l2",
+        max_iters: int = 50,
+    ):
         """Create a KMeans model.
 
         Parameters
@@ -83,6 +89,11 @@ class KMeans:
         max_iters: int
             The maximum number of iterations to run the KMeans algorithm. Default: 50.
         """
+        metric_type = metric_type.lower()
+        if metric_type not in ["l2", "dot", "cosine"]:
+            raise ValueError(
+                f"metric_type must be one of 'l2', 'dot', 'cosine', got: {metric_type}"
+            )
         self.k = k
         self._metric_type = metric_type
         self._kmeans = _KMeans(k, metric_type, max_iters=max_iters)
@@ -92,17 +103,27 @@ class KMeans:
 
     @property
     def centroids(self) -> Optional[pa.FixedSizeListArray]:
-        """Returns the centroids of the model."""
+        """Returns the centroids of the model,
+
+        Returns None if the model is not trained.
+        """
         ret = self._kmeans.centroids()
         return ret
 
     def _to_fixed_size_list(self, data: pa.Array) -> pa.FixedSizeListArray:
         if isinstance(data, pa.FixedSizeListArray):
-            if data.value_type != pa.float32():
-                raise ValueError(f"Array must be float32 type, got: {data.value_type}")
+            if data.type.value_type != pa.float32():
+                raise ValueError(
+                    f"Array must be float32 type, got: {data.type.value_type}"
+                )
             return data
         elif isinstance(data, pa.FixedShapeTensorArray):
-            return pa.FixedSizeListArray.from_arrays(data.storage(), data.shape[1])
+            if len(data.type.shape) != 1:
+                raise ValueError(
+                    f"Fixed shape tensor array must be a 1-D array, "
+                    f"got {len(data.type.shape)}-D"
+                )
+            return self._to_fixed_size_list(data.storage)
         elif isinstance(data, np.ndarray):
             if len(data.shape) != 2:
                 raise ValueError(
