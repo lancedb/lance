@@ -362,7 +362,13 @@ impl Transaction {
             }
             Operation::Rewrite { ref groups, .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
-                Self::handle_rewrite_fragments(&mut final_fragments, groups, fragment_id)?;
+                let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
+                Self::handle_rewrite_fragments(
+                    &mut final_fragments,
+                    groups,
+                    fragment_id,
+                    current_version,
+                )?;
             }
             Operation::CreateIndex { new_indices } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -405,13 +411,14 @@ impl Transaction {
         final_fragments: &mut Vec<Fragment>,
         groups: &[RewriteGroup],
         mut fragment_id: u64,
+        version: u64,
     ) -> Result<()> {
         for group in groups {
             // If the old fragments are contiguous, find the range
             let replace_range = {
                 let start = final_fragments.iter().enumerate().find(|(_, f)| f.id == group.old_fragments[0].id)
-                    .ok_or_else(|| Error::Internal { message:
-                        format!("dataset does not contain a fragment a rewrite operation wants to replace: id={}", group.old_fragments[0].id) })?.0;
+                    .ok_or_else(|| Error::CommitConflict { version, source:
+                        format!("dataset does not contain a fragment a rewrite operation wants to replace: id={}", group.old_fragments[0].id).into() })?.0;
 
                 // Verify old_fragments matches contiguous range
                 let mut i = 1;
