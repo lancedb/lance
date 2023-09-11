@@ -22,6 +22,7 @@ approx = { workspace = true }
 arrow-arith = { workspace = true }
 criterion = { workspace = true }
 lance-testing = { path = "../lance-testing" }
+lance-arrow = { path = "../lance-arrow" }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof = { workspace = true }

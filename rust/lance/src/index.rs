@@ -198,10 +198,9 @@ mod tests {
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::*;
+    use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
-
-    use crate::index::vector::MetricType;
 
     #[tokio::test]
     async fn test_recreate_index() {

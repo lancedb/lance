@@ -433,12 +433,12 @@ mod tests {
     use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
+    use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
     use crate::arrow::*;
     use crate::dataset::{Dataset, WriteParams};
-    use crate::index::vector::MetricType;
     use crate::io::exec::testing::TestingExec;
 
     #[tokio::test]

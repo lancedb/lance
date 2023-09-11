@@ -16,6 +16,8 @@ use std::cmp::min;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
+use arrow_array::FixedSizeListArray;
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, new_empty_array, Array, Float32Array,
 };
@@ -326,30 +328,25 @@ impl KMeans {
     }
 
     /// Train a KMeans model on data with `k` clusters.
-    pub async fn new(
-        data: &Float32Array,
-        dimension: usize,
-        k: usize,
-        max_iters: u32,
-    ) -> Result<Self> {
+    pub async fn new(data: &FixedSizeListArray, k: usize, max_iters: u32) -> Result<Self> {
         let params = KMeansParams {
             max_iters,
             metric_type: MetricType::L2,
             ..Default::default()
         };
-        Self::new_with_params(data, dimension, k, &params).await
+        Self::new_with_params(data, k, &params).await
     }
 
     /// Train a [`KMeans`] model with full parameters.
     pub async fn new_with_params(
-        data: &Float32Array,
-        dimension: usize,
+        data: &FixedSizeListArray,
         k: usize,
         params: &KMeansParams,
     ) -> Result<Self> {
-        let n = data.len() / dimension;
+        let dimension = data.value_length() as usize;
+        let n = data.len();
         if n < k {
-            return Err(ArrowError::ComputeError(
+            return Err(ArrowError::InvalidArgumentError(
                 format!(
                     "KMeans: training does not have sufficient data points: n({}) is smaller than k({})",
                     n, k
@@ -357,8 +354,16 @@ impl KMeans {
             ));
         }
 
+        if !matches!(data.value_type(), DataType::Float32) {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "KMeans: data must be Float32, got: {}",
+                data.value_type()
+            )));
+        }
+        let values: &Float32Array = data.values().as_primitive();
+
         // TODO: refactor kmeans to work with reference instead of Arc?
-        let data = Arc::new(data.clone());
+        let data = Arc::new(values.clone());
         let mut best_kmeans = Self::empty(k, dimension, params.metric_type);
         let mut best_stddev = f32::MAX;
 
@@ -510,11 +515,13 @@ mod tests {
     use super::*;
 
     use arrow_array::Float32Array;
+    use lance_arrow::*;
 
     #[tokio::test]
     async fn test_train_with_small_dataset() {
         let data = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
-        match KMeans::new(&data, 2, 128, 5).await {
+        let data = FixedSizeListArray::try_new_from_values(data, 2).unwrap();
+        match KMeans::new(&data, 128, 5).await {
             Ok(_) => panic!("Should fail to train KMeans"),
             Err(e) => {
                 assert!(e.to_string().contains("smaller than"));

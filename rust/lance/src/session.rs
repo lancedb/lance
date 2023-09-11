@@ -92,11 +92,10 @@ impl FileMetadataCache {
 mod tests {
     use super::*;
 
-    use crate::index::vector::{
-        pq::{PQIndex, ProductQuantizer},
-        MetricType,
-    };
     use std::sync::Arc;
+
+    use crate::index::vector::pq::{PQIndex, ProductQuantizer};
+    use lance_linalg::distance::MetricType;
 
     #[test]
     fn test_disable_index_cache() {
