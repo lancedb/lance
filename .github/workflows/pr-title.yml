@@ -30,9 +30,7 @@ jobs:
           script: |
             const message = `**ACTION NEEDED**
               
-              Lance follows the [Conventional Commits
-              specification](https://www.conventionalcommits.org/en/v1.0.0/) for
-              release automation.
+              Lance follows the [Conventional Commits specification](https://www.conventionalcommits.org/en/v1.0.0/) for release automation.
 
               The PR title and description are used as the merge commit message.\
               Please update your PR title and description to match the specification.
