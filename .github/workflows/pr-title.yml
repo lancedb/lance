@@ -16,6 +16,10 @@ jobs:
       - run: npm install @commitlint/config-conventional
       - run: >
           echo 'module.exports = {
+            "rules": {
+              "body-max-line-length": [0, "always", Infinity],
+              "body-leading-blank": [0, "always"]
+            }
             "ignores": [(message) => /^Bumps \[.+]\(.+\) from .+ to .+\.$/m.test(message)]
           }' > .commitlintrc.js
       - run: npx commitlint --extends @commitlint/config-conventional --verbose <<< $COMMIT_MSG
@@ -34,6 +38,8 @@ jobs:
 
               The PR title and description are used as the merge commit message.\
               Please update your PR title and description to match the specification.
+
+              For details on the error please inspect the "PR Title Check" action.
               `
             // Get list of current comments
             const comments = await github.paginate(github.rest.issues.listComments, {
