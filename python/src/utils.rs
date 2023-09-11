@@ -38,8 +38,9 @@ pub struct KMeans {
     /// Metric type
     metric_type: MetricType,
 
-    max_iters: usize,
+    max_iters: u32,
 
+    /// A trained KMean model. This is set after calling `fit`.
     trained_kmeans: Option<LanceKMeans>,
 }
 
@@ -47,7 +48,7 @@ pub struct KMeans {
 impl KMeans {
     #[new]
     #[pyo3(signature = (k, metric_type="l2", max_iters=50))]
-    fn new(k: usize, metric_type: &str, max_iters: usize) -> PyResult<Self> {
+    fn new(k: usize, metric_type: &str, max_iters: u32) -> PyResult<Self> {
         Ok(Self {
             k,
             metric_type: metric_type.try_into().unwrap(),
@@ -65,7 +66,7 @@ impl KMeans {
         let fixed_size_arr = FixedSizeListArray::from(data);
         let params = KMeansParams {
             metric_type: self.metric_type,
-            max_iters: self.max_iters as u32,
+            max_iters: self.max_iters,
             ..Default::default()
         };
         let kmeans = RT

@@ -48,6 +48,23 @@ def sanitize_ts(ts: ts_types) -> datetime:
 
 
 class KMeans:
+    """KMean model for clustering.
+
+    It works with 2-D arrays of float32 type,
+    and support distance metrics: "l2", "cosine", "dot".
+
+    Note `fit()` must be called before `predict()`.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import lance
+    >>> data = np.random.randn(1000, 128).astype(np.float32)
+    >>> kmeans = lance.util.KMeans(8, metric_type="cosine")
+    >>> kmeans.fit(data)
+    >>> centroids = np.stack(kmeans.centroids.to_numpy(zero_copy_only=False))
+    >>> clusters = kmeans.predict(data)
+    """
     def __init__(self, k: int, metric_type: str = "l2", max_iters: int = 50):
         """Create a KMeans model.
 
