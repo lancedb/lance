@@ -53,7 +53,12 @@ class KMeans:
     It works with 2-D arrays of float32 type,
     and support distance metrics: "l2", "cosine", "dot".
 
-    Note `fit()` must be called before `predict()`.
+    Note, you must train the kmeans model by calling :meth:`fit` before
+    calling :meth:`predict`.
+    Calling `fit()` again will reset the model.
+
+    Currently, the initial centroids are initialized randomly. ``kmean++``
+    is implemented but not exposed yet.
 
     Examples
     --------
