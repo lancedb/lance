@@ -1125,7 +1125,12 @@ class DatasetOptimizer:
          * Removes dropped columns from fragments
          * Merges small fragments into larger ones
 
-        This method tries to preserve the insertion order of rows in the dataset.
+        This method preserves the insertion order of the dataset. This may mean
+        it leaves small fragments in the dataset if they are not adjacent to
+        other fragments that need compaction. For example, if you have fragments
+        with row counts 5 million, 100, and 5 million, the middle fragment will
+        not be compacted because the fragments it is adjacent to do not need
+        compaction.
 
         Parameters
         ----------

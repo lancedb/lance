@@ -24,6 +24,8 @@
 //! can compact in two cases:
 //!
 //! 1. If a fragment has fewer rows than the target number of rows per fragment.
+//!    The fragment must also have neighbors that are also candidates for
+//!    compaction.
 //! 2. If a fragment has a higher percentage of deleted rows than the provided
 //!    threshold.
 //!
