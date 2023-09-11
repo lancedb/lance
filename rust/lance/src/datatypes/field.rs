@@ -193,9 +193,17 @@ impl Field {
 
     /// Create a new field by removing all fields that do not match the filter.
     ///
+    /// If a child field matches the filter then the parent will be kept even if
+    /// it does not match the filter.
+    ///
     /// Returns None if the field itself does not match the filter.
     pub(crate) fn project_by_filter<F: Fn(&Self) -> bool>(&self, filter: &F) -> Option<Self> {
-        if filter(self) {
+        let children = self
+            .children
+            .iter()
+            .filter_map(|c| c.project_by_filter(filter))
+            .collect::<Vec<_>>();
+        if children.len() > 0 || filter(self) {
             Some(Self {
                 name: self.name.clone(),
                 id: self.id,
@@ -204,11 +212,7 @@ impl Field {
                 metadata: self.metadata.clone(),
                 encoding: self.encoding.clone(),
                 nullable: self.nullable,
-                children: self
-                    .children
-                    .iter()
-                    .filter_map(|c| c.project_by_filter(filter))
-                    .collect(),
+                children,
                 dictionary: self.dictionary.clone(),
             })
         } else {
