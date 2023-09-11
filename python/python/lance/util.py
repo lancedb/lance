@@ -48,10 +48,22 @@ def sanitize_ts(ts: ts_types) -> datetime:
 
 
 class KMeans:
-    def __init__(self, k: int, metric_type: str = "l2"):
+    def __init__(self, k: int, metric_type: str = "l2", max_iters: int = 50):
+        """Create a KMeans model.
+
+        Parameters
+        ----------
+        k: int
+            The number of clusters to create.
+        metric_type: str, default="l2"
+            The metric to use for calculating distances between vectors.
+            Supported distance metrics: "l2", "cosine", "dot"
+        max_iters: int
+            The maximum number of iterations to run the KMeans algorithm. Default: 50.
+        """
         self.k = k
         self._metric_type = metric_type
-        self._kmeans = _KMeans(k, metric_type)
+        self._kmeans = _KMeans(k, metric_type, max_iters=max_iters)
 
     def __repr__(self) -> str:
         return f"lance.KMeans(k={self.k}, metric_type={self._metric_type})"
