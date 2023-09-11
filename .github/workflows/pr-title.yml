@@ -5,6 +5,8 @@ on:
     types: [opened, edited, synchronize, reopened]
 jobs:
   commitlint:
+    permissions:
+      pull-requests: write
     name: Verify PR title / description conforms to semantic-release
     runs-on: ubuntu-latest
     steps:
