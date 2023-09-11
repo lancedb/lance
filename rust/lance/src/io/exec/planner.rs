@@ -23,6 +23,7 @@ use datafusion::sql::sqlparser::ast::{
     FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
 };
 use datafusion::{
+    common::Column,
     logical_expr::{
         col,
         expr::{InList, ScalarFunction},
@@ -295,10 +296,8 @@ impl Planner {
     fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
         match expr {
             SQLExpr::Identifier(id) => {
-                if id.quote_style == Some('"') {
-                    Ok(Expr::Literal(ScalarValue::Utf8(Some(id.value.clone()))))
-                } else if id.quote_style == Some('`') {
-                    Ok(Expr::Literal(ScalarValue::Utf8(Some(id.value.clone()))))
+                if id.quote_style == Some('`') {
+                    Ok(Expr::Column(Column::from_name(id.value.clone())))
                 } else {
                     self.column(vec![id.clone()].as_slice())
                 }
