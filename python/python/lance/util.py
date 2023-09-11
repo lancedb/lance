@@ -13,7 +13,7 @@
 #  limitations under the License.
 
 from datetime import datetime
-from typing import Union, Optional
+from typing import Optional, Union
 
 import numpy as np
 import pyarrow as pa
