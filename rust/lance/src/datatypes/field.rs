@@ -203,7 +203,7 @@ impl Field {
             .iter()
             .filter_map(|c| c.project_by_filter(filter))
             .collect::<Vec<_>>();
-        if children.len() > 0 || filter(self) {
+        if !children.is_empty() || filter(self) {
             Some(Self {
                 name: self.name.clone(),
                 id: self.id,
