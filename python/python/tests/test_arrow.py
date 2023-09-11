@@ -18,7 +18,6 @@ from pathlib import Path
 import lance
 import pandas as pd
 import pyarrow as pa
-import pytest
 from helper import requires_pyarrow_12
 from lance.arrow import BFloat16, BFloat16Array, PandasBFloat16Array, bfloat16_array
 
