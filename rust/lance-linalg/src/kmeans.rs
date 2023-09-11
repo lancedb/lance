@@ -175,7 +175,7 @@ pub struct KMeanMembership {
     dimension: usize,
 
     /// Cluster Id for each vector.
-    cluster_ids: Vec<u32>,
+    pub cluster_ids: Vec<u32>,
 
     /// Distance between each vector, to its corresponding centroids.
     distances: Vec<f32>,
@@ -441,7 +441,7 @@ impl KMeans {
     ///
     /// - *data*: a `N * dimension` float32 array.
     /// - *dist_fn*: the function to compute distances.
-    async fn compute_membership(&self, data: Arc<Float32Array>) -> KMeanMembership {
+    pub async fn compute_membership(&self, data: Arc<Float32Array>) -> KMeanMembership {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let metric_type = self.metric_type;

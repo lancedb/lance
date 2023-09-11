@@ -74,6 +74,26 @@ class KMeans:
         ret = self._kmeans.centroids()
         return ret
 
+    def _to_fixed_size_list(self, data: pa.Array) -> pa.FixedSizeListArray:
+        if isinstance(data, pa.FixedSizeListArray):
+            if data.value_type != pa.float32():
+                raise ValueError(f"Array must be float32 type, got: {data.value_type}")
+            return data
+        elif isinstance(data, pa.FixedShapeTensorArray):
+            return pa.FixedSizeListArray.from_arrays(data.storage(), data.shape[1])
+        elif isinstance(data, np.ndarray):
+            if len(data.shape) != 2:
+                raise ValueError(
+                    f"Numpy array must be a 2-D array, got {len(data.shape)}-D"
+                )
+            elif data.dtype != np.float32:
+                raise ValueError(f"Numpy array must be float32 type, got: {data.dtype}")
+
+            inner_arr = pa.array(data.reshape((-1,)), type=pa.float32())
+            return pa.FixedSizeListArray.from_arrays(inner_arr, data.shape[1])
+        else:
+            raise ValueError("Data must be a FixedSizeListArray, Tensor or numpy array")
+
     def fit(
         self, data: Union[pa.FixedSizeListArray, pa.FixedShapeTensorArray, np.ndarray]
     ):
@@ -84,32 +104,12 @@ class KMeans:
         data: pa.FixedSizeListArray, pa.FixedShapeTensorArray, np.ndarray
             The data to fit the model to. Must be a 2-D array of float32 type.
         """
-        if isinstance(data, pa.FixedShapeTensorArray):
-            if len(data.shape) != 1:
-                raise ValueError(
-                    f"Tensor array must be a 1-D array, got {len(data.shape)}-D"
-                )
-            data = data.storage()
-        elif isinstance(data, np.ndarray):
-            if len(data.shape) != 2:
-                raise ValueError(
-                    f"Numpy array must be a 2-D array, got {len(data.shape)}-D"
-                )
-            elif data.dtype != np.float32:
-                raise ValueError(f"Numpy array must be float32 type, got: {data.dtype}")
-
-            inner_arr = pa.array(data.reshape((-1,)), type=pa.float32())
-            data = pa.FixedSizeListArray.from_arrays(inner_arr, data.shape[1])
-        elif isinstance(data, pa.FixedSizeListArray):
-            pass
-        else:
-            raise ValueError("Data must be a FixedSizeListArray, Tensor or numpy array")
-
-        self._kmeans.fit(data)
+        arr = self._to_fixed_size_list(data)
+        self._kmeans.fit(arr)
 
     def predict(
         self, data: Union[pa.FixedSizeListArray, pa.FixedShapeTensorArray, np.ndarray]
     ) -> pa.UInt32Array:
         """Predict the cluster for each vector in the data."""
-        centroids = self.centroids
-        pass
+        arr = self._to_fixed_size_list(data)
+        return self._kmeans.predict(arr)

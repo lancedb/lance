@@ -14,6 +14,7 @@
 
 import lance
 import numpy as np
+from numpy.linalg import norm
 
 
 def test_train_cosine():
@@ -25,3 +26,15 @@ def test_train_cosine():
     assert kmeans.centroids is not None
     centroids = np.stack(kmeans.centroids.to_numpy(zero_copy_only=False))
     assert centroids.shape == (32, 128)
+
+    # test predict
+    pred = kmeans.predict(data)
+
+    # compute predict using numpy brute-force
+    expected = []
+    for row in data:
+        # Cosine distance
+        dist = 1 - np.dot(centroids, row) / (norm(centroids, axis=1) * norm(row))
+        cluster_id = np.argmin(dist)
+        expected.append(cluster_id)
+    assert np.allclose(pred, expected)

@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
-use arrow_array::{Array, FixedSizeListArray, Float32Array};
+use arrow_array::{cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
 use lance_arrow::FixedSizeListArrayExt;
@@ -55,8 +57,8 @@ impl KMeans {
     }
 
     /// Train the model
-    fn fit(&mut self, py: Python, reader: &PyAny) -> PyResult<()> {
-        let data = ArrayData::from_pyarrow(reader)?;
+    fn fit(&mut self, py: Python, arr: &PyAny) -> PyResult<()> {
+        let data = ArrayData::from_pyarrow(arr)?;
         if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
             return Err(PyValueError::new_err("Must be a FixedSizeList"));
         }
@@ -74,6 +76,31 @@ impl KMeans {
             .map_err(|e| PyRuntimeError::new_err(format!("Error training KMeans: {}", e)))?;
         self.trained_kmeans = Some(kmeans);
         Ok(())
+    }
+
+    fn predict(&self, py: Python, array: &PyAny) -> PyResult<PyObject> {
+        let Some(kmeans) = self.trained_kmeans.as_ref() else {
+            return Err(PyRuntimeError::new_err("KMeans must fit (train) first"));
+        };
+        let data = ArrayData::from_pyarrow(array)?;
+        if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
+            return Err(PyValueError::new_err("Must be a FixedSizeList"));
+        }
+        let fixed_size_arr = FixedSizeListArray::from(data);
+        if kmeans.dimension != fixed_size_arr.value_length() as usize {
+            return Err(PyValueError::new_err(format!(
+                "Dimension mismatch: kmean model {} != data {}",
+                kmeans.dimension,
+                fixed_size_arr.value_length()
+            )));
+        };
+        if !matches!(fixed_size_arr.value_type(), DataType::Float32) {
+            return Err(PyValueError::new_err("Must be a FixedSizeList of Float32"));
+        };
+        let values: Arc<Float32Array> = fixed_size_arr.values().as_primitive().clone().into();
+        let membership = RT.block_on(Some(py), kmeans.compute_membership(values));
+        let cluster_ids: UInt32Array = membership.cluster_ids.into();
+        cluster_ids.into_data().to_pyarrow(py)
     }
 
     fn centroids(&self, py: Python) -> PyResult<PyObject> {
