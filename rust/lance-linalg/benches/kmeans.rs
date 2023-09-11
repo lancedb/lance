@@ -1,3 +1,4 @@
+use arrow_array::FixedSizeListArray;
 // Copyright 2023 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,10 +14,11 @@
 // limitations under the License.
 use criterion::{criterion_group, criterion_main, Criterion};
 
+use lance_arrow::FixedSizeListArrayExt;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance::utils::kmeans::KMeans;
+use lance_linalg::kmeans::KMeans;
 use lance_testing::datagen::generate_random_array;
 
 fn bench_train(c: &mut Criterion) {
@@ -24,11 +26,12 @@ fn bench_train(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let dimension: i32 = 128;
-    let array = generate_random_array(1024 * 4 * dimension as usize);
+    let values = generate_random_array(1024 * 4 * dimension as usize);
+    let array = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
 
     c.bench_function("train_128d_4k", |b| {
         b.to_async(&rt).iter(|| async {
-            KMeans::new(&array, 256, 25, 50).await.ok().unwrap();
+            KMeans::new(&array, 25, 50).await.ok().unwrap();
         })
     });
 
@@ -44,10 +47,11 @@ fn bench_train(c: &mut Criterion) {
         })
     });
 
-    let array = generate_random_array(1024 * 64 * dimension as usize);
+    let values = generate_random_array(1024 * 64 * dimension as usize);
+    let array = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
     c.bench_function("train_128d_65535", |b| {
         b.to_async(&rt).iter(|| async {
-            KMeans::new(&array, 256, 25, 50).await.ok().unwrap();
+            KMeans::new(&array, 25, 50).await.ok().unwrap();
         })
     });
 
@@ -64,10 +68,11 @@ fn bench_train(c: &mut Criterion) {
     });
 
     let dimension = 8;
-    let array = generate_random_array(1024 * 64 * dimension as usize);
+    let values = generate_random_array(1024 * 64 * dimension as usize);
+    let array = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
     c.bench_function("train_8d_65535", |b| {
         b.to_async(&rt).iter(|| async {
-            KMeans::new(&array, 256, 25, 50).await.ok().unwrap();
+            KMeans::new(&array, 25, 50).await.ok().unwrap();
         })
     });
 }

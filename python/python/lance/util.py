@@ -68,6 +68,12 @@ class KMeans:
     def __repr__(self) -> str:
         return f"lance.KMeans(k={self.k}, metric_type={self._metric_type})"
 
+    @property
+    def centroids(self) -> Optional[pa.FixedSizeListArray]:
+        """Returns the centroids of the model."""
+        ret = self._kmeans.centroids()
+        return ret
+
     def fit(
         self, data: Union[pa.FixedSizeListArray, pa.FixedShapeTensorArray, np.ndarray]
     ):
@@ -101,8 +107,9 @@ class KMeans:
 
         self._kmeans.fit(data)
 
-    @property
-    def centroids(self) -> Optional[pa.FixedSizeListArray]:
-        """Returns the centroids of the model."""
-        ret = self._kmeans.centroids()
-        return ret
+    def predict(
+        self, data: Union[pa.FixedSizeListArray, pa.FixedShapeTensorArray, np.ndarray]
+    ) -> pa.UInt32Array:
+        """Predict the cluster for each vector in the data."""
+        centroids = self.centroids
+        pass

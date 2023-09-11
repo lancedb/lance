@@ -42,3 +42,7 @@ harness = false
 [[bench]]
 name = "cosine"
 harness = false
+
+[[bench]]
+name = "kmeans"
+harness = false
