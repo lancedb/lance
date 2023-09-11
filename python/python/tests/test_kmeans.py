@@ -20,5 +20,8 @@ def test_train_cosine():
     kmeans = lance.util.KMeans(32, metric_type="cosine")
     data = np.random.randn(1000, 128).astype(np.float32)
 
+    assert kmeans.centroids is None
     kmeans.fit(data)
-    print(kmeans, kmeans.centroids)
+    assert kmeans.centroids is not None
+    centroids = np.stack(kmeans.centroids.to_numpy(zero_copy_only=False))
+    assert centroids.shape == (32, 128)

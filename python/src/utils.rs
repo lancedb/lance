@@ -12,15 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow::pyarrow::FromPyArrow;
-use arrow_array::{cast::AsArray, RecordBatch};
+use arrow::pyarrow::{FromPyArrow, ToPyArrow};
+use arrow_array::{Array, FixedSizeListArray, Float32Array};
+use arrow_data::ArrayData;
 use arrow_schema::DataType;
-use pyo3::{exceptions::PyValueError, prelude::*};
-
+use lance_arrow::FixedSizeListArrayExt;
 use lance_linalg::{
     distance::MetricType,
     kmeans::{KMeans as LanceKMeans, KMeansParams},
 };
+use pyo3::{
+    exceptions::{PyRuntimeError, PyValueError},
+    prelude::*,
+};
+
+use crate::RT;
 
 #[pyclass(name = "_KMeans")]
 pub struct KMeans {
@@ -31,6 +37,8 @@ pub struct KMeans {
     metric_type: MetricType,
 
     max_iters: usize,
+
+    trained_kmeans: Option<LanceKMeans>,
 }
 
 #[pymethods]
@@ -42,34 +50,46 @@ impl KMeans {
             k,
             metric_type: metric_type.try_into().unwrap(),
             max_iters,
+            trained_kmeans: None,
         })
     }
 
     /// Train the model
-    fn fit(&mut self, reader: &PyAny) -> PyResult<()> {
-        let batch = RecordBatch::from_pyarrow(reader)?;
-        let Some(array) = batch.column_by_name("_kmeans_data") else {
-            return Err(PyValueError::new_err("Missing column '_kmeans_data'"));
-        };
-        let dim: i32 = match array.data_type() {
-            DataType::FixedSizeList(_, dim) => *dim,
-            _ => {
-                return Err(PyValueError::new_err(
-                    "Column '_kmeans_data' must be a FixedSizeList",
-                ))
-            }
-        };
-        let fixed_size_arr = array.as_fixed_size_list();
+    fn fit(&mut self, py: Python, reader: &PyAny) -> PyResult<()> {
+        let data = ArrayData::from_pyarrow(reader)?;
+        if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
+            return Err(PyValueError::new_err("Must be a FixedSizeList"));
+        }
+        let fixed_size_arr = FixedSizeListArray::from(data);
         let params = KMeansParams {
             metric_type: self.metric_type,
             max_iters: self.max_iters as u32,
             ..Default::default()
         };
-        let kmeans = LanceKMeans::new_with_params(fixed_size_arr, self.k, &params);
+        let kmeans = RT
+            .block_on(
+                Some(py),
+                LanceKMeans::new_with_params(&fixed_size_arr, self.k, &params),
+            )
+            .map_err(|e| PyRuntimeError::new_err(format!("Error training KMeans: {}", e)))?;
+        self.trained_kmeans = Some(kmeans);
         Ok(())
     }
 
-    fn centroids(&self) -> PyResult<PyObject> {
-        Ok(Python::with_gil(|py| py.None()))
+    fn centroids(&self, py: Python) -> PyResult<PyObject> {
+        if let Some(kmeans) = self.trained_kmeans.as_ref() {
+            let centroids: Float32Array = kmeans.centroids.as_ref().clone();
+            let fixed_size_arr =
+                FixedSizeListArray::try_new_from_values(centroids, kmeans.dimension as i32)
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "Error converting centroids to FixedSizeListArray: {}",
+                            e
+                        ))
+                    })?;
+            fixed_size_arr.into_data().to_pyarrow(py)
+        } else {
+            Ok(py.None())
+        }
     }
 }

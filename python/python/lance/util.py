@@ -87,10 +87,10 @@ class KMeans:
         else:
             raise ValueError("Data must be a FixedSizeListArray, Tensor or numpy array")
 
-        batch = pa.RecordBatch.from_arrays([data], ["_kmeans_data"])
-        self._kmeans.fit(batch)
+        self._kmeans.fit(data)
 
     @property
     def centroids(self) -> Optional[pa.FixedSizeListArray]:
         """Returns the centroids of the model."""
-        return self._kmeans.centroids()
+        ret = self._kmeans.centroids()
+        return ret
