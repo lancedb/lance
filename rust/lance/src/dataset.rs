@@ -939,8 +939,6 @@ impl Dataset {
                 })?
                 .values();
 
-            
-
             let remapping_index: UInt64Array = row_ids
                 .iter()
                 .filter_map(|o| {
@@ -952,7 +950,6 @@ impl Dataset {
                 .collect();
 
             debug_assert_eq!(remapping_index.len(), one_batch.num_rows());
-
 
             // Remove the row id column.
             let keep_indices = (0..one_batch.num_columns() - 1).collect::<Vec<_>>();
@@ -1228,10 +1225,13 @@ fn check_row_ids(row_ids: &[u64]) -> RowIdMeta {
     }
 
     let mut last_id = row_ids[0];
+    let first_fragment_id = row_ids[0] >> 32;
 
     for id in row_ids.iter().skip(1) {
         sorted &= *id > last_id;
         contiguous &= *id == last_id + 1;
+        // Contiguous also requires the fragment ids are all the same
+        contiguous &= (*id >> 32) == first_fragment_id;
         last_id = *id;
     }
 

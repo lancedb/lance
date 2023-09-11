@@ -363,15 +363,15 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
         let positions_ref = positions.as_ref();
         futures::stream::iter(chunks)
             .map(|chunk| async move {
-                let start = chunk.indices.value(0);
-                let end = chunk.indices.value(chunk.indices.len() - 1);
+                let chunk_offset = chunk.indices.value(0);
+                let chunk_end = chunk.indices.value(chunk.indices.len() - 1);
                 let array = self
-                    .get_range(positions_ref, start as usize..end as usize + 1)
+                    .get_range(positions_ref, chunk_offset as usize..chunk_end as usize + 1)
                     .await?;
-                Result::Ok((chunk, start, array))
+                Result::Ok((chunk, chunk_offset, array))
             })
             .buffered(num_cpus::get())
-            .try_for_each(|(chunk, start, array)| {
+            .try_for_each(|(chunk, chunk_offset, array)| {
                 let array: &GenericByteArray<T> = array.as_bytes();
 
                 // Faster to do one large memcpy than O(n) small ones.
@@ -382,12 +382,12 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
                 // Append each value to the buffer in the correct order
                 for index in chunk.indices.values() {
                     if !chunk.is_contiguous {
-                        let value = array.value((index - start) as usize);
+                        let value = array.value((index - chunk_offset) as usize);
                         let value_ref: &[u8] = value.as_ref();
                         buffer.extend_from_slice(value_ref);
                     }
 
-                    offset += array.value_length((index - start) as usize);
+                    offset += array.value_length((index - chunk_offset) as usize);
                     // Append next offset
                     // Safety: We allocated appropriate capacity on initialization
                     unsafe {

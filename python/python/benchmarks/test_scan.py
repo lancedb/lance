@@ -73,8 +73,8 @@ def sample_dataset(tmpdir_factory):
                     random.choice(
                         [
                             random.randbytes(100 * 1024),
-                            random.randbytes(1024),
-                            random.randbytes(1024),
+                            random.randbytes(100 * 1024),
+                            random.randbytes(100 * 1024),
                         ]
                     )
                     for _ in range(NUM_ROWS)
