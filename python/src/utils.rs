@@ -128,22 +128,23 @@ pub(crate) fn utc_datetime_from_str(s: &str) -> PyResult<DateTime<Utc>> {
         .or_else(|err| {
             // If a naive datetime is provided then we assume it is in the local time zone
             let naive = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f");
-            if naive.is_err() {
+            if let Ok(naive) = naive {
+                if let Some(dt) = naive.and_local_timezone(Local).single() {
+                    Ok(dt.fixed_offset())
+                } else {
+                    // This can fail with times that are ambiguous (e.g. 1:30am on the day we
+                    // switch to daylight savings time)
+                    Err(PyValueError::new_err(format!(
+                        "Failed to parse ambiguous local time from string: {}",
+                        err
+                    )))
+                }
+            } else {
                 // Whatever they provided was not a naive date time so use the original error
                 Err(PyValueError::new_err(format!(
                     "Failed to parse date time from string: {}",
                     err
                 )))
-            } else {
-                match naive.unwrap().and_local_timezone(Local).single() {
-                    Some(dt) => Ok(dt.fixed_offset()),
-                    // This can fail with times that are ambiguous (e.g. 1:30am on the day we
-                    // switch to daylight savings time)
-                    None => Err(PyValueError::new_err(format!(
-                        "Failed to parse ambiguous local time from string: {}",
-                        err
-                    ))),
-                }
             }
         })?
         .with_timezone(&Utc))
