@@ -38,8 +38,7 @@ pub struct Schema {
 /// State for a pre-order DFS iterator over the fields of a schema.
 struct SchemaFieldIterPreOrder<'a> {
     schema: &'a Schema,
-    field_stack: Vec<&'a Field>,
-    idx_stack: Vec<usize>,
+    field_stack: Vec<(&'a Field, usize)>,
     top_level_idx: usize,
 }
 
@@ -48,7 +47,6 @@ impl<'a> SchemaFieldIterPreOrder<'a> {
         Self {
             schema,
             field_stack: Vec::new(),
-            idx_stack: Vec::new(),
             top_level_idx: 0,
         }
     }
@@ -63,25 +61,22 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
             if self.field_stack.is_empty() {
                 if self.top_level_idx < self.schema.fields.len() {
                     self.field_stack
-                        .push(&self.schema.fields[self.top_level_idx]);
-                    self.idx_stack.push(0);
+                        .push((&self.schema.fields[self.top_level_idx], 0));
                     self.top_level_idx += 1;
-                    return Some(self.field_stack.last().unwrap());
+                    return Some(self.field_stack.last().unwrap().0);
                 } else {
                     return None;
                 }
             } else {
-                let field = self.field_stack.last().unwrap();
-                let idx = self.idx_stack.last_mut().unwrap();
+                let (field, idx) = self.field_stack.last_mut().unwrap();
                 if *idx < field.children.len() {
                     // Field has more children
-                    self.field_stack.push(&field.children[*idx]);
+                    let child = &field.children[*idx];
                     *idx += 1;
-                    self.idx_stack.push(0);
-                    return Some(self.field_stack.last().unwrap());
+                    self.field_stack.push((child, 0));
+                    return Some(child);
                 } else {
                     // Field has no more children
-                    self.idx_stack.pop();
                     self.field_stack.pop();
                 }
             }
