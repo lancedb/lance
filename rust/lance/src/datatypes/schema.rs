@@ -37,18 +37,17 @@ pub struct Schema {
 
 /// State for a pre-order DFS iterator over the fields of a schema.
 struct SchemaFieldIterPreOrder<'a> {
-    schema: &'a Schema,
-    field_stack: Vec<(&'a Field, usize)>,
-    top_level_idx: usize,
+    field_stack: Vec<&'a Field>,
 }
 
 impl<'a> SchemaFieldIterPreOrder<'a> {
     fn new(schema: &'a Schema) -> Self {
-        Self {
-            schema,
-            field_stack: Vec::new(),
-            top_level_idx: 0,
+        let mut field_stack = Vec::new();
+        field_stack.reserve(schema.fields.len() * 2);
+        for field in schema.fields.iter().rev() {
+            field_stack.push(field);
         }
+        Self { field_stack }
     }
 }
 
@@ -57,29 +56,13 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
     type Item = &'a Field;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.field_stack.is_empty() {
-                if self.top_level_idx < self.schema.fields.len() {
-                    self.field_stack
-                        .push((&self.schema.fields[self.top_level_idx], 0));
-                    self.top_level_idx += 1;
-                    return Some(self.field_stack.last().unwrap().0);
-                } else {
-                    return None;
-                }
-            } else {
-                let (field, idx) = self.field_stack.last_mut().unwrap();
-                if *idx < field.children.len() {
-                    // Field has more children
-                    let child = &field.children[*idx];
-                    *idx += 1;
-                    self.field_stack.push((child, 0));
-                    return Some(child);
-                } else {
-                    // Field has no more children
-                    self.field_stack.pop();
-                }
+        if let Some(next_field) = self.field_stack.pop() {
+            for child in next_field.children.iter().rev() {
+                self.field_stack.push(child);
             }
+            Some(next_field)
+        } else {
+            None
         }
     }
 }
