@@ -1983,7 +1983,7 @@ mod test {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut data_gen = BatchGenerator::new().col(Box::new(
-            IncrementingInt32::new().named("filter_me".to_owned()),
+            IncrementingInt32::new().named("Filter_me".to_owned()),
         ));
         Dataset::write(data_gen.batch(32), test_uri, None)
             .await
@@ -1995,7 +1995,7 @@ mod test {
             16,
             dataset
                 .scan()
-                .filter("filter_me > 15")
+                .filter("`Filter_me` > 15")
                 .unwrap()
                 .count_rows()
                 .await
