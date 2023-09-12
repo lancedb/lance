@@ -37,7 +37,7 @@ from .fragment import FragmentMetadata, LanceFragment
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .lance import CleanupStats, _Dataset, _Operation, _Scanner, _write_dataset
-from .util import ts_to_iso8601
+from .util import ts_to_epoch_micros
 
 try:
     import pandas as pd
@@ -586,7 +586,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if before is None:
             before = datetime.now(timezone.utc) - timedelta(days=14)
-        return self._ds.cleanup_old_versions(ts_to_iso8601(before))
+        return self._ds.cleanup_old_versions(ts_to_epoch_micros(before))
 
     def create_index(
         self,

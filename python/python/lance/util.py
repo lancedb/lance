@@ -12,7 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional, Union
 
 import numpy as np
@@ -57,10 +57,14 @@ def sanitize_ts(ts: ts_types) -> datetime:
     return ts
 
 
-def ts_to_iso8601(ts: ts_types) -> str:
-    """Returns an ISO8601 formatted string from various timestamp input types."""
+def ts_to_epoch_micros(ts: ts_types) -> int:
     ts = sanitize_ts(ts)
-    return ts.isoformat()
+    if ts.tzinfo is None:
+        # If we are given a naive datetime then assume the user wants the local timezone
+        ts = ts.astimezone()
+    diff = ts - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    micros = round(diff / timedelta(microseconds=1))
+    return micros
 
 
 class KMeans:

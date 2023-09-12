@@ -45,7 +45,7 @@ use pyo3::{
 };
 
 use crate::fragment::{FileFragment, FragmentMetadata};
-use crate::utils::utc_datetime_from_str;
+use crate::utils::utc_datetime_from_epoch_timestamp;
 use crate::Scanner;
 use crate::RT;
 
@@ -487,8 +487,8 @@ impl Dataset {
         Ok(())
     }
 
-    fn cleanup_old_versions(&self, before: &str) -> PyResult<CleanupStats> {
-        let before = utc_datetime_from_str(before)?;
+    fn cleanup_old_versions(&self, before: i64) -> PyResult<CleanupStats> {
+        let before = utc_datetime_from_epoch_timestamp(before)?;
         let cleanup_stats = RT
             .block_on(None, self.ds.cleanup_old_versions(before))
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
