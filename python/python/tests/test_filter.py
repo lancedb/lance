@@ -173,11 +173,15 @@ def test_escaped_name(tmp_path: Path, provide_pandas: bool):
         result, pd.DataFrame([{"ALLCAPSNAME": 1, "other": 3}])
     )
 
-    table = pa.table({"Nested with Space": pa.array([{"Inner With Caps": i} for i in range(3)])})
+    table = pa.table(
+        {"Nested with Space": pa.array([{"Inner With Caps": i} for i in range(3)])}
+    )
     _ = lance.write_dataset(table, tmp_path / "test_escaped_name_nested_and_capped")
 
     dataset = lance.dataset(tmp_path / "test_escaped_name_nested_and_capped")
-    result = dataset.to_table(filter="`Nested with Space`.`Inner With Caps` > 1").to_pandas()
+    result = dataset.to_table(
+        filter="`Nested with Space`.`Inner With Caps` > 1"
+    ).to_pandas()
     pd.testing.assert_frame_equal(
         result, pd.DataFrame({"Nested with Space": [{"Inner With Caps": 2}]})
     )
