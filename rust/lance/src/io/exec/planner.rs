@@ -296,7 +296,13 @@ impl Planner {
     fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
         match expr {
             SQLExpr::Identifier(id) => {
-                if id.quote_style == Some('`') {
+                // Users can pass string literals wrapped in `"`.
+                // (Normally SQL only allows single quotes.)
+                if id.quote_style == Some('"') {
+                    Ok(Expr::Literal(ScalarValue::Utf8(Some(id.value.clone()))))
+                // Users can wrap identifiers with ` to reference non-standard
+                // names, such as uppercase or spaces.
+                } else if id.quote_style == Some('`') {
                     Ok(Expr::Column(Column::from_name(id.value.clone())))
                 } else {
                     self.column(vec![id.clone()].as_slice())
