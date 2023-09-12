@@ -57,6 +57,12 @@ def sanitize_ts(ts: ts_types) -> datetime:
     return ts
 
 
+def ts_to_iso8601(ts: ts_types) -> str:
+    """Returns an ISO8601 formatted string from various timestamp input types."""
+    ts = sanitize_ts(ts)
+    return ts.isoformat()
+
+
 class KMeans:
     """KMean model for clustering.
 

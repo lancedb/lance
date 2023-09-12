@@ -20,7 +20,7 @@ import os
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
@@ -36,7 +36,8 @@ from .commit import CommitLock
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
-from .lance import _Dataset, _Operation, _Scanner, _write_dataset
+from .lance import CleanupStats, _Dataset, _Operation, _Scanner, _write_dataset
+from .util import ts_to_iso8601
 
 try:
     import pandas as pd
@@ -559,6 +560,33 @@ class LanceDataset(pa.dataset.Dataset):
         This creates a new commit.
         """
         self._ds.restore()
+
+    def cleanup_old_versions(self, before: datetime = None) -> CleanupStats:
+        """
+        Cleans up old versions of the dataset.
+
+        Some dataset changes, such as a delete, remove data from the dataset but
+        do not physically remove the deleted rows from storage.  The old data is
+        left in place to allow the dataset to be restored back to an older version.
+
+        This method will remove older versions and any data files they reference.
+        Once this cleanup task has run you will not be able to checkout or restore
+        these older versions.
+
+        Parameters
+        ----------
+
+        before: datetime or str, optional
+            Only versions older than this will be removed.  If not specified, this
+            will default to two weeks ago.  This cannot be more recent than two
+            weeks ago.
+
+            This can be a datetime object or a string in ISO 8601 format.  If no
+            timezone is provided then it is assumed to be a time in the local timezone.
+        """
+        if before is None:
+            before = datetime.now(timezone.utc) - timedelta(days=14)
+        return self._ds.cleanup_old_versions(ts_to_iso8601(before))
 
     def create_index(
         self,

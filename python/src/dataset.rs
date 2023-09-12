@@ -45,11 +45,14 @@ use pyo3::{
 };
 
 use crate::fragment::{FileFragment, FragmentMetadata};
+use crate::utils::utc_datetime_from_str;
 use crate::Scanner;
 use crate::RT;
 
+use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
 
+pub mod cleanup;
 pub mod commit;
 pub mod optimize;
 
@@ -482,6 +485,20 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
+    }
+
+    fn cleanup_old_versions(&self, before: &str) -> PyResult<CleanupStats> {
+        let before = utc_datetime_from_str(before)?;
+        let cleanup_stats = RT
+            .block_on(None, self.ds.cleanup_old_versions(before))
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(CleanupStats {
+            unreferenced_data_paths: cleanup_stats.unreferenced_data_paths,
+            unreferenced_delete_paths: cleanup_stats.unreferenced_delete_paths,
+            unreferenced_index_paths: cleanup_stats.unreferenced_index_paths,
+            unreferenced_tx_paths: cleanup_stats.unreferenced_tx_paths,
+            old_manifests: cleanup_stats.old_manifests,
+        })
     }
 
     fn create_index(

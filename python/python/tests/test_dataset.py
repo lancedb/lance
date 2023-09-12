@@ -19,7 +19,7 @@ import platform
 import re
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -385,6 +385,38 @@ def test_add_columns(tmp_path: Path):
     assert tbl == pa.Table.from_pydict(
         {"a": range(100), "b": range(100), "c": pa.array(range(0, 200, 2), pa.int64())}
     )
+
+
+def test_cleanup_old_versions(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    # These tests don't actually clean up any files.  Due to the 2 weeks
+    # requirement this is currently too difficult to simulate from python.
+    # Instead we just make sure the API is correct.
+
+    # Ok, defaults to two weeks ago
+    stats = dataset.cleanup_old_versions()
+    assert stats.old_manifests == 0
+    assert stats.unreferenced_data_paths == 0
+    assert stats.unreferenced_delete_paths == 0
+    assert stats.unreferenced_index_paths == 0
+    assert stats.unreferenced_tx_paths == 0
+
+    # Ok, can accept time as ISO string
+    dataset.cleanup_old_versions(before="2021-01-01T00:00:00.000000Z")
+    # Ok, can accept time as datetime
+    dataset.cleanup_old_versions(
+        before=datetime.now(timezone.utc) - pd.Timedelta(days=14)
+    )
+    # Ok if no time zone specified, will assume local time
+    dataset.cleanup_old_versions(before=datetime.now() - pd.Timedelta(days=14))
+    dataset.cleanup_old_versions(before="2021-01-01T00:00:00.000000")
+    # Not ok, too recent
+    with pytest.raises(OSError):
+        dataset.cleanup_old_versions(before=datetime.now(timezone.utc))
 
 
 def test_create_from_commit(tmp_path: Path):

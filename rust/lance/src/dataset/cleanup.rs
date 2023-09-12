@@ -62,11 +62,11 @@ struct ReferencedFiles {
 
 #[derive(Clone, Debug, Default)]
 pub struct RemovalStats {
-    unreferenced_data_paths: u64,
-    unreferenced_delete_paths: u64,
-    unreferenced_index_paths: u64,
-    unreferenced_tx_paths: u64,
-    old_manifests: u64,
+    pub unreferenced_data_paths: u64,
+    pub unreferenced_delete_paths: u64,
+    pub unreferenced_index_paths: u64,
+    pub unreferenced_tx_paths: u64,
+    pub old_manifests: u64,
 }
 
 fn remove_prefix(path: &Path, prefix: &Path) -> Path {

@@ -27,6 +27,7 @@ use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::ArrowError;
+use dataset::cleanup::CleanupStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
@@ -81,6 +82,7 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<FragmentMetadata>()?;
     m.add_class::<DataFile>()?;
     m.add_class::<BFloat16>()?;
+    m.add_class::<CleanupStats>()?;
     m.add_class::<KMeans>()?;
     m.add_class::<PyCompactionTask>()?;
     m.add_class::<PyCompaction>()?;

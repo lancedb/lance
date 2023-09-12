@@ -18,6 +18,7 @@ use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
+use chrono::{DateTime, Local, NaiveDateTime, Utc};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_linalg::{
     distance::MetricType,
@@ -120,4 +121,30 @@ impl KMeans {
             Ok(py.None())
         }
     }
+}
+
+pub(crate) fn utc_datetime_from_str(s: &str) -> PyResult<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(s)
+        .or_else(|err| {
+            // If a naive datetime is provided then we assume it is in the local time zone
+            let naive = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f");
+            if naive.is_err() {
+                // Whatever they provided was not a naive date time so use the original error
+                Err(PyValueError::new_err(format!(
+                    "Failed to parse date time from string: {}",
+                    err
+                )))
+            } else {
+                match naive.unwrap().and_local_timezone(Local).single() {
+                    Some(dt) => Ok(dt.fixed_offset()),
+                    // This can fail with times that are ambiguous (e.g. 1:30am on the day we
+                    // switch to daylight savings time)
+                    None => Err(PyValueError::new_err(format!(
+                        "Failed to parse ambiguous local time from string: {}",
+                        err
+                    ))),
+                }
+            }
+        })?
+        .with_timezone(&Utc))
 }

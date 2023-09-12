@@ -45,6 +45,7 @@ pub mod transaction;
 pub mod updater;
 mod write;
 
+use self::cleanup::RemovalStats;
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::Scanner;
@@ -562,6 +563,26 @@ impl Dataset {
         );
 
         Ok(())
+    }
+
+    /// Removes old versions of the dataset from disk
+    ///
+    /// This function will remove all versions of the dataset that are older than the provided
+    /// timestamp.  This function will not remove the current version of the dataset.
+    ///
+    /// Once a version is removed it can no longer be checked out or restored.  Any data unique
+    /// to that version will be lost.
+    ///
+    /// # Arguments
+    ///
+    /// * `before` - The timestamp of the oldest version to keep.  This must be at least
+    ///              two weeks ago.
+    ///
+    /// # Returns
+    ///
+    /// * `RemovalStats` - Statistics about the removal operation
+    pub async fn cleanup_old_versions(&self, before: DateTime<Utc>) -> Result<RemovalStats> {
+        cleanup::cleanup_old_versions(self, before).await
     }
 
     /// Commit changes to the dataset
