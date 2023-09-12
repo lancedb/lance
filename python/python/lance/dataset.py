@@ -34,9 +34,10 @@ from pyarrow._compute import Expression
 
 from .commit import CommitLock
 from .fragment import FragmentMetadata, LanceFragment
+from .lance import CleanupStats
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
-from .lance import CleanupStats, _Dataset, _Operation, _Scanner, _write_dataset
+from .lance import _Dataset, _Operation, _Scanner, _write_dataset
 from .util import ts_to_epoch_micros
 
 try:
