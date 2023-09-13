@@ -28,6 +28,8 @@ use std::os::windows::fs::FileExt;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use object_store::path::Path;
+use snafu::location;
+use snafu::Location;
 
 use super::object_reader::ObjectReader;
 use crate::{Error, Result};
@@ -67,6 +69,7 @@ impl LocalObjectReader {
         let file = File::open(local_path).map_err(|e| match e.kind() {
             ErrorKind::NotFound => Error::NotFound {
                 uri: path.to_string(),
+                location: location!(),
             },
             _ => Error::IO {
                 message: e.to_string(),

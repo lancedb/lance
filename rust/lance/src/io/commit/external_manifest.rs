@@ -19,7 +19,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use log::warn;
 use object_store::path::Path;
+use snafu::{location, Location};
 
 use crate::format::{Index, Manifest};
 use crate::io::commit::{CommitError, CommitHandler, ManifestWriter};
@@ -128,13 +130,39 @@ impl CommitHandler for ExternalManifestCommitHandler {
         version: u64,
         object_store: &ObjectStore,
     ) -> std::result::Result<Path, crate::Error> {
-        let path = self
+        let path_res = self
             .external_manifest_store
             .get(base_path.as_ref(), version)
-            .await
-            .map_err(|_| Error::NotFound {
-                uri: manifest_path(base_path, version).to_string(),
-            })?;
+            .await;
+
+        let path = match path_res {
+            Ok(p) => p,
+            // not board external manifest yet, direct to object store
+            Err(Error::NotFound { .. }) => {
+                let path = manifest_path(base_path, version);
+                // if exist update external manifest store
+                if object_store.exists(&path).await? {
+                    // best effort put, if it fails, it's okay
+                    match self
+                        .external_manifest_store
+                        .put_if_not_exists(base_path.as_ref(), version, path.as_ref())
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!("could up update external manifest store during load, with error: {}", e);
+                        }
+                    }
+                } else {
+                    return Err(Error::NotFound {
+                        uri: path.to_string(),
+                        location: location!(),
+                    });
+                }
+                return Ok(manifest_path(base_path, version));
+            }
+            Err(e) => return Err(e),
+        };
 
         // finalized path, just return
         if path.ends_with(&format!(".{MANIFEST_EXTENSION}")) {
@@ -247,8 +275,9 @@ mod test {
             let store = self.store.lock().await;
             match store.get(&(uri.to_string(), version)) {
                 Some(path) => Ok(path.clone()),
-                None => Err(Error::IO {
-                    message: format!("manifest not found for uri: {}, version: {}", uri, version),
+                None => Err(Error::NotFound {
+                    uri: uri.to_string(),
+                    location: location!(),
                 }),
             }
         }
@@ -341,13 +370,28 @@ mod test {
 
         // Then try to load the dataset with external store handler set
         let sleepy_store = SleepyExternalManifestStore::new();
-        let handler = ExternalManifestCommitHandler {
+        let handler = Arc::new(ExternalManifestCommitHandler {
             external_manifest_store: Arc::new(sleepy_store),
-        };
-        let options = read_params(Arc::new(handler));
+        });
+        let options = read_params(handler.clone());
         Dataset::open_with_params(ds_uri, &options).await.expect(
             "If this fails, it means the external store handler does not correctly handle the case when a dataset exist, but it has never used external store before."
         );
+
+        Dataset::write(
+            data_gen.batch(100),
+            ds_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                store_params: Some(ObjectStoreParams {
+                    commit_handler: Some(handler),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
