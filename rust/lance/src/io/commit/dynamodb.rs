@@ -411,10 +411,12 @@ mod test {
         // DNE should return None for latest
         assert_eq!(store.get_latest_version("test").await.unwrap(), None);
         // DNE should return Err for get specific version
-        assert_eq!(
-            store.get("test", 1).await.unwrap_err().to_string(),
-            "Not found: dynamodb not found: base_uri: test; version: 1"
-        );
+        assert!(store
+            .get("test", 1)
+            .await
+            .unwrap_err()
+            .to_string()
+            .starts_with("Not found: dynamodb not found: base_uri: test; version: 1"));
         // try to use the API for finalizing should return err when the version is DNE
         assert!(store.put_if_exists("test", 1, "test").await.is_err());
 

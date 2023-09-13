@@ -264,7 +264,7 @@ impl Dataset {
             .open(manifest_path)
             .await
             .map_err(|e| match &e {
-                Error::NotFound { uri } => Error::DatasetNotFound {
+                Error::NotFound { uri, .. } => Error::DatasetNotFound {
                     path: uri.clone(),
                     source: box_error(e),
                 },

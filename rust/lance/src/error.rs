@@ -16,7 +16,7 @@
 // under the License.
 
 use arrow_schema::ArrowError;
-use snafu::Snafu;
+use snafu::{Location, Snafu};
 
 use crate::datatypes::Schema;
 
@@ -53,8 +53,8 @@ pub enum Error {
     Arrow { message: String },
     #[snafu(display("LanceError(Schema): {message}"))]
     Schema { message: String },
-    #[snafu(display("Not found: {uri}"))]
-    NotFound { uri: String },
+    #[snafu(display("Not found: {uri}, {location}"))]
+    NotFound { uri: String, location: Location },
     #[snafu(display("LanceError(IO): {message}"))]
     IO { message: String },
     #[snafu(display("LanceError(Index): {message}"))]
