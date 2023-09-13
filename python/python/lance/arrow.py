@@ -11,12 +11,125 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import pyarrow as pa
 
 from .lance import BFloat16
 from .lance import bfloat16_array as bfloat16_array
+
+class ImageURIType(pa.ExtensionType):
+    def __init__(self):
+        pa.ExtensionType.__init__(self, pa.string(), "lance.arrow.image_uri")
+
+    def __arrow_ext_serialize__(self):
+        return b""
+
+    @classmethod
+    def __arrow_ext_deserialize__(self, storage_type, serialized):
+        return ImageURIType()
+
+    def __arrow_ext_class__(self):
+        return EncodedImageArray
+
+    def __arrow_ext_scalar_class__(self):
+        return ImageURIScalar
+
+
+class ImageURIArray(pa.ExtensionArray):
+    def __repr__(self):
+        return "<lance.arrow.ImageURIArray object at 0x%016x>\n%s" % (
+            id(self),
+            repr(self.to_pylist()),
+        )
+
+    @classmethod
+    def from_uris(cls, uris: Union[pa.StringArray, List[str]]):
+        if isinstance(uris, list):
+            return cls.from_storage(ImageURIType(), pa.array(uris, type=pa.string()))
+        else:
+            return cls.from_storage(ImageURIType(), storage)
+
+    def materialize(self):
+        # TODO: download images and return them as lance.arrow.EncodedImageArray
+        pass
+
+
+class ImageURIScalar(pa.ExtensionScalar):
+    def as_py(self):
+        self.value.as_py()
+
+
+class EncodedImageType(pa.ExtensionType):
+    def __init__(self):
+        pa.ExtensionType.__init__(self, pa.binary(), "lance.arrow.encoded_image")
+
+    def __arrow_ext_serialize__(self):
+        return b""
+
+    @classmethod
+    def __arrow_ext_deserialize__(self, storage_type, serialized):
+        return EncodedImageType()
+
+    def __arrow_ext_class__(self):
+        return EncodedImageArray
+
+    def __arrow_ext_scalar_class__(self):
+        return EncodedImageScalar
+
+
+class EncodedImageArray(pa.ExtensionArray):
+    def __repr__(self):
+        return "<lance.arrow.EncodedImageArray object at 0x%016x>\n%s" % (
+            id(self),
+            repr(self.to_pylist()),
+        )
+
+    def from_array(self, array: pa.BinaryArray):
+        self.storage = array
+
+    def materialize(self):
+        # TODO: decode encoded images and return them as lance.arrow.TensorImageArray
+        pass
+
+
+class EncodedImageScalar(pa.ExtensionScalar):
+    def as_py(self):
+        self.value.as_py()
+
+
+class ImageTensorType(pa.ExtensionType):
+    def __init__(self):
+        pa.ExtensionType.__init__(self, pa.binary(), "lance.arrow.tensor_image")
+
+    def __arrow_ext_serialize__(self):
+        return b""
+
+    @classmethod
+    def __arrow_ext_deserialize__(self, storage_type, serialized):
+        return ImageTensorType()
+
+    def __arrow_ext_class__(self):
+        return ImageTensorArray
+
+    def __arrow_ext_scalar_class__(self):
+        return ImageTensorScalar
+
+
+class ImageTensorArray(pa.ExtensionArray):
+    def __repr__(self):
+        return "<lance.arrow.ImageTensorArray object at 0x%016x>\n%s" % (
+            id(self),
+            repr(self.to_pylist()),
+        )
+
+    def from_array(self, array: pa.FixedShapeTensorArray):
+        self.storage = array
+
+
+class ImageTensorScalar(pa.ExtensionScalar):
+    def as_py(self):
+        self.value.as_py()
 
 
 class BFloat16Array(pa.ExtensionArray):

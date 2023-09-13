@@ -19,7 +19,7 @@ import lance
 import pandas as pd
 import pyarrow as pa
 from helper import requires_pyarrow_12
-from lance.arrow import BFloat16, BFloat16Array, PandasBFloat16Array, bfloat16_array
+from lance.arrow import BFloat16, BFloat16Array, PandasBFloat16Array, bfloat16_array, ImageURIArray, EncodedImageArray, ImageTensorArray
 
 
 def test_bf16_value():
@@ -132,3 +132,8 @@ def test_roundtrip_take_ext_types(tmp_path: Path):
         [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
         [12.0, 13.0, 14.0, 15.0, 16.0, 17.0],
     ]
+
+def test_image_arrays():
+    uris = [None, "http://example.com"]
+    uri_array = ImageURIArray.from_uris(uris)
+    # TODO

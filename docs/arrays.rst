@@ -72,3 +72,25 @@ Finally, if you have a pre-existing NumPy array, you can convert it into either:
 
 When reading, these can be converted back to to the NumPy bfloat16 dtype using
 each array class's ``to_numpy`` method.
+
+ImageURI
+--------
+
+:class:`lance.arrow.ImageURIArray` is an Arrow extension array that represents
+URIs of images backed by a :class:`pyarrow.StringArray`. It provides a method
+for reading images into memory as a :class:`lance.arrow.EncodedImageArray`.
+
+EncodedImage
+------------
+
+:class:`lance.arrow.EncodedImageArray` is an Arrow extension array that represents
+jpeg/png/gif/bmp encoded images stored in a :class:`pyarrow.BinaryArray`. It provides
+a method for materializing images into memory as a :class:`lance.arrow.ImageTensorArray`.
+
+ImageTensor
+-----------
+
+:class:`lance.arrow.ImageTensorArray` is an Arrow extension array that represents
+images stored as a :class:`pyarrow.FixedShapeTensorArray` or
+:class:`pyarrow.VariableShapeTensorArray`. It provides methods for converting to
+common memory layouts such as NumPy, PIL, PyTorch, and TensorFlow.
