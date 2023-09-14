@@ -31,7 +31,7 @@ use datafusion::physical_plan::{
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
     union::UnionExec,
-    ExecutionPlan, SendableRecordBatchStream,
+    ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
 };
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
@@ -79,6 +79,9 @@ pub struct Scanner {
 
     projections: Schema,
 
+    /// If true then the filter will be applied before an index scan
+    prefilter: bool,
+
     /// Optional filters string.
     filter: Option<String>,
 
@@ -119,6 +122,7 @@ impl Scanner {
         Self {
             dataset,
             projections: projection,
+            prefilter: false,
             filter: None,
             batch_size,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
@@ -138,6 +142,7 @@ impl Scanner {
         Self {
             dataset,
             projections: projection,
+            prefilter: false,
             filter: None,
             batch_size,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
@@ -180,6 +185,23 @@ impl Scanner {
     pub fn project<T: AsRef<str>>(&mut self, columns: &[T]) -> Result<&mut Self> {
         self.projections = self.dataset.schema().project(columns)?;
         Ok(self)
+    }
+
+    /// Should the filter run before the vector index is applied
+    ///
+    /// If true then the filter will be applied before the vector index.  This
+    /// means the results will be accurate but the overall query may be more expensive.
+    ///
+    /// If false then the filter will be applied to the nearest results.  This means
+    /// you may get back fewer results than you ask for (or none at all) if the closest
+    /// results do not match the filter.
+    ///
+    /// EXPERIMENTAL: Currently, prefiltering is only supported when a vector index
+    /// is not used and the query is performing a flat knn search.  If the filter matches
+    /// many rows then the query could be very expensive.
+    pub fn prefilter(&mut self, should_prefilter: bool) -> &mut Self {
+        self.prefilter = should_prefilter;
+        self
     }
 
     /// Apply filters
@@ -463,14 +485,14 @@ impl Scanner {
     ///
     /// In general, a plan has 4 stages:
     ///
-    /// 1. Source (from dataset Scan or from index)
+    /// 1. Source (from dataset Scan or from index, may include prefilter)
     /// 2. Filter
     /// 3. Limit / Offset
     /// 4. Take remaining columns / Projection
     async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         // NOTE: we only support node that have one partition. So any nodes that
         // produce multiple need to be repartitioned to 1.
-        let filter_expr = if let Some(filter) = self.filter.as_ref() {
+        let mut filter_expr = if let Some(filter) = self.filter.as_ref() {
             let planner = Planner::new(Arc::new(self.dataset.schema().into()));
             let logical_expr = planner.parse_filter(filter)?;
             Some(planner.create_physical_expr(&logical_expr)?)
@@ -480,7 +502,13 @@ impl Scanner {
 
         // Stage 1: source
         let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() {
-            self.knn().await?
+            if self.prefilter {
+                let prefilter = filter_expr;
+                filter_expr = None;
+                self.knn(prefilter).await?
+            } else {
+                self.knn(None).await?
+            }
         } else if let Some(expr) = filter_expr.as_ref() {
             let columns_in_filter = column_names_in_expr(expr.as_ref());
             let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
@@ -520,8 +548,11 @@ impl Scanner {
         Ok(plan)
     }
 
-    // KNN search execution node.
-    async fn knn(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    // KNN search execution node with optional prefilter
+    async fn knn(
+        &self,
+        prefilter: Option<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let Some(q) = self.nearest.as_ref() else {
             return Err(Error::IO {
                 message: "No nearest query".to_string(),
@@ -561,6 +592,9 @@ impl Scanner {
         };
         let knn_idx = indices.iter().find(|i| i.fields.contains(&column_id));
         if let Some(index) = knn_idx {
+            if prefilter.is_some() {
+                return Err(Error::NotSupported { source: "A prefilter cannot currently be used with a vector index.  Set use_index to false or remove the prefilter.".into() });
+            }
             // There is an index built for the column.
             // We will use the index.
             if let Some(rf) = q.refine_factor {
@@ -585,11 +619,17 @@ impl Scanner {
 
             Ok(knn_node)
         } else {
+            let mut columns = vec![q.column.clone()];
+            if let Some(prefilter) = prefilter.as_ref() {
+                columns.extend(column_names_in_expr(prefilter.as_ref()));
+            }
             // No index found. use flat search.
-            let vector_scan_projection =
-                Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-            let scan_node = self.scan(true, vector_scan_projection);
-            Ok(self.flat_knn(scan_node, q)?)
+            let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
+            let mut plan = self.scan(true, vector_scan_projection);
+            if let Some(prefilter) = prefilter {
+                plan = Arc::new(FilterExec::try_new(prefilter.clone(), plan)?);
+            }
+            Ok(self.flat_knn(plan, q)?)
         }
     }
 
@@ -1182,6 +1222,65 @@ mod test {
                 400
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_knn_with_prefilter() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_vector_dataset(test_uri, true).await;
+        let mut scan = dataset.scan();
+        let key: Float32Array = (32..64).map(|v| v as f32).collect();
+        scan.filter("i > 100").unwrap();
+        scan.prefilter(true);
+        scan.project(&["i"]).unwrap();
+        scan.nearest("vec", &key, 5).unwrap();
+
+        // Prefilter with index not supported yet
+        assert!(scan.try_into_stream().await.is_err());
+
+        scan.use_index(false);
+
+        let results = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let batch = &results[0];
+
+        assert_eq!(batch.num_rows(), 5);
+        assert_eq!(
+            batch.schema().as_ref(),
+            &ArrowSchema::new(vec![
+                ArrowField::new("i", DataType::Int32, true),
+                ArrowField::new(
+                    "vec",
+                    DataType::FixedSizeList(
+                        Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                        32,
+                    ),
+                    true,
+                ),
+                ArrowField::new("_distance", DataType::Float32, false),
+            ])
+        );
+
+        // These match the query exactly.  The 5 results must include these 3.
+        let exact_i = BTreeSet::from_iter(vec![161, 241, 321]);
+        // These also include those 1 off from the query.  The remaining 2 results must be in this set.
+        let close_i = BTreeSet::from_iter(vec![161, 241, 321, 160, 162, 240, 242, 320, 322]);
+        let column_i = batch.column_by_name("i").unwrap();
+        let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        assert!(exact_i.is_subset(&actual_i));
+        assert!(actual_i.is_subset(&close_i));
     }
 
     #[tokio::test]
