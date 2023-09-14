@@ -36,6 +36,7 @@ use lance_arrow::*;
 use lance_linalg::{kernels::argmin, matrix::MatrixView};
 use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
+use roaring::RoaringBitmap;
 use serde::Serialize;
 
 #[cfg(feature = "opq")]
@@ -75,6 +76,8 @@ pub struct IVFIndex {
     metric_type: MetricType,
 
     session: Arc<Session>,
+
+    fragment_bitmap: Option<RoaringBitmap>,
 }
 
 impl IVFIndex {
@@ -99,6 +102,7 @@ impl IVFIndex {
             reader,
             sub_index,
             metric_type,
+            fragment_bitmap: None,
         })
     }
 
@@ -190,6 +194,10 @@ impl Index for IVFIndex {
             partitions: partitions_statistics,
         })?)
     }
+
+    fn fragment_bitmap(&self) -> Option<&RoaringBitmap> {
+        self.fragment_bitmap.as_ref()
+    }
 }
 
 #[async_trait]
@@ -269,6 +277,9 @@ pub struct IvfPQIndexMetadata {
 
     /// Transforms to be applied before search.
     transforms: Vec<pb::Transform>,
+
+    /// The fragment coverage of this index.
+    fragment_bitmap: RoaringBitmap,
 }
 
 /// Convert a IvfPQIndex to protobuf payload
@@ -297,6 +308,9 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
             },
         ]);
 
+        let mut fragment_bitmap: Vec<u8> = Vec::new();
+        idx.fragment_bitmap.serialize_into(&mut fragment_bitmap)?;
+
         Ok(Self {
             name: idx.name.clone(),
             columns: vec![idx.column.clone()],
@@ -312,6 +326,7 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                     MetricType::Dot => pb::VectorMetricType::Dot.into(),
                 },
             })),
+            fragment_bitmap,
         })
     }
 }
@@ -840,6 +855,7 @@ async fn write_index_file(
         ivf,
         pq: pq.into(),
         transforms,
+        fragment_bitmap: dataset.get_fragments().iter().map(|f| f.id() as u32).collect(),
     };
 
     let metadata = pb::Index::try_from(&metadata)?;

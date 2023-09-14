@@ -153,6 +153,11 @@ message DataFragment {
 
   // File that indicates which rows, if any, should be considered deleted.
   DeletionFile deletion_file = 3;
+
+  // Number of original rows in the fragment, not counting deletions. To compute
+  // the current number of rows, subtract `deletion_file.num_deleted_rows` from
+  // this value.
+  uint64 num_rows = 4;
 }
 
 // Lance Data File
@@ -193,6 +198,8 @@ message DeletionFile {
   // An opaque id used to differentiate this file from others written by concurrent
   // writers.
   uint64 id = 3;
+  // The number of rows that are marked as deleted.
+  uint64 num_deleted_rows = 4;
 } // DeletionFile
 
 // Metadata of one Lance file.

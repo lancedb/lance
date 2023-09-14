@@ -20,6 +20,7 @@ use futures::stream::TryStreamExt;
 
 use lance_arrow::as_fixed_size_list_array;
 use lance_linalg::MatrixView;
+use roaring::RoaringBitmap;
 
 use crate::dataset::Dataset;
 use crate::{Error, Result};

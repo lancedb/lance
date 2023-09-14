@@ -20,6 +20,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 /// Protobuf definitions for the index on-disk format.
@@ -48,6 +49,9 @@ pub(crate) trait Index: Send + Sync {
     // TODO: if we ever make this public, do so in such a way that `serde_json`
     // isn't exposed at the interface. That way mismatched versions isn't an issue.
     fn statistics(&self) -> Result<serde_json::Value>;
+
+    /// A bitmap representing the fragments that are included in the index.
+    fn fragment_bitmap(&self) -> Option<&RoaringBitmap>;
 }
 
 /// Index Type

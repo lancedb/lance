@@ -25,6 +25,7 @@ use ordered_float::OrderedFloat;
 use rand::distributions::Uniform;
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
+use roaring::RoaringBitmap;
 
 use crate::dataset::{Dataset, ROW_ID};
 use crate::index::pb;
@@ -335,6 +336,10 @@ async fn write_index_file(
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
     let mut writer = object_store.create(&path).await?;
 
+    let fragment_bitmap: RoaringBitmap = dataset.get_fragments().iter().map(|f| f.id() as u32).collect();
+    let mut serialized_bitmap: Vec<u8> = Vec::new();
+    fragment_bitmap.serialize_into(&mut serialized_bitmap)?;
+
     let stages: Vec<pb::VectorIndexStage> = vec![pb::VectorIndexStage {
         stage: Some(pb::vector_index_stage::Stage::Diskann(pb::DiskAnn {
             spec: 1,
@@ -360,6 +365,7 @@ async fn write_index_file(
                 MetricType::Dot => pb::VectorMetricType::Dot.into(),
             },
         })),
+        fragment_bitmap: serialized_bitmap,
     };
 
     let pos = writer.write_protobuf(&metadata).await?;
