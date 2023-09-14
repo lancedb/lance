@@ -12,7 +12,7 @@ use arrow_array::FixedSizeListArray;
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use criterion::{criterion_group, criterion_main, Criterion};
+use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion};
 
 use lance_arrow::FixedSizeListArrayExt;
 #[cfg(target_os = "linux")]

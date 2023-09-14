@@ -22,6 +22,7 @@ lance-arrow = { workspace = true }
 approx = { workspace = true }
 arrow-arith = { workspace = true }
 criterion = { workspace = true }
+codspeed-criterion-compat = { workspace = true }
 lance-testing = { path = "../lance-testing" }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

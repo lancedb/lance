@@ -31,7 +31,7 @@ use arrow_array::{
     StringArray,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
-use criterion::{criterion_group, criterion_main, Criterion};
+use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion};
 use futures::stream::TryStreamExt;
 use lance::arrow::FixedSizeListArrayExt;
 #[cfg(target_os = "linux")]

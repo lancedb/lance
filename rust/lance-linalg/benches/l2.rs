@@ -18,7 +18,7 @@ use arrow_arith::{
     arity::binary,
 };
 use arrow_array::{cast::as_primitive_array, Float32Array};
-use criterion::{criterion_group, criterion_main, Criterion};
+use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion};
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};

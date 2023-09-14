@@ -109,6 +109,7 @@ prost-build = "0.11"
 [dev-dependencies]
 clap = { version = "4.1.1", features = ["derive"] }
 criterion = { workspace = true }
+codspeed-criterion-compat = { workspace = true }
 tempfile = "3.3.0"
 approx = "0.5.1"
 dirs = "5.0.0"

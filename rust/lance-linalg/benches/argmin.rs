@@ -15,7 +15,7 @@
 use std::{sync::Arc, time::Duration};
 
 use arrow_array::{Float32Array, UInt32Array};
-use criterion::{criterion_group, criterion_main, Criterion};
+use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion};
 use lance_linalg::kernels::argmin;
 use lance_testing::datagen::generate_random_array_with_seed;
 

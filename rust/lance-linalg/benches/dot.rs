@@ -19,7 +19,7 @@ use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
     ArrowNumericType, Float16Array, Float32Array, NativeAdapter, PrimitiveArray,
 };
-use criterion::{criterion_group, criterion_main, Criterion};
+use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion};
 use num_traits::{real::Real, FromPrimitive};
 
 #[cfg(target_os = "linux")]

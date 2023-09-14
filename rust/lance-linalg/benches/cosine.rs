@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use arrow_array::Float32Array;
-use criterion::{criterion_group, criterion_main, Criterion};
+use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion};
 
 use lance_linalg::distance::cosine::cosine_distance_batch;
 #[cfg(target_os = "linux")]
