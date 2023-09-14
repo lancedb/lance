@@ -307,6 +307,8 @@ where
 mod tests {
     use std::collections::HashSet;
 
+    use arrow_array::Float32Array;
+
     #[cfg(feature = "opq")]
     use approx::assert_relative_eq;
 
@@ -337,13 +339,13 @@ mod tests {
     fn test_dot_on_transposed_mat() {
         // A[2,3]
         let a_data = Arc::new(Float32Array::from_iter((1..=6).map(|v| v as f32)));
-        let a = MatrixView::new(a_data, 3);
+        let a = MatrixView::<Float32Array>::new(a_data, 3);
 
         // B[3,2]
         let b_data = Arc::new(Float32Array::from_iter_values([
             2.0, 3.0, 6.0, 7.0, 10.0, 11.0,
         ]));
-        let b = MatrixView::new(b_data, 2);
+        let b = MatrixView::<Float32Array>::new(b_data, 2);
 
         let c_t = b.transpose().dot(&a.transpose()).unwrap();
         let expected = vec![44.0, 98.0, 50.0, 113.0];
