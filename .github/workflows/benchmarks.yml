@@ -11,7 +11,7 @@ on:
     - cron: '20 6 * * *'
 
 jobs:
-  rust:
+  lance:
     runs-on:
       group: large-runners
       labels: ubuntu-22.04-8core
@@ -30,6 +30,7 @@ jobs:
           sudo apt install -y -qq protobuf-compiler libssl-dev pkg-config
           cargo install cargo-codspeed
       - name: Build the benchmark target(s)
+        working-directory: rust/lance
         run: cargo codspeed build
       - name: CPU info
         run: cat /proc/cpuinfo | grep -E 'model name|flags' | head -n 2
@@ -37,5 +38,34 @@ jobs:
         uses: CodSpeedHQ/action@v1
         with:
           token: ${{ secrets.CODSPEED_TOKEN }}
-          working-directory: rust
+          working-directory: rust/lance
+          run: cargo codspeed run
+  linalg:
+    runs-on:
+      group: large-runners
+      labels: ubuntu-22.04-8core
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: ./rust
+    steps:
+      - uses: actions/checkout@v3
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Install dependencies
+        run: |
+          sudo apt -qq update
+          sudo apt install -y -qq protobuf-compiler libssl-dev pkg-config
+          cargo install cargo-codspeed
+      - name: Build the benchmark target(s)
+        working-directory: rust/lance-linalg
+        run: cargo codspeed build
+      - name: CPU info
+        run: cat /proc/cpuinfo | grep -E 'model name|flags' | head -n 2
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v1
+        with:
+          token: ${{ secrets.CODSPEED_TOKEN }}
+          working-directory: rust/lance-linalg
           run: cargo codspeed run

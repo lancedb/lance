@@ -31,7 +31,7 @@ half = { "version" = "=2.2.1", default-features = false, features = [
 ] }
 approx = "0.5.1"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
-codspeed-criterion-compat = "2.2.0"
+codspeed-criterion-compat = { version = "2.2.0", features = ["async", "async_tokio"] }
 futures = "0.3"
 log = "0.4"
 num_cpus = "1.0"
