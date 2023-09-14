@@ -1,5 +1,5 @@
 [profile.release]
-lto = true
+lto = "thin"
 
 [target.'cfg(all())']
 rustflags = [
