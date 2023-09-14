@@ -1,0 +1,22 @@
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[target.'cfg(all())']
+rustflags = [
+    # "-Wclippy::all",
+    # "-Wclippy::fallible_impl_from",
+    # "-Wclippy::manual_let_else",
+    # "-Wclippy::redundant_pub_crate",
+    # "-Wclippy::string_add_assign",
+    # "-Wclippy::string_add",
+    # "-Wclippy::string_lit_as_bytes",
+    # "-Wclippy::string_to_string",
+    # "-Wclippy::use_self",
+]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=haswell", "-C", "target-feature=+avx2"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=apple-m1", "-C", "target-feature=+neon"]
