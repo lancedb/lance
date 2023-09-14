@@ -34,7 +34,3 @@ num_cpus = "1"
 
 [build-dependencies]
 prost-build = "0.11"
-
-[profile.release-with-debug]
-inherits = "release"
-debug = true
