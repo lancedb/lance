@@ -5,22 +5,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "A columnar data format that is 100x faster than Parquet for random access."
+description.workspace = true
 readme = "README.md"
 rust-version = "1.65"
-keywords = [
-    "data-format",
-    "data-science",
-    "machine-learning",
-    "apache-arrow",
-    "data-analytics"
-]
-categories = [
-    "database-implementations",
-    "data-structures",
-    "development-tools",
-    "science"
-]
+keywords.workspace = true
+categories.workspace = true
 
 [package.metadata.docs.rs]
 features = []
