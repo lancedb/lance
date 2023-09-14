@@ -393,7 +393,7 @@ impl Ivf {
     /// Returns a `RecordBatch` with schema `{__part_id: u32, __residual: FixedSizeList}`
     pub fn compute_partition_and_residual(
         &self,
-        data: &MatrixView,
+        data: &MatrixView<Float32Array>,
         metric_type: MetricType,
     ) -> Result<RecordBatch> {
         let mut part_id_builder = UInt32Builder::with_capacity(data.num_rows());
@@ -402,7 +402,7 @@ impl Ivf {
 
         let dim = data.num_columns();
         let dist_func = metric_type.batch_func();
-        let centroids: MatrixView = self.centroids.as_ref().try_into()?;
+        let centroids: MatrixView<Float32Array> = self.centroids.as_ref().try_into()?;
         for i in 0..data.num_rows() {
             let vector = data.row(i).unwrap();
             let part_id =
@@ -571,8 +571,8 @@ impl IvfBuildParams {
 /// - *centroids*: the centroids to compute residual vectors.
 /// - *metric_type*: the metric type to compute distance.
 fn compute_residual_matrix(
-    data: &MatrixView,
-    centroids: &MatrixView,
+    data: &MatrixView<Float32Array>,
+    centroids: &MatrixView<Float32Array>,
     metric_type: MetricType,
 ) -> Result<Arc<Float32Array>> {
     assert_eq!(centroids.num_columns(), data.num_columns());
@@ -691,7 +691,11 @@ pub async fn build_ivf_pq_index(
         )
     } else {
         // Compute the residual vector for training PQ
-        let ivf_centroids = ivf_model.centroids.as_ref().try_into()?;
+        let centroids = &ivf_model.centroids;
+        let ivf_centroids = MatrixView::new(
+            Arc::new(centroids.values().as_primitive::<Float32Type>().clone()),
+            centroids.value_length() as usize,
+        );
         let residual_data = compute_residual_matrix(&training_data, &ivf_centroids, metric_type)?;
         let pq_training_data = MatrixView::new(residual_data, training_data.num_columns());
 
@@ -718,7 +722,17 @@ pub async fn build_ivf_pq_index(
             let arr = batch.column_by_name(column).ok_or_else(|| Error::IO {
                 message: format!("Dataset does not have column {column}"),
             })?;
-            let mut vectors: MatrixView = as_fixed_size_list_array(arr).try_into()?;
+            let fixed_size_list_arr = arr.as_fixed_size_list();
+
+            let mut vectors = MatrixView::new(
+                Arc::new(
+                    fixed_size_list_arr
+                        .values()
+                        .as_primitive::<Float32Type>()
+                        .clone(),
+                ),
+                fixed_size_list_arr.value_length() as usize,
+            );
 
             // Transform the vectors if pre-transforms are used.
             for transform in transform_ref.iter() {
@@ -731,13 +745,15 @@ pub async fn build_ivf_pq_index(
             })
             .await??;
 
-            let residual_col = part_id_and_residual
+            let residual_arr = part_id_and_residual
                 .column_by_name(RESIDUAL_COLUMN)
-                .unwrap();
-            let residual_data = as_fixed_size_list_array(&residual_col);
-            let pq_code = pq_ref
-                .transform(&residual_data.try_into()?, metric_type)
-                .await?;
+                .unwrap()
+                .as_fixed_size_list();
+            let residual_data = MatrixView::new(
+                Arc::new(residual_arr.values().as_primitive::<Float32Type>().clone()),
+                residual_arr.value_length() as usize,
+            );
+            let pq_code = pq_ref.transform(&residual_data, metric_type).await?;
 
             let row_ids = batch
                 .column_by_name(ROW_ID)
@@ -852,7 +868,7 @@ async fn write_index_file(
 
 /// Train IVF partitions using kmeans.
 async fn train_ivf_model(
-    data: &MatrixView,
+    data: &MatrixView<Float32Array>,
     metric_type: MetricType,
     params: &IvfBuildParams,
 ) -> Result<Ivf> {

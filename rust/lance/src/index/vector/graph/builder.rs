@@ -16,8 +16,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::UInt32Array;
+use arrow_array::{Float32Array, UInt32Array};
 use async_trait::async_trait;
+use lance_arrow::FloatArray;
 use lance_linalg::distance::{DistanceFunc, MetricType};
 
 use super::{Graph, Vertex};
@@ -42,7 +43,7 @@ pub struct GraphBuilder<V: Vertex + Clone + Sync + Send> {
     pub(crate) nodes: Vec<Node<V>>,
 
     /// Hold all vectors in memory for fast access at the moment.
-    pub(crate) data: MatrixView,
+    pub(crate) data: MatrixView<Float32Array>,
 
     /// Metric type.
     metric_type: MetricType,
@@ -52,7 +53,7 @@ pub struct GraphBuilder<V: Vertex + Clone + Sync + Send> {
 }
 
 impl<V: Vertex + Clone + Sync + Send> GraphBuilder<V> {
-    pub fn new(vertices: &[V], data: MatrixView, metric_type: MetricType) -> Self {
+    pub fn new(vertices: &[V], data: MatrixView<Float32Array>, metric_type: MetricType) -> Self {
         Self {
             nodes: vertices
                 .iter()

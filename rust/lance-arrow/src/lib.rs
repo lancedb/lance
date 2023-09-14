@@ -28,6 +28,8 @@ use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema};
 pub mod schema;
 pub use schema::*;
 pub mod bfloat16;
+pub mod floats;
+pub use floats::*;
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
