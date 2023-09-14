@@ -272,6 +272,35 @@ where
             transpose: false,
         }
     }
+
+    pub fn iter(&self) -> MatrixRowIter<T> {
+        MatrixRowIter {
+            data: self,
+            cur_idx: 0,
+        }
+    }
+}
+
+/// Iterator over the matrix one row at a time.
+pub struct MatrixRowIter<'a, T: FloatArray>
+where
+    Standard: rand::distributions::Distribution<<T as FloatArray>::Native>,
+{
+    data: &'a MatrixView<T>,
+    cur_idx: usize,
+}
+
+impl<'a, T: FloatArray> Iterator for MatrixRowIter<'a, T>
+where
+    Standard: rand::distributions::Distribution<<T as FloatArray>::Native>,
+{
+    type Item = &'a [T::Native];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let cur_idx = self.cur_idx;
+        self.cur_idx += 1;
+        self.data.row(cur_idx)
+    }
 }
 
 #[cfg(test)]
