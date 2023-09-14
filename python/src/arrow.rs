@@ -100,7 +100,7 @@ pub fn bfloat16_array(values: Vec<Option<f32>>, py: Python<'_>) -> PyResult<PyOb
 ///
 /// TODO: replace this method with `Box<RecordBatchReader>::into_pyarrow()`
 /// once arrow-rs 47.0.0 is released.
-pub(crate) fn reader_to_pyarrow(
+pub fn reader_to_pyarrow(
     py: Python,
     reader: Box<dyn RecordBatchReader + Send>,
 ) -> PyResult<PyObject> {
@@ -120,7 +120,7 @@ pub(crate) fn reader_to_pyarrow(
 /// https://github.com/apache/arrow-rs/pull/4806
 ///
 /// TODO: replace this method once arrow-rs 47.0.0 is released.
-pub(crate) fn record_batch_to_pyarrow(py: Python<'_>, batch: &RecordBatch) -> PyResult<PyObject> {
+pub fn record_batch_to_pyarrow(py: Python<'_>, batch: &RecordBatch) -> PyResult<PyObject> {
     let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema().clone());
     let reader: Box<dyn RecordBatchReader + Send> = Box::new(reader);
     let py_reader = reader_to_pyarrow(py, reader)?;
