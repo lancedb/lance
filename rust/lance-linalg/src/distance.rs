@@ -96,7 +96,7 @@ impl TryFrom<&str> for DistanceType {
             "dot" => Ok(Self::Dot),
             _ => Err(ArrowError::InvalidArgumentError(
                 format!("Metric type '{s}' is not supported,")
-                    + "only 'l2'/'euclidean', 'cosine', and 'dot' are supported.",
+                    + "only 'l2'/'euclidean, 'cosine', and 'dot' are supported.",
             )),
         }
     }

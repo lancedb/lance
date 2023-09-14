@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow_array::cast::AsArray;
 use std::sync::Arc;
 
-use arrow_array::types::Float32Type;
-use arrow_array::Float32Array;
+use arrow_array::{cast::AsArray, types::Float32Type, Float32Array};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat_batches;
 use futures::stream::TryStreamExt;

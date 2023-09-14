@@ -17,9 +17,10 @@
 
 use std::sync::Arc;
 
-use lance_arrow::FloatArray;
 use num_traits::{AsPrimitive, Float, FromPrimitive, ToPrimitive};
 use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
+
+use lance_arrow::FloatArray;
 
 /// Transpose a matrix.
 fn transpose<T: Float>(input: &[T], dimension: usize) -> Vec<T> {

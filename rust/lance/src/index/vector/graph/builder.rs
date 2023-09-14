@@ -18,12 +18,11 @@ use std::sync::Arc;
 
 use arrow_array::{Float32Array, UInt32Array};
 use async_trait::async_trait;
-use lance_arrow::FloatArray;
 use lance_linalg::distance::{DistanceFunc, MetricType};
+use lance_linalg::matrix::MatrixView;
 
 use super::{Graph, Vertex};
 use crate::{Error, Result};
-use lance_linalg::matrix::MatrixView;
 
 /// A graph node to hold the vertex data and its neighbors.
 #[derive(Debug)]

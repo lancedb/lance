@@ -15,6 +15,7 @@
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 
+use arrow_array::types::Float32Type;
 use arrow_array::{cast::AsArray, types::UInt64Type, Float32Array, UInt32Array};
 use arrow_select::concat::concat_batches;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -147,7 +148,10 @@ async fn init_graph(
             message: format!("column {} not found", column),
         })?
         .as_fixed_size_list();
-    let matrix: MatrixView<Float32Array> = vectors.try_into()?;
+    let matrix = MatrixView::<Float32Array>::new(
+        Arc::new(vectors.values().as_primitive::<Float32Type>().clone()),
+        vectors.value_length(),
+    );
     let nodes = row_ids
         .values()
         .iter()
