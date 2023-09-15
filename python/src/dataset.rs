@@ -441,8 +441,11 @@ impl Dataset {
                 .map(|v| {
                     let dict = PyDict::new(py);
                     dict.set_item("version", v.version).unwrap();
-                    dict.set_item("timestamp", v.timestamp.timestamp_nanos())
-                        .unwrap();
+                    dict.set_item(
+                        "timestamp",
+                        v.timestamp.timestamp_nanos_opt().unwrap_or_default(),
+                    )
+                    .unwrap();
                     let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
                     dict.set_item("metadata", tup.into_py_dict(py)).unwrap();
                     dict.to_object(py)
