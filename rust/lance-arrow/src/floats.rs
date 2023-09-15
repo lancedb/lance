@@ -14,8 +14,8 @@
 
 //! Floats Array
 
-use arrow_array::{Array, Float16Array, Float32Array, Float64Array};
-use half::{bf16, f16};
+use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray};
+use half::bf16;
 use num_traits::{Float, FromPrimitive};
 
 use super::bfloat16::BFloat16Array;
@@ -37,24 +37,12 @@ impl FloatArray for BFloat16Array {
     }
 }
 
-impl FloatArray for Float16Array {
-    type Native = f16;
-
-    fn as_slice(&self) -> &[Self::Native] {
-        self.values()
-    }
-}
-
-impl FloatArray for Float32Array {
-    type Native = f32;
-
-    fn as_slice(&self) -> &[Self::Native] {
-        self.values()
-    }
-}
-
-impl FloatArray for Float64Array {
-    type Native = f64;
+impl<T: ArrowPrimitiveType> FloatArray for PrimitiveArray<T>
+where
+    T::Native: Float + FromPrimitive,
+    PrimitiveArray<T>: From<Vec<T::Native>>,
+{
+    type Native = T::Native;
 
     fn as_slice(&self) -> &[Self::Native] {
         self.values()
