@@ -660,7 +660,7 @@ fn parse_write_mode(mode: &str) -> PyResult<WriteMode> {
     }
 }
 
-pub(crate) fn get_object_store_params(options: &PyDict) -> Option<ObjectStoreParams> {
+pub fn get_object_store_params(options: &PyDict) -> Option<ObjectStoreParams> {
     if options.is_none() {
         None
     } else if let Some(commit_handler) = options.get_item("commit_handler") {
@@ -673,7 +673,7 @@ pub(crate) fn get_object_store_params(options: &PyDict) -> Option<ObjectStorePar
     }
 }
 
-pub(crate) fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
+pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
     let params = if options.is_none() {
         None
     } else {

@@ -301,7 +301,7 @@ impl FileFragment {
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         match updated_fragment {
-            Some(frag) => Ok(Some(FileFragment::new(frag))),
+            Some(frag) => Ok(Some(Self::new(frag))),
             None => Ok(None),
         }
     }
@@ -356,7 +356,7 @@ impl DataFile {
     }
 
     fn path(&self) -> String {
-        self.inner.path.to_string()
+        self.inner.path.clone()
     }
 
     fn field_ids(&self) -> Vec<i32> {

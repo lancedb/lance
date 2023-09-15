@@ -234,7 +234,7 @@ impl PyCompactionTask {
         Ok((from_json, state))
     }
 
-    pub fn __richcmp__(&self, other: PyCompactionTask, op: CompareOp) -> PyResult<bool> {
+    pub fn __richcmp__(&self, other: Self, op: CompareOp) -> PyResult<bool> {
         match op {
             CompareOp::Eq => Ok(self.0 == other.0),
             CompareOp::Ne => Ok(self.0 != other.0),
@@ -349,7 +349,7 @@ impl PyRewriteResult {
         Ok((from_json, state))
     }
 
-    pub fn __richcmp__(&self, other: PyRewriteResult, op: CompareOp) -> PyResult<bool> {
+    pub fn __richcmp__(&self, other: Self, op: CompareOp) -> PyResult<bool> {
         match op {
             CompareOp::Eq => Ok(self.0 == other.0),
             CompareOp::Ne => Ok(self.0 != other.0),
