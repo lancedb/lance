@@ -16,10 +16,10 @@ use std::cmp::min;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::cast::AsArray;
-use arrow_array::FixedSizeListArray;
+use arrow_array::types::Float32Type;
 use arrow_array::{
-    builder::Float32Builder, cast::as_primitive_array, new_empty_array, Array, Float32Array,
+    cast::{as_primitive_array, AsArray},
+    new_empty_array, Array, FixedSizeListArray, Float32Array,
 };
 use arrow_schema::{ArrowError, DataType};
 use arrow_select::concat::concat;
@@ -154,12 +154,12 @@ async fn kmeans_random_init(
     let chosen = (0..data.len() / dimension)
         .choose_multiple(&mut rng, k)
         .to_vec();
-    let mut builder = Float32Builder::with_capacity(k * dimension);
+    let mut builder: Vec<f32> = Vec::with_capacity(k * dimension);
     for i in chosen {
-        builder.append_slice(&data.values()[i * dimension..(i + 1) * dimension]);
+        builder.extend(data.values()[i * dimension..(i + 1) * dimension].iter());
     }
     let mut kmeans = KMeans::empty(k, dimension, metric_type);
-    kmeans.centroids = Arc::new(builder.finish());
+    kmeans.centroids = Arc::new(builder.into());
     Ok(kmeans)
 }
 
@@ -246,7 +246,7 @@ impl KMeanMembership {
         }
         let centroids = concat(&mean_refs).unwrap();
         Ok(KMeans {
-            centroids: Arc::new(as_primitive_array(centroids.as_ref()).clone()),
+            centroids: Arc::new(centroids.as_ref().as_primitive::<Float32Type>().clone()),
             dimension,
             k: self.k,
             metric_type: self.metric_type,
@@ -319,7 +319,7 @@ impl KMeans {
     /// - *metric_type*: the metric type to calculate distance.
     /// - *rng*: random generator.
     pub async fn init_random(
-        data: &MatrixView,
+        data: &MatrixView<Float32Array>,
         k: usize,
         metric_type: MetricType,
         rng: impl Rng,
@@ -431,7 +431,7 @@ impl KMeans {
     ///   let kmeans = membership.to_kmeans();
     /// }
     /// ```
-    pub async fn train_once(&self, data: &MatrixView) -> KMeanMembership {
+    pub async fn train_once(&self, data: &MatrixView<Float32Array>) -> KMeanMembership {
         self.compute_membership(data.data().clone()).await
     }
 

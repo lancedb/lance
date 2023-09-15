@@ -15,8 +15,8 @@
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 
-use arrow_array::UInt32Array;
-use arrow_array::{cast::as_primitive_array, types::UInt64Type};
+use arrow_array::types::Float32Type;
+use arrow_array::{cast::AsArray, types::UInt64Type, Float32Array, UInt32Array};
 use arrow_select::concat::concat_batches;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::*;
@@ -136,16 +136,22 @@ async fn init_graph(
     let batches = stream.try_collect::<Vec<_>>().await?;
     let batch = concat_batches(&batches[0].schema(), &batches)?;
 
-    let row_ids = as_primitive_array::<UInt64Type>(batch.column_by_qualified_name(ROW_ID).ok_or(
-        Error::Index {
+    let row_ids = batch
+        .column_by_qualified_name(ROW_ID)
+        .ok_or(Error::Index {
             message: "row_id not found".to_string(),
-        },
-    )?);
-    let vectors =
-        as_fixed_size_list_array(batch.column_by_qualified_name(column).ok_or(Error::Index {
+        })?
+        .as_primitive::<UInt64Type>();
+    let vectors = batch
+        .column_by_qualified_name(column)
+        .ok_or(Error::Index {
             message: format!("column {} not found", column),
-        })?);
-    let matrix: MatrixView = vectors.try_into()?;
+        })?
+        .as_fixed_size_list();
+    let matrix = MatrixView::<Float32Array>::new(
+        Arc::new(vectors.values().as_primitive::<Float32Type>().clone()),
+        vectors.value_length(),
+    );
     let nodes = row_ids
         .values()
         .iter()
@@ -176,7 +182,7 @@ async fn init_graph(
 }
 
 /// Distance between two vectors in the matrix.
-fn distance(matrix: &MatrixView, i: usize, j: usize) -> Result<f32> {
+fn distance(matrix: &MatrixView<Float32Array>, i: usize, j: usize) -> Result<f32> {
     let vector_i = matrix.row(i).ok_or(Error::Index {
         message: "Invalid row index".to_string(),
     })?;
@@ -245,7 +251,7 @@ async fn robust_prune<V: Vertex + Clone + Sync + Send>(
 }
 
 /// Find the index of the medoid vector in all vectors.
-async fn find_medoid(vectors: &MatrixView, metric_type: MetricType) -> Result<usize> {
+async fn find_medoid(vectors: &MatrixView<Float32Array>, metric_type: MetricType) -> Result<usize> {
     let centroid = vectors.centroid().ok_or_else(|| Error::Index {
         message: "Cannot find the medoid of an empty matrix".to_string(),
     })?;

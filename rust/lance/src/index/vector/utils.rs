@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use arrow_array::{cast::AsArray, types::Float32Type, Float32Array};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat_batches;
 use futures::stream::TryStreamExt;
@@ -29,7 +30,7 @@ pub async fn maybe_sample_training_data(
     dataset: &Dataset,
     column: &str,
     sample_size_hint: usize,
-) -> Result<MatrixView> {
+) -> Result<MatrixView<Float32Array>> {
     let num_rows = dataset.count_rows().await?;
     let projection = dataset.schema().project(&[column])?;
     let batch = if num_rows > sample_size_hint {
@@ -52,5 +53,11 @@ pub async fn maybe_sample_training_data(
         ),
     })?;
     let fixed_size_array = as_fixed_size_list_array(array);
-    Ok(fixed_size_array.try_into()?)
+    let values = Arc::new(
+        fixed_size_array
+            .values()
+            .as_primitive::<Float32Type>()
+            .clone(),
+    );
+    Ok(MatrixView::new(values, fixed_size_array.value_length()))
 }

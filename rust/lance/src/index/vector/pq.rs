@@ -429,7 +429,11 @@ impl ProductQuantizer {
     ///
     /// Quantization distortion is the difference between the centroids
     /// from the PQ code to the actual vector.
-    pub async fn distortion(&self, data: &MatrixView, metric_type: MetricType) -> Result<f64> {
+    pub async fn distortion(
+        &self,
+        data: &MatrixView<Float32Array>,
+        metric_type: MetricType,
+    ) -> Result<f64> {
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
         debug_assert_eq!(sub_vectors.len(), self.num_sub_vectors);
 
@@ -465,7 +469,7 @@ impl ProductQuantizer {
     /// Transform the vector array to PQ code array.
     pub async fn transform(
         &self,
-        data: &MatrixView,
+        data: &MatrixView<Float32Array>,
         metric_type: MetricType,
     ) -> Result<FixedSizeListArray> {
         let all_centroids = (0..self.num_sub_vectors)
@@ -508,7 +512,7 @@ impl ProductQuantizer {
     /// Train [`ProductQuantizer`] using vectors.
     pub async fn train(
         &mut self,
-        data: &MatrixView,
+        data: &MatrixView<Float32Array>,
         metric_type: MetricType,
         max_iters: usize,
     ) -> Result<()> {
@@ -555,7 +559,7 @@ impl ProductQuantizer {
     /// Reset the centroids from the OPQ training.
     pub fn reset_centroids(
         &mut self,
-        data: &MatrixView,
+        data: &MatrixView<Float32Array>,
         pq_code: &FixedSizeListArray,
     ) -> Result<()> {
         assert_eq!(data.num_rows(), pq_code.len());
@@ -634,7 +638,7 @@ impl From<&ProductQuantizer> for pb::Pq {
 ///
 /// For example, for a `[1024x1M]` matrix, when `n = 8`, this function divides
 /// the matrix into  `[128x1M; 8]` vector of matrix.
-fn divide_to_subvectors(data: &MatrixView, m: usize) -> Vec<Arc<FixedSizeListArray>> {
+fn divide_to_subvectors(data: &MatrixView<Float32Array>, m: usize) -> Vec<Arc<FixedSizeListArray>> {
     assert!(!data.num_rows() > 0);
 
     let sub_vector_length = data.num_columns() / m;
@@ -723,7 +727,7 @@ impl PQBuildParams {
 
 /// Train product quantization over (OPQ-rotated) residual vectors.
 pub(crate) async fn train_pq(
-    data: &MatrixView,
+    data: &MatrixView<Float32Array>,
     params: &PQBuildParams,
 ) -> Result<ProductQuantizer> {
     let mut pq = ProductQuantizer::new(
