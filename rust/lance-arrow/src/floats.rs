@@ -32,6 +32,7 @@ impl FloatArray for BFloat16Array {
     type Native = bf16;
 
     fn as_slice(&self) -> &[Self::Native] {
+        // TODO: apache/arrow-rs#4820
         todo!()
     }
 }
