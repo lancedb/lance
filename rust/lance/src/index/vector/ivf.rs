@@ -855,7 +855,11 @@ async fn write_index_file(
         ivf,
         pq: pq.into(),
         transforms,
-        fragment_bitmap: dataset.get_fragments().iter().map(|f| f.id() as u32).collect(),
+        fragment_bitmap: dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u32)
+            .collect(),
     };
 
     let metadata = pb::Index::try_from(&metadata)?;

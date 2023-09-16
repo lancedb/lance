@@ -181,6 +181,7 @@ pub fn deletion_file_path(base: &Path, fragment_id: u64, deletion_file: &Deletio
         read_version,
         id,
         file_type,
+        ..
     } = deletion_file;
     let suffix = file_type.suffix();
     base.child(DELETION_DIRS)
@@ -206,6 +207,7 @@ pub async fn write_deletion_file(
                 read_version,
                 id,
                 file_type: DeletionFileType::Array,
+                num_deleted_rows: set.len() as u64,
             };
             let path = deletion_file_path(base, fragment_id, &deletion_file);
 
@@ -239,6 +241,7 @@ pub async fn write_deletion_file(
                 read_version,
                 id,
                 file_type: DeletionFileType::Bitmap,
+                num_deleted_rows: bitmap.len(),
             };
             let path = deletion_file_path(base, fragment_id, &deletion_file);
 

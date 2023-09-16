@@ -336,7 +336,11 @@ async fn write_index_file(
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
     let mut writer = object_store.create(&path).await?;
 
-    let fragment_bitmap: RoaringBitmap = dataset.get_fragments().iter().map(|f| f.id() as u32).collect();
+    let fragment_bitmap: RoaringBitmap = dataset
+        .get_fragments()
+        .iter()
+        .map(|f| f.id() as u32)
+        .collect();
     let mut serialized_bitmap: Vec<u8> = Vec::new();
     fragment_bitmap.serialize_into(&mut serialized_bitmap)?;
 

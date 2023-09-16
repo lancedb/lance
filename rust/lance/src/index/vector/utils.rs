@@ -20,7 +20,6 @@ use futures::stream::TryStreamExt;
 
 use lance_arrow::as_fixed_size_list_array;
 use lance_linalg::MatrixView;
-use roaring::RoaringBitmap;
 
 use crate::dataset::Dataset;
 use crate::{Error, Result};
@@ -33,7 +32,7 @@ pub async fn maybe_sample_training_data(
 ) -> Result<MatrixView> {
     let num_rows = dataset.count_rows().await?;
     let projection = dataset.schema().project(&[column])?;
-    let batch = if num_rows > sample_size_hint {
+    let batch = if num_rows > sample_size_hint as u64 {
         dataset.sample(sample_size_hint, &projection).await?
     } else {
         let mut scanner = dataset.scan();

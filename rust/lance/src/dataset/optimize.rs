@@ -206,6 +206,7 @@ pub async fn compact_files(
     Ok(metrics)
 }
 
+// TODO: remove this todo.
 // TODO: ideally these metrics should already be in the manifest, so we don't
 // have to scan during compaction.
 
@@ -213,9 +214,9 @@ pub async fn compact_files(
 #[derive(Debug)]
 struct FragmentMetrics {
     /// The number of original rows in the fragment
-    pub fragment_length: usize,
+    pub fragment_length: u64,
     /// The number of rows that have been deleted
-    pub num_deletions: usize,
+    pub num_deletions: u64,
 }
 
 impl FragmentMetrics {
@@ -230,11 +231,12 @@ impl FragmentMetrics {
 
     /// The number of rows that are still in the fragment
     fn num_rows(&self) -> usize {
-        self.fragment_length - self.num_deletions
+        (self.fragment_length - self.num_deletions) as usize
     }
 }
 
 async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
+    // TODO: get these from metadata if available.
     let fragment_length = fragment.fragment_length();
     let num_deletions = fragment.count_deletions();
     let (fragment_length, num_deletions) =
@@ -435,7 +437,7 @@ pub async fn plan_compaction(
             && metrics.deletion_percentage() > options.materialize_deletions_threshold
         {
             Some(CompactionCandidacy::CompactItself)
-        } else if metrics.fragment_length < options.target_rows_per_fragment {
+        } else if metrics.fragment_length < options.target_rows_per_fragment as u64 {
             // Only want to compact if their are neighbors to compact such that
             // we can get a larger fragment.
             Some(CompactionCandidacy::CompactWithNeighbors)
@@ -636,6 +638,7 @@ mod tests {
             id: 0,
             files: vec![],
             deletion_file: None,
+            fragment_length: 0,
         };
         let single_bin = CandidateBin {
             fragments: vec![fragment.clone()],

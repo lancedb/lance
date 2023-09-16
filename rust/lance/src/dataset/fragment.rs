@@ -80,7 +80,7 @@ impl FileFragment {
 
         let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
         let filename = format!("{}.lance", Uuid::new_v4());
-        let fragment = Fragment::with_file(id as u64, &filename, &schema);
+        let mut fragment = Fragment::with_file(id as u64, &filename, &schema, 0);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
 
@@ -92,8 +92,7 @@ impl FileFragment {
             writer.write(&batch).await?;
         }
 
-        // Params.max_rows_per_file is ignored in this case.
-        writer.finish().await?;
+        fragment.fragment_length = writer.finish().await?;
 
         progress.complete(&fragment).await?;
 
@@ -104,8 +103,14 @@ impl FileFragment {
         filename: &str,
         schema: &Schema,
         fragment_id: usize,
+        fragment_length: Option<u64>,
     ) -> Result<Fragment> {
-        let fragment = Fragment::with_file(fragment_id as u64, filename, schema);
+        let fragment = Fragment::with_file(
+            fragment_id as u64,
+            filename,
+            schema,
+            fragment_length.unwrap_or_default(),
+        );
         Ok(fragment)
     }
 
@@ -167,7 +172,7 @@ impl FileFragment {
     }
 
     /// Count the rows in this fragment.
-    pub async fn count_rows(&self) -> Result<usize> {
+    pub async fn count_rows(&self) -> Result<u64> {
         let total_rows = self.fragment_length();
 
         let deletion_count = self.count_deletions();
@@ -178,26 +183,35 @@ impl FileFragment {
         Ok(total_rows - deletion_count)
     }
 
-    pub(crate) async fn count_deletions(&self) -> Result<usize> {
-        read_deletion_file(
-            &self.dataset.base,
-            &self.metadata,
-            self.dataset.object_store(),
-        )
-        .map_ok(|v| v.map(|v| v.len()).unwrap_or_default())
-        .await
+    pub(crate) async fn count_deletions(&self) -> Result<u64> {
+        match &self.metadata().deletion_file {
+            Some(f) if f.num_deleted_rows > 0 => Ok(f.num_deleted_rows),
+            _ => {
+                read_deletion_file(
+                    &self.dataset.base,
+                    &self.metadata,
+                    self.dataset.object_store(),
+                )
+                .map_ok(|v| v.map(|v| v.len()).unwrap_or_default() as u64)
+                .await
+            }
+        }
     }
 
     /// Get the number of physical rows in the fragment. This includes deleted rows.
     ///
     /// If there are no deleted rows, this is equal to the number of rows in the
     /// fragment.
-    pub async fn fragment_length(&self) -> Result<usize> {
+    pub async fn fragment_length(&self) -> Result<u64> {
         if self.metadata.files.is_empty() {
             return Err(Error::IO {
                 message: format!("Fragment {} does not contain any data", self.id()),
             });
         };
+
+        if self.metadata.fragment_length > 0 {
+            return Ok(self.metadata.fragment_length);
+        }
 
         // Just open any file. All of them should have same size.
         let path = self
@@ -213,7 +227,7 @@ impl FileFragment {
         )
         .await?;
 
-        Ok(reader.len())
+        Ok(reader.len() as u64)
     }
 
     /// Validate the fragment
@@ -479,11 +493,11 @@ impl FileFragment {
         // TODO: could we keep the number of rows in memory when we first get
         // the fragment metadata?
         let fragment_length = self.fragment_length().await?;
-        if deletion_vector.len() == fragment_length
+        if deletion_vector.len() as u64 == fragment_length
             && deletion_vector.contains_range(0..fragment_length as u32)
         {
             return Ok(None);
-        } else if deletion_vector.len() >= fragment_length {
+        } else if deletion_vector.len() as u64 >= fragment_length {
             let dv_len = deletion_vector.len();
             let examples: Vec<u32> = deletion_vector
                 .into_iter()
@@ -840,7 +854,7 @@ mod tests {
 
         let mut fragments: Vec<Fragment> = Vec::new();
         for (idx, path) in paths.iter().enumerate() {
-            let f = FileFragment::create_from_file(path, schema, idx)
+            let f = FileFragment::create_from_file(path, schema, idx, None)
                 .await
                 .unwrap();
             fragments.push(f)

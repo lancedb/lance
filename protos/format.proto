@@ -157,7 +157,7 @@ message DataFragment {
   // Number of original rows in the fragment, not counting deletions. To compute
   // the current number of rows, subtract `deletion_file.num_deleted_rows` from
   // this value.
-  uint64 num_rows = 4;
+  uint64 fragment_length = 4;
 }
 
 // Lance Data File

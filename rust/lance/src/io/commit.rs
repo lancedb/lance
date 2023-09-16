@@ -41,18 +41,21 @@ use std::{fmt::Debug, sync::atomic::AtomicBool};
 pub(crate) mod dynamodb;
 pub(crate) mod external_manifest;
 
+use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig};
-use crate::Dataset;
+use crate::format::{DeletionFile, Fragment};
 use crate::Result;
 use crate::{format::pb, format::Index, format::Manifest};
-use futures::future::BoxFuture;
+use crate::{Dataset, Error};
+use futures::future::{BoxFuture, Either};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::Error as ObjectStoreError;
 use prost::Message;
 
+use super::deletion::read_deletion_file;
 use super::ObjectStore;
 
 /// Function that writes the manifest to the object store.
@@ -495,6 +498,79 @@ pub(crate) async fn commit_new_dataset(
     Ok(manifest)
 }
 
+/// Update manifest with new metadata fields.
+///
+/// Fields such as `fragment_length` and `num_deleted_rows` may not have been
+/// in older datasets. To bring these old manifests up-to-date, we add them here.
+async fn migrate_manifest(
+    dataset: &Dataset,
+    manifest: &mut Manifest,
+    object_store: &ObjectStore,
+    base_path: &Path,
+) -> Result<()> {
+    if manifest.fragments.iter().all(|f| {
+        f.fragment_length > 0
+            && (f.deletion_file.is_none()
+                || f.deletion_file
+                    .as_ref()
+                    .map(|d| d.num_deleted_rows)
+                    .unwrap_or_default()
+                    > 0)
+    }) {
+        return Ok(());
+    }
+
+    let dataset = Arc::new(dataset.clone());
+
+    let new_fragments = futures::stream::iter(manifest.fragments.as_ref())
+        .map(|fragment| async {
+            let fragment_length = if fragment.fragment_length == 0 {
+                let file_fragment = FileFragment::new(dataset.clone(), fragment.clone());
+                Either::Left(async move { file_fragment.count_rows().await.map(|c| c as u64) })
+            } else {
+                Either::Right(futures::future::ready(Ok(fragment.fragment_length)))
+            };
+            let num_deleted_rows = match &fragment.deletion_file {
+                None => Either::Left(futures::future::ready(Ok(0))),
+                Some(deletion_file) if deletion_file.num_deleted_rows > 0 => {
+                    Either::Left(futures::future::ready(Ok(deletion_file.num_deleted_rows)))
+                }
+                Some(_) => Either::Right(async {
+                    let deletion_vector =
+                        read_deletion_file(base_path, fragment, object_store).await?;
+                    if let Some(deletion_vector) = deletion_vector {
+                        Ok(deletion_vector.len() as u64)
+                    } else {
+                        Ok(0)
+                    }
+                }),
+            };
+
+            let (fragment_length, num_deleted_rows) =
+                futures::future::try_join(fragment_length, num_deleted_rows).await?;
+
+            let deletion_file = fragment
+                .deletion_file
+                .as_ref()
+                .map(|deletion_file| DeletionFile {
+                    num_deleted_rows,
+                    ..deletion_file.clone()
+                });
+
+            Ok::<_, Error>(Fragment {
+                fragment_length,
+                deletion_file,
+                ..fragment.clone()
+            })
+        })
+        .buffered(num_cpus::get() * 2)
+        .boxed();
+
+    manifest.fragments = Arc::new(new_fragments.try_collect().await?);
+
+    Ok(())
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
 pub(crate) async fn commit_transaction(
     dataset: &Dataset,
@@ -562,6 +638,8 @@ pub(crate) async fn commit_transaction(
         };
 
         manifest.version = target_version;
+
+        migrate_manifest(&dataset, &mut manifest, object_store, &dataset.base).await?;
 
         // Try to commit the manifest
         let result = write_manifest_file(

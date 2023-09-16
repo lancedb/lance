@@ -195,7 +195,9 @@ impl DiskANNIndex {
         index_column: &str,
         graph_path: &Path,
     ) -> Result<Self> {
-        let fragment_bitmap: RoaringBitmap = dataset.get_fragments().iter()
+        let fragment_bitmap: RoaringBitmap = dataset
+            .get_fragments()
+            .iter()
             .map(|f| f.id() as u32)
             .collect();
 
@@ -204,7 +206,10 @@ impl DiskANNIndex {
         let graph =
             PersistedGraph::try_new(dataset, index_column, graph_path, params, serde).await?;
 
-        Ok(Self { graph, fragment_bitmap: Some(fragment_bitmap) })
+        Ok(Self {
+            graph,
+            fragment_bitmap: Some(fragment_bitmap),
+        })
     }
 }
 

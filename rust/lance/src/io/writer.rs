@@ -148,9 +148,16 @@ impl FileWriter {
         Ok(())
     }
 
-    pub async fn finish(&mut self) -> Result<()> {
+    pub async fn finish(&mut self) -> Result<u64> {
         self.write_footer().await?;
-        self.object_writer.shutdown().await
+        self.object_writer.shutdown().await?;
+        let num_rows = self
+            .metadata
+            .batch_offsets
+            .last()
+            .cloned()
+            .unwrap_or_default();
+        Ok(num_rows as u64)
     }
 
     /// Total records written in this file.
