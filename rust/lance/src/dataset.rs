@@ -2421,4 +2421,125 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         assert!(fragments[0].metadata.deletion_file.is_some());
     }
+
+    #[tokio::test]
+    async fn test_search_empty() {
+        // Create a table
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "vec",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 128),
+            false,
+        )]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let vectors = Arc::new(
+            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                Float32Array::from_iter_values(vec![]),
+                128,
+            )
+            .unwrap(),
+        );
+
+        let data = RecordBatch::try_new(schema.clone(), vec![vectors]);
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let mut stream = dataset
+            .scan()
+            .nearest(
+                "vec",
+                &Float32Array::from_iter_values((0..128).map(|_| 0.1)),
+                1,
+            )
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+
+        while let Some(batch) = stream.next().await {
+            let schema = batch.unwrap().schema();
+            assert_eq!(schema.fields.len(), 2);
+            assert_eq!(
+                schema.field_with_name("vec").unwrap(),
+                &Field::new(
+                    "vec",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        128
+                    ),
+                    false,
+                )
+            );
+            assert_eq!(
+                schema.field_with_name("_distance").unwrap(),
+                &Field::new("_distance", DataType::Float32, false)
+            );
+        }
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn test_search_empty_after_delete() {
+        // TODO: This test is broken, fix it https://github.com/lancedb/lance/issues/1288
+        // Error:
+        // called `Result::unwrap()` on an `Err` value: IO { message: "Execution error: External error: Execution error: LanceError(IO): Does not find any data file for schema: \nfragment_id=0" }
+        // thread 'dataset::tests::test_search_empty_after_delete' panicked at 'called `Result::unwrap()` on an `Err` value: IO { message: "Execution error: External error: Execution error: LanceError(IO): Does not find any data file for schema: \nfragment_id=0" }', lance/src/dataset.rs:2502:38
+
+        // Create a table
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "vec",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 128),
+            false,
+        )]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let vectors = Arc::new(
+            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                Float32Array::from_iter_values((0..128).map(|_| 0.1_f32)),
+                128,
+            )
+            .unwrap(),
+        );
+
+        let data = RecordBatch::try_new(schema.clone(), vec![vectors]);
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        dataset.delete("true").await.unwrap();
+
+        let mut stream = dataset
+            .scan()
+            .nearest(
+                "vec",
+                &Float32Array::from_iter_values((0..128).map(|_| 0.1)),
+                1,
+            )
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+
+        while let Some(batch) = stream.next().await {
+            let schema = batch.unwrap().schema();
+            assert_eq!(schema.fields.len(), 2);
+            assert_eq!(
+                schema.field_with_name("vec").unwrap(),
+                &Field::new(
+                    "vec",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        128
+                    ),
+                    false,
+                )
+            );
+            assert_eq!(
+                schema.field_with_name("_distance").unwrap(),
+                &Field::new("_distance", DataType::Float32, false)
+            );
+        }
+    }
 }

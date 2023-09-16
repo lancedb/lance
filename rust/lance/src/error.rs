@@ -51,8 +51,8 @@ pub enum Error {
     Internal { message: String },
     #[snafu(display("LanceError(Arrow): {message}"))]
     Arrow { message: String },
-    #[snafu(display("LanceError(Schema): {message}"))]
-    Schema { message: String },
+    #[snafu(display("LanceError(Schema): {message}, {location}"))]
+    Schema { message: String, location: Location },
     #[snafu(display("Not found: {uri}, {location}"))]
     NotFound { uri: String, location: Location },
     #[snafu(display("LanceError(IO): {message}"))]
@@ -151,7 +151,7 @@ impl From<Error> for ArrowError {
         match value {
             Error::Arrow { message: err } => Self::IoError(err), // we lose the error type converting to LanceError
             Error::IO { message: err } => Self::IoError(err),
-            Error::Schema { message: err } => Self::SchemaError(err),
+            Error::Schema { message: err, .. } => Self::SchemaError(err),
             Error::Index { message: err } => Self::IoError(err),
             Error::Stop => Self::IoError("early stop".to_string()),
             e => Self::IoError(e.to_string()), // Find a more scalable way of doing this

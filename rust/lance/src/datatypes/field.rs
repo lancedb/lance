@@ -25,6 +25,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field as ArrowField};
 use async_recursion::async_recursion;
+use snafu::{location, Location};
 
 use super::{Dictionary, LogicalType};
 use crate::{
@@ -200,6 +201,7 @@ impl Field {
                     "Attempt to project field by different names: {} and {}",
                     self.name, other.name,
                 ),
+                location: location!(),
             });
         };
 
@@ -215,6 +217,7 @@ impl Field {
                             "Attempt to project field by different types: {} and {}",
                             dt, other_dt,
                         ),
+                        location: location!(),
                     });
                 }
                 Ok(self.clone())
@@ -228,6 +231,7 @@ impl Field {
                                 "Attempt to project non-existed field: {} on {}",
                                 other_field.name, self,
                             ),
+                            location: location!(),
                         });
                     };
                     fields.push(child.project_by_field(other_field)?);
@@ -263,6 +267,7 @@ impl Field {
                     "Attempt to project incompatible fields: {} and {}",
                     self, other
                 ),
+                location: location!(),
             }),
         }
     }
@@ -387,6 +392,7 @@ impl Field {
                             "Attempt to merge incompatible fields: {} and {}",
                             self, other
                         ),
+                        location: location!(),
                     });
                 }
             }
@@ -471,6 +477,7 @@ impl Field {
                                 "Does not support {} as dictionary value type",
                                 value_type
                             ),
+                            location: location!(),
                         });
                     }
                 }

@@ -29,6 +29,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use object_store::path::Path;
 use prost::Message;
+use snafu::{location, Location};
 
 use super::ReadBatchParams;
 use crate::arrow::*;
@@ -149,6 +150,7 @@ pub(crate) async fn read_fixed_stride_array(
     if !data_type.is_fixed_stride() {
         return Err(Error::Schema {
             message: format!("{data_type} is not a fixed stride type"),
+            location: location!(),
         });
     }
     // TODO: support more than plain encoding here.
