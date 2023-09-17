@@ -103,7 +103,7 @@ impl FileFragment {
         filename: &str,
         schema: &Schema,
         fragment_id: usize,
-        fragment_length: Option<u64>,
+        fragment_length: Option<usize>,
     ) -> Result<Fragment> {
         let fragment = Fragment::with_file(
             fragment_id as u64,
@@ -172,7 +172,7 @@ impl FileFragment {
     }
 
     /// Count the rows in this fragment.
-    pub async fn count_rows(&self) -> Result<u64> {
+    pub async fn count_rows(&self) -> Result<usize> {
         let total_rows = self.fragment_length();
 
         let deletion_count = self.count_deletions();
@@ -183,7 +183,7 @@ impl FileFragment {
         Ok(total_rows - deletion_count)
     }
 
-    pub(crate) async fn count_deletions(&self) -> Result<u64> {
+    pub(crate) async fn count_deletions(&self) -> Result<usize> {
         match &self.metadata().deletion_file {
             Some(f) if f.num_deleted_rows > 0 => Ok(f.num_deleted_rows),
             _ => {
@@ -192,7 +192,7 @@ impl FileFragment {
                     &self.metadata,
                     self.dataset.object_store(),
                 )
-                .map_ok(|v| v.map(|v| v.len()).unwrap_or_default() as u64)
+                .map_ok(|v| v.map(|v| v.len()).unwrap_or_default())
                 .await
             }
         }
@@ -202,7 +202,7 @@ impl FileFragment {
     ///
     /// If there are no deleted rows, this is equal to the number of rows in the
     /// fragment.
-    pub async fn fragment_length(&self) -> Result<u64> {
+    pub async fn fragment_length(&self) -> Result<usize> {
         if self.metadata.files.is_empty() {
             return Err(Error::IO {
                 message: format!("Fragment {} does not contain any data", self.id()),
@@ -227,7 +227,7 @@ impl FileFragment {
         )
         .await?;
 
-        Ok(reader.len() as u64)
+        Ok(reader.len())
     }
 
     /// Validate the fragment
@@ -493,11 +493,11 @@ impl FileFragment {
         // TODO: could we keep the number of rows in memory when we first get
         // the fragment metadata?
         let fragment_length = self.fragment_length().await?;
-        if deletion_vector.len() as u64 == fragment_length
+        if deletion_vector.len() == fragment_length
             && deletion_vector.contains_range(0..fragment_length as u32)
         {
             return Ok(None);
-        } else if deletion_vector.len() as u64 >= fragment_length {
+        } else if deletion_vector.len() >= fragment_length {
             let dv_len = deletion_vector.len();
             let examples: Vec<u32> = deletion_vector
                 .into_iter()

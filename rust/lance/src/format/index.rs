@@ -17,6 +17,7 @@
 
 //! Metadata for index
 
+use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::*;
@@ -36,23 +37,25 @@ pub struct Index {
 
     /// The latest version of the dataset this index covers
     pub dataset_version: u64,
-}
 
-impl Index {
-    pub fn new(uuid: Uuid, name: &str, fields: &[i32], dataset_version: u64) -> Self {
-        Self {
-            uuid,
-            name: name.to_string(),
-            fields: Vec::from(fields),
-            dataset_version,
-        }
-    }
+    /// The fragment ids this index covers.
+    ///
+    /// If this is None, then this is unknown.
+    pub fragment_bitmap: Option<RoaringBitmap>,
 }
 
 impl TryFrom<&pb::IndexMetadata> for Index {
     type Error = Error;
 
     fn try_from(proto: &pb::IndexMetadata) -> Result<Self> {
+        let fragment_bitmap = if proto.fragment_bitmap.is_empty() {
+            None
+        } else {
+            Some(RoaringBitmap::deserialize_from(
+                &mut proto.fragment_bitmap.as_slice(),
+            )?)
+        };
+
         Ok(Self {
             uuid: proto
                 .uuid
@@ -64,17 +67,29 @@ impl TryFrom<&pb::IndexMetadata> for Index {
             name: proto.name.clone(),
             fields: proto.fields.clone(),
             dataset_version: proto.dataset_version,
+            fragment_bitmap,
         })
     }
 }
 
 impl From<&Index> for pb::IndexMetadata {
     fn from(idx: &Index) -> Self {
+        let mut fragment_bitmap = Vec::new();
+        if let Some(bitmap) = &idx.fragment_bitmap {
+            if let Err(e) = bitmap.serialize_into(&mut fragment_bitmap) {
+                // In theory, this should never error. But if we do, just
+                // recover gracefully.
+                log::error!("Failed to serialize fragment bitmap: {}", e);
+                fragment_bitmap.clear();
+            }
+        }
+
         Self {
             uuid: Some((&idx.uuid).into()),
             name: idx.name.clone(),
             fields: idx.fields.clone(),
             dataset_version: idx.dataset_version,
+            fragment_bitmap,
         }
     }
 }

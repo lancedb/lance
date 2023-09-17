@@ -502,12 +502,7 @@ pub(crate) async fn commit_new_dataset(
 ///
 /// Fields such as `fragment_length` and `num_deleted_rows` may not have been
 /// in older datasets. To bring these old manifests up-to-date, we add them here.
-async fn migrate_manifest(
-    dataset: &Dataset,
-    manifest: &mut Manifest,
-    object_store: &ObjectStore,
-    base_path: &Path,
-) -> Result<()> {
+async fn migrate_manifest(dataset: &Dataset, manifest: &mut Manifest) -> Result<()> {
     if manifest.fragments.iter().all(|f| {
         f.fragment_length > 0
             && (f.deletion_file.is_none()
@@ -526,7 +521,7 @@ async fn migrate_manifest(
         .map(|fragment| async {
             let fragment_length = if fragment.fragment_length == 0 {
                 let file_fragment = FileFragment::new(dataset.clone(), fragment.clone());
-                Either::Left(async move { file_fragment.count_rows().await.map(|c| c as u64) })
+                Either::Left(async move { file_fragment.count_rows().await })
             } else {
                 Either::Right(futures::future::ready(Ok(fragment.fragment_length)))
             };
@@ -537,9 +532,9 @@ async fn migrate_manifest(
                 }
                 Some(_) => Either::Right(async {
                     let deletion_vector =
-                        read_deletion_file(base_path, fragment, object_store).await?;
+                        read_deletion_file(&dataset.base, fragment, dataset.object_store()).await?;
                     if let Some(deletion_vector) = deletion_vector {
-                        Ok(deletion_vector.len() as u64)
+                        Ok(deletion_vector.len())
                     } else {
                         Ok(0)
                     }
@@ -567,6 +562,38 @@ async fn migrate_manifest(
         .boxed();
 
     manifest.fragments = Arc::new(new_fragments.try_collect().await?);
+
+    Ok(())
+}
+
+/// Update indices with new fields.
+///
+/// Indices might be missing `fragment_bitmap`, so this function will add it.
+async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()> {
+    // Early return so we have a fast path if they are already migrated.
+    if indices.iter().all(|i| i.fragment_bitmap.is_some()) {
+        return Ok(());
+    }
+
+    for index in indices {
+        if index.fragment_bitmap.is_none() {
+            // Load the read version of the index
+            let old_version = match dataset.checkout_version(index.dataset_version).await {
+                Ok(dataset) => dataset,
+                // If the version doesn't exist anymore, skip it.
+                Err(crate::Error::DatasetNotFound { .. }) => continue,
+                // Any other error we return.
+                Err(e) => return Err(e),
+            };
+            index.fragment_bitmap = Some(
+                old_version
+                    .get_fragments()
+                    .iter()
+                    .map(|f| f.id() as u32)
+                    .collect(),
+            );
+        }
+    }
 
     Ok(())
 }
@@ -618,7 +645,7 @@ pub(crate) async fn commit_transaction(
 
     for _ in 0..commit_config.num_retries {
         // Build an up-to-date manifest from the transaction and current manifest
-        let (mut manifest, indices) = match transaction.operation {
+        let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
                 Transaction::restore_old_manifest(
                     object_store,
@@ -639,7 +666,9 @@ pub(crate) async fn commit_transaction(
 
         manifest.version = target_version;
 
-        migrate_manifest(&dataset, &mut manifest, object_store, &dataset.base).await?;
+        migrate_manifest(&dataset, &mut manifest).await?;
+
+        migrate_indices(&dataset, &mut indices).await?;
 
         // Try to commit the manifest
         let result = write_manifest_file(

@@ -84,7 +84,7 @@ pub struct DeletionFile {
     pub id: u64,
     pub file_type: DeletionFileType,
     /// Number of deleted rows in this file. If 0, this is unknown.
-    pub num_deleted_rows: u64,
+    pub num_deleted_rows: usize,
 }
 
 // TODO: should we convert this to TryFrom and surface the error?
@@ -100,7 +100,7 @@ impl From<&pb::DeletionFile> for DeletionFile {
             read_version: value.read_version,
             id: value.id,
             file_type,
-            num_deleted_rows: value.num_deleted_rows,
+            num_deleted_rows: value.num_deleted_rows as usize,
         }
     }
 }
@@ -123,7 +123,7 @@ pub struct Fragment {
 
     /// Original number of rows in the fragment. If this is zero, then it is
     /// unknown.
-    pub fragment_length: u64,
+    pub fragment_length: usize,
 }
 
 impl Fragment {
@@ -136,7 +136,7 @@ impl Fragment {
         }
     }
 
-    pub fn num_rows(&self) -> Option<u64> {
+    pub fn num_rows(&self) -> Option<usize> {
         match (self.fragment_length, &self.deletion_file) {
             // Unknown fragment length
             (0, _) => None,
@@ -154,7 +154,7 @@ impl Fragment {
     }
 
     /// Create a `Fragment` with one DataFile
-    pub fn with_file(id: u64, path: &str, schema: &Schema, fragment_length: u64) -> Self {
+    pub fn with_file(id: u64, path: &str, schema: &Schema, fragment_length: usize) -> Self {
         Self {
             id,
             files: vec![DataFile::new(path, schema)],
@@ -182,7 +182,7 @@ impl From<&pb::DataFragment> for Fragment {
             id: p.id,
             files: p.files.iter().map(DataFile::from).collect(),
             deletion_file: p.deletion_file.as_ref().map(DeletionFile::from),
-            fragment_length: p.fragment_length,
+            fragment_length: p.fragment_length as usize,
         }
     }
 }
@@ -198,14 +198,14 @@ impl From<&Fragment> for pb::DataFragment {
                 read_version: f.read_version,
                 id: f.id,
                 file_type: file_type.into(),
-                num_deleted_rows: f.num_deleted_rows,
+                num_deleted_rows: f.num_deleted_rows as u64,
             }
         });
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
             deletion_file,
-            fragment_length: f.fragment_length,
+            fragment_length: f.fragment_length as u64,
         }
     }
 }

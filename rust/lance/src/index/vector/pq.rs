@@ -247,10 +247,6 @@ impl Index for PQIndex {
             metric_type: self.metric_type.to_string(),
         })?)
     }
-
-    fn fragment_bitmap(&self) -> Option<&roaring::RoaringBitmap> {
-        None
-    }
 }
 
 #[async_trait]

@@ -134,6 +134,17 @@ message IndexMetadata {
 
   // The version of the dataset this index was built from.
   uint64 dataset_version = 4;
+
+  /// A bitmap of the included fragment ids.
+  ///
+  /// This may by used to determine how much of the dataset is covered by the
+  /// index. This information can be retrieved from the dataset by looking at
+  /// the dataset at `dataset_version`. However, since the old version may be
+  /// deletedd while the index is still in use, this information is also stored
+  /// in the index.
+  /// 
+  /// The bitmap is stored as a 32-bit Roaring bitmap.
+  bytes fragment_bitmap = 5;
 }
 
 // Index Section, containing a list of index metadata for one dataset version.

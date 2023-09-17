@@ -759,7 +759,7 @@ impl Dataset {
     /// Count the number of rows in the dataset.
     ///
     /// It offers a fast path of counting rows by just computing via metadata.
-    pub async fn count_rows(&self) -> Result<u64> {
+    pub async fn count_rows(&self) -> Result<usize> {
         // Open file to read metadata.
         let counts = stream::iter(self.get_fragments())
             .map(|f| async move { f.count_rows().await })
@@ -892,7 +892,7 @@ impl Dataset {
     /// Sample `n` rows from the dataset.
     pub(crate) async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
         use rand::seq::IteratorRandom;
-        let num_rows = self.count_rows().await? as usize;
+        let num_rows = self.count_rows().await?;
         let ids = (0..num_rows).choose_multiple(&mut rand::thread_rng(), n);
         self.take(&ids[..], projection).await
     }
@@ -1367,7 +1367,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(dataset.count_rows().await.unwrap() as usize, num_rows);
+        assert_eq!(dataset.count_rows().await.unwrap(), num_rows);
 
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 10);

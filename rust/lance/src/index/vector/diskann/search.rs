@@ -24,7 +24,6 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
-use roaring::RoaringBitmap;
 use serde::Serialize;
 
 use super::row_vertex::{RowVertex, RowVertexSerDe};
@@ -178,7 +177,6 @@ pub async fn greedy_search(
 
 pub struct DiskANNIndex {
     graph: PersistedGraph<RowVertex>,
-    fragment_bitmap: Option<roaring::RoaringBitmap>,
 }
 
 impl std::fmt::Debug for DiskANNIndex {
@@ -195,21 +193,11 @@ impl DiskANNIndex {
         index_column: &str,
         graph_path: &Path,
     ) -> Result<Self> {
-        let fragment_bitmap: RoaringBitmap = dataset
-            .get_fragments()
-            .iter()
-            .map(|f| f.id() as u32)
-            .collect();
-
         let params = GraphReadParams::default();
         let serde = Arc::new(RowVertexSerDe::new());
         let graph =
             PersistedGraph::try_new(dataset, index_column, graph_path, params, serde).await?;
-
-        Ok(Self {
-            graph,
-            fragment_bitmap: Some(fragment_bitmap),
-        })
+        Ok(Self { graph })
     }
 }
 
@@ -229,10 +217,6 @@ impl Index for DiskANNIndex {
             index_type: "DiskANNIndex".to_string(),
             length: self.graph.len(),
         })?)
-    }
-
-    fn fragment_bitmap(&self) -> Option<&roaring::RoaringBitmap> {
-        self.fragment_bitmap.as_ref()
     }
 }
 

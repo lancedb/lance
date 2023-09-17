@@ -32,7 +32,7 @@ pub async fn maybe_sample_training_data(
 ) -> Result<MatrixView> {
     let num_rows = dataset.count_rows().await?;
     let projection = dataset.schema().project(&[column])?;
-    let batch = if num_rows > sample_size_hint as u64 {
+    let batch = if num_rows > sample_size_hint {
         dataset.sample(sample_size_hint, &projection).await?
     } else {
         let mut scanner = dataset.scan();
