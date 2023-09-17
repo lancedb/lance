@@ -2061,6 +2061,9 @@ mod tests {
         let actual = indices.first().unwrap().dataset_version;
         let expected = dataset.manifest.version - 1;
         assert_eq!(actual, expected);
+        let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+        assert_eq!(fragment_bitmap.len(), 1);
+        assert!(fragment_bitmap.contains(0));
 
         // Append should inherit index
         let write_params = WriteParams {
@@ -2077,6 +2080,11 @@ mod tests {
         let expected = dataset.manifest.version - 2;
         assert_eq!(actual, expected);
         dataset.validate().await.unwrap();
+        // Fragment bitmap should show the original fragments, and not include
+        // the newly appended fragment.
+        let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+        assert_eq!(fragment_bitmap.len(), 1);
+        assert!(fragment_bitmap.contains(0));
 
         let expected_statistics =
             "{\"index_type\":\"IVF\",\"metric_type\":\"l2\",\"num_partitions\":10";
@@ -2106,6 +2114,10 @@ mod tests {
         assert!(dataset.manifest.index_section.is_none());
         assert!(dataset.load_indices().await.unwrap().is_empty());
         dataset.validate().await.unwrap();
+
+        let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+        assert_eq!(fragment_bitmap.len(), 1);
+        assert!(fragment_bitmap.contains(0));
     }
 
     async fn create_bad_file() -> Result<Dataset> {

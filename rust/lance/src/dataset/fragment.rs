@@ -868,6 +868,16 @@ mod tests {
         let new_dataset = Dataset::commit(test_uri, op, None, None).await.unwrap();
 
         assert_eq!(new_dataset.count_rows().await.unwrap(), dataset_rows);
+
+        // Fragments will have number of rows recorded in metadata, even though
+        // we passed `None` when constructing the `FileFragment`.
+        let fragments = new_dataset.get_fragments();
+        assert_eq!(fragments.len(), 5);
+        for f in fragments {
+            assert_eq!(f.metadata.num_rows(), Some(40));
+            assert_eq!(f.count_rows().await.unwrap(), 40);
+            assert_eq!(f.metadata().deletion_file, None);
+        }
     }
 
     #[tokio::test]
@@ -879,6 +889,7 @@ mod tests {
 
         assert_eq!(fragment.count_rows().await.unwrap(), 40);
         assert_eq!(fragment.fragment_length().await.unwrap(), 40);
+        assert!(fragment.metadata.deletion_file.is_none());
 
         let fragment = fragment
             .delete("i >= 160 and i <= 172")
@@ -890,6 +901,11 @@ mod tests {
 
         assert_eq!(fragment.count_rows().await.unwrap(), 27);
         assert_eq!(fragment.fragment_length().await.unwrap(), 40);
+        assert!(fragment.metadata.deletion_file.is_some());
+        assert_eq!(
+            fragment.metadata.deletion_file.unwrap().num_deleted_rows,
+            13
+        );
     }
 
     #[tokio::test]
