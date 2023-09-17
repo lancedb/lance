@@ -5,30 +5,19 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "A columnar data format that is 100x faster than Parquet for random access."
+description.workspace = true
 readme = "README.md"
 rust-version = "1.65"
-keywords = [
-    "data-format",
-    "data-science",
-    "machine-learning",
-    "apache-arrow",
-    "data-analytics"
-]
-categories = [
-    "database-implementations",
-    "data-structures",
-    "development-tools",
-    "science"
-]
+keywords.workspace = true
+categories.workspace = true
 
 [package.metadata.docs.rs]
 features = []
 no-default-features = true
 
 [dependencies]
-lance-arrow = { version = "0.7.3", path = "../lance-arrow" }
-lance-linalg = { version = "0.7.3", path = "../lance-linalg" }
+lance-arrow = { workspace = true }
+lance-linalg = { workspace = true }
 bytes = "1.3"
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
@@ -114,7 +103,7 @@ approx = "0.5.1"
 dirs = "5.0.0"
 all_asserts = "2.3.1"
 mock_instant = { version = "0.3.1", features = ["sync"] }
-lance-testing = { path = "../lance-testing" }
+lance-testing = { workspace = true }
 
 [features]
 cli = ["clap"]

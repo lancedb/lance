@@ -17,18 +17,15 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    builder::Float32Builder, cast::AsArray, Array, FixedSizeListArray, Float32Array,
-};
-use arrow_schema::DataType;
+use num_traits::{AsPrimitive, Float, FromPrimitive, ToPrimitive};
 use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
 
-use crate::{Error, Result};
+use lance_arrow::FloatArray;
 
 /// Transpose a matrix.
-fn transpose(input: &[f32], dimension: usize) -> Vec<f32> {
+fn transpose<T: Float>(input: &[T], dimension: usize) -> Vec<T> {
     let n = input.len() / dimension;
-    let mut mat = vec![0_f32; input.len()];
+    let mut mat = vec![T::zero(); input.len()];
     for row in 0..dimension {
         for col in 0..n {
             mat[row * n + col] = input[col * dimension + row];
@@ -38,26 +35,32 @@ fn transpose(input: &[f32], dimension: usize) -> Vec<f32> {
     mat
 }
 
-/// A 2-D matrix view on top of Arrow Arrays.
+/// A 2-D dense matrix on top of Arrow Arrays.
 ///
 #[derive(Debug, Clone)]
-pub struct MatrixView {
+pub struct MatrixView<T: FloatArray>
+where
+    Standard: rand::distributions::Distribution<<T as FloatArray>::Native>,
+{
     /// Underneath data array.
-    data: Arc<Float32Array>,
+    data: Arc<T>,
 
-    /// The number of
+    /// The number of columns in the matrix.
     num_columns: usize,
 
     /// Is this matrix transposed or not.
     pub transpose: bool,
 }
 
-impl MatrixView {
+impl<T: FloatArray> MatrixView<T>
+where
+    Standard: rand::distributions::Distribution<<T as FloatArray>::Native>,
+{
     /// Create a MatrixView from a f32 data.
-    pub fn new(data: Arc<Float32Array>, num_columns: usize) -> Self {
+    pub fn new(data: Arc<T>, num_columns: impl AsPrimitive<usize>) -> Self {
         Self {
             data,
-            num_columns,
+            num_columns: num_columns.as_(),
             transpose: false,
         }
     }
@@ -65,10 +68,11 @@ impl MatrixView {
     /// Randomly initialize a matrix of shape `(num_rows, num_columns)`.
     pub fn random(num_rows: usize, num_columns: usize) -> Self {
         let mut rng = SmallRng::from_entropy();
-        let data = Arc::new(Float32Array::from_iter_values(
+        let data = Arc::new(T::from(
             (&mut rng)
                 .sample_iter(Standard)
-                .take(num_columns * num_rows),
+                .take(num_columns * num_rows)
+                .collect::<Vec<_>>(),
         ));
         Self {
             data,
@@ -79,14 +83,18 @@ impl MatrixView {
 
     /// Create a identity matrix, with number of rows `n`.
     pub fn identity(n: usize) -> Self {
-        let mut builder = Float32Builder::with_capacity(n * n);
+        let mut builder = Vec::<T::Native>::with_capacity(n * n);
         for i in 0..n {
             for j in 0..n {
-                builder.append_value(if i == j { 1.0 } else { 0.0 });
+                builder.push(if i == j {
+                    T::Native::from_f32(1.0).unwrap()
+                } else {
+                    T::Native::from_f32(0.0).unwrap()
+                });
             }
         }
         Self {
-            data: Arc::new(builder.finish()),
+            data: Arc::new(builder.into()),
             num_columns: n,
             transpose: false,
         }
@@ -101,6 +109,7 @@ impl MatrixView {
         }
     }
 
+    /// Number of the columns (dimension) in the matrix.
     pub fn num_columns(&self) -> usize {
         if self.transpose {
             self.data.len() / self.num_columns
@@ -109,9 +118,9 @@ impl MatrixView {
         }
     }
 
-    pub fn data(&self) -> Arc<Float32Array> {
+    pub fn data(&self) -> Arc<T> {
         if self.transpose {
-            Arc::new(transpose(self.data.values(), self.num_rows()).into())
+            Arc::new(transpose(self.data.as_slice(), self.num_rows()).into())
         } else {
             self.data.clone()
         }
@@ -120,7 +129,7 @@ impl MatrixView {
     /// Returns a row at index `i`. Returns `None` if the index is out of bound.
     ///
     /// # Panics if the matrix is transposed.
-    pub fn row(&self, i: usize) -> Option<&[f32]> {
+    pub fn row(&self, i: usize) -> Option<&[T::Native]> {
         assert!(
             !self.transpose,
             "Centroid is not defined for transposed matrix."
@@ -129,14 +138,14 @@ impl MatrixView {
             None
         } else {
             let dim = self.num_columns();
-            Some(&self.data.values()[i * dim..(i + 1) * dim])
+            Some(&self.data.as_slice()[i * dim..(i + 1) * dim])
         }
     }
 
     /// Compute the centroid from all the rows. Returns `None` if this matrix is empty.
     ///
     /// # Panics if the matrix is transposed.
-    pub fn centroid(&self) -> Option<Float32Array> {
+    pub fn centroid(&self) -> Option<T> {
         assert!(
             !self.transpose,
             "Centroid is not defined for transposed matrix."
@@ -149,13 +158,18 @@ impl MatrixView {
         // Add all rows with only one memory allocation.
         let mut sum = vec![0_f64; dim];
         // TODO: can SIMD work better here? Is it memory-bandwidth bound?.
-        self.data.values().chunks(dim).for_each(|row| {
+        self.data.as_slice().chunks(dim).for_each(|row| {
             row.iter().enumerate().for_each(|(i, v)| {
-                sum[i] += *v as f64;
+                sum[i] += v.to_f64().unwrap();
             })
         });
         let total = self.num_rows() as f64;
-        let arr = Float32Array::from_iter(sum.iter().map(|v| (v / total) as f32));
+        let arr: T = sum
+            .iter()
+            .map(|v| T::Native::from_f64(v / total).unwrap())
+            .collect::<Vec<T::Native>>()
+            .into();
+
         Some(arr)
     }
 
@@ -239,46 +253,61 @@ impl MatrixView {
             "Does not support sampling on transposed matrix"
         );
         if n > self.num_rows() {
-            return self.clone();
+            return Self {
+                data: self.data.clone(),
+                num_columns: self.num_columns,
+                transpose: self.transpose,
+            };
         }
         let chosen = (0..self.num_rows()).choose_multiple(&mut rng, n);
         let dim = self.num_columns();
-        let mut builder = Float32Builder::with_capacity(n * dim);
+        let mut builder = Vec::with_capacity(n * dim);
         for idx in chosen.iter() {
-            let s = self.data.slice(idx * dim, dim);
-            builder.append_slice(s.values());
+            builder.extend(self.data.as_slice()[idx * dim..(idx + 1) * dim].iter());
         }
-        let data = Arc::new(builder.finish());
+        let data = Arc::new(builder.into());
         Self {
             data,
             num_columns: self.num_columns,
             transpose: false,
         }
     }
+
+    pub fn iter(&self) -> MatrixRowIter<T> {
+        MatrixRowIter {
+            data: self,
+            cur_idx: 0,
+        }
+    }
 }
 
-impl TryFrom<&FixedSizeListArray> for MatrixView {
-    type Error = Error;
+/// Iterator over the matrix one row at a time.
+pub struct MatrixRowIter<'a, T: FloatArray>
+where
+    Standard: rand::distributions::Distribution<<T as FloatArray>::Native>,
+{
+    data: &'a MatrixView<T>,
+    cur_idx: usize,
+}
 
-    fn try_from(fsl: &FixedSizeListArray) -> Result<Self> {
-        if !matches!(fsl.value_type(), DataType::Float32) {
-            return Err(Error::ComputeError(format!(
-                "Only support convert f32 FixedSizeListArray to MatrixView, got {}",
-                fsl.data_type()
-            )));
-        }
-        let values = fsl.values();
-        Ok(Self {
-            data: Arc::new(values.as_primitive().clone()),
-            num_columns: fsl.value_length() as usize,
-            transpose: false,
-        })
+impl<'a, T: FloatArray> Iterator for MatrixRowIter<'a, T>
+where
+    Standard: rand::distributions::Distribution<<T as FloatArray>::Native>,
+{
+    type Item = &'a [T::Native];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let cur_idx = self.cur_idx;
+        self.cur_idx += 1;
+        self.data.row(cur_idx)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+
+    use arrow_array::Float32Array;
 
     #[cfg(feature = "opq")]
     use approx::assert_relative_eq;
@@ -310,13 +339,13 @@ mod tests {
     fn test_dot_on_transposed_mat() {
         // A[2,3]
         let a_data = Arc::new(Float32Array::from_iter((1..=6).map(|v| v as f32)));
-        let a = MatrixView::new(a_data, 3);
+        let a = MatrixView::<Float32Array>::new(a_data, 3);
 
         // B[3,2]
         let b_data = Arc::new(Float32Array::from_iter_values([
             2.0, 3.0, 6.0, 7.0, 10.0, 11.0,
         ]));
-        let b = MatrixView::new(b_data, 2);
+        let b = MatrixView::<Float32Array>::new(b_data, 2);
 
         let c_t = b.transpose().dot(&a.transpose()).unwrap();
         let expected = vec![44.0, 98.0, 50.0, 113.0];

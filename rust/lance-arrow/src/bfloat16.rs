@@ -25,6 +25,8 @@ use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType};
 use half::bf16;
 
+pub struct BFloat16Type {}
+
 pub struct BFloat16Array {
     inner: FixedSizeBinaryArray,
 }
