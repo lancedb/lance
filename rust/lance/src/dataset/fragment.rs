@@ -183,7 +183,8 @@ impl FileFragment {
         Ok(total_rows - deletion_count)
     }
 
-    pub(crate) async fn count_deletions(&self) -> Result<usize> {
+    /// Get the number of rows that have been deleted in this fragment.
+    pub async fn count_deletions(&self) -> Result<usize> {
         match &self.metadata().deletion_file {
             Some(f) if f.num_deleted_rows > 0 => Ok(f.num_deleted_rows),
             _ => {

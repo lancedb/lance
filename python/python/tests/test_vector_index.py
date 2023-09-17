@@ -192,8 +192,10 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     )["id"].to_numpy()
     assert len(actual) == 10
 
-    index_uuid = dataset_with_index.list_indices()[0]["uuid"]
+    index_meta = dataset_with_index.list_indices()[0]
+    index_uuid = index_meta["uuid"]
     assert len(index_uuid) == 36
+    assert index_meta["fragment_ids"] == {0}
 
     expected_filepath = str(tmp_path / "_indices" / index_uuid / "index.idx")
     if platform.system() == "Windows":

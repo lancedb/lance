@@ -334,6 +334,8 @@ def test_get_fragments(tmp_path: Path):
     dataset = lance.dataset(base_dir)
     fragment = dataset.get_fragments()[0]
     assert fragment.count_rows() == 100
+    assert fragment.fragment_length == 100
+    assert fragment.num_deletions == 0
 
     head = fragment.head(10)
     tm.assert_frame_equal(head.to_pandas(), table.to_pandas()[0:10])

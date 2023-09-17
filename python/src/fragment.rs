@@ -144,7 +144,7 @@ impl FileFragment {
             ))
         })?;
         let metadata = rt.block_on(async {
-            LanceFragment::create_from_file(filename, &schema, fragment_id)
+            LanceFragment::create_from_file(filename, &schema, fragment_id, None)
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))
         })?;
@@ -328,6 +328,18 @@ impl FileFragment {
         let deletion = self.fragment.metadata().deletion_file.clone();
         Ok(deletion
             .map(|d| deletion_file_path(&Default::default(), self.id() as u64, &d).to_string()))
+    }
+
+    #[getter]
+    fn num_deletions(&self) -> PyResult<usize> {
+        RT.block_on(None, self.fragment.count_deletions())
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    #[getter]
+    fn fragment_length(&self) -> PyResult<usize> {
+        RT.block_on(None, self.fragment.fragment_length())
+            .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 }
 
