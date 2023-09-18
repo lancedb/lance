@@ -17,20 +17,21 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
-use arrow_schema::DataType;
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use datafusion::execution::{
     context::SessionState,
     runtime_env::{RuntimeConfig, RuntimeEnv},
 };
 use datafusion::logical_expr::AggregateFunction;
-use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
-use datafusion::physical_plan::display::DisplayableExecutionPlan;
-use datafusion::physical_plan::expressions::{create_aggregate_expr, Literal};
-use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{
-    filter::FilterExec, limit::GlobalLimitExec, union::UnionExec, ExecutionPlan,
-    SendableRecordBatchStream,
+    aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
+    display::DisplayableExecutionPlan,
+    expressions::{create_aggregate_expr, Literal},
+    filter::FilterExec,
+    limit::GlobalLimitExec,
+    repartition::RepartitionExec,
+    union::UnionExec,
+    ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
@@ -43,10 +44,10 @@ use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index};
 use crate::index::vector::Query;
-use crate::io::exec::{
-    KNNFlatExec, KNNIndexExec, LanceScanExec, Planner, ProjectionExec, TakeExec,
+use crate::io::{
+    exec::{KNNFlatExec, KNNIndexExec, LanceScanExec, Planner, ProjectionExec, TakeExec},
+    RecordBatchStream,
 };
-use crate::io::RecordBatchStream;
 use crate::utils::sql::parse_sql_filter;
 use crate::{Error, Result};
 
