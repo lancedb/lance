@@ -171,7 +171,7 @@ impl KNNFlatExec {
         if !is_vector {
             return Err(Error::IO {
                 message: format!(
-                    "KNNFlatExec node: query column {} is not a vector",
+                    "KNNFlatExec node: query column {} is not a vector (float32 fixed size array)",
                     query.column
                 ),
             });
