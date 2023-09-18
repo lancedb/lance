@@ -1,11 +1,32 @@
+// Copyright 2023 Lance Developers.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::sync::Arc;
 
-use arrow::pyarrow::ToPyArrow;
-use arrow_array::RecordBatch;
+use arrow::ffi_stream::{export_reader_into_raw, FFI_ArrowArrayStream};
+use arrow::pyarrow::*;
+use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{DataType, Field, Schema};
 use half::bf16;
 use lance::arrow::bfloat16::BFloat16Array;
-use pyo3::{exceptions::PyValueError, prelude::*, pyclass::CompareOp, types::PyType};
+use pyo3::{
+    exceptions::PyValueError,
+    ffi::Py_uintptr_t,
+    prelude::*,
+    pyclass::CompareOp,
+    types::{PyTuple, PyType},
+};
 
 #[pyclass]
 pub struct BFloat16(bf16);
@@ -72,4 +93,36 @@ pub fn bfloat16_array(values: Vec<Option<f32>>, py: Python<'_>) -> PyResult<PyOb
 
     let pyarrow_batch = batch.to_pyarrow(py)?;
     pyarrow_batch.call_method1(py, "__getitem__", ("bfloat16",))
+}
+
+/// Temporary solution until arrow-rs 47.0.0 is released.
+/// https://github.com/apache/arrow-rs/blob/878217b9e330b4f1ed13e798a214ea11fbeb2bbb/arrow/src/pyarrow.rs#L318
+///
+/// TODO: replace this method with `Box<RecordBatchReader>::into_pyarrow()`
+/// once arrow-rs 47.0.0 is released.
+pub fn reader_to_pyarrow(
+    py: Python,
+    reader: Box<dyn RecordBatchReader + Send>,
+) -> PyResult<PyObject> {
+    let mut stream = FFI_ArrowArrayStream::empty();
+    unsafe { export_reader_into_raw(reader, &mut stream) };
+
+    let stream_ptr = (&mut stream) as *mut FFI_ArrowArrayStream;
+    let module = py.import("pyarrow")?;
+    let class = module.getattr("RecordBatchReader")?;
+    let args = PyTuple::new(py, [stream_ptr as Py_uintptr_t]);
+    let reader = class.call_method1("_import_from_c", args)?;
+
+    Ok(PyObject::from(reader))
+}
+
+/// Temporary solution until arrow-rs 47.0.0 is released.
+/// https://github.com/apache/arrow-rs/pull/4806
+///
+/// TODO: replace this method once arrow-rs 47.0.0 is released.
+pub fn record_batch_to_pyarrow(py: Python<'_>, batch: &RecordBatch) -> PyResult<PyObject> {
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema().clone());
+    let reader: Box<dyn RecordBatchReader + Send> = Box::new(reader);
+    let py_reader = reader_to_pyarrow(py, reader)?;
+    py_reader.call_method0(py, "read_next_batch")
 }

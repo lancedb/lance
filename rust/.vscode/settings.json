@@ -1,6 +1,7 @@
 {
     "rust-analyzer.linkedProjects": [
-        "Cargo.toml"
+        "Cargo.toml",
+        "./lance-linalg/Cargo.toml"
     ],
     "rust-analyzer.cargo.features": [
         "clap",

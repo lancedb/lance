@@ -16,42 +16,132 @@ use std::str;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow::pyarrow::*;
+use arrow::pyarrow::{ToPyArrow, *};
 use arrow_array::{Float32Array, RecordBatch};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use lance::arrow::as_fixed_size_list_array;
-use lance::dataset::fragment::FileFragment as LanceFileFragment;
-use lance::dataset::ReadParams;
+use lance::dataset::transaction::RewriteGroup;
+use lance::dataset::{
+    fragment::FileFragment as LanceFileFragment, scanner::Scanner as LanceScanner,
+    transaction::Operation as LanceOperation, Dataset as LanceDataset, ReadParams, Version,
+    WriteMode, WriteParams,
+};
 use lance::datatypes::Schema;
 use lance::format::Fragment;
-use lance::index::vector::ivf::IvfBuildParams;
-use lance::index::vector::pq::PQBuildParams;
+use lance::index::{
+    vector::{diskann::DiskANNParams, ivf::IvfBuildParams, pq::PQBuildParams, VectorIndexParams},
+    DatasetIndexExt, IndexType,
+};
 use lance::io::object_store::ObjectStoreParams;
-use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
+use lance_linalg::distance::MetricType;
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong};
-use pyo3::{pyclass, PyObject, PyResult};
+use pyo3::{
+    exceptions::{PyIOError, PyKeyError, PyValueError},
+    pyclass,
+    types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong},
+    PyObject, PyResult,
+};
 
 use crate::fragment::{FileFragment, FragmentMetadata};
 use crate::Scanner;
 use crate::RT;
-use lance::dataset::{
-    scanner::Scanner as LanceScanner, Dataset as LanceDataset, Version, WriteMode, WriteParams,
-};
-use lance::index::{
-    vector::diskann::DiskANNParams,
-    vector::{MetricType, VectorIndexParams},
-    DatasetIndexExt, IndexType,
-};
 
 use self::commit::PyCommitLock;
 
 pub mod commit;
+pub mod optimize;
 
 const DEFAULT_NPROBS: usize = 1;
 const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
+
+#[pyclass(name = "_Operation", module = "_lib")]
+#[derive(Clone)]
+pub struct Operation(LanceOperation);
+
+fn into_fragments(fragments: Vec<FragmentMetadata>) -> Vec<Fragment> {
+    fragments
+        .into_iter()
+        .map(|f| f.inner)
+        .collect::<Vec<Fragment>>()
+}
+
+fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
+    Schema::try_from(arrow_schema).map_err(|e| {
+        PyValueError::new_err(format!(
+            "Failed to convert Arrow schema to Lance schema: {}",
+            e
+        ))
+    })
+}
+
+#[pymethods]
+impl Operation {
+    fn __repr__(&self) -> String {
+        format!("{:?}", self.0)
+    }
+
+    #[staticmethod]
+    fn overwrite(
+        schema: PyArrowType<ArrowSchema>,
+        fragments: Vec<FragmentMetadata>,
+    ) -> PyResult<Self> {
+        let schema = convert_schema(&schema.0)?;
+        let fragments = into_fragments(fragments);
+        let op = LanceOperation::Overwrite { fragments, schema };
+        Ok(Self(op))
+    }
+
+    #[staticmethod]
+    fn append(fragments: Vec<FragmentMetadata>) -> PyResult<Self> {
+        let fragments = into_fragments(fragments);
+        let op = LanceOperation::Append { fragments };
+        Ok(Self(op))
+    }
+
+    #[staticmethod]
+    fn delete(
+        updated_fragments: Vec<FragmentMetadata>,
+        deleted_fragment_ids: Vec<u64>,
+        predicate: String,
+    ) -> PyResult<Self> {
+        let updated_fragments = into_fragments(updated_fragments);
+        let op = LanceOperation::Delete {
+            updated_fragments,
+            deleted_fragment_ids,
+            predicate,
+        };
+        Ok(Self(op))
+    }
+
+    #[staticmethod]
+    fn rewrite(groups: Vec<(Vec<FragmentMetadata>, Vec<FragmentMetadata>)>) -> PyResult<Self> {
+        let groups = groups
+            .into_iter()
+            .map(|(old_fragments, new_fragments)| RewriteGroup {
+                old_fragments: into_fragments(old_fragments),
+                new_fragments: into_fragments(new_fragments),
+            })
+            .collect::<Vec<_>>();
+        let op = LanceOperation::Rewrite { groups };
+        Ok(Self(op))
+    }
+
+    #[staticmethod]
+    fn merge(fragments: Vec<FragmentMetadata>, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
+        let schema = convert_schema(&schema.0)?;
+        let fragments = into_fragments(fragments);
+        let op = LanceOperation::Merge { fragments, schema };
+        Ok(Self(op))
+    }
+
+    #[staticmethod]
+    fn restore(version: u64) -> PyResult<Self> {
+        let op = LanceOperation::Restore { version };
+        Ok(Self(op))
+    }
+}
 
 /// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib")]
@@ -302,12 +392,22 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
-    fn take(self_: PyRef<'_, Self>, row_indices: Vec<usize>) -> PyResult<PyObject> {
-        let projection = self_.ds.schema();
+    fn take(
+        self_: PyRef<'_, Self>,
+        row_indices: Vec<usize>,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<PyObject> {
+        let projection = if let Some(columns) = columns {
+            self_.ds.schema().project(&columns)
+        } else {
+            Ok(self_.ds.schema().clone())
+        }
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
         let batch = RT
-            .block_on(Some(self_.py()), self_.ds.take(&row_indices, projection))
+            .block_on(Some(self_.py()), self_.ds.take(&row_indices, &projection))
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        batch.to_pyarrow(self_.py())
+
+        crate::arrow::record_batch_to_pyarrow(self_.py(), &batch)
     }
 
     fn merge(
@@ -341,8 +441,11 @@ impl Dataset {
                 .map(|v| {
                     let dict = PyDict::new(py);
                     dict.set_item("version", v.version).unwrap();
-                    dict.set_item("timestamp", v.timestamp.timestamp_nanos())
-                        .unwrap();
+                    dict.set_item(
+                        "timestamp",
+                        v.timestamp.timestamp_nanos_opt().unwrap_or_default(),
+                    )
+                    .unwrap();
                     let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
                     dict.set_item("metadata", tup.into_py_dict(py)).unwrap();
                     dict.to_object(py)
@@ -499,27 +602,22 @@ impl Dataset {
     #[staticmethod]
     fn commit(
         dataset_uri: &str,
-        schema: &PyAny,
-        fragments: Vec<&PyAny>,
-        mode: Option<&str>,
+        operation: Operation,
+        read_version: Option<u64>,
+        commit_lock: Option<&PyAny>,
     ) -> PyResult<Self> {
-        let arrow_schema = ArrowSchema::from_pyarrow(schema)?;
-        let py = schema.py();
-        let schema = Schema::try_from(&arrow_schema).map_err(|e| {
-            PyValueError::new_err(format!(
-                "Failed to convert Arrow schema to Lance schema: {}",
-                e
-            ))
-        })?;
-        let fragment_metadata = fragments
-            .iter()
-            .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
-            .collect::<PyResult<Vec<Fragment>>>()?;
-        let mode = parse_write_mode(mode.unwrap_or("create"))?;
+        let store_params = if let Some(commit_handler) = commit_lock {
+            let py_commit_lock = PyCommitLock::new(commit_handler.to_object(commit_handler.py()));
+            let mut object_store_params = ObjectStoreParams::default();
+            object_store_params.set_commit_lock(Arc::new(py_commit_lock));
+            Some(object_store_params)
+        } else {
+            None
+        };
         let ds = RT
             .block_on(
-                Some(py),
-                LanceDataset::commit(dataset_uri, &schema, &fragment_metadata, mode),
+                commit_lock.map(|cl| cl.py()),
+                LanceDataset::commit(dataset_uri, operation.0, read_version, store_params),
             )
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
@@ -565,7 +663,20 @@ fn parse_write_mode(mode: &str) -> PyResult<WriteMode> {
     }
 }
 
-pub(crate) fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
+pub fn get_object_store_params(options: &PyDict) -> Option<ObjectStoreParams> {
+    if options.is_none() {
+        None
+    } else if let Some(commit_handler) = options.get_item("commit_handler") {
+        let py_commit_lock = PyCommitLock::new(commit_handler.to_object(options.py()));
+        let mut object_store_params = ObjectStoreParams::default();
+        object_store_params.set_commit_lock(Arc::new(py_commit_lock));
+        Some(object_store_params)
+    } else {
+        None
+    }
+}
+
+pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
     let params = if options.is_none() {
         None
     } else {
@@ -579,13 +690,7 @@ pub(crate) fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>
         if let Some(maybe_nrows) = options.get_item("max_rows_per_group") {
             p.max_rows_per_group = usize::extract(maybe_nrows)?;
         }
-
-        if let Some(commit_handler) = options.get_item("commit_handler") {
-            let py_commit_lock = PyCommitLock::new(commit_handler.to_object(options.py()));
-            let mut object_store_params = ObjectStoreParams::default();
-            object_store_params.set_commit_lock(Arc::new(py_commit_lock));
-            p.store_params = Some(object_store_params);
-        }
+        p.store_params = get_object_store_params(options);
 
         Some(p)
     };

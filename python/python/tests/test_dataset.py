@@ -33,6 +33,7 @@ import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
 from lance.commit import CommitConflictError
+from lance.lance import Compaction
 
 # Various valid inputs for write_dataset
 input_schema = pa.schema([pa.field("a", pa.float64()), pa.field("b", pa.int64())])
@@ -200,6 +201,17 @@ def test_take(tmp_path: Path):
     assert table2 == table1
 
 
+def test_take_with_columns(tmp_path: Path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table1, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    table2 = dataset.take([0], columns=["b"])
+
+    assert table2 == pa.Table.from_pylist([{"b": 2}])
+
+
 def test_filter(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -362,7 +374,8 @@ def test_add_columns(tmp_path: Path):
     fragment_metadata = fragment.add_columns(adder, columns=["a"])
     schema = dataset.schema.append(pa.field("c", pa.int64()))
 
-    dataset = lance.LanceDataset._commit(base_dir, schema, [fragment_metadata])
+    operation = lance.LanceOperation.Overwrite(schema, [fragment_metadata])
+    dataset = lance.LanceDataset._commit(base_dir, operation)
     assert dataset.schema == schema
 
     tbl = dataset.to_table()
@@ -371,14 +384,125 @@ def test_add_columns(tmp_path: Path):
     )
 
 
-def test_create_from_fragments(tmp_path: Path):
+def test_create_from_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
 
-    dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment])
+    operation = lance.LanceOperation.Overwrite(table.schema, [fragment])
+    dataset = lance.LanceDataset._commit(base_dir, operation)
     tbl = dataset.to_table()
     assert tbl == table
+
+
+def test_append_with_commit(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    lance.write_dataset(table, base_dir)
+
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    append = lance.LanceOperation.Append([fragment])
+
+    with pytest.raises(OSError):
+        # Must specify read version
+        dataset = lance.LanceDataset._commit(base_dir, append)
+
+    dataset = lance.LanceDataset._commit(base_dir, append, read_version=1)
+
+    tbl = dataset.to_table()
+
+    expected = pa.Table.from_pydict(
+        {
+            "a": list(range(100)) + list(range(100)),
+            "b": list(range(100)) + list(range(100)),
+        }
+    )
+    assert tbl == expected
+
+
+def test_delete_with_commit(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    lance.write_dataset(table, base_dir)
+    lance.write_dataset(table, base_dir, mode="append")
+
+    half_table = pa.Table.from_pydict({"a": range(50), "b": range(50)})
+
+    fragments = lance.dataset(base_dir).get_fragments()
+
+    updated_fragment = fragments[0].delete("a >= 50")
+    delete = lance.LanceOperation.Delete(
+        [updated_fragment], [fragments[1].fragment_id], "hello"
+    )
+
+    dataset = lance.LanceDataset._commit(base_dir, delete, read_version=2)
+
+    tbl = dataset.to_table()
+    assert tbl == half_table
+
+
+def test_rewrite_with_commit(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    lance.write_dataset(table, base_dir)
+    lance.write_dataset(table, base_dir, mode="append")
+
+    combined = pa.Table.from_pydict(
+        {
+            "a": list(range(100)) + list(range(100)),
+            "b": list(range(100)) + list(range(100)),
+        }
+    )
+
+    to_be_rewrote = [lf.metadata for lf in lance.dataset(base_dir).get_fragments()]
+
+    fragment = lance.fragment.LanceFragment.create(base_dir, combined)
+    group = lance.LanceOperation.Rewrite.RewriteGroup(to_be_rewrote, [fragment])
+    rewrite = lance.LanceOperation.Rewrite([group])
+
+    dataset = lance.LanceDataset._commit(base_dir, rewrite, read_version=1)
+
+    tbl = dataset.to_table()
+    assert tbl == combined
+
+    assert len(lance.dataset(base_dir).get_fragments()) == 1
+
+
+def test_restore_with_commit(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    lance.write_dataset(table, base_dir)
+    lance.write_dataset(table, base_dir, mode="append")
+
+    restore = lance.LanceOperation.Restore(1)
+    dataset = lance.LanceDataset._commit(base_dir, restore)
+
+    tbl = dataset.to_table()
+    assert tbl == table
+
+
+def test_merge_with_commit(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    lance.write_dataset(table, base_dir)
+
+    fragment = lance.dataset(base_dir).get_fragments()[0]
+    merged = fragment.add_columns(
+        lambda _: pa.RecordBatch.from_pydict({"c": range(100)})
+    )
+
+    expected = pa.Table.from_pydict({"a": range(100), "b": range(100), "c": range(100)})
+
+    merge = lance.LanceOperation.Merge([merged], expected.schema)
+    dataset = lance.LanceDataset._commit(base_dir, merge, read_version=1)
+
+    tbl = dataset.to_table()
+    assert tbl == expected
 
 
 def test_data_files(tmp_path: Path):
@@ -411,7 +535,8 @@ def test_deletion_file(tmp_path: Path):
     assert new_fragment.deletion_file() is not None
     assert re.match("_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file())
     print(type(new_fragment), new_fragment)
-    dataset = lance.LanceDataset._commit(base_dir, table.schema, [new_fragment])
+    operation = lance.LanceOperation.Overwrite(table.schema, [new_fragment])
+    dataset = lance.LanceDataset._commit(base_dir, operation)
     assert dataset.count_rows() == 90
 
 
@@ -429,7 +554,8 @@ def test_commit_fragments_via_scanner(tmp_path: Path):
     unpickled = pickle.loads(pickled)
     assert fragment_metadata == unpickled
 
-    dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment_metadata])
+    operation = lance.LanceOperation.Overwrite(table.schema, [fragment_metadata])
+    dataset = lance.LanceDataset._commit(base_dir, operation)
     assert dataset.schema == table.schema
 
     tbl = dataset.to_table()
@@ -655,3 +781,64 @@ def test_metadata(tmp_path: Path):
 
     data = data.replace_schema_metadata({"foo": base64.b64encode(pickle.dumps("foo"))})
     lance.write_dataset(data, tmp_path)
+
+
+def test_dataset_optimize(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"a": range(1000), "b": range(1000)})
+
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=100)
+    assert dataset.version == 1
+    assert len(dataset.get_fragments()) == 10
+
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=1000,
+        materialize_deletions=False,
+        num_threads=1,
+    )
+
+    assert metrics.fragments_removed == 10
+    assert metrics.fragments_added == 1
+    assert metrics.files_removed == 10
+    assert metrics.files_added == 1
+
+    assert dataset.version == 2
+
+
+def test_dataset_distributed_optimize(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"a": range(800), "b": range(800)})
+
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=200)
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 4
+
+    plan = Compaction.plan(
+        dataset, options=dict(target_rows_per_fragment=400, num_threads=None)
+    )
+    assert plan.read_version == 1
+    assert plan.num_tasks() == 2
+    assert plan.tasks[0].fragments == [frag.metadata for frag in fragments[0:2]]
+    assert plan.tasks[1].fragments == [frag.metadata for frag in fragments[2:4]]
+    assert repr(plan) == "CompactionPlan(read_version=1, tasks=<2 compaction tasks>)"
+
+    pickled_task = pickle.dumps(plan.tasks[0])
+    task = pickle.loads(pickled_task)
+    assert task == plan.tasks[0]
+
+    result1 = plan.tasks[0].execute(dataset)
+    result1.metrics.fragments_removed == 2
+    result1.metrics.fragments_added == 1
+
+    pickled_result = pickle.dumps(result1)
+    result = pickle.loads(pickled_result)
+    assert result == result1
+    assert re.match(
+        r"RewriteResult\(read_version=1, new_fragments=\[.+\], old_fragments=\[.+\]\)",
+        repr(result),
+    )
+
+    metrics = Compaction.commit(dataset, [result1])
+    assert metrics.fragments_removed == 2
+    assert metrics.fragments_added == 1
+    assert dataset.version == 2

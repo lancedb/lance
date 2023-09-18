@@ -29,9 +29,12 @@ except ImportError:
     )
 
 import lance
+from helper import PYARROW_VERSION
 from lance.fragment import LanceFragment
 from lance.tf.data import from_lance, lance_fragments
 from lance.tf.tfrecord import infer_tfrecord_schema, read_tfrecord
+
+pytestmark = pytest.mark.skipif(PYARROW_VERSION.major < 12, reason="requires arrow 12+")
 
 
 @pytest.fixture
