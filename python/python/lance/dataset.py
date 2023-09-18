@@ -164,6 +164,8 @@ class LanceDataset(pa.dataset.Dataset):
             If True then the filter will be applied before the vector query is run.
             This will generate more correct results but it may be a more costly
             query.  It's generally good when the filter is highly selective.
+            Right now, this must be used with ``use_index=False`` in the
+            ``nearest`` parameters.
 
             If False then the filter will be applied after the vector query is run.
             This will perform well but the results may have fewer than the requested
