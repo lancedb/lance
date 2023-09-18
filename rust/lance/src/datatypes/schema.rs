@@ -21,6 +21,7 @@ use std::{
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+use snafu::{location, Location};
 
 use super::field::Field;
 use crate::arrow::*;
@@ -89,6 +90,7 @@ impl Schema {
             } else {
                 return Err(Error::Schema {
                     message: format!("Column {} does not exist", col.as_ref()),
+                    location: location!(),
                 });
             }
         }
@@ -107,7 +109,7 @@ impl Schema {
                 return Err(Error::Schema{message:format!(
                     "Top level field {} cannot contain `.`. Maybe you meant to create a struct field?",
                     field.name.clone()
-                )});
+                ), location: location!(),});
             }
         }
         Ok(true)
@@ -167,6 +169,7 @@ impl Schema {
             } else {
                 return Err(Error::Schema {
                     message: format!("Field {} not found", field.name),
+                    location: location!(),
                 });
             }
         }
@@ -180,6 +183,7 @@ impl Schema {
     pub fn exclude<T: TryInto<Self> + Debug>(&self, schema: T) -> Result<Self> {
         let other = schema.try_into().map_err(|_| Error::Schema {
             message: "The other schema is not compatible with this schema".to_string(),
+            location: location!(),
         })?;
         let mut fields = vec![];
         for field in self.fields.iter() {
@@ -213,6 +217,7 @@ impl Schema {
             .map(|f| f.id)
             .ok_or_else(|| Error::Schema {
                 message: "Vector column not in schema".to_string(),
+                location: location!(),
             })
     }
 
@@ -252,6 +257,7 @@ impl Schema {
                 .column_by_name(&field.name)
                 .ok_or_else(|| Error::Schema {
                     message: format!("column '{}' does not exist in the record batch", field.name),
+                    location: location!(),
                 })?;
             field.set_dictionary(column);
         }

@@ -29,6 +29,7 @@ use arrow_array::types::{
 use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray, UInt32Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use snafu::{location, Location};
 
 use super::plain::PlainEncoder;
 use super::AsyncIndex;
@@ -90,6 +91,7 @@ impl<'a> Encoder for DictionaryEncoder<'a> {
                     "DictionaryEncoder: unsupported key type: {:?}",
                     self.key_type
                 ),
+                location: location!(),
             }),
         }
     }

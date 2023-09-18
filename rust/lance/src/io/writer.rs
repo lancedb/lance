@@ -22,6 +22,7 @@ use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use object_store::path::Path;
+use snafu::{location, Location};
 
 use crate::arrow::*;
 use crate::datatypes::{Field, Schema};
@@ -200,6 +201,7 @@ impl FileWriter {
             }
             _ => Err(Error::Schema {
                 message: format!("FileWriter::write: unsupported data type: {data_type}"),
+                location: location!(),
             }),
         }
     }
@@ -270,6 +272,7 @@ impl FileWriter {
                             child.name,
                             struct_array.data_type()
                         ),
+                        location: location!(),
                     })?;
                 arrs.push(arr);
             }

@@ -23,11 +23,16 @@ use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::{concat::concat_batches, take::take};
 use futures::future;
 use futures::stream::{repeat_with, StreamExt, TryStreamExt};
+use snafu::{location, Location};
 
 use super::{Query, DIST_COL};
 use crate::arrow::*;
 use crate::io::RecordBatchStream;
 use crate::{Error, Result};
+
+fn distance_field() -> ArrowField {
+    ArrowField::new(DIST_COL, DataType::Float32, false)
+}
 
 pub async fn flat_search(stream: impl RecordBatchStream, query: &Query) -> Result<RecordBatch> {
     let input_schema = stream.schema();
@@ -45,6 +50,7 @@ pub async fn flat_search(stream: impl RecordBatchStream, query: &Query) -> Resul
                 .column_by_name(&query.column)
                 .ok_or_else(|| Error::Schema {
                     message: format!("column {} does not exist in dataset", query.column),
+                    location: location!(),
                 })?
                 .clone();
             let flatten_vectors = as_fixed_size_list_array(vectors.as_ref()).values().clone();
@@ -59,10 +65,7 @@ pub async fn flat_search(stream: impl RecordBatchStream, query: &Query) -> Resul
 
             // TODO: use heap
             let indices = sort_to_indices(&distances, None, Some(query.k))?;
-            let batch_with_distance = batch.try_with_column(
-                ArrowField::new(DIST_COL, DataType::Float32, false),
-                distances,
-            )?;
+            let batch_with_distance = batch.try_with_column(distance_field(), distances)?;
             let struct_arr = StructArray::from(batch_with_distance);
             let selected_arr = take(&struct_arr, &indices, None)?;
             Ok::<RecordBatch, Error>(as_struct_array(&selected_arr).into())
@@ -72,7 +75,8 @@ pub async fn flat_search(stream: impl RecordBatchStream, query: &Query) -> Resul
         .await?;
 
     if batches.is_empty() {
-        return Ok(RecordBatch::new_empty(input_schema));
+        let schema_with_distance = input_schema.try_with_column(distance_field())?;
+        return Ok(RecordBatch::new_empty(schema_with_distance.into()));
     }
 
     let batch = concat_batches(&batches[0].schema(), &batches)?;
