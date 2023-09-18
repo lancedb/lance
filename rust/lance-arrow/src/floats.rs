@@ -40,7 +40,7 @@ impl FloatArray for BFloat16Array {
 impl<T: ArrowPrimitiveType> FloatArray for PrimitiveArray<T>
 where
     T::Native: Float + FromPrimitive,
-    PrimitiveArray<T>: From<Vec<T::Native>>,
+    Self: From<Vec<T::Native>>,
 {
     type Native = T::Native;
 

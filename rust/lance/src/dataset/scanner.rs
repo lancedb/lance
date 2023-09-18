@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::{Float32Array, Int64Array, RecordBatch};
+use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::DataType;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use datafusion::execution::{
@@ -518,6 +518,27 @@ impl Scanner {
                 message: "No nearest query".to_string(),
             });
         };
+
+        // Santity check
+        let schema = self.dataset.schema();
+        if let Some(field) = schema.field(&q.column) {
+            match field.data_type() {
+                DataType::FixedSizeList(subfield, _)
+                    if matches!(subfield.data_type(), DataType::Float32) => {}
+                _ => {
+                    return Err(Error::IO {
+                        message: format!(
+                            "Vector search error: column {} is not a vector type: expected FixedSizeList<Float32>, got {}",
+                            q.column, field.data_type(),
+                        ),
+                    });
+                }
+            }
+        } else {
+            return Err(Error::IO {
+                message: format!("Vector search error: column {} not found", q.column),
+            });
+        }
 
         let column_id = self.dataset.schema().field_id(q.column.as_str())?;
         let use_index = self.nearest.as_ref().map(|q| q.use_index).unwrap_or(false);
