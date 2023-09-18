@@ -2,6 +2,7 @@
 members = [
     "lance-arrow",
     "lance-core",
+    "lance-datagen",
     "lance-index",
     "lance-linalg",
     "lance-testing",
@@ -37,6 +38,7 @@ rust-version = "1.70"
 [workspace.dependencies]
 lance-arrow = { version = "=0.8.8", path = "./lance-arrow" }
 lance-core = { version = "=0.8.8", path = "./lance-core" }
+lance-datagen = { version = "=0.8.8", path = "./lance-datagen" }
 lance-index = { version = "=0.8.8", path = "./lance-index" }
 lance-linalg = { version = "=0.8.8", path = "./lance-linalg" }
 lance-test-macros = { version = "=0.8.8", path = "./lance-test-macros" }
