@@ -1,9 +1,9 @@
 [project]
 name = "pylance"
 dependencies = ["pyarrow>=10", "numpy>=1.22"]
-description = "python wrapper for lance-rs"
+description = "python wrapper for Lance columnar format"
 authors = [
-    { name = "Lance Devs", email = "dev@eto.ai" },
+    { name = "Lance Devs", email = "dev@lancedb.com" },
 ]
 license = { file = "LICENSE" }
 repository = "https://github.com/eto-ai/lance"
@@ -56,6 +56,10 @@ tests = [
     "polars[pyarrow,pandas]",
     "ml_dtypes",
     "tensorflow",
+    "semver",
+]
+benchmarks = [
+    "pytest-benchmark",
 ]
 
 [tool.isort]

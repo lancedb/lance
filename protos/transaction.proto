@@ -87,12 +87,30 @@ message Transaction {
   message Rewrite {
     // The old fragments that are being replaced
     //
+    // DEPRECATED: use groups instead.
+    //
     // These should all have existing fragment IDs.
     repeated DataFragment old_fragments = 1;
     // The new fragments
     //
+    // DEPRECATED: use groups instead.
+    //
     // These fragments IDs are not yet assigned.
     repeated DataFragment new_fragments = 2;
+
+    // A group of rewrite files that are all part of the same rewrite.
+    message RewriteGroup {
+      // The old fragment that is being replaced
+      //
+      // This should have an existing fragment ID.
+      repeated DataFragment old_fragments = 1;
+      // The new fragment
+      //
+      // This fragment ID is not yet assigned.
+      repeated DataFragment new_fragments = 2;
+    }
+
+    repeated RewriteGroup groups = 3;
   }
 
   // An operation that merges in a new column, altering the schema.

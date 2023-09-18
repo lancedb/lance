@@ -58,6 +58,18 @@ impl Scanner {
             .map_err(|err| PyValueError::new_err(err.to_string()))?
     }
 
+    #[pyo3(signature = (*, verbose = false))]
+    fn explain_plan(self_: PyRef<'_, Self>, verbose: bool) -> PyResult<String> {
+        let scanner = self_.scanner.clone();
+        let res = RT
+            .spawn(Some(self_.py()), async move {
+                scanner.explain_plan(verbose).await
+            })
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Ok(res)
+    }
+
     fn count_rows(self_: PyRef<'_, Self>) -> PyResult<u64> {
         let scanner = self_.scanner.clone();
         RT.spawn(Some(self_.py()), async move { scanner.count_rows().await })

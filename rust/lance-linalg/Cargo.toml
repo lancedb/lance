@@ -1,0 +1,52 @@
+[package]
+name = "lance-linalg"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+description = { workspace = true }
+readme = { workspace = true }
+keywords = { workspace = true }
+categories = { workspace = true }
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
+futures = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+num_cpus = { workspace = true }
+num-traits = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+lance-arrow = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+arrow-arith = { workspace = true }
+criterion = { workspace = true }
+lance-testing = { path = "../lance-testing" }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+pprof = { workspace = true }
+
+[[bench]]
+name = "l2"
+harness = false
+
+[[bench]]
+name = "dot"
+harness = false
+
+[[bench]]
+name = "argmin"
+harness = false
+
+[[bench]]
+name = "cosine"
+harness = false
+
+[[bench]]
+name = "kmeans"
+harness = false

@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import os
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -25,13 +27,15 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 import numpy as np
 import pyarrow as pa
 import pyarrow.dataset
+from lance.optimize import Compaction
 from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
 from .commit import CommitLock
 from .fragment import FragmentMetadata, LanceFragment
+from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
-from .lance import _Dataset, _Scanner, _write_dataset
+from .lance import _Dataset, _Operation, _Scanner, _write_dataset
 
 try:
     import pandas as pd
@@ -340,14 +344,21 @@ class LanceDataset(pa.dataset.Dataset):
             scan_in_order=scan_in_order,
         ).to_batches()
 
-    def take(self, indices, **kwargs):
-        """
-        Select rows of data by index.
+    def take(
+        self,
+        indices: Union[List[int], pa.Array],
+        columns: Optional[List[str]] = None,
+        **kwargs,
+    ) -> pa.Table:
+        """Select rows of data by index.
 
         Parameters
         ----------
         indices : Array or array-like
             indices of rows to select in the dataset.
+        columns: list of strings, optional
+            List of column names to be fetched. All columns are fetched
+            if not specified.
         **kwargs : dict, optional
             See scanner() method for full parameter description.
 
@@ -355,8 +366,7 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         table : Table
         """
-        # kwargs['take'] = indices
-        return pa.Table.from_batches([self._ds.take(indices)])
+        return pa.Table.from_batches([self._ds.take(indices, columns)])
 
     def head(self, num_rows, **kwargs):
         """
@@ -620,9 +630,16 @@ class LanceDataset(pa.dataset.Dataset):
             if c not in self.schema.names:
                 raise KeyError(f"{c} not found in schema")
             field = self.schema.field(c)
-            if not pa.types.is_fixed_size_list(field.type):
+            if not (
+                pa.types.is_fixed_size_list(field.type)
+                or (
+                    isinstance(field.type, pa.FixedShapeTensorType)
+                    and len(field.type.shape) == 1
+                )
+            ):
                 raise TypeError(
-                    f"Vector column {c} must be FixedSizeListArray, got {field.type}"
+                    f"Vector column {c} must be FixedSizeListArray "
+                    f"1-dimensional FixedShapeTensorArray, got {field.type}"
                 )
             if not pa.types.is_float32(field.type.value_type):
                 raise TypeError(
@@ -681,21 +698,37 @@ class LanceDataset(pa.dataset.Dataset):
     @staticmethod
     def _commit(
         base_uri: Union[str, Path],
-        new_schema: pa.Schema,
-        fragments: Iterable[FragmentMetadata],
-        mode: str = "append",
+        operation: LanceOperation.BaseOperation,
+        read_version: Optional[int] = None,
+        commit_lock: Optional[CommitLock] = None,
     ) -> LanceDataset:
-        """Create a new version of dataset with collected fragments.
+        """Create a new version of dataset
 
-        This method allows users to commit a version of dataset in a distributed
-        environment.
+        This method is an advanced method which allows users to describe a change
+        that has been made to the data files.  This method is not needed when using
+        Lance to apply changes (e.g. when using :py:class:`LanceDataset` or
+        :py:func:`write_dataset`.)
+
+        It's current purpose is to allow for changes being made in a distributed
+        environment where no single process is doing all of the work.  For example,
+        a distributed bulk update or a distributed bulk modify operation.
+
+        Once all of the changes have been made, this method can be called to make
+        the changes visible by updating the dataset manifest.
 
         Parameters
         ----------
-        new_schema : pa.Schema
-            The schema for the new version of dataset.
-        fragments : list[FragmentMetadata]
-            The fragments to create new version of dataset.
+        base_uri: str or Path
+            The base uri of the dataset
+        operation: BaseOperation
+            The operation to apply to the dataset.  This describes what changes
+            have been made.
+        read_version: int, optional
+            The version of the dataset that was used as the base for the changes.
+            This is not needed for overwrite or restore operations.
+        commit_lock : CommitLock, optional
+            A custom commit lock.  Only needed if your object store does not support
+            atomic commits.  See the user guide for more details.
 
         Returns
         -------
@@ -709,8 +742,25 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
-        if not isinstance(new_schema, pa.Schema):
-            raise TypeError(f"schema must be pyarrow.Schema, got {type(new_schema)}")
+
+        if commit_lock:
+            if not callable(commit_lock):
+                raise TypeError(
+                    f"commit_lock must be a function, got {type(commit_lock)}"
+                )
+
+        _Dataset.commit(base_uri, operation._to_inner(), read_version, commit_lock)
+        return LanceDataset(base_uri)
+
+    @property
+    def optimize(self) -> "DatasetOptimizer":
+        return DatasetOptimizer(self)
+
+
+# LanceOperation is a namespace for operations that can be applied to a dataset.
+class LanceOperation:
+    @staticmethod
+    def _validate_fragments(fragments):
         if not isinstance(fragments, list):
             raise TypeError(
                 f"fragments must be list[FragmentMetadata], got {type(fragments)}"
@@ -721,10 +771,104 @@ class LanceDataset(pa.dataset.Dataset):
             raise TypeError(
                 f"fragments must be list[FragmentMetadata], got {type(fragments[0])}"
             )
-        raw_fragments = [f._metadata for f in fragments]
-        # TODO: make fragments as a generator
-        _Dataset.commit(base_uri, new_schema, raw_fragments)
-        return LanceDataset(base_uri)
+
+    class BaseOperation(ABC):
+        @abstractmethod
+        def _to_inner(self):
+            raise NotImplementedError()
+
+    @dataclass
+    class Overwrite(BaseOperation):
+        new_schema: pa.Schema
+        fragments: Iterable[FragmentMetadata]
+
+        def __post_init__(self):
+            if not isinstance(self.new_schema, pa.Schema):
+                raise TypeError(
+                    f"schema must be pyarrow.Schema, got {type(self.new_schema)}"
+                )
+            LanceOperation._validate_fragments(self.fragments)
+
+        def _to_inner(self):
+            raw_fragments = [f._metadata for f in self.fragments]
+            return _Operation.overwrite(self.new_schema, raw_fragments)
+
+    @dataclass
+    class Append(BaseOperation):
+        fragments: Iterable[FragmentMetadata]
+
+        def __post_init__(self):
+            LanceOperation._validate_fragments(self.fragments)
+
+        def _to_inner(self):
+            raw_fragments = [f._metadata for f in self.fragments]
+            return _Operation.append(raw_fragments)
+
+    @dataclass
+    class Delete(BaseOperation):
+        updated_fragments: Iterable[FragmentMetadata]
+        deleted_fragment_ids: Iterable[int]
+        predicate: str
+
+        def __post_init__(self):
+            LanceOperation._validate_fragments(self.updated_fragments)
+
+        def _to_inner(self):
+            raw_updated_fragments = [f._metadata for f in self.updated_fragments]
+            return _Operation.delete(
+                raw_updated_fragments, self.deleted_fragment_ids, self.predicate
+            )
+
+    @dataclass
+    class Rewrite(BaseOperation):
+        """
+        Operation that rewrites fragments but does not change the data within them.
+
+        This is for rearranging the data.
+
+        The data are grouped, such that each group contains the old fragments
+        and the new fragments those are rewritten into.
+        """
+
+        groups: Iterable[RewriteGroup]
+
+        @dataclass
+        class RewriteGroup:
+            old_fragments: Iterable[FragmentMetadata]
+            new_fragments: Iterable[FragmentMetadata]
+
+            def __post_init__(self):
+                LanceOperation._validate_fragments(self.old_fragments)
+                LanceOperation._validate_fragments(self.new_fragments)
+
+        def _to_inner(self):
+            groups = [
+                (
+                    [f._metadata for f in g.old_fragments],
+                    [f._metadata for f in g.new_fragments],
+                )
+                for g in self.groups
+            ]
+            return _Operation.rewrite(groups)
+
+    @dataclass
+    class Merge(BaseOperation):
+        fragments: Iterable[FragmentMetadata]
+        schema: pa.Schema
+
+        def __post_init__(self):
+            LanceOperation._validate_fragments(self.fragments)
+
+        def _to_inner(self):
+            raw_fragments = [f._metadata for f in self.fragments]
+            return _Operation.merge(raw_fragments, self.schema)
+
+    @dataclass
+    class Restore(BaseOperation):
+        version: int
+
+        def _to_inner(self):
+            return _Operation.restore(self.version)
 
 
 class ScannerBuilder:
@@ -957,6 +1101,85 @@ class LanceScanner(pa.dataset.Scanner):
         """
         return self._scanner.count_rows()
 
+    def explain_plan(self, verbose=False) -> str:
+        """Return the execution plan for this scanner.
+
+        Parameters
+        ----------
+        verbose : bool, default False
+            Use a verbose output format.
+
+        Returns
+        -------
+        plan : str
+        """
+
+        return self._scanner.explain_plan(verbose=verbose)
+
+
+class DatasetOptimizer:
+    def __init__(self, dataset: LanceDataset):
+        self._dataset = dataset
+
+    def compact_files(
+        self,
+        *,
+        target_rows_per_fragment: int = 1024 * 1024,
+        max_rows_per_group: int = 1024,
+        materialize_deletions: bool = True,
+        materialize_deletions_threshold: float = 0.1,
+        num_threads: Optional[int] = None,
+    ) -> CompactionMetrics:
+        """Compacts small files in the dataset, reducing total number of files.
+
+        This does a few things:
+         * Removes deleted rows from fragments
+         * Removes dropped columns from fragments
+         * Merges small fragments into larger ones
+
+        This method preserves the insertion order of the dataset. This may mean
+        it leaves small fragments in the dataset if they are not adjacent to
+        other fragments that need compaction. For example, if you have fragments
+        with row counts 5 million, 100, and 5 million, the middle fragment will
+        not be compacted because the fragments it is adjacent to do not need
+        compaction.
+
+        Parameters
+        ----------
+        target_rows_per_fragment: int, default 1024*1024
+            The target number of rows per fragment. This is the number of rows
+            that will be in each fragment after compaction.
+        max_rows_per_group: int, default 1024
+            Max number of rows per group. This does not affect which fragments
+            need compaction, but does affect how they are re-written if selected.
+        materialize_deletions: bool, default True
+            Whether to compact fragments with soft deleted rows so they are no
+            longer present in the file.
+        materialize_deletions_threshold: float, default 0.1
+            The fraction of original rows that are soft deleted in a fragment
+            before the fragment is a candidate for compaction.
+        num_threads: int, optional
+            The number of threads to use when performing compaction. If not
+            specified, defaults to the number of cores on the machine.
+
+        Returns
+        -------
+        CompactionMetrics
+            Metrics about the compaction process
+
+        See Also
+        --------
+        lance.optimize.Compaction
+        """
+        opts = dict(
+            target_rows_per_fragment=target_rows_per_fragment,
+            max_rows_per_group=max_rows_per_group,
+            materialize_deletions=materialize_deletions,
+            materialize_deletions_threshold=materialize_deletions_threshold,
+            num_threads=num_threads,
+        )
+        return Compaction.execute(self._dataset, opts)
+
 
 def write_dataset(
     data_obj: ReaderLike,
@@ -988,6 +1211,9 @@ def write_dataset(
         The max number of rows to write before starting a new file
     max_rows_per_group: int, default 1024
         The max number of rows before starting a new group (in the same file)
+    commit_lock : CommitLock, optional
+        A custom commit lock.  Only needed if your object store does not support
+        atomic commits.  See the user guide for more details.
 
     """
     reader = _coerce_reader(data_obj, schema)

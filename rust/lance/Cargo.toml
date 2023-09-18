@@ -1,0 +1,129 @@
+[package]
+name = "lance"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+readme = "README.md"
+rust-version = "1.65"
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+features = []
+no-default-features = true
+
+[dependencies]
+lance-arrow = { workspace = true }
+lance-linalg = { workspace = true }
+bytes = "1.3"
+arrow-arith = { workspace = true }
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-data = { workspace = true }
+arrow-ipc = { version = "43.0", features = ["zstd"] }
+arrow-ord = { workspace = true }
+arrow-row = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
+async-recursion = "1.0"
+async-trait = "0.1.60"
+byteorder = "1.4.3"
+chrono = "0.4.23"
+clap = { version = "4.1.1", features = ["derive"], optional = true }
+# This is already used by datafusion
+dashmap = "5"
+# matches arrow-rs use
+half = { version = "2.2.1", default-features = false, features = [
+    "num-traits"
+] }
+http = "0.2.9"
+object_store = { workspace = true }
+aws-config = "0.56"
+aws-credential-types = "0.56"
+pin-project = "1.0"
+prost = "0.10"
+prost-types = "0.10"
+roaring = "0.10.1"
+tokio = { workspace = true }
+url = "2.3"
+rand = { version = "0.8.3", features = ["small_rng"] }
+futures = { workspace = true }
+uuid = { version = "1.2", features = ["v4"] }
+path-absolutize = "3.0.14"
+shellexpand = "3.0.0"
+arrow = { version = "43.0.0", features = ["prettyprint"] }
+num_cpus = "1.0"
+# TODO: use datafusion sub-modules to reduce build size?
+datafusion = { version = "28.0.0", default-features = false, features = [
+    "regex_expressions"
+] }
+lapack = { version = "0.19.0", optional = true }
+cblas = { version = "0.4.0", optional = true }
+lru_time_cache = "0.11"
+num-traits = "0.2"
+ordered-float = "3.6.0"
+snafu = { workspace = true }
+log = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+moka = "0.11.3"
+tfrecord = { version = "0.14.0", optional = true, features = ["async"] }
+aws-sdk-dynamodb = { version = "0.30.0", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+accelerate-src = { version = "0.3.2", optional = true }
+
+# docs.rs won't build with openblas-src, because it downloads file from internet.
+[target.'cfg(target_os = "linux")'.dependencies]
+openblas-src = { version = "0.10.8", default-features = false, features = [
+    "static",
+    "cblas"
+], optional = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+pprof = { version = "0.12", features = ["flamegraph", "criterion"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+openblas-src = { version = "0.10.8", default-features = false, features = [
+    "system"
+], optional = true }
+
+[build-dependencies]
+prost-build = "0.11"
+
+[dev-dependencies]
+clap = { version = "4.1.1", features = ["derive"] }
+criterion = { workspace = true }
+tempfile = "3.3.0"
+approx = "0.5.1"
+dirs = "5.0.0"
+all_asserts = "2.3.1"
+mock_instant = { version = "0.3.1", features = ["sync"] }
+lance-testing = { workspace = true }
+
+[features]
+cli = ["clap"]
+# opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
+tensorflow = ["tfrecord"]
+dynamodb = ["aws-sdk-dynamodb"]
+dynamodb_tests = ["dynamodb"]
+
+[[bin]]
+name = "lq"
+required-features = ["cli"]
+
+[[bench]]
+name = "scan"
+harness = false
+
+[[bench]]
+name = "vector_index"
+harness = false
+
+[[bench]]
+name = "ivf_pq"
+harness = false

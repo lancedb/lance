@@ -11,10 +11,14 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-import re
 
+import re
+from pathlib import Path
+
+import lance
 import pandas as pd
 import pyarrow as pa
+from helper import requires_pyarrow_12
 from lance.arrow import BFloat16, BFloat16Array, PandasBFloat16Array, bfloat16_array
 
 
@@ -110,3 +114,21 @@ def test_bf16_numpy():
     arr_arrow = BFloat16Array.from_numpy(arr_numpy)
     assert arr == arr_arrow
     np.testing.assert_array_equal(arr_arrow.to_numpy(), expected)
+
+
+@requires_pyarrow_12
+def test_roundtrip_take_ext_types(tmp_path: Path):
+    tensor_type = pa.fixed_shape_tensor(pa.float32(), [2, 3])
+    inner = pa.array([float(x) for x in range(0, 18)], pa.float32())
+    storage = pa.FixedSizeListArray.from_arrays(inner, 6)
+    tensor_arr = pa.ExtensionArray.from_storage(tensor_type, storage)
+
+    tbl = pa.Table.from_arrays([tensor_arr], ["tensor"])
+    lance.write_dataset(tbl, tmp_path)
+
+    tbl2 = lance.dataset(tmp_path)
+    rows = tbl2.take([0, 2])
+    assert rows["tensor"].to_pylist() == [
+        [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        [12.0, 13.0, 14.0, 15.0, 16.0, 17.0],
+    ]

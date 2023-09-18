@@ -26,13 +26,20 @@ except ImportError:
     pd = None
     ts_types = Union[datetime, str]
 
-from .dataset import LanceDataset, LanceScanner, __version__, write_dataset
+from .dataset import (
+    LanceDataset,
+    LanceOperation,
+    LanceScanner,
+    __version__,
+    write_dataset,
+)
 from .fragment import FragmentMetadata, LanceFragment
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
 __all__ = [
     "LanceDataset",
+    "LanceOperation",
     "LanceScanner",
     "__version__",
     "write_dataset",

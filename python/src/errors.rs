@@ -15,6 +15,6 @@
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 
-pub(crate) fn ioerror(py: Python, err: String) -> PyErr {
+pub fn ioerror(py: Python, err: String) -> PyErr {
     PyErr::from_value(PyIOError::new_err(err).value(py))
 }

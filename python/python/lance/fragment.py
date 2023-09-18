@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, Optional, Union
+from typing import TYPE_CHECKING, Callable, Iterator, Optional, Union
 
 try:
     import pandas as pd
@@ -55,12 +55,12 @@ class FragmentMetadata:
             return False
         return self._metadata.__eq__(other._metadata)
 
-    def to_json(self) -> Dict[str, Any]:
+    def to_json(self) -> str:
         """Serialize :class:`FragmentMetadata` to a JSON blob"""
         return json.loads(self._metadata.json())
 
     @staticmethod
-    def from_json(json_data: Dict[str, Any]) -> FragmentMetadata:
+    def from_json(json_data: str) -> FragmentMetadata:
         """Reconstruct :class:`FragmentMetadata` from a JSON blob"""
         return FragmentMetadata(json_data)
 
@@ -347,4 +347,4 @@ class LanceFragment(pa.dataset.Fragment):
         FragmentMetadata
         """
 
-        return FragmentMetadata(self._fragment.metadata())
+        return FragmentMetadata(self._fragment.metadata().json())
