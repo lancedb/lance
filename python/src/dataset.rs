@@ -228,7 +228,6 @@ impl Dataset {
                 let schema = self_.ds.schema();
                 let field_names = schema
                     .project_by_ids(idx.fields.as_slice())
-                    .unwrap()
                     .fields
                     .iter()
                     .map(|f| f.name.clone())

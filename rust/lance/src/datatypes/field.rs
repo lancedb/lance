@@ -191,6 +191,35 @@ impl Field {
         Ok(f)
     }
 
+    /// Create a new field by removing all fields that do not match the filter.
+    ///
+    /// If a child field matches the filter then the parent will be kept even if
+    /// it does not match the filter.
+    ///
+    /// Returns None if the field itself does not match the filter.
+    pub(crate) fn project_by_filter<F: Fn(&Self) -> bool>(&self, filter: &F) -> Option<Self> {
+        let children = self
+            .children
+            .iter()
+            .filter_map(|c| c.project_by_filter(filter))
+            .collect::<Vec<_>>();
+        if !children.is_empty() || filter(self) {
+            Some(Self {
+                name: self.name.clone(),
+                id: self.id,
+                parent_id: self.parent_id,
+                logical_type: self.logical_type.clone(),
+                metadata: self.metadata.clone(),
+                encoding: self.encoding.clone(),
+                nullable: self.nullable,
+                children,
+                dictionary: self.dictionary.clone(),
+            })
+        } else {
+            None
+        }
+    }
+
     /// Project by a field.
     ///
     pub(super) fn project_by_field(&self, other: &Self) -> Result<Self> {
