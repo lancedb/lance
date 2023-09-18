@@ -562,13 +562,19 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.restore()
 
-    def cleanup_old_versions(self, before: datetime = None) -> CleanupStats:
+    def cleanup_old_versions(
+        self,
+        before: datetime = None,
+        *,
+        delete_unverified: bool = False,
+    ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
 
-        Some dataset changes, such as a delete, remove data from the dataset but
-        do not physically remove the deleted rows from storage.  The old data is
-        left in place to allow the dataset to be restored back to an older version.
+        Some dataset changes, such as overwriting, or restoring an old version,
+        remove data from the dataset but do not physically remove the deleted rows
+        from storage.  The old data is left in place to allow the dataset to be
+        restored back to an older version.
 
         This method will remove older versions and any data files they reference.
         Once this cleanup task has run you will not be able to checkout or restore
@@ -579,15 +585,24 @@ class LanceDataset(pa.dataset.Dataset):
 
         before: datetime or str, optional
             Only versions older than this will be removed.  If not specified, this
-            will default to two weeks ago.  This cannot be more recent than two
-            weeks ago.
+            will default to two weeks ago.
 
             This can be a datetime object or a string in ISO 8601 format.  If no
             timezone is provided then it is assumed to be a time in the local timezone.
+        delete_unverified: bool, default False
+            Some files may be part of an in-progress operation (e.g. appending new data)
+            and these files will not be deleted unless they are at least 7 days old.  If
+            this is True then these files will be deleted regardless of their age.
+
+            This should only be set to True if you can guarantee that no other process
+            is currently working on this dataset.  Otherwise the dataset could be put into
+            a corrupted state.
         """
         if before is None:
             before = datetime.now(timezone.utc) - timedelta(days=14)
-        return self._ds.cleanup_old_versions(ts_to_epoch_micros(before))
+        return self._ds.cleanup_old_versions(
+            ts_to_epoch_micros(before), delete_unverified
+        )
 
     def create_index(
         self,

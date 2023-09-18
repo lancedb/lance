@@ -487,10 +487,17 @@ impl Dataset {
         Ok(())
     }
 
-    fn cleanup_old_versions(&self, before: i64) -> PyResult<CleanupStats> {
+    fn cleanup_old_versions(
+        &self,
+        before: i64,
+        delete_unverified: Option<bool>,
+    ) -> PyResult<CleanupStats> {
         let before = utc_datetime_from_epoch_timestamp(before)?;
         let cleanup_stats = RT
-            .block_on(None, self.ds.cleanup_old_versions(before))
+            .block_on(
+                None,
+                self.ds.cleanup_old_versions(before, delete_unverified),
+            )
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(CleanupStats {
             unreferenced_data_paths: cleanup_stats.unreferenced_data_paths,

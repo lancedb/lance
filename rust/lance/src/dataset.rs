@@ -581,8 +581,12 @@ impl Dataset {
     /// # Returns
     ///
     /// * `RemovalStats` - Statistics about the removal operation
-    pub async fn cleanup_old_versions(&self, before: DateTime<Utc>) -> Result<RemovalStats> {
-        cleanup::cleanup_old_versions(self, before).await
+    pub async fn cleanup_old_versions(
+        &self,
+        before: DateTime<Utc>,
+        delete_unverified: Option<bool>,
+    ) -> Result<RemovalStats> {
+        cleanup::cleanup_old_versions(self, before, delete_unverified).await
     }
 
     /// Commit changes to the dataset

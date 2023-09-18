@@ -82,43 +82,34 @@ struct CleanupTask<'a> {
     dataset: &'a Dataset,
     /// Cleanup all versions before this time
     before: DateTime<Utc>,
+    /// If true, delete unverified data files even if they are recent
+    delete_unverified: bool,
     old_manifests: Arc<Mutex<Vec<Path>>>,
     referenced_files: Arc<Mutex<ReferencedFiles>>,
 }
 
-/// The before parameter must be at least this many days before
-/// the current date.  This is to prevent accidentally deleting
-/// data that is still being written.
-const MINIMUM_CLEANUP_DAYS: i64 = 7;
+/// If a file cannot be verified then it will only be deleted if it is at least
+/// this many days old.
+const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
 
 impl<'a> CleanupTask<'a> {
-    fn new(dataset: &'a Dataset, before: DateTime<Utc>) -> Self {
+    fn new(dataset: &'a Dataset, before: DateTime<Utc>, delete_unverified: bool) -> Self {
         Self {
             dataset,
             before,
+            delete_unverified,
             old_manifests: Arc::new(Mutex::new(Vec::default())),
             referenced_files: Arc::new(Mutex::new(ReferencedFiles::default())),
         }
     }
 
     async fn run(&self) -> Result<RemovalStats> {
-        self.validate()?;
         // First we process all manifest files in parallel to figure
         // out which files are referenced by valid manifests
         self.process_manifests().await?;
         // Then we scan all of the files and delete those that are
         // not part of our valid set.
         self.delete_unreferenced_files().await
-    }
-
-    fn validate(&self) -> Result<()> {
-        if (utc_now() - self.before) < Duration::days(MINIMUM_CLEANUP_DAYS) {
-            return Err(Error::invalid_input(format!(
-                "Cannot cleanup data less than {} days old",
-                MINIMUM_CLEANUP_DAYS
-            )));
-        }
-        Ok(())
     }
 
     async fn process_manifests(&self) -> Result<()> {
@@ -305,8 +296,9 @@ impl<'a> CleanupTask<'a> {
 pub async fn cleanup_old_versions(
     dataset: &Dataset,
     before: DateTime<Utc>,
+    delete_unverified: Option<bool>,
 ) -> Result<RemovalStats> {
-    let cleanup = CleanupTask::new(dataset, before);
+    let cleanup = CleanupTask::new(dataset, before, delete_unverified.unwrap_or(false));
     cleanup.run().await
 }
 
@@ -589,7 +581,7 @@ mod tests {
 
         async fn run_cleanup(&self, before: DateTime<Utc>) -> Result<RemovalStats> {
             let db = self.open().await?;
-            cleanup_old_versions(&db, before).await
+            cleanup_old_versions(&db, before, None).await
         }
 
         async fn open(&self) -> Result<Box<Dataset>> {
