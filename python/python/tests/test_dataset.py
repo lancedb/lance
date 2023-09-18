@@ -699,7 +699,8 @@ def test_scan_prefilter(tmp_path: Path):
         "nearest": {"column": "vecs", "q": pa.array(query), "k": 2, "use_index": False},
     }
 
-    # With post-filter no results are returned because all the closest results don't match the filter
+    # With post-filter no results are returned because all
+    # the closest results don't match the filter
     assert dataset.scanner(**args).to_table().num_rows == 0
 
     args["prefilter"] = True
