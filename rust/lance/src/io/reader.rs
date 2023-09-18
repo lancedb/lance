@@ -39,6 +39,7 @@ use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use prost::Message;
 use snafu::{location, Location};
+use tracing::instrument;
 
 use super::deletion::{read_deletion_file, DeletionVector};
 use super::object_reader::read_message;
@@ -64,6 +65,7 @@ use super::object_store::ObjectStore;
 /// Read Manifest on URI.
 ///
 /// This only reads manifest files. It does not read data files.
+#[instrument(skip(object_store))]
 pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Manifest> {
     let file_size = object_store.inner.head(path).await?.size;
     const PREFETCH_SIZE: usize = 64 * 1024;
@@ -129,6 +131,7 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     Ok(Manifest::from(proto))
 }
 
+#[instrument(skip(object_store, manifest))]
 pub async fn read_manifest_indexes(
     object_store: &ObjectStore,
     path: &Path,
@@ -199,6 +202,7 @@ impl FileReader {
     ///
     /// The session passed in is used to cache metadata about the file. If no session
     /// is passed in, there will be no caching.
+    #[instrument(skip(object_store, manifest, session))]
     pub(crate) async fn try_new_with_fragment(
         object_store: &ObjectStore,
         path: &Path,
@@ -380,6 +384,7 @@ impl FileReader {
     /// Read a batch of data from the file.
     ///
     /// The schema of the returned [RecordBatch] is set by [`FileReader::schema()`].
+    #[instrument(skip(self, params, projection))]
     pub(crate) async fn read_batch(
         &self,
         batch_id: i32,
@@ -401,6 +406,7 @@ impl FileReader {
     ///
     /// Note that it might call concat if the range is crossing multiple batches, which
     /// makes it less efficient than [`FileReader::read_batch()`].
+    #[instrument(skip(self, projection))]
     pub(crate) async fn read_range(
         &self,
         range: Range<usize>,
@@ -425,6 +431,7 @@ impl FileReader {
     /// Take by records by indices within the file.
     ///
     /// The indices must be sorted.
+    #[instrument(skip_all)]
     pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
         let indices_in_batches = self.metadata.group_indices_to_batches(indices);
         let batches = stream::iter(indices_in_batches)
