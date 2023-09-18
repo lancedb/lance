@@ -164,18 +164,18 @@ impl KNNFlatExec {
                     query.column
                 ),
             })?;
-        let is_vector = match field.data_type() {
-            DataType::FixedSizeList(item, _) => item.as_ref().data_type() == &DataType::Float32,
-            _ => false,
-        };
-        if !is_vector {
-            return Err(Error::IO {
-                message: format!(
-                    "KNNFlatExec node: query column {} is not a vector. Expected float32 fixed-size array, got {}",
-                    query.column, field.data_type()
-                ),
-            });
-        };
+        match field.data_type() {
+            DataType::FixedSizeList(list_field, _)
+                if matches!(list_field.data_type(), DataType::Float32) => {}
+            _ => {
+                return Err(Error::IO {
+                    message: format!(
+                        "KNNFlatExec node: query column {} is not a vector. Expect FixedSizeList<Float32>, got {}",
+                        query.column, field.data_type()
+                    ),
+                });
+            }
+        }
 
         Ok(Self { input, query })
     }
