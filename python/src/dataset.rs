@@ -487,12 +487,13 @@ impl Dataset {
         Ok(())
     }
 
+    /// Cleanup old versions from the dataset
     fn cleanup_old_versions(
         &self,
-        before: i64,
+        before_micros: i64,
         delete_unverified: Option<bool>,
     ) -> PyResult<CleanupStats> {
-        let before = utc_datetime_from_epoch_timestamp(before)?;
+        let before = utc_datetime_from_epoch_timestamp(before_micros)?;
         let cleanup_stats = RT
             .block_on(
                 None,

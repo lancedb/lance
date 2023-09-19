@@ -124,7 +124,8 @@ impl KMeans {
 }
 
 pub(crate) fn utc_datetime_from_epoch_timestamp(micros: i64) -> PyResult<DateTime<Utc>> {
-    let naive = NaiveDateTime::from_timestamp_opt(micros / 1000000, (micros % 1000000) as u32);
+    let naive =
+        NaiveDateTime::from_timestamp_opt(micros / 1000000, 1000 * (micros % 1000000) as u32);
     if let Some(naive) = naive {
         Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
     } else {

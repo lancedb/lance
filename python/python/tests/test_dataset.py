@@ -390,18 +390,19 @@ def test_add_columns(tmp_path: Path):
 def test_cleanup_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
+    start = datetime.now()
     lance.write_dataset(table, base_dir)
+    moment = datetime.now()
     lance.write_dataset(table, base_dir, mode="overwrite")
 
     dataset = lance.dataset(base_dir)
 
+    # These calls do nothing, but make sure we can call the method ok
+
     # Ok, defaults to two weeks ago
     stats = dataset.cleanup_old_versions()
-    assert stats.old_manifests == 0
-    assert stats.unreferenced_data_paths == 0
-    assert stats.unreferenced_delete_paths == 0
-    assert stats.unreferenced_index_paths == 0
-    assert stats.unreferenced_tx_paths == 0
+    assert stats.bytes_removed == 0
+    assert stats.old_versions == 0
 
     # Ok, can accept time as ISO string
     dataset.cleanup_old_versions(before="2021-01-01T00:00:00.000000Z")
@@ -412,9 +413,17 @@ def test_cleanup_old_versions(tmp_path):
     # Ok if no time zone specified, will assume local time
     dataset.cleanup_old_versions(before=datetime.now() - pd.Timedelta(days=14))
     dataset.cleanup_old_versions(before="2021-01-01T00:00:00.000000")
-    # Not ok, too recent
-    with pytest.raises(OSError):
-        dataset.cleanup_old_versions(before=datetime.now(timezone.utc))
+
+    print(tmp_path)
+    for root, dirnames, filenames in os.walk(tmp_path):
+        for filename in filenames:
+            print(root + "/" + filename)
+
+    # Now this call will actually delete the old version
+    stats = dataset.cleanup_old_versions(before=moment)
+    print(stats)
+    assert stats.bytes_removed > 0
+    assert stats.old_versions == 1
 
 
 def test_create_from_commit(tmp_path: Path):

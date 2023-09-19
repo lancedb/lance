@@ -571,10 +571,9 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Cleans up old versions of the dataset.
 
-        Some dataset changes, such as overwriting, or restoring an old version,
-        remove data from the dataset but do not physically remove the deleted rows
-        from storage.  The old data is left in place to allow the dataset to be
-        restored back to an older version.
+        Some dataset changes, such as overwriting, leave behind data that is not
+        referenced by the latest dataset version.  The old data is left in place
+        to allow the dataset to be restored back to an older version.
 
         This method will remove older versions and any data files they reference.
         Once this cleanup task has run you will not be able to checkout or restore
@@ -590,9 +589,10 @@ class LanceDataset(pa.dataset.Dataset):
             This can be a datetime object or a string in ISO 8601 format.  If no
             timezone is provided then it is assumed to be a time in the local timezone.
         delete_unverified: bool, default False
-            Some files may be part of an in-progress operation (e.g. appending new data)
-            and these files will not be deleted unless they are at least 7 days old.  If
-            this is True then these files will be deleted regardless of their age.
+            Files leftover from a failed transaction may appear to be part of an in-progress
+            operation (e.g. appending new data) and these files will not be deleted unless
+            they are at least 7 days old.  If delete_unverified is True then these files
+            will be deleted regardless of their age.
 
             This should only be set to True if you can guarantee that no other process
             is currently working on this dataset.  Otherwise the dataset could be put into

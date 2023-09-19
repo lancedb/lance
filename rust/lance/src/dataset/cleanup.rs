@@ -39,6 +39,10 @@
 //! If the data is not referenced by any manifest then we look at the age of
 //! the file.  If the file is at least 7 days old then we assume it is probably
 //! not part of any ongoing operation and we will delete it.
+//!
+//! Otherwise we will leave the file unless delete_unverified is set to true.
+//! (which should only be done if the caller can guarantee there are no updates
+//! happening at the same time)
 
 use std::{
     collections::HashSet,
@@ -47,9 +51,8 @@ use std::{
 };
 
 use chrono::{DateTime, Duration, Utc};
-use futures::{future::BoxFuture, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use object_store::path::Path;
-use tokio::join;
 
 use crate::{
     format::{Index, Manifest},
@@ -81,8 +84,8 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
 }
 
 #[derive(Clone, Debug)]
-struct CleanupTask {
-    dataset: Dataset,
+struct CleanupTask<'a> {
+    dataset: &'a Dataset,
     /// Cleanup all versions before this time
     before: DateTime<Utc>,
     /// If true, delete unverified data files even if they are recent
@@ -105,25 +108,23 @@ struct CleanupInspection {
 /// this many days old.
 const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
 
-impl CleanupTask {
-    fn new(dataset: &Dataset, before: DateTime<Utc>, delete_unverified: bool) -> Self {
+impl<'a> CleanupTask<'a> {
+    fn new(dataset: &'a Dataset, before: DateTime<Utc>, delete_unverified: bool) -> Self {
         Self {
-            dataset: dataset.clone(),
+            dataset: dataset,
             before,
             delete_unverified,
         }
     }
 
-    fn run(self) -> BoxFuture<'static, Result<RemovalStats>> {
+    async fn run(self) -> Result<RemovalStats> {
         // First we process all manifest files in parallel to figure
         // out which files are referenced by valid manifests
-        let inspection_fut = self.process_manifests();
-        inspection_fut
-            .and_then(|inspection| self.delete_unreferenced_files(inspection))
-            .boxed()
+        let inspection = self.process_manifests().await?;
+        self.delete_unreferenced_files(inspection).await
     }
 
-    async fn process_manifests(&self) -> Result<CleanupInspection> {
+    async fn process_manifests(&'a self) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
             .object_store
@@ -236,10 +237,14 @@ impl CleanupTask {
 
         let old_manifests = inspection.old_manifests.clone();
         let num_old_manifests = old_manifests.len();
-        let old_manifests_stream = stream::iter(old_manifests.clone())
-            .map(Result::<Path>::Ok)
-            .boxed();
 
+        let manifest_bytes_removed = stream::iter(&old_manifests)
+            .then(|path| async move { self.dataset.object_store.size(&path).await })
+            // .buffer_unordered(num_cpus::get())
+            .try_fold(0, |acc, size| async move { Ok(acc + (size as u64)) })
+            .await;
+
+        let old_manifests_stream = stream::iter(old_manifests).map(Result::<Path>::Ok).boxed();
         let all_paths_to_remove =
             stream::iter(vec![unreferenced_paths, old_manifests_stream]).flatten();
 
@@ -249,18 +254,11 @@ impl CleanupTask {
             .remove_stream(all_paths_to_remove.boxed())
             .try_for_each(|_| future::ready(Ok(())));
 
-        let manifest_bytes_removed = stream::iter(old_manifests.clone())
-            .then(|path| async move { self.dataset.object_store.size(&path).await })
-            // .buffer_unordered(num_cpus::get())
-            .try_fold(0, |acc, size| async move { Ok(acc + (size as u64)) });
-
-        let (delete_res, bytes_removed_res) = join!(delete_fut, manifest_bytes_removed);
-
-        delete_res?;
+        delete_fut.await?;
 
         let mut removal_stats = removal_stats.into_inner().unwrap();
         removal_stats.old_versions = num_old_manifests as u64;
-        removal_stats.bytes_removed += bytes_removed_res?;
+        removal_stats.bytes_removed += manifest_bytes_removed?;
         Ok(removal_stats)
     }
 
@@ -390,13 +388,13 @@ impl CleanupTask {
 /// even if it is older than the `before` parameter.
 ///
 /// The `before` parameter must be at least 7 days before the current date.
-pub fn cleanup_old_versions(
+pub async fn cleanup_old_versions(
     dataset: &Dataset,
     before: DateTime<Utc>,
     delete_unverified: Option<bool>,
-) -> BoxFuture<'static, Result<RemovalStats>> {
+) -> Result<RemovalStats> {
     let cleanup = CleanupTask::new(dataset, before, delete_unverified.unwrap_or(false));
-    cleanup.run()
+    cleanup.run().await
 }
 
 /// Force cleanup of specific partial writes.

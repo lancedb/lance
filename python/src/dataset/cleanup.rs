@@ -12,10 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use pyo3::pyclass;
+use pyo3::{pyclass, pymethods};
 
 #[pyclass(get_all)]
+#[derive(Debug)]
 pub struct CleanupStats {
     pub bytes_removed: u64,
     pub old_versions: u64,
+}
+
+#[pymethods]
+impl CleanupStats {
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
 }
