@@ -89,19 +89,28 @@ class ImageURIArray(pa.ExtensionArray):
 
     @classmethod
     def from_uris(cls, uris: Union[pa.StringArray, Iterable[Union[str, Path]]]):
-        if isinstance(uris, pa.StringArray):
-            return cls.from_storage(ImageURIType(), uris)
-        elif isinstance(uris, Iterable):
-            storage = pa.array((str(uri) for uri in uris), type=pa.string())
-            return cls.from_storage(ImageURIType(), storage)
+        from urllib.parse import urlparse
+
+        if isinstance(uris, Iterable):
+            uris = pa.array((str(uri) for uri in uris), type=pa.string())
         else:
             raise TypeError("Cannot build a ImageURIArray from {}".format(type(uris)))
 
+        for uri in uris:
+            parsed_uri = urlparse(uri.as_py())
+            if not parsed_uri.scheme and not parsed_uri.scheme == "":
+                raise ValueError("URI {} is not a valid URI".format(uri))
+            if parsed_uri.scheme not in ("file", "s3", "gs", ""):
+                raise ValueError("URI {} is not a supported scheme".format(uri))
+
+        return cls.from_storage(ImageURIType(), uris)
+
     def read_uris(self):
-        # Assume first URI's filesystem is the same for all URIs
+        """
+        Read the images from the URIs into memory and return an EncodedImageArray
+        """
         from pyarrow import fs
 
-        # Read all URIs and return their content as lance.arrow.EncodedImageArray
         images = []
         for uri in self.storage:
             filesystem, path = fs.FileSystem.from_uri(uri.as_py())
@@ -120,28 +129,42 @@ class EncodedImageArray(pa.ExtensionArray):
 
     @classmethod
     def from_binary_array(cls, array: pa.binary()):
+        """
+        Create an EncodedImageArray from a pa.binary() array
+        """
         return cls.from_storage(EncodedImageType(), array)
 
-    def image_to_tensor(self):
-        # TODO: try other decoders (pillow/torchvision/cv2/scipy/..) to decode images
-        # or rather just pick one and make it a requirement?
+    def image_to_tensor(self, decoder=None):
+        """
+        Decode the images and return a EncodedImageArray
+        """
         import numpy as np
 
-        try:
-            import tensorflow as tf
-
-            image_arrays = (tf.io.decode_image(img.as_py()) for img in self.storage)
-        except ImportError:
+        if not decoder:
             import io
 
-            from PIL import Image
+            decoders = [
+                ("scipy", lambda lib, x: lib.misc.imread(x)),
+                ("PIL", lambda lib, x: lib.Image.open(io.BytesIO(x))),
+                ("tensorflow", lambda lib, x: lib.io.decode_image(x)),
+            ]
+            for libname, decoder_function in decoders:
+                try:
+                    lib = __import__(libname)
 
-            image_arrays = (
-                np.array(Image.open(io.BytesIO(img.as_py()))) for img in self.storage
-            )
-        except ImportError:
-            raise "No image decoder available"
+                    def decoder(x):
+                        return decoder_function(lib, x)
 
+                    break
+                except ImportError:
+                    pass
+            else:
+                raise ValueError(
+                    "No image decoder installed. Please either install one of "
+                    "tensorflow, pillow, scipy, or pass a decoder argument"
+                )
+
+        image_arrays = (decoder(img.as_py()) for img in self.storage)
         image_array = np.stack(image_arrays)
         return FixedShapeImageTensorArray.from_numpy_ndarray(image_array)
 
@@ -178,7 +201,6 @@ class FixedShapeImageTensorArray(pa.ExtensionArray):
         import tensorflow as tf
 
         full_tensor = tf.convert_to_tensor(self.storage.to_numpy_ndarray())
-        # a = tf.io.encode_png(full_tensor[0])
         encoded_images = (tf.io.encode_png(x).numpy() for x in full_tensor)
 
         return EncodedImageArray.from_binary_array(
