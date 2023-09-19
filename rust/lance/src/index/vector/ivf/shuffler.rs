@@ -55,8 +55,7 @@ impl Shuffler {
         // TODO: create a `ObjectWriter::tempfile()` method.
         let temp_dir = tempfile::tempdir()?;
         let (object_store, _) = ObjectStore::from_uri(temp_dir.path().to_str().unwrap()).await?;
-        let file_path = temp_dir.path().join("temp_part.lance");
-        let path = Path::from_filesystem_path(file_path)?;
+        let path = Self::lance_buffer_path(&temp_dir)?;
         let writer = object_store.create(&path).await?;
 
         Ok(Self {
@@ -66,6 +65,12 @@ impl Shuffler {
             parted_groups: BTreeMap::new(),
             writer: FileWriter::with_object_writer(writer, schema)?,
         })
+    }
+
+    fn lance_buffer_path(dir: &TempDir) -> Result<Path> {
+        let file_path = dir.path().join("temp_part.lance");
+        let path = Path::from_filesystem_path(file_path)?;
+        Ok(path)
     }
 
     /// Insert a [RecordBatch] with the same key (Partition ID).
@@ -87,8 +92,11 @@ impl Shuffler {
     }
 
     /// Iterate over the shuffled [RecordBatch]s for a given partition key.
-    pub fn key_iter(&self, key: u32) -> Result<impl RecordBatchStream> {
-        PartitionStream::try_new(&self.parted_groups, key)
+    pub async fn key_iter(&self, key: u32) -> Result<impl RecordBatchStream + '_> {
+        let file_path = Self::lance_buffer_path(&self.temp_dir)?;
+        let (object_store, path) = ObjectStore::from_uri(&file_path.to_string()).await?;
+        let reader = FileReader::try_new(&object_store, &path).await?;
+        Ok(PartitionStream::new(reader, &self.parted_groups, key))
     }
 }
 
@@ -99,12 +107,16 @@ pub(crate) struct PartitionStream<'a> {
 }
 
 impl<'a> PartitionStream<'a> {
-    fn try_new(parted_groups: &'a BTreeMap<u32, Vec<u32>>, part_id: u32) -> Result<Self> {
-        todo!()
+    fn new(reader: FileReader, parted_groups: &'a BTreeMap<u32, Vec<u32>>, part_id: u32) -> Self {
+        Self {
+            reader,
+            partition_id: part_id,
+            parted_groups,
+        }
     }
 }
 
-impl Stream for PartitionStream {
+impl Stream for PartitionStream<'_> {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -112,7 +124,7 @@ impl Stream for PartitionStream {
     }
 }
 
-impl RecordBatchStream for PartitionStream {
+impl<'a> RecordBatchStream<'a> for PartitionStream<'a> {
     fn schema(&self) -> SchemaRef {
         todo!()
     }

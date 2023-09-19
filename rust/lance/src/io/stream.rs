@@ -23,7 +23,7 @@ use pin_project::pin_project;
 use crate::Result;
 
 /// RecordBatch Stream trait.
-pub trait RecordBatchStream: Stream<Item = Result<RecordBatch>> + Send + 'static {
+pub trait RecordBatchStream<'a>: Stream<Item = Result<RecordBatch>> + Send + 'a {
     /// Returns the schema of the stream.
     fn schema(&self) -> SchemaRef;
 }
