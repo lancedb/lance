@@ -26,7 +26,7 @@ use crate::datatypes::Schema;
 use crate::error::{Error, Result};
 use crate::format::{pb, ProtoStruct};
 use crate::utils::temporal::SystemTime;
-
+use snafu::{location, Location};
 /// Manifest of a dataset
 ///
 ///  * Schema
@@ -164,6 +164,7 @@ impl Manifest {
                     "fragments_since: given version {} is newer than manifest version {}",
                     since.version, self.version
                 ),
+                location: location!(),
             });
         }
         let start = since.max_fragment_id();

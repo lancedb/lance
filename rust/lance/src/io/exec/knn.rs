@@ -26,6 +26,7 @@ use datafusion::physical_plan::{
 };
 use futures::stream::Stream;
 use futures::FutureExt;
+use snafu::{location, Location};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
@@ -163,6 +164,7 @@ impl KNNFlatExec {
                     "KNNFlatExec node: query column {} not found in input schema",
                     query.column
                 ),
+                location: location!(),
             })?;
         match field.data_type() {
             DataType::FixedSizeList(list_field, _)
@@ -173,6 +175,7 @@ impl KNNFlatExec {
                         "KNNFlatExec node: query column {} is not a vector. Expect FixedSizeList<Float32>, got {}",
                         query.column, field.data_type()
                     ),
+                    location: location!(),
                 });
             }
         }
@@ -360,6 +363,7 @@ impl KNNIndexExec {
                     "KNNIndexExec node: query column {} does not exist in dataset.",
                     query.column
                 ),
+                location: location!(),
             });
         };
 

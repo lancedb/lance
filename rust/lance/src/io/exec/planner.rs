@@ -39,6 +39,7 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
+use snafu::{location, Location};
 
 use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
 use crate::{
@@ -82,6 +83,7 @@ impl Planner {
             _ => {
                 return Err(Error::IO {
                     message: format!("Operator {op} is not supported"),
+                    location: location!(),
                 })
             }
         })
@@ -110,7 +112,8 @@ impl Planner {
                             .parse::<f64>()
                             .map_err(|_e| {
                                 Error::IO{
-                                    message: format!("negative operator can be only applied to integer and float operands, got: {n}")
+                                    message: format!("negative operator can be only applied to integer and float operands, got: {n}"),
+                                    location: location!(),
                                 }
                             })?),
                     },
@@ -123,6 +126,7 @@ impl Planner {
             _ => {
                 return Err(Error::IO {
                     message: format!("Unary operator '{:?}' is not supported", op),
+                    location: location!(),
                 })
             }
         })
@@ -136,6 +140,7 @@ impl Planner {
         } else {
             value.parse::<f64>().map(lit).map_err(|_| Error::IO {
                 message: format!("'{value}' is not supported number value."),
+                location: location!(),
             })
         }
     }
@@ -164,6 +169,7 @@ impl Planner {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self.parse_sql_expr(expr),
             _ => Err(Error::IO {
                 message: format!("Unsupported function args: {:?}", func_args),
+                location: location!(),
             }),
         }
     }
@@ -173,6 +179,7 @@ impl Planner {
             if func.args.len() != 1 {
                 return Err(Error::IO {
                     message: format!("is_valid only support 1 args, got {}", func.args.len()),
+                    location: location!(),
                 });
             }
             return Ok(Expr::IsNotNull(Box::new(
@@ -182,6 +189,7 @@ impl Planner {
             if func.args.len() != 2 {
                 return Err(Error::IO {
                     message: format!("regexp_match only supports 2 args, got {}", func.args.len()),
+                    location: location!(),
                 });
             }
 
@@ -198,6 +206,7 @@ impl Planner {
         }
         Err(Error::IO {
             message: format!("function '{}' is not supported", func.name),
+            location: location!(),
         })
     }
 
@@ -240,6 +249,7 @@ impl Planner {
                     _ => {
                         return Err(Error::IO {
                             message: "Timezone not supported in timestamp".to_string(),
+                            location: location!(),
                         })
                     }
                 };
@@ -253,6 +263,7 @@ impl Planner {
                     _ => {
                         return Err(Error::IO {
                             message: format!("Unsupported datetime resolution: {:?}", resolution),
+                            location: location!(),
                         })
                     }
                 };
@@ -268,6 +279,7 @@ impl Planner {
                     _ => {
                         return Err(Error::IO {
                             message: format!("Unsupported datetime resolution: {:?}", resolution),
+                            location: location!(),
                         })
                     }
                 };
@@ -282,6 +294,7 @@ impl Planner {
                         "Must provide precision and scale for decimal: {:?}",
                         number_info
                     ),
+                    location: location!(),
                 }),
             },
             _ => Err(Error::IO {
@@ -289,6 +302,7 @@ impl Planner {
                     "Unsupported data type: {:?}. Supported types: {:?}",
                     data_type, SUPPORTED_TYPES
                 ),
+                location: location!(),
             }),
         }
     }
@@ -369,6 +383,7 @@ impl Planner {
             })),
             _ => Err(Error::IO {
                 message: format!("Expression '{expr}' is not supported as filter in lance"),
+                location: location!(),
             }),
         }
     }
@@ -461,6 +476,7 @@ impl Planner {
                 if fun != &BuiltinScalarFunction::RegexpMatch {
                     return Err(Error::IO {
                         message: format!("Scalar function '{:?}' is not supported", fun),
+                        location: location!(),
                     });
                 }
                 let execution_props = ExecutionProps::new();
@@ -475,6 +491,7 @@ impl Planner {
                             fun,
                             args_vec.len()
                         ),
+                        location: location!(),
                     });
                 }
 
@@ -492,6 +509,7 @@ impl Planner {
             _ => {
                 return Err(Error::IO {
                     message: format!("Expression '{expr}' is not supported as filter in lance"),
+                    location: location!(),
                 })
             }
         })

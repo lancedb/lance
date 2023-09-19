@@ -50,7 +50,7 @@ use crate::io::{
 };
 use crate::utils::sql::parse_sql_filter;
 use crate::{Error, Result};
-
+use snafu::{location, Location};
 /// Column name for the meta row ID.
 pub const ROW_ID: &str = "_rowid";
 pub const DEFAULT_BATCH_SIZE: usize = 8192;
@@ -163,6 +163,7 @@ impl Scanner {
         if self.is_fragment_scan() {
             Err(Error::IO {
                 message: "This operation is not supported for fragment scan".to_string(),
+                location: location!(),
             })
         } else {
             Ok(())
@@ -242,12 +243,14 @@ impl Scanner {
         if limit.unwrap_or_default() < 0 {
             return Err(Error::IO {
                 message: "Limit must be non-negative".to_string(),
+                location: location!(),
             });
         }
         if let Some(off) = offset {
             if off < 0 {
                 return Err(Error::IO {
                     message: "Offset must be non-negative".to_string(),
+                    location: location!(),
                 });
             }
         }
@@ -263,11 +266,13 @@ impl Scanner {
         if k == 0 {
             return Err(Error::IO {
                 message: "k must be positive".to_string(),
+                location: location!(),
             });
         }
         if q.is_empty() {
             return Err(Error::IO {
                 message: "Query vector must have non-zero length".to_string(),
+                location: location!(),
             });
         }
         // make sure the field exists
@@ -338,9 +343,11 @@ impl Scanner {
         if let Some(q) = self.nearest.as_ref() {
             let vector_field = self.dataset.schema().field(&q.column).ok_or(Error::IO {
                 message: format!("Column {} not found", q.column),
+                location: location!(),
             })?;
             let vector_field = ArrowField::try_from(vector_field).map_err(|e| Error::IO {
                 message: format!("Failed to convert vector field: {}", e),
+                location: location!(),
             })?;
             extra_columns.push(vector_field);
             extra_columns.push(ArrowField::new("_distance", DataType::Float32, false));
@@ -408,6 +415,7 @@ impl Scanner {
                 .downcast_ref::<Int64Array>()
                 .ok_or(Error::IO {
                     message: "Count plan did not return a UInt64Array".to_string(),
+                    location: location!(),
                 })?;
             Ok(array.value(0) as u64)
         } else {
@@ -517,6 +525,7 @@ impl Scanner {
         let Some(q) = self.nearest.as_ref() else {
             return Err(Error::IO {
                 message: "No nearest query".to_string(),
+                location: location!(),
             });
         };
 
@@ -532,12 +541,14 @@ impl Scanner {
                             "Vector search error: column {} is not a vector type: expected FixedSizeList<Float32>, got {}",
                             q.column, field.data_type(),
                         ),
+                        location: location!(),
                     });
                 }
             }
         } else {
             return Err(Error::IO {
                 message: format!("Vector search error: column {} not found", q.column),
+                location: location!(),
             });
         }
 
@@ -556,6 +567,7 @@ impl Scanner {
                 if rf == 0 {
                     return Err(Error::IO {
                         message: "Refine factor can not be zero".to_string(),
+                        location: location!(),
                     });
                 }
             }
@@ -595,6 +607,7 @@ impl Scanner {
             let ds = self.dataset.checkout_version(version).await?;
             let max_fragment_id_idx = ds.manifest.max_fragment_id().ok_or_else(|| Error::IO {
                 message: "No fragments in index version".to_string(),
+                location: location!(),
             })?;
             let max_fragment_id_ds =
                 self.dataset
@@ -602,6 +615,7 @@ impl Scanner {
                     .max_fragment_id()
                     .ok_or_else(|| Error::IO {
                         message: "No fragments in dataset version".to_string(),
+                        location: location!(),
                     })?;
             // If we have new fragments, then we need to do a combined search
             if max_fragment_id_idx < max_fragment_id_ds {
@@ -744,6 +758,7 @@ impl Stream for DatasetRecordBatchStream {
             Poll::Ready(result) => Poll::Ready(result.map(|r| {
                 r.map_err(|e| Error::IO {
                     message: e.to_string(),
+                    location: location!(),
                 })
             })),
             Poll::Pending => Poll::Pending,

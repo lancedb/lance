@@ -222,7 +222,10 @@ impl CommitHandler for ExternalManifestCommitHandler {
             &staging_path,
             &path,
         ).await.map_err(|e| CommitError::OtherError(
-            Error::IO { message: format!("commit to external store is successful, but could not copy manifest to object store, with error: {}.", e) }
+            Error::IO {
+                message: format!("commit to external store is successful, but could not copy manifest to object store, with error: {}.", e),
+                location: location!(),
+            }
         ))?;
 
         // update the _latest.manifest pointer
@@ -310,6 +313,7 @@ mod test {
                         "manifest already exists for uri: {}, version: {}",
                         uri, version
                     ),
+                    location: location!(),
                 }),
                 None => {
                     store.insert((uri.to_string(), version), path.to_string());
@@ -333,6 +337,7 @@ mod test {
                         "manifest already exists for uri: {}, version: {}",
                         uri, version
                     ),
+                    location: location!(),
                 }),
             }
         }

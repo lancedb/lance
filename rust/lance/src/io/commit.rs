@@ -54,7 +54,7 @@ use object_store::Error as ObjectStoreError;
 use prost::Message;
 
 use super::ObjectStore;
-
+use snafu::{location, Location};
 /// Function that writes the manifest to the object store.
 pub type ManifestWriter = for<'a> fn(
     object_store: &'a ObjectStore,
@@ -82,6 +82,7 @@ fn make_staging_manifest_path(base: &Path) -> Result<Path> {
     let id = uuid::Uuid::new_v4().to_string();
     Path::parse(format!("{base}-{id}")).map_err(|e| crate::Error::IO {
         message: format!("failed to parse path: {}", e),
+        location: location!(),
     })
 }
 

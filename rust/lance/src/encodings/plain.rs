@@ -209,6 +209,7 @@ impl<'a> PlainDecoder<'a> {
                     "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
                     start, end, self.length
                 ),
+                location: location!(),
             });
         }
         let byte_range = get_byte_range(self.data_type, start..end);

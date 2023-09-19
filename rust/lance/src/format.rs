@@ -15,7 +15,7 @@ pub use index::Index;
 pub use manifest::Manifest;
 pub use metadata::Metadata;
 pub use page_table::{PageInfo, PageTable};
-
+use snafu::{location, Location};
 /// Protobuf definitions
 pub mod pb {
     #![allow(clippy::all)]
@@ -46,6 +46,7 @@ impl TryFrom<&pb::Uuid> for Uuid {
         if p.uuid.len() != 16 {
             return Err(Error::IO {
                 message: "Protobuf UUID is malformed".to_string(),
+                location: location!(),
             });
         }
         let mut buf: [u8; 16] = [0; 16];

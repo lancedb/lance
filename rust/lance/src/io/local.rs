@@ -73,6 +73,7 @@ impl LocalObjectReader {
             },
             _ => Error::IO {
                 message: e.to_string(),
+                location: location!(),
             },
         })?;
         Ok(Box::new(Self {
@@ -117,6 +118,7 @@ impl ObjectReader for LocalObjectReader {
                         range.len(),
                         bytes_read
                     ),
+                    location: location!(),
                 });
             }
             Ok(buf.freeze())
