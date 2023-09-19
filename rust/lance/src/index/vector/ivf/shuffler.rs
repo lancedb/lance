@@ -13,12 +13,17 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
+use futures::Stream;
+use object_store::path::Path;
 use tempfile::TempDir;
 
 use crate::datatypes::Schema;
+use crate::io::FileReader;
 use crate::{
     error::Result,
     io::{FileWriter, ObjectStore, RecordBatchStream},
@@ -28,7 +33,8 @@ use crate::{
 ///
 ///
 pub struct Shuffler {
-    buffer: Mutex<BTreeMap<u32, Mutex<Vec<RecordBatch>>>>,
+    buffer: BTreeMap<u32, Vec<RecordBatch>>,
+
     /// The size, as number of rows, of each partition in memory before flushing to disk.
     flush_size: usize,
 
@@ -46,13 +52,15 @@ pub struct Shuffler {
 
 impl Shuffler {
     pub async fn try_new(schema: Schema) -> Result<Self> {
+        // TODO: create a `ObjectWriter::tempfile()` method.
         let temp_dir = tempfile::tempdir()?;
         let (object_store, _) = ObjectStore::from_uri(temp_dir.path().to_str().unwrap()).await?;
         let file_path = temp_dir.path().join("temp_part.lance");
-        let writer = object_store.create(&file_path).await?;
-        dbg!(println!("temp file: {:?}", file_path));
+        let path = Path::from_filesystem_path(file_path)?;
+        let writer = object_store.create(&path).await?;
+
         Ok(Self {
-            buffer: Mutex::new(BTreeMap::new()),
+            buffer: BTreeMap::new(),
             flush_size: 1024, // TODO: change to parameterized value later.
             temp_dir,
             parted_groups: BTreeMap::new(),
@@ -61,24 +69,51 @@ impl Shuffler {
     }
 
     /// Insert a [RecordBatch] with the same key (Partition ID).
-    pub fn insert(&self, key: u32, batch: RecordBatch) -> Result<Self> {
-        {
-            let mut buffer = self.buffer.lock().unwrap();
-            let entry = buffer.entry(key).or_default();
-            entry.push(batch);
-            let batches = entry.get_mut().unwrap();
-            let total = batches.iter().map(|b| b.num_rows()).sum::<usize>();
-            if total > self.flush_size {
-                let mut batches = Vec::new();
-                std::mem::swap(&mut batches, batches);
-                self.writer.write_batches(batches)?;
-            }
-        }
-        todo!()
+    pub async fn insert(&mut self, key: u32, batch: RecordBatch) -> Result<()> {
+        let batches = self.buffer.entry(key).or_default();
+        batches.push(batch);
+        let total = batches.iter().map(|b| b.num_rows()).sum::<usize>();
+        /// If there are more than `flush_size` rows in the buffer, flush them to disk
+        /// as one group.
+        if total > self.flush_size {
+            self.parted_groups
+                .entry(key)
+                .or_default()
+                .push(self.writer.batch_id as u32);
+            self.writer.write(&batches).await?;
+            batches.clear();
+        };
+        Ok(())
     }
 
-    /// Iterate over the shuffled [RecordBatch] for a given partition.
+    /// Iterate over the shuffled [RecordBatch]s for a given partition key.
     pub fn key_iter(&self, key: u32) -> Result<impl RecordBatchStream> {
+        PartitionStream::try_new(&self.parted_groups, key)
+    }
+}
+
+pub(crate) struct PartitionStream<'a> {
+    reader: FileReader,
+    partition_id: u32,
+    parted_groups: &'a BTreeMap<u32, Vec<u32>>,
+}
+
+impl<'a> PartitionStream<'a> {
+    fn try_new(parted_groups: &'a BTreeMap<u32, Vec<u32>>, part_id: u32) -> Result<Self> {
+        todo!()
+    }
+}
+
+impl Stream for PartitionStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        todo!()
+    }
+}
+
+impl RecordBatchStream for PartitionStream {
+    fn schema(&self) -> SchemaRef {
         todo!()
     }
 }

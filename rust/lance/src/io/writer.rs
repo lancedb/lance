@@ -110,7 +110,7 @@ pub async fn write_manifest(
 pub struct FileWriter {
     object_writer: ObjectWriter,
     schema: Schema,
-    batch_id: i32,
+    pub batch_id: i32,
     page_table: PageTable,
     metadata: Metadata,
 }
