@@ -37,6 +37,7 @@ use lance_linalg::{kernels::argmin, matrix::MatrixView};
 use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
+use snafu::{location, Location};
 
 #[cfg(feature = "opq")]
 use super::opq::train_opq;
@@ -55,7 +56,8 @@ use crate::{
     session::Session,
 };
 use crate::{Error, Result};
-use snafu::{location, Location};
+mod shuffler;
+
 const PARTITION_ID_COLUMN: &str = "__ivf_part_id";
 const RESIDUAL_COLUMN: &str = "__residual_vector";
 const PQ_CODE_COLUMN: &str = "__pq_code";

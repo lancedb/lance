@@ -118,6 +118,10 @@ pub struct FileWriter {
 impl FileWriter {
     pub async fn try_new(object_store: &ObjectStore, path: &Path, schema: Schema) -> Result<Self> {
         let object_writer = object_store.create(path).await?;
+        Self::with_object_writer(object_writer, schema)
+    }
+
+    pub fn with_object_writer(object_writer: ObjectWriter, schema: Schema) -> Result<Self> {
         Ok(Self {
             object_writer,
             schema,
