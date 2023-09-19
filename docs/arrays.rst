@@ -93,4 +93,5 @@ ImageTensor
 :class:`lance.arrow.ImageTensorArray` is an Arrow extension array that represents
 images stored as a :class:`pyarrow.FixedShapeTensorArray` or
 :class:`pyarrow.VariableShapeTensorArray`. It provides methods for converting to
-common memory layouts such as NumPy, PIL, PyTorch, and TensorFlow.
+common memory layouts such as NumPy, PyTorch, TensorFlow. It also provides
+a method for storing to TFRecords.

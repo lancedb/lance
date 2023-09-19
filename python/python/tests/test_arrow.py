@@ -16,10 +16,18 @@ import re
 from pathlib import Path
 
 import lance
+import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pytest
 from helper import requires_pyarrow_12
-from lance.arrow import BFloat16, BFloat16Array, PandasBFloat16Array, bfloat16_array, ImageURIArray, EncodedImageArray, ImageTensorArray
+from lance.arrow import (
+    BFloat16,
+    BFloat16Array,
+    ImageURIArray,
+    PandasBFloat16Array,
+    bfloat16_array,
+)
 
 
 def test_bf16_value():
@@ -133,7 +141,33 @@ def test_roundtrip_take_ext_types(tmp_path: Path):
         [12.0, 13.0, 14.0, 15.0, 16.0, 17.0],
     ]
 
+
 def test_image_arrays():
-    uris = [None, "http://example.com"]
-    uri_array = ImageURIArray.from_uris(uris)
-    # TODO
+    n = 20
+    import os
+
+    import tensorflow as tf
+
+    png_uris = [os.path.join(os.path.dirname(__file__), "images/1.png")] * n
+    uri_array = ImageURIArray.from_uris(png_uris)
+    encoded_image_array = uri_array.materialize()
+    tensor_image_array = encoded_image_array.materialize()
+    assert len(tensor_image_array) == n
+    assert tensor_image_array.storage.type == pa.fixed_shape_tensor(
+        pa.uint8(), (1, 1, 4)
+    )
+    assert tensor_image_array[19].as_py() == [42, 42, 42, 255]
+
+    uris = [
+        os.path.join(os.path.dirname(__file__), "images/1.png"),
+        os.path.join(os.path.dirname(__file__), "images/2.jpeg"),
+    ]
+    encoded_image_array = ImageURIArray.from_uris(uris).materialize()
+    with pytest.raises(ValueError, match="all input arrays must have the same shape"):
+        encoded_image_array.materialize()
+
+    test_tensor = tf.constant(
+        np.array([42, 42, 42, 255] * n, dtype=np.uint8).reshape((n, 1, 1, 4))
+    )
+    assert test_tensor.shape == (n, 1, 1, 4)
+    assert tf.math.reduce_all(tensor_image_array.to_tf() == test_tensor)
