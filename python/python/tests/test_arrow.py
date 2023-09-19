@@ -147,28 +147,32 @@ def test_image_arrays():
 
     import tensorflow as tf
 
-    n = 20
-    png_uris = [os.path.join(os.path.dirname(__file__), "images/1.png")] * n
+    n = 10
+    png_uris = [
+        "file://" + os.path.join(os.path.dirname(__file__), "images/1.png"),
+        os.path.join(os.path.dirname(__file__), "images/1.png"),
+    ] * 5
+
     uri_array = ImageURIArray.from_uris(png_uris)
-    encoded_image_array = uri_array.materialize()
-    tensor_image_array = encoded_image_array.materialize()
+    encoded_image_array = uri_array.read_uris()
+    tensor_image_array = encoded_image_array.image_to_tensor()
     assert len(tensor_image_array) == n
     assert tensor_image_array.storage.type == pa.fixed_shape_tensor(
         pa.uint8(), (1, 1, 4)
     )
-    assert tensor_image_array[19].as_py() == [42, 42, 42, 255]
+    assert tensor_image_array[2].as_py() == [42, 42, 42, 255]
 
     test_tensor = tf.constant(
         np.array([42, 42, 42, 255] * n, dtype=np.uint8).reshape((n, 1, 1, 4))
     )
     assert test_tensor.shape == (n, 1, 1, 4)
     assert tf.math.reduce_all(tensor_image_array.to_tf() == test_tensor)
-    assert tensor_image_array.to_encoded().materialize() == tensor_image_array
+    assert tensor_image_array.to_encoded().image_to_tensor() == tensor_image_array
 
     uris = [
         os.path.join(os.path.dirname(__file__), "images/1.png"),
         os.path.join(os.path.dirname(__file__), "images/2.jpeg"),
     ]
-    encoded_image_array = ImageURIArray.from_uris(uris).materialize()
+    encoded_image_array = ImageURIArray.from_uris(uris).read_uris()
     with pytest.raises(ValueError, match="all input arrays must have the same shape"):
-        encoded_image_array.materialize()
+        encoded_image_array.image_to_tensor()

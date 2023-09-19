@@ -11,7 +11,8 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-from typing import List, Optional, Union
+from pathlib import Path
+from typing import Iterable, Optional, Union
 
 import pyarrow as pa
 
@@ -19,6 +20,7 @@ from .lance import BFloat16
 from .lance import bfloat16_array as bfloat16_array
 
 
+# TODO: add VariableShapeImageTensorType once pa.VariableShapeTensorArray is available
 class ImageURIType(pa.ExtensionType):
     def __init__(self):
         pa.ExtensionType.__init__(self, pa.string(), "lance.arrow.image_uri")
@@ -56,11 +58,12 @@ class EncodedImageType(pa.ExtensionType):
         return EncodedImageScalar
 
 
-class ImageTensorType(pa.ExtensionType):
+class FixedShapeImageTensorType(pa.ExtensionType):
     def __init__(self, arrow_type, shape):
-        # TODO: use pa.VariableShapeTensorArray once available?
         pa.ExtensionType.__init__(
-            self, pa.fixed_shape_tensor(arrow_type, shape), "lance.arrow.image_tensor"
+            self,
+            pa.fixed_shape_tensor(arrow_type, shape),
+            "lance.arrow.fixed_shape_image_tensor",
         )
 
     def __arrow_ext_serialize__(self):
@@ -68,13 +71,13 @@ class ImageTensorType(pa.ExtensionType):
 
     @classmethod
     def __arrow_ext_deserialize__(cls, self, storage_type, serialized):
-        return ImageTensorType()
+        return FixedShapeImageTensorType()
 
     def __arrow_ext_class__(self):
-        return ImageTensorArray
+        return FixedShapeImageTensorArray
 
     def __arrow_ext_scalar_class__(self):
-        return ImageTensorScalar
+        return FixedShapeImageTensorScalar
 
 
 class ImageURIArray(pa.ExtensionArray):
@@ -85,23 +88,24 @@ class ImageURIArray(pa.ExtensionArray):
         )
 
     @classmethod
-    def from_uris(cls, uris: Union[pa.StringArray, List[str]]):
-        if isinstance(uris, list):
-            return cls.from_storage(ImageURIType(), pa.array(uris, type=pa.string()))
-        else:
+    def from_uris(cls, uris: Union[pa.StringArray, Iterable[Union[str, Path]]]):
+        if isinstance(uris, pa.StringArray):
             return cls.from_storage(ImageURIType(), uris)
+        elif isinstance(uris, Iterable):
+            storage = pa.array((str(uri) for uri in uris), type=pa.string())
+            return cls.from_storage(ImageURIType(), storage)
+        else:
+            raise TypeError("Cannot build a ImageURIArray from {}".format(type(uris)))
 
-    def materialize(self):
+    def read_uris(self):
         # Assume first URI's filesystem is the same for all URIs
         from pyarrow import fs
-
-        first_uri = self.storage[0].as_py()
-        filesystem, _ = fs.FileSystem.from_uri(first_uri)
 
         # Read all URIs and return their content as lance.arrow.EncodedImageArray
         images = []
         for uri in self.storage:
-            with filesystem.open_input_stream(uri.as_py()) as f:
+            filesystem, path = fs.FileSystem.from_uri(uri.as_py())
+            with filesystem.open_input_stream(path) as f:
                 images.append(f.read())
 
         return EncodedImageArray.from_binary_array(pa.array(images, type=pa.binary()))
@@ -118,7 +122,7 @@ class EncodedImageArray(pa.ExtensionArray):
     def from_binary_array(cls, array: pa.binary()):
         return cls.from_storage(EncodedImageType(), array)
 
-    def materialize(self):
+    def image_to_tensor(self):
         # TODO: try other decoders (pillow/torchvision/cv2/scipy/..) to decode images
         # or rather just pick one and make it a requirement?
         import numpy as np
@@ -139,14 +143,14 @@ class EncodedImageArray(pa.ExtensionArray):
             raise "No image decoder available"
 
         image_array = np.stack(image_arrays)
-        return ImageTensorArray.from_numpy_ndarray(image_array)
+        return FixedShapeImageTensorArray.from_numpy_ndarray(image_array)
 
 
-class ImageTensorArray(pa.ExtensionArray):
+class FixedShapeImageTensorArray(pa.ExtensionArray):
     import numpy as np
 
     def __repr__(self):
-        return "<lance.arrow.ImageTensorArray object at 0x%016x>\n%s" % (
+        return "<lance.arrow.FixedShapeImageTensorArray object at 0x%016x>\n%s" % (
             id(self),
             repr(self.to_pylist()),
         )
@@ -161,7 +165,9 @@ class ImageTensorArray(pa.ExtensionArray):
             pa.fixed_shape_tensor(arrow_type, shape),
             pa.FixedSizeListArray.from_arrays(array.ravel(), size),
         )
-        return cls.from_storage(ImageTensorType(arrow_type, shape), tensor_array)
+        return cls.from_storage(
+            FixedShapeImageTensorType(arrow_type, shape), tensor_array
+        )
 
     def to_tf(self):
         import tensorflow as tf
@@ -179,10 +185,6 @@ class ImageTensorArray(pa.ExtensionArray):
             pa.array(encoded_images, type=pa.binary())
         )
 
-    def to_tfrecords(self):
-        # TODO: write to tfrecords
-        pass
-
 
 class ImageURIScalar(pa.ExtensionScalar):
     def as_py(self):
@@ -194,7 +196,7 @@ class EncodedImageScalar(pa.ExtensionScalar):
         return self.value.as_py()
 
 
-class ImageTensorScalar(pa.ExtensionScalar):
+class FixedShapeImageTensorScalar(pa.ExtensionScalar):
     def as_py(self):
         return self.value.as_py()
 
