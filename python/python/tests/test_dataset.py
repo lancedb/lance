@@ -391,11 +391,9 @@ def test_cleanup_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
     lance.write_dataset(table, base_dir)
+    lance.write_dataset(table, base_dir, mode="overwrite")
 
     dataset = lance.dataset(base_dir)
-    # These tests don't actually clean up any files.  Due to the 2 weeks
-    # requirement this is currently too difficult to simulate from python.
-    # Instead we just make sure the API is correct.
 
     # Ok, defaults to two weeks ago
     stats = dataset.cleanup_old_versions()

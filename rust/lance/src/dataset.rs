@@ -29,6 +29,7 @@ use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::FutureExt;
 use log::warn;
 use object_store::path::Path;
 use tracing::instrument;
@@ -581,12 +582,12 @@ impl Dataset {
     /// # Returns
     ///
     /// * `RemovalStats` - Statistics about the removal operation
-    pub async fn cleanup_old_versions(
+    pub fn cleanup_old_versions(
         &self,
         before: DateTime<Utc>,
         delete_unverified: Option<bool>,
-    ) -> Result<RemovalStats> {
-        cleanup::cleanup_old_versions(self, before, delete_unverified).await
+    ) -> BoxFuture<Result<RemovalStats>> {
+        cleanup::cleanup_old_versions(self, before, delete_unverified).boxed()
     }
 
     /// Commit changes to the dataset

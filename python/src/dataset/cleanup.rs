@@ -16,9 +16,6 @@ use pyo3::pyclass;
 
 #[pyclass(get_all)]
 pub struct CleanupStats {
-    pub unreferenced_data_paths: u64,
-    pub unreferenced_delete_paths: u64,
-    pub unreferenced_index_paths: u64,
-    pub unreferenced_tx_paths: u64,
-    pub old_manifests: u64,
+    pub bytes_removed: u64,
+    pub old_versions: u64,
 }

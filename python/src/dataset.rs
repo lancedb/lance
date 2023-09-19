@@ -500,11 +500,8 @@ impl Dataset {
             )
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(CleanupStats {
-            unreferenced_data_paths: cleanup_stats.unreferenced_data_paths,
-            unreferenced_delete_paths: cleanup_stats.unreferenced_delete_paths,
-            unreferenced_index_paths: cleanup_stats.unreferenced_index_paths,
-            unreferenced_tx_paths: cleanup_stats.unreferenced_tx_paths,
-            old_manifests: cleanup_stats.old_manifests,
+            bytes_removed: cleanup_stats.bytes_removed,
+            old_versions: cleanup_stats.old_versions,
         })
     }
 
