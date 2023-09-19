@@ -143,11 +143,11 @@ def test_roundtrip_take_ext_types(tmp_path: Path):
 
 
 def test_image_arrays():
-    n = 20
     import os
 
     import tensorflow as tf
 
+    n = 20
     png_uris = [os.path.join(os.path.dirname(__file__), "images/1.png")] * n
     uri_array = ImageURIArray.from_uris(png_uris)
     encoded_image_array = uri_array.materialize()
@@ -158,6 +158,13 @@ def test_image_arrays():
     )
     assert tensor_image_array[19].as_py() == [42, 42, 42, 255]
 
+    test_tensor = tf.constant(
+        np.array([42, 42, 42, 255] * n, dtype=np.uint8).reshape((n, 1, 1, 4))
+    )
+    assert test_tensor.shape == (n, 1, 1, 4)
+    assert tf.math.reduce_all(tensor_image_array.to_tf() == test_tensor)
+    assert tensor_image_array.to_encoded().materialize() == tensor_image_array
+
     uris = [
         os.path.join(os.path.dirname(__file__), "images/1.png"),
         os.path.join(os.path.dirname(__file__), "images/2.jpeg"),
@@ -165,9 +172,3 @@ def test_image_arrays():
     encoded_image_array = ImageURIArray.from_uris(uris).materialize()
     with pytest.raises(ValueError, match="all input arrays must have the same shape"):
         encoded_image_array.materialize()
-
-    test_tensor = tf.constant(
-        np.array([42, 42, 42, 255] * n, dtype=np.uint8).reshape((n, 1, 1, 4))
-    )
-    assert test_tensor.shape == (n, 1, 1, 4)
-    assert tf.math.reduce_all(tensor_image_array.to_tf() == test_tensor)

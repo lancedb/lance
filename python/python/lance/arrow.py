@@ -39,6 +39,7 @@ class ImageURIType(pa.ExtensionType):
 
 class EncodedImageType(pa.ExtensionType):
     def __init__(self):
+        # TODO: use pa.BinaryView once available?
         pa.ExtensionType.__init__(self, pa.binary(), "lance.arrow.encoded_image")
 
     def __arrow_ext_serialize__(self):
@@ -166,6 +167,17 @@ class ImageTensorArray(pa.ExtensionArray):
         import tensorflow as tf
 
         return tf.convert_to_tensor(self.storage.to_numpy_ndarray())
+
+    def to_encoded(self):
+        import tensorflow as tf
+
+        full_tensor = tf.convert_to_tensor(self.storage.to_numpy_ndarray())
+        # a = tf.io.encode_png(full_tensor[0])
+        encoded_images = (tf.io.encode_png(x).numpy() for x in full_tensor)
+
+        return EncodedImageArray.from_binary_array(
+            pa.array(encoded_images, type=pa.binary())
+        )
 
     def to_tfrecords(self):
         # TODO: write to tfrecords
