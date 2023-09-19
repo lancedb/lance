@@ -1,5 +1,13 @@
 [profile.release]
-lto = true
+lto = "thin"
+codegen-units = 1
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+# Prioritize compile time over runtime performance
+codegen-units = 16
+lto = "off"
 
 [target.'cfg(all())']
 rustflags = [
