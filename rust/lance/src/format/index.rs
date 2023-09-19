@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::Error;
-
+use snafu::{location, Location};
 /// Index metadata
 #[derive(Debug, Clone)]
 pub struct Index {
@@ -60,6 +60,7 @@ impl TryFrom<&pb::IndexMetadata> for Index {
                 .map(Uuid::try_from)
                 .ok_or_else(|| Error::IO {
                     message: "uuid field does not exist in Index metadata".to_string(),
+                    location: location!(),
                 })??,
             name: proto.name.clone(),
             fields: proto.fields.clone(),

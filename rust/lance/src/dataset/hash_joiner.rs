@@ -23,6 +23,7 @@ use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use arrow_select::interleave::interleave;
 use dashmap::{DashMap, ReadOnlyView};
 use futures::{StreamExt, TryStreamExt};
+use snafu::{location, Location};
 use tokio::task;
 
 use crate::datatypes::lance_supports_nulls;
@@ -59,6 +60,7 @@ impl HashJoiner {
         if batches.is_empty() {
             return Err(Error::IO {
                 message: "HashJoiner: No data".to_string(),
+                location: location!(),
             });
         };
 
@@ -103,6 +105,7 @@ impl HashJoiner {
                         Ok(Err(err)) => Err(err),
                         Err(err) => Err(Error::IO {
                             message: format!("HashJoiner: {}", err),
+                            location: location!(),
                         }),
                     }
                 }
@@ -182,6 +185,7 @@ impl HashJoiner {
                         interleave(array_refs.as_ref(), indices.as_ref())
                             .map_err(|err| Error::IO {
                                 message: format!("HashJoiner: {}", err),
+                                location: location!(),
                             })
                     })
                     .await;
@@ -199,6 +203,7 @@ impl HashJoiner {
                         Ok(Err(err)) => Err(err),
                         Err(err) => Err(Error::IO {
                             message: format!("HashJoiner: {}", err),
+                            location: location!(),
                         }),
                     }
                 }

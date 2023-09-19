@@ -17,7 +17,7 @@ use std::ops::Range;
 
 use crate::format::{pb, ProtoStruct};
 use crate::{Error, Result};
-
+use snafu::{location, Location};
 /// Data File Metadata
 #[derive(Debug, Default, PartialEq)]
 pub struct Metadata {
@@ -150,6 +150,7 @@ impl Metadata {
                     range,
                     self.batch_offsets.last().unwrap()
                 ),
+                location: location!(),
             });
         }
         let offsets = self.batch_offsets.as_slice();

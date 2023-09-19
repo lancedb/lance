@@ -36,11 +36,11 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{
     DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
+use snafu::{location, Location};
 use tfrecord::protobuf::feature::Kind;
 use tfrecord::protobuf::{DataType as TensorDataType, TensorProto};
 use tfrecord::record_reader::RecordStream;
 use tfrecord::{Example, Feature};
-
 /// Infer the Arrow schema from a TFRecord file.
 ///
 /// The featured named by `tensor_features` will be assumed to be binary fields
@@ -74,6 +74,7 @@ pub async fn infer_tfrecord_schema(
     while let Some(record) = records.next().await {
         let record = record.map_err(|err| Error::IO {
             message: err.to_string(),
+            location: location!(),
         })?;
 
         if let Some(features) = record.features {
@@ -215,6 +216,7 @@ impl FeatureMeta {
                             self.feature_type,
                             feature.kind.as_ref().unwrap()
                         ),
+                        location: location!(),
                     })
                 }
             },
@@ -224,6 +226,7 @@ impl FeatureMeta {
         if self.feature_type != feature_type {
             return Err(Error::IO {
                 message: format!("inconsistent feature type for field {:?}", feature_type),
+                location: location!(),
             });
         }
         if feature_is_repeated(feature) {
@@ -263,6 +266,7 @@ fn tensor_dtype_to_arrow(tensor_dtype: &TensorDataType) -> Result<DataType> {
         _ => {
             return Err(Error::IO {
                 message: format!("unsupported tensor data type {:?}", tensor_dtype),
+                location: location!(),
             });
         }
     })
@@ -541,6 +545,7 @@ fn convert_leaf(
         } => convert_fixedshape_tensor(&features, type_info)?,
         _ => Err(Error::IO {
             message: format!("unsupported type {:?}", type_info.leaf_type),
+            location: location!(),
         })?,
     };
 
@@ -723,6 +728,7 @@ fn convert_fixedshape_tensor(
         }
         _ => Err(Error::IO {
             message: format!("unsupported type {:?}", type_info.leaf_type),
+            location: location!(),
         })?,
     };
 
@@ -739,6 +745,7 @@ fn validate_tensor(tensor: &TensorProto, type_info: &TypeInfo) -> Result<()> {
                 type_info.fsl_size.unwrap(),
                 length
             ),
+            location: location!(),
         });
     }
 
@@ -750,6 +757,7 @@ fn validate_tensor(tensor: &TensorProto, type_info: &TypeInfo) -> Result<()> {
                 type_info.leaf_type,
                 tensor.dtype()
             ),
+            location: location!(),
         });
     }
 

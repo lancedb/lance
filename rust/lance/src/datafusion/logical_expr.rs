@@ -22,7 +22,7 @@ use datafusion::{logical_expr::BinaryExpr, prelude::*};
 
 use crate::datatypes::Schema;
 use crate::{Error, Result};
-
+use snafu::{location, Location};
 /// Resolve a Value
 fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
     match expr {
@@ -39,6 +39,7 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
             DataType::Float64 => Ok(Expr::Literal(ScalarValue::Float64(v.map(|v| v as f64)))),
             _ => Err(Error::IO {
                 message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
+                location: location!(),
             }),
         },
         Expr::Literal(ScalarValue::Float64(v)) => match data_type {
@@ -46,6 +47,7 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
             DataType::Float64 => Ok(Expr::Literal(ScalarValue::Float64(*v))),
             _ => Err(Error::IO {
                 message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
+                location: location!(),
             }),
         },
         Expr::Literal(ScalarValue::Utf8(v)) => match data_type {
@@ -53,6 +55,7 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
             DataType::LargeUtf8 => Ok(Expr::Literal(ScalarValue::LargeUtf8(v.clone()))),
             _ => Err(Error::IO {
                 message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
+                location: location!(),
             }),
         },
         Expr::Literal(ScalarValue::Boolean(_)) | Expr::Literal(ScalarValue::Null) => {
@@ -60,6 +63,7 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
         }
         _ => Err(Error::IO {
             message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
+            location: location!(),
         }),
     }
 }
@@ -88,6 +92,7 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                                 "Column {} does not exist in the dataset.",
                                 l.flat_name()
                             ),
+                            location: location!(),
                         });
                     };
                     Ok(Expr::BinaryExpr(BinaryExpr {
@@ -103,6 +108,7 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                                 "Column {} does not exist in the dataset.",
                                 l.flat_name()
                             ),
+                            location: location!(),
                         });
                     };
                     Ok(Expr::BinaryExpr(BinaryExpr {
@@ -119,6 +125,7 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                                 "Column {} does not exist in the dataset.",
                                 l.flat_name()
                             ),
+                            location: location!(),
                         });
                     };
                     Ok(Expr::BinaryExpr(BinaryExpr {

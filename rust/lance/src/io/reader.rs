@@ -37,6 +37,7 @@ use futures::stream::{self, TryStreamExt};
 use futures::{Future, FutureExt, StreamExt};
 use object_store::path::Path;
 use prost::Message;
+use snafu::{location, Location};
 
 use super::deletion::{read_deletion_file, DeletionVector};
 use super::object_reader::read_message;
@@ -72,11 +73,13 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     if buf.len() < 16 {
         return Err(Error::IO {
             message: "Invalid format: file size is smaller than 16 bytes".to_string(),
+            location: location!(),
         });
     }
     if !buf.ends_with(super::MAGIC) {
         return Err(Error::IO {
             message: "Invalid format: magic number does not match".to_string(),
+            location: location!(),
         });
     }
     let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
@@ -115,6 +118,7 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
                 recorded_length,
                 buf.len()
             ),
+            location: location!(),
         });
     }
 
@@ -260,6 +264,7 @@ impl FileReader {
                 .map(|f| f.to_owned())
                 .ok_or(Error::IO {
                     message: format!("Fragment {} not found in manifest", fragment_id),
+                    location: location!(),
                 })?;
             Some(fragment)
         } else {
@@ -324,6 +329,7 @@ impl FileReader {
                             "Deletion file {:?} not found in fragment {}",
                             deletion_file, fragment.id
                         ),
+                        location: location!(),
                     })
             })
             .await?;
@@ -478,6 +484,7 @@ async fn read_batch(
             .get_offset(batch_id)
             .ok_or_else(|| Error::IO {
                 message: format!("batch {batch_id} does not exist"),
+                location: location!(),
             })?;
         let row_ids: Vec<u64> = ids_in_batch
             .iter()
@@ -549,6 +556,7 @@ fn get_page_info<'a>(
             "No page info found for field: {}, field_id={} batch={}",
             field.name, field.id, batch_id
         ),
+        location: location!(),
     })
 }
 
@@ -591,6 +599,7 @@ fn read_null_array(
                             "NullArray Reader: request([{}]) out of range: [0..{}]",
                             idx_max, page_info.length
                         ),
+                        location: location!(),
                     });
                 }
                 indices.len()
@@ -610,6 +619,7 @@ fn read_null_array(
                         "NullArray Reader: request([{}..{}]) out of range: [0..{}]",
                         idx_start, idx_end, page_info.length
                     ),
+                    location: location!(),
                 });
             }
             idx_end - idx_start

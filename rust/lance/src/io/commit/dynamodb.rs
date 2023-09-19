@@ -29,11 +29,12 @@ use snafu::OptionExt;
 use crate::error::{IOSnafu, NotFoundSnafu};
 use crate::io::commit::external_manifest::ExternalManifestStore;
 use crate::{Error, Result};
-
+use snafu::{location, Location};
 impl<E> From<SdkError<E>> for Error {
     fn from(e: SdkError<E>) -> Self {
         Self::IO {
             message: format!("dynamodb error: {e}"),
+            location: location!(),
         }
     }
 }
@@ -127,8 +128,9 @@ impl DynamoDBExternalManifestStore {
                 _ => {
                     return Err(Error::IO {
                         message: format!(
-                            "dynamodb table: {table_name} unknown key type encountered name:{name}"
+                            "dynamodb table: {table_name} unknown key type encountered name:{name}",
                         ),
+                        location: location!(),
                     });
                 }
             }
@@ -138,7 +140,8 @@ impl DynamoDBExternalManifestStore {
         if !(has_hask_key && has_range_key) {
             return Err(
                 Error::IO {
-                    message: format!("dynamodb table: {} must have HASH and RANGE keys, named `{}` and `{}` respectively", table_name, base_uri!(), version!())
+                    message: format!("dynamodb table: {} must have HASH and RANGE keys, named `{}` and `{}` respectively", table_name, base_uri!(), version!()),
+                    location: location!(),
                 }
             );
         }
@@ -195,6 +198,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             AttributeValue::S(path) => Ok(path.clone()),
             _ => Err(Error::IO {
                 message: format!("key {} is not a string", path!()),
+                location: location!(),
             }),
         }
     }
@@ -224,6 +228,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                             "dynamodb table: {} return unexpect number of items",
                             self.table_name
                         ),
+                        location: location!(),
                     });
                 }
 
@@ -246,11 +251,15 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
 
                 match (version_attibute, path_attribute) {
                     (AttributeValue::N(version), AttributeValue::S(path)) => Ok(Some((
-                        version.parse().map_err(|e| Error::IO {message: format!("dynamodb error: could not parse the version number returned {}, error: {}", version, e)})?,
+                        version.parse().map_err(|e| Error::IO {
+                            message: format!("dynamodb error: could not parse the version number returned {}, error: {}", version, e),
+                            location: location!(),
+                        })?,
                         path.clone(),
                     ))),
                     _ => Err(Error::IO {
-                        message: format!("dynamodb error: found entries for {base_uri} but the returned data is not number type")
+                        message: format!("dynamodb error: found entries for {base_uri} but the returned data is not number type"),
+                        location: location!(),
                     })
                 }
             }

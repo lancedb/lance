@@ -106,6 +106,7 @@ pub(crate) async fn read_message<M: Message + Default>(
     if pos > file_size {
         return Err(Error::IO {
             message: "file size is too small".to_string(),
+            location: location!(),
         });
     }
 
@@ -183,6 +184,7 @@ pub(crate) async fn read_binary_array(
         _ => {
             return Err(Error::IO {
                 message: format!("Unsupported binary type: {data_type}",),
+                location: location!(),
             })
         }
     };

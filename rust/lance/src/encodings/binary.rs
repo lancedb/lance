@@ -45,6 +45,7 @@ use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
 use crate::io::ReadBatchParams;
+use snafu::{location, Location};
 
 /// Encoder for Var-binary encoding.
 pub struct BinaryEncoder<'a> {
@@ -112,6 +113,7 @@ impl<'a> Encoder for BinaryEncoder<'a> {
             _ => {
                 return Err(crate::Error::IO {
                     message: format!("Binary encoder does not support {}", data_type),
+                    location: location!(),
                 })
             }
         }
