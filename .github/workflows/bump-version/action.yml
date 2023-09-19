@@ -24,4 +24,4 @@ runs:
     shell: bash
     run: |
       cargo install cargo-workspaces
-      cargo ws version --no-git-commit --no-git-push --no-git-tag ${{ inputs.part }}
+      cargo ws version --no-git-commit -y --exact --force 'lance*' ${{ inputs.part }}
