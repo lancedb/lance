@@ -2479,14 +2479,8 @@ mod tests {
         }
     }
 
-    #[ignore]
     #[tokio::test]
     async fn test_search_empty_after_delete() {
-        // TODO: This test is broken, fix it https://github.com/lancedb/lance/issues/1288
-        // Error:
-        // called `Result::unwrap()` on an `Err` value: IO { message: "Execution error: External error: Execution error: LanceError(IO): Does not find any data file for schema: \nfragment_id=0" }
-        // thread 'dataset::tests::test_search_empty_after_delete' panicked at 'called `Result::unwrap()` on an `Err` value: IO { message: "Execution error: External error: Execution error: LanceError(IO): Does not find any data file for schema: \nfragment_id=0" }', lance/src/dataset.rs:2502:38
-
         // Create a table
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "vec",
@@ -2508,7 +2502,8 @@ mod tests {
         let data = RecordBatch::try_new(schema.clone(), vec![vectors]);
         let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
-        dataset.delete("true").await.unwrap();
+        dataset.delete("vec IS NOT NULL").await.unwrap();
+        let dataset = Dataset::open(test_uri).await.unwrap();
 
         let mut stream = dataset
             .scan()
