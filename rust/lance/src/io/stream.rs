@@ -12,14 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use futures::Stream;
+use futures::{stream::BoxStream, Stream, StreamExt};
 
 use crate::Result;
 
 /// RecordBatch Stream trait.
-pub trait RecordBatchStream: Stream<Item = Result<RecordBatch>> + Send + 'static {
+pub trait RecordBatchStream<'a>: Stream<Item = Result<RecordBatch>> + Send + 'a {
     /// Returns the schema of the stream.
     fn schema(&self) -> SchemaRef;
+}
+
+pub struct BoxedRecordBatchStream<'a> {
+    inner: BoxStream<'a, Result<RecordBatch>>,
+    schema: SchemaRef,
+}
+
+impl<'a> BoxedRecordBatchStream<'a> {
+    pub fn new(inner: BoxStream<'a, Result<RecordBatch>>, schema: SchemaRef) -> Self {
+        Self { inner, schema }
+    }
+}
+
+impl<'a> RecordBatchStream<'a> for BoxedRecordBatchStream<'a> {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+impl Stream for BoxedRecordBatchStream<'_> {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::into_inner(self).inner.poll_next_unpin(cx)
+    }
 }

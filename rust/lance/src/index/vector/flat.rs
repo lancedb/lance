@@ -34,7 +34,7 @@ fn distance_field() -> ArrowField {
     ArrowField::new(DIST_COL, DataType::Float32, false)
 }
 
-pub async fn flat_search(stream: impl RecordBatchStream, query: &Query) -> Result<RecordBatch> {
+pub async fn flat_search(stream: impl RecordBatchStream<'_>, query: &Query) -> Result<RecordBatch> {
     let input_schema = stream.schema();
     let batches = stream
         .try_filter(|batch| future::ready(batch.num_rows() > 0))

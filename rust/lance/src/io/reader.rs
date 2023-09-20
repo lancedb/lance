@@ -33,7 +33,7 @@ use arrow_select::filter::filter_record_batch;
 use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
-use futures::{stream, Future, FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use prost::Message;
 use snafu::{location, Location};
@@ -47,7 +47,8 @@ use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::error::{Error, Result};
 use crate::format::{pb, Fragment, Index, Manifest, Metadata, PageTable};
 use crate::io::object_reader::{read_fixed_stride_array, read_struct, ObjectReader};
-use crate::io::{read_metadata_offset, read_struct_from_buf};
+use crate::io::stream::BoxedRecordBatchStream;
+use crate::io::{read_metadata_offset, read_struct_from_buf, RecordBatchStream};
 use crate::session::Session;
 use crate::{
     datatypes::{Field, Schema},
@@ -151,6 +152,7 @@ fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
 /// Lance File Reader.
 ///
 /// It reads arrow data from one data file.
+#[derive(Clone)]
 pub struct FileReader {
     object_reader: Arc<dyn ObjectReader>,
     metadata: Arc<Metadata>,
@@ -372,26 +374,39 @@ impl FileReader {
     }
 
     /// Stream desired full batches from the file.
+    ///
+    /// Parameters:
+    /// - **projection**: The schema of the returning [RecordBatch].
+    /// - **predicate**: A function that takes a batch ID and returns true if the batch should be
+    ///  returned.
+    ///
+    /// Returns:
+    /// - A stream of [RecordBatch]s.
     #[allow(dead_code)]
     pub(crate) fn batches_stream<'a>(
         &'a self,
+        projection: Schema,
         predicate: impl FnMut(&i32) -> bool + Send + Sync + 'a,
-    ) -> impl Stream<Item = Result<impl Future<Output = Result<RecordBatch>> + 'a>> + 'a {
-        let reader = Arc::new(self.clone());
-        // let pred = Arc::new(predicate);
+    ) -> impl RecordBatchStream + 'a {
+        // Make projection an Arc so we can clone it and pass between threads.
+        let projection = Arc::new(projection);
         let batches = (0..self.num_batches() as i32)
             .filter(predicate)
             .collect::<Vec<_>>();
-        stream::iter(batches)
-            .map(move |batch_id| {
-                let reader = reader.clone();
-                Ok(async move {
-                    reader
-                        .read_batch(batch_id, ReadBatchParams::RangeFull, reader.schema())
-                        .await
-                })
+        let this = self;
+        let proj = projection.clone();
+        let inner = stream::iter(batches)
+            .zip(stream::repeat_with(move || proj.clone()))
+            .map(move |(batch_id, proj)| async move {
+                let proj = proj.clone();
+
+                this.read_batch(batch_id, ReadBatchParams::RangeFull, &proj)
+                    .await
             })
-            .boxed()
+            .buffered(2)
+            .boxed();
+        let arrow_schema = ArrowSchema::from(projection.as_ref());
+        BoxedRecordBatchStream::new(inner, Arc::new(arrow_schema))
     }
 
     /// Read a batch of data from the file.
@@ -828,7 +843,6 @@ mod tests {
     use arrow::array::LargeListBuilder;
     use arrow_array::builder::StringDictionaryBuilder;
     use arrow_array::types::Int32Type;
-    use arrow_array::RecordBatchIterator;
     use arrow_array::{
         builder::{Int32Builder, ListBuilder, StringBuilder},
         cast::{as_string_array, as_struct_array},
@@ -836,6 +850,7 @@ mod tests {
         Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, NullArray,
         StringArray, StructArray, UInt32Array, UInt8Array,
     };
+    use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
     use rand::{distributions::Alphanumeric, Rng};
     use roaring::RoaringBitmap;
@@ -1586,5 +1601,31 @@ mod tests {
         test_roundtrip_manifest(0, 100_000).await;
         test_roundtrip_manifest(1000, 100_000).await;
         test_roundtrip_manifest(1000, 1000).await;
+    }
+
+    #[tokio::test]
+    async fn test_batches_stream() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/batch_stream");
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, true)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut writer = FileWriter::try_new(&store, &path, schema.clone())
+            .await
+            .unwrap();
+        for i in 0..10 {
+            let batch = RecordBatch::try_new(
+                Arc::new(arrow_schema.clone()),
+                vec![Arc::new(Int32Array::from_iter_values(i * 10..(i + 1) * 10))],
+            )
+            .unwrap();
+            writer.write(&[batch]).await.unwrap();
+        }
+        writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let mut stream = reader.batches_stream(schema, |id| id % 2 == 0);
+        let batches = stream.buffered(2).try_collect::<Vec<_>>().await.unwrap();
+        println!("{:?}", batches);
     }
 }
