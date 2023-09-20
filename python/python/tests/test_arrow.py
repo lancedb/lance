@@ -167,6 +167,7 @@ def test_image_arrays():
     )
     assert test_tensor.shape == (n, 1, 1, 4)
     assert tf.math.reduce_all(tensor_image_array.to_tf() == test_tensor)
+    tensor_image_array.to_encoded().image_to_tensor()
     assert tensor_image_array.to_encoded().image_to_tensor() == tensor_image_array
 
     uris = [

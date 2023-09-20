@@ -89,6 +89,25 @@ class ImageURIArray(pa.ExtensionArray):
 
     @classmethod
     def from_uris(cls, uris: Union[pa.StringArray, Iterable[Union[str, Path]]]):
+        """
+        Create an ImageURIArray from a pa.StringArray or an iterable.
+
+        Parameters
+        ----------
+        uris : Union[pa.StringArray, Iterable[Union[str, Path]]]
+
+        Returns
+        -------
+        ImageURIArray
+            Array of image URIs
+
+        Examples
+        --------
+        >>> uris = ["file::///tmp/1.png"]
+        >>> ImageURIArray.from_uris(uris)
+        <lance.arrow.ImageURIArray object at 0x...>
+        ['file::///tmp/1.png']
+        """
         from urllib.parse import urlparse
 
         if isinstance(uris, Iterable):
@@ -97,17 +116,30 @@ class ImageURIArray(pa.ExtensionArray):
             raise TypeError("Cannot build a ImageURIArray from {}".format(type(uris)))
 
         for uri in uris:
+            # This is to catch malformed URIs
             parsed_uri = urlparse(uri.as_py())
             if not parsed_uri.scheme and not parsed_uri.scheme == "":
                 raise ValueError("URI {} is not a valid URI".format(uri))
-            if parsed_uri.scheme not in ("file", "s3", "gs", ""):
-                raise ValueError("URI {} is not a supported scheme".format(uri))
 
         return cls.from_storage(ImageURIType(), uris)
 
     def read_uris(self):
         """
         Read the images from the URIs into memory and return an EncodedImageArray
+
+        Returns
+        -------
+        EncodedImageArray
+            Array of encoded images
+
+        Examples
+        --------
+        >>> import os
+        >>> uris = [os.path.join(os.path.dirname(__file__), "../tests/images/1.png")]
+        >>> uri_array = ImageURIArray.from_uris(uris)
+        >>> uri_array.read_uris()
+        <lance.arrow.EncodedImageArray object at 0x...>
+        [...]
         """
         from pyarrow import fs
 
@@ -117,7 +149,9 @@ class ImageURIArray(pa.ExtensionArray):
             with filesystem.open_input_stream(path) as f:
                 images.append(f.read())
 
-        return EncodedImageArray.from_binary_array(pa.array(images, type=pa.binary()))
+        return EncodedImageArray.from_storage(
+            EncodedImageType(), pa.array(images, type=pa.binary())
+        )
 
 
 class EncodedImageArray(pa.ExtensionArray):
@@ -127,84 +161,179 @@ class EncodedImageArray(pa.ExtensionArray):
             repr(self.to_pylist()),
         )
 
-    @classmethod
-    def from_binary_array(cls, array: pa.binary()):
-        """
-        Create an EncodedImageArray from a pa.binary() array
-        """
-        return cls.from_storage(EncodedImageType(), array)
-
     def image_to_tensor(self, decoder=None):
         """
-        Decode the images and return a EncodedImageArray
+        Decode encoded images and return a FixedShapeImageTensorArray
+
+        Parameters
+        ----------
+        decoder : Callable[pa.binary()], optional
+            A function that takes a pa.binary() and returns a numpy.ndarray
+            or pa.fixed_size_tensor. If not provided, will attempt to use
+            tensorflow or pillow decoder.
+
+        Returns
+        -------
+        FixedShapeImageTensorArray
+            Array of images as tensors
+
+        Examples
+        --------
+        >>> import os
+        >>> uris = [os.path.join(os.path.dirname(__file__), "../tests/images/1.png")]
+        >>> encoded_image_array = ImageURIArray.from_uris(uris).read_uris()
+        >>> encoded_image_array.image_to_tensor()
+        <lance.arrow.FixedShapeImageTensorArray object at 0x...>
+        [[42, 42, 42, 255]]
         """
         import numpy as np
 
         if not decoder:
-            import io
+
+            def pillow_decoder(x):
+                import io
+
+                from PIL import Image
+
+                return np.stack(
+                    Image.open(io.BytesIO(img.as_py())) for img in self.storage
+                )
+
+            def tensorflow_decoder(x):
+                import tensorflow as tf
+
+                return np.stack(tf.io.decode_image(img.as_py()) for img in self.storage)
 
             decoders = [
-                ("scipy", lambda lib, x: lib.misc.imread(x)),
-                ("PIL", lambda lib, x: lib.Image.open(io.BytesIO(x))),
-                ("tensorflow", lambda lib, x: lib.io.decode_image(x)),
+                ("tensorflow", tensorflow_decoder),
+                ("PIL", pillow_decoder),
             ]
             for libname, decoder_function in decoders:
                 try:
-                    lib = __import__(libname)
-
-                    def decoder(x):
-                        return decoder_function(lib, x)
-
+                    __import__(libname)
+                    decoder = decoder_function
                     break
                 except ImportError:
                     pass
             else:
                 raise ValueError(
-                    "No image decoder installed. Please either install one of "
-                    "tensorflow, pillow, scipy, or pass a decoder argument"
+                    "No image decoder available. Please either install one of "
+                    "tensorflow, pillow, or pass a decoder argument."
                 )
 
-        image_arrays = (decoder(img.as_py()) for img in self.storage)
-        image_array = np.stack(image_arrays)
-        return FixedShapeImageTensorArray.from_numpy_ndarray(image_array)
+        image_array = decoder(self.storage)
+        arrow_type = pa.from_numpy_dtype(image_array.dtype)
+        shape = image_array.shape[1:]
+        tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(image_array)
+
+        return FixedShapeImageTensorArray.from_storage(
+            FixedShapeImageTensorType(arrow_type, shape), tensor_array
+        )
 
 
 class FixedShapeImageTensorArray(pa.ExtensionArray):
-    import numpy as np
-
     def __repr__(self):
         return "<lance.arrow.FixedShapeImageTensorArray object at 0x%016x>\n%s" % (
             id(self),
             repr(self.to_pylist()),
         )
 
-    @classmethod
-    def from_numpy_ndarray(cls, array: np.ndarray):
-        arrow_type = pa.from_numpy_dtype(array.dtype)
-        shape = array.shape[1:]
-        size = array.size / array.shape[0]
-
-        tensor_array = pa.FixedShapeTensorArray.from_storage(
-            pa.fixed_shape_tensor(arrow_type, shape),
-            pa.FixedSizeListArray.from_arrays(array.ravel(), size),
-        )
-        return cls.from_storage(
-            FixedShapeImageTensorType(arrow_type, shape), tensor_array
-        )
-
     def to_tf(self):
-        import tensorflow as tf
+        """
+        Convert FixedShapeImageTensorArray to a tensorflow.Tensor.
 
+        Returns
+        -------
+        tf.Tensor
+            Tensor of images
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> arr = np.array([[[[42, 42, 42, 255]]]], dtype=np.uint8)
+        >>> arrow_type = pa.from_numpy_dtype(arr.dtype)
+        >>> shape = arr.shape[1:]
+        >>> tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(arr)
+        >>> tensor_image_array = FixedShapeImageTensorArray.from_storage(
+        ... FixedShapeImageTensorType(arrow_type, shape), tensor_array)
+        >>> tensor_image_array.to_tf()
+        <tf.Tensor: shape=(1, 1, 1, 4), dtype=uint8, numpy=array([[[[ 42,  42,  42, 255\
+]]]], dtype=uint8)>
+        """
+        try:
+            import tensorflow as tf
+        except ImportError:
+            raise ImportError("Cannot convert to tf.Tensor without tensorflow")
         return tf.convert_to_tensor(self.storage.to_numpy_ndarray())
 
-    def to_encoded(self):
-        import tensorflow as tf
+    def to_encoded(self, encoder=None):
+        """
+        Encode FixedShapeImageTensorArray to PNG bytes and return an EncodedImageArray.
 
-        full_tensor = tf.convert_to_tensor(self.storage.to_numpy_ndarray())
-        encoded_images = (tf.io.encode_png(x).numpy() for x in full_tensor)
+        Parameters
+        ----------
+        encoder : Callable[np.ndarray], optional
+            An encoder function that takes a numpy.ndarray and returns an encoded image.
 
-        return EncodedImageArray.from_binary_array(
-            pa.array(encoded_images, type=pa.binary())
+        Returns
+        -------
+        EncodedImageArray
+            Array of encoded images
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> arr = np.array([[[[42, 42, 42, 255]]]], dtype=np.uint8)
+        >>> arrow_type = pa.from_numpy_dtype(arr.dtype)
+        >>> shape = arr.shape[1:]
+        >>> tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(arr)
+        >>> tensor_image_array = FixedShapeImageTensorArray.from_storage(
+        ... FixedShapeImageTensorType(arrow_type, shape), tensor_array)
+        >>> tensor_image_array.to_encoded()
+        <lance.arrow.EncodedImageArray object at 0x...>
+        ...
+        """
+
+        def pillow_encoder(x):
+            import io
+
+            from PIL import Image
+
+            encoded_images = []
+            buf = io.BytesIO()
+            for y in x:
+                Image.fromarray(y).save(buf, format="PNG")
+                encoded_images.append(buf.getvalue())
+            return pa.array(encoded_images, type=pa.binary())
+
+        def tensorflow_encoder(x):
+            import tensorflow as tf
+
+            encoded_images = (
+                tf.io.encode_png(y).numpy() for y in tf.convert_to_tensor(x)
+            )
+            return pa.array(encoded_images, type=pa.binary())
+
+        if not encoder:
+            encoders = (
+                ("PIL", pillow_encoder),
+                ("tensorflow", tensorflow_encoder),
+            )
+            for libname, encoder_function in encoders:
+                try:
+                    __import__(libname)
+                    encoder = encoder_function
+                    break
+                except ImportError:
+                    pass
+            else:
+                raise ValueError(
+                    "No image encoder available. Please either install one of "
+                    "tensorflow, pillow, or pass an encoder argument."
+                )
+
+        return EncodedImageArray.from_storage(
+            EncodedImageType(), encoder(self.storage.to_numpy_ndarray())
         )
 
 
