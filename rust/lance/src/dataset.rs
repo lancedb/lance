@@ -878,8 +878,15 @@ impl Dataset {
 
         let remapping_index: UInt64Array = row_ids
             .iter()
-            .filter_map(|o| returned_row_ids.binary_search(o).ok().map(|pos| pos as u64))
+            .filter_map(|o| {
+                returned_row_ids
+                    .iter()
+                    .position(|id| id == o)
+                    .map(|pos| pos as u64)
+            })
             .collect();
+
+        debug_assert_eq!(remapping_index.len(), one_batch.num_rows());
 
         // Remove the row id column.
         let keep_indices = (0..one_batch.num_columns() - 1).collect::<Vec<_>>();
