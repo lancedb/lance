@@ -1630,10 +1630,9 @@ mod tests {
         let batches = stream.try_collect::<Vec<_>>().await.unwrap();
 
         assert_eq!(batches.len(), 5);
-        for i in 0..5 {
-            let actual = &batches[i];
+        for (i, batch) in batches.iter().enumerate() {
             assert_eq!(
-                actual,
+                batch,
                 &RecordBatch::try_new(
                     Arc::new(arrow_schema.clone()),
                     vec![Arc::new(Int32Array::from_iter_values(
