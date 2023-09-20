@@ -589,14 +589,14 @@ class LanceDataset(pa.dataset.Dataset):
             This can be a datetime object or a string in ISO 8601 format.  If no
             timezone is provided then it is assumed to be a time in the local timezone.
         delete_unverified: bool, default False
-            Files leftover from a failed transaction may appear to be part of an in-progress
-            operation (e.g. appending new data) and these files will not be deleted unless
-            they are at least 7 days old.  If delete_unverified is True then these files
-            will be deleted regardless of their age.
+            Files leftover from a failed transaction may appear to be part of an
+            in-progress operation (e.g. appending new data) and these files will
+            not be deleted unless they are at least 7 days old.  If delete_unverified
+            is True then these files will be deleted regardless of their age.
 
             This should only be set to True if you can guarantee that no other process
-            is currently working on this dataset.  Otherwise the dataset could be put into
-            a corrupted state.
+            is currently working on this dataset.  Otherwise the dataset could be put
+            into a corrupted state.
         """
         if before is None:
             before = datetime.now(timezone.utc) - timedelta(days=14)

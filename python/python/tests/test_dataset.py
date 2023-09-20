@@ -390,7 +390,6 @@ def test_add_columns(tmp_path: Path):
 def test_cleanup_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
-    start = datetime.now()
     lance.write_dataset(table, base_dir)
     moment = datetime.now()
     lance.write_dataset(table, base_dir, mode="overwrite")

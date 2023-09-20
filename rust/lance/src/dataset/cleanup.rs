@@ -111,7 +111,7 @@ const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
 impl<'a> CleanupTask<'a> {
     fn new(dataset: &'a Dataset, before: DateTime<Utc>, delete_unverified: bool) -> Self {
         Self {
-            dataset: dataset,
+            dataset,
             before,
             delete_unverified,
         }
@@ -192,8 +192,8 @@ impl<'a> CleanupTask<'a> {
                 .deletion_file
                 .as_ref()
                 .map(|delfile| deletion_file_path(&self.dataset.base, fragment.id, delfile));
-            if delpath.is_some() {
-                let relative_path = remove_prefix(&delpath.unwrap(), &self.dataset.base);
+            if let Some(delpath) = delpath {
+                let relative_path = remove_prefix(&delpath, &self.dataset.base);
                 referenced_files.delete_paths.insert(relative_path);
             }
         }
@@ -239,7 +239,7 @@ impl<'a> CleanupTask<'a> {
         let num_old_manifests = old_manifests.len();
 
         let manifest_bytes_removed = stream::iter(&old_manifests)
-            .then(|path| async move { self.dataset.object_store.size(&path).await })
+            .then(|path| async move { self.dataset.object_store.size(path).await })
             // .buffer_unordered(num_cpus::get())
             .try_fold(0, |acc, size| async move { Ok(acc + (size as u64)) })
             .await;

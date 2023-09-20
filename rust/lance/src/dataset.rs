@@ -582,11 +582,11 @@ impl Dataset {
     /// # Returns
     ///
     /// * `RemovalStats` - Statistics about the removal operation
-    pub fn cleanup_old_versions<'a>(
-        &'a self,
+    pub fn cleanup_old_versions(
+        &self,
         before: DateTime<Utc>,
         delete_unverified: Option<bool>,
-    ) -> BoxFuture<'a, Result<RemovalStats>> {
+    ) -> BoxFuture<Result<RemovalStats>> {
         cleanup::cleanup_old_versions(self, before, delete_unverified).boxed()
     }
 
