@@ -18,12 +18,13 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use futures::{stream, stream::BoxStream, Stream, StreamExt};
+use arrow_schema::SchemaRef;
+use futures::{Stream, StreamExt};
 use object_store::path::Path;
 use tempfile::TempDir;
 
 use crate::datatypes::Schema;
+use crate::io::reader::batches_stream;
 use crate::io::FileReader;
 use crate::{
     error::Result,
@@ -137,45 +138,11 @@ impl<'a> Shuffler<'a> {
         let file_path = lance_buffer_path(&self.temp_dir)?;
         let (object_store, path) = ObjectStore::from_uri(&file_path.to_string()).await?;
         let reader = FileReader::try_new(&object_store, &path).await?;
-        Ok(PartitionStream::new(reader, &self.parted_groups, key))
-    }
-}
+        let schema = reader.schema().clone();
 
-fn file_read_stream(reader: FileReader, batch_ids: &[u32]) -> impl Stream {
-    stream::iter(batch_ids)
-        .then(move |batch_id| reader.read_batch(batch_id as i32, None, None))
-        .map_ok(|batch| batch.into())
-        .boxed()
-}
-
-pub(crate) struct PartitionStream<'a> {
-    inner: BoxStream<'a, Result<RecordBatch>>,
-    partition_id: u32,
-    parted_groups: &'a BTreeMap<u32, Vec<u32>>,
-}
-
-impl<'a> PartitionStream<'a> {
-    fn new(reader: FileReader, parted_groups: &'a BTreeMap<u32, Vec<u32>>, part_id: u32) -> Self {
-        let inner = file_read_stream(reader, &parted_groups[&part_id]);
-        Self {
-            inner,
-            partition_id: part_id,
-            parted_groups,
-        }
-    }
-}
-
-impl Stream for PartitionStream<'_> {
-    type Item = Result<RecordBatch>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).inner.poll_next_unpin(cx)
-    }
-}
-
-impl<'a> RecordBatchStream<'a> for PartitionStream<'a> {
-    fn schema(&self) -> SchemaRef {
-        Arc::new(ArrowSchema::from(self.reader.schema()))
+        let group_ids = self.parted_groups.get(&key).unwrap_or(&vec![]).clone();
+        let stream = batches_stream(reader, schema, move |id| group_ids.contains(&(*id as u32)));
+        Ok(stream)
     }
 }
 
@@ -183,5 +150,5 @@ impl<'a> RecordBatchStream<'a> for PartitionStream<'a> {
 mod tests {
 
     #[tokio::test]
-    fn test_shuffler() {}
+    async fn test_shuffler() {}
 }

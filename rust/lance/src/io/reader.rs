@@ -377,41 +377,6 @@ impl FileReader {
         self.metadata.is_empty()
     }
 
-    /// Stream desired full batches from the file.
-    ///
-    /// Parameters:
-    /// - **projection**: The schema of the returning [RecordBatch].
-    /// - **predicate**: A function that takes a batch ID and returns true if the batch should be
-    ///  returned.
-    ///
-    /// Returns:
-    /// - A stream of [RecordBatch]s, each one corresponding to one full batch in the file.
-    #[allow(dead_code)]
-    pub(crate) fn batches_stream(
-        &self,
-        projection: Schema,
-        predicate: impl FnMut(&i32) -> bool + Send + Sync + 'static,
-    ) -> impl RecordBatchStream + '_ {
-        // Make projection an Arc so we can clone it and pass between threads.
-        let projection = Arc::new(projection);
-        let arrow_schema = ArrowSchema::from(projection.as_ref());
-
-        let batches = (0..self.num_batches() as i32).filter(predicate);
-        let this = Arc::new(self.clone());
-        let inner = stream::iter(batches)
-            .zip(stream::repeat_with(move || {
-                (this.clone(), projection.clone())
-            }))
-            .map(|(batch_id, (reader, projection))| async move {
-                reader
-                    .read_batch(batch_id, ReadBatchParams::RangeFull, &projection)
-                    .await
-            })
-            .buffered(2)
-            .boxed();
-        RecordBatchStreamAdapter::new(Arc::new(arrow_schema), inner)
-    }
-
     /// Read a batch of data from the file.
     ///
     /// The schema of the returned [RecordBatch] is set by [`FileReader::schema()`].
@@ -479,6 +444,42 @@ impl FileReader {
 
         Ok(concat_batches(&schema, &batches)?)
     }
+}
+
+/// Stream desired full batches from the file.
+///
+/// Parameters:
+/// - **projection**: The schema of the returning [RecordBatch].
+/// - **predicate**: A function that takes a batch ID and returns true if the batch should be
+///  returned.
+///
+/// Returns:
+/// - A stream of [RecordBatch]s, each one corresponding to one full batch in the file.
+pub(crate) fn batches_stream(
+    reader: FileReader,
+    projection: Schema,
+    predicate: impl FnMut(&i32) -> bool + Send + Sync + 'static,
+) -> impl RecordBatchStream + '_ {
+    // Make projection an Arc so we can clone it and pass between threads.
+    let projection = Arc::new(projection);
+    let arrow_schema = ArrowSchema::from(projection.as_ref());
+
+    let total_batches = reader.num_batches() as i32;
+    let batches = (0..total_batches).filter(predicate);
+    // Make another copy of self so we can clone it and pass between threads.
+    let this = Arc::new(reader.clone());
+    let inner = stream::iter(batches)
+        .zip(stream::repeat_with(move || {
+            (this.clone(), projection.clone())
+        }))
+        .map(|(batch_id, (reader, projection))| async move {
+            reader
+                .read_batch(batch_id, ReadBatchParams::RangeFull, &projection)
+                .await
+        })
+        .buffered(2)
+        .boxed();
+    RecordBatchStreamAdapter::new(Arc::new(arrow_schema), inner)
 }
 
 /// Read a batch.

@@ -53,7 +53,7 @@ impl<S> std::fmt::Debug for RecordBatchStreamAdapter<S> {
     }
 }
 
-impl<S> RecordBatchStream for RecordBatchStreamAdapter<S>
+impl<S> RecordBatchStream<'_> for RecordBatchStreamAdapter<S>
 where
     S: Stream<Item = Result<RecordBatch>> + Send + 'static,
 {
