@@ -18,23 +18,24 @@
 use std::ops::{Range, RangeTo};
 use std::sync::Arc;
 
-use arrow::array::PrimitiveBuilder;
-use arrow::datatypes::{Int32Type, Int64Type};
 use arrow_arith::arithmetic::subtract_scalar;
-use arrow_array::cast::as_primitive_array;
 use arrow_array::{
+    builder::PrimitiveBuilder,
+    cast::AsArray,
+    types::{Int32Type, Int64Type},
     ArrayRef, ArrowNativeTypeOp, ArrowNumericType, NullArray, OffsetSizeTrait, PrimitiveArray,
     RecordBatch, StructArray, UInt32Array, UInt64Array,
 };
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType, Field as ArrowField, FieldRef, Schema as ArrowSchema};
-use arrow_select::concat::{concat, concat_batches};
-use arrow_select::filter::filter_record_batch;
+use arrow_select::{
+    concat::{concat, concat_batches},
+    filter::filter_record_batch,
+};
 use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
-use futures::stream::{self, TryStreamExt};
-use futures::{Future, FutureExt, StreamExt};
+use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use prost::Message;
 use snafu::{location, Location};
@@ -46,10 +47,12 @@ use crate::arrow::*;
 use crate::dataset::ROW_ID;
 use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::error::{Error, Result};
-use crate::format::{pb, Index, Metadata, PageTable};
-use crate::format::{Fragment, Manifest};
-use crate::io::object_reader::{read_fixed_stride_array, read_struct, ObjectReader};
-use crate::io::{read_metadata_offset, read_struct_from_buf};
+use crate::format::{pb, Fragment, Index, Manifest, Metadata, PageTable};
+use crate::io::{
+    object_reader::{read_fixed_stride_array, read_struct, ObjectReader},
+    read_metadata_offset, read_struct_from_buf,
+    stream::{RecordBatchStream, RecordBatchStreamAdapter},
+};
 use crate::session::Session;
 use crate::{
     datatypes::{Field, Schema},
@@ -153,6 +156,7 @@ fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
 /// Lance File Reader.
 ///
 /// It reads arrow data from one data file.
+#[derive(Clone)]
 pub struct FileReader {
     object_reader: Arc<dyn ObjectReader>,
     metadata: Arc<Metadata>,
@@ -371,6 +375,41 @@ impl FileReader {
 
     pub fn is_empty(&self) -> bool {
         self.metadata.is_empty()
+    }
+
+    /// Stream desired full batches from the file.
+    ///
+    /// Parameters:
+    /// - **projection**: The schema of the returning [RecordBatch].
+    /// - **predicate**: A function that takes a batch ID and returns true if the batch should be
+    ///  returned.
+    ///
+    /// Returns:
+    /// - A stream of [RecordBatch]s, each one corresponding to one full batch in the file.
+    #[allow(dead_code)]
+    pub(crate) fn batches_stream(
+        &self,
+        projection: Schema,
+        predicate: impl FnMut(&i32) -> bool + Send + Sync + 'static,
+    ) -> impl RecordBatchStream + '_ {
+        // Make projection an Arc so we can clone it and pass between threads.
+        let projection = Arc::new(projection);
+        let arrow_schema = ArrowSchema::from(projection.as_ref());
+
+        let batches = (0..self.num_batches() as i32).filter(predicate);
+        let this = Arc::new(self.clone());
+        let inner = stream::iter(batches)
+            .zip(stream::repeat_with(move || {
+                (this.clone(), projection.clone())
+            }))
+            .map(|(batch_id, (reader, projection))| async move {
+                reader
+                    .read_batch(batch_id, ReadBatchParams::RangeFull, &projection)
+                    .await
+            })
+            .buffered(2)
+            .boxed();
+        RecordBatchStreamAdapter::new(Arc::new(arrow_schema), inner)
     }
 
     /// Read a batch of data from the file.
@@ -769,7 +808,7 @@ where
     )
     .await?;
 
-    let positions: &PrimitiveArray<T> = as_primitive_array(position_arr.as_ref());
+    let positions: &PrimitiveArray<T> = position_arr.as_primitive();
 
     // Recompute params so they align with the offset array
     let value_params = match params {
@@ -807,14 +846,14 @@ mod tests {
     use arrow::array::LargeListBuilder;
     use arrow_array::builder::StringDictionaryBuilder;
     use arrow_array::types::Int32Type;
-    use arrow_array::RecordBatchIterator;
     use arrow_array::{
         builder::{Int32Builder, ListBuilder, StringBuilder},
-        cast::{as_primitive_array, as_string_array, as_struct_array},
+        cast::{as_string_array, as_struct_array},
         types::UInt8Type,
         Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, NullArray,
         StringArray, StructArray, UInt32Array, UInt8Array,
     };
+    use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
     use rand::{distributions::Alphanumeric, Rng};
     use roaring::RoaringBitmap;
@@ -865,7 +904,7 @@ mod tests {
 
             assert_eq!(
                 &UInt64Array::from_iter_values(start_pos..start_pos + 10),
-                as_primitive_array(row_ids_col)
+                row_ids_col.as_primitive(),
             );
         }
     }
@@ -993,7 +1032,7 @@ mod tests {
 
             assert_eq!(
                 &UInt64Array::from_iter_values((start_pos..start_pos + 10).filter(|i| i % 2 == 1)),
-                as_primitive_array(row_ids_col)
+                row_ids_col.as_primitive(),
             );
         }
     }
@@ -1565,5 +1604,44 @@ mod tests {
         test_roundtrip_manifest(0, 100_000).await;
         test_roundtrip_manifest(1000, 100_000).await;
         test_roundtrip_manifest(1000, 1000).await;
+    }
+
+    #[tokio::test]
+    async fn test_batches_stream() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/batch_stream");
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, true)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut writer = FileWriter::try_new(&store, &path, schema.clone())
+            .await
+            .unwrap();
+        for i in 0..10 {
+            let batch = RecordBatch::try_new(
+                Arc::new(arrow_schema.clone()),
+                vec![Arc::new(Int32Array::from_iter_values(i * 10..(i + 1) * 10))],
+            )
+            .unwrap();
+            writer.write(&[batch]).await.unwrap();
+        }
+        writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let stream = reader.batches_stream(schema, |id| id % 2 == 0);
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(batches.len(), 5);
+        for (i, batch) in batches.iter().enumerate() {
+            assert_eq!(
+                batch,
+                &RecordBatch::try_new(
+                    Arc::new(arrow_schema.clone()),
+                    vec![Arc::new(Int32Array::from_iter_values(
+                        i as i32 * 2 * 10..(i as i32 * 2 + 1) * 10
+                    ))],
+                )
+                .unwrap()
+            )
+        }
     }
 }
