@@ -28,8 +28,10 @@ use arrow_array::{
 };
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType, Field as ArrowField, FieldRef, Schema as ArrowSchema};
-use arrow_select::concat::{concat, concat_batches};
-use arrow_select::filter::filter_record_batch;
+use arrow_select::{
+    concat::{concat, concat_batches},
+    filter::filter_record_batch,
+};
 use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
@@ -1624,8 +1626,22 @@ mod tests {
         writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let mut stream = reader.batches_stream(schema, |id| id % 2 == 0);
-        let batches = stream.buffered(2).try_collect::<Vec<_>>().await.unwrap();
-        println!("{:?}", batches);
+        let stream = reader.batches_stream(schema, |id| id % 2 == 0);
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(batches.len(), 5);
+        for i in 0..5 {
+            let actual = &batches[i];
+            assert_eq!(
+                actual,
+                &RecordBatch::try_new(
+                    Arc::new(arrow_schema.clone()),
+                    vec![Arc::new(Int32Array::from_iter_values(
+                        i as i32 * 2 * 10..(i as i32 * 2 + 1) * 10
+                    ))],
+                )
+                .unwrap()
+            )
+        }
     }
 }
