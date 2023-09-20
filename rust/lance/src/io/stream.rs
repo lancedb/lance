@@ -17,37 +17,62 @@ use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use futures::{stream::BoxStream, Stream, StreamExt};
+use futures::Stream;
+use pin_project::pin_project;
 
 use crate::Result;
 
 /// RecordBatch Stream trait.
-pub trait RecordBatchStream<'a>: Stream<Item = Result<RecordBatch>> + Send + 'a {
+pub trait RecordBatchStream: Stream<Item = Result<RecordBatch>> + Send + 'static {
     /// Returns the schema of the stream.
     fn schema(&self) -> SchemaRef;
 }
 
-pub struct BoxedRecordBatchStream<'a> {
-    inner: BoxStream<'a, Result<RecordBatch>>,
+/// Combines a [`Stream`] with a [`SchemaRef`] implementing
+/// [`RecordBatchStream`] for the combination
+#[pin_project]
+pub struct RecordBatchStreamAdapter<S> {
     schema: SchemaRef,
+
+    #[pin]
+    stream: S,
 }
 
-impl<'a> BoxedRecordBatchStream<'a> {
-    pub fn new(inner: BoxStream<'a, Result<RecordBatch>>, schema: SchemaRef) -> Self {
-        Self { inner, schema }
+impl<S> RecordBatchStreamAdapter<S> {
+    /// Creates a new [`RecordBatchStreamAdapter`] from the provided schema and stream
+    pub fn new(schema: SchemaRef, stream: S) -> Self {
+        Self { schema, stream }
     }
 }
 
-impl<'a> RecordBatchStream<'a> for BoxedRecordBatchStream<'a> {
+impl<S> std::fmt::Debug for RecordBatchStreamAdapter<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordBatchStreamAdapter")
+            .field("schema", &self.schema)
+            .finish()
+    }
+}
+
+impl<S> RecordBatchStream for RecordBatchStreamAdapter<S>
+where
+    S: Stream<Item = Result<RecordBatch>> + Send + 'static,
+{
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 }
 
-impl Stream for BoxedRecordBatchStream<'_> {
+impl<S> Stream for RecordBatchStreamAdapter<S>
+where
+    S: Stream<Item = Result<RecordBatch>>,
+{
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).inner.poll_next_unpin(cx)
+        self.project().stream.poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
     }
 }

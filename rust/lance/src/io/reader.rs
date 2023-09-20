@@ -48,9 +48,11 @@ use crate::dataset::ROW_ID;
 use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::error::{Error, Result};
 use crate::format::{pb, Fragment, Index, Manifest, Metadata, PageTable};
-use crate::io::object_reader::{read_fixed_stride_array, read_struct, ObjectReader};
-use crate::io::stream::BoxedRecordBatchStream;
-use crate::io::{read_metadata_offset, read_struct_from_buf, RecordBatchStream};
+use crate::io::{
+    object_reader::{read_fixed_stride_array, read_struct, ObjectReader},
+    read_metadata_offset, read_struct_from_buf,
+    stream::{RecordBatchStream, RecordBatchStreamAdapter},
+};
 use crate::session::Session;
 use crate::{
     datatypes::{Field, Schema},
@@ -383,32 +385,31 @@ impl FileReader {
     ///  returned.
     ///
     /// Returns:
-    /// - A stream of [RecordBatch]s.
+    /// - A stream of [RecordBatch]s, each one corresponding to one full batch in the file.
     #[allow(dead_code)]
-    pub(crate) fn batches_stream<'a>(
-        &'a self,
+    pub(crate) fn batches_stream(
+        &self,
         projection: Schema,
-        predicate: impl FnMut(&i32) -> bool + Send + Sync + 'a,
-    ) -> impl RecordBatchStream + 'a {
+        predicate: impl FnMut(&i32) -> bool + Send + Sync + 'static,
+    ) -> impl RecordBatchStream + '_ {
         // Make projection an Arc so we can clone it and pass between threads.
         let projection = Arc::new(projection);
-        let batches = (0..self.num_batches() as i32)
-            .filter(predicate)
-            .collect::<Vec<_>>();
-        let this = self;
-        let proj = projection.clone();
-        let inner = stream::iter(batches)
-            .zip(stream::repeat_with(move || proj.clone()))
-            .map(move |(batch_id, proj)| async move {
-                let proj = proj.clone();
+        let arrow_schema = ArrowSchema::from(projection.as_ref());
 
-                this.read_batch(batch_id, ReadBatchParams::RangeFull, &proj)
+        let batches = (0..self.num_batches() as i32).filter(predicate);
+        let this = Arc::new(self.clone());
+        let inner = stream::iter(batches)
+            .zip(stream::repeat_with(move || {
+                (this.clone(), projection.clone())
+            }))
+            .map(|(batch_id, (reader, projection))| async move {
+                reader
+                    .read_batch(batch_id, ReadBatchParams::RangeFull, &projection)
                     .await
             })
             .buffered(2)
             .boxed();
-        let arrow_schema = ArrowSchema::from(projection.as_ref());
-        BoxedRecordBatchStream::new(inner, Arc::new(arrow_schema))
+        RecordBatchStreamAdapter::new(Arc::new(arrow_schema), inner)
     }
 
     /// Read a batch of data from the file.

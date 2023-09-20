@@ -52,7 +52,7 @@ impl KNNFlatStream {
         Self::from_stream(stream, query)
     }
 
-    fn from_stream(stream: impl RecordBatchStream<'static>, query: &Query) -> Self {
+    fn from_stream(stream: impl RecordBatchStream, query: &Query) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
         let q = query.clone();
