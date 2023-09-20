@@ -7,7 +7,7 @@ inherits = "release"
 debug = true
 # Prioritize compile time over runtime performance
 codegen-units = 16
-lto = "off"
+lto = "thin"
 
 [target.'cfg(all())']
 rustflags = [
