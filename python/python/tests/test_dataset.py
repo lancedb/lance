@@ -679,6 +679,38 @@ def test_scan_with_batch_size(tmp_path: Path):
         assert df["a"].iloc[0] == idx * 16
 
 
+def test_scan_prefilter(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    vecs = pa.array(
+        [[1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6]], type=pa.list_(pa.float32(), 2)
+    )
+    df = pa.Table.from_pydict(
+        {
+            "index": [1, 2, 3, 4, 5, 6],
+            "type": ["a", "a", "a", "b", "b", "b"],
+            "vecs": vecs,
+        }
+    )
+    dataset = lance.write_dataset(df, base_dir)
+    query = pa.array([1, 1], pa.float32())
+    args = {
+        "columns": ["index"],
+        "filter": "type = 'b'",
+        "nearest": {"column": "vecs", "q": pa.array(query), "k": 2, "use_index": False},
+    }
+
+    # With post-filter no results are returned because all
+    # the closest results don't match the filter
+    assert dataset.scanner(**args).to_table().num_rows == 0
+
+    args["prefilter"] = True
+    table = dataset.scanner(**args).to_table()
+
+    expected = pa.Table.from_pydict({"index": [4, 5]})
+
+    assert table.column("index") == expected.column("index")
+
+
 def test_scan_count_rows(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     df = pd.DataFrame({"a": range(42), "b": range(42)})

@@ -117,6 +117,8 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_readahead: Optional[int] = None,
         scan_in_order: bool = True,
         fragments: Optional[Iterable[LanceFragment]] = None,
+        *,
+        prefilter: bool = False,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -158,7 +160,18 @@ class LanceDataset(pa.dataset.Dataset):
         fragments: iterable of LanceFragment, default None
             If specified, only scan these fragments. If scan_in_order is True, then
             the fragments will be scanned in the order given.
+        prefilter: bool, default False
+            If True then the filter will be applied before the vector query is run.
+            This will generate more correct results but it may be a more costly
+            query.  It's generally good when the filter is highly selective.
+            Right now, this must be used with ``use_index=False`` in the
+            ``nearest`` parameters.
 
+            If False then the filter will be applied after the vector query is run.
+            This will perform well but the results may have fewer than the requested
+            number of rows (or be empty) if the rows closest to the query do not
+            match the filter.  It's generally good when the filter is not very
+            selective.
         Notes
         -----
 
@@ -184,6 +197,7 @@ class LanceDataset(pa.dataset.Dataset):
             ScannerBuilder(self)
             .columns(columns)
             .filter(filter)
+            .prefilter(prefilter)
             .limit(limit)
             .offset(offset)
             .nearest(**(nearest or {}))
@@ -875,6 +889,7 @@ class ScannerBuilder:
         self.ds = ds
         self._limit = 0
         self._filter = None
+        self._prefilter = None
         self._offset = None
         self._columns = None
         self._nearest = None
@@ -934,6 +949,10 @@ class ScannerBuilder:
         if isinstance(filter, pa.compute.Expression):
             filter = str(filter)
         self._filter = filter
+        return self
+
+    def prefilter(self, prefilter: bool) -> ScannerBuilder:
+        self._prefilter = prefilter
         return self
 
     def with_fragments(
@@ -996,6 +1015,7 @@ class ScannerBuilder:
         scanner = self.ds._ds.scanner(
             self._columns,
             self._filter,
+            self._prefilter,
             self._limit,
             self._offset,
             self._nearest,
