@@ -29,12 +29,10 @@ import pandas as pd
 import pandas.testing as tm
 import polars as pl
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
 from lance.commit import CommitConflictError
-from lance.lance import Compaction
 
 # Various valid inputs for write_dataset
 input_schema = pa.schema([pa.field("a", pa.float64()), pa.field("b", pa.int64())])
@@ -814,83 +812,3 @@ def test_metadata(tmp_path: Path):
 
     data = data.replace_schema_metadata({"foo": base64.b64encode(pickle.dumps("foo"))})
     lance.write_dataset(data, tmp_path)
-
-
-def test_dataset_optimize(tmp_path: Path):
-    base_dir = tmp_path / "dataset"
-    ndim = 128
-    vec = pc.random(1000 * ndim).cast("float32")
-    vec = pa.FixedSizeListArray.from_arrays(vec, ndim)
-    data = pa.table({"a": range(1000), "b": range(1000), "vector": vec})
-
-    # One fragment with 1k rows
-    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1000)
-    # 10 fragments with 100 rows each
-    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=100, mode="append")
-    # One fragment with 1k rows
-    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1000, mode="append")
-
-    fragment_ids = [f.fragment_id for f in dataset.get_fragments()]
-    assert fragment_ids == list(range(12))
-
-    assert dataset.version == 3
-
-    metrics = dataset.optimize.compact_files(
-        target_rows_per_fragment=1000,
-        materialize_deletions=False,
-        num_threads=1,
-    )
-
-    assert metrics.fragments_removed == 10
-    assert metrics.fragments_added == 1
-    assert metrics.files_removed == 10
-    assert metrics.files_added == 1
-
-    assert dataset.version == 4
-
-    fragment_ids = [f.fragment_id for f in dataset.get_fragments()]
-    # Note that fragment_ids are out of order. Fragments 1 - 10 are replaced
-    # by a new compacted fragment, fragment 12.
-    assert fragment_ids == [0, 12, 11]
-
-    # Make sure we can query successfully.
-    dataset.to_table(nearest=dict(column="vector", q=[0] * ndim))
-
-
-def test_dataset_distributed_optimize(tmp_path: Path):
-    base_dir = tmp_path / "dataset"
-    data = pa.table({"a": range(800), "b": range(800)})
-
-    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=200)
-    fragments = dataset.get_fragments()
-    assert len(fragments) == 4
-
-    plan = Compaction.plan(
-        dataset, options=dict(target_rows_per_fragment=400, num_threads=None)
-    )
-    assert plan.read_version == 1
-    assert plan.num_tasks() == 2
-    assert plan.tasks[0].fragments == [frag.metadata for frag in fragments[0:2]]
-    assert plan.tasks[1].fragments == [frag.metadata for frag in fragments[2:4]]
-    assert repr(plan) == "CompactionPlan(read_version=1, tasks=<2 compaction tasks>)"
-
-    pickled_task = pickle.dumps(plan.tasks[0])
-    task = pickle.loads(pickled_task)
-    assert task == plan.tasks[0]
-
-    result1 = plan.tasks[0].execute(dataset)
-    result1.metrics.fragments_removed == 2
-    result1.metrics.fragments_added == 1
-
-    pickled_result = pickle.dumps(result1)
-    result = pickle.loads(pickled_result)
-    assert result == result1
-    assert re.match(
-        r"RewriteResult\(read_version=1, new_fragments=\[.+\], old_fragments=\[.+\]\)",
-        repr(result),
-    )
-
-    metrics = Compaction.commit(dataset, [result1])
-    assert metrics.fragments_removed == 2
-    assert metrics.fragments_added == 1
-    assert dataset.version == 2

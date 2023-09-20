@@ -131,6 +131,65 @@ impl PyCompactionPlan {
     pub fn tasks(&self) -> Vec<PyCompactionTask> {
         self.0.compaction_tasks().map(PyCompactionTask).collect()
     }
+
+    /// Get a JSON representation of the plan.
+    ///
+    /// Returns
+    /// -------
+    /// str
+    ///
+    /// Warning
+    /// -------
+    /// The JSON representation is not guaranteed to be stable across versions.
+    pub fn json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.0).map_err(|err| {
+            PyValueError::new_err(format!(
+                "Could not dump CompactionPlan due to error: {}",
+                err
+            ))
+        })
+    }
+
+    /// Load a plan from a JSON representation.
+    ///
+    /// Parameters
+    /// ----------
+    /// json : str
+    ///     The JSON representation of the plan.
+    ///
+    /// Returns
+    /// -------
+    /// CompactionPlan
+    #[staticmethod]
+    pub fn from_json(json: String) -> PyResult<Self> {
+        let task = serde_json::from_str(&json).map_err(|err| {
+            PyValueError::new_err(format!(
+                "Could not load CompactionPlan due to error: {}",
+                err
+            ))
+        })?;
+        Ok(Self(task))
+    }
+
+    pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
+        let state = self.json()?;
+        let state = PyTuple::new(py, vec![state]).extract()?;
+        let from_json = PyModule::import(py, "lance.optimize")?
+            .getattr("CompactionPlan")?
+            .getattr("from_json")?
+            .extract()?;
+        Ok((from_json, state))
+    }
+
+    pub fn __richcmp__(&self, other: PyRef<'_, Self>, op: CompareOp) -> PyResult<bool> {
+        match op {
+            CompareOp::Eq => Ok(self.0 == other.0),
+            CompareOp::Ne => Ok(self.0 != other.0),
+            _ => Err(PyNotImplementedError::new_err(
+                "Only == and != are supported for CompactionTask",
+            )),
+        }
+    }
 }
 
 #[pyclass(name = "CompactionTask", module = "lance.optimize")]

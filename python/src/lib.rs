@@ -27,7 +27,9 @@ use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::ArrowError;
-use dataset::optimize::{PyCompaction, PyCompactionMetrics, PyCompactionTask, PyRewriteResult};
+use dataset::optimize::{
+    PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
+};
 use env_logger::Env;
 use futures::StreamExt;
 use pyo3::exceptions::{PyIOError, PyValueError};
@@ -80,6 +82,7 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<KMeans>()?;
     m.add_class::<PyCompactionTask>()?;
     m.add_class::<PyCompaction>()?;
+    m.add_class::<PyCompactionPlan>()?;
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;

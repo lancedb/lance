@@ -17,6 +17,7 @@ from typing import Optional, TypedDict
 # Re-exported from native module. See src/dataset/optimize.rs for implementation.
 from .lance import Compaction as Compaction
 from .lance import CompactionMetrics as CompactionMetrics
+from .lance import CompactionPlan as CompactionPlan
 from .lance import CompactionTask as CompactionTask
 from .lance import RewriteResult as RewriteResult
 
