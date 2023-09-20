@@ -142,7 +142,7 @@ def test_roundtrip_take_ext_types(tmp_path: Path):
     ]
 
 
-def test_image_arrays():
+def test_image_arrays(tmp_path: Path):
     import os
     from pathlib import Path
 
@@ -193,3 +193,17 @@ def test_image_arrays():
     encoded_image_array = ImageURIArray.from_uris(uris).read_uris()
     with pytest.raises(ValueError, match="all input arrays must have the same shape"):
         encoded_image_array.image_to_tensor()
+
+    uri_array = ImageURIArray.from_uris(png_uris)
+    encoded_image_array = uri_array.read_uris()
+    tensor_image_array = encoded_image_array.image_to_tensor()
+
+    # TODO: add tensor_image_array once it can be serialized
+    arrays = [uri_array, encoded_image_array, encoded_image_array]  # tensor_image_array
+    tbl = pa.Table.from_arrays(
+        arrays, ["uri_array", "encoded_image_array", "tensor_image_array"]
+    )
+
+    lance.write_dataset(tbl, tmp_path)
+    tbl2 = lance.dataset(tmp_path)
+    assert tbl2.to_table().to_pylist() == tbl.to_pylist()

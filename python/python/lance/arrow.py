@@ -12,7 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 from pathlib import Path
-from typing import Iterable, Optional, Union
+from typing import Callable, Iterable, Optional, Union
 
 import pyarrow as pa
 
@@ -20,7 +20,6 @@ from .lance import BFloat16
 from .lance import bfloat16_array as bfloat16_array
 
 
-# TODO: add VariableShapeImageTensorType once pa.VariableShapeTensorArray is available
 class ImageURIType(pa.ExtensionType):
     def __init__(self):
         pa.ExtensionType.__init__(self, pa.string(), "lance.arrow.image_uri")
@@ -81,6 +80,11 @@ class FixedShapeImageTensorType(pa.ExtensionType):
 
 
 class ImageURIArray(pa.ExtensionArray):
+    """
+    Array of image URIs. URIs may represent local files or remote files in
+    S3 or GCS if they are accessible by the machine executing this.
+    """
+
     def __repr__(self):
         return "<lance.arrow.ImageURIArray object at 0x%016x>\n%s" % (
             id(self),
@@ -110,7 +114,7 @@ class ImageURIArray(pa.ExtensionArray):
         """
         from urllib.parse import urlparse
 
-        if isinstance(uris, Iterable):
+        if not isinstance(uris, pa.StringArray):
             uris = pa.array((str(uri) for uri in uris), type=pa.string())
         else:
             raise TypeError("Cannot build a ImageURIArray from {}".format(type(uris)))
@@ -155,13 +159,23 @@ class ImageURIArray(pa.ExtensionArray):
 
 
 class EncodedImageArray(pa.ExtensionArray):
+    """
+    Array of encoded images. Images may be encoded in any format. Format is not stored
+    by the array but can typically be inferred from the image bytes. Alternatively a
+    separate record of encoding can be kept in a separate array outside this library.
+    """
+
+    import numpy as np
+
     def __repr__(self):
         return "<lance.arrow.EncodedImageArray object at 0x%016x>\n%s" % (
             id(self),
             repr(self.to_pylist()),
         )
 
-    def image_to_tensor(self, decoder: Optional[Callable[[pa.BinaryArray], np.ndarray]]=None):
+    def image_to_tensor(
+        self, decoder: Optional[Callable[[pa.BinaryArray], np.ndarray]] = None
+    ):
         """
         Decode encoded images and return a FixedShapeImageTensorArray
 
@@ -170,7 +184,7 @@ class EncodedImageArray(pa.ExtensionArray):
         decoder : Callable[pa.binary()], optional
             A function that takes a pa.binary() and returns a numpy.ndarray
             or pa.fixed_size_tensor. If not provided, will attempt to use
-            tensorflow or pillow decoder.
+            tensorflow and then pillow decoder in that order.
 
         Returns
         -------
@@ -222,16 +236,25 @@ class EncodedImageArray(pa.ExtensionArray):
                 )
 
         image_array = decoder(self.storage)
-        arrow_type = pa.from_numpy_dtype(image_array.dtype)
         shape = image_array.shape[1:]
-        tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(image_array)
+        if isinstance(image_array, pa.FixedShapeTensorType):
+            tensor_array = image_array
+            arrow_type = image_array.storage_type
+        else:
+            arrow_type = pa.from_numpy_dtype(image_array.dtype)
+            tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(image_array)
 
         return FixedShapeImageTensorArray.from_storage(
             FixedShapeImageTensorType(arrow_type, shape), tensor_array
         )
 
 
+# TODO: add VariableShapeImageTensorType once pa.VariableShapeTensorArray is available
 class FixedShapeImageTensorArray(pa.ExtensionArray):
+    """
+    Array of fixed shape tensors representing image pixels.
+    """
+
     def __repr__(self):
         return "<lance.arrow.FixedShapeImageTensorArray object at 0x%016x>\n%s" % (
             id(self),
