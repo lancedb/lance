@@ -144,6 +144,7 @@ def test_roundtrip_take_ext_types(tmp_path: Path):
 
 def test_image_arrays():
     import os
+    from pathlib import Path
 
     import tensorflow as tf
 
@@ -152,6 +153,9 @@ def test_image_arrays():
         "file://" + os.path.join(os.path.dirname(__file__), "images/1.png"),
         os.path.join(os.path.dirname(__file__), "images/1.png"),
     ] * 5
+
+    if os.name == "nt":
+        png_uris = [str(Path(x)) for x in png_uris]
 
     uri_array = ImageURIArray.from_uris(png_uris)
     encoded_image_array = uri_array.read_uris()
@@ -170,6 +174,18 @@ def test_image_arrays():
     tensor_image_array.to_encoded().image_to_tensor()
     assert tensor_image_array.to_encoded().image_to_tensor() == tensor_image_array
 
+    def png_encoder(images):
+        import tensorflow as tf
+
+        encoded_images = (
+            tf.io.encode_png(x).numpy() for x in tf.convert_to_tensor(images)
+        )
+        return pa.array(encoded_images, type=pa.binary())
+
+    assert (
+        tensor_image_array.to_encoded(png_encoder).image_to_tensor()
+        == tensor_image_array
+    )
     uris = [
         os.path.join(os.path.dirname(__file__), "images/1.png"),
         os.path.join(os.path.dirname(__file__), "images/2.jpeg"),
