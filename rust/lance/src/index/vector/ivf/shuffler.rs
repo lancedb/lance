@@ -19,7 +19,7 @@ use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use futures::Stream;
+use futures::{stream, stream::BoxStream, Stream, StreamExt};
 use object_store::path::Path;
 use tempfile::TempDir;
 
@@ -81,8 +81,8 @@ impl ShufflerBuilder {
         let batches = self.buffer.entry(key).or_default();
         batches.push(batch);
         let total = batches.iter().map(|b| b.num_rows()).sum::<usize>();
-        /// If there are more than `flush_size` rows in the buffer, flush them to disk
-        /// as one group.
+        // If there are more than `flush_size` rows in the buffer, flush them to disk
+        // as one group.
         if total > self.flush_size {
             self.parted_groups
                 .entry(key)
@@ -113,7 +113,7 @@ pub struct Shuffler<'a> {
     /// Partition ID to file-group ID mapping, in memory.
     /// No external dependency is required, because we don't need to guarantee the
     /// persistence of this mapping, as well as the temp files.
-    parted_groups: &'a BTreeMap<u32, Vec<u32>>,
+    parted_groups: BTreeMap<u32, Vec<u32>>,
 
     /// We need to keep the temp_dir with Shuffler because ObjectStore crate does not
     /// work with a NamedTempFile.
@@ -121,11 +121,15 @@ pub struct Shuffler<'a> {
 }
 
 impl<'a> Shuffler<'a> {
-    fn new(parted_groups: &'a BTreeMap<u32, Vec<u32>>, temp_dir: &'a TempDir) -> Self {
+    fn new(parted_groups: &BTreeMap<u32, Vec<u32>>, temp_dir: &'a TempDir) -> Self {
         Self {
-            parted_groups,
+            parted_groups: parted_groups.clone(),
             temp_dir,
         }
+    }
+
+    pub fn keys(&self) -> Vec<u32> {
+        self.parted_groups.keys().copied().collect()
     }
 
     /// Iterate over the shuffled [RecordBatch]s for a given partition key.
@@ -137,16 +141,24 @@ impl<'a> Shuffler<'a> {
     }
 }
 
+fn file_read_stream(reader: FileReader, batch_ids: &[u32]) -> impl Stream {
+    stream::iter(batch_ids)
+        .then(move |batch_id| reader.read_batch(batch_id as i32, None, None))
+        .map_ok(|batch| batch.into())
+        .boxed()
+}
+
 pub(crate) struct PartitionStream<'a> {
-    reader: FileReader,
+    inner: BoxStream<'a, Result<RecordBatch>>,
     partition_id: u32,
     parted_groups: &'a BTreeMap<u32, Vec<u32>>,
 }
 
 impl<'a> PartitionStream<'a> {
     fn new(reader: FileReader, parted_groups: &'a BTreeMap<u32, Vec<u32>>, part_id: u32) -> Self {
+        let inner = file_read_stream(reader, &parted_groups[&part_id]);
         Self {
-            reader,
+            inner,
             partition_id: part_id,
             parted_groups,
         }
@@ -157,7 +169,7 @@ impl Stream for PartitionStream<'_> {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        todo!()
+        Pin::into_inner(self).inner.poll_next_unpin(cx)
     }
 }
 
