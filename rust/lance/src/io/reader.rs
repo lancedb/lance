@@ -18,11 +18,11 @@
 use std::ops::{Range, RangeTo};
 use std::sync::Arc;
 
-use arrow::array::PrimitiveBuilder;
-use arrow::datatypes::{Int32Type, Int64Type};
 use arrow_arith::arithmetic::subtract_scalar;
-use arrow_array::cast::as_primitive_array;
 use arrow_array::{
+    builder::PrimitiveBuilder,
+    cast::AsArray,
+    types::{Int32Type, Int64Type},
     ArrayRef, ArrowNativeTypeOp, ArrowNumericType, NullArray, OffsetSizeTrait, PrimitiveArray,
     RecordBatch, StructArray, UInt32Array, UInt64Array,
 };
@@ -33,8 +33,7 @@ use arrow_select::filter::filter_record_batch;
 use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
-use futures::stream::{self, TryStreamExt};
-use futures::{Future, FutureExt, StreamExt};
+use futures::{stream, Future, FutureExt, Stream, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use prost::Message;
 use snafu::{location, Location};
@@ -46,8 +45,7 @@ use crate::arrow::*;
 use crate::dataset::ROW_ID;
 use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::error::{Error, Result};
-use crate::format::{pb, Index, Metadata, PageTable};
-use crate::format::{Fragment, Manifest};
+use crate::format::{pb, Fragment, Index, Manifest, Metadata, PageTable};
 use crate::io::object_reader::{read_fixed_stride_array, read_struct, ObjectReader};
 use crate::io::{read_metadata_offset, read_struct_from_buf};
 use crate::session::Session;
@@ -371,6 +369,29 @@ impl FileReader {
 
     pub fn is_empty(&self) -> bool {
         self.metadata.is_empty()
+    }
+
+    /// Stream desired full batches from the file.
+    #[allow(dead_code)]
+    pub(crate) fn batches_stream<'a>(
+        &'a self,
+        predicate: impl FnMut(&i32) -> bool + Send + Sync + 'a,
+    ) -> impl Stream<Item = Result<impl Future<Output = Result<RecordBatch>> + 'a>> + 'a {
+        let reader = Arc::new(self.clone());
+        // let pred = Arc::new(predicate);
+        let batches = (0..self.num_batches() as i32)
+            .filter(predicate)
+            .collect::<Vec<_>>();
+        stream::iter(batches)
+            .map(move |batch_id| {
+                let reader = reader.clone();
+                Ok(async move {
+                    reader
+                        .read_batch(batch_id, ReadBatchParams::RangeFull, reader.schema())
+                        .await
+                })
+            })
+            .boxed()
     }
 
     /// Read a batch of data from the file.
@@ -769,7 +790,7 @@ where
     )
     .await?;
 
-    let positions: &PrimitiveArray<T> = as_primitive_array(position_arr.as_ref());
+    let positions: &PrimitiveArray<T> = position_arr.as_primitive();
 
     // Recompute params so they align with the offset array
     let value_params = match params {
@@ -810,7 +831,7 @@ mod tests {
     use arrow_array::RecordBatchIterator;
     use arrow_array::{
         builder::{Int32Builder, ListBuilder, StringBuilder},
-        cast::{as_primitive_array, as_string_array, as_struct_array},
+        cast::{as_string_array, as_struct_array},
         types::UInt8Type,
         Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, NullArray,
         StringArray, StructArray, UInt32Array, UInt8Array,
@@ -865,7 +886,7 @@ mod tests {
 
             assert_eq!(
                 &UInt64Array::from_iter_values(start_pos..start_pos + 10),
-                as_primitive_array(row_ids_col)
+                row_ids_col.as_primitive(),
             );
         }
     }
@@ -993,7 +1014,7 @@ mod tests {
 
             assert_eq!(
                 &UInt64Array::from_iter_values((start_pos..start_pos + 10).filter(|i| i % 2 == 1)),
-                as_primitive_array(row_ids_col)
+                row_ids_col.as_primitive(),
             );
         }
     }
