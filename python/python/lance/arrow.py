@@ -161,7 +161,7 @@ class EncodedImageArray(pa.ExtensionArray):
             repr(self.to_pylist()),
         )
 
-    def image_to_tensor(self, decoder=None):
+    def image_to_tensor(self, decoder: Optional[Callable[[pa.BinaryArray], np.ndarray]]=None):
         """
         Decode encoded images and return a FixedShapeImageTensorArray
 
