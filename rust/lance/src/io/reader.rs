@@ -456,7 +456,7 @@ impl FileReader {
 ///
 /// Returns:
 /// - A stream of [RecordBatch]s, each one corresponding to one full batch in the file.
-pub(crate) fn batches_stream(
+pub fn batches_stream(
     reader: FileReader,
     projection: Schema,
     predicate: impl FnMut(&i32) -> bool + Send + Sync + 'static,
