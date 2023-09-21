@@ -46,7 +46,7 @@ make lint
 
 ## Benchmarks
 
-The benchmarks in `python/benchmarks` can be used to identify and diagnose 
+The benchmarks in `python/benchmarks` can be used to identify and diagnose
 performance issues. They are run with [pytest-benchmark](https://pytest-benchmark.readthedocs.io/en/latest/).
 These benchmarks aren't mean to showcase performance on full-scale real world
 datasets; rather they are meant to be useful for developers to iterate on
@@ -74,7 +74,7 @@ they are re-used between benchmark runs.
 
 ### Run a particular benchmark
 
-To filter benchmarks by name, use the usual pytest `-k` flag (this can be a 
+To filter benchmarks by name, use the usual pytest `-k` flag (this can be a
 substring match, so you don't need to type the full name):
 
 ```shell
@@ -121,3 +121,77 @@ COMPARE_ID=$(ls .benchmarks/*/ | tail -1 | cut -c1-4)
 maturin develop --profile release-with-debug
 pytest --benchmark-compare=$COMPARE_ID python/benchmarks
 ```
+
+## Tracing
+
+Rust has great integration with tools like criterion and pprof which make it easy
+to profile and debug CPU intensive tasks.  However, these tools are not as effective
+at profiling I/O intensive work or providing a high level trace of an operation.
+
+To fill this gap the lance code utlizies the Rust tracing crate to provide tracing
+information for lance operations.  User applications can receive these events and
+forward them on for logging purposes.  Developers can also use this information to
+get a sense of the I/O that happens during an operation.
+
+### Instrumenting code
+
+When instrumenting code you can use the `#[instrument]` macro from the Rust tracing
+crate.  See the crate docs for more information on the various parameters that can
+be set.  As a general guideline we should aim to instrument the following methods:
+
+* Top-level methods that will often be called by external libraries and could be slow
+* Compute intensive methods that will perform a significant amount of CPU compute
+* Any point where we are waiting on external resources (e.g. disk)
+
+To begin with, instrument methods as close to the user as possible and refine downwards
+as you need.  For example, start by instrumenting the entire dataset write operation
+and then instrument any individual parts of the operation that you would like to see
+details for.
+
+### Tracing a unit test
+
+If you would like tracing information for a rust unit test then you will need to
+decorate your test with the lance_test_macros::test attribute.  This will wrap any
+existing test attributes that you are using:
+
+```rust
+#[lance_test_macros::test(tokio::test)]
+async fn test() {
+    ...
+}
+```
+
+Then, when running your test, you will need to set the environment variable
+LANCE_TRACING to the your desired verbosity level (trace, debug, info, warn, error):
+
+```bash
+LANCE_TESTING=debug cargo test dataset::tests::test_create_dataset
+```
+
+This will create a .json file (named with a timestamp) in your working directory.  This
+.json file can be loaded by chrome or by <https://ui.perfetto.dev>
+
+### Tracing a python script
+
+If you would like to trace a python script (application, benchmark, test) then you can easily
+do so using the lance.tracing module.  Simply call:
+
+```python
+from lance.tracing import trace_to_chrome
+
+trace_to_chrome()
+
+# rest of script
+```
+
+A single .json trace file will be generated after python has exited.
+
+### Trace visualization limitations
+
+The current tracing implementation is slightly flawed when it comes to async
+operations that run in parallel.  The rust tracing-chrome library emits
+trace events into the chrome trace events JSON format.  This format is not
+sophisticated enough to represent asynchronous parallel work.
+
+As a result, a single instrumented async method may appear as many different
+spans in the UI.
