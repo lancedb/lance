@@ -140,7 +140,7 @@ message IndexMetadata {
   /// This may by used to determine how much of the dataset is covered by the
   /// index. This information can be retrieved from the dataset by looking at
   /// the dataset at `dataset_version`. However, since the old version may be
-  /// deletedd while the index is still in use, this information is also stored
+  /// deleted while the index is still in use, this information is also stored
   /// in the index.
   /// 
   /// The bitmap is stored as a 32-bit Roaring bitmap.
