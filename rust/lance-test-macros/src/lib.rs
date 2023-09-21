@@ -112,7 +112,7 @@ fn expand_wrapper(wrapped_attr: Tokens, wrappee: ItemFn) -> Tokens {
 ///
 /// Example:
 ///
-/// ```
+/// ```rust,ignore
 /// #[lance_test_macros::test(tokio::test)]
 /// async fn test_something() {
 ///  ...
@@ -124,7 +124,9 @@ fn expand_wrapper(wrapped_attr: Tokens, wrappee: ItemFn) -> Tokens {
 ///
 /// Example:
 ///
+/// ```bash
 /// LANCE_TRACING=debug cargo test dataset::tests::test_create_dataset
+/// ```
 ///
 /// A .json file will be generated in the current directory that can be loaded into
 /// chrome://tracing or the perfetto UI.
