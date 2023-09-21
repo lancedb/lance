@@ -138,7 +138,10 @@ impl<'a> Shuffler<'a> {
 
     /// Iterate over the shuffled [RecordBatch]s for a given partition key.
     #[allow(dead_code)]
-    pub async fn key_iter(&self, key: u32) -> Result<impl RecordBatchStream + '_> {
+    pub async fn key_iter(&self, key: u32) -> Result<Option<impl RecordBatchStream + '_>> {
+        if !self.parted_groups.contains_key(&key) {
+            return Ok(None);
+        }
         let file_path = lance_buffer_path(self.temp_dir)?;
         let (object_store, _) = ObjectStore::from_uri("file://").await?;
         let reader = FileReader::try_new(&object_store, &file_path).await?;
@@ -147,12 +150,12 @@ impl<'a> Shuffler<'a> {
         let group_ids = self
             .parted_groups
             .get(&key)
-            .unwrap_or(&vec![])
+            .unwrap() // Checked existence already.
             .iter()
             .copied()
             .collect::<HashSet<_>>();
         let stream = batches_stream(reader, schema, move |id| group_ids.contains(&(*id as u32)));
-        Ok(stream)
+        Ok(Some(stream))
     }
 }
 
@@ -186,9 +189,11 @@ mod tests {
         let reader = shuffler.finish().await.unwrap();
         assert_eq!(reader.keys(), vec![0, 1, 2]);
         for i in 0..3 {
-            let stream = reader.key_iter(i).await.unwrap();
+            let stream = reader.key_iter(i).await.unwrap().expect("key exists");
             let batches = stream.try_collect::<Vec<_>>().await.unwrap();
             assert_eq!(batches.len(), 2, "key {} has {} batches", i, batches.len());
         }
+
+        assert!(reader.key_iter(5).await.unwrap().is_none())
     }
 }
