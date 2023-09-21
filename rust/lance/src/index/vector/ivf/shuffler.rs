@@ -32,7 +32,18 @@ const BUFFER_FILE_NAME: &str = "buffer.lance";
 
 /// Shuffle [RecordBatch] based on their IVF partition.
 ///
+/// Internally, we shuffle several partitions of [RecordBatch]s into a single LanceFile,
+/// and keep tracks of the partition ID to file-group ID mapping in memory.
 ///
+/// The IVF partition / group id mapping then be passed to [Shuffler] to retrieve the
+/// all the [RecordBatch]s for a given IVF partition.
+///
+/// It enables distributed indexing as well:
+///  1. Main thread: train IVF model
+///  2. Distributed IVF model cross workers.
+///  3. Each worker takes parts of the IVF partitions, i.e., `IVF / num_workers` of partitions.
+///  4. Each worker shuffle the [RecordBatch]s of the assigned partitions into a single LanceFile,
+///     and later aggregated to create the final index file.
 #[allow(dead_code)]
 pub struct ShufflerBuilder {
     buffer: BTreeMap<u32, Vec<RecordBatch>>,
