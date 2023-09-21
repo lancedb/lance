@@ -4,7 +4,7 @@ members = ["lance-arrow", "lance-linalg", "lance-testing", "lance"]
 resolver = "2"
 
 [workspace.package]
-version = "0.7.4"
+version = "0.7.5"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -26,9 +26,9 @@ categories = [
 ]
 
 [workspace.dependencies]
-lance-arrow = { version = "0.7.4", path = "./lance-arrow" }
-lance-linalg = { version = "0.7.4", path = "./lance-linalg" }
-lance-testing = { version = "0.7.4", path = "./lance-testing" }
+lance-arrow = { version = "=0.7.5", path = "./lance-arrow" }
+lance-linalg = { version = "=0.7.5", path = "./lance-linalg" }
+lance-testing = { version = "=0.7.5", path = "./lance-testing" }
 # Note that this one does not include pyarrow
 arrow = { version = "43.0.0", optional = false }
 arrow-arith = "43.0"

@@ -366,7 +366,7 @@ impl Transaction {
                 Self::handle_rewrite_fragments(
                     &mut final_fragments,
                     groups,
-                    fragment_id,
+                    &mut fragment_id,
                     current_version,
                 )?;
             }
@@ -410,7 +410,7 @@ impl Transaction {
     fn handle_rewrite_fragments(
         final_fragments: &mut Vec<Fragment>,
         groups: &[RewriteGroup],
-        mut fragment_id: u64,
+        fragment_id: &mut u64,
         version: u64,
     ) -> Result<()> {
         for group in groups {
@@ -433,8 +433,7 @@ impl Transaction {
                 }
             };
 
-            let new_fragments =
-                Self::fragments_with_ids(group.new_fragments.clone(), &mut fragment_id);
+            let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id);
             if let Some(replace_range) = replace_range {
                 // Efficiently path using slice
                 final_fragments.splice(replace_range, new_fragments);
@@ -756,5 +755,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_rewrite_fragments() {
+        let existing_fragments: Vec<Fragment> = (0..10).map(Fragment::new).collect();
+
+        let mut final_fragments = existing_fragments.clone();
+        let rewrite_groups = vec![
+            // Since these are contiguous, they will be put in the same location
+            // as 1 and 2.
+            RewriteGroup {
+                old_fragments: vec![Fragment::new(1), Fragment::new(2)],
+                new_fragments: vec![Fragment::new(0), Fragment::new(0)],
+            },
+            // These are not contiguous, so they will be inserted at the end.
+            RewriteGroup {
+                old_fragments: vec![Fragment::new(5), Fragment::new(8)],
+                new_fragments: vec![Fragment::new(0)],
+            },
+        ];
+
+        let mut fragment_id = 10;
+        let version = 0;
+
+        Transaction::handle_rewrite_fragments(
+            &mut final_fragments,
+            &rewrite_groups,
+            &mut fragment_id,
+            version,
+        )
+        .unwrap();
+
+        assert_eq!(fragment_id, 13);
+
+        let expected_fragments: Vec<Fragment> = vec![
+            Fragment::new(0),
+            Fragment::new(10),
+            Fragment::new(11),
+            Fragment::new(3),
+            Fragment::new(4),
+            Fragment::new(6),
+            Fragment::new(7),
+            Fragment::new(9),
+            Fragment::new(12),
+        ];
+
+        assert_eq!(final_fragments, expected_fragments);
     }
 }

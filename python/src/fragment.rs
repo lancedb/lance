@@ -33,6 +33,7 @@ use pyo3::{
     pyclass::CompareOp,
     types::{PyBytes, PyDict},
 };
+use snafu::{location, Location};
 use tokio::runtime::Runtime;
 
 use crate::dataset::get_write_params;
@@ -70,6 +71,7 @@ impl WriteFragmentProgress for PyWriteProgress {
         })
         .map_err(|e| lance::Error::IO {
             message: format!("Failed to call begin() on WriteFragmentProgress: {}", e),
+            location: location!(),
         })?;
         Ok(())
     }
@@ -84,6 +86,7 @@ impl WriteFragmentProgress for PyWriteProgress {
         })
         .map_err(|e| lance::Error::IO {
             message: format!("Failed to call complete() on WriteFragmentProgress: {}", e),
+            location: location!(),
         })?;
         Ok(())
     }

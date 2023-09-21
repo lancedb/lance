@@ -21,6 +21,7 @@ use std::{
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+use snafu::{location, Location};
 
 use super::field::Field;
 use crate::arrow::*;
@@ -33,6 +34,38 @@ pub struct Schema {
     pub fields: Vec<Field>,
     /// Metadata of the schema
     pub metadata: HashMap<String, String>,
+}
+
+/// State for a pre-order DFS iterator over the fields of a schema.
+struct SchemaFieldIterPreOrder<'a> {
+    field_stack: Vec<&'a Field>,
+}
+
+impl<'a> SchemaFieldIterPreOrder<'a> {
+    fn new(schema: &'a Schema) -> Self {
+        let mut field_stack = Vec::new();
+        field_stack.reserve(schema.fields.len() * 2);
+        for field in schema.fields.iter().rev() {
+            field_stack.push(field);
+        }
+        Self { field_stack }
+    }
+}
+
+/// Iterator implementation for a pre-order traversal of fields
+impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
+    type Item = &'a Field;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(next_field) = self.field_stack.pop() {
+            for child in next_field.children.iter().rev() {
+                self.field_stack.push(child);
+            }
+            Some(next_field)
+        } else {
+            None
+        }
+    }
 }
 
 impl Schema {
@@ -57,6 +90,7 @@ impl Schema {
             } else {
                 return Err(Error::Schema {
                     message: format!("Column {} does not exist", col.as_ref()),
+                    location: location!(),
                 });
             }
         }
@@ -75,7 +109,7 @@ impl Schema {
                 return Err(Error::Schema{message:format!(
                     "Top level field {} cannot contain `.`. Maybe you meant to create a struct field?",
                     field.name.clone()
-                )});
+                ), location: location!(),});
             }
         }
         Ok(true)
@@ -96,15 +130,27 @@ impl Schema {
         })
     }
 
-    pub fn project_by_ids(&self, column_ids: &[i32]) -> Result<Self> {
-        let protos: Vec<pb::Field> = self.into();
+    /// Iterates over the fields using a pre-order traversal
+    ///
+    /// This is a DFS traversal where the parent is visited
+    /// before its children
+    fn fields_pre_order(&self) -> SchemaFieldIterPreOrder {
+        SchemaFieldIterPreOrder::new(self)
+    }
 
-        let filtered_protos: Vec<pb::Field> = protos
+    /// Returns a new schema that only contains the fields in `column_ids`.
+    ///
+    /// This projection can filter out both top-level and nested fields
+    pub fn project_by_ids(&self, column_ids: &[i32]) -> Self {
+        let filtered_fields = self
+            .fields
             .iter()
-            .filter(|p| column_ids.contains(&p.id))
-            .cloned()
+            .filter_map(|f| f.project_by_filter(&|f| column_ids.contains(&f.id)))
             .collect();
-        Ok(Self::from(&filtered_protos))
+        Self {
+            fields: filtered_fields,
+            metadata: self.metadata.clone(),
+        }
     }
 
     /// Project the schema by another schema, and preserves field metadata, i.e., Field IDs.
@@ -123,6 +169,7 @@ impl Schema {
             } else {
                 return Err(Error::Schema {
                     message: format!("Field {} not found", field.name),
+                    location: location!(),
                 });
             }
         }
@@ -136,6 +183,7 @@ impl Schema {
     pub fn exclude<T: TryInto<Self> + Debug>(&self, schema: T) -> Result<Self> {
         let other = schema.try_into().map_err(|_| Error::Schema {
             message: "The other schema is not compatible with this schema".to_string(),
+            location: location!(),
         })?;
         let mut fields = vec![];
         for field in self.fields.iter() {
@@ -169,14 +217,13 @@ impl Schema {
             .map(|f| f.id)
             .ok_or_else(|| Error::Schema {
                 message: "Vector column not in schema".to_string(),
+                location: location!(),
             })
     }
 
-    /// Recursively collect all the field IDs,
+    /// Recursively collect all the field IDs, in pre-order traversal order.
     pub(crate) fn field_ids(&self) -> Vec<i32> {
-        // TODO: make a tree traversal iterator.
-        let protos: Vec<pb::Field> = self.into();
-        protos.iter().map(|f| f.id).collect()
+        self.fields_pre_order().map(|f| f.id).collect()
     }
 
     pub(crate) fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
@@ -210,6 +257,7 @@ impl Schema {
                 .column_by_name(&field.name)
                 .ok_or_else(|| Error::Schema {
                     message: format!("column '{}' does not exist in the record batch", field.name),
+                    location: location!(),
                 })?;
             field.set_dictionary(column);
         }
@@ -442,7 +490,7 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let projected = schema.project_by_ids(&[1, 2, 4, 5]).unwrap();
+        let projected = schema.project_by_ids(&[1, 2, 4, 5]);
 
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
@@ -455,6 +503,18 @@ mod tests {
             ),
             ArrowField::new("c", DataType::Float64, false),
         ]);
+        assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
+
+        let projected = schema.project_by_ids(&[2]);
+        let expected_arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "f1",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        )]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
     }
 

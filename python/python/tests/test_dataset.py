@@ -29,6 +29,7 @@ import pandas as pd
 import pandas.testing as tm
 import polars as pl
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
@@ -678,6 +679,38 @@ def test_scan_with_batch_size(tmp_path: Path):
         assert df["a"].iloc[0] == idx * 16
 
 
+def test_scan_prefilter(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    vecs = pa.array(
+        [[1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6]], type=pa.list_(pa.float32(), 2)
+    )
+    df = pa.Table.from_pydict(
+        {
+            "index": [1, 2, 3, 4, 5, 6],
+            "type": ["a", "a", "a", "b", "b", "b"],
+            "vecs": vecs,
+        }
+    )
+    dataset = lance.write_dataset(df, base_dir)
+    query = pa.array([1, 1], pa.float32())
+    args = {
+        "columns": ["index"],
+        "filter": "type = 'b'",
+        "nearest": {"column": "vecs", "q": pa.array(query), "k": 2, "use_index": False},
+    }
+
+    # With post-filter no results are returned because all
+    # the closest results don't match the filter
+    assert dataset.scanner(**args).to_table().num_rows == 0
+
+    args["prefilter"] = True
+    table = dataset.scanner(**args).to_table()
+
+    expected = pa.Table.from_pydict({"index": [4, 5]})
+
+    assert table.column("index") == expected.column("index")
+
+
 def test_scan_count_rows(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     df = pd.DataFrame({"a": range(42), "b": range(42)})
@@ -785,11 +818,22 @@ def test_metadata(tmp_path: Path):
 
 def test_dataset_optimize(tmp_path: Path):
     base_dir = tmp_path / "dataset"
-    data = pa.table({"a": range(1000), "b": range(1000)})
+    ndim = 128
+    vec = pc.random(1000 * ndim).cast("float32")
+    vec = pa.FixedSizeListArray.from_arrays(vec, ndim)
+    data = pa.table({"a": range(1000), "b": range(1000), "vector": vec})
 
-    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=100)
-    assert dataset.version == 1
-    assert len(dataset.get_fragments()) == 10
+    # One fragment with 1k rows
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1000)
+    # 10 fragments with 100 rows each
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=100, mode="append")
+    # One fragment with 1k rows
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1000, mode="append")
+
+    fragment_ids = [f.fragment_id for f in dataset.get_fragments()]
+    assert fragment_ids == list(range(12))
+
+    assert dataset.version == 3
 
     metrics = dataset.optimize.compact_files(
         target_rows_per_fragment=1000,
@@ -802,7 +846,15 @@ def test_dataset_optimize(tmp_path: Path):
     assert metrics.files_removed == 10
     assert metrics.files_added == 1
 
-    assert dataset.version == 2
+    assert dataset.version == 4
+
+    fragment_ids = [f.fragment_id for f in dataset.get_fragments()]
+    # Note that fragment_ids are out of order. Fragments 1 - 10 are replaced
+    # by a new compacted fragment, fragment 12.
+    assert fragment_ids == [0, 12, 11]
+
+    # Make sure we can query successfully.
+    dataset.to_table(nearest=dict(column="vector", q=[0] * ndim))
 
 
 def test_dataset_distributed_optimize(tmp_path: Path):

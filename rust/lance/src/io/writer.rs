@@ -22,6 +22,7 @@ use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use object_store::path::Path;
+use snafu::{location, Location};
 
 use crate::arrow::*;
 use crate::datatypes::{Field, Schema};
@@ -46,6 +47,7 @@ pub async fn write_manifest(
             if field.data_type().is_dictionary() {
                 let dict_info = field.dictionary.as_mut().ok_or_else(|| Error::IO {
                     message: format!("Lance field {} misses dictionary info", field.name),
+                    location: location!(),
                 })?;
 
                 let value_arr = dict_info.values.as_ref().ok_or_else(|| Error::IO {
@@ -53,6 +55,7 @@ pub async fn write_manifest(
                         "Lance field {} is dictionary type, but misses the dictionary value array",
                         field.name
                     ),
+                    location: location!(),
                 })?;
 
                 let data_type = value_arr.data_type();
@@ -71,6 +74,7 @@ pub async fn write_manifest(
                                 "Does not support {} as dictionary value type",
                                 value_arr.data_type()
                             ),
+                            location: location!(),
                         });
                     }
                 };
@@ -136,6 +140,7 @@ impl FileWriter {
                 .map(|batch| {
                     batch.column_by_name(&field.name).ok_or_else(|| Error::IO {
                         message: format!("FileWriter::write: Field {} not found", field.name),
+                        location: location!(),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -200,6 +205,7 @@ impl FileWriter {
             }
             _ => Err(Error::Schema {
                 message: format!("FileWriter::write: unsupported data type: {data_type}"),
+                location: location!(),
             }),
         }
     }
@@ -270,6 +276,7 @@ impl FileWriter {
                             child.name,
                             struct_array.data_type()
                         ),
+                        location: location!(),
                     })?;
                 arrs.push(arr);
             }

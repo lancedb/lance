@@ -37,6 +37,7 @@ use futures::{StreamExt, TryStreamExt};
 use http::header::{HeaderMap, CACHE_CONTROL};
 use object_store::aws::AwsCredential as ObjectStoreAwsCredential;
 use shellexpand::tilde;
+use snafu::{location, Location};
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 use url::Url;
 
@@ -545,6 +546,7 @@ impl ObjectStore {
             }),
             s => Err(Error::IO {
                 message: format!("Unsupported URI scheme: {}", s),
+                location: location!(),
             }),
         }
     }

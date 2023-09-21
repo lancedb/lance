@@ -16,7 +16,7 @@
 // under the License.
 
 use arrow_schema::ArrowError;
-use snafu::{Location, Snafu};
+use snafu::{location, Location, Snafu};
 
 use crate::datatypes::Schema;
 
@@ -51,12 +51,12 @@ pub enum Error {
     Internal { message: String },
     #[snafu(display("LanceError(Arrow): {message}"))]
     Arrow { message: String },
-    #[snafu(display("LanceError(Schema): {message}"))]
-    Schema { message: String },
+    #[snafu(display("LanceError(Schema): {message}, {location}"))]
+    Schema { message: String, location: Location },
     #[snafu(display("Not found: {uri}, {location}"))]
     NotFound { uri: String, location: Location },
-    #[snafu(display("LanceError(IO): {message}"))]
-    IO { message: String },
+    #[snafu(display("LanceError(IO): {message}, {location}"))]
+    IO { message: String, location: Location },
     #[snafu(display("LanceError(Index): {message}"))]
     Index { message: String },
     /// Stream early stop
@@ -102,6 +102,7 @@ impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Self::IO {
             message: (e.to_string()),
+            location: location!(),
         }
     }
 }
@@ -110,6 +111,7 @@ impl From<object_store::Error> for Error {
     fn from(e: object_store::Error) -> Self {
         Self::IO {
             message: (e.to_string()),
+            location: location!(),
         }
     }
 }
@@ -118,6 +120,7 @@ impl From<prost::DecodeError> for Error {
     fn from(e: prost::DecodeError) -> Self {
         Self::IO {
             message: (e.to_string()),
+            location: location!(),
         }
     }
 }
@@ -126,6 +129,7 @@ impl From<tokio::task::JoinError> for Error {
     fn from(e: tokio::task::JoinError) -> Self {
         Self::IO {
             message: (e.to_string()),
+            location: location!(),
         }
     }
 }
@@ -134,6 +138,7 @@ impl From<object_store::path::Error> for Error {
     fn from(e: object_store::path::Error) -> Self {
         Self::IO {
             message: (e.to_string()),
+            location: location!(),
         }
     }
 }
@@ -142,6 +147,7 @@ impl From<url::ParseError> for Error {
     fn from(e: url::ParseError) -> Self {
         Self::IO {
             message: (e.to_string()),
+            location: location!(),
         }
     }
 }
@@ -150,8 +156,8 @@ impl From<Error> for ArrowError {
     fn from(value: Error) -> Self {
         match value {
             Error::Arrow { message: err } => Self::IoError(err), // we lose the error type converting to LanceError
-            Error::IO { message: err } => Self::IoError(err),
-            Error::Schema { message: err } => Self::SchemaError(err),
+            Error::IO { message: err, .. } => Self::IoError(err),
+            Error::Schema { message: err, .. } => Self::SchemaError(err),
             Error::Index { message: err } => Self::IoError(err),
             Error::Stop => Self::IoError("early stop".to_string()),
             e => Self::IoError(e.to_string()), // Find a more scalable way of doing this
@@ -163,6 +169,7 @@ impl From<datafusion::sql::sqlparser::parser::ParserError> for Error {
     fn from(e: datafusion::sql::sqlparser::parser::ParserError) -> Self {
         Self::IO {
             message: e.to_string(),
+            location: location!(),
         }
     }
 }
@@ -171,6 +178,7 @@ impl From<datafusion::sql::sqlparser::tokenizer::TokenizerError> for Error {
     fn from(e: datafusion::sql::sqlparser::tokenizer::TokenizerError) -> Self {
         Self::IO {
             message: e.to_string(),
+            location: location!(),
         }
     }
 }
@@ -185,6 +193,7 @@ impl From<datafusion::error::DataFusionError> for Error {
     fn from(e: datafusion::error::DataFusionError) -> Self {
         Self::IO {
             message: e.to_string(),
+            location: location!(),
         }
     }
 }

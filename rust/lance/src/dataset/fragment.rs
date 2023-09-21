@@ -24,6 +24,7 @@ use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
 use object_store::path::Path;
+use snafu::{location, Location};
 use uuid::Uuid;
 
 use super::chunker::chunk_stream;
@@ -160,6 +161,7 @@ impl FileFragment {
                     projection,
                     self.id()
                 ),
+                location: location!(),
             });
         }
 
@@ -196,6 +198,7 @@ impl FileFragment {
         if self.metadata.files.is_empty() {
             return Err(Error::IO {
                 message: format!("Fragment {} does not contain any data", self.id()),
+                location: location!(),
             });
         };
 
@@ -541,6 +544,7 @@ fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
     if batches.is_empty() {
         return Err(Error::IO {
             message: "Cannot merge empty batches".to_string(),
+            location: location!(),
         });
     }
 
@@ -556,6 +560,7 @@ impl FragmentReader {
         if readers.is_empty() {
             return Err(Error::IO {
                 message: "Cannot create FragmentReader with zero readers".to_string(),
+                location: location!(),
             });
         }
 
@@ -565,6 +570,7 @@ impl FragmentReader {
                 message:
                     "Cannot create FragmentReader from data files with different number of batches"
                         .to_string(),
+                location: location!(),
             });
         }
         Ok(Self {

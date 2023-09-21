@@ -20,6 +20,8 @@ from .lance import CompactionMetrics as CompactionMetrics
 from .lance import CompactionTask as CompactionTask
 from .lance import RewriteResult as RewriteResult
 
+# from .lance import CompactionPlan as CompactionPlan
+
 
 class CompactionOptions(TypedDict):
     """Options for compaction."""

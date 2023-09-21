@@ -228,7 +228,6 @@ impl Dataset {
                 let schema = self_.ds.schema();
                 let field_names = schema
                     .project_by_ids(idx.fields.as_slice())
-                    .unwrap()
                     .fields
                     .iter()
                     .map(|f| f.name.clone())
@@ -253,6 +252,7 @@ impl Dataset {
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
         filter: Option<String>,
+        prefilter: Option<bool>,
         limit: Option<i64>,
         offset: Option<i64>,
         nearest: Option<&PyDict>,
@@ -272,6 +272,9 @@ impl Dataset {
             scanner
                 .filter(f.as_str())
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(prefilter) = prefilter {
+            scanner.prefilter(prefilter);
         }
 
         scanner

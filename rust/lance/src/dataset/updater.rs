@@ -24,7 +24,7 @@ use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::io::deletion::DeletionVector;
 use crate::{io::FileWriter, Error, Result};
-
+use snafu::{location, Location};
 /// Update or insert a new column.
 ///
 /// To use, call [`Updater::next`] to get the next [`RecordBatch`] as input,
@@ -109,6 +109,7 @@ impl Updater {
                         "Append column: duplicated column {} already exists",
                         field.name
                     ),
+                    location: location!(),
                 });
             }
         }
@@ -131,16 +132,18 @@ impl Updater {
         let Some(last) = self.last_input.as_ref() else {
             return Err(Error::IO {
                 message: "Fragment Updater: no input data is available before update".to_string(),
+                location: location!(),
             });
         };
 
         if last.num_rows() != batch.num_rows() {
             return Err(Error::IO {
                 message: format!(
-                "Fragment Updater: new batch has different size with the source batch: {} != {}",
-                last.num_rows(),
-                batch.num_rows()
-            ),
+                    "Fragment Updater: new batch has different size with the source batch: {} != {}",
+                    last.num_rows(),
+                    batch.num_rows()
+                ),
+                location: location!(),
             });
         };
 

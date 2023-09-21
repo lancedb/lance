@@ -22,7 +22,7 @@ use datafusion::sql::sqlparser::{
 };
 
 use crate::{Error, Result};
-
+use snafu::{location, Location};
 #[derive(Debug, Default)]
 struct LanceDialect(GenericDialect);
 
@@ -83,6 +83,7 @@ pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
     };
     let expr = selection.ok_or_else(|| Error::IO {
         message: format!("Filter is not valid: {filter}"),
+        location: location!(),
     })?;
     Ok(expr.clone())
 }

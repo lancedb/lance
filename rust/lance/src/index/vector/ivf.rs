@@ -55,7 +55,7 @@ use crate::{
     session::Session,
 };
 use crate::{Error, Result};
-
+use snafu::{location, Location};
 const PARTITION_ID_COLUMN: &str = "__ivf_part_id";
 const RESIDUAL_COLUMN: &str = "__residual_vector";
 const PQ_CODE_COLUMN: &str = "__pq_code";
@@ -215,6 +215,7 @@ impl VectorIndex for IVFIndex {
                 "_distance column does not exist in batch: {}",
                 batch.schema()
             ),
+            location: location!(),
         })?;
 
         // TODO: Use a heap sort to get the top-k.
@@ -365,6 +366,7 @@ impl Ivf {
                     query.len(),
                     self.dimension()
                 ),
+                location: location!(),
             });
         }
         let dist_func = metric_type.batch_func();
@@ -418,6 +420,7 @@ impl Ivf {
                         vector.len(),
                         cent.len()
                     ),
+                    location: location!(),
                 });
             }
             unsafe {
@@ -453,6 +456,7 @@ impl TryFrom<&Ivf> for pb::Ivf {
         if ivf.offsets.len() != ivf.centroids.len() {
             return Err(Error::IO {
                 message: "Ivf model has not been populated".to_string(),
+                location: location!(),
             });
         }
         let centroids_arr = ivf.centroids.values();
@@ -491,6 +495,7 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
                 "Building index: column {} does not exist in dataset: {:?}",
                 column, dataset
             ),
+            location: location!(),
         });
     };
     if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
@@ -599,6 +604,7 @@ fn compute_residual_matrix(
                     row.len(),
                     centroid.len()
                 ),
+                location: location!(),
             });
         };
         unsafe {
@@ -723,6 +729,7 @@ pub async fn build_ivf_pq_index(
             let batch = b?;
             let arr = batch.column_by_name(column).ok_or_else(|| Error::IO {
                 message: format!("Dataset does not have column {column}"),
+                location: location!(),
             })?;
             let fixed_size_list_arr = arr.as_fixed_size_list();
 

@@ -37,6 +37,7 @@ use arrow_select::take::take;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use snafu::{location, Location};
 use tokio::io::AsyncWriteExt;
 
 use crate::arrow::*;
@@ -144,6 +145,7 @@ impl<'a> PlainEncoder<'a> {
                 .downcast_ref::<FixedSizeListArray>()
                 .ok_or_else(|| Error::Schema {
                     message: format!("Needed a FixedSizeListArray but got {}", array.data_type()),
+                    location: location!(),
                 })?;
             let offset = list_array.value_offset(0) as usize;
             let length = list_array.len();
@@ -207,6 +209,7 @@ impl<'a> PlainDecoder<'a> {
                     "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
                     start, end, self.length
                 ),
+                location: location!(),
             });
         }
         let byte_range = get_byte_range(self.data_type, start..end);
@@ -267,6 +270,7 @@ impl<'a> PlainDecoder<'a> {
                     "Items for fixed size list should be primitives but found {}",
                     items.data_type()
                 ),
+                location: location!(),
             });
         };
         let item_decoder = PlainDecoder::new(
@@ -303,6 +307,7 @@ impl<'a> PlainDecoder<'a> {
             .downcast_ref::<UInt8Array>()
             .ok_or_else(|| Error::Schema {
                 message: "Could not cast to UInt8Array for FixedSizeBinary".to_string(),
+                location: location!(),
             })?;
         Ok(Arc::new(FixedSizeBinaryArray::try_new_from_values(values, stride)?) as ArrayRef)
     }
