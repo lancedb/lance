@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
@@ -82,7 +82,7 @@ impl ShufflerBuilder {
         let total = batches.iter().map(|b| b.num_rows()).sum::<usize>();
         // If there are more than `flush_size` rows in the buffer, flush them to disk
         // as one group.
-        if total > self.flush_size {
+        if total >= self.flush_size {
             self.parted_groups
                 .entry(key)
                 .or_default()
@@ -94,7 +94,6 @@ impl ShufflerBuilder {
     }
 
     pub async fn finish(&mut self) -> Result<Shuffler> {
-        println!("FInish: {:?}", self.buffer);
         for (key, batches) in self.buffer.iter() {
             if !batches.is_empty() {
                 self.parted_groups
@@ -110,7 +109,7 @@ impl ShufflerBuilder {
 }
 
 #[allow(dead_code)]
-pub struct Shuffler<'a> {
+pub(crate) struct Shuffler<'a> {
     /// Partition ID to file-group ID mapping, in memory.
     /// No external dependency is required, because we don't need to guarantee the
     /// persistence of this mapping, as well as the temp files.
@@ -135,12 +134,12 @@ impl<'a> Shuffler<'a> {
 
     /// Iterate over the shuffled [RecordBatch]s for a given partition key.
     pub async fn key_iter(&self, key: u32) -> Result<impl RecordBatchStream + '_> {
-        let file_path = lance_buffer_path(&self.temp_dir)?;
+        let file_path = lance_buffer_path(self.temp_dir)?;
         let (object_store, _) = ObjectStore::from_uri("file://").await?;
         let reader = FileReader::try_new(&object_store, &file_path).await?;
         let schema = reader.schema().clone();
 
-        let group_ids = self.parted_groups.get(&key).unwrap_or(&vec![]).clone();
+        let group_ids: HashSet<_> = self.parted_groups.get(&key).unwrap_or(&vec![]).into();
         let stream = batches_stream(reader, schema, move |id| group_ids.contains(&(*id as u32)));
         Ok(stream)
     }
@@ -152,30 +151,33 @@ mod tests {
 
     use std::sync::Arc;
 
+    use arrow_array::UInt32Array;
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
 
     #[tokio::test]
     async fn test_shuffler() {
-        let schema = Schema::new(vec![
-            Field::new("a", DataType::Int32, false),
-            Field::new("b", DataType::Utf8, false),
-        ]);
-        let mut shuffler = ShufflerBuilder::try_new(&schema).await.unwrap();
+        let schema = Schema::new(vec![Field::new("a", DataType::UInt32, false)]);
+        let mut shuffler = ShufflerBuilder::try_new(&schema, 4).await.unwrap();
         for i in 0..20 {
             shuffler
-                .insert(i % 3, RecordBatch::new_empty(Arc::new(schema.clone())))
+                .insert(
+                    i % 3,
+                    RecordBatch::try_new(
+                        Arc::new(schema.clone()),
+                        vec![Arc::new(UInt32Array::from(vec![i]))],
+                    )
+                    .unwrap(),
+                )
                 .await
                 .unwrap();
         }
-        println!("After finish");
         let reader = shuffler.finish().await.unwrap();
         assert_eq!(reader.keys(), vec![0, 1, 2]);
         for i in 0..3 {
             let stream = reader.key_iter(i).await.unwrap();
             let batches = stream.try_collect::<Vec<_>>().await.unwrap();
-            println!("batches: {:?}", batches);
-            assert_eq!(batches.len(), 6);
+            assert_eq!(batches.len(), 2, "key {} has {} batches", i, batches.len());
         }
     }
 }
