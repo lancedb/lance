@@ -449,17 +449,18 @@ impl FileReader {
 /// Stream desired full batches from the file.
 ///
 /// Parameters:
+/// - **reader**: An opened file reader.
 /// - **projection**: The schema of the returning [RecordBatch].
 /// - **predicate**: A function that takes a batch ID and returns true if the batch should be
-///  returned.
+///                  returned.
 ///
 /// Returns:
 /// - A stream of [RecordBatch]s, each one corresponding to one full batch in the file.
-pub(crate) fn batches_stream(
+pub(crate) fn batches_stream<'a>(
     reader: FileReader,
     projection: Schema,
     predicate: impl FnMut(&i32) -> bool + Send + Sync + 'static,
-) -> impl RecordBatchStream + '_ {
+) -> impl RecordBatchStream<'a> {
     // Make projection an Arc so we can clone it and pass between threads.
     let projection = Arc::new(projection);
     let arrow_schema = ArrowSchema::from(projection.as_ref());
@@ -1628,7 +1629,7 @@ mod tests {
         writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let stream = reader.batches_stream(schema, |id| id % 2 == 0);
+        let stream = batches_stream(reader, schema, |id| id % 2 == 0);
         let batches = stream.try_collect::<Vec<_>>().await.unwrap();
 
         assert_eq!(batches.len(), 5);
