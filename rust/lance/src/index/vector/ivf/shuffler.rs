@@ -99,7 +99,7 @@ impl ShufflerBuilder {
             self.parted_groups
                 .entry(key)
                 .or_default()
-                .push(self.writer.batch_id as u32);
+                .push(self.writer.next_batch_id() as u32);
             self.writer.write(batches).await?;
             batches.clear();
         };
@@ -113,7 +113,7 @@ impl ShufflerBuilder {
                 self.parted_groups
                     .entry(*key)
                     .or_default()
-                    .push(self.writer.batch_id as u32);
+                    .push(self.writer.next_batch_id() as u32);
                 self.writer.write(batches.as_slice()).await?;
             }
         }

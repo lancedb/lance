@@ -110,7 +110,7 @@ pub async fn write_manifest(
 pub struct FileWriter {
     object_writer: ObjectWriter,
     schema: Schema,
-    pub batch_id: i32,
+    batch_id: i32,
     page_table: PageTable,
     metadata: Metadata,
 }
@@ -170,6 +170,11 @@ impl FileWriter {
     /// Returns the in-flight multipart ID.
     pub fn multipart_id(&self) -> &str {
         &self.object_writer.multipart_id
+    }
+
+    /// Return the id of the next batch to be written.
+    pub fn next_batch_id(&self) -> i32 {
+        self.batch_id
     }
 
     pub fn is_empty(&self) -> bool {
