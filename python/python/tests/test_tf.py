@@ -87,6 +87,14 @@ def test_projection(tf_dataset):
         assert batch["a"].shape == (100,)
 
 
+def test_filter(tf_dataset):
+    ds = from_lance(tf_dataset, batch_size=100, filter="a >= 5000")
+
+    for idx, batch in enumerate(ds):
+        assert batch["a"].numpy()[0] == idx * 100 + 5000
+        assert batch["a"].shape == (100,)
+
+
 def test_scan_use_tf_data(tf_dataset):
     ds = tf.data.Dataset.from_lance(tf_dataset)
     for idx, batch in enumerate(ds):
@@ -97,6 +105,26 @@ def test_scan_use_tf_data(tf_dataset):
             100,
             128,
         )  # Fixed size list
+
+
+def test_pass_fragments(tf_dataset):
+    # Can pass fragments directly to from_lance
+    dataset = lance.dataset(tf_dataset)
+    ds = from_lance(tf_dataset, fragments=dataset.get_fragments(), batch_size=100)
+    ds_default = from_lance(tf_dataset, batch_size=100)
+    for batch, batch_default in zip(ds, ds_default):
+        assert batch["a"].numpy()[0] == batch_default["a"].numpy()[0]
+        assert batch["a"].numpy().shape == (100,)
+        assert batch["vec"].shape == (
+            100,
+            128,
+        )
+
+    # Can pass ids directly to from_lance
+    ds = from_lance(tf_dataset, fragments=[0, 1, 2], batch_size=100)
+    for idx, batch in enumerate(ds):
+        assert batch["a"].numpy()[0] == idx * 100
+        assert batch["a"].numpy().shape == (100,)
 
 
 def test_shuffle(tf_dataset):
