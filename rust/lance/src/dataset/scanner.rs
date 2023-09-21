@@ -783,7 +783,7 @@ impl DatasetRecordBatchStream {
     }
 }
 
-impl RecordBatchStream<'_> for DatasetRecordBatchStream {
+impl RecordBatchStream for DatasetRecordBatchStream {
     fn schema(&self) -> SchemaRef {
         self.exec_node.schema()
     }

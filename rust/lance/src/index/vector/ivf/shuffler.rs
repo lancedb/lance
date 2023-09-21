@@ -109,7 +109,7 @@ impl ShufflerBuilder {
 }
 
 #[allow(dead_code)]
-pub(crate) struct Shuffler<'a> {
+pub struct Shuffler<'a> {
     /// Partition ID to file-group ID mapping, in memory.
     /// No external dependency is required, because we don't need to guarantee the
     /// persistence of this mapping, as well as the temp files.
@@ -139,7 +139,13 @@ impl<'a> Shuffler<'a> {
         let reader = FileReader::try_new(&object_store, &file_path).await?;
         let schema = reader.schema().clone();
 
-        let group_ids: HashSet<_> = self.parted_groups.get(&key).unwrap_or(&vec![]).into();
+        let group_ids = self
+            .parted_groups
+            .get(&key)
+            .unwrap_or(&vec![])
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
         let stream = batches_stream(reader, schema, move |id| group_ids.contains(&(*id as u32)));
         Ok(stream)
     }

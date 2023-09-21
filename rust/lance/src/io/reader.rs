@@ -456,11 +456,11 @@ impl FileReader {
 ///
 /// Returns:
 /// - A stream of [RecordBatch]s, each one corresponding to one full batch in the file.
-pub(crate) fn batches_stream<'a>(
+pub(crate) fn batches_stream(
     reader: FileReader,
     projection: Schema,
     predicate: impl FnMut(&i32) -> bool + Send + Sync + 'static,
-) -> impl RecordBatchStream<'a> {
+) -> impl RecordBatchStream {
     // Make projection an Arc so we can clone it and pass between threads.
     let projection = Arc::new(projection);
     let arrow_schema = ArrowSchema::from(projection.as_ref());

@@ -34,8 +34,8 @@ fn distance_field() -> ArrowField {
     ArrowField::new(DIST_COL, DataType::Float32, false)
 }
 
-pub async fn flat_search<'a>(
-    stream: impl RecordBatchStream<'a>,
+pub async fn flat_search(
+    stream: impl RecordBatchStream + 'static,
     query: &Query,
 ) -> Result<RecordBatch> {
     let input_schema = stream.schema();

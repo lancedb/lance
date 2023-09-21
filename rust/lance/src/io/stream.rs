@@ -23,7 +23,7 @@ use pin_project::pin_project;
 use crate::Result;
 
 /// RecordBatch Stream trait.
-pub trait RecordBatchStream<'a>: Stream<Item = Result<RecordBatch>> + Send + 'a {
+pub trait RecordBatchStream: Stream<Item = Result<RecordBatch>> + Send {
     /// Returns the schema of the stream.
     fn schema(&self) -> SchemaRef;
 }
@@ -53,7 +53,7 @@ impl<S> std::fmt::Debug for RecordBatchStreamAdapter<S> {
     }
 }
 
-impl<S> RecordBatchStream<'_> for RecordBatchStreamAdapter<S>
+impl<S> RecordBatchStream for RecordBatchStreamAdapter<S>
 where
     S: Stream<Item = Result<RecordBatch>> + Send + 'static,
 {
