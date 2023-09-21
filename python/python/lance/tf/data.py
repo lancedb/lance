@@ -32,7 +32,7 @@ import numpy as np
 import pyarrow as pa
 import tensorflow as tf
 from lance import LanceDataset
-from lance.fragment import LanceFragment
+from lance.fragment import FragmentMetadata, LanceFragment
 
 
 def arrow_data_type_to_tf(dt: pa.DataType) -> tf.DType:
@@ -134,7 +134,7 @@ def from_lance(
     columns: Optional[List[str]] = None,
     batch_size: int = 256,
     filter: Optional[str] = None,
-    fragments: Union[Iterable[LanceFragment], tf.data.Dataset] = None,
+    fragments: Union[Iterable[int], Iterable[LanceFragment], tf.data.Dataset] = None,
     output_signature: Optional[Dict[str, tf.TypeSpec]] = None,
 ) -> tf.data.Dataset:
     """Create a ``tf.data.Dataset`` from a Lance dataset.
@@ -197,14 +197,28 @@ def from_lance(
     """
     if not isinstance(dataset, LanceDataset):
         dataset = lance.dataset(dataset)
+
     if isinstance(fragments, tf.data.Dataset):
         fragments = list(fragments.as_numpy_iterator())
     elif isinstance(fragments, np.ndarray):
         fragments = list(fragments)
 
     if fragments is not None:
+
+        def gen_fragments(fragments):
+            for f in fragments:
+                if isinstance(f, (int, np.integer)):
+                    yield LanceFragment(dataset, int(f))
+                elif isinstance(f, FragmentMetadata):
+                    yield LanceFragment(dataset, f.fragment_id)
+                elif isinstance(f, LanceFragment):
+                    yield f
+                else:
+                    raise TypeError(f"Invalid type passed to `fragments`: {type(f)}")
+
         # A Generator of Fragments
-        fragments = (LanceFragment(dataset, f) for f in fragments)
+        fragments = gen_fragments(fragments)
+
     scanner = dataset.scanner(
         filter=filter, columns=columns, batch_size=batch_size, fragments=fragments
     )
