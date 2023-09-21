@@ -13,12 +13,14 @@ def main():
         help="The metric type (L2, cosine, dot) to use for indexing",
     )
     parser.add_argument(
+        "-p",
         "--num-partitions",
         default=2048,
         type=int,
         help="The number of partitions to use for indexing",
     )
     parser.add_argument(
+        "-s",
         "--num-sub-vectors",
         default=96,
         type=int,

@@ -16,15 +16,15 @@ use std::collections::{BTreeMap, HashSet};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
-use object_store::path::Path;
-use path_absolutize::Absolutize;
+use snafu::{location, Location};
 use tempfile::TempDir;
 
 use crate::datatypes::Schema;
+use crate::io::object_store::ObjectStoreParams;
 use crate::io::reader::batches_stream;
 use crate::io::FileReader;
 use crate::{
-    error::Result,
+    error::{Error, Result},
     io::{FileWriter, ObjectStore, RecordBatchStream},
 };
 
@@ -63,10 +63,9 @@ pub struct ShufflerBuilder {
     writer: FileWriter,
 }
 
-fn lance_buffer_path(dir: &TempDir) -> Result<Path> {
+fn lance_buffer_path(dir: &TempDir) -> String {
     let file_path = dir.path().join(BUFFER_FILE_NAME);
-    let path = Path::from(file_path.absolutize()?.to_str().unwrap());
-    Ok(path)
+    file_path.to_str().unwrap().to_string()
 }
 
 impl ShufflerBuilder {
@@ -74,8 +73,9 @@ impl ShufflerBuilder {
     pub async fn try_new(schema: &ArrowSchema, flush_threshold: usize) -> Result<Self> {
         // TODO: create a `ObjectWriter::tempfile()` method.
         let temp_dir = tempfile::tempdir()?;
-        let (object_store, _) = ObjectStore::from_uri(temp_dir.path().to_str().unwrap()).await?;
-        let path = lance_buffer_path(&temp_dir)?;
+        let buffer_path = lance_buffer_path(&temp_dir);
+        let (object_store, path) =
+            ObjectStore::from_path(&buffer_path, &ObjectStoreParams::default())?;
         let writer = object_store.create(&path).await?;
         let lance_schema = Schema::try_from(schema)?;
         Ok(Self {
@@ -153,9 +153,16 @@ impl<'a> Shuffler<'a> {
         if !self.parted_groups.contains_key(&key) {
             return Ok(None);
         }
-        let file_path = lance_buffer_path(self.temp_dir)?;
-        let (object_store, _) = ObjectStore::from_uri("file://").await?;
-        let reader = FileReader::try_new(&object_store, &file_path).await?;
+
+        let buffer_path = lance_buffer_path(self.temp_dir);
+        let (object_store, path) =
+            ObjectStore::from_path(&buffer_path, &ObjectStoreParams::default())?;
+        let reader = FileReader::try_new(&object_store, &path)
+            .await
+            .map_err(|e| Error::IO {
+                message: format!("failed to open shuffler buffer file: {}, {}", path, e),
+                location: location!(),
+            })?;
         let schema = reader.schema().clone();
 
         let group_ids = self

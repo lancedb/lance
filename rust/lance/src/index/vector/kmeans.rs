@@ -14,9 +14,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::FixedSizeListArray;
-use arrow_array::{builder::Float32Builder, Float32Array};
+use arrow_array::{builder::Float32Builder, FixedSizeListArray, Float32Array};
 use lance_arrow::FixedSizeListArrayExt;
+use log::info;
 use rand::{seq::IteratorRandom, Rng};
 
 use crate::index::vector::MetricType;
@@ -46,7 +46,7 @@ pub async fn train_kmeans(
     }
     // Ony sample sample_rate * num_clusters. See Faiss
     let data = if num_rows > sample_rate * k {
-        println!(
+        info!(
             "Sample {} out of {} to train kmeans of {} dim, {} clusters",
             sample_rate * k,
             array.len() / dimension,
