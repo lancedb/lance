@@ -19,12 +19,13 @@ use arrow_array::Array;
 use object_store::{path::Path, MultipartId};
 use pin_project::pin_project;
 use prost::Message;
+use snafu::{location, Location};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::encodings::plain::PlainEncoder;
 use crate::format::{ProtoStruct, MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use crate::io::ObjectStore;
-use crate::Result;
+use crate::{Error, Result};
 
 /// AsyncWrite with the capability to tell the position the data is written.
 ///
@@ -43,7 +44,15 @@ pub struct ObjectWriter {
 
 impl ObjectWriter {
     pub async fn new(object_store: &ObjectStore, path: &Path) -> Result<Self> {
-        let (multipart_id, writer) = object_store.inner.put_multipart(path).await?;
+        let (multipart_id, writer) =
+            object_store
+                .inner
+                .put_multipart(path)
+                .await
+                .map_err(|e| Error::IO {
+                    message: format!("failed to create object writer for {}: {}", path, e),
+                    location: location!(),
+                })?;
 
         Ok(Self {
             store: object_store.clone(),

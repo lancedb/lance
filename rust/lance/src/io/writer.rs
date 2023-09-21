@@ -118,6 +118,10 @@ pub struct FileWriter {
 impl FileWriter {
     pub async fn try_new(object_store: &ObjectStore, path: &Path, schema: Schema) -> Result<Self> {
         let object_writer = object_store.create(path).await?;
+        Self::with_object_writer(object_writer, schema)
+    }
+
+    pub fn with_object_writer(object_writer: ObjectWriter, schema: Schema) -> Result<Self> {
         Ok(Self {
             object_writer,
             schema,
@@ -166,6 +170,11 @@ impl FileWriter {
     /// Returns the in-flight multipart ID.
     pub fn multipart_id(&self) -> &str {
         &self.object_writer.multipart_id
+    }
+
+    /// Return the id of the next batch to be written.
+    pub fn next_batch_id(&self) -> i32 {
+        self.batch_id
     }
 
     pub fn is_empty(&self) -> bool {
