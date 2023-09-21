@@ -59,6 +59,7 @@ fn lance_buffer_path(dir: &TempDir) -> Result<Path> {
 }
 
 impl ShufflerBuilder {
+    #[allow(dead_code)]
     pub async fn try_new(schema: &ArrowSchema, flush_threshold: usize) -> Result<Self> {
         // TODO: create a `ObjectWriter::tempfile()` method.
         let temp_dir = tempfile::tempdir()?;
@@ -76,6 +77,7 @@ impl ShufflerBuilder {
     }
 
     /// Insert a [RecordBatch] with the same key (Partition ID).
+    #[allow(dead_code)]
     pub async fn insert(&mut self, key: u32, batch: RecordBatch) -> Result<()> {
         let batches = self.buffer.entry(key).or_default();
         batches.push(batch);
@@ -87,12 +89,13 @@ impl ShufflerBuilder {
                 .entry(key)
                 .or_default()
                 .push(self.writer.batch_id as u32);
-            self.writer.write(&batches).await?;
+            self.writer.write(batches).await?;
             batches.clear();
         };
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn finish(&mut self) -> Result<Shuffler> {
         for (key, batches) in self.buffer.iter() {
             if !batches.is_empty() {
@@ -108,7 +111,6 @@ impl ShufflerBuilder {
     }
 }
 
-#[allow(dead_code)]
 pub struct Shuffler<'a> {
     /// Partition ID to file-group ID mapping, in memory.
     /// No external dependency is required, because we don't need to guarantee the
@@ -121,6 +123,7 @@ pub struct Shuffler<'a> {
 }
 
 impl<'a> Shuffler<'a> {
+    #[allow(dead_code)]
     fn new(parted_groups: &BTreeMap<u32, Vec<u32>>, temp_dir: &'a TempDir) -> Self {
         Self {
             parted_groups: parted_groups.clone(),
@@ -128,11 +131,13 @@ impl<'a> Shuffler<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn keys(&self) -> Vec<u32> {
         self.parted_groups.keys().copied().collect()
     }
 
     /// Iterate over the shuffled [RecordBatch]s for a given partition key.
+    #[allow(dead_code)]
     pub async fn key_iter(&self, key: u32) -> Result<impl RecordBatchStream + '_> {
         let file_path = lance_buffer_path(self.temp_dir)?;
         let (object_store, _) = ObjectStore::from_uri("file://").await?;
