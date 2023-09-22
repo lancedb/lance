@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -716,6 +717,20 @@ class LanceDataset(pa.dataset.Dataset):
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
     ) -> LanceDataset:
+        warnings.warn(
+            "LanceDataset._commit() is deprecated, use LanceDataset.commit()"
+            " instead",
+            DeprecationWarning,
+        )
+        return LanceDataset.commit(base_uri, operation, read_version, commit_lock)
+
+    @staticmethod
+    def commit(
+        base_uri: Union[str, Path],
+        operation: LanceOperation.BaseOperation,
+        read_version: Optional[int] = None,
+        commit_lock: Optional[CommitLock] = None,
+    ) -> LanceDataset:
         """Create a new version of dataset
 
         This method is an advanced method which allows users to describe a change
@@ -730,13 +745,19 @@ class LanceDataset(pa.dataset.Dataset):
         Once all of the changes have been made, this method can be called to make
         the changes visible by updating the dataset manifest.
 
+        Warnings
+        --------
+        This is an advanced API and doesn't provide the same level of validation
+        as the other APIs. For example, it's the responsibility of the caller to
+        ensure that the fragments are valid for the schema.
+
         Parameters
         ----------
         base_uri: str or Path
             The base uri of the dataset
         operation: BaseOperation
             The operation to apply to the dataset.  This describes what changes
-            have been made.
+            have been made. See available operations under :class:`LanceOperation`.
         read_version: int, optional
             The version of the dataset that was used as the base for the changes.
             This is not needed for overwrite or restore operations.
@@ -749,10 +770,26 @@ class LanceDataset(pa.dataset.Dataset):
         LanceDataset
             A new version of Lance Dataset.
 
+        Examples
+        --------
 
-        Note
-        -----
-        This method is for internal use only.
+        Creating a new dataset with the :class:`LanceOperation.Overwrite` operation:
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> tab1 = pa.table({"a": [1, 2], "b": ["a", "b"]})
+        >>> tab2 = pa.table({"a": [3, 4], "b": ["c", "d"]})
+        >>> fragment1 = lance.fragment.LanceFragment.create("example", tab1)
+        >>> fragment2 = lance.fragment.LanceFragment.create("example", tab2)
+        >>> fragments = [fragment1, fragment2]
+        >>> operation = lance.LanceOperation.Overwrite(tab1.schema, fragments)
+        >>> dataset = lance.LanceDataset.commit("example", operation)
+        >>> dataset.to_table().to_pandas()
+           a  b
+        0  1  a
+        1  2  b
+        2  3  c
+        3  4  d
         """
         # TODO: mode is never used!
         if isinstance(base_uri, Path):
@@ -788,12 +825,59 @@ class LanceOperation:
             )
 
     class BaseOperation(ABC):
+        """
+        Base class for operations that can be applied to a dataset.
+
+        See available operations under :class:`LanceOperation`.
+        """
+
         @abstractmethod
         def _to_inner(self):
             raise NotImplementedError()
 
     @dataclass
     class Overwrite(BaseOperation):
+        """
+        Overwrite or create a new dataset.
+
+        Attributes
+        ----------
+        new_schema: pyarrow.Schema
+            The schema of the new dataset.
+        fragments: list[FragmentMetadata]
+            The fragments that make up the new dataset.
+
+        Warning
+        -------
+        This is an advanced API for distributed operations. To overwrite or
+        create new dataset on a single machine, use :func:`lance.write_dataset`.
+
+        Examples
+        --------
+
+        To create or overwrite a dataset, first use
+        :meth:`lance.fragment.LanceFragment.create` to create fragments. Then
+        collect the fragment metadata into a list and pass it along with the
+        schema to this class. Finally, pass the operation to the
+        :meth:`LanceDataset.commit` method to create the new dataset.
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> tab1 = pa.table({"a": [1, 2], "b": ["a", "b"]})
+        >>> tab2 = pa.table({"a": [3, 4], "b": ["c", "d"]})
+        >>> fragment1 = lance.fragment.LanceFragment.create("example", tab1)
+        >>> fragment2 = lance.fragment.LanceFragment.create("example", tab2)
+        >>> fragments = [fragment1, fragment2]
+        >>> operation = lance.LanceOperation.Overwrite(tab1.schema, fragments)
+        >>> dataset = lance.LanceDataset.commit("example", operation)
+        >>> dataset.to_table().to_pandas()
+           a  b
+        0  1  a
+        1  2  b
+        2  3  c
+        3  4  d
+        """
+
         new_schema: pa.Schema
         fragments: Iterable[FragmentMetadata]
 
@@ -810,6 +894,44 @@ class LanceOperation:
 
     @dataclass
     class Append(BaseOperation):
+        """
+        Append new rows to the dataset.
+
+        Attributes
+        ----------
+        fragments: list[FragmentMetadata]
+            The fragments that contain the new rows.
+
+        Warning
+        -------
+        This is an advanced API for distributed operations. To append to a
+        dataset on a single machine, use :func:`lance.write_dataset`.
+
+        Examples
+        --------
+
+        To append new rows to a dataset, first use :meth:`lance.fragment.LanceFragment.create`
+        to create fragments. Then collect the fragment metadata into a list and pass it
+        to this class. Finally, pass the operation to the :meth:`LanceDataset.commit`
+        method to create the new dataset.
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> tab1 = pa.table({"a": [1, 2], "b": ["a", "b"]})
+        >>> dataset = lance.write_dataset(tab1, "example")
+        >>> tab2 = pa.table({"a": [3, 4], "b": ["c", "d"]})
+        >>> fragment = lance.fragment.LanceFragment.create("example", tab2)
+        >>> operation = lance.LanceOperation.Append([fragment])
+        >>> dataset = lance.LanceDataset.commit("example", operation,
+        ...                                     read_version=dataset.version)
+        >>> dataset.to_table().to_pandas()
+           a  b
+        0  1  a
+        1  2  b
+        2  3  c
+        3  4  d
+        """
+
         fragments: Iterable[FragmentMetadata]
 
         def __post_init__(self):
@@ -821,6 +943,65 @@ class LanceOperation:
 
     @dataclass
     class Delete(BaseOperation):
+        """
+        Remove fragments or rows from the dataset.
+
+        Attributes
+        ----------
+        updated_fragments: list[FragmentMetadata]
+            The fragments that have been updated with new deletion vectors.
+        deleted_fragment_ids: list[int]
+            The ids of the fragments that have been deleted entirely. These are
+            the fragments where :meth:`LanceFragment.delete()` returned None.
+        predicate: str
+            The original SQL predicate used to select the rows to delete.
+
+        Warning
+        -------
+        This is an advanced API for distributed operations. To delete rows from
+        dataset on a single machine, use :meth:`lance.LanceDataset.delete`.
+
+        Examples
+        --------
+
+        To delete rows from a dataset, call :meth:`lance.fragment.LanceFragment.delete`
+        on each of the fragments. If that returns a new fragment, add that to
+        the ``updated_fragments`` list. If it returns None, that means the whole
+        fragment was deleted, so add the fragment id to the ``deleted_fragment_ids``.
+        Finally, pass the operation to the :meth:`LanceDataset.commit` method to
+        complete the deletion operation.
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2], "b": ["a", "b"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> table = pa.table({"a": [3, 4], "b": ["c", "d"]})
+        >>> dataset = lance.write_dataset(table, "example", mode="append")
+        >>> dataset.to_table().to_pandas()
+           a  b
+        0  1  a
+        1  2  b
+        2  3  c
+        3  4  d
+        >>> predicate = "a >= 2"
+        >>> updated_fragments = []
+        >>> deleted_fragment_ids = []
+        >>> for fragment in dataset.get_fragments():
+        ...     new_fragment = fragment.delete(predicate)
+        ...     if new_fragment is not None:
+        ...         updated_fragments.append(new_fragment)
+        ...     else:
+        ...         deleted_fragment_ids.append(fragment.fragment_id)
+        >>> operation = lance.LanceOperation.Delete(updated_fragments,
+        ...                                         deleted_fragment_ids,
+        ...                                         predicate)
+        >>> dataset = lance.LanceDataset.commit("example", operation,
+        ...                                     read_version=dataset.version)
+        >>> dataset.to_table().to_pandas()
+           a  b
+        0  1  a
+        """
+
         updated_fragments: Iterable[FragmentMetadata]
         deleted_fragment_ids: Iterable[int]
         predicate: str
@@ -868,6 +1049,59 @@ class LanceOperation:
 
     @dataclass
     class Merge(BaseOperation):
+        """
+        Operation that adds columns. Unlike Overwrite, this should not change
+        the structure of the fragments, allowing existing indices to be kept.
+
+        Attributes
+        ----------
+        fragments: iterable of FragmentMetadata
+            The fragments that make up the new dataset.
+        schema: pyarrow.Schema
+            The schema of the new dataset.
+
+        Warning
+        -------
+        This is an advanced API for distributed operations. To overwrite or
+        create new dataset on a single machine, use :func:`lance.write_dataset`.
+
+        Examples
+        --------
+
+        To add new columns to a dataset, first define a method that will create
+        the new columns based on the existing columns. Then use
+        :meth:`lance.fragment.LanceFragment.add_columns`
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> import pyarrow.compute as pc
+        >>> table = pa.table({"a": [1, 2, 3, 4], "b": ["a", "b", "c", "d"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.to_table().to_pandas()
+           a  b
+        0  1  a
+        1  2  b
+        2  3  c
+        3  4  d
+        >>> def double_a(batch: pa.RecordBatch) -> pa.RecordBatch:
+        ...     doubled = pc.multiply(batch["a"], 2)
+        ...     return pa.record_batch([doubled], ["a_doubled"])
+        >>> fragments = []
+        >>> for fragment in dataset.get_fragments():
+        ...     new_fragment = fragment.add_columns(double_a, columns=['a'])
+        ...     fragments.append(new_fragment)
+        >>> new_schema = table.schema.append(pa.field("a_doubled", pa.int64()))
+        >>> operation = lance.LanceOperation.Merge(fragments, new_schema)
+        >>> dataset = lance.LanceDataset.commit("example", operation,
+        ...                                     read_version=dataset.version)
+        >>> dataset.to_table().to_pandas()
+           a  b  a_doubled
+        0  1  a          2
+        1  2  b          4
+        2  3  c          6
+        3  4  d          8
+        """
+
         fragments: Iterable[FragmentMetadata]
         schema: pa.Schema
 
@@ -880,6 +1114,10 @@ class LanceOperation:
 
     @dataclass
     class Restore(BaseOperation):
+        """
+        Operation that restores a previous version of the dataset.
+        """
+
         version: int
 
         def _to_inner(self):
