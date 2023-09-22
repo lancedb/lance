@@ -34,7 +34,7 @@ pub struct TraceGuard {
 
 #[pymethods]
 impl TraceGuard {
-    pub fn drop(&mut self) {
+    pub fn finish_tracing(&mut self) {
         self.guard.take();
     }
 }

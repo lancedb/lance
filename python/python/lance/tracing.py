@@ -20,4 +20,4 @@ def trace_to_chrome(*, file: str = None, level: str = None):
         or "error".  If None, then "info" is used.
     """
     guard = lance_trace_to_chrome(file, level)
-    atexit.register(lambda: guard.drop())
+    atexit.register(lambda: guard.finish_tracing())
