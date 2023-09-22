@@ -1,10 +1,10 @@
 import glob
 import os
-import pytest
 import subprocess
 import sys
 import uuid
 
+import pytest
 from lance.tracing import trace_to_chrome
 
 
