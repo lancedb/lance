@@ -28,7 +28,7 @@ class ImageURIType(pa.ExtensionType):
         return b""
 
     @classmethod
-    def __arrow_ext_deserialize__(cls, self, storage_type, serialized):
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
         return ImageURIType()
 
     def __arrow_ext_class__(self):
@@ -47,7 +47,7 @@ class EncodedImageType(pa.ExtensionType):
         return b""
 
     @classmethod
-    def __arrow_ext_deserialize__(cls, self, storage_type, serialized):
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
         return EncodedImageType()
 
     def __arrow_ext_class__(self):
@@ -66,11 +66,14 @@ class FixedShapeImageTensorType(pa.ExtensionType):
         )
 
     def __arrow_ext_serialize__(self):
-        return b""
+        return self.storage_type.__arrow_ext_serialize__()
 
     @classmethod
-    def __arrow_ext_deserialize__(cls, self, storage_type, serialized):
-        return FixedShapeImageTensorType()
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
+        import json
+
+        deserialized = json.loads(serialized.decode())
+        return FixedShapeImageTensorType(storage_type.value_type, deserialized["shape"])
 
     def __arrow_ext_class__(self):
         return FixedShapeImageTensorArray

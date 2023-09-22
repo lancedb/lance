@@ -194,16 +194,25 @@ def test_image_arrays(tmp_path: Path):
     with pytest.raises(ValueError, match="all input arrays must have the same shape"):
         encoded_image_array.image_to_tensor()
 
+
+@requires_pyarrow_12
+def test_roundtrip_image_tensor(tmp_path: Path):
+    import os
+
+    png_uris = [
+        "file://" + os.path.join(os.path.dirname(__file__), "images/1.png"),
+        os.path.join(os.path.dirname(__file__), "images/1.png"),
+    ] * 5
     uri_array = ImageURIArray.from_uris(png_uris)
     encoded_image_array = uri_array.read_uris()
     tensor_image_array = encoded_image_array.image_to_tensor()
 
-    # TODO: add tensor_image_array once it can be serialized
-    arrays = [uri_array, encoded_image_array, encoded_image_array]  # tensor_image_array
     tbl = pa.Table.from_arrays(
-        arrays, ["uri_array", "encoded_image_array", "tensor_image_array"]
+        [uri_array, encoded_image_array, tensor_image_array],
+        ["uri_array", "encoded_image_array", "tensor_image_array"],
     )
-
     lance.write_dataset(tbl, tmp_path)
     tbl2 = lance.dataset(tmp_path)
-    assert tbl2.to_table().to_pylist() == tbl.to_pylist()
+    indices = list(range(len(png_uris)))
+
+    assert tbl.take(indices).to_pylist() == tbl2.take(indices).to_pylist()
