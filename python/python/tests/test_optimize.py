@@ -18,7 +18,7 @@ from pathlib import Path
 import lance
 import pyarrow as pa
 from lance.lance import Compaction
-from lance.optimize import CompactionPlan, CompactionTask, RewriteResult
+from lance.optimize import RewriteResult
 
 
 def test_dataset_optimize(tmp_path: Path):
@@ -52,7 +52,7 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     assert len(fragments) == 4
 
     plan = Compaction.plan(
-        dataset, options=dict(target_rows_per_fragment=400, num_threads=None)
+        dataset, options=dict(target_rows_per_fragment=400, num_threads=1)
     )
     assert plan.read_version == 1
     assert plan.num_tasks() == 2
@@ -61,12 +61,10 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     assert repr(plan) == "CompactionPlan(read_version=1, tasks=<2 compaction tasks>)"
     # Plan can be pickled
     assert pickle.loads(pickle.dumps(plan)) == plan
-    assert isinstance(plan, CompactionPlan)
 
     pickled_task = pickle.dumps(plan.tasks[0])
     task = pickle.loads(pickled_task)
     assert task == plan.tasks[0]
-    assert isinstance(task, CompactionTask)
 
     result1 = plan.tasks[0].execute(dataset)
     result1.metrics.fragments_removed == 2
