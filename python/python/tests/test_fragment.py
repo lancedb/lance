@@ -52,7 +52,7 @@ def test_write_fragment_two_phases(tmp_path: Path):
     schema = pa.schema([pa.field("a", pa.int64())])
 
     operation = LanceOperation.Overwrite(schema, fragments)
-    dataset = LanceDataset._commit(tmp_path, operation)
+    dataset = LanceDataset.commit(tmp_path, operation)
 
     df = dataset.to_table().to_pandas()
     pd.testing.assert_frame_equal(
@@ -176,7 +176,3 @@ def test_fragment_meta():
         'Fragment { id: 0, files: [DataFile { path: "0.lance", fields: [0] },'
         ' DataFile { path: "1.lance", fields: [1] }], deletion_file: None }'
     )
-
-    # Can set id
-    meta.id = 1
-    assert meta.id == 1

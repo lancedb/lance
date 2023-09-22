@@ -378,7 +378,7 @@ def test_add_columns(tmp_path: Path):
     schema = dataset.schema.append(pa.field("c", pa.int64()))
 
     operation = lance.LanceOperation.Overwrite(schema, [fragment_metadata])
-    dataset = lance.LanceDataset._commit(base_dir, operation)
+    dataset = lance.LanceDataset.commit(base_dir, operation)
     assert dataset.schema == schema
 
     tbl = dataset.to_table()
@@ -393,7 +393,7 @@ def test_create_from_commit(tmp_path: Path):
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
 
     operation = lance.LanceOperation.Overwrite(table.schema, [fragment])
-    dataset = lance.LanceDataset._commit(base_dir, operation)
+    dataset = lance.LanceDataset.commit(base_dir, operation)
     tbl = dataset.to_table()
     assert tbl == table
 
@@ -409,9 +409,9 @@ def test_append_with_commit(tmp_path: Path):
 
     with pytest.raises(OSError):
         # Must specify read version
-        dataset = lance.LanceDataset._commit(base_dir, append)
+        dataset = lance.LanceDataset.commit(base_dir, append)
 
-    dataset = lance.LanceDataset._commit(base_dir, append, read_version=1)
+    dataset = lance.LanceDataset.commit(base_dir, append, read_version=1)
 
     tbl = dataset.to_table()
 
@@ -440,7 +440,7 @@ def test_delete_with_commit(tmp_path: Path):
         [updated_fragment], [fragments[1].fragment_id], "hello"
     )
 
-    dataset = lance.LanceDataset._commit(base_dir, delete, read_version=2)
+    dataset = lance.LanceDataset.commit(base_dir, delete, read_version=2)
 
     tbl = dataset.to_table()
     assert tbl == half_table
@@ -466,7 +466,7 @@ def test_rewrite_with_commit(tmp_path: Path):
     group = lance.LanceOperation.Rewrite.RewriteGroup(to_be_rewrote, [fragment])
     rewrite = lance.LanceOperation.Rewrite([group])
 
-    dataset = lance.LanceDataset._commit(base_dir, rewrite, read_version=1)
+    dataset = lance.LanceDataset.commit(base_dir, rewrite, read_version=1)
 
     tbl = dataset.to_table()
     assert tbl == combined
@@ -482,7 +482,7 @@ def test_restore_with_commit(tmp_path: Path):
     lance.write_dataset(table, base_dir, mode="append")
 
     restore = lance.LanceOperation.Restore(1)
-    dataset = lance.LanceDataset._commit(base_dir, restore)
+    dataset = lance.LanceDataset.commit(base_dir, restore)
 
     tbl = dataset.to_table()
     assert tbl == table
@@ -502,7 +502,7 @@ def test_merge_with_commit(tmp_path: Path):
     expected = pa.Table.from_pydict({"a": range(100), "b": range(100), "c": range(100)})
 
     merge = lance.LanceOperation.Merge([merged], expected.schema)
-    dataset = lance.LanceDataset._commit(base_dir, merge, read_version=1)
+    dataset = lance.LanceDataset.commit(base_dir, merge, read_version=1)
 
     tbl = dataset.to_table()
     assert tbl == expected
@@ -539,7 +539,7 @@ def test_deletion_file(tmp_path: Path):
     assert re.match("_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file())
     print(type(new_fragment), new_fragment)
     operation = lance.LanceOperation.Overwrite(table.schema, [new_fragment])
-    dataset = lance.LanceDataset._commit(base_dir, operation)
+    dataset = lance.LanceDataset.commit(base_dir, operation)
     assert dataset.count_rows() == 90
 
 
@@ -558,7 +558,7 @@ def test_commit_fragments_via_scanner(tmp_path: Path):
     assert fragment_metadata == unpickled
 
     operation = lance.LanceOperation.Overwrite(table.schema, [fragment_metadata])
-    dataset = lance.LanceDataset._commit(base_dir, operation)
+    dataset = lance.LanceDataset.commit(base_dir, operation)
     assert dataset.schema == table.schema
 
     tbl = dataset.to_table()
