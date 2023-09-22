@@ -26,36 +26,23 @@ To check the documentation examples, use
 pytest --doctest-modules python/lance
 ```
 
-## Formatting and linting Python
+## Formatting and linting
 
-To check the formatting, use
-
-```shell
-black --check python
-isort --check-only python
-ruff check python
-```
-
-To automatically fix, use
+To run formatters, run:
 
 ```shell
-black python
-isort python
-ruff python --fix
+make format
 ```
 
-## Formatting and linting Rust
+(To run for just Python or just Rust, use `make format-python` or `cargo fmt`.)
+
+To run format checker and linters, run:
 
 ```shell
-cargo fmt
-cargo clippy --all-features
+make lint
 ```
 
-Some lints can be fixed automatically:
-
-```shell
-cargo clippy --all-features --fix
-```
+(To run for just Python or just Rust, use `make lint-python` or `make lint-rust`.)
 
 ## Benchmarks
 

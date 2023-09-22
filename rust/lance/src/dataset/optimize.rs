@@ -248,7 +248,7 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
 /// A plan for what groups of fragments to compact.
 ///
 /// See [plan_compaction()] for more details.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompactionPlan {
     tasks: Vec<TaskData>,
     read_version: u64,
