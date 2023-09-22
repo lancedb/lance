@@ -549,7 +549,7 @@ fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
     }
 
     let mut merged = batches[0].clone();
-    for batch in batches.iter() {
+    for batch in batches.iter().skip(1) {
         merged = merged.merge(batch)?;
     }
     Ok(merged)

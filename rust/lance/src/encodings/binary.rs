@@ -22,20 +22,20 @@ use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
+use arrow_array::cast::AsArray;
 use arrow_array::{
     cast::as_primitive_array,
     new_empty_array,
     types::{BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, Utf8Type},
     Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, UInt32Array,
 };
-use arrow_buffer::{bit_util, ArrowNativeType, Buffer, MutableBuffer};
+use arrow_buffer::{bit_util, ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
 use arrow_cast::cast::cast;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
-use arrow_select::{concat::concat, take::take};
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
 use super::Encoder;
@@ -184,6 +184,25 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
         Ok(Arc::new(as_primitive_array(&values).clone()))
     }
 
+    fn count_nulls<O: OffsetSizeTrait>(offsets: &ScalarBuffer<O>) -> (usize, Option<Buffer>) {
+        let mut null_count = 0;
+        let mut null_buf = MutableBuffer::new_null(offsets.len() - 1);
+        offsets.windows(2).enumerate().for_each(|(idx, w)| {
+            if w[0] == w[1] {
+                bit_util::unset_bit(null_buf.as_mut(), idx);
+                null_count += 1;
+            } else {
+                bit_util::set_bit(null_buf.as_mut(), idx);
+            }
+        });
+        let null_buf = if null_count > 0 {
+            Some(null_buf.into())
+        } else {
+            None
+        };
+        (null_count, null_buf)
+    }
+
     /// Read the array with batch positions and range.
     ///
     /// Parameters
@@ -218,19 +237,10 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
 
         // Count nulls
         if self.nullable {
-            let mut null_count = 0;
-            let mut null_buf = MutableBuffer::new_null(self.length);
-            slice.values().windows(2).enumerate().for_each(|(idx, w)| {
-                if w[0] == w[1] {
-                    bit_util::unset_bit(null_buf.as_mut(), idx);
-                    null_count += 1;
-                } else {
-                    bit_util::set_bit(null_buf.as_mut(), idx);
-                }
-            });
+            let (null_count, null_buf) = Self::count_nulls(slice.values());
             data_builder = data_builder
                 .null_count(null_count)
-                .null_bit_buffer(Some(null_buf.into()));
+                .null_bit_buffer(null_buf);
         }
 
         // TODO: replace this with safe method once arrow-rs 47.0.0 comes out.
@@ -253,42 +263,54 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
 
         Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
     }
-
-    async fn take_internal(
-        &self,
-        positions: &Int64Array,
-        indices: &UInt32Array,
-    ) -> Result<ArrayRef> {
-        let start = indices.value(0);
-        let end = indices.value(indices.len() - 1);
-        let array = self
-            .get_range(positions, start as usize..end as usize + 1)
-            .await?;
-        let adjusted_offsets = subtract_scalar(indices, start)?;
-        Ok(take(&array, &adjusted_offsets, None)?)
-    }
 }
 
+#[derive(Debug)]
+struct TakeChunksPlan {
+    indices: UInt32Array,
+    is_contiguous: bool,
+}
+
+/// Group the indices into chunks, such that either:
+/// 1. the indices are contiguous (and non-repeating)
+/// 2. the values are within `min_io_size` of each other (and thus are worth
+///    grabbing in a single request)
 fn plan_take_chunks(
     positions: &Int64Array,
     indices: &UInt32Array,
     min_io_size: i64,
-) -> Result<Vec<UInt32Array>> {
+) -> Result<Vec<TakeChunksPlan>> {
     let start = indices.value(0);
     let indices = subtract_scalar(indices, start)?;
 
-    let mut chunks: Vec<UInt32Array> = vec![];
+    let mut chunks: Vec<TakeChunksPlan> = vec![];
     let mut start_idx = 0;
+    let mut last_idx: i64 = -1;
+    let mut is_contiguous = true;
     for i in 0..indices.len() {
         let current = indices.value(i) as usize;
-        if positions.value(current) - positions.value(indices.value(start_idx) as usize)
-            > min_io_size
+        let curr_contiguous = current == start_idx || current as i64 - last_idx == 1;
+
+        if !curr_contiguous
+            && positions.value(current) - positions.value(indices.value(start_idx) as usize)
+                > min_io_size
         {
-            chunks.push(as_primitive_array(&indices.slice(start_idx, i - start_idx)).clone());
+            chunks.push(TakeChunksPlan {
+                indices: as_primitive_array(&indices.slice(start_idx, i - start_idx)).clone(),
+                is_contiguous,
+            });
             start_idx = i;
+            is_contiguous = true;
+        } else {
+            is_contiguous &= curr_contiguous;
         }
+
+        last_idx = current as i64;
     }
-    chunks.push(as_primitive_array(&indices.slice(start_idx, indices.len() - start_idx)).clone());
+    chunks.push(TakeChunksPlan {
+        indices: as_primitive_array(&indices.slice(start_idx, indices.len() - start_idx)).clone(),
+        is_contiguous,
+    });
 
     Ok(chunks)
 }
@@ -299,6 +321,9 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
         self.get(..).await
     }
 
+    /// Take the values at the given indices.
+    ///
+    /// This function assumes indices are sorted.
     async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
         if indices.is_empty() {
             return Ok(new_empty_array(&T::DATA_TYPE));
@@ -313,23 +338,88 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
         let positions = self
             .get_positions(start as usize..(end + 1) as usize)
             .await?;
+        // Use indices and positions to pre-allocate an exact-size buffer
+        let capacity = indices
+            .iter()
+            .map(|i| {
+                let relative_index = (i.unwrap() - start) as usize;
+                let start = positions.value(relative_index) as usize;
+                let end = positions.value(relative_index + 1) as usize;
+                end - start
+            })
+            .sum();
+        let mut buffer = MutableBuffer::with_capacity(capacity);
+
+        let offsets_capacity = std::mem::size_of::<T::Offset>() * (indices.len() + 1);
+        let mut offsets = MutableBuffer::with_capacity(offsets_capacity);
+        let mut offset = T::Offset::from_usize(0).unwrap();
+        // Safety: We allocated appropriate capacity just above.
+        unsafe {
+            offsets.push_unchecked(offset);
+        }
+
         let chunks = plan_take_chunks(&positions, indices, MIN_IO_SIZE)?;
 
-        let arrays = stream::iter(chunks)
-            .zip(repeat_with(|| positions.clone()))
-            .map(|(indices, positions)| async move {
-                self.take_internal(positions.as_ref(), &indices).await
+        let positions_ref = positions.as_ref();
+        futures::stream::iter(chunks)
+            .map(|chunk| async move {
+                let chunk_offset = chunk.indices.value(0);
+                let chunk_end = chunk.indices.value(chunk.indices.len() - 1);
+                let array = self
+                    .get_range(positions_ref, chunk_offset as usize..chunk_end as usize + 1)
+                    .await?;
+                Result::Ok((chunk, chunk_offset, array))
             })
             .buffered(num_cpus::get())
-            .try_collect::<Vec<_>>()
+            .try_for_each(|(chunk, chunk_offset, array)| {
+                let array: &GenericByteArray<T> = array.as_bytes();
+
+                // Faster to do one large memcpy than O(n) small ones.
+                if chunk.is_contiguous {
+                    buffer.extend_from_slice(array.value_data());
+                }
+
+                // Append each value to the buffer in the correct order
+                for index in chunk.indices.values() {
+                    if !chunk.is_contiguous {
+                        let value = array.value((index - chunk_offset) as usize);
+                        let value_ref: &[u8] = value.as_ref();
+                        buffer.extend_from_slice(value_ref);
+                    }
+
+                    offset += array.value_length((index - chunk_offset) as usize);
+                    // Append next offset
+                    // Safety: We allocated appropriate capacity on initialization
+                    unsafe {
+                        offsets.push_unchecked(offset);
+                    }
+                }
+                futures::future::ready(Ok(()))
+            })
             .await?;
-        Ok(concat(
-            arrays
-                .iter()
-                .map(|a| a.as_ref())
-                .collect::<Vec<_>>()
-                .as_slice(),
-        )?)
+
+        let mut data_builder = ArrayDataBuilder::new(T::DATA_TYPE)
+            .len(indices.len())
+            .null_count(0);
+
+        let offsets: ScalarBuffer<T::Offset> = ScalarBuffer::from(Buffer::from(offsets));
+
+        // We should have pre-sized perfectly.
+        debug_assert_eq!(buffer.len(), capacity);
+
+        if self.nullable {
+            let (null_count, null_buf) = Self::count_nulls(&offsets);
+            data_builder = data_builder
+                .null_count(null_count)
+                .null_bit_buffer(null_buf);
+        }
+
+        let array_data = data_builder
+            .add_buffer(offsets.into_inner())
+            .add_buffer(buffer.into())
+            .build()?;
+
+        Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
     }
 }
 
@@ -569,13 +659,9 @@ mod tests {
         let indices = UInt32Array::from_iter_values([1, 999998]);
         let chunks = plan_take_chunks(positions.as_ref(), &indices, 64 * 1024).unwrap();
         // Relative offset within the positions.
-        assert_eq!(
-            chunks,
-            vec![
-                UInt32Array::from_iter_values([0]),
-                UInt32Array::from_iter_values([999997])
-            ]
-        );
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].indices, UInt32Array::from_iter_values([0]),);
+        assert_eq!(chunks[1].indices, UInt32Array::from_iter_values([999997]),);
 
         let actual = decoder
             .take(&UInt32Array::from_iter_values([1, 999998]))
@@ -584,6 +670,53 @@ mod tests {
         assert_eq!(
             actual.as_ref(),
             &StringArray::from_iter_values(["string-1", "string-999998"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_dense_indices() {
+        let data = StringArray::from_iter_values((0..1000000).map(|v| format!("string-{v}")));
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/bar");
+        let pos = write_test_data(&store, &path, &[&data]).await.unwrap();
+
+        let reader = store.open(&path).await.unwrap();
+        let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
+
+        let positions = decoder.get_positions(1..999998).await.unwrap();
+        let indices = UInt32Array::from_iter_values([
+            2, 3, 4, 1001, 1001, 1002, 2001, 2002, 2004, 3004, 3005,
+        ]);
+
+        let chunks = plan_take_chunks(positions.as_ref(), &indices, 1024).unwrap();
+        assert_eq!(chunks.len(), 4);
+        // A contiguous range.
+        assert_eq!(chunks[0].indices, UInt32Array::from_iter_values(0..3));
+        assert!(chunks[0].is_contiguous);
+        // Not contiguous because of repeats
+        assert_eq!(
+            chunks[1].indices,
+            UInt32Array::from_iter_values([999, 999, 1000])
+        );
+        assert!(!chunks[1].is_contiguous);
+        // Not contiguous because of gaps
+        assert_eq!(
+            chunks[2].indices,
+            UInt32Array::from_iter_values([1999, 2000, 2002])
+        );
+        assert!(!chunks[2].is_contiguous);
+        // Another contiguous range, this time after non-contiguous ones
+        assert_eq!(
+            chunks[3].indices,
+            UInt32Array::from_iter_values([3002, 3003])
+        );
+        assert!(chunks[3].is_contiguous);
+
+        let actual = decoder.take(&indices).await.unwrap();
+        assert_eq!(
+            actual.as_ref(),
+            &StringArray::from_iter_values(indices.values().iter().map(|v| format!("string-{v}")))
         );
     }
 
