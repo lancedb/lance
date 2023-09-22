@@ -337,8 +337,8 @@ impl FileFragment {
     }
 
     #[getter]
-    fn fragment_length(&self) -> PyResult<usize> {
-        RT.block_on(None, self.fragment.fragment_length())
+    fn physical_rows(&self) -> PyResult<usize> {
+        RT.block_on(None, self.fragment.physical_rows())
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 }

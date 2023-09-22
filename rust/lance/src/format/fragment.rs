@@ -123,7 +123,7 @@ pub struct Fragment {
 
     /// Original number of rows in the fragment. If this is zero, then it is
     /// unknown.
-    pub fragment_length: usize,
+    pub physical_rows: usize,
 }
 
 impl Fragment {
@@ -132,12 +132,12 @@ impl Fragment {
             id,
             files: vec![],
             deletion_file: None,
-            fragment_length: 0,
+            physical_rows: 0,
         }
     }
 
     pub fn num_rows(&self) -> Option<usize> {
-        match (self.fragment_length, &self.deletion_file) {
+        match (self.physical_rows, &self.deletion_file) {
             // Unknown fragment length
             (0, _) => None,
             // Known fragment length, no deletion file.
@@ -154,12 +154,12 @@ impl Fragment {
     }
 
     /// Create a `Fragment` with one DataFile
-    pub fn with_file(id: u64, path: &str, schema: &Schema, fragment_length: usize) -> Self {
+    pub fn with_file(id: u64, path: &str, schema: &Schema, physical_rows: usize) -> Self {
         Self {
             id,
             files: vec![DataFile::new(path, schema)],
             deletion_file: None,
-            fragment_length,
+            physical_rows,
         }
     }
 
@@ -182,7 +182,7 @@ impl From<&pb::DataFragment> for Fragment {
             id: p.id,
             files: p.files.iter().map(DataFile::from).collect(),
             deletion_file: p.deletion_file.as_ref().map(DeletionFile::from),
-            fragment_length: p.fragment_length as usize,
+            physical_rows: p.physical_rows as usize,
         }
     }
 }
@@ -205,7 +205,7 @@ impl From<&Fragment> for pb::DataFragment {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
             deletion_file,
-            fragment_length: f.fragment_length as u64,
+            physical_rows: f.physical_rows as u64,
         }
     }
 }
@@ -292,7 +292,7 @@ mod tests {
                     {"path": "foobar.lance", "fields": [0]}],
                      "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
                                        "num_deleted_rows": 10},
-                "fragment_length": 0}),
+                "physical_rows": 0}),
         );
 
         let frag2 = Fragment::from_json(&json).unwrap();

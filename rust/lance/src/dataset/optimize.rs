@@ -210,7 +210,7 @@ pub async fn compact_files(
 #[derive(Debug)]
 struct FragmentMetrics {
     /// The number of original rows in the fragment
-    pub fragment_length: usize,
+    pub physical_rows: usize,
     /// The number of rows that have been deleted
     pub num_deletions: usize,
 }
@@ -218,8 +218,8 @@ struct FragmentMetrics {
 impl FragmentMetrics {
     /// The fraction of rows that have been deleted
     fn deletion_percentage(&self) -> f32 {
-        if self.fragment_length > 0 {
-            self.num_deletions as f32 / self.fragment_length as f32
+        if self.physical_rows > 0 {
+            self.num_deletions as f32 / self.physical_rows as f32
         } else {
             0.0
         }
@@ -227,17 +227,17 @@ impl FragmentMetrics {
 
     /// The number of rows that are still in the fragment
     fn num_rows(&self) -> usize {
-        self.fragment_length - self.num_deletions
+        self.physical_rows - self.num_deletions
     }
 }
 
 async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
-    let fragment_length = fragment.fragment_length();
+    let physical_rows = fragment.physical_rows();
     let num_deletions = fragment.count_deletions();
-    let (fragment_length, num_deletions) =
-        futures::future::try_join(fragment_length, num_deletions).await?;
+    let (physical_rows, num_deletions) =
+        futures::future::try_join(physical_rows, num_deletions).await?;
     Ok(FragmentMetrics {
-        fragment_length,
+        physical_rows,
         num_deletions,
     })
 }
@@ -432,7 +432,7 @@ pub async fn plan_compaction(
             && metrics.deletion_percentage() > options.materialize_deletions_threshold
         {
             Some(CompactionCandidacy::CompactItself)
-        } else if metrics.fragment_length < options.target_rows_per_fragment {
+        } else if metrics.physical_rows < options.target_rows_per_fragment {
             // Only want to compact if their are neighbors to compact such that
             // we can get a larger fragment.
             Some(CompactionCandidacy::CompactWithNeighbors)
@@ -633,7 +633,7 @@ mod tests {
             id: 0,
             files: vec![],
             deletion_file: None,
-            fragment_length: 0,
+            physical_rows: 0,
         };
         let single_bin = CandidateBin {
             fragments: vec![fragment.clone()],

@@ -500,11 +500,11 @@ pub(crate) async fn commit_new_dataset(
 
 /// Update manifest with new metadata fields.
 ///
-/// Fields such as `fragment_length` and `num_deleted_rows` may not have been
+/// Fields such as `physical_rows` and `num_deleted_rows` may not have been
 /// in older datasets. To bring these old manifests up-to-date, we add them here.
 async fn migrate_manifest(dataset: &Dataset, manifest: &mut Manifest) -> Result<()> {
     if manifest.fragments.iter().all(|f| {
-        f.fragment_length > 0
+        f.physical_rows > 0
             && (f.deletion_file.is_none()
                 || f.deletion_file
                     .as_ref()
@@ -519,11 +519,11 @@ async fn migrate_manifest(dataset: &Dataset, manifest: &mut Manifest) -> Result<
 
     let new_fragments = futures::stream::iter(manifest.fragments.as_ref())
         .map(|fragment| async {
-            let fragment_length = if fragment.fragment_length == 0 {
+            let physical_rows = if fragment.physical_rows == 0 {
                 let file_fragment = FileFragment::new(dataset.clone(), fragment.clone());
                 Either::Left(async move { file_fragment.count_rows().await })
             } else {
-                Either::Right(futures::future::ready(Ok(fragment.fragment_length)))
+                Either::Right(futures::future::ready(Ok(fragment.physical_rows)))
             };
             let num_deleted_rows = match &fragment.deletion_file {
                 None => Either::Left(futures::future::ready(Ok(0))),
@@ -541,8 +541,8 @@ async fn migrate_manifest(dataset: &Dataset, manifest: &mut Manifest) -> Result<
                 }),
             };
 
-            let (fragment_length, num_deleted_rows) =
-                futures::future::try_join(fragment_length, num_deleted_rows).await?;
+            let (physical_rows, num_deleted_rows) =
+                futures::future::try_join(physical_rows, num_deleted_rows).await?;
 
             let deletion_file = fragment
                 .deletion_file
@@ -553,7 +553,7 @@ async fn migrate_manifest(dataset: &Dataset, manifest: &mut Manifest) -> Result<
                 });
 
             Ok::<_, Error>(Fragment {
-                fragment_length,
+                physical_rows,
                 deletion_file,
                 ..fragment.clone()
             })
