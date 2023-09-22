@@ -46,6 +46,7 @@ half = { "version" = "=2.2.1", default-features = false, features = [
 ] }
 approx = "0.5.1"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
+either = "1.0"
 futures = "0.3"
 log = "0.4"
 num_cpus = "1.0"

@@ -628,7 +628,13 @@ mod tests {
 
     #[test]
     fn test_conflicts() {
-        let index0 = Index::new(uuid::Uuid::new_v4(), "test", &[0], 1);
+        let index0 = Index {
+            uuid: uuid::Uuid::new_v4(),
+            name: "test".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: None,
+        };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
         let fragment2 = Fragment::new(2);

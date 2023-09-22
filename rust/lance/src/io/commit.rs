@@ -41,18 +41,21 @@ use std::{fmt::Debug, sync::atomic::AtomicBool};
 pub(crate) mod dynamodb;
 pub(crate) mod external_manifest;
 
+use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig};
-use crate::Dataset;
+use crate::format::{DeletionFile, Fragment};
 use crate::Result;
 use crate::{format::pb, format::Index, format::Manifest};
-use futures::future::BoxFuture;
+use crate::{Dataset, Error};
+use futures::future::{BoxFuture, Either};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::Error as ObjectStoreError;
 use prost::Message;
 
+use super::deletion::read_deletion_file;
 use super::ObjectStore;
 use snafu::{location, Location};
 /// Function that writes the manifest to the object store.
@@ -496,6 +499,106 @@ pub(crate) async fn commit_new_dataset(
     Ok(manifest)
 }
 
+/// Update manifest with new metadata fields.
+///
+/// Fields such as `physical_rows` and `num_deleted_rows` may not have been
+/// in older datasets. To bring these old manifests up-to-date, we add them here.
+async fn migrate_manifest(dataset: &Dataset, manifest: &mut Manifest) -> Result<()> {
+    if manifest.fragments.iter().all(|f| {
+        f.physical_rows > 0
+            && (f.deletion_file.is_none()
+                || f.deletion_file
+                    .as_ref()
+                    .map(|d| d.num_deleted_rows)
+                    .unwrap_or_default()
+                    > 0)
+    }) {
+        return Ok(());
+    }
+
+    let dataset = Arc::new(dataset.clone());
+
+    let new_fragments = futures::stream::iter(manifest.fragments.as_ref())
+        .map(|fragment| async {
+            let physical_rows = if fragment.physical_rows == 0 {
+                let file_fragment = FileFragment::new(dataset.clone(), fragment.clone());
+                Either::Left(async move { file_fragment.count_rows().await })
+            } else {
+                Either::Right(futures::future::ready(Ok(fragment.physical_rows)))
+            };
+            let num_deleted_rows = match &fragment.deletion_file {
+                None => Either::Left(futures::future::ready(Ok(0))),
+                Some(deletion_file) if deletion_file.num_deleted_rows > 0 => {
+                    Either::Left(futures::future::ready(Ok(deletion_file.num_deleted_rows)))
+                }
+                Some(_) => Either::Right(async {
+                    let deletion_vector =
+                        read_deletion_file(&dataset.base, fragment, dataset.object_store()).await?;
+                    if let Some(deletion_vector) = deletion_vector {
+                        Ok(deletion_vector.len())
+                    } else {
+                        Ok(0)
+                    }
+                }),
+            };
+
+            let (physical_rows, num_deleted_rows) =
+                futures::future::try_join(physical_rows, num_deleted_rows).await?;
+
+            let deletion_file = fragment
+                .deletion_file
+                .as_ref()
+                .map(|deletion_file| DeletionFile {
+                    num_deleted_rows,
+                    ..deletion_file.clone()
+                });
+
+            Ok::<_, Error>(Fragment {
+                physical_rows,
+                deletion_file,
+                ..fragment.clone()
+            })
+        })
+        .buffered(num_cpus::get() * 2)
+        .boxed();
+
+    manifest.fragments = Arc::new(new_fragments.try_collect().await?);
+
+    Ok(())
+}
+
+/// Update indices with new fields.
+///
+/// Indices might be missing `fragment_bitmap`, so this function will add it.
+async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()> {
+    // Early return so we have a fast path if they are already migrated.
+    if indices.iter().all(|i| i.fragment_bitmap.is_some()) {
+        return Ok(());
+    }
+
+    for index in indices {
+        if index.fragment_bitmap.is_none() {
+            // Load the read version of the index
+            let old_version = match dataset.checkout_version(index.dataset_version).await {
+                Ok(dataset) => dataset,
+                // If the version doesn't exist anymore, skip it.
+                Err(crate::Error::DatasetNotFound { .. }) => continue,
+                // Any other error we return.
+                Err(e) => return Err(e),
+            };
+            index.fragment_bitmap = Some(
+                old_version
+                    .get_fragments()
+                    .iter()
+                    .map(|f| f.id() as u32)
+                    .collect(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
 pub(crate) async fn commit_transaction(
     dataset: &Dataset,
@@ -543,7 +646,7 @@ pub(crate) async fn commit_transaction(
 
     for _ in 0..commit_config.num_retries {
         // Build an up-to-date manifest from the transaction and current manifest
-        let (mut manifest, indices) = match transaction.operation {
+        let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
                 Transaction::restore_old_manifest(
                     object_store,
@@ -563,6 +666,10 @@ pub(crate) async fn commit_transaction(
         };
 
         manifest.version = target_version;
+
+        migrate_manifest(&dataset, &mut manifest).await?;
+
+        migrate_indices(&dataset, &mut indices).await?;
 
         // Try to commit the manifest
         let result = write_manifest_file(

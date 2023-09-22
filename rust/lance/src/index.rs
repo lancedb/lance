@@ -164,7 +164,13 @@ impl DatasetIndexExt for Dataset {
             }
         }
 
-        let new_idx = IndexMetadata::new(index_id, &index_name, &[field.id], self.manifest.version);
+        let new_idx = IndexMetadata {
+            uuid: index_id,
+            name: index_name,
+            fields: vec![field.id],
+            dataset_version: self.manifest.version,
+            fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+        };
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::CreateIndex {

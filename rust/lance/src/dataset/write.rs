@@ -141,14 +141,17 @@ pub async fn write_fragments(
         }
 
         if num_rows_in_current_file >= params.max_rows_per_file {
-            writer.take().unwrap().finish().await?;
+            let num_rows = writer.take().unwrap().finish().await?;
+            debug_assert_eq!(num_rows, num_rows_in_current_file);
+            fragments.last_mut().unwrap().physical_rows = num_rows;
             num_rows_in_current_file = 0;
         }
     }
 
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
-        writer.finish().await?;
+        let num_rows = writer.finish().await?;
+        fragments.last_mut().unwrap().physical_rows = num_rows;
     }
 
     Ok(fragments)

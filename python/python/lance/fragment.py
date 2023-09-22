@@ -201,6 +201,21 @@ class LanceFragment(pa.dataset.Fragment):
             raise ValueError("Does not support filter at the moment")
         return self._fragment.count_rows()
 
+    @property
+    def num_deletions(self) -> int:
+        """Return the number of deleted rows in this fragment."""
+        return self._fragment.num_deletions
+
+    @property
+    def physical_rows(self) -> int:
+        """
+        Return the number of rows originally in this fragment.
+
+        To get the number of rows after deletions, use
+        :meth:`count_rows` instead.
+        """
+        return self._fragment.physical_rows
+
     def head(self, num_rows: int) -> pa.Table:
         return self.scanner(limit=num_rows).to_table()
 
@@ -314,7 +329,7 @@ class LanceFragment(pa.dataset.Fragment):
         >>> dataset = lance.write_dataset(tab, "dataset")
         >>> frag = dataset.get_fragment(0)
         >>> frag.delete("a > 1")
-        Fragment { id: 0, files: ..., deletion_file: Some(...) }
+        Fragment { id: 0, files: ..., deletion_file: Some(...), physical_rows: 3 }
         >>> frag.delete("a > 0") is None
         True
         """

@@ -36,6 +36,7 @@ use lance::index::{
 use lance::io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use pyo3::prelude::*;
+use pyo3::types::PySet;
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
@@ -233,6 +234,13 @@ impl Dataset {
                     .map(|f| f.name.clone())
                     .collect::<Vec<_>>();
 
+                let fragment_set = PySet::empty(py).unwrap();
+                if let Some(bitmap) = &idx.fragment_bitmap {
+                    for fragment_id in bitmap.iter() {
+                        fragment_set.add(fragment_id).unwrap();
+                    }
+                }
+
                 dict.set_item("name", idx.name.clone()).unwrap();
                 // TODO: once we add more than vector indices, we need to:
                 // 1. Change protos and write path to persist index type
@@ -242,6 +250,7 @@ impl Dataset {
                 dict.set_item("uuid", idx.uuid.to_string()).unwrap();
                 dict.set_item("fields", field_names).unwrap();
                 dict.set_item("version", idx.dataset_version).unwrap();
+                dict.set_item("fragment_ids", fragment_set).unwrap();
                 dict.to_object(py)
             })
             .collect::<Vec<_>>())

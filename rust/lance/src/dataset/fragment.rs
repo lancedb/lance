@@ -81,7 +81,7 @@ impl FileFragment {
 
         let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
         let filename = format!("{}.lance", Uuid::new_v4());
-        let fragment = Fragment::with_file(id as u64, &filename, &schema);
+        let mut fragment = Fragment::with_file(id as u64, &filename, &schema, 0);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
 
@@ -93,8 +93,7 @@ impl FileFragment {
             writer.write(&batch).await?;
         }
 
-        // Params.max_rows_per_file is ignored in this case.
-        writer.finish().await?;
+        fragment.physical_rows = writer.finish().await?;
 
         progress.complete(&fragment).await?;
 
@@ -105,8 +104,14 @@ impl FileFragment {
         filename: &str,
         schema: &Schema,
         fragment_id: usize,
+        physical_rows: Option<usize>,
     ) -> Result<Fragment> {
-        let fragment = Fragment::with_file(fragment_id as u64, filename, schema);
+        let fragment = Fragment::with_file(
+            fragment_id as u64,
+            filename,
+            schema,
+            physical_rows.unwrap_or_default(),
+        );
         Ok(fragment)
     }
 
@@ -170,7 +175,7 @@ impl FileFragment {
 
     /// Count the rows in this fragment.
     pub async fn count_rows(&self) -> Result<usize> {
-        let total_rows = self.fragment_length();
+        let total_rows = self.physical_rows();
 
         let deletion_count = self.count_deletions();
 
@@ -180,27 +185,37 @@ impl FileFragment {
         Ok(total_rows - deletion_count)
     }
 
-    pub(crate) async fn count_deletions(&self) -> Result<usize> {
-        read_deletion_file(
-            &self.dataset.base,
-            &self.metadata,
-            self.dataset.object_store(),
-        )
-        .map_ok(|v| v.map(|v| v.len()).unwrap_or_default())
-        .await
+    /// Get the number of rows that have been deleted in this fragment.
+    pub async fn count_deletions(&self) -> Result<usize> {
+        match &self.metadata().deletion_file {
+            Some(f) if f.num_deleted_rows > 0 => Ok(f.num_deleted_rows),
+            _ => {
+                read_deletion_file(
+                    &self.dataset.base,
+                    &self.metadata,
+                    self.dataset.object_store(),
+                )
+                .map_ok(|v| v.map(|v| v.len()).unwrap_or_default())
+                .await
+            }
+        }
     }
 
     /// Get the number of physical rows in the fragment. This includes deleted rows.
     ///
     /// If there are no deleted rows, this is equal to the number of rows in the
     /// fragment.
-    pub async fn fragment_length(&self) -> Result<usize> {
+    pub async fn physical_rows(&self) -> Result<usize> {
         if self.metadata.files.is_empty() {
             return Err(Error::IO {
                 message: format!("Fragment {} does not contain any data", self.id()),
                 location: location!(),
             });
         };
+
+        if self.metadata.physical_rows > 0 {
+            return Ok(self.metadata.physical_rows);
+        }
 
         // Just open any file. All of them should have same size.
         let path = self
@@ -481,24 +496,24 @@ impl FileFragment {
 
         // TODO: could we keep the number of rows in memory when we first get
         // the fragment metadata?
-        let fragment_length = self.fragment_length().await?;
-        if deletion_vector.len() == fragment_length
-            && deletion_vector.contains_range(0..fragment_length as u32)
+        let physical_rows = self.physical_rows().await?;
+        if deletion_vector.len() == physical_rows
+            && deletion_vector.contains_range(0..physical_rows as u32)
         {
             return Ok(None);
-        } else if deletion_vector.len() >= fragment_length {
+        } else if deletion_vector.len() >= physical_rows {
             let dv_len = deletion_vector.len();
             let examples: Vec<u32> = deletion_vector
                 .into_iter()
-                .filter(|x| *x >= fragment_length as u32)
+                .filter(|x| *x >= physical_rows as u32)
                 .take(5)
                 .collect();
             return Err(Error::Internal {
                 message: format!(
                     "Deletion vector includes rows that aren't in the fragment. \
-                Fragment length: {}; Deletion vector length: {}; \
+                Num physical rows {}; Deletion vector length: {}; \
                 Examples: {:?}",
-                    fragment_length, dv_len, examples
+                    physical_rows, dv_len, examples
                 ),
             });
         }
@@ -846,7 +861,7 @@ mod tests {
 
         let mut fragments: Vec<Fragment> = Vec::new();
         for (idx, path) in paths.iter().enumerate() {
-            let f = FileFragment::create_from_file(path, schema, idx)
+            let f = FileFragment::create_from_file(path, schema, idx, None)
                 .await
                 .unwrap();
             fragments.push(f)
@@ -860,6 +875,16 @@ mod tests {
         let new_dataset = Dataset::commit(test_uri, op, None, None).await.unwrap();
 
         assert_eq!(new_dataset.count_rows().await.unwrap(), dataset_rows);
+
+        // Fragments will have number of rows recorded in metadata, even though
+        // we passed `None` when constructing the `FileFragment`.
+        let fragments = new_dataset.get_fragments();
+        assert_eq!(fragments.len(), 5);
+        for f in fragments {
+            assert_eq!(f.metadata.num_rows(), Some(40));
+            assert_eq!(f.count_rows().await.unwrap(), 40);
+            assert_eq!(f.metadata().deletion_file, None);
+        }
     }
 
     #[tokio::test]
@@ -870,7 +895,8 @@ mod tests {
         let fragment = dataset.get_fragments().pop().unwrap();
 
         assert_eq!(fragment.count_rows().await.unwrap(), 40);
-        assert_eq!(fragment.fragment_length().await.unwrap(), 40);
+        assert_eq!(fragment.physical_rows().await.unwrap(), 40);
+        assert!(fragment.metadata.deletion_file.is_none());
 
         let fragment = fragment
             .delete("i >= 160 and i <= 172")
@@ -881,7 +907,12 @@ mod tests {
         fragment.validate().await.unwrap();
 
         assert_eq!(fragment.count_rows().await.unwrap(), 27);
-        assert_eq!(fragment.fragment_length().await.unwrap(), 40);
+        assert_eq!(fragment.physical_rows().await.unwrap(), 40);
+        assert!(fragment.metadata.deletion_file.is_some());
+        assert_eq!(
+            fragment.metadata.deletion_file.unwrap().num_deleted_rows,
+            13
+        );
     }
 
     #[tokio::test]
