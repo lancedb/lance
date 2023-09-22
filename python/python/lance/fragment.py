@@ -64,16 +64,6 @@ class FragmentMetadata:
         """Reconstruct :class:`FragmentMetadata` from a JSON blob"""
         return FragmentMetadata(json_data)
 
-    @property
-    def id(self) -> int:
-        """Return the ID of the fragment"""
-        return self._metadata.id
-
-    @id.setter
-    def id(self, id: int):
-        """Set the ID of the fragment"""
-        self._metadata.id = id
-
     def data_files(self) -> Iterator[str]:
         """Return the data files of the fragment"""
         return self._metadata.data_files()

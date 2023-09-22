@@ -910,9 +910,10 @@ class LanceOperation:
         Examples
         --------
 
-        To append new rows to a dataset, first use :meth:`lance.fragment.LanceFragment.create`
-        to create fragments. Then collect the fragment metadata into a list and pass it
-        to this class. Finally, pass the operation to the :meth:`LanceDataset.commit`
+        To append new rows to a dataset, first use
+        :meth:`lance.fragment.LanceFragment.create` to create fragments. Then
+        collect the fragment metadata into a list and pass it to this class.
+        Finally, pass the operation to the :meth:`LanceDataset.commit`
         method to create the new dataset.
 
         >>> import lance
