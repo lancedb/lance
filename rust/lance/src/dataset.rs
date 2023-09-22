@@ -19,6 +19,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use arrow_array::{
     cast::as_struct_array, RecordBatch, RecordBatchReader, StructArray, UInt64Array,
 };
@@ -932,11 +934,7 @@ impl Dataset {
                 .ok_or_else(|| Error::Internal {
                     message: "ROW_ID column not found".into(),
                 })?
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| Error::Internal {
-                    message: "ROW_ID column is not UInt64Array".into(),
-                })?
+                .as_primitive::<UInt64Type>()
                 .values();
 
             let remapping_index: UInt64Array = row_ids

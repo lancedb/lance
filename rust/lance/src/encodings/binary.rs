@@ -321,7 +321,7 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
         self.get(..).await
     }
 
-    /// Take the values are the given indices.
+    /// Take the values at the given indices.
     ///
     /// This function assumes indices are sorted.
     async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
