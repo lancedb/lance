@@ -26,13 +26,14 @@ def test_tracing():
     os.remove(new_trace_file)
 
     some_uuid = uuid.uuid4()
-    trace_name = "{some_uuid}.json"
+    trace_name = f"{some_uuid}.json"
 
     subprocess.run(
         [
             sys.executable,
             "-c",
-            f"from lance.tracing import trace_to_chrome; trace_to_chrome(file='{trace_name}')",
+            f"from lance.tracing import trace_to_chrome;"
+            + "trace_to_chrome(file='{trace_name}')",
         ],
         check=True,
     )
