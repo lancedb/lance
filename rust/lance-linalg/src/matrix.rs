@@ -17,10 +17,13 @@
 
 use std::sync::Arc;
 
+use arrow_array::{FixedSizeListArray, Float16Array, cast::AsArray};
+use arrow_schema::{DataType, ArrowError};
+use lance_arrow::{FloatArray, FloatType};
 use num_traits::{AsPrimitive, Float, FromPrimitive, ToPrimitive};
 use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
 
-use lance_arrow::FloatArray;
+use crate::{Error, Result};
 
 /// Transpose a matrix.
 fn transpose<T: Float>(input: &[T], dimension: usize) -> Vec<T> {
@@ -278,6 +281,32 @@ where
             data: self,
             cur_idx: 0,
         }
+    }
+}
+
+impl<T: FloatArray> TryFrom<&FixedSizeListArray> for MatrixView<T>
+where
+    Standard: rand::distributions::Distribution<<T as FloatArray>::Native>,
+{
+    type Error = Error;
+
+    fn try_from(value: &FixedSizeListArray) -> Result<Self> {
+        match (value.value_type(), T::DATA_TYPE) {
+            (DataType::Float16, FloatType::Float16) |
+            (DataType::Float32, FloatType::Float32) |
+            (DataType::Float64, FloatType::Float64) => {},
+            _ => {
+                return Err(ArrowError::CastError(format!("Can not convert from {} to {:?}", value.value_type(), T::)))
+            }
+        }
+        let values = value.values();
+        .as_primitive::<>
+        let data = Arc::new(value.values().clone());
+        Ok(Self {
+            data,
+            num_columns: value.value_length() as usize,
+            transpose: false,
+        })
     }
 }
 
