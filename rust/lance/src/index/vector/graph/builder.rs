@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
-use arrow_array::{Float32Array, UInt32Array};
+use arrow_array::UInt32Array;
 use async_trait::async_trait;
 use lance_linalg::distance::{DistanceFunc, MetricType};
 use lance_linalg::matrix::MatrixView;

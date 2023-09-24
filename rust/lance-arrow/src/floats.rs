@@ -16,9 +16,7 @@
 
 use crate::bfloat16::BFloat16Type;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
-use arrow_array::{
-    Array, ArrowPrimitiveType, Float16Array, Float32Array, Float64Array, PrimitiveArray,
-};
+use arrow_array::{Array, Float16Array, Float32Array, Float64Array};
 use half::{bf16, f16};
 use num_traits::{Float, FromPrimitive};
 use std::fmt::Formatter;
@@ -40,10 +38,10 @@ pub enum FloatType {
 impl std::fmt::Display for FloatType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            FloatType::BFloat16 => write!(f, "bfloat16"),
-            FloatType::Float16 => write!(f, "float16"),
-            FloatType::Float32 => write!(f, "float32"),
-            FloatType::Float64 => write!(f, "float64"),
+            Self::BFloat16 => write!(f, "bfloat16"),
+            Self::Float16 => write!(f, "float16"),
+            Self::Float32 => write!(f, "float32"),
+            Self::Float64 => write!(f, "float64"),
         }
     }
 }

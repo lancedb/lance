@@ -17,9 +17,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, Array, ArrowNumericType, ArrowPrimitiveType, FixedSizeListArray};
+use arrow_array::{Array, ArrowPrimitiveType, FixedSizeListArray};
 use arrow_schema::{ArrowError, DataType};
-use futures::TryFutureExt;
 use lance_arrow::{ArrowFloatType, FloatArray, FloatType};
 use num_traits::{AsPrimitive, Float, FromPrimitive, ToPrimitive};
 use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
