@@ -17,8 +17,11 @@
 
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, Float16Array, cast::AsArray};
-use arrow_schema::{DataType, ArrowError};
+use arrow_array::{
+    cast::AsArray, Array, ArrowNumericType, ArrowPrimitiveType, FixedSizeListArray, Float16Array,
+    PrimitiveArray,
+};
+use arrow_schema::{ArrowError, DataType};
 use lance_arrow::{FloatArray, FloatType};
 use num_traits::{AsPrimitive, Float, FromPrimitive, ToPrimitive};
 use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
@@ -287,21 +290,24 @@ where
 impl<T: FloatArray> TryFrom<&FixedSizeListArray> for MatrixView<T>
 where
     Standard: rand::distributions::Distribution<<T as FloatArray>::Native>,
+    T::ArrowFloatType: ArrowPrimitiveType,
 {
     type Error = Error;
 
     fn try_from(value: &FixedSizeListArray) -> Result<Self> {
-        match (value.value_type(), T::DATA_TYPE) {
-            (DataType::Float16, FloatType::Float16) |
-            (DataType::Float32, FloatType::Float32) |
-            (DataType::Float64, FloatType::Float64) => {},
+        // TODO: move this check to FloatType?
+        match (value.value_type(), T::FLOAT_TYPE) {
+            (DataType::Float16, FloatType::Float16)
+            | (DataType::Float32, FloatType::Float32)
+            | (DataType::Float64, FloatType::Float64) => {}
             _ => {
-                return Err(ArrowError::CastError(format!("Can not convert from {} to {:?}", value.value_type(), T::)))
+                return Err(ArrowError::CastError(format!(
+                    "Can not convert from {}",
+                    value.value_type(),
+                )))
             }
         }
-        let values = value.values();
-        .as_primitive::<>
-        let data = Arc::new(value.values().clone());
+        let data: Arc<T> = Arc::new(value.values().as_any().downcast_ref::<T>().unwrap().clone());
         Ok(Self {
             data,
             num_columns: value.value_length() as usize,

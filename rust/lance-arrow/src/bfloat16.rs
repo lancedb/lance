@@ -27,6 +27,7 @@ use half::bf16;
 
 pub struct BFloat16Type {}
 
+#[derive(Clone)]
 pub struct BFloat16Array {
     inner: FixedSizeBinaryArray,
 }
