@@ -15,16 +15,17 @@
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 
-use arrow_array::types::Float32Type;
-use arrow_array::{cast::AsArray, types::UInt64Type, Float32Array, UInt32Array};
+use arrow_array::{
+    cast::AsArray,
+    types::{Float32Type, UInt64Type},
+    UInt32Array,
+};
 use arrow_select::concat::concat_batches;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_linalg::{distance::l2_distance, kernels::argmin, matrix::MatrixView};
 use ordered_float::OrderedFloat;
-use rand::distributions::Uniform;
-use rand::prelude::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::{distributions::Uniform, prelude::*, Rng, SeedableRng};
 
 use crate::dataset::{Dataset, ROW_ID};
 use crate::index::pb;
@@ -148,7 +149,7 @@ async fn init_graph(
             message: format!("column {} not found", column),
         })?
         .as_fixed_size_list();
-    let matrix = MatrixView::<Float32Array>::new(
+    let matrix = MatrixView::<Float32Type>::new(
         Arc::new(vectors.values().as_primitive::<Float32Type>().clone()),
         vectors.value_length(),
     );
@@ -182,7 +183,7 @@ async fn init_graph(
 }
 
 /// Distance between two vectors in the matrix.
-fn distance(matrix: &MatrixView<Float32Array>, i: usize, j: usize) -> Result<f32> {
+fn distance(matrix: &MatrixView<Float32Type>, i: usize, j: usize) -> Result<f32> {
     let vector_i = matrix.row(i).ok_or(Error::Index {
         message: "Invalid row index".to_string(),
     })?;
@@ -251,7 +252,7 @@ async fn robust_prune<V: Vertex + Clone + Sync + Send>(
 }
 
 /// Find the index of the medoid vector in all vectors.
-async fn find_medoid(vectors: &MatrixView<Float32Array>, metric_type: MetricType) -> Result<usize> {
+async fn find_medoid(vectors: &MatrixView<Float32Type>, metric_type: MetricType) -> Result<usize> {
     let centroid = vectors.centroid().ok_or_else(|| Error::Index {
         message: "Cannot find the medoid of an empty matrix".to_string(),
     })?;

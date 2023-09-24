@@ -30,7 +30,7 @@ pub async fn maybe_sample_training_data(
     dataset: &Dataset,
     column: &str,
     sample_size_hint: usize,
-) -> Result<MatrixView<Float32Array>> {
+) -> Result<MatrixView<Float32Type>> {
     let num_rows = dataset.count_rows().await?;
     let projection = dataset.schema().project(&[column])?;
     let batch = if num_rows > sample_size_hint {

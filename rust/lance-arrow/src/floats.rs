@@ -16,9 +16,12 @@
 
 use crate::bfloat16::BFloat16Type;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
-use arrow_array::{Array, ArrowPrimitiveType, Float16Array, Float32Array, Float64Array};
+use arrow_array::{
+    Array, ArrowPrimitiveType, Float16Array, Float32Array, Float64Array, PrimitiveArray,
+};
 use half::{bf16, f16};
 use num_traits::{Float, FromPrimitive};
+use std::fmt::Formatter;
 
 use super::bfloat16::BFloat16Array;
 
@@ -26,6 +29,7 @@ use super::bfloat16::BFloat16Array;
 ///
 /// This helps differentiate between the different float types,
 /// because bf16 is not officially supported [DataType] in arrow-rs.
+#[derive(Debug)]
 pub enum FloatType {
     BFloat16,
     Float16,
@@ -33,70 +37,96 @@ pub enum FloatType {
     Float64,
 }
 
-pub trait LanceArrowFloatType {}
-
-impl LanceArrowFloatType for BFloat16Type {}
-
-impl<T: ArrowPrimitiveType> LanceArrowFloatType for T where T::Native: Float + FromPrimitive {}
-
-/// [FloatArray] is a trait that is implemented by all float type arrays.
-pub trait FloatArray: Array + Clone + From<Vec<Self::Native>> + 'static{
-    type Native: Float + FromPrimitive;
-
-    type ArrowFloatType: LanceArrowFloatType;
-
-    /// Float type
-    const FLOAT_TYPE: FloatType;
-
-    /// Returns a reference to the underlying data as a slice.
-    fn as_slice(&self) -> &[Self::Native];
+impl std::fmt::Display for FloatType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FloatType::BFloat16 => write!(f, "bfloat16"),
+            FloatType::Float16 => write!(f, "float16"),
+            FloatType::Float32 => write!(f, "float32"),
+            FloatType::Float64 => write!(f, "float64"),
+        }
+    }
 }
 
-impl FloatArray for BFloat16Array {
-    type Native = bf16;
+pub trait ArrowFloatType {
+    type Native: Float + FromPrimitive;
 
-    type ArrowFloatType = BFloat16Type;
+    const FLOAT_TYPE: FloatType;
+
+    type ArrayType: FloatArray<Self>;
+}
+
+impl ArrowFloatType for BFloat16Type {
+    type Native = bf16;
 
     const FLOAT_TYPE: FloatType = FloatType::BFloat16;
 
-    fn as_slice(&self) -> &[Self::Native] {
+    type ArrayType = BFloat16Array;
+}
+
+impl ArrowFloatType for Float16Type {
+    type Native = f16;
+
+    const FLOAT_TYPE: FloatType = FloatType::Float16;
+
+    type ArrayType = Float16Array;
+}
+
+impl ArrowFloatType for Float32Type {
+    type Native = f32;
+
+    const FLOAT_TYPE: FloatType = FloatType::Float32;
+
+    type ArrayType = Float32Array;
+}
+
+impl ArrowFloatType for Float64Type {
+    type Native = f64;
+
+    const FLOAT_TYPE: FloatType = FloatType::Float64;
+
+    type ArrayType = Float64Array;
+}
+
+/// [FloatArray] is a trait that is implemented by all float type arrays.
+pub trait FloatArray<T: ArrowFloatType + ?Sized>:
+    Array + Clone + From<Vec<T::Native>> + 'static
+{
+    type FloatType: ArrowFloatType;
+
+    /// Returns a reference to the underlying data as a slice.
+    fn as_slice(&self) -> &[T::Native];
+}
+
+impl FloatArray<BFloat16Type> for BFloat16Array {
+    type FloatType = BFloat16Type;
+
+    fn as_slice(&self) -> &[<BFloat16Type as ArrowFloatType>::Native] {
         // TODO: apache/arrow-rs#4820
         todo!()
     }
 }
 
-impl FloatArray for Float16Array {
-    type Native = f16;
+impl FloatArray<Float16Type> for Float16Array {
+    type FloatType = Float16Type;
 
-    type ArrowFloatType = Float16Type;
-
-    const FLOAT_TYPE: FloatType = FloatType::Float16;
-
-    fn as_slice(&self) -> &[Self::Native] {
+    fn as_slice(&self) -> &[<Float16Type as ArrowFloatType>::Native] {
         self.values()
     }
 }
 
-impl FloatArray for Float32Array {
-    type Native = f32;
+impl FloatArray<Float32Type> for Float32Array {
+    type FloatType = Float32Type;
 
-    type ArrowFloatType = Float32Type;
-
-    const FLOAT_TYPE: FloatType = FloatType::Float32;
-
-    fn as_slice(&self) -> &[Self::Native] {
+    fn as_slice(&self) -> &[<Float32Type as ArrowFloatType>::Native] {
         self.values()
     }
 }
 
-impl FloatArray for Float64Array {
-    type Native = f64;
+impl FloatArray<Float64Type> for Float64Array {
+    type FloatType = Float64Type;
 
-    type ArrowFloatType = Float64Type;
-
-    const FLOAT_TYPE: FloatType = FloatType::Float64;
-
-    fn as_slice(&self) -> &[Self::Native] {
+    fn as_slice(&self) -> &[<Float64Type as ArrowFloatType>::Native] {
         self.values()
     }
 }

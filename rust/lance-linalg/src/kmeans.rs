@@ -319,7 +319,7 @@ impl KMeans {
     /// - *metric_type*: the metric type to calculate distance.
     /// - *rng*: random generator.
     pub async fn init_random(
-        data: &MatrixView<Float32Array>,
+        data: &MatrixView<Float32Type>,
         k: usize,
         metric_type: MetricType,
         rng: impl Rng,
@@ -431,7 +431,7 @@ impl KMeans {
     ///   let kmeans = membership.to_kmeans();
     /// }
     /// ```
-    pub async fn train_once(&self, data: &MatrixView<Float32Array>) -> KMeanMembership {
+    pub async fn train_once(&self, data: &MatrixView<Float32Type>) -> KMeanMembership {
         self.compute_membership(data.data().clone()).await
     }
 

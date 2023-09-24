@@ -17,12 +17,10 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    cast::AsArray, Array, ArrowNumericType, ArrowPrimitiveType, FixedSizeListArray, Float16Array,
-    PrimitiveArray,
-};
+use arrow_array::{cast::AsArray, Array, ArrowNumericType, ArrowPrimitiveType, FixedSizeListArray};
 use arrow_schema::{ArrowError, DataType};
-use lance_arrow::{FloatArray, FloatType};
+use futures::TryFutureExt;
+use lance_arrow::{ArrowFloatType, FloatArray, FloatType};
 use num_traits::{AsPrimitive, Float, FromPrimitive, ToPrimitive};
 use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
 
@@ -43,13 +41,13 @@ fn transpose<T: Float>(input: &[T], dimension: usize) -> Vec<T> {
 
 /// A 2-D dense matrix on top of Arrow Arrays.
 ///
-#[derive(Debug, Clone)]
-pub struct MatrixView<T: FloatArray>
+#[derive(Debug)]
+pub struct MatrixView<T: ArrowFloatType>
 where
-    Standard: rand::distributions::Distribution<<T as FloatArray>::Native>,
+    Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,
 {
     /// Underneath data array.
-    data: Arc<T>,
+    data: Arc<T::ArrayType>,
 
     /// The number of columns in the matrix.
     num_columns: usize,
@@ -58,12 +56,25 @@ where
     pub transpose: bool,
 }
 
-impl<T: FloatArray> MatrixView<T>
+impl<T: ArrowFloatType> Clone for MatrixView<T>
 where
-    Standard: rand::distributions::Distribution<<T as FloatArray>::Native>,
+    Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            num_columns: self.num_columns,
+            transpose: self.transpose,
+        }
+    }
+}
+
+impl<T: ArrowFloatType> MatrixView<T>
+where
+    Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,
 {
     /// Create a MatrixView from a f32 data.
-    pub fn new(data: Arc<T>, num_columns: impl AsPrimitive<usize>) -> Self {
+    pub fn new(data: Arc<T::ArrayType>, num_columns: impl AsPrimitive<usize>) -> Self {
         Self {
             data,
             num_columns: num_columns.as_(),
@@ -74,7 +85,7 @@ where
     /// Randomly initialize a matrix of shape `(num_rows, num_columns)`.
     pub fn random(num_rows: usize, num_columns: usize) -> Self {
         let mut rng = SmallRng::from_entropy();
-        let data = Arc::new(T::from(
+        let data = Arc::new(T::ArrayType::from(
             (&mut rng)
                 .sample_iter(Standard)
                 .take(num_columns * num_rows)
@@ -124,7 +135,7 @@ where
         }
     }
 
-    pub fn data(&self) -> Arc<T> {
+    pub fn data(&self) -> Arc<T::ArrayType> {
         if self.transpose {
             Arc::new(transpose(self.data.as_slice(), self.num_rows()).into())
         } else {
@@ -151,7 +162,7 @@ where
     /// Compute the centroid from all the rows. Returns `None` if this matrix is empty.
     ///
     /// # Panics if the matrix is transposed.
-    pub fn centroid(&self) -> Option<T> {
+    pub fn centroid(&self) -> Option<T::ArrayType> {
         assert!(
             !self.transpose,
             "Centroid is not defined for transposed matrix."
@@ -170,7 +181,7 @@ where
             })
         });
         let total = self.num_rows() as f64;
-        let arr: T = sum
+        let arr: T::ArrayType = sum
             .iter()
             .map(|v| T::Native::from_f64(v / total).unwrap())
             .collect::<Vec<T::Native>>()
@@ -287,10 +298,9 @@ where
     }
 }
 
-impl<T: FloatArray> TryFrom<&FixedSizeListArray> for MatrixView<T>
+impl<T: ArrowFloatType + ArrowPrimitiveType> TryFrom<&FixedSizeListArray> for MatrixView<T>
 where
-    Standard: rand::distributions::Distribution<<T as FloatArray>::Native>,
-    T::ArrowFloatType: ArrowPrimitiveType,
+    Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,
 {
     type Error = Error;
 
@@ -307,7 +317,20 @@ where
                 )))
             }
         }
-        let data: Arc<T> = Arc::new(value.values().as_any().downcast_ref::<T>().unwrap().clone());
+        // Use downcast instead of `as_primitive()` to away from the type check.
+        // This is a bit
+        let data: Arc<T::ArrayType> = Arc::new(
+            value
+                .values()
+                .as_any()
+                .downcast_ref::<T::ArrayType>()
+                .ok_or(Error::CastError(format!(
+                    "Can not cast {} to {}",
+                    value.value_type(),
+                    T::FLOAT_TYPE,
+                )))?
+                .clone(),
+        );
         Ok(Self {
             data,
             num_columns: value.value_length() as usize,
@@ -317,17 +340,17 @@ where
 }
 
 /// Iterator over the matrix one row at a time.
-pub struct MatrixRowIter<'a, T: FloatArray>
+pub struct MatrixRowIter<'a, T: ArrowFloatType>
 where
-    Standard: rand::distributions::Distribution<<T as FloatArray>::Native>,
+    Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,
 {
     data: &'a MatrixView<T>,
     cur_idx: usize,
 }
 
-impl<'a, T: FloatArray> Iterator for MatrixRowIter<'a, T>
+impl<'a, T: ArrowFloatType> Iterator for MatrixRowIter<'a, T>
 where
-    Standard: rand::distributions::Distribution<<T as FloatArray>::Native>,
+    Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,
 {
     type Item = &'a [T::Native];
 
@@ -346,6 +369,8 @@ mod tests {
 
     #[cfg(feature = "opq")]
     use approx::assert_relative_eq;
+    use arrow_array::types::Float32Type;
+    use lance_arrow::FixedSizeListArrayExt;
 
     use super::*;
 
@@ -392,7 +417,7 @@ mod tests {
     #[test]
     fn test_sample_matrix() {
         let a_data = Arc::new(Float32Array::from_iter((1..=20).map(|v| v as f32)));
-        let a = MatrixView::new(a_data, 2);
+        let a: MatrixView<Float32Type> = MatrixView::new(a_data, 2);
 
         let samples = a.sample(5);
         assert_eq!(samples.num_rows(), 5);
@@ -404,7 +429,7 @@ mod tests {
     #[test]
     fn test_transpose() {
         let a_data = Arc::new(Float32Array::from_iter((1..=12).map(|v| v as f32)));
-        let a = MatrixView::new(a_data, 3);
+        let a = MatrixView::<Float32Type>::new(a_data, 3);
         assert_eq!(a.num_rows(), 4);
         assert_eq!(a.num_columns(), 3);
         assert_eq!(
@@ -424,11 +449,21 @@ mod tests {
     #[test]
     fn test_centroids() {
         let data = Arc::new(Float32Array::from_iter((0..500).map(|v| v as f32)));
-        let mat = MatrixView::new(data, 10);
+        let mat: MatrixView<Float32Type> = MatrixView::new(data, 10);
         let centroids = mat.centroid().unwrap();
         assert_eq!(
             centroids.values(),
             (245..255).map(|v| v as f32).collect::<Vec<_>>().as_slice(),
         );
+    }
+
+    #[test]
+    fn test_from_fsl() {
+        let data = Float32Array::from_iter((0..500).map(|v| v as f32));
+        let fsl = FixedSizeListArray::try_new_from_values(data.clone(), 50).unwrap();
+        let mat = MatrixView::<Float32Type>::try_from(&fsl).unwrap();
+        assert_eq!(mat.num_rows(), 10);
+        assert_eq!(mat.num_columns(), 50);
+        assert_eq!(mat.data().values(), data.values());
     }
 }
