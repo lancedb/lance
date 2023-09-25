@@ -397,7 +397,7 @@ impl Ivf {
     /// Returns a `RecordBatch` with schema `{__part_id: u32, __residual: FixedSizeList}`
     pub fn compute_partition_and_residual(
         &self,
-        data: &MatrixView<Float32Array>,
+        data: &MatrixView<Float32Type>,
         metric_type: MetricType,
     ) -> Result<RecordBatch> {
         let mut part_id_builder = UInt32Builder::with_capacity(data.num_rows());
@@ -406,9 +406,7 @@ impl Ivf {
 
         let dim = data.num_columns();
         let dist_func = metric_type.batch_func();
-        let centroids_arr = self.centroids.values().as_primitive::<Float32Type>();
-        let centroids: MatrixView<Float32Array> =
-            MatrixView::new(Arc::new(centroids_arr.clone()), dim);
+        let centroids: MatrixView<Float32Type> = self.centroids.as_ref().try_into()?;
         for i in 0..data.num_rows() {
             let vector = data.row(i).unwrap();
             let part_id =
@@ -580,8 +578,8 @@ impl IvfBuildParams {
 /// - *centroids*: the centroids to compute residual vectors.
 /// - *metric_type*: the metric type to compute distance.
 fn compute_residual_matrix(
-    data: &MatrixView<Float32Array>,
-    centroids: &MatrixView<Float32Array>,
+    data: &MatrixView<Float32Type>,
+    centroids: &MatrixView<Float32Type>,
     metric_type: MetricType,
 ) -> Result<Arc<Float32Array>> {
     assert_eq!(centroids.num_columns(), data.num_columns());
@@ -879,7 +877,7 @@ async fn write_index_file(
 
 /// Train IVF partitions using kmeans.
 async fn train_ivf_model(
-    data: &MatrixView<Float32Array>,
+    data: &MatrixView<Float32Type>,
     metric_type: MetricType,
     params: &IvfBuildParams,
 ) -> Result<Ivf> {

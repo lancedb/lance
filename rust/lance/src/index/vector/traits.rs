@@ -17,7 +17,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Float32Array, RecordBatch};
+use arrow_array::types::Float32Type;
+use arrow_array::RecordBatch;
 use async_trait::async_trait;
 
 use lance_linalg::MatrixView;
@@ -73,12 +74,12 @@ pub trait Transformer: std::fmt::Debug + Sync + Send {
     ///
     /// Parameters:
     /// - *data*: training vectors.
-    async fn train(&mut self, data: &MatrixView<Float32Array>) -> Result<()>;
+    async fn train(&mut self, data: &MatrixView<Float32Type>) -> Result<()>;
 
     /// Apply transform on the matrix `data`.
     ///
     /// Returns a new Matrix instead.
-    async fn transform(&self, data: &MatrixView<Float32Array>) -> Result<MatrixView<Float32Array>>;
+    async fn transform(&self, data: &MatrixView<Float32Type>) -> Result<MatrixView<Float32Type>>;
 
     async fn save(&self, writer: &mut ObjectWriter) -> Result<Transform>;
 }

@@ -24,6 +24,7 @@ categories = [
     "development-tools",
     "science"
 ]
+rust-version = "1.65"
 
 [workspace.dependencies]
 lance-arrow = { version = "=0.7.5", path = "./lance-arrow" }
