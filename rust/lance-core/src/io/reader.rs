@@ -361,7 +361,7 @@ impl FileReader {
                         reader,
                         stats_meta.page_table_position,
                         stats_meta.leaf_field_ids.len() as i32,
-                        metadata.num_batches() as i32,
+                        1,
                         0,
                     )
                     .await?,
@@ -538,13 +538,32 @@ impl FileReader {
         Ok(tokio::task::spawn_blocking(move || concat_batches(&schema, &batches)).await??)
     }
 
-    pub async fn read_page_stats(&self, projection: &Schema) -> Result<Option<RecordBatch>> {
+    /// Get the schema of the statistics page table, for the given data field ids.
+    pub fn page_stats_schema(&self, field_ids: &[i32]) -> Option<Schema> {
+        self.metadata.stats_metadata.as_ref().map(|meta| {
+            let mut stats_field_ids = vec![];
+            for stats_field in &meta.schema.fields {
+                if let Ok(stats_field_id) = stats_field.name.parse::<i32>() {
+                    if field_ids.contains(&stats_field_id) {
+                        stats_field_ids.push(stats_field.id);
+                        for child in &stats_field.children {
+                            stats_field_ids.push(child.id);
+                        }
+                    }
+                }
+            }
+            meta.schema.project_by_ids(&stats_field_ids)
+        })
+    }
+
+    pub async fn read_page_stats(&self, field_ids: &[i32]) -> Result<Option<RecordBatch>> {
         if let Some(stats_page_table) = self.stats_page_table.as_ref() {
-            let arrays = futures::stream::iter(&projection.fields)
+            let projection = self.page_stats_schema(field_ids).unwrap();
+            let arrays = futures::stream::iter(projection.fields.iter().cloned())
                 .map(|field| async move {
                     read_array(
                         self,
-                        field,
+                        &field,
                         0,
                         stats_page_table,
                         &ReadBatchParams::RangeFull,
@@ -555,7 +574,7 @@ impl FileReader {
                 .try_collect::<Vec<_>>()
                 .await?;
 
-            let schema = ArrowSchema::from(projection);
+            let schema = ArrowSchema::from(&projection);
             let batch = RecordBatch::try_new(Arc::new(schema), arrays)?;
             Ok(Some(batch))
         } else {

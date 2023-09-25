@@ -61,10 +61,10 @@ use snafu::{location, Location};
 pub const DEFAULT_BATCH_SIZE: usize = 8192;
 
 // Same as pyarrow Dataset::scanner()
-const DEFAULT_BATCH_READAHEAD: usize = 16;
+pub const DEFAULT_BATCH_READAHEAD: usize = 16;
 
 // Same as pyarrow Dataset::scanner()
-const DEFAULT_FRAGMENT_READAHEAD: usize = 4;
+pub const DEFAULT_FRAGMENT_READAHEAD: usize = 4;
 
 /// Defines an ordering for a single column
 ///

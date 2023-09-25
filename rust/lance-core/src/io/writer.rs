@@ -60,16 +60,16 @@ pub struct FileWriter {
     batch_id: i32,
     page_table: PageTable,
     metadata: Metadata,
-    // Just for testing purposes.
-    // TODO: replace this with stats collection logic.
-    stats: Option<RecordBatch>,
     stats_collector: Option<statistics::StatisticsCollector>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct FileWriterOptions {
     /// The field ids to collect statistics for.
-    pub collect_stats_for_fields: Vec<i32>,
+    ///
+    /// If None, will collect for all fields in the schema (that support stats).
+    /// If an empty vector, will not collect any statistics.
+    pub collect_stats_for_fields: Option<Vec<i32>>,
 }
 
 impl FileWriter {
@@ -88,9 +88,16 @@ impl FileWriter {
         schema: Schema,
         options: &FileWriterOptions,
     ) -> Result<Self> {
-        let stats_collector = if !options.collect_stats_for_fields.is_empty() {
-            let stats_schema = schema.project_by_ids(&options.collect_stats_for_fields);
-            let stats_collector = statistics::StatisticsCollector::new(&stats_schema.fields);
+        let collect_stats_for_fields = if let Some(stats_fields) = &options.collect_stats_for_fields
+        {
+            stats_fields.clone()
+        } else {
+            schema.field_ids()
+        };
+
+        let stats_collector = if !collect_stats_for_fields.is_empty() {
+            let stats_schema = schema.project_by_ids(&collect_stats_for_fields);
+            let stats_collector = statistics::StatisticsCollector::new(&stats_schema);
             Some(stats_collector)
         } else {
             None
@@ -108,7 +115,6 @@ impl FileWriter {
             page_table: PageTable::default(),
             metadata: Metadata::default(),
             stats_collector,
-            stats: None,
         })
     }
 
@@ -135,6 +141,18 @@ impl FileWriter {
             }
         }
 
+        // If we are collecting stats for this column, collect them.
+        // Statistics need to traverse nested arrays, so it's a separate loop
+        // from writing which is done on top-level arrays.
+        if let Some(stats_collector) = &mut self.stats_collector {
+            for (field, arrays) in fields_in_batches(batches, &self.schema) {
+                if let Some(stats_builder) = stats_collector.get_builder(field.id) {
+                    let stats_row = statistics::collect_statistics(&arrays);
+                    stats_builder.append(stats_row);
+                }
+            }
+        }
+
         // Copy a list of fields to avoid borrow checker error.
         let fields = self.schema.fields.clone();
         for field in fields.iter() {
@@ -147,14 +165,6 @@ impl FileWriter {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-
-            // If we are collecting stats for this column, collect them
-            if let Some(stats_collector) = &mut self.stats_collector {
-                if let Some(stats_builder) = stats_collector.get_builder(field.id) {
-                    let stats_row = statistics::collect_statistics(&arrs);
-                    stats_builder.append(stats_row);
-                }
-            }
 
             Self::write_array(
                 &mut self.object_writer,
@@ -173,13 +183,6 @@ impl FileWriter {
     }
 
     pub async fn finish(&mut self) -> Result<usize> {
-        // Finish the statistics
-        let _statistics = self
-            .stats_collector
-            .as_mut()
-            .map(|collector| collector.finish());
-
-        // TODO: write the statistics to the file
         self.write_footer().await?;
         self.object_writer.shutdown().await?;
         let num_rows = self
@@ -515,16 +518,15 @@ impl FileWriter {
         .await
     }
 
-    // For testing purposes, set statistics
-    // TODO: remove this once we have stats collection logic.
-    #[allow(dead_code)]
-    fn set_statistics(&mut self, stats: RecordBatch) {
-        self.stats = Some(stats);
-    }
-
     async fn write_statistics(&mut self) -> Result<Option<StatisticsMetadata>> {
-        match &self.stats {
-            Some(stats_batch) if stats_batch.num_rows() > 0 => {
+        let statistics = self
+            .stats_collector
+            .as_mut()
+            .map(|collector| collector.finish());
+
+        match statistics {
+            Some(Ok(stats_batch)) if stats_batch.num_rows() > 0 => {
+                debug_assert_eq!(self.next_batch_id() as usize, stats_batch.num_rows());
                 let schema = Schema::try_from(stats_batch.schema().as_ref())?;
                 let leaf_field_ids = schema.field_ids();
 
@@ -549,6 +551,7 @@ impl FileWriter {
                     page_table_position,
                 }))
             }
+            Some(Err(e)) => Err(e),
             _ => Ok(None),
         }
     }
@@ -576,6 +579,46 @@ impl FileWriter {
         // Step 5. Write magics.
         self.object_writer.write_magics(pos).await
     }
+}
+
+/// Walk through the schema and return arrays with their Lance field.
+///
+/// This skips over nested arrays and fields within list arrays. It does walk
+/// over the children of structs.
+fn fields_in_batches<'a>(
+    batches: &'a [RecordBatch],
+    schema: &'a Schema,
+) -> impl Iterator<Item = (&'a Field, Vec<&'a ArrayRef>)> {
+    let num_columns = batches[0].num_columns();
+    let array_iters = (0..num_columns).map(|col_i| {
+        batches
+            .iter()
+            .map(|batch| batch.column(col_i))
+            .collect::<Vec<_>>()
+    });
+    let mut to_visit: Vec<(&'a Field, Vec<&'a ArrayRef>)> =
+        schema.fields.iter().zip(array_iters).collect();
+
+    std::iter::from_fn(move || {
+        loop {
+            let (field, arrays): (_, Vec<&'a ArrayRef>) = to_visit.pop()?;
+            match field.data_type() {
+                DataType::Struct(_) => {
+                    for (i, child_field) in field.children.iter().enumerate() {
+                        let child_arrays = arrays
+                            .iter()
+                            .map(|arr| as_struct_array(*arr).column(i))
+                            .collect::<Vec<&'a ArrayRef>>();
+                        to_visit.push((child_field, child_arrays));
+                    }
+                    continue;
+                }
+                // We only walk structs right now.
+                _ if field.data_type().is_nested() => continue,
+                _ => return Some((field, arrays)),
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -870,11 +913,13 @@ mod tests {
                 .await
                 .unwrap();
         file_writer.write(&[data_batch.clone()]).await.unwrap();
-        file_writer.set_statistics(stats_batch);
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
-        reader.read_page_stats(projection).await.unwrap()
+        reader
+            .read_page_stats(&projection.field_ids())
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1007,9 +1052,9 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
 
-        // TODO: collect_stats_for_fields: vec![0,1,3] once structs are supported
+        // TODO: add 6 once strings are supported
         let options = FileWriterOptions {
-            collect_stats_for_fields: vec![0, 1],
+            collect_stats_for_fields: Some(vec![0, 1, 5]),
         };
         let mut file_writer = FileWriter::try_new(&store, &path, schema, &options)
             .await
@@ -1066,7 +1111,99 @@ mod tests {
 
         file_writer.finish().await.unwrap();
 
-        // TODO: read and test statistics
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+
+        let read_stats = reader.read_page_stats(&[0, 1, 5, 6]).await.unwrap();
+        assert!(read_stats.is_some());
+        let read_stats = read_stats.unwrap();
+
+        let expected_stats_schema = stats_schema([
+            (0, DataType::Int64),
+            (1, DataType::Int64),
+            (5, DataType::Int64),
+            // (6, DataType::Utf8),
+        ]);
+
+        assert_eq!(read_stats.schema().as_ref(), &expected_stats_schema);
+
+        let expected_stats = stats_batch(&[
+            Stats {
+                field_id: 0,
+                null_counts: vec![0, 0],
+                min_values: Arc::new(Int64Array::from(vec![1, 5])),
+                max_values: Arc::new(Int64Array::from(vec![3, 6])),
+            },
+            Stats {
+                field_id: 1,
+                null_counts: vec![0, 0],
+                min_values: Arc::new(Int64Array::from(vec![4, 10])),
+                max_values: Arc::new(Int64Array::from(vec![6, 11])),
+            },
+            Stats {
+                field_id: 5,
+                null_counts: vec![0, 0],
+                min_values: Arc::new(Int64Array::from(vec![1, 4])),
+                max_values: Arc::new(Int64Array::from(vec![3, 5])),
+            },
+        ]);
+
+        assert_eq!(read_stats, expected_stats);
+    }
+
+    fn stats_schema(data_fields: impl IntoIterator<Item = (i32, DataType)>) -> ArrowSchema {
+        let fields = data_fields
+            .into_iter()
+            .map(|(field_id, data_type)| {
+                Arc::new(ArrowField::new(
+                    format!("{}", field_id),
+                    DataType::Struct(
+                        vec![
+                            Arc::new(ArrowField::new("null_count", DataType::Int64, false)),
+                            Arc::new(ArrowField::new("min_value", data_type.clone(), true)),
+                            Arc::new(ArrowField::new("max_value", data_type, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                ))
+            })
+            .collect::<Vec<_>>();
+        ArrowSchema::new(fields)
+    }
+
+    struct Stats {
+        field_id: i32,
+        null_counts: Vec<i64>,
+        min_values: ArrayRef,
+        max_values: ArrayRef,
+    }
+
+    fn stats_batch(stats: &[Stats]) -> RecordBatch {
+        let schema = stats_schema(
+            stats
+                .iter()
+                .map(|s| (s.field_id, s.min_values.data_type().clone())),
+        );
+
+        let columns = stats
+            .iter()
+            .map(|s| {
+                let data_type = s.min_values.data_type().clone();
+                let fields = vec![
+                    Arc::new(ArrowField::new("null_count", DataType::Int64, false)),
+                    Arc::new(ArrowField::new("min_value", data_type.clone(), true)),
+                    Arc::new(ArrowField::new("max_value", data_type, true)),
+                ];
+                let arrays = vec![
+                    Arc::new(Int64Array::from(s.null_counts.clone())),
+                    s.min_values.clone(),
+                    s.max_values.clone(),
+                ];
+                Arc::new(StructArray::new(fields.into(), arrays, None)) as ArrayRef
+            })
+            .collect();
+
+        RecordBatch::try_new(Arc::new(schema), columns).unwrap()
     }
 
     async fn read_file_as_one_batch(object_store: &ObjectStore, path: &Path) -> RecordBatch {

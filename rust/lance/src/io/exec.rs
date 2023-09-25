@@ -15,6 +15,7 @@
 mod knn;
 mod planner;
 mod projection;
+mod pushdown_scan;
 mod scalar_index;
 mod scan;
 mod take;

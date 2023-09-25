@@ -18,7 +18,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::datatypes::Field;
+use crate::datatypes::{Field, Schema};
 use crate::error::Result;
 use arrow_array::{
     builder::{make_builder, ArrayBuilder, BooleanBuilder, PrimitiveBuilder},
@@ -598,19 +598,40 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
                 "Stats collection for {} is not supported yet",
                 arrays[0].data_type()
             );
-            todo!()
+            unreachable!()
         }
     }
 }
 
+pub fn supports_stats_collection(datatype: &DataType) -> bool {
+    match datatype {
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::UInt8
+        | DataType::Int16
+        | DataType::UInt16
+        | DataType::Int32
+        | DataType::UInt32
+        | DataType::Int64
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Date32
+        | DataType::Date64 => true,
+        _ => false,
+    }
+}
+
+#[derive(Debug)]
 pub struct StatisticsCollector {
     builders: BTreeMap<i32, (Field, StatisticsBuilder)>,
 }
 
 impl StatisticsCollector {
-    pub fn new(fields: &[Field]) -> Self {
-        let builders = fields
-            .iter()
+    pub fn new(schema: &Schema) -> Self {
+        let builders = schema
+            .fields_pre_order()
+            .filter(|f| supports_stats_collection(&f.data_type()))
             .map(|f| (f.id, (f.clone(), StatisticsBuilder::new(&f.data_type()))))
             .collect();
         Self { builders }
@@ -660,6 +681,15 @@ pub struct StatisticsBuilder {
     min_value: Box<dyn ArrayBuilder>,
     max_value: Box<dyn ArrayBuilder>,
     dt: DataType,
+}
+
+impl std::fmt::Debug for StatisticsBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatisticsBuilder")
+            .field("null_count", &self.null_count)
+            .field("dt", &self.dt)
+            .finish()
+    }
 }
 
 impl StatisticsBuilder {
@@ -1624,7 +1654,7 @@ mod tests {
             ArrowField::new("b", DataType::Utf8, true),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut collector = StatisticsCollector::new(&schema.fields);
+        let mut collector = StatisticsCollector::new(&schema);
 
         // Collect stats for a
         let id = schema.field("a").unwrap().id;
@@ -1645,7 +1675,7 @@ mod tests {
         assert!(collector.finish().is_err());
 
         // We cannot reuse old collector as it's builders were finished.
-        let mut collector = StatisticsCollector::new(&schema.fields);
+        let mut collector = StatisticsCollector::new(&schema);
 
         let id = schema.field("a").unwrap().id;
         let builder = collector.get_builder(id).unwrap();
@@ -1747,7 +1777,7 @@ mod tests {
             ArrowField::new("large_string", DataType::LargeUtf8, true),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut collector = StatisticsCollector::new(&schema.fields);
+        let mut collector = StatisticsCollector::new(&schema);
 
         // Collect stats
         let id = schema.field("boolean").unwrap().id;

@@ -665,6 +665,7 @@ impl From<FileFragment> for Fragment {
 ///
 /// It opens the data files that contains the columns of the projection schema, and
 /// reconstruct the RecordBatch from columns read from each data file.
+#[derive(Debug)]
 pub struct FragmentReader {
     /// Readers and schema of each opened data file.
     readers: Vec<(FileReader, Schema)>,
@@ -731,11 +732,34 @@ impl FragmentReader {
     }
 
     pub(crate) fn num_batches(&self) -> usize {
-        self.readers[0].0.num_batches()
+        let num_batches = self.readers[0].0.num_batches();
+        assert!(
+            self.readers
+                .iter()
+                .all(|r| r.0.num_batches() == num_batches),
+            "Data files have varying number of batches, which is not yet supported."
+        );
+        num_batches
     }
 
     pub(crate) fn num_rows_in_batch(&self, batch_id: usize) -> usize {
         self.readers[0].0.num_rows_in_batch(batch_id as i32)
+    }
+
+    /// Read the page statistics of the fragment for the specified fields.
+    pub(crate) async fn read_page_stats(&self) -> Result<Option<RecordBatch>> {
+        let mut stats_batches = vec![];
+        for (reader, schema) in self.readers.iter() {
+            if let Some(stats_batch) = reader.read_page_stats(&schema.field_ids()).await? {
+                stats_batches.push(stats_batch);
+            }
+        }
+
+        if stats_batches.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(merge_batches(&stats_batches)?))
+        }
     }
 
     pub(crate) async fn read_batch(
