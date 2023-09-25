@@ -28,7 +28,7 @@ use crate::arrow::*;
 use crate::datatypes::{Field, Schema};
 use crate::encodings::dictionary::DictionaryEncoder;
 use crate::encodings::{binary::BinaryEncoder, plain::PlainEncoder, Encoder, Encoding};
-use crate::format::{pb, Index, Manifest, Metadata, PageInfo, PageTable};
+use crate::format::{pb, Index, Manifest, Metadata, PageInfo, PageTable, StatisticsMetadata};
 use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
 
@@ -113,6 +113,9 @@ pub struct FileWriter {
     batch_id: i32,
     page_table: PageTable,
     metadata: Metadata,
+    // Just for testing purposes.
+    // TODO: replace this with stats collection logic.
+    stats: Option<RecordBatch>,
 }
 
 impl FileWriter {
@@ -128,6 +131,7 @@ impl FileWriter {
             batch_id: 0,
             page_table: PageTable::default(),
             metadata: Metadata::default(),
+            stats: None,
         })
     }
 
@@ -149,7 +153,14 @@ impl FileWriter {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            self.write_array(field, &arrs).await?;
+            Self::write_array(
+                &mut self.object_writer,
+                field,
+                &arrs,
+                self.batch_id,
+                &mut self.page_table,
+            )
+            .await?;
         }
         let batch_length = batches.iter().map(|b| b.num_rows() as i32).sum();
         self.metadata.push_batch_length(batch_length);
@@ -189,35 +200,99 @@ impl FileWriter {
     }
 
     #[async_recursion]
-    async fn write_array(&mut self, field: &Field, arrs: &[&ArrayRef]) -> Result<()> {
+    async fn write_array(
+        object_writer: &mut ObjectWriter,
+        field: &Field,
+        arrs: &[&ArrayRef],
+        batch_id: i32,
+        page_table: &mut PageTable,
+    ) -> Result<()> {
         assert!(!arrs.is_empty());
         let data_type = arrs[0].data_type();
         let arrs_ref = arrs.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
 
         match data_type {
-            DataType::Null => self.write_null_array(field, arrs_ref.as_slice()).await,
-            dt if dt.is_fixed_stride() => {
-                self.write_fixed_stride_array(field, arrs_ref.as_slice())
-                    .await
+            DataType::Null => {
+                Self::write_null_array(
+                    object_writer,
+                    field,
+                    arrs_ref.as_slice(),
+                    batch_id,
+                    page_table,
+                )
+                .await
             }
-            dt if dt.is_binary_like() => self.write_binary_array(field, arrs_ref.as_slice()).await,
+            dt if dt.is_fixed_stride() => {
+                Self::write_fixed_stride_array(
+                    object_writer,
+                    field,
+                    arrs_ref.as_slice(),
+                    batch_id,
+                    page_table,
+                )
+                .await
+            }
+            dt if dt.is_binary_like() => {
+                Self::write_binary_array(
+                    object_writer,
+                    field,
+                    arrs_ref.as_slice(),
+                    batch_id,
+                    page_table,
+                )
+                .await
+            }
             DataType::Dictionary(key_type, _) => {
-                self.write_dictionary_arr(field, arrs_ref.as_slice(), key_type)
-                    .await
+                Self::write_dictionary_arr(
+                    object_writer,
+                    field,
+                    arrs_ref.as_slice(),
+                    key_type,
+                    batch_id,
+                    page_table,
+                )
+                .await
             }
             dt if dt.is_struct() => {
                 let struct_arrays = arrs.iter().map(|a| as_struct_array(a)).collect::<Vec<_>>();
-                self.write_struct_array(field, struct_arrays.as_slice())
-                    .await
+                Self::write_struct_array(
+                    object_writer,
+                    field,
+                    struct_arrays.as_slice(),
+                    batch_id,
+                    page_table,
+                )
+                .await
             }
             DataType::FixedSizeList(_, _) | DataType::FixedSizeBinary(_) => {
-                self.write_fixed_stride_array(field, arrs_ref.as_slice())
-                    .await
+                Self::write_fixed_stride_array(
+                    object_writer,
+                    field,
+                    arrs_ref.as_slice(),
+                    batch_id,
+                    page_table,
+                )
+                .await
             }
-            DataType::List(_) => self.write_list_array(field, arrs_ref.as_slice()).await,
+            DataType::List(_) => {
+                Self::write_list_array(
+                    object_writer,
+                    field,
+                    arrs_ref.as_slice(),
+                    batch_id,
+                    page_table,
+                )
+                .await
+            }
             DataType::LargeList(_) => {
-                self.write_large_list_array(field, arrs_ref.as_slice())
-                    .await
+                Self::write_large_list_array(
+                    object_writer,
+                    field,
+                    arrs_ref.as_slice(),
+                    batch_id,
+                    page_table,
+                )
+                .await
             }
             _ => Err(Error::Schema {
                 message: format!("FileWriter::write: unsupported data type: {data_type}"),
@@ -226,57 +301,83 @@ impl FileWriter {
         }
     }
 
-    async fn write_null_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
+    async fn write_null_array(
+        object_writer: &mut ObjectWriter,
+        field: &Field,
+        arrs: &[&dyn Array],
+        batch_id: i32,
+        page_table: &mut PageTable,
+    ) -> Result<()> {
         let arrs_length: i32 = arrs.iter().map(|a| a.len() as i32).sum();
-        let page_info = PageInfo::new(self.object_writer.tell(), arrs_length as usize);
-        self.page_table.set(field.id, self.batch_id, page_info);
+        let page_info = PageInfo::new(object_writer.tell(), arrs_length as usize);
+        page_table.set(field.id, batch_id, page_info);
         Ok(())
     }
 
     /// Write fixed size array, including, primtiives, fixed size binary, and fixed size list.
-    async fn write_fixed_stride_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
+    async fn write_fixed_stride_array(
+        object_writer: &mut ObjectWriter,
+        field: &Field,
+        arrs: &[&dyn Array],
+        batch_id: i32,
+        page_table: &mut PageTable,
+    ) -> Result<()> {
         assert_eq!(field.encoding, Some(Encoding::Plain));
         assert!(!arrs.is_empty());
         let data_type = arrs[0].data_type();
 
-        let mut encoder = PlainEncoder::new(&mut self.object_writer, data_type);
+        let mut encoder = PlainEncoder::new(object_writer, data_type);
         let pos = encoder.encode(arrs).await?;
         let arrs_length: i32 = arrs.iter().map(|a| a.len() as i32).sum();
         let page_info = PageInfo::new(pos, arrs_length as usize);
-        self.page_table.set(field.id, self.batch_id, page_info);
+        page_table.set(field.id, batch_id, page_info);
         Ok(())
     }
 
     /// Write var-length binary arrays.
-    async fn write_binary_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
+    async fn write_binary_array(
+        object_writer: &mut ObjectWriter,
+        field: &Field,
+        arrs: &[&dyn Array],
+        batch_id: i32,
+        page_table: &mut PageTable,
+    ) -> Result<()> {
         assert_eq!(field.encoding, Some(Encoding::VarBinary));
-        let mut encoder = BinaryEncoder::new(&mut self.object_writer);
+        let mut encoder = BinaryEncoder::new(object_writer);
         let pos = encoder.encode(arrs).await?;
         let arrs_length: i32 = arrs.iter().map(|a| a.len() as i32).sum();
         let page_info = PageInfo::new(pos, arrs_length as usize);
-        self.page_table.set(field.id, self.batch_id, page_info);
+        page_table.set(field.id, batch_id, page_info);
         Ok(())
     }
 
     async fn write_dictionary_arr(
-        &mut self,
+        object_writer: &mut ObjectWriter,
         field: &Field,
         arrs: &[&dyn Array],
         key_type: &DataType,
+        batch_id: i32,
+        page_table: &mut PageTable,
     ) -> Result<()> {
         assert_eq!(field.encoding, Some(Encoding::Dictionary));
 
         // Write the dictionary keys.
-        let mut encoder = DictionaryEncoder::new(&mut self.object_writer, key_type);
+        let mut encoder = DictionaryEncoder::new(object_writer, key_type);
         let pos = encoder.encode(arrs).await?;
         let arrs_length: i32 = arrs.iter().map(|a| a.len() as i32).sum();
         let page_info = PageInfo::new(pos, arrs_length as usize);
-        self.page_table.set(field.id, self.batch_id, page_info);
+        page_table.set(field.id, batch_id, page_info);
         Ok(())
     }
 
     #[async_recursion]
-    async fn write_struct_array(&mut self, field: &Field, arrays: &[&StructArray]) -> Result<()> {
+    async fn write_struct_array(
+        object_writer: &mut ObjectWriter,
+        field: &Field,
+        arrays: &[&StructArray],
+        batch_id: i32,
+        page_table: &mut PageTable,
+    ) -> Result<()> {
         arrays
             .iter()
             .for_each(|a| assert_eq!(a.num_columns(), field.children.len()));
@@ -296,12 +397,18 @@ impl FileWriter {
                     })?;
                 arrs.push(arr);
             }
-            self.write_array(child, arrs.as_slice()).await?;
+            Self::write_array(object_writer, child, arrs.as_slice(), batch_id, page_table).await?;
         }
         Ok(())
     }
 
-    async fn write_list_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
+    async fn write_list_array(
+        object_writer: &mut ObjectWriter,
+        field: &Field,
+        arrs: &[&dyn Array],
+        batch_id: i32,
+        page_table: &mut PageTable,
+    ) -> Result<()> {
         let capacity: usize = arrs.iter().map(|a| a.len()).sum();
         let mut list_arrs: Vec<ArrayRef> = Vec::new();
         let mut pos_builder: PrimitiveBuilder<Int32Type> =
@@ -330,12 +437,26 @@ impl FileWriter {
         }
 
         let positions: &dyn Array = &pos_builder.finish();
-        self.write_fixed_stride_array(field, &[positions]).await?;
+        Self::write_fixed_stride_array(object_writer, field, &[positions], batch_id, page_table)
+            .await?;
         let arrs = list_arrs.iter().collect::<Vec<_>>();
-        self.write_array(&field.children[0], arrs.as_slice()).await
+        Self::write_array(
+            object_writer,
+            &field.children[0],
+            arrs.as_slice(),
+            batch_id,
+            page_table,
+        )
+        .await
     }
 
-    async fn write_large_list_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
+    async fn write_large_list_array(
+        object_writer: &mut ObjectWriter,
+        field: &Field,
+        arrs: &[&dyn Array],
+        batch_id: i32,
+        page_table: &mut PageTable,
+    ) -> Result<()> {
         let capacity: usize = arrs.iter().map(|a| a.len()).sum();
         let mut list_arrs: Vec<ArrayRef> = Vec::new();
         let mut pos_builder: PrimitiveBuilder<Int64Type> =
@@ -365,9 +486,53 @@ impl FileWriter {
         }
 
         let positions: &dyn Array = &pos_builder.finish();
-        self.write_fixed_stride_array(field, &[positions]).await?;
+        Self::write_fixed_stride_array(object_writer, field, &[positions], batch_id, page_table)
+            .await?;
         let arrs = list_arrs.iter().collect::<Vec<_>>();
-        self.write_array(&field.children[0], arrs.as_slice()).await
+        Self::write_array(
+            object_writer,
+            &field.children[0],
+            arrs.as_slice(),
+            batch_id,
+            page_table,
+        )
+        .await
+    }
+
+    // For testing purposes, set statistics
+    // TODO: remove this once we have stats collection logic.
+    #[allow(dead_code)]
+    fn set_statistics(&mut self, stats: RecordBatch) {
+        self.stats = Some(stats);
+    }
+
+    async fn write_statistics(&mut self) -> Result<Option<StatisticsMetadata>> {
+        if let Some(stats_batch) = &self.stats {
+            let schema = Schema::try_from(stats_batch.schema().as_ref())?;
+            let leaf_field_ids = schema.field_ids();
+
+            let mut stats_page_table = PageTable::default();
+            for (i, field) in schema.fields.iter().enumerate() {
+                Self::write_array(
+                    &mut self.object_writer,
+                    field,
+                    &[stats_batch.column(i)],
+                    0, // Only one batch for statistics.
+                    &mut stats_page_table,
+                )
+                .await?;
+            }
+
+            let page_table_position = stats_page_table.write(&mut self.object_writer, 0).await?;
+
+            Ok(Some(StatisticsMetadata {
+                schema,
+                leaf_field_ids,
+                page_table_position,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn write_footer(&mut self) -> Result<()> {
@@ -378,6 +543,9 @@ impl FileWriter {
             .write(&mut self.object_writer, field_id_offset)
             .await?;
         self.metadata.page_table_position = pos;
+
+        // Step 1.5 Write statistics.
+        self.metadata.stats_metadata = self.write_statistics().await?;
 
         // Step 2. Write manifest and dictionary values.
         let mut manifest = Manifest::new(&self.schema, Arc::new(vec![]));

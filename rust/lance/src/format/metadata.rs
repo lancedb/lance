@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use crate::datatypes::Schema;
 use crate::format::{pb, ProtoStruct};
 use crate::{Error, Result};
 use snafu::{location, Location};
@@ -29,6 +30,9 @@ pub struct Metadata {
 
     /// The file position of the manifest block in the file.
     pub manifest_position: Option<usize>,
+
+    /// Metadata about statistics.
+    pub stats_metadata: Option<StatisticsMetadata>,
 }
 
 impl ProtoStruct for Metadata {
@@ -37,10 +41,22 @@ impl ProtoStruct for Metadata {
 
 impl From<&Metadata> for pb::Metadata {
     fn from(m: &Metadata) -> Self {
+        let statistics = if let Some(stats_meta) = &m.stats_metadata {
+            let (schema, _) = (&stats_meta.schema).into();
+            Some(pb::metadata::StatisticsMetadata {
+                schema,
+                fields: stats_meta.leaf_field_ids.clone(),
+                page_table_position: stats_meta.page_table_position as u64,
+            })
+        } else {
+            None
+        };
+
         Self {
             batch_offsets: m.batch_offsets.clone(),
             page_table_position: m.page_table_position as u64,
             manifest_position: m.manifest_position.unwrap_or(0) as u64,
+            statistics,
         }
     }
 }
@@ -51,6 +67,15 @@ impl From<pb::Metadata> for Metadata {
             batch_offsets: m.batch_offsets.clone(),
             page_table_position: m.page_table_position as usize,
             manifest_position: Some(m.manifest_position as usize),
+            stats_metadata: if let Some(stats_meta) = m.statistics {
+                Some(StatisticsMetadata {
+                    schema: Schema::from((&stats_meta.schema, Default::default())),
+                    leaf_field_ids: stats_meta.fields,
+                    page_table_position: stats_meta.page_table_position as usize,
+                })
+            } else {
+                None
+            },
         }
     }
 }
@@ -171,6 +196,13 @@ impl Metadata {
         }
         Ok(batches)
     }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct StatisticsMetadata {
+    pub(crate) schema: Schema,
+    pub(crate) leaf_field_ids: Vec<i32>,
+    pub(crate) page_table_position: usize,
 }
 
 #[cfg(test)]

@@ -330,3 +330,67 @@ The reader load process is as follows:
 2. ``COPY_OBJECT_STORE mydataset.lance/_versions/{version}.manifest-{uuid} mydataset.lance/_versions/{version}.manifest`` reattempt synchronization
 3. ``PUT_EXTERNAL_STORE base_uri, version, mydataset.lance/_versions/{version}.manifest`` update the external store to point to the final manifest
 4. ``RETURN mydataset.lance/_versions/{version}.manifest`` always return the finalized path, return error if synchronization fails
+
+Statistics
+----------
+
+Statistics are stored within Lance files. The statistics can be used to determine
+which pages can be skipped within a query. The null count, lower bound (min),
+and upper bound (max) are stored.
+
+Statistics themselves are stored in Lance's columnar format, which allows for
+selectively reading only relevant stats columns.
+
+Statistic values
+~~~~~~~~~~~~~~~~
+
+Three types of statistics are stored per column: null count, min value, max value.
+The min and max values are stored as their native data types in arrays.
+
+There are special behavior for different data types to account for nulls:
+
+For integer-based data types (including signed and unsigned integers, dates,
+and timestamps), if the min and max are unknown (all values are null), then the
+minimum/maximum representable values should be used instead.
+
+For float data types, if the min and max are unknown, then use ``-Inf`` and ``+Inf``,
+respectively. ``NaN`` values should be ignored for the purpose of min and max
+statistics. If the max value is zero (negative or positive), the max value
+should be recorded as ``+0.0``. Likewise, if the min value is zero (positive
+or negative), it should be recorded as ``-0.0``.
+
+For binary data types, if the min or max are unknown or unrepresentable, then use
+null value. Binary data type bounds can also be truncated. For example, an array
+containing just the value ``"abcd"`` could have a truncated min of
+``"abc"`` and max of ``"abd"``. If there is no truncated value greater than the
+maximum value, then instead use null for the maximum.
+
+.. warning::
+
+    The ``min`` and ``max`` values are not guaranteed to be within the array;
+    they are simply upper and lower bounds. Two common cases where they are not
+    contained in the array is if the min or max original value was deleted and
+    when binary data is truncated. Therefore, statistic should not be used to
+    compute queries such as ``SELECT max(col) FROM table``, except to identify
+    which pages and files definitely do not contain the min or max value.
+
+Page-level statistics format
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Page-level statistics are stored as separate arrays within the Lance file. Each
+array is only one page long. The page offsets are stored in an array just like
+the data page table. The offset to the statistics page offsets is stored in the
+metadata.
+
+The schema for the statistics is:
+
+.. code-block::
+    <field_id_1>: struct
+        null_count: i64
+        min_value: <field_1_data_type>
+        max_value: <field_1_data_type>
+    ...
+    <field_id_N>: struct
+        null_count: i64
+        min_value: <field_N_data_type>
+        max_value: <field_N_data_type>
