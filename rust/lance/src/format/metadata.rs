@@ -198,11 +198,16 @@ impl Metadata {
     }
 }
 
+/// Metadata about the statistics
 #[derive(Debug, PartialEq)]
 pub struct StatisticsMetadata {
-    pub(crate) schema: Schema,
-    pub(crate) leaf_field_ids: Vec<i32>,
-    pub(crate) page_table_position: usize,
+    /// Schema of the page-level statistics.
+    ///
+    /// For a given field with id `i`, the statistics are stored in the field
+    /// `i.null_count`, `i.min_value`, and `i.max_value`.
+    pub schema: Schema,
+    pub leaf_field_ids: Vec<i32>,
+    pub page_table_position: usize,
 }
 
 #[cfg(test)]

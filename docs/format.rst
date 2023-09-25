@@ -385,6 +385,7 @@ metadata.
 The schema for the statistics is:
 
 .. code-block::
+
     <field_id_1>: struct
         null_count: i64
         min_value: <field_1_data_type>
@@ -394,3 +395,14 @@ The schema for the statistics is:
         null_count: i64
         min_value: <field_N_data_type>
         max_value: <field_N_data_type>
+
+
+Any number of fields may be missing, as statistics for some fields or of some
+kind may be skipped. In addition, readers should expect there may be extra
+fields that are not in this schema. These should be ignored. Future changes to
+the format may add additional fields, but these changes will be backwards
+compatible.
+
+However, writers should not write extra fields that aren't described in this
+document. Until they are defined the specification, there is no guarantee that
+writers will be able to safely interpret new forms of statistics.

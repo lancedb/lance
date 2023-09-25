@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::prelude::*;
@@ -67,20 +67,10 @@ pub struct Manifest {
 
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
-
-    /// Index of fragments by id. This only exists in memory and is not persisted.
-    ///
-    /// Keys are fragment ids and values are the index of the fragment in the `fragments` vector.
-    fragment_id_index: BTreeMap<u32, usize>,
 }
 
 impl Manifest {
     pub fn new(schema: &Schema, fragments: Arc<Vec<Fragment>>) -> Self {
-        let fragment_id_index = fragments
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (f.id as u32, i))
-            .collect();
         Self {
             schema: schema.clone(),
             version: 1,
@@ -93,7 +83,6 @@ impl Manifest {
             writer_feature_flags: 0,
             max_fragment_id: 0,
             transaction_file: None,
-            fragment_id_index,
         }
     }
 
@@ -102,11 +91,6 @@ impl Manifest {
         schema: &Schema,
         fragments: Arc<Vec<Fragment>>,
     ) -> Self {
-        let fragment_id_index = fragments
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (f.id as u32, i))
-            .collect();
         Self {
             schema: schema.clone(),
             version: previous.version + 1,
@@ -119,7 +103,6 @@ impl Manifest {
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
-            fragment_id_index,
         }
     }
 
@@ -184,17 +167,13 @@ impl Manifest {
                 location: location!(),
             });
         }
-        let start = since.max_fragment_id().map(|id| id + 1).unwrap_or_default() as u32;
-
+        let start = since.max_fragment_id();
         Ok(self
-            .fragment_id_index
-            .range(start..)
-            .map(|(_, i)| self.fragments[*i].clone())
+            .fragments
+            .iter()
+            .filter(|&f| start.map(|s| f.id > s).unwrap_or(true))
+            .cloned()
             .collect())
-    }
-
-    pub fn fragment_by_id(&self, id: u32) -> Option<&Fragment> {
-        self.fragment_id_index.get(&id).map(|i| &self.fragments[*i])
     }
 }
 
@@ -209,17 +188,10 @@ impl From<pb::Manifest> for Manifest {
             let nanos = ts.nanos as u128;
             sec + nanos
         });
-        let fragments: Arc<Vec<Fragment>> =
-            Arc::new(p.fragments.iter().map(Fragment::from).collect());
-        let fragment_id_index = fragments
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (f.id as u32, i))
-            .collect();
         Self {
             schema: Schema::from((&p.fields, p.metadata)),
             version: p.version,
-            fragments,
+            fragments: Arc::new(p.fragments.iter().map(Fragment::from).collect()),
             version_aux_data: p.version_aux_data as usize,
             index_section: p.index_section.map(|i| i as usize),
             timestamp_nanos: timestamp_nanos.unwrap_or(0),
@@ -232,7 +204,6 @@ impl From<pb::Manifest> for Manifest {
             } else {
                 Some(p.transaction_file)
             },
-            fragment_id_index,
         }
     }
 }

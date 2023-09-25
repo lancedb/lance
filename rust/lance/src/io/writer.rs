@@ -861,8 +861,8 @@ mod tests {
                 DataType::Struct(
                     vec![
                         ArrowField::new("null_count", DataType::Int64, true),
-                        ArrowField::new("min", DataType::Float32, true),
-                        ArrowField::new("max", DataType::Float32, true),
+                        ArrowField::new("min_value", DataType::Float32, true),
+                        ArrowField::new("max_value", DataType::Float32, true),
                     ]
                     .into(),
                 ),
@@ -873,8 +873,8 @@ mod tests {
                 DataType::Struct(
                     vec![
                         ArrowField::new("null_count", DataType::Int64, true),
-                        ArrowField::new("min", DataType::Utf8, true),
-                        ArrowField::new("max", DataType::Utf8, true),
+                        ArrowField::new("min_value", DataType::Utf8, true),
+                        ArrowField::new("max_value", DataType::Utf8, true),
                     ]
                     .into(),
                 ),
@@ -897,11 +897,11 @@ mod tests {
                         Arc::new(Int64Array::from(vec![3, 0])) as ArrayRef,
                     ),
                     (
-                        Arc::new(ArrowField::new("min", DataType::Float32, true)),
+                        Arc::new(ArrowField::new("min_value", DataType::Float32, true)),
                         Arc::new(Float32Array::from(vec![0.0, -20.0])) as ArrayRef,
                     ),
                     (
-                        Arc::new(ArrowField::new("max", DataType::Float32, true)),
+                        Arc::new(ArrowField::new("max_value", DataType::Float32, true)),
                         Arc::new(Float32Array::from(vec![10.0, 20.0])) as ArrayRef,
                     ),
                 ])),
@@ -911,11 +911,11 @@ mod tests {
                         Arc::new(Int64Array::from(vec![0, 2])) as ArrayRef,
                     ),
                     (
-                        Arc::new(ArrowField::new("min", DataType::Utf8, true)),
+                        Arc::new(ArrowField::new("min_value", DataType::Utf8, true)),
                         Arc::new(StringArray::from(vec!["abcdef", "abbb"])) as ArrayRef,
                     ),
                     (
-                        Arc::new(ArrowField::new("max", DataType::Utf8, true)),
+                        Arc::new(ArrowField::new("max_value", DataType::Utf8, true)),
                         Arc::new(StringArray::from(vec!["yz", "zz"])) as ArrayRef,
                     ),
                 ])),
@@ -929,7 +929,9 @@ mod tests {
         let arrow_projection = Arc::new(ArrowSchema::new(vec![
             ArrowField::new(
                 "0",
-                DataType::Struct(vec![ArrowField::new("min", DataType::Float32, true)].into()),
+                DataType::Struct(
+                    vec![ArrowField::new("min_value", DataType::Float32, true)].into(),
+                ),
                 true,
             ),
             ArrowField::new(
@@ -937,7 +939,7 @@ mod tests {
                 DataType::Struct(
                     vec![
                         ArrowField::new("null_count", DataType::Int64, true),
-                        ArrowField::new("max", DataType::Utf8, true),
+                        ArrowField::new("max_value", DataType::Utf8, true),
                     ]
                     .into(),
                 ),

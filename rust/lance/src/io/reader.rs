@@ -238,7 +238,10 @@ impl FileReader {
         // read the fragment metadata so we can handle deletion
         let fragment = if is_dataset {
             let fragment = manifest
-                .fragment_by_id(fragment_id as u32)
+                .fragments
+                .iter()
+                .find(|frag| frag.id == fragment_id)
+                .map(|f| f.to_owned())
                 .ok_or(Error::IO {
                     message: format!("Fragment {} not found in manifest", fragment_id),
                     location: location!(),
