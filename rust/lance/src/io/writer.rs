@@ -507,31 +507,32 @@ impl FileWriter {
     }
 
     async fn write_statistics(&mut self) -> Result<Option<StatisticsMetadata>> {
-        if let Some(stats_batch) = &self.stats {
-            let schema = Schema::try_from(stats_batch.schema().as_ref())?;
-            let leaf_field_ids = schema.field_ids();
+        match &self.stats {
+            Some(stats_batch) if stats_batch.num_rows() > 0 => {
+                let schema = Schema::try_from(stats_batch.schema().as_ref())?;
+                let leaf_field_ids = schema.field_ids();
 
-            let mut stats_page_table = PageTable::default();
-            for (i, field) in schema.fields.iter().enumerate() {
-                Self::write_array(
-                    &mut self.object_writer,
-                    field,
-                    &[stats_batch.column(i)],
-                    0, // Only one batch for statistics.
-                    &mut stats_page_table,
-                )
-                .await?;
+                let mut stats_page_table = PageTable::default();
+                for (i, field) in schema.fields.iter().enumerate() {
+                    Self::write_array(
+                        &mut self.object_writer,
+                        field,
+                        &[stats_batch.column(i)],
+                        0, // Only one batch for statistics.
+                        &mut stats_page_table,
+                    )
+                    .await?;
+                }
+
+                let page_table_position = stats_page_table.write(&mut self.object_writer, 0).await?;
+
+                Ok(Some(StatisticsMetadata {
+                    schema,
+                    leaf_field_ids,
+                    page_table_position,
+                }))
             }
-
-            let page_table_position = stats_page_table.write(&mut self.object_writer, 0).await?;
-
-            Ok(Some(StatisticsMetadata {
-                schema,
-                leaf_field_ids,
-                page_table_position,
-            }))
-        } else {
-            Ok(None)
+            _ => Ok(None),
         }
     }
 
@@ -569,8 +570,9 @@ mod tests {
     use arrow_array::{
         types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
         DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
-        DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int64Array,
-        NullArray, StringArray, TimestampMicrosecondArray, TimestampSecondArray, UInt8Array,
+        DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int32Array,
+        Int64Array, NullArray, StringArray, TimestampMicrosecondArray, TimestampSecondArray,
+        UInt8Array,
     };
     use arrow_buffer::i256;
     use arrow_schema::{
@@ -818,5 +820,133 @@ mod tests {
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
         assert_eq!(actual, batch);
+    }
+
+    async fn roundtrip_stats_batch(
+        stats_batch: RecordBatch,
+        projection: &Schema,
+    ) -> Option<RecordBatch> {
+        // Irrelevant sample data
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let data_batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )
+        .unwrap();
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
+            .await
+            .unwrap();
+        file_writer.write(&[data_batch.clone()]).await.unwrap();
+        file_writer.set_statistics(stats_batch);
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        reader.read_page_stats(projection).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_write_statistics() {
+        // Schema
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "0",
+                DataType::Struct(
+                    vec![
+                        ArrowField::new("null_count", DataType::Int64, true),
+                        ArrowField::new("min", DataType::Float32, true),
+                        ArrowField::new("max", DataType::Float32, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            ArrowField::new(
+                "1",
+                DataType::Struct(
+                    vec![
+                        ArrowField::new("null_count", DataType::Int64, true),
+                        ArrowField::new("min", DataType::Utf8, true),
+                        ArrowField::new("max", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+        ]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        // Empty record batch just isn't saved.
+        let batch = RecordBatch::new_empty(arrow_schema.clone());
+        assert!(roundtrip_stats_batch(batch, &schema).await.is_none());
+
+        // Can get back the full schema
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(ArrowField::new("null_count", DataType::Int64, true)),
+                        Arc::new(Int64Array::from(vec![3, 0])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("min", DataType::Float32, true)),
+                        Arc::new(Float32Array::from(vec![0.0, -20.0])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("max", DataType::Float32, true)),
+                        Arc::new(Float32Array::from(vec![10.0, 20.0])) as ArrayRef,
+                    ),
+                ])),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(ArrowField::new("null_count", DataType::Int64, true)),
+                        Arc::new(Int64Array::from(vec![0, 2])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("min", DataType::Utf8, true)),
+                        Arc::new(StringArray::from(vec!["abcdef", "abbb"])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("max", DataType::Utf8, true)),
+                        Arc::new(StringArray::from(vec!["yz", "zz"])) as ArrayRef,
+                    ),
+                ])),
+            ],
+        )
+        .unwrap();
+        let actual = roundtrip_stats_batch(batch.clone(), &schema).await.unwrap();
+        assert_eq!(actual, batch);
+
+        // Can project a subset of columns
+        let arrow_projection = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "0",
+                DataType::Struct(vec![ArrowField::new("min", DataType::Float32, true)].into()),
+                true,
+            ),
+            ArrowField::new(
+                "1",
+                DataType::Struct(
+                    vec![
+                        ArrowField::new("null_count", DataType::Int64, true),
+                        ArrowField::new("max", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+        ]));
+        let projection = schema.project_by_schema(arrow_projection.as_ref()).unwrap();
+        let expected = batch.project_by_schema(arrow_projection.as_ref()).unwrap();
+        let actual = roundtrip_stats_batch(batch, &projection).await.unwrap();
+        assert_eq!(actual, expected);
     }
 }
