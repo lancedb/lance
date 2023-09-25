@@ -368,7 +368,7 @@ mod tests {
 
     #[cfg(feature = "opq")]
     use approx::assert_relative_eq;
-    use arrow_array::types::Float32Type;
+    use arrow_array::types::{Float32Type, Float64Type};
     use lance_arrow::FixedSizeListArrayExt;
 
     use super::*;
@@ -464,5 +464,7 @@ mod tests {
         assert_eq!(mat.num_rows(), 10);
         assert_eq!(mat.num_columns(), 50);
         assert_eq!(mat.data().values(), data.values());
+
+        assert!(MatrixView::<Float64Type>::try_from(&fsl).is_err());
     }
 }
