@@ -149,10 +149,7 @@ async fn init_graph(
             message: format!("column {} not found", column),
         })?
         .as_fixed_size_list();
-    let matrix = MatrixView::<Float32Type>::new(
-        Arc::new(vectors.values().as_primitive::<Float32Type>().clone()),
-        vectors.value_length(),
-    );
+    let matrix = MatrixView::<Float32Type>::try_from(vectors)?;
     let nodes = row_ids
         .values()
         .iter()

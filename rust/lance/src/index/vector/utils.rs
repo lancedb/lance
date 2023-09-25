@@ -19,7 +19,6 @@ use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat_batches;
 use futures::stream::TryStreamExt;
 
-use lance_arrow::as_fixed_size_list_array;
 use lance_linalg::MatrixView;
 
 use crate::dataset::Dataset;
@@ -52,12 +51,5 @@ pub async fn maybe_sample_training_data(
             column
         ),
     })?;
-    let fixed_size_array = as_fixed_size_list_array(array);
-    let values = Arc::new(
-        fixed_size_array
-            .values()
-            .as_primitive::<Float32Type>()
-            .clone(),
-    );
-    Ok(MatrixView::new(values, fixed_size_array.value_length()))
+    Ok(array.as_fixed_size_list().try_into()?)
 }

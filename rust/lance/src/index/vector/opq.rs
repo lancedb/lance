@@ -18,8 +18,11 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow::array::{as_primitive_array, Float32Builder};
-use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array};
+use arrow::array::as_primitive_array;
+use arrow_array::{
+    builder::Float32Builder, cast::AsArray, types::Float32Type, Array, FixedSizeListArray,
+    Float32Array, RecordBatch, UInt8Array,
+};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_linalg::{distance::*, MatrixView};
@@ -95,8 +98,10 @@ impl OptimizedProductQuantizer {
         let length = dim * dim;
         let data =
             read_fixed_stride_array(reader, &DataType::Float32, position, length, ..).await?;
-        let f32_data: Float32Array = as_primitive_array(data.as_ref()).clone();
-        let rotation = Some(MatrixView::new(Arc::new(f32_data), dim));
+        let rotation = Some(MatrixView::new(
+            Arc::new(data.as_primitive::<Float32Type>().clone()),
+            dim,
+        ));
         Ok(Self {
             num_sub_vectors: 0,
             num_bits: 0,

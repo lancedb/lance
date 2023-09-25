@@ -46,11 +46,14 @@ impl std::fmt::Display for FloatType {
     }
 }
 
+/// Trait for float types used in Arrow Array.
+///
 pub trait ArrowFloatType {
     type Native: Float + FromPrimitive;
 
     const FLOAT_TYPE: FloatType;
 
+    /// Arrow Float Array Type.
     type ArrayType: FloatArray<Self>;
 }
 

@@ -406,9 +406,7 @@ impl Ivf {
 
         let dim = data.num_columns();
         let dist_func = metric_type.batch_func();
-        let centroids_arr = self.centroids.values().as_primitive::<Float32Type>();
-        let centroids: MatrixView<Float32Type> =
-            MatrixView::new(Arc::new(centroids_arr.clone()), dim);
+        let centroids: MatrixView<Float32Type> = self.centroids.as_ref().try_into()?;
         for i in 0..data.num_rows() {
             let vector = data.row(i).unwrap();
             let part_id =
