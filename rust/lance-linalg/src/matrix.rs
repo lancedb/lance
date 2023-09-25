@@ -316,8 +316,7 @@ where
                 )))
             }
         }
-        // Use downcast instead of `as_primitive()` to away from the type check.
-        // This is a bit
+        // Use downcast instead of `as_primitive()` to get away from the type check.
         let data: Arc<T::ArrayType> = Arc::new(
             value
                 .values()

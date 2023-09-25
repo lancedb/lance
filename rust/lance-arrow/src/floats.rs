@@ -14,14 +14,16 @@
 
 //! Floats Array
 
-use crate::bfloat16::BFloat16Type;
-use arrow_array::types::{Float16Type, Float32Type, Float64Type};
-use arrow_array::{Array, Float16Array, Float32Array, Float64Array};
-use half::{bf16, f16};
-use num_traits::{Float, FromPrimitive};
 use std::fmt::Formatter;
 
-use super::bfloat16::BFloat16Array;
+use arrow_array::{
+    types::{Float16Type, Float32Type, Float64Type},
+    Array, Float16Array, Float32Array, Float64Array,
+};
+use half::{bf16, f16};
+use num_traits::{Float, FromPrimitive};
+
+use super::bfloat16::{BFloat16Array, BFloat16Type};
 
 /// Float data type.
 ///
