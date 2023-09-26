@@ -60,6 +60,18 @@ Then install the hooks:
 pre-commit install
 ```
 
+From now any, any attempt to commit, will first run the linters against the
+modified files:
+
+```shell
+$ git commit -m"Changed some python files"
+black....................................................................Passed
+isort (python)...........................................................Passed
+ruff.....................................................................Passed
+[main daf91ed] Changed some python files
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+```
+
 ## Benchmarks
 
 The benchmarks in `python/benchmarks` can be used to identify and diagnose
