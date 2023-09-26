@@ -45,11 +45,13 @@ pub(crate) mod executor;
 pub(crate) mod fragment;
 pub(crate) mod reader;
 pub(crate) mod scanner;
+pub(crate) mod tracing;
 pub(crate) mod updater;
 pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
 use crate::fragment::cleanup_partial_writes;
+pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::KMeans;
 pub use dataset::write_dataset;
 pub use dataset::{Dataset, Operation};
@@ -85,6 +87,7 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyCompactionPlan>()?;
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
+    m.add_class::<TraceGuard>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
@@ -92,6 +95,7 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(infer_tfrecord_schema))?;
     m.add_wrapped(wrap_pyfunction!(read_tfrecord))?;
     m.add_wrapped(wrap_pyfunction!(cleanup_partial_writes))?;
+    m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

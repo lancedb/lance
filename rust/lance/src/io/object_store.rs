@@ -45,11 +45,15 @@ use crate::error::{Error, Result};
 use crate::io::object_reader::CloudObjectReader;
 use crate::io::object_writer::ObjectWriter;
 
+use self::tracing::ObjectStoreTracingExt;
+
 #[cfg(feature = "dynamodb")]
 use super::commit::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore};
 use super::commit::{CommitHandler, CommitLock, RenameCommitHandler, UnsafeCommitHandler};
 use super::local::LocalObjectReader;
 use super::object_reader::ObjectReader;
+
+mod tracing;
 
 // This is a bit odd but some object_store functions only accept
 // Stream<Result<T, ObjectStoreError>> and so we need to convert
@@ -409,7 +413,7 @@ impl ObjectStore {
 
         Ok((
             Self {
-                inner: Arc::new(LocalFileSystem::new()),
+                inner: Arc::new(LocalFileSystem::new()).traced(),
                 scheme: String::from("file"),
                 base_path: Path::from_absolute_path(&expanded_path)?,
                 block_size: 4 * 1024, // 4KB block size
@@ -506,7 +510,8 @@ impl ObjectStore {
 
                 Ok(Self {
                     inner: build_s3_object_store(url.to_string().as_str(), aws_creds, &region)
-                        .await?,
+                        .await?
+                        .traced(),
                     scheme: String::from(url.scheme()),
                     base_path: Path::from(url.path()),
                     block_size: 64 * 1024,
@@ -514,7 +519,9 @@ impl ObjectStore {
                 })
             }
             "gs" => Ok(Self {
-                inner: build_gcs_object_store(url.to_string().as_str()).await?,
+                inner: build_gcs_object_store(url.to_string().as_str())
+                    .await?
+                    .traced(),
                 scheme: String::from("gs"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
@@ -524,7 +531,9 @@ impl ObjectStore {
                     .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
             }),
             "az" => Ok(Self {
-                inner: build_azure_object_store(url.to_string().as_str()).await?,
+                inner: build_azure_object_store(url.to_string().as_str())
+                    .await?
+                    .traced(),
                 scheme: String::from("az"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
@@ -535,7 +544,7 @@ impl ObjectStore {
             }),
             "file" => Ok(Self::new_from_path(url.path(), params)?.0),
             "memory" => Ok(Self {
-                inner: Arc::new(InMemory::new()),
+                inner: Arc::new(InMemory::new()).traced(),
                 scheme: String::from("memory"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
@@ -554,7 +563,7 @@ impl ObjectStore {
     /// Create a in-memory object store directly for testing.
     pub fn memory() -> Self {
         Self {
-            inner: Arc::new(InMemory::new()),
+            inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
             base_path: Path::from("/"),
             block_size: 64 * 1024,

@@ -31,6 +31,8 @@
 *.out
 *.app
 
+# Tracing files
+trace-*.json
 
 **/*~
 **/__pycache__

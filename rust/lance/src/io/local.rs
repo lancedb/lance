@@ -30,6 +30,7 @@ use bytes::{Bytes, BytesMut};
 use object_store::path::Path;
 use snafu::location;
 use snafu::Location;
+use tracing::instrument;
 
 use super::object_reader::ObjectReader;
 use crate::{Error, Result};
@@ -64,6 +65,7 @@ pub struct LocalObjectReader {
 
 impl LocalObjectReader {
     /// Open a local object reader, with default prefetch size.
+    #[instrument(level = "debug")]
     pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn ObjectReader>> {
         let local_path = to_local_path(path);
         let file = File::open(local_path).map_err(|e| match e.kind() {
@@ -100,6 +102,7 @@ impl ObjectReader for LocalObjectReader {
     }
 
     /// Reads a range of data.
+    #[instrument(level = "debug", skip(self))]
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
         let file = self.file.clone();
         tokio::task::spawn_blocking(move || {

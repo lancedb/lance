@@ -31,6 +31,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use log::warn;
 use object_store::path::Path;
+use tracing::instrument;
 
 mod chunker;
 pub mod cleanup;
@@ -311,6 +312,7 @@ impl Dataset {
         })
     }
 
+    #[instrument(skip(batches, params))]
     async fn write_impl(
         batches: Box<dyn RecordBatchReader + Send>,
         uri: &str,
@@ -1350,7 +1352,7 @@ mod tests {
         )
     }
 
-    #[tokio::test]
+    #[lance_test_macros::test(tokio::test)]
     async fn test_create_dataset() {
         // Appending / Overwriting a dataset that does not exist is treated as Create
         for mode in [WriteMode::Create, WriteMode::Append, Overwrite] {
@@ -1359,7 +1361,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[lance_test_macros::test(tokio::test)]
     async fn test_create_and_fill_empty_dataset() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
