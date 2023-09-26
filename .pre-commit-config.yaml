@@ -1,0 +1,16 @@
+repos:
+  - repo: https://github.com/ambv/black
+    rev: 23.9.1
+    hooks:
+      - id: black
+        args: ["--check"]
+  - repo: https://github.com/pycqa/isort
+    rev: 5.12.0
+    hooks:
+      - id: isort
+        args: ["--check"]
+        name: isort (python)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.0.291
+    hooks:
+      - id: ruff
