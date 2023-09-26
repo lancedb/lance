@@ -710,6 +710,9 @@ def test_scan_prefilter(tmp_path: Path):
 
     assert table.column("index") == expected.column("index")
 
+    table = dataset.to_table(**args)
+    assert table.column("index") == expected.column("index")
+
 
 def test_scan_count_rows(tmp_path: Path):
     base_dir = tmp_path / "dataset"

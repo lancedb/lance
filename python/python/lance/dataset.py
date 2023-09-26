@@ -228,6 +228,8 @@ class LanceDataset(pa.dataset.Dataset):
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
         scan_in_order: bool = True,
+        *,
+        prefilter: bool = False,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -285,6 +287,7 @@ class LanceDataset(pa.dataset.Dataset):
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
             scan_in_order=scan_in_order,
+            prefilter=prefilter,
         ).to_table()
 
     @property
