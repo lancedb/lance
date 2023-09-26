@@ -1141,6 +1141,7 @@ impl Dataset {
 
         // All fragments have equal lengths
         futures::stream::iter(self.get_fragments())
+        
             .map(|f| async move { f.validate().await })
             .buffer_unordered(num_cpus::get() * 4)
             .try_collect::<Vec<()>>()

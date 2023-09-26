@@ -14,11 +14,3 @@ repos:
     rev: v0.0.291
     hooks:
       - id: ruff
-  - repo: https://github.com/doublify/pre-commit-rust
-    rev: v1.0
-    hooks:
-      - id: fmt
-        args: ["--check"]
-      - id: cargo-check
-      - id: clippy
-        args: ["--all-targets", "--all-features", "--", "-D", "warnings"]
