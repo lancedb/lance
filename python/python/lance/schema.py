@@ -32,7 +32,7 @@ def schema_to_json(schema: pa.Schema) -> Dict[str, Any]:
 
 def json_to_schema(schema_json: Dict[str, Any]) -> pa.Schema:
     """
-    Converts a JSON string to a PyArrow schema.
+    Converts a JSON string to a PyArrow schemas.
 
     Parameters
     ----------
