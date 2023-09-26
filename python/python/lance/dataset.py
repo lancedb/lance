@@ -38,7 +38,7 @@ from .lance import CleanupStats
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .lance import _Dataset, _Operation, _Scanner, _write_dataset
-from .util import ts_to_epoch_micros
+from .util import td_to_micros
 
 try:
     import pandas as pd
@@ -564,7 +564,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def cleanup_old_versions(
         self,
-        before: datetime = None,
+        older_than: timedelta = None,
         *,
         delete_unverified: bool = False,
     ) -> CleanupStats:
@@ -582,12 +582,10 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
 
-        before: datetime or str, optional
+        older_than: timedelta, optional
             Only versions older than this will be removed.  If not specified, this
-            will default to two weeks ago.
+            will default to two weeks.
 
-            This can be a datetime object or a string in ISO 8601 format.  If no
-            timezone is provided then it is assumed to be a time in the local timezone.
         delete_unverified: bool, default False
             Files leftover from a failed transaction may appear to be part of an
             in-progress operation (e.g. appending new data) and these files will
@@ -598,10 +596,10 @@ class LanceDataset(pa.dataset.Dataset):
             is currently working on this dataset.  Otherwise the dataset could be put
             into a corrupted state.
         """
-        if before is None:
-            before = datetime.now(timezone.utc) - timedelta(days=14)
+        if older_than is None:
+            older_than = timedelta(days=14)
         return self._ds.cleanup_old_versions(
-            ts_to_epoch_micros(before), delete_unverified
+            td_to_micros(older_than), delete_unverified
         )
 
     def create_index(

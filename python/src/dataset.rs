@@ -20,6 +20,7 @@ use arrow::pyarrow::{ToPyArrow, *};
 use arrow_array::{Float32Array, RecordBatch};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
+use chrono::Duration;
 use lance::arrow::as_fixed_size_list_array;
 use lance::dataset::transaction::RewriteGroup;
 use lance::dataset::{
@@ -45,7 +46,6 @@ use pyo3::{
 };
 
 use crate::fragment::{FileFragment, FragmentMetadata};
-use crate::utils::utc_datetime_from_epoch_timestamp;
 use crate::Scanner;
 use crate::RT;
 
@@ -490,14 +490,14 @@ impl Dataset {
     /// Cleanup old versions from the dataset
     fn cleanup_old_versions(
         &self,
-        before_micros: i64,
+        older_than_micros: i64,
         delete_unverified: Option<bool>,
     ) -> PyResult<CleanupStats> {
-        let before = utc_datetime_from_epoch_timestamp(before_micros)?;
+        let older_than = Duration::microseconds(older_than_micros);
         let cleanup_stats = RT
             .block_on(
                 None,
-                self.ds.cleanup_old_versions(before, delete_unverified),
+                self.ds.cleanup_old_versions(older_than, delete_unverified),
             )
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(CleanupStats {

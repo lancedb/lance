@@ -18,7 +18,6 @@ use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
-use chrono::{DateTime, NaiveDateTime, Utc};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_linalg::{
     distance::MetricType,
@@ -120,18 +119,5 @@ impl KMeans {
         } else {
             Ok(py.None())
         }
-    }
-}
-
-pub(crate) fn utc_datetime_from_epoch_timestamp(micros: i64) -> PyResult<DateTime<Utc>> {
-    let naive =
-        NaiveDateTime::from_timestamp_opt(micros / 1000000, 1000 * (micros % 1000000) as u32);
-    if let Some(naive) = naive {
-        Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
-    } else {
-        Err(PyValueError::new_err(format!(
-            "Timestamp {} is out of range",
-            micros
-        )))?
     }
 }

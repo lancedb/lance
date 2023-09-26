@@ -57,14 +57,9 @@ def sanitize_ts(ts: ts_types) -> datetime:
     return ts
 
 
-def ts_to_epoch_micros(ts: ts_types) -> int:
-    ts = sanitize_ts(ts)
-    if ts.tzinfo is None:
-        # If we are given a naive datetime then assume the user wants the local timezone
-        ts = ts.astimezone()
-    diff = ts - datetime(1970, 1, 1, tzinfo=timezone.utc)
-    micros = round(diff / timedelta(microseconds=1))
-    return micros
+def td_to_micros(td: timedelta) -> int:
+    """Returns the number of microseconds in a timedelta object."""
+    return round(td / timedelta(microseconds=1))
 
 
 class KMeans:

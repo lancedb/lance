@@ -19,7 +19,7 @@ import platform
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -403,15 +403,8 @@ def test_cleanup_old_versions(tmp_path):
     assert stats.bytes_removed == 0
     assert stats.old_versions == 0
 
-    # Ok, can accept time as ISO string
-    dataset.cleanup_old_versions(before="2021-01-01T00:00:00.000000Z")
-    # Ok, can accept time as datetime
-    dataset.cleanup_old_versions(
-        before=datetime.now(timezone.utc) - pd.Timedelta(days=14)
-    )
-    # Ok if no time zone specified, will assume local time
-    dataset.cleanup_old_versions(before=datetime.now() - pd.Timedelta(days=14))
-    dataset.cleanup_old_versions(before="2021-01-01T00:00:00.000000")
+    # Ok, can accept timedelta
+    dataset.cleanup_old_versions(older_than=timedelta(days=14))
 
     print(tmp_path)
     for root, dirnames, filenames in os.walk(tmp_path):
@@ -419,7 +412,7 @@ def test_cleanup_old_versions(tmp_path):
             print(root + "/" + filename)
 
     # Now this call will actually delete the old version
-    stats = dataset.cleanup_old_versions(before=moment)
+    stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
     print(stats)
     assert stats.bytes_removed > 0
     assert stats.old_versions == 1

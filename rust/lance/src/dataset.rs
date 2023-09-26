@@ -26,7 +26,7 @@ use arrow_array::{
 };
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::{concat::concat_batches, take::take};
-use chrono::prelude::*;
+use chrono::{prelude::*, Duration};
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::FutureExt;
@@ -64,7 +64,7 @@ use crate::io::{
     read_manifest, read_metadata_offset, write_manifest, ObjectStore,
 };
 use crate::session::Session;
-use crate::utils::temporal::SystemTime;
+use crate::utils::temporal::{utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use scanner::ROW_ID;
@@ -576,8 +576,7 @@ impl Dataset {
     ///
     /// # Arguments
     ///
-    /// * `before` - The timestamp of the oldest version to keep.  This must be at least
-    ///              two weeks ago.
+    /// * `older_than` - Versions older than this will be deleted.
     /// * `delete_unverified` - If false (the default) then files will only be deleted if they
     ///                        are listed in at least one manifest.  Otherwise these files will
     ///                        be kept since they cannot be distinguished from an in-progress
@@ -589,9 +588,10 @@ impl Dataset {
     /// * `RemovalStats` - Statistics about the removal operation
     pub fn cleanup_old_versions(
         &self,
-        before: DateTime<Utc>,
+        older_than: Duration,
         delete_unverified: Option<bool>,
     ) -> BoxFuture<Result<RemovalStats>> {
+        let before = utc_now() - older_than;
         cleanup::cleanup_old_versions(self, before, delete_unverified).boxed()
     }
 
