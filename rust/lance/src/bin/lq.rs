@@ -136,11 +136,11 @@ async fn main() -> Result<()> {
             metric_type,
             use_opq,
         } => {
-            let dataset = Dataset::open(uri).await.unwrap();
+            let mut dataset = Dataset::open(uri).await.unwrap();
             match action {
                 IndexAction::Create => {
                     create_index(
-                        &dataset,
+                        &mut dataset,
                         name,
                         column,
                         index_type,
@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 async fn create_index(
-    dataset: &Dataset,
+    dataset: &mut Dataset,
     name: &Option<String>,
     column: &Option<String>,
     index_type: &Option<IndexType>,

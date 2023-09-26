@@ -943,7 +943,7 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
         let centroids = generate_random_array(2 * DIM);
         let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
@@ -954,7 +954,7 @@ mod tests {
 
         let params = VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params);
 
-        let dataset = dataset
+        dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();

@@ -44,6 +44,34 @@ make lint
 
 (To run for just Python or just Rust, use `make lint-python` or `make lint-rust`.)
 
+### Format and lint on commit
+
+If you would like to run the formatters and linters when you commit your code
+then you can use the pre-commit tool.  The project includes a pre-commit config
+file already.  First, install the pre-commit tool:
+
+```shell
+pip install pre-commit
+```
+
+Then install the hooks:
+
+```shell
+pre-commit install
+```
+
+From now any, any attempt to commit, will first run the linters against the
+modified files:
+
+```shell
+$ git commit -m"Changed some python files"
+black....................................................................Passed
+isort (python)...........................................................Passed
+ruff.....................................................................Passed
+[main daf91ed] Changed some python files
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+```
+
 ## Benchmarks
 
 The benchmarks in `python/benchmarks` can be used to identify and diagnose 

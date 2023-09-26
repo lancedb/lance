@@ -535,7 +535,7 @@ mod tests {
         }
 
         async fn create_some_index(&self) -> Result<()> {
-            let db = self.open().await?;
+            let mut db = self.open().await?;
             let index_params = Box::new(VectorIndexParams {
                 stages: vec![StageParams::DiskANN(Default::default())],
                 metric_type: MetricType::L2,

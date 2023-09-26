@@ -942,7 +942,7 @@ mod tests {
         let futures: Vec<_> = ["vector1", "vector1", "vector2"]
             .iter()
             .map(|col_name| {
-                let dataset = dataset.clone();
+                let mut dataset = dataset.clone();
                 let params = params.clone();
                 tokio::spawn(async move {
                     dataset
