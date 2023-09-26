@@ -14,9 +14,8 @@ arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-schema = { workspace = true }
-chrono = "0.4.31"
-paste = "1.0.14"
-rand.workspace = true
+chrono = { workspace = true }
+rand = { workspace = true }
 rand_xoshiro = "0.6.0"
 
 [dev-dependencies]
