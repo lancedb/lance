@@ -44,7 +44,7 @@ make lint
 
 (To run for just Python or just Rust, use `make lint-python` or `make lint-rust`.)
 
-### Format and linting on commit
+### Format and lint on commit
 
 If you would like to run the formatters and linters when you commit your code
 then you can use the pre-commit tool.  The project includes a pre-commit config
@@ -74,7 +74,7 @@ ruff.....................................................................Passed
 
 ## Benchmarks
 
-The benchmarks in `python/benchmarks` can be used to identify and diagnose
+The benchmarks in `python/benchmarks` can be used to identify and diagnose 
 performance issues. They are run with [pytest-benchmark](https://pytest-benchmark.readthedocs.io/en/latest/).
 These benchmarks aren't mean to showcase performance on full-scale real world
 datasets; rather they are meant to be useful for developers to iterate on
@@ -102,7 +102,7 @@ they are re-used between benchmark runs.
 
 ### Run a particular benchmark
 
-To filter benchmarks by name, use the usual pytest `-k` flag (this can be a
+To filter benchmarks by name, use the usual pytest `-k` flag (this can be a 
 substring match, so you don't need to type the full name):
 
 ```shell
