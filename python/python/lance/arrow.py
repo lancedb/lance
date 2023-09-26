@@ -59,6 +59,8 @@ class EncodedImageType(pa.ExtensionType):
 
 class FixedShapeImageTensorType(pa.ExtensionType):
     def __init__(self, arrow_type, shape):
+        self.shape = shape
+        self.arrow_type = arrow_type
         length = 1
         for dim in shape:
             length *= dim
@@ -66,12 +68,16 @@ class FixedShapeImageTensorType(pa.ExtensionType):
         pa.ExtensionType.__init__(
             self,
             pa.list_(arrow_type, length),
-            # pa.fixed_shape_tensor(arrow_type, shape),
             "lance.arrow.fixed_shape_image_tensor",
         )
 
     def __arrow_ext_serialize__(self):
-        return b""
+        import json
+
+        serialized = json.dumps(
+            {"shape": self.shape, "parent_type": "FixedShapeImageTensorType"}
+        ).encode()
+        return serialized
 
     @classmethod
     def __arrow_ext_deserialize__(cls, storage_type, serialized):
@@ -87,14 +93,9 @@ class FixedShapeImageTensorType(pa.ExtensionType):
         return FixedShapeImageTensorScalar
 
 
-def _storage_matches_or_raise(expected_type, storage_type):
-    if not expected_type == storage_type:
-        raise TypeError(f"Cannot read {expected_type} images from a {storage_type}.")
-
-
 class ImageArray(pa.ExtensionArray):
     def __repr__(self):
-        return f"<lance.arrow.{type(self)} object at 0x%016x>\n%s" % (
+        return f"<lance.arrow.{type(self).__repr__()} object at 0x%016x>\n%s" % (
             id(self),
             repr(self.to_pylist()),
         )
@@ -253,8 +254,9 @@ class EncodedImageArray(ImageArray):
             arrow_type = pa.from_numpy_dtype(image_array.dtype)
             tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(image_array)
 
-        ty = FixedShapeImageTensorType(arrow_type, shape)
-        return pa.ExtensionArray.from_storage(ty, tensor_array.storage)
+        return pa.ExtensionArray.from_storage(
+            FixedShapeImageTensorType(arrow_type, shape), tensor_array.storage
+        )
 
 
 # TODO: add VariableShapeImageTensorType once pa.VariableShapeTensorArray is available
