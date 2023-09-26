@@ -328,7 +328,8 @@ impl Dataset {
 
             let k: usize = if let Some(k) = nearest.get_item("k") {
                 if k.is_none() {
-                    10
+                    // Use limit if k is not specified, default to 10.
+                    limit.unwrap_or(10) as usize
                 } else {
                     PyAny::downcast::<PyLong>(k)?.extract()?
                 }

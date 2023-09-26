@@ -139,15 +139,23 @@ def test_use_index(dataset, tmp_path):
         nearest={
             "column": "vector",
             "q": q,
-            "k": 10,
+            "k": 12,  # Use non-default k
         },
     )["id"].to_numpy()
 
     actual = ann_ds.to_table(
         columns=["id"],
-        nearest={"column": "vector", "q": q, "k": 10, "use_index": False},
+        nearest={"column": "vector", "q": q, "k": 12, "use_index": False},
     )["id"].to_numpy()
 
+    assert np.all(expected == actual)
+
+    # Can omit k but provide limit
+    actual = ann_ds.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": q, "use_index": False},
+        limit=12,
+    )["id"].to_numpy()
     assert np.all(expected == actual)
 
 
