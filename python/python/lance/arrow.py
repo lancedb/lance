@@ -84,7 +84,7 @@ class FixedShapeImageTensorType(pa.ExtensionType):
         import json
 
         deserialized = json.loads(serialized.decode())
-        return cls.__init__(storage_type.value_type, deserialized["shape"])
+        return FixedShapeImageTensorType(storage_type.value_type, deserialized["shape"])
 
     def __arrow_ext_class__(self):
         return FixedShapeImageTensorArray
@@ -93,10 +93,15 @@ class FixedShapeImageTensorType(pa.ExtensionType):
         return FixedShapeImageTensorScalar
 
 
+pa.register_extension_type(ImageURIType())
+pa.register_extension_type(EncodedImageType())
+pa.register_extension_type(FixedShapeImageTensorType(pa.uint8(), (0,)))
+
+
 class ImageArray(pa.ExtensionArray):
     def __repr__(self):
-        return "%s object at 0x%016x>\n%s" % (
-            str(type(self)).rstrip(">"),
+        return "<lance.arrow.%s object at 0x%016x>\n%s" % (
+            type(self).__name__,
             id(self),
             repr(self.to_pylist()),
         )
@@ -266,6 +271,11 @@ class FixedShapeImageTensorArray(ImageArray):
     Array of fixed shape tensors representing image pixels.
     """
 
+    def _to_numpy_ndarray(self):
+        ext_type = pa.fixed_shape_tensor(self.storage.type.value_type, self.type.shape)
+        tensor_array = pa.ExtensionArray.from_storage(ext_type, self.storage)
+        return tensor_array.to_numpy_ndarray()
+
     def to_tf(self):
         """
         Convert FixedShapeImageTensorArray to a tensorflow.Tensor.
@@ -283,7 +293,7 @@ class FixedShapeImageTensorArray(ImageArray):
         >>> shape = arr.shape[1:]
         >>> tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(arr)
         >>> tensor_image_array = FixedShapeImageTensorArray.from_storage(
-        ... FixedShapeImageTensorType(arrow_type, shape), tensor_array)
+        ... FixedShapeImageTensorType(arrow_type, shape), tensor_array.storage)
         >>> tensor_image_array.to_tf()
         <tf.Tensor: shape=(1, 1, 1, 4), dtype=uint8, numpy=array([[[[ 42,  42,  42, 255\
 ]]]], dtype=uint8)>
@@ -292,7 +302,8 @@ class FixedShapeImageTensorArray(ImageArray):
             import tensorflow as tf
         except ImportError:
             raise ImportError("Cannot convert to tf.Tensor without tensorflow")
-        return tf.convert_to_tensor(self.storage.to_numpy_ndarray())
+
+        return tf.convert_to_tensor(self._to_numpy_ndarray())
 
     def to_encoded(self, encoder=None):
         """
@@ -316,7 +327,7 @@ class FixedShapeImageTensorArray(ImageArray):
         >>> shape = arr.shape[1:]
         >>> tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(arr)
         >>> tensor_image_array = FixedShapeImageTensorArray.from_storage(
-        ... FixedShapeImageTensorType(arrow_type, shape), tensor_array)
+        ... FixedShapeImageTensorType(arrow_type, shape), tensor_array.storage)
         >>> tensor_image_array.to_encoded()
         <lance.arrow.EncodedImageArray object at 0x...>
         ...
@@ -361,7 +372,7 @@ class FixedShapeImageTensorArray(ImageArray):
                 )
 
         return EncodedImageArray.from_storage(
-            EncodedImageType(), encoder(self.storage.to_numpy_ndarray())
+            EncodedImageType(), encoder(self._to_numpy_ndarray())
         )
 
 

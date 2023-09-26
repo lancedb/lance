@@ -161,9 +161,7 @@ def test_image_arrays(tmp_path: Path):
     encoded_image_array = uri_array.read_uris()
     tensor_image_array = encoded_image_array.to_tensor()
     assert len(tensor_image_array) == n
-    assert tensor_image_array.storage.type == pa.fixed_shape_tensor(
-        pa.uint8(), (1, 1, 4)
-    )
+    assert tensor_image_array.storage.type == pa.list_(pa.uint8(), 4)
     assert tensor_image_array[2].as_py() == [42, 42, 42, 255]
 
     test_tensor = tf.constant(
@@ -197,7 +195,6 @@ def test_roundtrip_image_tensor(tmp_path: Path):
     import os
 
     png_uris = [
-        "file://" + os.path.join(os.path.dirname(__file__), "images/1.png"),
         os.path.join(os.path.dirname(__file__), "images/1.png"),
     ] * 5
     uri_array = ImageURIArray.from_uris(png_uris)
@@ -215,5 +212,4 @@ def test_roundtrip_image_tensor(tmp_path: Path):
     assert tbl.take(indices).to_pylist() == tbl2.take(indices).to_pylist()
     tensor_image_array_2 = tbl2.take(indices).column(2)
 
-    # TODO: type is not preserved
     assert tensor_image_array_2.type == tensor_image_array.type
