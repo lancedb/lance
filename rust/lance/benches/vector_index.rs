@@ -140,7 +140,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-    let dataset = Dataset::write(reader, test_uri, Some(write_params))
+    let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
         .await
         .unwrap();
     let ivf_params = IvfBuildParams {

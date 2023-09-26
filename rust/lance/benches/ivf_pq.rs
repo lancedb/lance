@@ -93,6 +93,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
                     VectorIndexParams::ivf_pq(ivf_partition, 8, pq, false, MetricType::L2, 50);
 
                 dataset
+                    .clone()
                     .create_index(
                         vec!["vector"].as_slice(),
                         IndexType::Vector,

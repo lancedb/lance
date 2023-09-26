@@ -484,7 +484,7 @@ impl Dataset {
     }
 
     fn create_index(
-        self_: PyRef<'_, Self>,
+        &mut self,
         columns: Vec<&str>,
         index_type: &str,
         name: Option<String>,
@@ -581,13 +581,14 @@ impl Dataset {
             }
         };
 
+        let mut new_self = self.ds.as_ref().clone();
         RT.block_on(
-            Some(self_.py()),
-            self_
-                .ds
-                .create_index(&columns, idx_type, name, &params, replace),
+            None,
+            new_self.create_index(&columns, idx_type, name, &params, replace),
         )
-        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+
         Ok(())
     }
 

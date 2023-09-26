@@ -35,7 +35,6 @@ pub mod vector;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::format::Index as IndexMetadata;
 use crate::io::commit::commit_transaction;
-use crate::session::Session;
 use crate::{dataset::Dataset, Error, Result};
 
 use self::vector::{build_vector_index, VectorIndexParams};
@@ -95,25 +94,25 @@ pub trait DatasetIndexExt {
     ///  - `params`: index parameters.
     ///  - `replace`: replace the existing index if it exists.
     async fn create_index(
-        &self,
+        &mut self,
         columns: &[&str],
         index_type: IndexType,
         name: Option<String>,
         params: &dyn IndexParams,
         replace: bool,
-    ) -> Result<Dataset>;
+    ) -> Result<()>;
 }
 
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     async fn create_index(
-        &self,
+        &mut self,
         columns: &[&str],
         index_type: IndexType,
         name: Option<String>,
         params: &dyn IndexParams,
         replace: bool,
-    ) -> Result<Self> {
+    ) -> Result<()> {
         if columns.len() != 1 {
             return Err(Error::Index {
                 message: "Only support building index on 1 column at the moment".to_string(),
@@ -188,12 +187,9 @@ impl DatasetIndexExt for Dataset {
         )
         .await?;
 
-        Ok(Self {
-            object_store: self.object_store.clone(),
-            base: self.base.clone(),
-            manifest: Arc::new(new_manifest),
-            session: Arc::new(Session::default()),
-        })
+        self.manifest = Arc::new(new_manifest);
+
+        Ok(())
     }
 }
 
@@ -236,20 +232,20 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
         let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
-        let dataset = dataset
+        dataset
             .create_index(&["v"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
-        let dataset = dataset
+        dataset
             .create_index(&["o"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
 
         // Create index again
-        let dataset = dataset
+        dataset
             .create_index(&["v"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
