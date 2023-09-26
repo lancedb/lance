@@ -10,6 +10,7 @@ def trace_to_chrome(*, file: str = None, level: str = None):
     The trace file can be opened with chrome://tracing or with the Perfetto UI.
 
     The file will be finished (and closed) when the python process exits.
+
     Parameters
     ----------
     file: str, optional
