@@ -32,8 +32,8 @@ def test_tracing():
         [
             sys.executable,
             "-c",
-            f"from lance.tracing import trace_to_chrome;"
-            + "trace_to_chrome(file='{trace_name}')",
+            "from lance.tracing import trace_to_chrome;"
+            + f"trace_to_chrome(file='{trace_name}')",
         ],
         check=True,
     )
