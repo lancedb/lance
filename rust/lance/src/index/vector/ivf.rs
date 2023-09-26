@@ -528,6 +528,8 @@ pub struct IvfBuildParams {
 
     /// Use provided IVF centroids.
     pub centroids: Option<Arc<FixedSizeListArray>>,
+
+    pub sample_rate: usize,
 }
 
 impl Default for IvfBuildParams {
@@ -536,6 +538,7 @@ impl Default for IvfBuildParams {
             num_partitions: 32,
             max_iters: 50,
             centroids: None,
+            sample_rate: 256, // See faiss
         }
     }
 }
@@ -892,6 +895,7 @@ async fn train_ivf_model(
         REDOS,
         rng,
         metric_type,
+        params.sample_rate,
     )
     .await?;
     Ok(Ivf::new(Arc::new(FixedSizeListArray::try_new_from_values(

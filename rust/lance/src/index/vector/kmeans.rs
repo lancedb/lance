@@ -36,6 +36,7 @@ pub async fn train_kmeans(
     redos: usize,
     mut rng: impl Rng,
     metric_type: MetricType,
+    sample_rate: usize,
 ) -> Result<Float32Array> {
     let num_rows = array.len() / dimension;
     if num_rows < k {
@@ -43,16 +44,16 @@ pub async fn train_kmeans(
             "KMeans: can not train {k} centroids with {num_rows} vectors, choose a smaller K (< {num_rows}) instead"
         )});
     }
-    // Ony sample 256 * num_clusters. See Faiss
-    let data = if num_rows > 256 * k {
+    // Ony sample sample_rate * num_clusters. See Faiss
+    let data = if num_rows > sample_rate * k {
         println!(
             "Sample {} out of {} to train kmeans of {} dim, {} clusters",
-            256 * k,
+            sample_rate * k,
             array.len() / dimension,
             dimension,
             k,
         );
-        let sample_size = 256 * k;
+        let sample_size = sample_rate * k;
         let chosen = (0..num_rows).choose_multiple(&mut rng, sample_size);
         let mut builder = Float32Builder::with_capacity(sample_size * dimension);
         for idx in chosen.iter() {

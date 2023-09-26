@@ -513,8 +513,7 @@ impl ProductQuantizer {
     pub async fn train(
         &mut self,
         data: &MatrixView<Float32Type>,
-        metric_type: MetricType,
-        max_iters: usize,
+        params: &PQBuildParams,
     ) -> Result<()> {
         assert!(data.num_columns() % self.num_sub_vectors == 0);
         assert_eq!(data.data().null_count(), 0);
@@ -539,10 +538,11 @@ impl ProductQuantizer {
                 prev_centroids,
                 sub_vector_dimension,
                 num_centroids,
-                max_iters as u32,
+                params.max_iters as u32,
                 REDOS,
                 rng.clone(),
-                metric_type,
+                params.metric_type,
+                params.sample_rate,
             )
             .await?;
             // TODO: COPIED COPIED COPIED
@@ -686,6 +686,8 @@ pub struct PQBuildParams {
 
     /// User provided codebook.
     pub codebook: Option<Arc<Float32Array>>,
+
+    pub sample_rate: usize,
 }
 
 impl Default for PQBuildParams {
@@ -698,6 +700,7 @@ impl Default for PQBuildParams {
             max_iters: 50,
             max_opq_iters: 50,
             codebook: None,
+            sample_rate: 1024,
         }
     }
 }
@@ -735,7 +738,7 @@ pub(crate) async fn train_pq(
         params.num_bits as u32,
         data.num_columns(),
     );
-    pq.train(data, params.metric_type, params.max_iters).await?;
+    pq.train(data, params).await?;
     Ok(pq)
 }
 
@@ -776,18 +779,21 @@ mod tests {
     #[ignore]
     #[tokio::test]
     async fn test_train_pq_iteratively() {
+        let mut params = PQBuildParams::new(2, 8);
+        params.max_iters = 1;
+
         let values = Float32Array::from_iter((0..16000).map(|v| v as f32));
         // A 16-dim array.
         let dim = 16;
         let mat = MatrixView::new(values.into(), dim);
         let mut pq = ProductQuantizer::new(2, 8, dim);
-        pq.train(&mat, MetricType::L2, 1).await.unwrap();
+        pq.train(&mat, &params).await.unwrap();
 
         // Init centroids
         let centroids = pq.codebook.as_ref().unwrap().clone();
 
         // Keep training 10 times
-        pq.train(&mat, MetricType::L2, 10).await.unwrap();
+        pq.train(&mat, &params).await.unwrap();
 
         let mut actual_pq = ProductQuantizer {
             num_bits: 8,
@@ -799,7 +805,7 @@ mod tests {
         for _ in 0..10 {
             let code = actual_pq.transform(&mat, MetricType::L2).await.unwrap();
             actual_pq.reset_centroids(&mat, &code).unwrap();
-            actual_pq.train(&mat, MetricType::L2, 1).await.unwrap();
+            actual_pq.train(&mat, &params).await.unwrap();
         }
 
         let result = pq.codebook.unwrap();
