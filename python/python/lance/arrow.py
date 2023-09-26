@@ -84,7 +84,7 @@ class FixedShapeImageTensorType(pa.ExtensionType):
         import json
 
         deserialized = json.loads(serialized.decode())
-        return FixedShapeImageTensorType(storage_type.value_type, deserialized["shape"])
+        return cls.__init__(storage_type.value_type, deserialized["shape"])
 
     def __arrow_ext_class__(self):
         return FixedShapeImageTensorArray
@@ -95,7 +95,8 @@ class FixedShapeImageTensorType(pa.ExtensionType):
 
 class ImageArray(pa.ExtensionArray):
     def __repr__(self):
-        return f"<lance.arrow.{type(self).__repr__()} object at 0x%016x>\n%s" % (
+        return "%s object at 0x%016x>\n%s" % (
+            str(type(self)).rstrip(">"),
             id(self),
             repr(self.to_pylist()),
         )
@@ -193,7 +194,7 @@ class EncodedImageArray(ImageArray):
         ----------
         decoder : Callable[pa.binary()], optional
             A function that takes a pa.binary() and returns a numpy.ndarray
-            or pa.fixed_size_tensor. If not provided, will attempt to use
+            or pa.fixed_shape_tensor. If not provided, will attempt to use
             tensorflow and then pillow decoder in that order.
 
         Returns

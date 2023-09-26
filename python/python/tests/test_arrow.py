@@ -216,4 +216,4 @@ def test_roundtrip_image_tensor(tmp_path: Path):
     tensor_image_array_2 = tbl2.take(indices).column(2)
 
     # TODO: type is not preserved
-    # assert tensor_image_array_2.type == tensor_image_array.type
+    assert tensor_image_array_2.type == tensor_image_array.type
