@@ -229,6 +229,8 @@ class LanceDataset(pa.dataset.Dataset):
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
         scan_in_order: bool = True,
+        *,
+        prefilter: bool = False,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -286,6 +288,7 @@ class LanceDataset(pa.dataset.Dataset):
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
             scan_in_order=scan_in_order,
+            prefilter=prefilter,
         ).to_table()
 
     @property
@@ -334,6 +337,8 @@ class LanceDataset(pa.dataset.Dataset):
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
         scan_in_order: bool = True,
+        *,
+        prefilter: bool = False,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -357,6 +362,7 @@ class LanceDataset(pa.dataset.Dataset):
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
             scan_in_order=scan_in_order,
+            prefilter=prefilter,
         ).to_batches()
 
     def take(
