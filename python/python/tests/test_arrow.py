@@ -159,7 +159,7 @@ def test_image_arrays(tmp_path: Path):
 
     uri_array = ImageURIArray.from_uris(png_uris)
     encoded_image_array = uri_array.read_uris()
-    tensor_image_array = encoded_image_array.image_to_tensor()
+    tensor_image_array = encoded_image_array.to_tensor()
     assert len(tensor_image_array) == n
     assert tensor_image_array.storage.type == pa.fixed_shape_tensor(
         pa.uint8(), (1, 1, 4)
@@ -171,8 +171,8 @@ def test_image_arrays(tmp_path: Path):
     )
     assert test_tensor.shape == (n, 1, 1, 4)
     assert tf.math.reduce_all(tensor_image_array.to_tf() == test_tensor)
-    tensor_image_array.to_encoded().image_to_tensor()
-    assert tensor_image_array.to_encoded().image_to_tensor() == tensor_image_array
+    tensor_image_array.to_encoded().to_tensor()
+    assert tensor_image_array.to_encoded().to_tensor() == tensor_image_array
 
     def png_encoder(images):
         import tensorflow as tf
@@ -182,17 +182,14 @@ def test_image_arrays(tmp_path: Path):
         )
         return pa.array(encoded_images, type=pa.binary())
 
-    assert (
-        tensor_image_array.to_encoded(png_encoder).image_to_tensor()
-        == tensor_image_array
-    )
+    assert tensor_image_array.to_encoded(png_encoder).to_tensor() == tensor_image_array
     uris = [
         os.path.join(os.path.dirname(__file__), "images/1.png"),
         os.path.join(os.path.dirname(__file__), "images/2.jpeg"),
     ]
     encoded_image_array = ImageURIArray.from_uris(uris).read_uris()
     with pytest.raises(ValueError, match="all input arrays must have the same shape"):
-        encoded_image_array.image_to_tensor()
+        encoded_image_array.to_tensor()
 
 
 @requires_pyarrow_12
@@ -205,7 +202,7 @@ def test_roundtrip_image_tensor(tmp_path: Path):
     ] * 5
     uri_array = ImageURIArray.from_uris(png_uris)
     encoded_image_array = uri_array.read_uris()
-    tensor_image_array = encoded_image_array.image_to_tensor()
+    tensor_image_array = encoded_image_array.to_tensor()
 
     tbl = pa.Table.from_arrays(
         [uri_array, encoded_image_array, tensor_image_array],
@@ -216,3 +213,5 @@ def test_roundtrip_image_tensor(tmp_path: Path):
     indices = list(range(len(png_uris)))
 
     assert tbl.take(indices).to_pylist() == tbl2.take(indices).to_pylist()
+    tensor_image_array_2 = tbl2.take(indices).field(2)
+    assert tensor_image_array_2.type == tensor_image_array.type

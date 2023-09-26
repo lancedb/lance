@@ -59,14 +59,19 @@ class EncodedImageType(pa.ExtensionType):
 
 class FixedShapeImageTensorType(pa.ExtensionType):
     def __init__(self, arrow_type, shape):
+        length = 1
+        for dim in shape:
+            length *= dim
+
         pa.ExtensionType.__init__(
             self,
-            pa.fixed_shape_tensor(arrow_type, shape),
+            pa.list_(arrow_type, length),
+            # pa.fixed_shape_tensor(arrow_type, shape),
             "lance.arrow.fixed_shape_image_tensor",
         )
 
     def __arrow_ext_serialize__(self):
-        return self.storage_type.__arrow_ext_serialize__()
+        return b""
 
     @classmethod
     def __arrow_ext_deserialize__(cls, storage_type, serialized):
@@ -82,17 +87,24 @@ class FixedShapeImageTensorType(pa.ExtensionType):
         return FixedShapeImageTensorScalar
 
 
-class ImageURIArray(pa.ExtensionArray):
+def _storage_matches_or_raise(expected_type, storage_type):
+    if not expected_type == storage_type:
+        raise TypeError(f"Cannot read {expected_type} images from a {storage_type}.")
+
+
+class ImageArray(pa.ExtensionArray):
+    def __repr__(self):
+        return f"<lance.arrow.{type(self)} object at 0x%016x>\n%s" % (
+            id(self),
+            repr(self.to_pylist()),
+        )
+
+
+class ImageURIArray(ImageArray):
     """
     Array of image URIs. URIs may represent local files or remote files in
     S3 or GCS if they are accessible by the machine executing this.
     """
-
-    def __repr__(self):
-        return "<lance.arrow.ImageURIArray object at 0x%016x>\n%s" % (
-            id(self),
-            repr(self.to_pylist()),
-        )
 
     @classmethod
     def from_uris(cls, uris: Union[pa.StringArray, Iterable[Union[str, Path]]]):
@@ -161,7 +173,7 @@ class ImageURIArray(pa.ExtensionArray):
         )
 
 
-class EncodedImageArray(pa.ExtensionArray):
+class EncodedImageArray(ImageArray):
     """
     Array of encoded images. Images may be encoded in any format. Format is not stored
     by the array but can typically be inferred from the image bytes. Alternatively a
@@ -170,13 +182,7 @@ class EncodedImageArray(pa.ExtensionArray):
 
     import numpy as np
 
-    def __repr__(self):
-        return "<lance.arrow.EncodedImageArray object at 0x%016x>\n%s" % (
-            id(self),
-            repr(self.to_pylist()),
-        )
-
-    def image_to_tensor(
+    def to_tensor(
         self, decoder: Optional[Callable[[pa.BinaryArray], np.ndarray]] = None
     ):
         """
@@ -199,7 +205,7 @@ class EncodedImageArray(pa.ExtensionArray):
         >>> import os
         >>> uris = [os.path.join(os.path.dirname(__file__), "../tests/images/1.png")]
         >>> encoded_image_array = ImageURIArray.from_uris(uris).read_uris()
-        >>> encoded_image_array.image_to_tensor()
+        >>> encoded_image_array.to_tensor()
         <lance.arrow.FixedShapeImageTensorArray object at 0x...>
         [[42, 42, 42, 255]]
         """
@@ -247,22 +253,15 @@ class EncodedImageArray(pa.ExtensionArray):
             arrow_type = pa.from_numpy_dtype(image_array.dtype)
             tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(image_array)
 
-        return FixedShapeImageTensorArray.from_storage(
-            FixedShapeImageTensorType(arrow_type, shape), tensor_array
-        )
+        ty = FixedShapeImageTensorType(arrow_type, shape)
+        return pa.ExtensionArray.from_storage(ty, tensor_array.storage)
 
 
 # TODO: add VariableShapeImageTensorType once pa.VariableShapeTensorArray is available
-class FixedShapeImageTensorArray(pa.ExtensionArray):
+class FixedShapeImageTensorArray(ImageArray):
     """
     Array of fixed shape tensors representing image pixels.
     """
-
-    def __repr__(self):
-        return "<lance.arrow.FixedShapeImageTensorArray object at 0x%016x>\n%s" % (
-            id(self),
-            repr(self.to_pylist()),
-        )
 
     def to_tf(self):
         """
@@ -363,19 +362,21 @@ class FixedShapeImageTensorArray(pa.ExtensionArray):
         )
 
 
-class ImageURIScalar(pa.ExtensionScalar):
+class ImageScalar(pa.ExtensionScalar):
     def as_py(self):
         return self.value.as_py()
 
 
-class EncodedImageScalar(pa.ExtensionScalar):
-    def as_py(self):
-        return self.value.as_py()
+class ImageURIScalar(ImageScalar):
+    pass
 
 
-class FixedShapeImageTensorScalar(pa.ExtensionScalar):
-    def as_py(self):
-        return self.value.as_py()
+class EncodedImageScalar(ImageScalar):
+    pass
+
+
+class FixedShapeImageTensorScalar(ImageScalar):
+    pass
 
 
 class BFloat16Array(pa.ExtensionArray):
