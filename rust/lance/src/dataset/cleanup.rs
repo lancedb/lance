@@ -228,7 +228,7 @@ impl<'a> CleanupTask<'a> {
                     !self.delete_unverified && obj_meta.last_modified >= verification_threshold;
                 let path_to_remove =
                     self.path_if_not_referenced(obj_meta.location, maybe_in_progress, &inspection);
-                if path_to_remove.is_ok() && path_to_remove.as_ref().unwrap().is_some() {
+                if matches!(path_to_remove, Ok(Some(..))) {
                     removal_stats.lock().unwrap().bytes_removed += obj_meta.size as u64;
                 }
                 future::ready(path_to_remove)
@@ -240,6 +240,8 @@ impl<'a> CleanupTask<'a> {
 
         let manifest_bytes_removed = stream::iter(&old_manifests)
             .then(|path| async move { self.dataset.object_store.size(path).await })
+            // TODO: uncomment this after
+            // https://github.com/rust-lang/rust/issues/102211 is resolved
             // .buffer_unordered(num_cpus::get())
             .try_fold(0, |acc, size| async move { Ok(acc + (size as u64)) })
             .await;

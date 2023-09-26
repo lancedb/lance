@@ -578,6 +578,11 @@ impl Dataset {
     ///
     /// * `before` - The timestamp of the oldest version to keep.  This must be at least
     ///              two weeks ago.
+    /// * `delete_unverified` - If false (the default) then files will only be deleted if they
+    ///                        are listed in at least one manifest.  Otherwise these files will
+    ///                        be kept since they cannot be distinguished from an in-progress
+    ///                        transaction.  Set to true to delete these files if you are sure
+    ///                        there are no other in-progress dataset operations.
     ///
     /// # Returns
     ///
