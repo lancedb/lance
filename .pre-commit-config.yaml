@@ -15,7 +15,7 @@ repos:
     hooks:
       - id: ruff
   - repo: https://github.com/doublify/pre-commit-rust
-    rev: master
+    rev: v1.0
     hooks:
       - id: fmt
         args: ["--check"]
