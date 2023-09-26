@@ -52,7 +52,7 @@ def test_write_fragment_two_phases(tmp_path: Path):
     schema = pa.schema([pa.field("a", pa.int64())])
 
     operation = LanceOperation.Overwrite(schema, fragments)
-    dataset = LanceDataset._commit(tmp_path, operation)
+    dataset = LanceDataset.commit(tmp_path, operation)
 
     df = dataset.to_table().to_pandas()
     pd.testing.assert_frame_equal(
@@ -154,3 +154,27 @@ def test_dataset_progress(tmp_path: Path):
 
     assert not (progress_uri / "fragment_1.json").exists()
     assert not (progress_uri / "fragment_1.in_progress").exists()
+
+
+def test_fragment_meta():
+    data = {
+        "id": 0,
+        "files": [
+            {"path": "0.lance", "fields": [0]},
+            {"path": "1.lance", "fields": [1]},
+        ],
+        "deletion_file": None,
+        "physical_rows": 100,
+    }
+    meta = FragmentMetadata.from_json(json.dumps(data))
+
+    assert meta.id == 0
+    assert len(meta.data_files()) == 2
+    assert meta.data_files()[0].path() == "0.lance"
+    assert meta.data_files()[1].path() == "1.lance"
+
+    assert repr(meta) == (
+        'Fragment { id: 0, files: [DataFile { path: "0.lance", fields: [0] },'
+        ' DataFile { path: "1.lance", fields: [1] }], deletion_file: None,'
+        " physical_rows: 100 }"
+    )

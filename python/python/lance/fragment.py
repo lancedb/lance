@@ -161,6 +161,16 @@ class LanceFragment(pa.dataset.Fragment):
         progress: FragmentWriteProgress, optional
             *Experimental API*. Progress tracking for writing the fragment.
 
+        See Also
+        --------
+        lance.dataset.LanceOperation.Overwrite :
+            The operation used to create a new dataset or overwrite one using
+            fragments created with this API. See the doc page for an example of
+            using this API.
+        lance.dataset.LanceOperation.Append :
+            The operation used to append fragments created with this API to an
+            existing dataset. See the doc page for an example of using this API.
+
         Returns
         -------
         FragmentMetadata
@@ -279,6 +289,12 @@ class LanceFragment(pa.dataset.Fragment):
             If specified, only the columns in this list will be passed to the
             value_func. Otherwise, all columns will be passed to the value_func.
 
+        See Also
+        --------
+        lance.dataset.LanceOperation.Merge :
+            The operation used to commit these changes to the dataset. See the
+            doc page for an example of using this API.
+
         Returns
         -------
             A new fragment with the added column(s).
@@ -332,6 +348,12 @@ class LanceFragment(pa.dataset.Fragment):
         Fragment { id: 0, files: ..., deletion_file: Some(...), physical_rows: 3 }
         >>> frag.delete("a > 0") is None
         True
+
+        See Also
+        --------
+        lance.dataset.LanceOperation.Delete :
+            The operation used to commit these changes to a dataset. See the
+            doc page for an example of using this API.
         """
         raw_fragment = self._fragment.delete(predicate)
         if raw_fragment is None:
@@ -361,5 +383,4 @@ class LanceFragment(pa.dataset.Fragment):
         -------
         FragmentMetadata
         """
-
         return FragmentMetadata(self._fragment.metadata().json())
