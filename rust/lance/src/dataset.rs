@@ -26,9 +26,10 @@ use arrow_array::{
 };
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::{concat::concat_batches, take::take};
-use chrono::prelude::*;
+use chrono::{prelude::*, Duration};
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::FutureExt;
 use log::warn;
 use object_store::path::Path;
 use tracing::instrument;
@@ -45,6 +46,7 @@ pub mod transaction;
 pub mod updater;
 mod write;
 
+use self::cleanup::RemovalStats;
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::Scanner;
@@ -62,7 +64,7 @@ use crate::io::{
     read_manifest, read_metadata_offset, write_manifest, ObjectStore,
 };
 use crate::session::Session;
-use crate::utils::temporal::SystemTime;
+use crate::utils::temporal::{utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use scanner::ROW_ID;
@@ -562,6 +564,35 @@ impl Dataset {
         );
 
         Ok(())
+    }
+
+    /// Removes old versions of the dataset from disk
+    ///
+    /// This function will remove all versions of the dataset that are older than the provided
+    /// timestamp.  This function will not remove the current version of the dataset.
+    ///
+    /// Once a version is removed it can no longer be checked out or restored.  Any data unique
+    /// to that version will be lost.
+    ///
+    /// # Arguments
+    ///
+    /// * `older_than` - Versions older than this will be deleted.
+    /// * `delete_unverified` - If false (the default) then files will only be deleted if they
+    ///                        are listed in at least one manifest.  Otherwise these files will
+    ///                        be kept since they cannot be distinguished from an in-progress
+    ///                        transaction.  Set to true to delete these files if you are sure
+    ///                        there are no other in-progress dataset operations.
+    ///
+    /// # Returns
+    ///
+    /// * `RemovalStats` - Statistics about the removal operation
+    pub fn cleanup_old_versions(
+        &self,
+        older_than: Duration,
+        delete_unverified: Option<bool>,
+    ) -> BoxFuture<Result<RemovalStats>> {
+        let before = utc_now() - older_than;
+        cleanup::cleanup_old_versions(self, before, delete_unverified).boxed()
     }
 
     /// Commit changes to the dataset

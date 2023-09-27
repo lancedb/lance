@@ -97,7 +97,13 @@ async fn list_manifests<'a>(
     Ok(object_store
         .read_dir_all(&base_path.child(VERSIONS_DIR), None)
         .await?
-        .try_filter(|path| future::ready(path.extension() == Some("manifest")))
+        .try_filter_map(|obj_meta| {
+            if obj_meta.location.extension() == Some("manifest") {
+                future::ready(Ok(Some(obj_meta.location)))
+            } else {
+                future::ready(Ok(None))
+            }
+        })
         .boxed())
 }
 

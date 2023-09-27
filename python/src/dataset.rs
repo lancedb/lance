@@ -20,6 +20,7 @@ use arrow::pyarrow::{ToPyArrow, *};
 use arrow_array::{Float32Array, RecordBatch};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
+use chrono::Duration;
 use lance::arrow::as_fixed_size_list_array;
 use lance::dataset::transaction::RewriteGroup;
 use lance::dataset::{
@@ -48,8 +49,10 @@ use crate::fragment::{FileFragment, FragmentMetadata};
 use crate::Scanner;
 use crate::RT;
 
+use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
 
+pub mod cleanup;
 pub mod commit;
 pub mod optimize;
 
@@ -482,6 +485,25 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
+    }
+
+    /// Cleanup old versions from the dataset
+    fn cleanup_old_versions(
+        &self,
+        older_than_micros: i64,
+        delete_unverified: Option<bool>,
+    ) -> PyResult<CleanupStats> {
+        let older_than = Duration::microseconds(older_than_micros);
+        let cleanup_stats = RT
+            .block_on(
+                None,
+                self.ds.cleanup_old_versions(older_than, delete_unverified),
+            )
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(CleanupStats {
+            bytes_removed: cleanup_stats.bytes_removed,
+            old_versions: cleanup_stats.old_versions,
+        })
     }
 
     fn create_index(

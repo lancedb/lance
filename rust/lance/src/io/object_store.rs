@@ -36,6 +36,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use http::header::{HeaderMap, CACHE_CONTROL};
 use object_store::aws::AwsCredential as ObjectStoreAwsCredential;
+use object_store::ObjectMeta;
 use shellexpand::tilde;
 use snafu::{location, Location};
 use tokio::{io::AsyncWriteExt, sync::RwLock};
@@ -641,16 +642,14 @@ impl ObjectStore {
         &self,
         dir_path: impl Into<&Path>,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<Result<Path>>> {
+    ) -> Result<BoxStream<Result<ObjectMeta>>> {
         let mut output = self.inner.list(Some(dir_path.into())).await?;
         if let Some(unmodified_since_val) = unmodified_since {
             output = output
                 .try_filter(move |file| future::ready(file.last_modified < unmodified_since_val))
                 .boxed();
         }
-        Ok(output
-            .map(|file_result| Ok(file_result.map(|file| file.location)?))
-            .boxed())
+        Ok(output.map_err(|e| e.into()).boxed())
     }
 
     /// Remove a directory recursively.

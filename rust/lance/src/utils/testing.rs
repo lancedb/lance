@@ -32,27 +32,6 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::io::AsyncWrite;
 
-/// Asserts that the expression returns an error and the error, when converted to
-/// a string, contains the given substring.
-macro_rules! assert_err_containing {
-    ($expr: expr, $message: expr) => {
-        match $expr {
-            Ok(_) => panic!("expected an error"),
-            Err(e) => {
-                let err_msg = e.to_string();
-                if !err_msg.contains($message) {
-                    panic!(
-                        "unexpected error message: '{}' but was expecting '{}'",
-                        err_msg, $message
-                    );
-                }
-            }
-        }
-    };
-}
-
-pub(crate) use assert_err_containing;
-
 // A policy function takes in the name of the operation (e.g. "put") and the location
 // that is being accessed / modified and returns an optional error.
 pub trait PolicyFnT: Fn(&str, &Path) -> Result<()> + Send + Sync {}
