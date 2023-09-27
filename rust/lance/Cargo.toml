@@ -34,7 +34,7 @@ async-recursion.workspace = true
 async-trait.workspace = true
 byteorder.workspace = true
 bytes.workspace = true
-chrono = "0.4.23"
+chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
 # This is already used by datafusion
 dashmap = "5"

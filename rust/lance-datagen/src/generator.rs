@@ -104,7 +104,7 @@ impl ArrayGenerator for NullGenerator {
             if data.null_count() == 0 {
                 return Ok(array);
             } else {
-                (0 as usize, None)
+                (0_usize, None)
             }
         } else if self.null_probability == 1.0 {
             if data.null_count() == data.len() {
@@ -245,7 +245,7 @@ where
         element_size_bytes: ByteCount,
     ) -> Self {
         Self {
-            data_type: data_type,
+            data_type,
             generator,
             array_type: PhantomData,
             repeat,
@@ -272,7 +272,7 @@ where
             Vec::from_iter(
                 NTimesIter {
                     iter,
-                    n: self.repeat as u32,
+                    n: self.repeat,
                     cur: self.leftover,
                     count: self.leftover_count,
                 }
@@ -379,8 +379,7 @@ impl ArrayGenerator for RandomBinaryGenerator {
         length: RowCount,
         rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
     ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
-        let mut bytes = Vec::new();
-        bytes.resize((self.bytes_per_element.0 * length.0) as usize, 0);
+        let mut bytes = vec![0; (self.bytes_per_element.0 * length.0) as usize];
         rng.fill_bytes(&mut bytes);
         if self.scale_to_utf8 {
             // This doesn't give us the full UTF-8 range and it isn't statistically correct but
@@ -717,7 +716,7 @@ pub mod array {
                 DataType::DATA_TYPE.clone(),
                 move |_| {
                     let y = x;
-                    x += DataType::Native::from(DataType::Native::ONE);
+                    x += DataType::Native::ONE;
                     y
                 },
                 1,
