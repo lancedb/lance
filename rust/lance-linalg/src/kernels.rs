@@ -72,15 +72,7 @@ where
 pub fn argmin_value<T: Num + Bounded + PartialOrd + Copy>(
     iter: impl Iterator<Item = T>,
 ) -> Option<(u32, T)> {
-    let mut min_idx: Option<u32> = None;
-    let mut min_value = T::max_value();
-    for (idx, value) in iter.enumerate() {
-        if let Some(Ordering::Less) = value.partial_cmp(&min_value) {
-            min_value = value;
-            min_idx = Some(idx as u32);
-        }
-    }
-    min_idx.map(|idx| (idx, min_value))
+    argmin_value_opt(iter.map(Some))
 }
 
 pub fn argmin_value_opt<T: Num + Bounded + PartialOrd>(
