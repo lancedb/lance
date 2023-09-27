@@ -24,6 +24,7 @@ from helper import requires_pyarrow_12
 from lance.arrow import (
     BFloat16,
     BFloat16Array,
+    ImageArray,
     ImageURIArray,
     PandasBFloat16Array,
     bfloat16_array,
@@ -152,14 +153,36 @@ def test_image_arrays(tmp_path: Path):
     png_uris = [
         "file://" + os.path.join(os.path.dirname(__file__), "images/1.png"),
         os.path.join(os.path.dirname(__file__), "images/1.png"),
-    ] * 5
+    ] * int(n / 2)
 
     if os.name == "nt":
         png_uris = [str(Path(x)) for x in png_uris]
 
-    uri_array = ImageURIArray.from_uris(png_uris)
-    encoded_image_array = uri_array.read_uris()
+    assert ImageArray.from_array(png_uris).to_pylist() == png_uris
+    assert (
+        ImageArray.from_array(pa.array(png_uris, pa.string())).to_pylist() == png_uris
+    )
+    image_array = ImageURIArray.from_uris(png_uris)
+    assert ImageArray.from_array(image_array) == image_array
+
+    encoded_image_array = image_array.read_uris()
+    assert len(ImageArray.from_array(encoded_image_array.storage)) == n
+    assert ImageArray.from_array(encoded_image_array) == encoded_image_array
+
     tensor_image_array = encoded_image_array.to_tensor()
+    fixed_shape_tensor_array = pa.ExtensionArray.from_storage(
+        pa.fixed_shape_tensor(
+            tensor_image_array.storage.type.value_type, tensor_image_array.type.shape
+        ),
+        tensor_image_array.storage,
+    )
+    assert (
+        ImageArray.from_array(fixed_shape_tensor_array).storage
+        == fixed_shape_tensor_array.storage
+    )
+    assert ImageArray.from_array(tensor_image_array) == tensor_image_array
+
+    assert len(ImageArray.from_array(tensor_image_array)) == n
     assert len(tensor_image_array) == n
     assert tensor_image_array.storage.type == pa.list_(pa.uint8(), 4)
     assert tensor_image_array[2].as_py() == [42, 42, 42, 255]
@@ -167,9 +190,9 @@ def test_image_arrays(tmp_path: Path):
     test_tensor = tf.constant(
         np.array([42, 42, 42, 255] * n, dtype=np.uint8).reshape((n, 1, 1, 4))
     )
+
     assert test_tensor.shape == (n, 1, 1, 4)
     assert tf.math.reduce_all(tensor_image_array.to_tf() == test_tensor)
-    tensor_image_array.to_encoded().to_tensor()
     assert tensor_image_array.to_encoded().to_tensor() == tensor_image_array
 
     def png_encoder(images):
@@ -185,8 +208,10 @@ def test_image_arrays(tmp_path: Path):
         os.path.join(os.path.dirname(__file__), "images/1.png"),
         os.path.join(os.path.dirname(__file__), "images/2.jpeg"),
     ]
-    encoded_image_array = ImageURIArray.from_uris(uris).read_uris()
-    with pytest.raises(ValueError, match="all input arrays must have the same shape"):
+    encoded_image_array = ImageArray.from_array(uris).read_uris()
+    with pytest.raises(
+        tf.errors.InvalidArgumentError, match="Shapes of all inputs must match"
+    ):
         encoded_image_array.to_tensor()
 
 

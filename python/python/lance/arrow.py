@@ -106,6 +106,42 @@ class ImageArray(pa.ExtensionArray):
             repr(self.to_pylist()),
         )
 
+    @classmethod
+    def from_array(cls, images):
+        """
+        Create an one of subclasses of ImageArray from input data.
+
+        Parameters
+        ----------
+        images : Union[pa.StringArray, pa.BinaryArray, pa.FixedShapeTensorArray,
+            Iterable]
+
+        Returns
+        -------
+        Union[ImageURIArray, EncodedImageArray, FixedShapeImageTensorArray]
+        """
+
+        if isinstance(images, pa.StringArray):
+            return pa.ExtensionArray.from_storage(ImageURIType(), images)
+        elif isinstance(images, pa.BinaryArray):
+            return pa.ExtensionArray.from_storage(EncodedImageType(), images)
+        elif isinstance(images, pa.FixedShapeTensorArray):
+            shape = images.type.shape
+            value_type = images.type.value_type
+            typ = FixedShapeImageTensorType(value_type, shape)
+            return pa.ExtensionArray.from_storage(typ, images.storage)
+        elif isinstance(
+            images, (ImageURIArray, EncodedImageArray, FixedShapeImageTensorArray)
+        ):
+            return images
+        elif isinstance(images, (list, tuple, Iterable)):
+            return pa.ExtensionArray.from_storage(
+                ImageURIType(), pa.array(images, type=pa.string())
+            )
+
+        else:
+            raise TypeError("Cannot build a ImageArray from {}".format(type(images)))
+
 
 class ImageURIArray(ImageArray):
     """
@@ -220,19 +256,22 @@ class EncodedImageArray(ImageArray):
 
         if not decoder:
 
-            def pillow_decoder(x):
+            def pillow_decoder(images):
                 import io
 
                 from PIL import Image
 
                 return np.stack(
-                    Image.open(io.BytesIO(img.as_py())) for img in self.storage
+                    Image.open(io.BytesIO(img)) for img in images.to_pylist()
                 )
 
-            def tensorflow_decoder(x):
+            def tensorflow_decoder(images):
                 import tensorflow as tf
 
-                return np.stack(tf.io.decode_image(img.as_py()) for img in self.storage)
+                decoded_to_tensor = tuple(
+                    tf.io.decode_image(img) for img in images.to_pylist()
+                )
+                return tf.stack(decoded_to_tensor, axis=0).numpy()
 
             decoders = [
                 ("tensorflow", tensorflow_decoder),
@@ -252,11 +291,12 @@ class EncodedImageArray(ImageArray):
                 )
 
         image_array = decoder(self.storage)
-        shape = image_array.shape[1:]
         if isinstance(image_array, pa.FixedShapeTensorType):
-            tensor_array = image_array
+            shape = image_array.shape
             arrow_type = image_array.storage_type
+            tensor_array = image_array
         else:
+            shape = image_array.shape[1:]
             arrow_type = pa.from_numpy_dtype(image_array.dtype)
             tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(image_array)
 
