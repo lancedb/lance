@@ -28,7 +28,7 @@ pub fn rand_batches(
             pyo3::exceptions::PyValueError::new_err(format!("Failed to generate batches: {}", e))
         })?
         .map(|item| {
-            item.map(|batch| PyArrowType::from(batch)).map_err(|e| {
+            item.map(PyArrowType::from).map_err(|e| {
                 pyo3::exceptions::PyValueError::new_err(format!("Failed to generate batch: {}", e))
             })
         })
