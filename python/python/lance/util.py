@@ -12,7 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal, Optional, Union
 
 import numpy as np
@@ -55,6 +55,11 @@ def sanitize_ts(ts: ts_types) -> datetime:
     elif not isinstance(ts, datetime):
         raise TypeError(f"Unrecognized version timestamp {ts} of type {type(ts)}")
     return ts
+
+
+def td_to_micros(td: timedelta) -> int:
+    """Returns the number of microseconds in a timedelta object."""
+    return round(td / timedelta(microseconds=1))
 
 
 class KMeans:

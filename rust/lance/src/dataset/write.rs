@@ -23,6 +23,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
+use tracing::instrument;
 use uuid::Uuid;
 
 use super::progress::WriteFragmentProgress;
@@ -111,6 +112,7 @@ pub fn reader_to_stream(
 /// NOTE: the fragments have not yet been assigned an ID. That must be done
 /// by the caller. This is so this function can be called in parallel, and the
 /// IDs can be assigned after writing is complete.
+#[instrument(skip_all)]
 pub async fn write_fragments(
     object_store: Arc<ObjectStore>,
     base_dir: &Path,

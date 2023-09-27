@@ -34,9 +34,11 @@ from pyarrow._compute import Expression
 
 from .commit import CommitLock
 from .fragment import FragmentMetadata, LanceFragment
+from .lance import CleanupStats
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .lance import _Dataset, _Operation, _Scanner, _write_dataset
+from .util import td_to_micros
 
 try:
     import pandas as pd
@@ -559,6 +561,46 @@ class LanceDataset(pa.dataset.Dataset):
         This creates a new commit.
         """
         self._ds.restore()
+
+    def cleanup_old_versions(
+        self,
+        older_than: timedelta = None,
+        *,
+        delete_unverified: bool = False,
+    ) -> CleanupStats:
+        """
+        Cleans up old versions of the dataset.
+
+        Some dataset changes, such as overwriting, leave behind data that is not
+        referenced by the latest dataset version.  The old data is left in place
+        to allow the dataset to be restored back to an older version.
+
+        This method will remove older versions and any data files they reference.
+        Once this cleanup task has run you will not be able to checkout or restore
+        these older versions.
+
+        Parameters
+        ----------
+
+        older_than: timedelta, optional
+            Only versions older than this will be removed.  If not specified, this
+            will default to two weeks.
+
+        delete_unverified: bool, default False
+            Files leftover from a failed transaction may appear to be part of an
+            in-progress operation (e.g. appending new data) and these files will
+            not be deleted unless they are at least 7 days old.  If delete_unverified
+            is True then these files will be deleted regardless of their age.
+
+            This should only be set to True if you can guarantee that no other process
+            is currently working on this dataset.  Otherwise the dataset could be put
+            into a corrupted state.
+        """
+        if older_than is None:
+            older_than = timedelta(days=14)
+        return self._ds.cleanup_old_versions(
+            td_to_micros(older_than), delete_unverified
+        )
 
     def create_index(
         self,

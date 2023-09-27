@@ -19,7 +19,7 @@ import platform
 import re
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -385,6 +385,37 @@ def test_add_columns(tmp_path: Path):
     assert tbl == pa.Table.from_pydict(
         {"a": range(100), "b": range(100), "c": pa.array(range(0, 200, 2), pa.int64())}
     )
+
+
+def test_cleanup_old_versions(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    moment = datetime.now()
+    lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+
+    # These calls do nothing, but make sure we can call the method ok
+
+    # Ok, defaults to two weeks ago
+    stats = dataset.cleanup_old_versions()
+    assert stats.bytes_removed == 0
+    assert stats.old_versions == 0
+
+    # Ok, can accept timedelta
+    dataset.cleanup_old_versions(older_than=timedelta(days=14))
+
+    print(tmp_path)
+    for root, dirnames, filenames in os.walk(tmp_path):
+        for filename in filenames:
+            print(root + "/" + filename)
+
+    # Now this call will actually delete the old version
+    stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    print(stats)
+    assert stats.bytes_removed > 0
+    assert stats.old_versions == 1
 
 
 def test_create_from_commit(tmp_path: Path):
