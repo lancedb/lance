@@ -448,7 +448,8 @@ impl KMeans {
         let metric_type = self.metric_type;
         const CHUNK_SIZE: usize = 1024;
 
-        // Normalized centroids for fast cosine.
+        // Normalized centroids for fast cosine. cosine(A, B) = A * B / (|A| * |B|).
+        // So here, norm_centroids = |B| for each centroid B.
         let norm_centroids = if matches!(metric_type, MetricType::Cosine) {
             Arc::new(Some(
                 self.centroids
@@ -473,6 +474,11 @@ impl KMeans {
 
                     (start_idx..min(start_idx + CHUNK_SIZE, n))
                         .map(|idx| {
+                            // We've found about 40% performance improvement by using static dispatch instead
+                            // of dynamic dispatch.
+                            //
+                            // NOTE: Please make sure run benchmark when changing the following code.
+                            // `RUSTFLAGS="-C target-cpu=native" cargo bench --bench ivf_pq`
                             let vector = &array[idx * dimension..(idx + 1) * dimension];
                             argmin_value(centroids_array.chunks_exact(dimension).enumerate().map(
                                 |(c_idx, centroid)| match metric_type {
