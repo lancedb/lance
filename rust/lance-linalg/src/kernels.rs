@@ -23,20 +23,31 @@ use arrow_array::{
     Array, ArrowNumericType, GenericStringArray, OffsetSizeTrait, PrimitiveArray, UInt64Array,
 };
 use arrow_schema::{ArrowError, DataType};
-use num_traits::bounds::Bounded;
+use num_traits::{bounds::Bounded, Num};
 
 use crate::Result;
 
 /// Argmax on a [PrimitiveArray].
 ///
 /// Returns the index of the max value in the array.
-pub fn argmax<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Option<u32>
-where
-    T::Native: PartialOrd + Bounded,
-{
+pub fn argmax<T: Num + Bounded + PartialOrd>(iter: impl Iterator<Item = T>) -> Option<u32> {
     let mut max_idx: Option<u32> = None;
-    let mut max_value = T::Native::min_value();
-    for (idx, value) in array.iter().enumerate() {
+    let mut max_value = T::min_value();
+    for (idx, value) in iter.enumerate() {
+        if let Some(Ordering::Greater) = value.partial_cmp(&max_value) {
+            max_value = value;
+            max_idx = Some(idx as u32);
+        }
+    }
+    max_idx
+}
+
+pub fn argmax_opt<T: Num + Bounded + PartialOrd>(
+    iter: impl Iterator<Item = Option<T>>,
+) -> Option<u32> {
+    let mut max_idx: Option<u32> = None;
+    let mut max_value = T::min_value();
+    for (idx, value) in iter.enumerate() {
         if let Some(value) = value {
             if let Some(Ordering::Greater) = value.partial_cmp(&max_value) {
                 max_value = value;
@@ -47,16 +58,29 @@ where
     max_idx
 }
 
-/// Argmin on a [PrimitiveArray].
+/// Argmin on an iterator. Fused the operation in iterator to avoid memory allocation.
 ///
 /// Returns the index of the min value in the array.
-pub fn argmin<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Option<u32>
+///
+pub fn argmin<T: Num + PartialOrd + Copy>(iter: impl Iterator<Item = T>) -> Option<u32>
 where
-    T::Native: PartialOrd + Bounded,
+    T: Bounded,
 {
+    argmin_value(iter).map(|(idx, _)| idx)
+}
+
+pub fn argmin_value<T: Num + Bounded + PartialOrd + Copy>(
+    iter: impl Iterator<Item = T>,
+) -> Option<(u32, T)> {
+    argmin_value_opt(iter.map(Some))
+}
+
+pub fn argmin_value_opt<T: Num + Bounded + PartialOrd>(
+    iter: impl Iterator<Item = Option<T>>,
+) -> Option<(u32, T)> {
     let mut min_idx: Option<u32> = None;
-    let mut min_value = T::Native::max_value();
-    for (idx, value) in array.iter().enumerate() {
+    let mut min_value = T::max_value();
+    for (idx, value) in iter.enumerate() {
         if let Some(value) = value {
             if let Some(Ordering::Less) = value.partial_cmp(&min_value) {
                 min_value = value;
@@ -64,7 +88,16 @@ where
             }
         }
     }
-    min_idx
+    min_idx.map(|idx| (idx, min_value))
+}
+
+/// Argmin over an `Option<Float>` iterator.
+///
+#[inline]
+pub fn argmin_opt<T: Num + Bounded + PartialOrd>(
+    iter: impl Iterator<Item = Option<T>>,
+) -> Option<u32> {
+    argmin_value_opt(iter).map(|(idx, _)| idx)
 }
 
 fn hash_numeric_type<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Result<UInt64Array>
@@ -134,57 +167,57 @@ mod tests {
     #[test]
     fn test_argmax() {
         let f = Float32Array::from(vec![1.0, 5.0, 3.0, 2.0, 20.0, 8.2, 3.5]);
-        assert_eq!(argmax(&f), Some(4));
+        assert_eq!(argmax(f.values().iter().copied()), Some(4));
 
         let f = Float32Array::from(vec![1.0, 5.0, NAN, 3.0, 2.0, 20.0, INFINITY, 3.5]);
-        assert_eq!(argmax(&f), Some(6));
+        assert_eq!(argmax_opt(f.iter()), Some(6));
 
         let f = Float32Array::from_iter(vec![Some(2.0), None, Some(20.0), Some(NAN)]);
-        assert_eq!(argmax(&f), Some(2));
+        assert_eq!(argmax_opt(f.iter()), Some(2));
 
         let f = Float32Array::from(vec![NAN, NAN, NAN]);
-        assert_eq!(argmax(&f), None);
+        assert_eq!(argmax(f.values().iter().copied()), None);
 
         let i = Int16Array::from(vec![1, 5, 3, 2, 20, 8, 16]);
-        assert_eq!(argmax(&i), Some(4));
+        assert_eq!(argmax(i.values().iter().copied()), Some(4));
 
         let u = UInt32Array::from(vec![1, 5, 3, 2, 20, 8, 16]);
-        assert_eq!(argmax(&u), Some(4));
+        assert_eq!(argmax(u.values().iter().copied()), Some(4));
 
         let empty_vec: Vec<i16> = vec![];
-        let emtpy = Int16Array::from(empty_vec);
-        assert_eq!(argmax(&emtpy), None)
+        let empty = Int16Array::from(empty_vec);
+        assert_eq!(argmax_opt(empty.iter()), None)
     }
 
     #[test]
     fn test_argmin() {
         let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, 20.0, 8.2, 3.5]);
-        assert_eq!(argmin(&f), Some(2));
+        assert_eq!(argmin(f.values().iter().copied()), Some(2));
 
         let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, 20.0, NAN]);
-        assert_eq!(argmin(&f), Some(2));
+        assert_eq!(argmin_opt(f.iter()), Some(2));
 
         let f = Float32Array::from_iter(vec![Some(2.0), None, Some(NAN)]);
-        assert_eq!(argmin(&f), Some(0));
+        assert_eq!(argmin_opt(f.iter()), Some(0));
 
         let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, NEG_INFINITY, NAN]);
-        assert_eq!(argmin(&f), Some(3));
+        assert_eq!(argmin(f.values().iter().copied()), Some(3));
 
         let f = Float32Array::from_iter(vec![NAN, NAN, NAN, NAN]);
-        assert_eq!(argmin(&f), None);
+        assert_eq!(argmin(f.values().iter().copied()), None);
 
         let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, 20.0, 8.2, 3.5]);
-        assert_eq!(argmin(&f), Some(2));
+        assert_eq!(argmin(f.values().iter().copied()), Some(2));
 
         let i = Int16Array::from_iter(vec![5, 3, 2, 20, 8, 16]);
-        assert_eq!(argmin(&i), Some(2));
+        assert_eq!(argmin(i.values().iter().copied()), Some(2));
 
         let u = UInt32Array::from_iter(vec![5, 3, 2, 20, 8, 16]);
-        assert_eq!(argmin(&u), Some(2));
+        assert_eq!(argmin(u.values().iter().copied()), Some(2));
 
         let empty_vec: Vec<i16> = vec![];
         let emtpy = Int16Array::from(empty_vec);
-        assert_eq!(argmin(&emtpy), None)
+        assert_eq!(argmin_opt(emtpy.iter()), None)
     }
 
     #[test]

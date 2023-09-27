@@ -33,7 +33,11 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
-use lance_linalg::{kernels::argmin, matrix::MatrixView};
+use lance_linalg::{
+    distance::*,
+    kernels::{argmin, argmin_opt},
+    matrix::MatrixView,
+};
 use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
@@ -408,9 +412,10 @@ impl Ivf {
         let dist_func = metric_type.batch_func();
         let centroids: MatrixView<Float32Type> = self.centroids.as_ref().try_into()?;
         for i in 0..data.num_rows() {
+            // TODO(lei): use kmeans.comptue_membership()
             let vector = data.row(i).unwrap();
             let part_id =
-                argmin(dist_func(vector, centroids.data().values(), dim).as_ref()).unwrap();
+                argmin_opt(dist_func(vector, centroids.data().values(), dim).iter()).unwrap();
             part_id_builder.append_value(part_id);
             let cent = centroids.row(part_id as usize).unwrap();
             if vector.len() != cent.len() {
@@ -586,34 +591,19 @@ fn compute_residual_matrix(
     metric_type: MetricType,
 ) -> Result<Arc<Float32Array>> {
     assert_eq!(centroids.num_columns(), data.num_columns());
-    let dist_func = metric_type.batch_func();
-
-    let dim = data.num_columns();
     let mut builder = Float32Builder::with_capacity(data.data().len());
-    for i in 0..data.num_rows() {
-        let row = data.row(i).unwrap();
-        let dist_array = dist_func(row, centroids.data().values(), dim);
-        let part_id = argmin(dist_array.as_ref()).ok_or_else(|| Error::Index {
-            message: format!(
-                "Ivf::compute_residual: argmin failed. Failed to find minimum of {:?}",
-                dist_array
-            ),
-        })?;
+    data.iter().for_each(|row| {
+        let part_id = argmin(centroids.iter().map(|cent| match metric_type {
+            MetricType::L2 => cent.l2(row),
+            MetricType::Cosine => cent.cosine(row),
+            MetricType::Dot => cent.dot(row),
+        }))
+        .unwrap();
         let centroid = centroids.row(part_id as usize).unwrap();
-        if row.len() != centroid.len() {
-            return Err(Error::IO {
-                message: format!(
-                    "Ivf::compute_residual: dimension mismatch: {} != {}",
-                    row.len(),
-                    centroid.len()
-                ),
-                location: location!(),
-            });
-        };
         unsafe {
             builder.append_trusted_len_iter(row.iter().zip(centroid.iter()).map(|(v, c)| v - c))
         }
-    }
+    });
     Ok(Arc::new(builder.finish()))
 }
 

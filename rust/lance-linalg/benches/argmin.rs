@@ -16,7 +16,7 @@ use std::{sync::Arc, time::Duration};
 
 use arrow_array::{Float32Array, UInt32Array};
 use criterion::{criterion_group, criterion_main, Criterion};
-use lance_linalg::kernels::argmin;
+use lance_linalg::kernels::{argmin, argmin_opt};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 #[cfg(target_os = "linux")]
@@ -24,7 +24,7 @@ use pprof::criterion::{Output, PProfProfiler};
 
 #[inline]
 fn argmin_arrow(x: &Float32Array) -> u32 {
-    argmin(x).unwrap()
+    argmin_opt(x.iter()).unwrap()
 }
 
 fn argmin_arrow_batch(x: &Float32Array, dimension: usize) -> Arc<UInt32Array> {

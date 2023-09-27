@@ -23,7 +23,7 @@ use arrow_array::{
 use arrow_select::concat::concat_batches;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::*;
-use lance_linalg::{distance::l2_distance, kernels::argmin, matrix::MatrixView};
+use lance_linalg::{distance::l2_distance, kernels::argmin_opt, matrix::MatrixView};
 use ordered_float::OrderedFloat;
 use rand::{distributions::Uniform, prelude::*, Rng, SeedableRng};
 
@@ -261,7 +261,7 @@ async fn find_medoid(vectors: &MatrixView<Float32Type>, metric_type: MetricType)
         vectors.data().values(),
         vectors.num_columns(),
     );
-    let medoid_idx = argmin(dists.as_ref()).unwrap();
+    let medoid_idx = argmin_opt(dists.iter()).unwrap();
     Ok(medoid_idx as usize)
 }
 

@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_linalg::{
     distance::{l2::l2_distance_batch, norm_l2::norm_l2},
-    kernels::argmin,
+    kernels::argmin_opt,
     matrix::MatrixView,
 };
 use rand::SeedableRng;
@@ -494,8 +494,10 @@ impl ProductQuantizer {
                     let offset = row_offset + sub_idx * sub_dim;
                     let sub_vector = &flatten_values[offset..offset + sub_dim];
                     let centroids = all_centroids[sub_idx].as_ref();
-                    let code = argmin(dist_func(sub_vector, centroids.values(), sub_dim).as_ref())
-                        .unwrap();
+                    // TODO(lei): use kmeans.compute_membership()
+                    let code =
+                        argmin_opt(dist_func(sub_vector, centroids.values(), sub_dim).iter())
+                            .unwrap();
                     builder[i * num_sub_vectors + sub_idx] = code as u8;
                 }
             }

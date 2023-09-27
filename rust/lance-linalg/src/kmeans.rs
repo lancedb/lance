@@ -28,8 +28,9 @@ use log::{info, warn};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 
+use crate::kernels::argmin_value;
 use crate::{
-    distance::{Cosine, Dot, MetricType, L2},
+    distance::{Cosine, Dot, MetricType, Normalize, L2},
     matrix::MatrixView,
 };
 use crate::{Error, Result};
@@ -446,37 +447,50 @@ impl KMeans {
         let n = data.len() / self.dimension;
         let metric_type = self.metric_type;
         const CHUNK_SIZE: usize = 1024;
+
+        // Normalized centroids for fast cosine. cosine(A, B) = A * B / (|A| * |B|).
+        // So here, norm_centroids = |B| for each centroid B.
+        let norm_centroids = if matches!(metric_type, MetricType::Cosine) {
+            Arc::new(Some(
+                self.centroids
+                    .values()
+                    .chunks_exact(dimension)
+                    .map(|centroid| centroid.norm_l2())
+                    .collect::<Vec<f32>>(),
+            ))
+        } else {
+            Arc::new(None)
+        };
+
         let cluster_with_distances = stream::iter((0..n).step_by(CHUNK_SIZE))
             // make tiles of input data to split between threads.
-            .zip(repeat_with(|| (data.clone(), self.centroids.clone())))
-            .map(|(start_idx, (data, centroids))| async move {
+            .zip(repeat_with(|| {
+                (data.clone(), self.centroids.clone(), norm_centroids.clone())
+            }))
+            .map(|(start_idx, (data, centroids, norms))| async move {
                 let data = tokio::task::spawn_blocking(move || {
                     let array = data.values();
                     let centroids_array = centroids.values();
 
                     (start_idx..min(start_idx + CHUNK_SIZE, n))
                         .map(|idx| {
+                            // We've found about 40% performance improvement by using static dispatch instead
+                            // of dynamic dispatch.
+                            //
+                            // NOTE: Please make sure run benchmark when changing the following code.
+                            // `RUSTFLAGS="-C target-cpu=native" cargo bench --bench ivf_pq`
                             let vector = &array[idx * dimension..(idx + 1) * dimension];
-                            let mut min = std::f32::MAX;
-                            let mut min_idx = 0;
-                            for (idx, other) in centroids_array.chunks_exact(dimension).enumerate()
-                            {
-                                // We've found about 40% performance improvement by using static dispatch instead
-                                // of dynamic dispatch.
-                                //
-                                // NOTE: Please make sure run benchmark when changing the following code.
-                                // `RUSTFLAGS="-C target-cpu=native" cargo bench --bench ivf_pq`
-                                let dist = match metric_type {
-                                    MetricType::L2 => vector.l2(other),
-                                    MetricType::Cosine => vector.cosine(other),
-                                    MetricType::Dot => vector.dot(other),
-                                };
-                                if dist < min {
-                                    min = dist;
-                                    min_idx = idx;
-                                }
-                            }
-                            (min_idx as u32, min)
+                            argmin_value(centroids_array.chunks_exact(dimension).enumerate().map(
+                                |(c_idx, centroid)| match metric_type {
+                                    MetricType::L2 => vector.l2(centroid),
+                                    MetricType::Cosine => centroid.cosine_fast(
+                                        norms.as_ref().as_ref().unwrap()[c_idx],
+                                        vector,
+                                    ),
+                                    MetricType::Dot => vector.dot(centroid),
+                                },
+                            ))
+                            .unwrap()
                         })
                         .collect::<Vec<_>>()
                 })
