@@ -19,6 +19,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
+use arrow_array::UInt64Array;
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -41,6 +42,7 @@ use crate::{dataset::Dataset, Error, Result};
 use self::vector::{build_vector_index, VectorIndexParams};
 
 /// Trait of a secondary index.
+#[async_trait]
 pub(crate) trait Index: Send + Sync {
     /// Cast to [Any].
     fn as_any(&self) -> &dyn Any;
@@ -48,6 +50,14 @@ pub(crate) trait Index: Send + Sync {
     // TODO: if we ever make this public, do so in such a way that `serde_json`
     // isn't exposed at the interface. That way mismatched versions isn't an issue.
     fn statistics(&self) -> Result<serde_json::Value>;
+
+    /// Remap row id. This is used when the dataset goes thru compaction.
+    /// return an **new** index id with remapped row id.
+    async fn remap_row_id(&self, _mapper: fn(UInt64Array) -> UInt64Array) -> Result<String> {
+        Err(Error::Index {
+            message: "Index does not support remapping".to_string(),
+        })
+    }
 }
 
 /// Index Type

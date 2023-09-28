@@ -111,6 +111,20 @@ message Transaction {
     }
 
     repeated RewriteGroup groups = 3;
+
+    message RewriteIndex {
+      // The old index that is being replaced
+      //
+      // This should be an existing index.
+      IndexMetadata old_index = 1;
+
+      // The new index
+      //
+      // This index should not have been assigned
+      IndexMetadata new_index = 2;
+    }
+
+    repeated RewriteIndex index_rewrites = 4;
   }
 
   // An operation that merges in a new column, altering the schema.

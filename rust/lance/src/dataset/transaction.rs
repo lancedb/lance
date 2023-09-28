@@ -104,7 +104,7 @@ pub enum Operation {
     /// Data is rewritten but *not* modified. This is used for things like
     /// compaction or re-ordering. Contains the old fragments and the new
     /// ones that have been replaced.
-    Rewrite { groups: Vec<RewriteGroup> },
+    Rewrite { groups: Vec<RewriteGroup>, index_rewrites: Vec<RewriteIndex> },
     /// Merge a new column in
     Merge {
         fragments: Vec<Fragment>,
@@ -118,6 +118,12 @@ pub enum Operation {
 pub struct RewriteGroup {
     pub old_fragments: Vec<Fragment>,
     pub new_fragments: Vec<Fragment>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RewriteIndex {
+    pub old_index: IndexMetadata,
+    pub new_index: IndexMetadata,
 }
 
 impl Operation {
@@ -141,7 +147,7 @@ impl Operation {
                     .map(|f| f.id)
                     .chain(deleted_fragment_ids.iter().copied()),
             ),
-            Self::Rewrite { groups } => Box::new(
+            Self::Rewrite { groups, .. } => Box::new(
                 groups
                     .iter()
                     .flat_map(|f| f.old_fragments.iter().map(|f| f.id)),
@@ -150,11 +156,36 @@ impl Operation {
         }
     }
 
+    fn modified_index_ids(&self) -> Box<dyn Iterator<Item = Index> + '_> {
+        match self {
+            Self::Append { .. }
+            | Self::Overwrite { .. }
+            | Self::CreateIndex { .. }
+            | Self::Delete { .. }
+            | Self::Merge { .. }
+            | Self::Restore { .. } => Box::new(std::iter::empty()),
+            Self::CreateIndex  { new_indices } => Box::new(std::iter::empty()),
+            Self::Rewrite { groups, index_rewrites } => Box::new(std::iter::empty())
+        }
+    }
+
     /// Check whether another operation modifies the same fragment IDs as this one.
     fn modifies_same_ids(&self, other: &Self) -> bool {
         let self_ids = self.modified_fragment_ids().collect::<HashSet<_>>();
         let mut other_ids = other.modified_fragment_ids();
         other_ids.any(|id| self_ids.contains(&id))
+    }
+
+    fn modifies_same_indices(&self, other: &Self) -> bool {
+        match self {
+            Self::Append { .. } => false,
+            Self::Delete { .. } => false,
+            Self::Overwrite { .. } => false,
+            Self::CreateIndex { .. } => false,
+            Self::Rewrite { .. } => false,
+            Self::Merge { .. } => false,
+            Self::Restore { .. } => false,
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -197,7 +228,7 @@ impl Transaction {
                 Operation::Delete { .. } => false,
                 _ => true,
             },
-            Operation::Rewrite { .. } => match &other.operation {
+            Operation::Rewrite { index_rewrites, .. } => match &other.operation {
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments.
                 // TODO: it could also be compatible with operations that update
@@ -211,6 +242,10 @@ impl Transaction {
                 Operation::Rewrite { .. } => {
                     // As long as they rewrite disjoint fragments they shouldn't conflict.
                     self.operation.modifies_same_ids(&other.operation)
+                }
+                // if an index on the same column of the same type is recreated during an index rewrite, 
+                Operation::CreateIndex { new_indices } => {
+
                 }
                 _ => true,
             },
