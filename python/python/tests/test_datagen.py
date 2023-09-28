@@ -3,22 +3,18 @@ import math
 import pyarrow as pa
 import pytest
 
-
-def is_datagen_supported():
-    try:
-        import lance._datagen as _  # noqa: F401
-    except ImportError:
-        return False
-    return True
+import lance._datagen as datagen
 
 
-@pytest.mark.skipif(is_datagen_supported(), reason="datagen is supported")
+@pytest.mark.skipif(datagen.is_datagen_supported(), reason="datagen is supported")
 def test_import_error():
-    with pytest.raises(ImportError, match="was not built with the datagen feature"):
-        import lance._datagen as _  # noqa: F401
+    with pytest.raises(
+        NotImplementedError, match="was not built with the datagen feature"
+    ):
+        datagen.rand_batches(None)
 
 
-@pytest.mark.skipif(not is_datagen_supported(), reason="datagen not supported")
+@pytest.mark.skipif(not datagen.is_datagen_supported(), reason="datagen not supported")
 def test_rand_batches():
     import lance._datagen as datagen
 
