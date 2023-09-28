@@ -110,10 +110,37 @@ impl ObjectReader for LocalObjectReader {
             // Safety: `buf` is set with appropriate capacity above. It is
             // written to below and we check all data is initialized at that point.
             unsafe { buf.set_len(range.len()) };
+            #[cfg(unix)]
             file.read_exact_at(buf.as_mut(), range.start as u64)?;
+            #[cfg(windows)]
+            read_exact_at(file, buf.as_mut(), range.start as u64)?;
 
             Ok(buf.freeze())
         })
         .await?
+    }
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: Arc<File>, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => break,
+            Ok(n) => {
+                let tmp = buf;
+                buf = &mut tmp[n..];
+                offset += n as u64;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if !buf.is_empty() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        ))
+    } else {
+        Ok(())
     }
 }
