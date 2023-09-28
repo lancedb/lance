@@ -836,9 +836,13 @@ async fn write_index_file(
         if parted_batch.num_rows() > 0 {
             // Write one partition.
             let pq_code = &parted_batch[PQ_CODE_COLUMN];
-            writer.write_plain_encoded_array(pq_code.as_ref()).await?;
+            writer
+                .write_plain_encoded_array(&[pq_code.as_ref()])
+                .await?;
             let row_ids = &parted_batch[ROW_ID];
-            writer.write_plain_encoded_array(row_ids.as_ref()).await?;
+            writer
+                .write_plain_encoded_array(&[row_ids.as_ref()])
+                .await?;
         }
     }
 

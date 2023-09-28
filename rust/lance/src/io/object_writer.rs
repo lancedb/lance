@@ -87,12 +87,16 @@ impl ObjectWriter {
         self.write_protobuf(&msg).await
     }
 
-    /// Write an array using plain encoding.
+    /// Write arrays, as single array, using plain encoding
     ///
     /// Returns the file position if success.
-    pub async fn write_plain_encoded_array(&mut self, array: &dyn Array) -> Result<usize> {
-        let mut encoder = PlainEncoder::new(self, array.data_type());
-        encoder.encode(&[array]).await
+    pub async fn write_plain_encoded_array(&mut self, arrays: &[&dyn Array]) -> Result<usize> {
+        if arrays.is_empty() {
+            return Ok(self.tell());
+        }
+        let data_type = arrays[0].data_type();
+        let mut encoder = PlainEncoder::new(self, data_type);
+        encoder.encode(arrays).await
     }
 
     /// Write magics to the tail of a file before closing the file.

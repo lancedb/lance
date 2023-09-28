@@ -561,6 +561,17 @@ impl ObjectStore {
         }
     }
 
+    /// Local object store.
+    pub fn local() -> Self {
+        Self {
+            inner: Arc::new(LocalFileSystem::new()).traced(),
+            scheme: String::from("file"),
+            base_path: Path::from("/"),
+            block_size: 4 * 1024, // 4KB block size
+            commit_handler: Arc::new(RenameCommitHandler),
+        }
+    }
+
     /// Create a in-memory object store directly for testing.
     pub fn memory() -> Self {
         Self {
@@ -602,6 +613,20 @@ impl ObjectStore {
                 self.block_size,
             )?)),
         }
+    }
+
+    /// Create an [ObjectWriter] from local [std::path::Path]
+    pub async fn create_local_writer(path: &std::path::Path) -> Result<ObjectWriter> {
+        let object_store = Self::local();
+        let os_path = Path::from(path.to_str().unwrap());
+        object_store.create(&os_path).await
+    }
+
+    /// Open an [ObjectReader] from local [std::path::Path]
+    pub async fn open_local(path: &std::path::Path) -> Result<Box<dyn ObjectReader>> {
+        let object_store = Self::local();
+        let os_path = Path::from(path.to_str().unwrap());
+        object_store.open(&os_path).await
     }
 
     /// Create a new file.
@@ -702,6 +727,7 @@ impl ObjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::parquet::data_type::AsBytes;
     use std::env::set_current_dir;
     use std::fs::{create_dir_all, write};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -917,6 +943,22 @@ mod tests {
 
         // Not called yet
         assert!(mock_provider.called.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_local_paths() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let file_path = temp_dir.path().join("test_file");
+        let mut writer = ObjectStore::create_local_writer(file_path.as_path())
+            .await
+            .unwrap();
+        writer.write_all(b"LOCAL").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let reader = ObjectStore::open_local(file_path.as_path()).await.unwrap();
+        let buf = reader.get_range(0..5).await.unwrap();
+        assert_eq!(buf.as_bytes(), b"LOCAL");
     }
 
     #[tokio::test]
