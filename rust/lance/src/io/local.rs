@@ -123,6 +123,7 @@ impl ObjectReader for LocalObjectReader {
 
 #[cfg(windows)]
 fn read_exact_at(file: Arc<File>, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    let expected_len = buf.len();
     while !buf.is_empty() {
         match file.seek_read(buf, offset) {
             Ok(0) => break,
@@ -138,7 +139,10 @@ fn read_exact_at(file: Arc<File>, mut buf: &mut [u8], mut offset: u64) -> std::i
     if !buf.is_empty() {
         Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
-            "failed to fill whole buffer",
+            format!(
+                "failed to fill whole buffer. Expected {} bytes, got {}",
+                expected_len, offset
+            ),
         ))
     } else {
         Ok(())
