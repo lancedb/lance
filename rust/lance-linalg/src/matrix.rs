@@ -134,6 +134,11 @@ where
         }
     }
 
+    /// Number of dimensions.
+    pub fn ndim(&self) -> usize {
+        self.num_columns()
+    }
+
     pub fn data(&self) -> Arc<T::ArrayType> {
         if self.transpose {
             Arc::new(transpose(self.data.as_slice(), self.num_rows()).into())
