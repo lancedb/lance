@@ -398,7 +398,7 @@ impl KMeans {
     ///   let kmeans = membership.to_kmeans();
     /// }
     /// ```
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip_all)]
     pub async fn train_once(&self, data: &MatrixView<Float32Type>) -> KMeanMembership {
         self.compute_membership(data.data().clone()).await
     }
