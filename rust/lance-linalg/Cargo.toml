@@ -21,6 +21,7 @@ num-traits = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
 lance-arrow = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }

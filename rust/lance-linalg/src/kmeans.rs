@@ -17,16 +17,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
-use arrow_array::{
-    cast::{as_primitive_array, AsArray},
-    new_empty_array, Array, FixedSizeListArray, Float32Array,
-};
+use arrow_array::{cast::AsArray, new_empty_array, Array, FixedSizeListArray, Float32Array};
 use arrow_schema::{ArrowError, DataType};
-use arrow_select::concat::concat;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use log::{info, warn};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
+use tracing::instrument;
 
 use crate::kernels::argmin_value;
 use crate::{
@@ -165,11 +162,6 @@ async fn kmeans_random_init(
 }
 
 pub struct KMeanMembership {
-    /// Previous centroids.
-    ///
-    /// `k * dimension` f32 matrix.
-    centroids: Arc<Float32Array>,
-
     /// Reference to the input vectors, with dimension `dimension`.
     data: Arc<Float32Array>,
 
@@ -191,63 +183,37 @@ impl KMeanMembership {
     /// Reconstruct a KMeans model from the membership.
     async fn to_kmeans(&self) -> Result<KMeans> {
         let dimension = self.dimension;
-        let cluster_ids = Arc::new(self.cluster_ids.clone());
 
-        // New centroids for each cluster
-        let means = stream::iter(0..self.k)
-            .zip(repeat_with(|| {
-                (
-                    self.data.clone(),
-                    cluster_ids.clone(),
-                    self.centroids.clone(),
-                )
-            }))
-            .map(
-                |(cluster, (data, cluster_ids, prev_centroids))| async move {
-                    tokio::task::spawn_blocking(move || {
-                        let mut sum = vec![0.0; dimension];
-                        let data = data.values();
-                        let mut total = 0.0;
-                        // Eager group-by cluster id.
-                        for i in 0..cluster_ids.len() {
-                            if cluster_ids[i] as usize == cluster {
-                                // TODO: use simd ADD
-                                for j in 0..dimension {
-                                    sum[j] += data[i * dimension + j];
-                                }
-                                total += 1.0;
-                            };
-                        }
-                        if total > 0.0 {
-                            let s = Float32Array::from(
-                                sum
-                            );
-                            s.unary_mut(|x| x / total).unwrap()
-                        } else {
-                            warn!("Warning: KMean: cluster {} has no value, does not change centroids.", cluster);
-                            prev_centroids.slice(cluster * dimension, dimension)
-                        }
-                    })
-                    .await
-                },
-            )
-            .buffered(num_cpus::get())
-            .try_collect::<Vec<_>>()
-            .await.map_err(|e| {
-                ArrowError::ComputeError(format!(
-                    "KMeans: failed to compute new centroids: {}",
-                    e
-                ))
-            })?;
+        let mut cluster_cnts = vec![0_usize; self.k];
+        let mut new_centroids = vec![0.0_f32; self.k * dimension];
+        self.data
+            .values()
+            .chunks_exact(dimension)
+            .zip(self.cluster_ids.iter())
+            .for_each(|(vector, cluster_id)| {
+                cluster_cnts[*cluster_id as usize] += 1;
+                // TODO: simd
+                for (old, new) in new_centroids
+                    [*cluster_id as usize * dimension..(1 + *cluster_id as usize) * dimension]
+                    .iter_mut()
+                    .zip(vector)
+                {
+                    *old += new;
+                }
+            });
+        cluster_cnts.iter().enumerate().for_each(|(i, &cnt)| {
+            if cnt == 0 {
+                warn!("KMeans: cluster {} is empty", i);
+            } else {
+                // TODO: simd
+                new_centroids[i * dimension..(i + 1) * dimension]
+                    .iter_mut()
+                    .for_each(|v| *v /= cnt as f32);
+            }
+        });
 
-        // TODO: concat requires `&[&dyn Array]`. Are there cheaper way to pass Vec<Float32Array> to `concat`?
-        let mut mean_refs: Vec<&dyn Array> = vec![];
-        for m in means.iter() {
-            mean_refs.push(m);
-        }
-        let centroids = concat(&mean_refs).unwrap();
         Ok(KMeans {
-            centroids: Arc::new(centroids.as_ref().as_primitive::<Float32Type>().clone()),
+            centroids: Arc::new(new_centroids.into()),
             dimension,
             k: self.k,
             metric_type: self.metric_type,
@@ -289,7 +255,7 @@ impl KMeans {
     fn empty(k: usize, dimension: usize, metric_type: MetricType) -> Self {
         let empty_array = new_empty_array(&DataType::Float32);
         Self {
-            centroids: Arc::new(as_primitive_array(empty_array.as_ref()).clone()),
+            centroids: Arc::new(empty_array.as_primitive().clone()),
             dimension,
             k,
             metric_type,
@@ -432,6 +398,7 @@ impl KMeans {
     ///   let kmeans = membership.to_kmeans();
     /// }
     /// ```
+    #[instrument(level = "debug", skip(self))]
     pub async fn train_once(&self, data: &MatrixView<Float32Type>) -> KMeanMembership {
         self.compute_membership(data.data().clone()).await
     }
@@ -446,7 +413,7 @@ impl KMeans {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let metric_type = self.metric_type;
-        const CHUNK_SIZE: usize = 1024;
+        const CHUNK_SIZE: usize = 2048;
 
         // Normalized centroids for fast cosine. cosine(A, B) = A * B / (|A| * |B|).
         // So here, norm_centroids = |B| for each centroid B.
@@ -505,7 +472,6 @@ impl KMeans {
             .await
             .unwrap();
         KMeanMembership {
-            centroids: self.centroids.clone(),
             data,
             dimension,
             cluster_ids: cluster_with_distances
