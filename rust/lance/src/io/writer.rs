@@ -372,7 +372,11 @@ impl FileWriter {
 
     async fn write_footer(&mut self) -> Result<()> {
         // Step 1. Write page table.
-        let pos = self.page_table.write(&mut self.object_writer).await?;
+        let field_id_offset = *self.schema.field_ids().iter().min().unwrap();
+        let pos = self
+            .page_table
+            .write(&mut self.object_writer, field_id_offset)
+            .await?;
         self.metadata.page_table_position = pos;
 
         // Step 2. Write manifest and dictionary values.

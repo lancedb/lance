@@ -181,6 +181,8 @@ message DataFile {
   // field id in the table (if any already). So when a fragment is first created
   // with one file of N columns, the field ids will be 1, 2, ..., N. If a second,
   // fragment is created with M columns, the field ids will be N+1, N+2, ..., N+M.
+  //
+  // These ids must be sorted and contiguous.
   repeated int32 fields = 2;
 } // DataFile
 
@@ -230,6 +232,10 @@ message Metadata {
   // length:int64> of the page. Both position and length are int64 values. The
   // <position, length> of all the pages in the same column are then
   // contiguously stored.
+  //
+  // Every field that is a part of the file will have a run in the page table.
+  // This includes struct columns, which will have a run of length 0 since 
+  // they don't store any actual data.
   //
   // For example, for the column 5 and batch 4, we have:
   // ```text

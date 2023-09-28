@@ -111,21 +111,40 @@ impl ObjectReader for LocalObjectReader {
             // written to below and we check all data is initialized at that point.
             unsafe { buf.set_len(range.len()) };
             #[cfg(unix)]
-            let bytes_read = file.read_at(buf.as_mut(), range.start as u64)?;
+            file.read_exact_at(buf.as_mut(), range.start as u64)?;
             #[cfg(windows)]
-            let bytes_read = file.seek_read(buf.as_mut(), range.start as u64)?;
-            if bytes_read != range.len() {
-                return Err(Error::IO {
-                    message: format!(
-                        "failed to read all bytes from file: expected {}, got {}",
-                        range.len(),
-                        bytes_read
-                    ),
-                    location: location!(),
-                });
-            }
+            read_exact_at(file, buf.as_mut(), range.start as u64)?;
+
             Ok(buf.freeze())
         })
         .await?
+    }
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: Arc<File>, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    let expected_len = buf.len();
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => break,
+            Ok(n) => {
+                let tmp = buf;
+                buf = &mut tmp[n..];
+                offset += n as u64;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if !buf.is_empty() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "failed to fill whole buffer. Expected {} bytes, got {}",
+                expected_len, offset
+            ),
+        ))
+    } else {
+        Ok(())
     }
 }

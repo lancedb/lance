@@ -2383,6 +2383,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(actual, expected);
+
+        // Validate we can still read after re-instantiating dataset, which
+        // clears the cache.
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let actual_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

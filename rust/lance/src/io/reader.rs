@@ -14,6 +14,7 @@
 
 //! Lance Data File Reader
 
+use std::borrow::Cow;
 // Standard
 use std::ops::{Range, RangeTo};
 use std::sync::Arc;
@@ -250,19 +251,6 @@ impl FileReader {
             &m
         };
 
-        let page_table = Self::load_from_cache(session, path, |_| {
-            let num_columns = manifest.schema.max_field_id().unwrap() + 1;
-            PageTable::load(
-                object_reader.as_ref(),
-                metadata.page_table_position,
-                num_columns,
-                metadata.num_batches() as i32,
-            )
-        })
-        .await?;
-
-        let projection = manifest.schema.clone();
-
         // read the fragment metadata so we can handle deletion
         let fragment = if is_dataset {
             let fragment = manifest
@@ -278,6 +266,39 @@ impl FileReader {
         } else {
             None
         };
+
+        let page_table = Self::load_from_cache(session, path, |_| async {
+            // TODO: we should have a more efficient way to look up the fields
+            // present in a data file. We might want to include this info in the
+            // data file's metadata.
+            let field_ids = if let Some(fragment) = fragment.as_ref() {
+                Cow::Borrowed(
+                    &fragment
+                        .files
+                        .iter()
+                        .find(|f| path.to_string().ends_with(&f.path))
+                        .ok_or_else(|| Error::Internal {
+                            message: format!("File {} not found in fragment {:?}", path, fragment),
+                        })?
+                        .fields,
+                )
+            } else {
+                let max_id = manifest.schema.max_field_id().unwrap() as i32 + 1;
+                Cow::Owned((0..max_id).collect::<Vec<i32>>())
+            };
+
+            PageTable::load(
+                object_reader.as_ref(),
+                metadata.page_table_position,
+                field_ids.len() as i32,
+                metadata.num_batches() as i32,
+                field_ids[0],
+            )
+            .await
+        })
+        .await?;
+
+        let projection = manifest.schema.clone();
 
         let deletion_vector = if let Some(fragment) = &fragment {
             Self::load_deletion_vector(object_store, fragment, session).await?
@@ -1024,6 +1045,7 @@ mod tests {
 
         let mut frag_struct = Fragment::new(fragment);
         frag_struct.deletion_file = deletion_file;
+        frag_struct.add_file("foo", &schema);
 
         let manifest = Manifest::new(&schema, Arc::new(vec![frag_struct]));
 
@@ -1081,6 +1103,7 @@ mod tests {
 
         let mut frag_struct = Fragment::new(fragment);
         frag_struct.deletion_file = deletion_file;
+        frag_struct.add_file("foo", &schema);
 
         let manifest = Manifest::new(&schema, Arc::new(vec![frag_struct]));
 

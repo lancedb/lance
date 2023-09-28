@@ -639,7 +639,7 @@ def test_merge_data(tmp_path: Path):
     new_tab = pa.table({"a2": range(5), "d": ["a", "b", "c", "d", "e"]})
     dataset.merge(new_tab, left_on="a", right_on="a2")
     assert dataset.version == 3
-    assert dataset.to_table() == pa.table(
+    expected = pa.table(
         {
             "a": range(100),
             "b": range(100),
@@ -647,6 +647,10 @@ def test_merge_data(tmp_path: Path):
             "d": ["a", "b", "c", "d", "e"] + [None] * 95,
         }
     )
+    assert dataset.to_table() == expected
+    # Verify we can also load from fresh instance
+    dataset = lance.dataset(tmp_path / "dataset")
+    assert dataset.to_table() == expected
 
 
 def test_delete_data(tmp_path: Path):
