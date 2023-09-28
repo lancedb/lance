@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrowPrimitiveType, FixedSizeListArray};
 use arrow_schema::{ArrowError, DataType};
-use lance_arrow::{ArrowFloatType, FloatArray, FloatType};
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, FloatType};
 use num_traits::{AsPrimitive, Float, FromPrimitive, ToPrimitive};
 use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
 
@@ -302,13 +302,15 @@ where
     }
 }
 
-impl<T: ArrowFloatType + ArrowPrimitiveType> From<MatrixView<T>> for FixedSizeListArray
+impl<T: ArrowFloatType + ArrowPrimitiveType> TryFrom<MatrixView<T>> for FixedSizeListArray
 where
     Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,
 {
-    fn from(value: MatrixView<T>) -> Self {
-        let dim = value.
-        todo!()
+    type Error = Error;
+
+    fn try_from(value: MatrixView<T>) -> Result<Self> {
+        let ndim = value.ndim();
+        Self::try_new_from_values(value.data().as_ref().clone(), ndim as i32)
     }
 }
 

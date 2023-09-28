@@ -90,7 +90,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
         |b| {
             b.to_async(&rt).iter(|| async {
                 let params =
-                    VectorIndexParams::ivf_pq(ivf_partition, 8, pq, false, MetricType::L2, 50);
+                    VectorIndexParams::ivf_pq(ivf_partition, 8, pq, false, MetricType::Cosine, 50);
 
                 dataset
                     .clone()
@@ -119,7 +119,7 @@ criterion_group!(
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
-    config = Criterion::default().significance_level(0.1).sample_size(5);
+    config = Criterion::default().significance_level(0.1).sample_size(10);
     targets = bench_ivf_pq_index);
 
 criterion_main!(benches);

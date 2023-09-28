@@ -19,7 +19,7 @@ use std::{any::Any, sync::Arc};
 use arrow::datatypes::Float32Type;
 use arrow_arith::arithmetic::subtract_dyn;
 use arrow_array::{
-    builder::{Float32Builder, UInt32Builder},
+    builder::Float32Builder,
     cast::{as_primitive_array, as_struct_array, AsArray},
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, StructArray,
     UInt32Array,
@@ -33,11 +33,7 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
-use lance_linalg::{
-    distance::*,
-    kernels::{argmin, argmin_opt},
-    matrix::MatrixView,
-};
+use lance_linalg::{distance::*, kernels::argmin, matrix::MatrixView};
 use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
@@ -465,19 +461,10 @@ impl Ivf {
         metric_type: MetricType,
     ) -> Result<RecordBatch> {
         let part_ids = self.compute_partitions(data, metric_type);
-        let residuals = self.compute_residual(data, &part_ids);
-        let residuals =
-            FixedSizeListArray::try_new_from_values(residual_builder.finish(), dim as i32)?;
+        let residuals: FixedSizeListArray = self.compute_residual(&data, &part_ids).try_into()?;
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new(PARTITION_ID_COLUMN, DataType::UInt32, false),
-            ArrowField::new(
-                RESIDUAL_COLUMN,
-                DataType::FixedSizeList(
-                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                    dim as i32,
-                ),
-                false,
-            ),
+            ArrowField::new(RESIDUAL_COLUMN, residuals.data_type().clone(), false),
         ]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(part_ids), Arc::new(residuals)])?;
         Ok(batch)
