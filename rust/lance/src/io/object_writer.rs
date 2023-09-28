@@ -90,13 +90,13 @@ impl ObjectWriter {
     /// Write arrays, as single array, using plain encoding
     ///
     /// Returns the file position if success.
-    pub async fn write_plain_encoded_array(&mut self, array: &[&dyn Array]) -> Result<usize> {
-        if array.is_empty() {
+    pub async fn write_plain_encoded_array(&mut self, arrays: &[&dyn Array]) -> Result<usize> {
+        if arrays.is_empty() {
             return Ok(self.tell());
         }
-        let data_type = array[0].data_type();
+        let data_type = arrays[0].data_type();
         let mut encoder = PlainEncoder::new(self, data_type);
-        encoder.encode(array).await
+        encoder.encode(arrays).await
     }
 
     /// Write magics to the tail of a file before closing the file.
