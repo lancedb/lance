@@ -79,6 +79,10 @@ impl FileFragment {
         let reader = Box::new(reader);
         let (stream, schema) = reader_to_stream(reader)?;
 
+        if schema.fields.is_empty() {
+            return Err(Error::invalid_input("Cannot write with an empty schema."));
+        }
+
         let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
         let filename = format!("{}.lance", Uuid::new_v4());
         let mut fragment = Fragment::with_file(id as u64, &filename, &schema, 0);
