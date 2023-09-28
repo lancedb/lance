@@ -119,7 +119,7 @@ criterion_group!(
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
-    config = Criterion::default().significance_level(0.1).sample_size(10);
+    config = Criterion::default().significance_level(0.1).sample_size(5);
     targets = bench_ivf_pq_index);
 
 criterion_main!(benches);

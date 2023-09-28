@@ -302,6 +302,16 @@ where
     }
 }
 
+impl<T: ArrowFloatType + ArrowPrimitiveType> From<MatrixView<T>> for FixedSizeListArray
+where
+    Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,
+{
+    fn from(value: MatrixView<T>) -> Self {
+        let dim = value.
+        todo!()
+    }
+}
+
 impl<T: ArrowFloatType + ArrowPrimitiveType> TryFrom<&FixedSizeListArray> for MatrixView<T>
 where
     Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,

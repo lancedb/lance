@@ -392,6 +392,66 @@ impl Ivf {
         self.lengths.push(len);
     }
 
+    /// Compute the partition for each row in the input Matrix.
+    ///
+    pub fn compute_partitions(
+        &self,
+        data: &MatrixView<Float32Type>,
+        metric_type: MetricType,
+    ) -> UInt32Array {
+        let ndim = data.ndim();
+        let centroids_arr = self.centroids.values().as_primitive::<Float32Type>();
+        let normalized_centroids = centroids_arr
+            .values()
+            .chunks(ndim)
+            .map(|cent| cent.norm_l2())
+            .collect::<Vec<_>>();
+        UInt32Array::from_iter_values(data.iter().map(|row| {
+            argmin(
+                centroids_arr
+                    .values()
+                    .chunks(ndim)
+                    .enumerate()
+                    .map(|(id, centroid)| match metric_type {
+                        MetricType::L2 => row.l2(centroid),
+                        MetricType::Cosine => centroid.cosine_fast(normalized_centroids[id], row),
+                        MetricType::Dot => row.dot(centroid),
+                    }),
+            )
+            .expect("argmin should always return a value")
+        }))
+    }
+
+    /// Compute residual vector.
+    ///
+    /// A residual vector is `original vector - centroids`.
+    ///
+    /// Parameters:
+    ///  - *original*: original vector.
+    ///  - *partitions*: partition ID of each original vector.
+    pub(super) fn compute_residual(
+        &self,
+        original: &MatrixView<Float32Type>,
+        partitions: &UInt32Array,
+    ) -> MatrixView<Float32Type> {
+        let mut residual_arr: Vec<f32> =
+            Vec::with_capacity(original.num_rows() * original.num_columns());
+        original
+            .iter()
+            .zip(partitions.values().iter())
+            .for_each(|(vector, &part_id)| {
+                let values = self.centroids.value(part_id as usize);
+                let centroid = values.as_primitive::<Float32Type>();
+                residual_arr.extend(
+                    vector
+                        .iter()
+                        .zip(centroid.values().iter())
+                        .map(|(v, cent)| *v - *cent),
+                );
+            });
+        MatrixView::new(Arc::new(residual_arr.into()), original.ndim())
+    }
+
     /// Compute the partition ID and residual vectors.
     ///
     /// Parameters
@@ -404,37 +464,8 @@ impl Ivf {
         data: &MatrixView<Float32Type>,
         metric_type: MetricType,
     ) -> Result<RecordBatch> {
-        let mut part_id_builder = UInt32Builder::with_capacity(data.num_rows());
-        let mut residual_builder =
-            Float32Builder::with_capacity(data.num_columns() * data.num_rows());
-
-        let dim = data.num_columns();
-        let dist_func = metric_type.batch_func();
-        let centroids: MatrixView<Float32Type> = self.centroids.as_ref().try_into()?;
-        for i in 0..data.num_rows() {
-            // TODO(lei): use kmeans.comptue_membership()
-            let vector = data.row(i).unwrap();
-            let part_id =
-                argmin_opt(dist_func(vector, centroids.data().values(), dim).iter()).unwrap();
-            part_id_builder.append_value(part_id);
-            let cent = centroids.row(part_id as usize).unwrap();
-            if vector.len() != cent.len() {
-                return Err(Error::IO {
-                    message: format!(
-                        "Ivf::compute_residual: dimension mismatch: {} != {}",
-                        vector.len(),
-                        cent.len()
-                    ),
-                    location: location!(),
-                });
-            }
-            unsafe {
-                residual_builder
-                    .append_trusted_len_iter(vector.iter().zip(cent.iter()).map(|(v, c)| v - c))
-            }
-        }
-
-        let part_ids = part_id_builder.finish();
+        let part_ids = self.compute_partitions(data, metric_type);
+        let residuals = self.compute_residual(data, &part_ids);
         let residuals =
             FixedSizeListArray::try_new_from_values(residual_builder.finish(), dim as i32)?;
         let schema = Arc::new(ArrowSchema::new(vec![
