@@ -97,7 +97,7 @@ jobs:
         run: cargo clippy --all-features --tests -- -D warnings
   mac-build:
     runs-on: macos-12
-    timeout-minutes: 30
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: ./rust/lance
