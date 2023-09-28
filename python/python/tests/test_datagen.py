@@ -1,9 +1,8 @@
 import math
 
+import lance._datagen as datagen
 import pyarrow as pa
 import pytest
-
-import lance._datagen as datagen
 
 
 @pytest.mark.skipif(datagen.is_datagen_supported(), reason="datagen is supported")
