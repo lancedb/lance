@@ -251,7 +251,7 @@ impl FileFragment {
                 &self.dataset.object_store,
                 path,
                 self.id() as u64,
-                None,
+                Some(self.dataset.manifest.as_ref()),
                 Some(self.dataset.session.as_ref()),
             );
             reader.map_ok(|r| r.len())
