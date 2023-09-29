@@ -463,35 +463,30 @@ impl KMeans {
                         let array = data.values();
                         let centroids_array = centroids.values();
 
-                        (start_idx..min(start_idx + CHUNK_SIZE, n))
-                            .map(|idx| {
-                                // We've found about 40% performance improvement by using static dispatch instead
-                                // of dynamic dispatch.
-                                //
-                                // NOTE: Please make sure run benchmark when changing the following code.
-                                // `RUSTFLAGS="-C target-cpu=native" cargo bench --bench ivf_pq`
-                                let vector = &array[idx * dimension..(idx + 1) * dimension];
+                        let last_idx = min(start_idx + CHUNK_SIZE, n);
+                        (&array[start_idx * dimension..last_idx * dimension])
+                            .chunks_exact(dimension)
+                            .enumerate()
+                            .map(|(idx, vector)| {
                                 let norm_vec = if matches!(metric_type, MetricType::Cosine) {
                                     norm_data.as_ref().unwrap().values()[idx]
                                 } else {
                                     0.0
                                 };
-                                argmin_value(
-                                    centroids_array.chunks_exact(dimension).enumerate().map(
-                                        |(c_idx, centroid)| match metric_type {
-                                            MetricType::L2 => vector.l2(centroid),
-                                            MetricType::Cosine => centroid.cosine_with_norms(
-                                                norms.as_ref().as_ref().unwrap()[c_idx],
-                                                norm_vec,
-                                                vector,
-                                            ),
-                                            MetricType::Dot => vector.dot(centroid),
-                                        },
-                                    ),
-                                )
+                                argmin_value(centroids_array.chunks_exact(dimension).enumerate().map(
+                                    |(c_idx, centroid)| match metric_type {
+                                        MetricType::L2 => vector.l2(centroid),
+                                        MetricType::Cosine => centroid.cosine_with_norms(
+                                            norms.as_ref().as_ref().unwrap()[c_idx],
+                                            norm_vec,
+                                            vector,
+                                        ),
+                                        MetricType::Dot => vector.dot(centroid),
+                                    },
+                                ))
                                 .unwrap()
                             })
-                            .collect::<Vec<_>>()
+                        .collect::<Vec<_>>()
                     })
                     .await
                     .map_err(|e| {
