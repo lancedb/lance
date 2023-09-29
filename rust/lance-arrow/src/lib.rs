@@ -20,10 +20,12 @@ use std::sync::Arc;
 
 use arrow_array::{
     cast::AsArray, Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray,
-    GenericListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray, UInt8Array,
+    GenericListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray, UInt32Array,
+    UInt8Array,
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema};
+use arrow_select::take::take;
 
 pub mod schema;
 pub use schema::*;
@@ -344,6 +346,9 @@ pub trait RecordBatchExt {
 
     /// Project the schema over the [RecordBatch].
     fn project_by_schema(&self, schema: &Schema) -> Result<RecordBatch>;
+
+    /// Take selected rows from the [RecordBatch].
+    fn take(&self, indices: &UInt32Array) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
@@ -411,6 +416,12 @@ impl RecordBatchExt for RecordBatch {
     fn project_by_schema(&self, schema: &Schema) -> Result<Self> {
         let struct_array: StructArray = self.clone().into();
         self.try_new_from_struct_array(project(&struct_array, schema.fields())?)
+    }
+
+    fn take(&self, indices: &UInt32Array) -> Result<RecordBatch> {
+        let struct_array: StructArray = self.clone().into();
+        let taken = take(&struct_array, indices, None)?;
+        Ok(taken.as_struct().into())
     }
 }
 
@@ -617,5 +628,35 @@ mod tests {
 
         let result = left_batch.merge(&right_batch).unwrap();
         assert_eq!(result, merged_batch);
+    }
+
+    #[test]
+    fn test_take_record_batch() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..20)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..20).map(|i| format!("str-{}", i)),
+                )),
+            ],
+        )
+        .unwrap();
+        let taken = batch.take(&(vec![1_u32, 5_u32, 10_u32].into())).unwrap();
+        assert_eq!(
+            taken,
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 5, 10])),
+                    Arc::new(StringArray::from(vec!["str-1", "str-5", "str-10"])),
+                ],
+            )
+            .unwrap()
+        )
     }
 }
