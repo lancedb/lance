@@ -174,7 +174,12 @@ mod x86_64 {
                 dotprod += dot(&x_vector[len..], &y_vector[len..]);
                 let mut y_sq_sum = add_f32_register(y_sq);
                 y_sq_sum += norm_l2(&y_vector[len..]).powi(2);
-                1.0 - dotprod / (x_norm * y_sq_sum.sqrt())
+                let div = x_norm * y_sq_sum.sqrt();
+                if div == 0.0 {
+                    1.0
+                } else {
+                    1.0 - dotprod / div
+                }
             }
         }
     }
