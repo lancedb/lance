@@ -468,11 +468,6 @@ impl KMeans {
                             .chunks_exact(dimension)
                             .enumerate()
                             .map(|(idx, vector)| {
-                                let norm_vec = if matches!(metric_type, MetricType::Cosine) {
-                                    norm_data.as_ref().unwrap().values()[idx]
-                                } else {
-                                    0.0
-                                };
                                 let centroid_stream = centroids_array.chunks_exact(dimension);
                                 match metric_type {
                                     MetricType::L2 => {
@@ -480,6 +475,7 @@ impl KMeans {
                                     }
                                     MetricType::Cosine => {
                                         let centroid_norms = norms.as_ref().as_ref().unwrap();
+                                        let norm_vec = norm_data.as_ref().unwrap().values()[idx];
                                         argmin_value(
                                             centroid_stream.zip(centroid_norms.iter()).map(
                                                 |(cent, &cent_norm)| {
