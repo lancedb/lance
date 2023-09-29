@@ -15,6 +15,7 @@
 //! DynamoDB based external manifest store
 //!
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -25,15 +26,24 @@ use aws_sdk_dynamodb::operation::query::builders::QueryFluentBuilder;
 use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
 use aws_sdk_dynamodb::Client;
 use snafu::OptionExt;
+use tokio::sync::RwLock;
 
 use crate::error::{IOSnafu, NotFoundSnafu};
 use crate::io::commit::external_manifest::ExternalManifestStore;
 use crate::{Error, Result};
 use snafu::{location, Location};
-impl<E> From<SdkError<E>> for Error {
+impl<E> From<SdkError<E>> for Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
     fn from(e: SdkError<E>) -> Self {
+        let error_type = format!("{}", e);
         Self::IO {
-            message: format!("dynamodb error: {e}"),
+            message: format!(
+                "dynamodb error: {}, source: {:?}",
+                error_type,
+                e.into_source()
+            ),
             location: location!(),
         }
     }
@@ -91,6 +101,23 @@ impl DynamoDBExternalManifestStore {
         table_name: &str,
         commiter_name: &str,
     ) -> Result<Arc<dyn ExternalManifestStore>> {
+        lazy_static::lazy_static! {
+            static ref SANITY_CHECK_CACHE: RwLock<HashSet<String>> = RwLock::new(HashSet::new());
+        }
+
+        let store = Arc::new(Self {
+            client: client.clone(),
+            table_name: table_name.to_string(),
+            commiter_name: commiter_name.to_string(),
+        });
+
+        // already checked this table before, skip
+        // this is to avoid checking the table schema every time
+        // because it's expensive to call DescribeTable
+        if SANITY_CHECK_CACHE.read().await.contains(table_name) {
+            return Ok(store);
+        }
+
         // Check if the table schema is correct
         let describe_result = client
             .describe_table()
@@ -146,11 +173,12 @@ impl DynamoDBExternalManifestStore {
             );
         }
 
-        Ok(Arc::new(Self {
-            client,
-            table_name: table_name.to_string(),
-            commiter_name: commiter_name.to_string(),
-        }))
+        SANITY_CHECK_CACHE
+            .write()
+            .await
+            .insert(table_name.to_string());
+
+        Ok(store)
     }
 
     fn ddb_put(&self) -> PutItemFluentBuilder {
