@@ -51,9 +51,9 @@ pub struct StatisticsRow {
 }
 
 fn max_min_null<T: ArrowNumericType>(arrays: &[&PrimitiveArray<T>]) -> StatisticsRow
-    where
-        T::Native: Bounded + PartialOrd,
-        datafusion::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
+where
+    T::Native: Bounded + PartialOrd,
+    datafusion::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
 {
     let mut min_value = T::Native::max_value();
     let mut max_value = T::Native::min_value();
@@ -194,7 +194,7 @@ impl StatisticsCollector {
                 Arc::new(null_count),
             ],
         )
-            .unwrap();
+        .unwrap();
         todo!()
     }
 }
@@ -453,7 +453,7 @@ mod tests {
             BINARY_PREFIX_LENGTH
                 + 5
         ]
-            .as_ref()]))];
+        .as_ref()]))];
         let array_refs = arrays.iter().collect::<Vec<_>>();
         let stats = collect_statistics(&array_refs);
         let min_value: Vec<u8> = vec![0xFFu8; BINARY_PREFIX_LENGTH];
@@ -600,7 +600,7 @@ mod tests {
                 ])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         assert_eq!(batch, expected_batch);
     }

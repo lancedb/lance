@@ -1779,7 +1779,7 @@ mod tests {
 
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, true)]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut writer = FileWriter::try_new(&store, &path, schema.clone())
+        let mut writer = FileWriter::try_new(&store, &path, schema.clone(), &Default::default())
             .await
             .unwrap();
         for i in 0..10 {

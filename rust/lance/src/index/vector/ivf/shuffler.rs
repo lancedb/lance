@@ -85,7 +85,7 @@ impl ShufflerBuilder {
             flush_size: flush_threshold, // TODO: change to parameterized value later.
             temp_dir,
             parted_groups: BTreeMap::new(),
-            writer: FileWriter::with_object_writer(writer, lance_schema)?,
+            writer: FileWriter::with_object_writer(writer, lance_schema, &Default::default())?,
         })
     }
 
