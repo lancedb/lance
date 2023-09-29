@@ -15,6 +15,7 @@
 use std::cmp::min;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::vec;
 
 use arrow_array::types::Float32Type;
 use arrow_array::{cast::AsArray, new_empty_array, Array, FixedSizeListArray, Float32Array};
@@ -475,16 +476,30 @@ impl KMeans {
                                     }
                                     MetricType::Cosine => {
                                         let centroid_norms = norms.as_ref().as_ref().unwrap();
-                                        let norm_vec = norm_data.as_ref().unwrap().values()[idx];
-                                        argmin_value(
-                                            centroid_stream.zip(centroid_norms.iter()).map(
-                                                |(cent, &cent_norm)| {
-                                                    cent.cosine_with_norms(
-                                                        cent_norm, norm_vec, vector,
-                                                    )
-                                                },
-                                            ),
-                                        )
+                                        if let Some(norm_vectors) = norm_data.as_ref() {
+                                            let norm_vec = norm_vectors.values()[idx];
+                                            argmin_value(
+                                                centroid_stream.zip(centroid_norms.iter()).map(
+                                                    |(cent, &cent_norm)| {
+                                                        cent.cosine_with_norms(
+                                                            cent_norm, norm_vec, vector,
+                                                        )
+                                                    },
+                                                ),
+                                            )
+                                        } else {
+                                            argmin_value(
+                                                centroid_stream
+                                                    .zip(centroid_norms.iter())
+                                                    .map(|(cent, &cent_norm)| {
+                                                        cent.cosine_fast(
+                                                            cent_norm,
+                                                            vector,
+                                                        )
+                                                    }),
+                                            )
+                                        }
+
                                     }
                                     crate::distance::DistanceType::Dot => {
                                         argmin_value(centroid_stream.map(|cent| vector.dot(cent)))
