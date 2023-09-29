@@ -1319,7 +1319,9 @@ class ScannerBuilder:
         if self.ds.schema.get_field_index(column) < 0:
             raise ValueError(f"Embedding column {column} not in dataset")
         if not (
-            isinstance(column_field.type, (np.ndarray, list, tuple))
+            isinstance(
+                column_field.type, (pa.FloatingPointArray, np.ndarray, list, tuple)
+            )
             or pa.types.is_fixed_size_list(column_field.type)
         ):
             raise TypeError(
