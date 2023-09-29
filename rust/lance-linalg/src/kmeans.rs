@@ -400,16 +400,19 @@ impl KMeans {
     /// ```
     #[instrument(level = "debug", skip_all)]
     pub async fn train_once(&self, data: &MatrixView<Float32Type>) -> KMeanMembership {
-        let norm_data: Option<Arc<Float32Array>> = if self.metric_type == MetricType::Cosine {
-            Some(Arc::new(
-                data.iter()
-                    .map(|v| v.norm_l2())
-                    .collect::<Vec<f32>>()
-                    .into(),
-            ))
-        } else {
-            None
-        };
+        match self.metric_type {
+            MetricType::Cosine => self.train_cosine_once(data).await,
+            _ => self.compute_membership(data.data().clone(), None).await,
+        }
+    }
+
+    async fn train_cosine_once(&self, data: &MatrixView<Float32Type>) -> KMeanMembership {
+        let norm_data = Some(Arc::new(
+            data.iter()
+                .map(|v| v.norm_l2())
+                .collect::<Vec<f32>>()
+                .into(),
+        ));
         self.compute_membership(data.data().clone(), norm_data)
             .await
     }
@@ -447,49 +450,59 @@ impl KMeans {
         let cluster_with_distances = stream::iter((0..n).step_by(CHUNK_SIZE))
             // make tiles of input data to split between threads.
             .zip(repeat_with(|| {
-                (data.clone(), self.centroids.clone(), norm_centroids.clone(), norm_data.clone())
+                (
+                    data.clone(),
+                    self.centroids.clone(),
+                    norm_centroids.clone(),
+                    norm_data.clone(),
+                )
             }))
-            .map(|(start_idx, (data, centroids, norms, norm_data))| async move {
-                let data = tokio::task::spawn_blocking(move || {
-                    let array = data.values();
-                    let centroids_array = centroids.values();
+            .map(
+                |(start_idx, (data, centroids, norms, norm_data))| async move {
+                    let data = tokio::task::spawn_blocking(move || {
+                        let array = data.values();
+                        let centroids_array = centroids.values();
 
-                    (start_idx..min(start_idx + CHUNK_SIZE, n))
-                        .map(|idx| {
-                            // We've found about 40% performance improvement by using static dispatch instead
-                            // of dynamic dispatch.
-                            //
-                            // NOTE: Please make sure run benchmark when changing the following code.
-                            // `RUSTFLAGS="-C target-cpu=native" cargo bench --bench ivf_pq`
-                            let vector = &array[idx * dimension..(idx + 1) * dimension];
-                            let norm_vec = if matches!(metric_type, MetricType::Cosine) {
-                                norm_data.as_ref().unwrap().values()[idx]
-                            } else {
-                                0.0
-                            };
-                            argmin_value(centroids_array.chunks_exact(dimension).enumerate().map(
-                                |(c_idx, centroid)|
-                                match metric_type {
-                                    MetricType::L2 => vector.l2(centroid),
-                                    MetricType::Cosine => centroid.cosine_with_norms(
-                                        norms.as_ref().as_ref().unwrap()[c_idx],
-                                        norm_vec,
-                                        vector,
+                        (start_idx..min(start_idx + CHUNK_SIZE, n))
+                            .map(|idx| {
+                                // We've found about 40% performance improvement by using static dispatch instead
+                                // of dynamic dispatch.
+                                //
+                                // NOTE: Please make sure run benchmark when changing the following code.
+                                // `RUSTFLAGS="-C target-cpu=native" cargo bench --bench ivf_pq`
+                                let vector = &array[idx * dimension..(idx + 1) * dimension];
+                                let norm_vec = if matches!(metric_type, MetricType::Cosine) {
+                                    norm_data.as_ref().unwrap().values()[idx]
+                                } else {
+                                    0.0
+                                };
+                                argmin_value(
+                                    centroids_array.chunks_exact(dimension).enumerate().map(
+                                        |(c_idx, centroid)| match metric_type {
+                                            MetricType::L2 => vector.l2(centroid),
+                                            MetricType::Cosine => centroid.cosine_with_norms(
+                                                norms.as_ref().as_ref().unwrap()[c_idx],
+                                                norm_vec,
+                                                vector,
+                                            ),
+                                            MetricType::Dot => vector.dot(centroid),
+                                        },
                                     ),
-                                    MetricType::Dot => vector.dot(centroid),
-                                },
-
-                            ))
-                            .unwrap()
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .await
-                .map_err(|e| {
-                    ArrowError::ComputeError(format!("KMeans: failed to compute membership: {}", e))
-                })?;
-                Ok::<Vec<_>, Error>(data)
-            })
+                                )
+                                .unwrap()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await
+                    .map_err(|e| {
+                        ArrowError::ComputeError(format!(
+                            "KMeans: failed to compute membership: {}",
+                            e
+                        ))
+                    })?;
+                    Ok::<Vec<_>, Error>(data)
+                },
+            )
             .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await
