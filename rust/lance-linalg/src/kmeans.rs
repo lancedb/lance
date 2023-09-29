@@ -489,17 +489,13 @@ impl KMeans {
                                             )
                                         } else {
                                             argmin_value(
-                                                centroid_stream
-                                                    .zip(centroid_norms.iter())
-                                                    .map(|(cent, &cent_norm)| {
-                                                        cent.cosine_fast(
-                                                            cent_norm,
-                                                            vector,
-                                                        )
-                                                    }),
+                                                centroid_stream.zip(centroid_norms.iter()).map(
+                                                    |(cent, &cent_norm)| {
+                                                        cent.cosine_fast(cent_norm, vector)
+                                                    },
+                                                ),
                                             )
                                         }
-
                                     }
                                     crate::distance::DistanceType::Dot => {
                                         argmin_value(centroid_stream.map(|cent| vector.dot(cent)))
