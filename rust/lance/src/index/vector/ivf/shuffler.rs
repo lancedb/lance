@@ -16,9 +16,9 @@ use std::collections::{BTreeMap, HashSet};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::TempDir;
-use object_store::path::Path;
 
 use crate::datatypes::Schema;
 use crate::io::reader::batches_stream;

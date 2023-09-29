@@ -405,7 +405,7 @@ impl FileReader {
     /// Read a batch of data from the file.
     ///
     /// The schema of the returned [RecordBatch] is set by [`FileReader::schema()`].
-    #[instrument(skip(self, params, projection))]
+    #[instrument(level = "debug", skip(self, params, projection))]
     pub(crate) async fn read_batch(
         &self,
         batch_id: i32,
