@@ -480,15 +480,15 @@ impl KMeans {
                                     }
                                     MetricType::Cosine => {
                                         let centroid_norms = norms.as_ref().as_ref().unwrap();
-                                        argmin_value(centroid_stream.enumerate().map(
-                                            |(c_idx, cent)| {
-                                                cent.cosine_with_norms(
-                                                    centroid_norms[c_idx],
-                                                    norm_vec,
-                                                    vector,
-                                                )
-                                            },
-                                        ))
+                                        argmin_value(
+                                            centroid_stream.zip(centroid_norms.iter()).map(
+                                                |(cent, &cent_norm)| {
+                                                    cent.cosine_with_norms(
+                                                        cent_norm, norm_vec, vector,
+                                                    )
+                                                },
+                                            ),
+                                        )
                                     }
                                     crate::distance::DistanceType::Dot => {
                                         argmin_value(centroid_stream.map(|cent| vector.dot(cent)))
