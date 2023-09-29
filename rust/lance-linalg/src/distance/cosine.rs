@@ -135,7 +135,9 @@ impl Cosine for [f32] {
     ) -> Self::Output {
         #[cfg(target_arch = "aarch64")]
         {
-            aarch64::neon::cosine_f32(self, other, x_norm)
+            // TODO: SIMD with normalized X and Y.
+            let _ = y_norm; // Make compiler happy.
+            aarch64::neon::cosine_f32(self, y, x_norm)
         }
 
         #[cfg(target_arch = "x86_64")]
