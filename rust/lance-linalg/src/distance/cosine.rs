@@ -24,6 +24,7 @@ use std::sync::Arc;
 use arrow_array::Float32Array;
 use half::{bf16, f16};
 use num_traits::real::Real;
+use num_traits::{AsPrimitive, FromPrimitive};
 
 use super::dot::dot;
 use super::norm_l2::{norm_l2, Normalize};
@@ -37,6 +38,14 @@ pub trait Cosine {
 
     /// Fast cosine function, that assumes that the norm of the first vector is already known.
     fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output;
+
+    /// Cosine between two vectors, with the L2 norms of both vectors already known.
+    fn cosine_with_norms(
+        &self,
+        x_norm: Self::Output,
+        y_norm: Self::Output,
+        y: &Self,
+    ) -> Self::Output;
 }
 
 impl Cosine for [bf16] {
@@ -53,6 +62,16 @@ impl Cosine for [bf16] {
         // TODO: Implement SIMD
         cosine_scalar(self, x_norm, other)
     }
+
+    #[inline]
+    fn cosine_with_norms(
+        &self,
+        x_norm: Self::Output,
+        y_norm: Self::Output,
+        y: &Self,
+    ) -> Self::Output {
+        cosine_scalar_fast(self, x_norm, y, y_norm)
+    }
 }
 
 impl Cosine for [f16] {
@@ -68,6 +87,16 @@ impl Cosine for [f16] {
     fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output {
         // TODO: Implement SIMD
         cosine_scalar(self, x_norm, other)
+    }
+
+    #[inline]
+    fn cosine_with_norms(
+        &self,
+        x_norm: Self::Output,
+        y_norm: Self::Output,
+        y: &Self,
+    ) -> Self::Output {
+        cosine_scalar_fast(self, x_norm, y, y_norm)
     }
 }
 
@@ -97,6 +126,32 @@ impl Cosine for [f32] {
         #[cfg(not(target_arch = "aarch64"))]
         cosine_scalar(self, x_norm, other)
     }
+
+    #[inline]
+    fn cosine_with_norms(
+        &self,
+        x_norm: Self::Output,
+        y_norm: Self::Output,
+        y: &Self,
+    ) -> Self::Output {
+        #[cfg(target_arch = "aarch64")]
+        {
+            // TODO: SIMD with normalized X and Y.
+            let _ = y_norm; // Make compiler happy.
+            aarch64::neon::cosine_f32(self, y, x_norm)
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("fma") {
+                return x86_64::avx::cosine_f32_norms(self, y, x_norm, y_norm);
+            }
+        }
+
+        // Slow path
+        #[cfg(not(target_arch = "aarch64"))]
+        cosine_scalar_fast(self, x_norm, y, y_norm)
+    }
 }
 
 impl Cosine for [f64] {
@@ -113,16 +168,44 @@ impl Cosine for [f64] {
         // TODO: Implement SIMD
         cosine_scalar(self, x_norm, other)
     }
+
+    #[inline]
+    fn cosine_with_norms(
+        &self,
+        x_norm: Self::Output,
+        y_norm: Self::Output,
+        y: &Self,
+    ) -> Self::Output {
+        cosine_scalar_fast(self, x_norm, y, y_norm)
+    }
 }
 
 /// Fallback non-SIMD implementation
 #[allow(dead_code)] // Does not fallback on aarch64.
 #[inline]
-fn cosine_scalar<T: Real + Sum>(x: &[T], x_norm: T, y: &[T]) -> T {
+fn cosine_scalar<T: Real + Sum + AsPrimitive<f64> + FromPrimitive>(
+    x: &[T],
+    x_norm: T,
+    y: &[T],
+) -> T {
     let y_sq = dot(y, y);
     let xy = dot(x, y);
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
-    T::one().sub(xy.div(x_norm.mul(y_sq.sqrt())))
+    // use f64 for overflow protection.
+    T::from_f64(1.0 - (xy.as_() / (x_norm.as_() * (y_sq.sqrt()).as_()))).unwrap()
+}
+
+#[inline]
+fn cosine_scalar_fast<T: Real + Sum + AsPrimitive<f64> + FromPrimitive>(
+    x: &[T],
+    x_norm: T,
+    y: &[T],
+    y_norm: T,
+) -> T {
+    let xy = dot(x, y);
+    // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
+    // use f64 for overflow protection.
+    T::from_f64(1.0 - (xy.as_() / (x_norm.as_() * y_norm.as_()))).unwrap()
 }
 
 /// Cosine distance function between two vectors.
@@ -174,7 +257,41 @@ mod x86_64 {
                 dotprod += dot(&x_vector[len..], &y_vector[len..]);
                 let mut y_sq_sum = add_f32_register(y_sq);
                 y_sq_sum += norm_l2(&y_vector[len..]).powi(2);
-                1.0 - dotprod / (x_norm * y_sq_sum.sqrt())
+                let div = x_norm * y_sq_sum.sqrt();
+                if div == 0.0 {
+                    1.0
+                } else {
+                    1.0 - dotprod / div
+                }
+            }
+        }
+
+        #[inline]
+        pub fn cosine_f32_norms(
+            x_vector: &[f32],
+            y_vector: &[f32],
+            x_norm: f32,
+            y_norm: f32,
+        ) -> f32 {
+            unsafe {
+                use crate::distance::x86_64::avx::add_f32_register;
+
+                let len = x_vector.len() / 8 * 8;
+                let mut xy = _mm256_setzero_ps();
+                for i in (0..len).step_by(8) {
+                    let x = _mm256_loadu_ps(x_vector.as_ptr().add(i));
+                    let y = _mm256_loadu_ps(y_vector.as_ptr().add(i));
+                    xy = _mm256_fmadd_ps(x, y, xy);
+                }
+                // handle remaining elements
+                let mut dotprod = add_f32_register(xy);
+                dotprod += dot(&x_vector[len..], &y_vector[len..]);
+                let div = x_norm * y_norm;
+                if div == 0.0 {
+                    1.0
+                } else {
+                    1.0 - dotprod / div
+                }
             }
         }
     }

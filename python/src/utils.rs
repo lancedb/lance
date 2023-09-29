@@ -99,7 +99,7 @@ impl KMeans {
             return Err(PyValueError::new_err("Must be a FixedSizeList of Float32"));
         };
         let values: Arc<Float32Array> = fixed_size_arr.values().as_primitive().clone().into();
-        let membership = RT.block_on(Some(py), kmeans.compute_membership(values));
+        let membership = RT.block_on(Some(py), kmeans.compute_membership(values, None));
         let cluster_ids: UInt32Array = membership.cluster_ids.into();
         cluster_ids.into_data().to_pyarrow(py)
     }

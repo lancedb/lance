@@ -15,6 +15,7 @@
 use std::cmp::min;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::vec;
 
 use arrow_array::types::Float32Type;
 use arrow_array::{cast::AsArray, new_empty_array, Array, FixedSizeListArray, Float32Array};
@@ -111,7 +112,7 @@ async fn kmean_plusplus(
     seen.insert(first_idx);
 
     for _ in 1..k {
-        let membership = kmeans.compute_membership(data.clone()).await;
+        let membership = kmeans.compute_membership(data.clone(), None).await;
         let weights = WeightedIndex::new(&membership.distances).unwrap();
         let mut chosen;
         loop {
@@ -400,7 +401,21 @@ impl KMeans {
     /// ```
     #[instrument(level = "debug", skip_all)]
     pub async fn train_once(&self, data: &MatrixView<Float32Type>) -> KMeanMembership {
-        self.compute_membership(data.data().clone()).await
+        match self.metric_type {
+            MetricType::Cosine => self.train_cosine_once(data).await,
+            _ => self.compute_membership(data.data().clone(), None).await,
+        }
+    }
+
+    async fn train_cosine_once(&self, data: &MatrixView<Float32Type>) -> KMeanMembership {
+        let norm_data = Some(Arc::new(
+            data.iter()
+                .map(|v| v.norm_l2())
+                .collect::<Vec<f32>>()
+                .into(),
+        ));
+        self.compute_membership(data.data().clone(), norm_data)
+            .await
     }
 
     /// Recompute the membership of each vector.
@@ -409,7 +424,11 @@ impl KMeans {
     ///
     /// - *data*: a `N * dimension` float32 array.
     /// - *dist_fn*: the function to compute distances.
-    pub async fn compute_membership(&self, data: Arc<Float32Array>) -> KMeanMembership {
+    pub async fn compute_membership(
+        &self,
+        data: Arc<Float32Array>,
+        norm_data: Option<Arc<Float32Array>>,
+    ) -> KMeanMembership {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let metric_type = self.metric_type;
@@ -432,41 +451,70 @@ impl KMeans {
         let cluster_with_distances = stream::iter((0..n).step_by(CHUNK_SIZE))
             // make tiles of input data to split between threads.
             .zip(repeat_with(|| {
-                (data.clone(), self.centroids.clone(), norm_centroids.clone())
+                (
+                    data.clone(),
+                    self.centroids.clone(),
+                    norm_centroids.clone(),
+                    norm_data.clone(),
+                )
             }))
-            .map(|(start_idx, (data, centroids, norms))| async move {
-                let data = tokio::task::spawn_blocking(move || {
-                    let array = data.values();
-                    let centroids_array = centroids.values();
+            .map(
+                |(start_idx, (data, centroids, norms, norm_data))| async move {
+                    let data = tokio::task::spawn_blocking(move || {
+                        let array = data.values();
+                        let centroids_array = centroids.values();
 
-                    (start_idx..min(start_idx + CHUNK_SIZE, n))
-                        .map(|idx| {
-                            // We've found about 40% performance improvement by using static dispatch instead
-                            // of dynamic dispatch.
-                            //
-                            // NOTE: Please make sure run benchmark when changing the following code.
-                            // `RUSTFLAGS="-C target-cpu=native" cargo bench --bench ivf_pq`
-                            let vector = &array[idx * dimension..(idx + 1) * dimension];
-                            argmin_value(centroids_array.chunks_exact(dimension).enumerate().map(
-                                |(c_idx, centroid)| match metric_type {
-                                    MetricType::L2 => vector.l2(centroid),
-                                    MetricType::Cosine => centroid.cosine_fast(
-                                        norms.as_ref().as_ref().unwrap()[c_idx],
-                                        vector,
-                                    ),
-                                    MetricType::Dot => vector.dot(centroid),
-                                },
-                            ))
-                            .unwrap()
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .await
-                .map_err(|e| {
-                    ArrowError::ComputeError(format!("KMeans: failed to compute membership: {}", e))
-                })?;
-                Ok::<Vec<_>, Error>(data)
-            })
+                        let last_idx = min(start_idx + CHUNK_SIZE, n);
+                        array[start_idx * dimension..last_idx * dimension]
+                            .chunks_exact(dimension)
+                            .enumerate()
+                            .map(|(idx, vector)| {
+                                let centroid_stream = centroids_array.chunks_exact(dimension);
+                                match metric_type {
+                                    MetricType::L2 => {
+                                        argmin_value(centroid_stream.map(|cent| vector.l2(cent)))
+                                    }
+                                    MetricType::Cosine => {
+                                        let centroid_norms = norms.as_ref().as_ref().unwrap();
+                                        if let Some(norm_vectors) = norm_data.as_ref() {
+                                            let norm_vec = norm_vectors.values()[idx];
+                                            argmin_value(
+                                                centroid_stream.zip(centroid_norms.iter()).map(
+                                                    |(cent, &cent_norm)| {
+                                                        cent.cosine_with_norms(
+                                                            cent_norm, norm_vec, vector,
+                                                        )
+                                                    },
+                                                ),
+                                            )
+                                        } else {
+                                            argmin_value(
+                                                centroid_stream.zip(centroid_norms.iter()).map(
+                                                    |(cent, &cent_norm)| {
+                                                        cent.cosine_fast(cent_norm, vector)
+                                                    },
+                                                ),
+                                            )
+                                        }
+                                    }
+                                    crate::distance::DistanceType::Dot => {
+                                        argmin_value(centroid_stream.map(|cent| vector.dot(cent)))
+                                    }
+                                }
+                                .unwrap()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await
+                    .map_err(|e| {
+                        ArrowError::ComputeError(format!(
+                            "KMeans: failed to compute membership: {}",
+                            e
+                        ))
+                    })?;
+                    Ok::<Vec<_>, Error>(data)
+                },
+            )
             .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await
