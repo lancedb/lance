@@ -464,7 +464,7 @@ impl KMeans {
                         let centroids_array = centroids.values();
 
                         let last_idx = min(start_idx + CHUNK_SIZE, n);
-                        (&array[start_idx * dimension..last_idx * dimension])
+                        array[start_idx * dimension..last_idx * dimension]
                             .chunks_exact(dimension)
                             .enumerate()
                             .map(|(idx, vector)| {
@@ -473,20 +473,22 @@ impl KMeans {
                                 } else {
                                     0.0
                                 };
-                                argmin_value(centroids_array.chunks_exact(dimension).enumerate().map(
-                                    |(c_idx, centroid)| match metric_type {
-                                        MetricType::L2 => vector.l2(centroid),
-                                        MetricType::Cosine => centroid.cosine_with_norms(
-                                            norms.as_ref().as_ref().unwrap()[c_idx],
-                                            norm_vec,
-                                            vector,
-                                        ),
-                                        MetricType::Dot => vector.dot(centroid),
-                                    },
-                                ))
+                                argmin_value(
+                                    centroids_array.chunks_exact(dimension).enumerate().map(
+                                        |(c_idx, centroid)| match metric_type {
+                                            MetricType::L2 => vector.l2(centroid),
+                                            MetricType::Cosine => centroid.cosine_with_norms(
+                                                norms.as_ref().as_ref().unwrap()[c_idx],
+                                                norm_vec,
+                                                vector,
+                                            ),
+                                            MetricType::Dot => vector.dot(centroid),
+                                        },
+                                    ),
+                                )
                                 .unwrap()
                             })
-                        .collect::<Vec<_>>()
+                            .collect::<Vec<_>>()
                     })
                     .await
                     .map_err(|e| {
