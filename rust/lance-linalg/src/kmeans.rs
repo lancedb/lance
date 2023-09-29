@@ -111,7 +111,7 @@ async fn kmean_plusplus(
     seen.insert(first_idx);
 
     for _ in 1..k {
-        let membership = kmeans.compute_membership(data.clone()).await;
+        let membership = kmeans.compute_membership(data.clone(), None).await;
         let weights = WeightedIndex::new(&membership.distances).unwrap();
         let mut chosen;
         loop {
@@ -400,7 +400,18 @@ impl KMeans {
     /// ```
     #[instrument(level = "debug", skip_all)]
     pub async fn train_once(&self, data: &MatrixView<Float32Type>) -> KMeanMembership {
-        self.compute_membership(data.data().clone()).await
+        let norm_data: Option<Arc<Float32Array>> = if self.metric_type == MetricType::Cosine {
+            Some(Arc::new(
+                data.iter()
+                    .map(|v| v.norm_l2())
+                    .collect::<Vec<f32>>()
+                    .into(),
+            ))
+        } else {
+            None
+        };
+        self.compute_membership(data.data().clone(), norm_data)
+            .await
     }
 
     /// Recompute the membership of each vector.
@@ -409,7 +420,11 @@ impl KMeans {
     ///
     /// - *data*: a `N * dimension` float32 array.
     /// - *dist_fn*: the function to compute distances.
-    pub async fn compute_membership(&self, data: Arc<Float32Array>) -> KMeanMembership {
+    pub async fn compute_membership(
+        &self,
+        data: Arc<Float32Array>,
+        norm_data: Option<Arc<Float32Array>>,
+    ) -> KMeanMembership {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let metric_type = self.metric_type;
@@ -432,9 +447,9 @@ impl KMeans {
         let cluster_with_distances = stream::iter((0..n).step_by(CHUNK_SIZE))
             // make tiles of input data to split between threads.
             .zip(repeat_with(|| {
-                (data.clone(), self.centroids.clone(), norm_centroids.clone())
+                (data.clone(), self.centroids.clone(), norm_centroids.clone(), norm_data.clone())
             }))
-            .map(|(start_idx, (data, centroids, norms))| async move {
+            .map(|(start_idx, (data, centroids, norms, norm_data))| async move {
                 let data = tokio::task::spawn_blocking(move || {
                     let array = data.values();
                     let centroids_array = centroids.values();
@@ -447,15 +462,23 @@ impl KMeans {
                             // NOTE: Please make sure run benchmark when changing the following code.
                             // `RUSTFLAGS="-C target-cpu=native" cargo bench --bench ivf_pq`
                             let vector = &array[idx * dimension..(idx + 1) * dimension];
+                            let norm_vec = if matches!(metric_type, MetricType::Cosine) {
+                                norm_data.as_ref().unwrap().values()[idx]
+                            } else {
+                                0.0
+                            };
                             argmin_value(centroids_array.chunks_exact(dimension).enumerate().map(
-                                |(c_idx, centroid)| match metric_type {
+                                |(c_idx, centroid)|
+                                match metric_type {
                                     MetricType::L2 => vector.l2(centroid),
-                                    MetricType::Cosine => centroid.cosine_fast(
+                                    MetricType::Cosine => centroid.cosine_with_norms(
                                         norms.as_ref().as_ref().unwrap()[c_idx],
+                                        norm_vec,
                                         vector,
                                     ),
                                     MetricType::Dot => vector.dot(centroid),
                                 },
+
                             ))
                             .unwrap()
                         })
