@@ -5,8 +5,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-readme.workspace = true
-description.workspace = true
+readme = "README.md"
+description = "Arrow Extension for Lance"
 keywords.workspace = true
 categories.workspace = true
 
@@ -15,6 +15,7 @@ arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-data = { workspace = true }
 arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 half = { workspace = true }
