@@ -418,10 +418,10 @@ impl RecordBatchExt for RecordBatch {
         self.try_new_from_struct_array(project(&struct_array, schema.fields())?)
     }
 
-    fn take(&self, indices: &UInt32Array) -> Result<RecordBatch> {
+    fn take(&self, indices: &UInt32Array) -> Result<Self> {
         let struct_array: StructArray = self.clone().into();
         let taken = take(&struct_array, indices, None)?;
-        Ok(taken.as_struct().into())
+        self.try_new_from_struct_array(taken.as_struct().clone())
     }
 }
 
