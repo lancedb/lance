@@ -143,6 +143,10 @@ impl FileWriter {
         let batch_length = batches.iter().map(|b| b.num_rows() as i32).sum();
         self.metadata.push_batch_length(batch_length);
 
+        if let Some(stats_collector) = &mut self.stats_collector {
+            stats_collector.append_num_values(batch_length as i64);
+        }
+
         self.batch_id += 1;
         Ok(())
     }
@@ -563,8 +567,11 @@ mod tests {
         types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
         DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
         DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int32Array,
-        Int64Array, ListArray, NullArray, StringArray, TimestampMicrosecondArray,
-        TimestampSecondArray, UInt8Array,
+        Int64Array, NullArray, StringArray, TimestampMicrosecondArray, TimestampSecondArray,
+        UInt8Array,
+        DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int64Array,
+        ListArray, NullArray, StringArray, TimestampMicrosecondArray, TimestampSecondArray,
+        UInt8Array,
     };
     use arrow_buffer::i256;
     use arrow_schema::{
@@ -840,10 +847,9 @@ mod tests {
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let mut file_writer =
-            FileWriter::try_new(&store, &path, schema.clone(), &FileWriterOptions::default())
-                .await
-                .unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
+            .await
+            .unwrap();
         file_writer.write(&[data_batch.clone()]).await.unwrap();
         file_writer.set_statistics(stats_batch);
         file_writer.finish().await.unwrap();
@@ -977,14 +983,13 @@ mod tests {
             ),
         ]);
 
-        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
 
-        // TODO: collect_stats_for_fields: vec![0,1,3] once structs are supported
         let options = FileWriterOptions {
-            collect_stats_for_fields: vec![0, 1],
+            collect_stats_for_fields: vec![0, 2, 4],
         };
         let mut file_writer = FileWriter::try_new(&store, &path, schema, &options)
             .await
@@ -1012,7 +1017,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         file_writer.write(&[batch1]).await.unwrap();
 
         let batch2 = RecordBatch::try_new(
@@ -1022,6 +1027,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![10, 11])),
                 Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
                     Some(vec![Some(1i32), Some(2), Some(3)]),
+                    Some(vec![Some(4), Some(5)]),
                     Some(vec![]),
                 ])),
                 Arc::new(StructArray::from(vec![
@@ -1036,7 +1042,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         file_writer.write(&[batch2]).await.unwrap();
 
         file_writer.finish().await.unwrap();
