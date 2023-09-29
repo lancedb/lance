@@ -67,7 +67,7 @@ fn filter_batch_by_partition(
     ivf: &Ivf,
     metric_type: MetricType,
     part_range: Range<u32>,
-) -> Result<RecordBatch> {
+) -> Result<Vec<(u32, RecordBatch)>> {
     let arr = batch
         .column_by_name(column)
         .expect("The caller already checked column exist")
@@ -89,7 +89,6 @@ fn filter_batch_by_partition(
         }
     });
 
-    let parted_batches = vec![];
     let struct_arr = StructArray::from(batch.clone());
 
     let residual_field = Field::new(
@@ -101,6 +100,7 @@ fn filter_batch_by_partition(
         true,
     );
 
+    let mut parted_batches = vec![];
     for (&part_id, row_ids) in parted_map.iter() {
         let indices = UInt32Array::from(row_ids.clone());
         // Use `take` to select rows.
@@ -113,38 +113,12 @@ fn filter_batch_by_partition(
             .as_fixed_size_list();
         let origin = MatrixView::try_from(origin_vec_col)?;
         let residual = ivf.compute_residual(&origin, &UInt32Array::from(vec![part_id; str_arr.len()]));
-        let residual_col: FixedSizeListArray = (&residual).into();
-        let parted_batch =
-        parted_batches.push(parted_batch);
-    }
-
-    // Filtered rows.
-    let arr = filtered
-        .column_by_name(column)
-        .expect("The caller already checked the column exist")
-        .as_fixed_size_list();
-    let origin = MatrixView::new(
-        Arc::new(arr.values().as_primitive::<Float32Type>().clone()),
-        dim,
-    );
-    let part_ids = filtered
-        .column_by_name(PARTITION_ID_COLUMN)
-        .unwrap()
-        .as_primitive::<UInt32Type>();
-    let residual = ivf.compute_residual(&origin, part_ids);
-    let residual_field = Field::new(
-        RESIDUAL_COLUMN,
-        DataType::FixedSizeList(
-            Arc::new(Field::new("item", DataType::Float32, true)),
-            dim as i32,
-        ),
-        true,
-    );
-    let residual_arr =
+        let residual_arr =
         FixedSizeListArray::try_new_from_values(residual.data().as_ref().clone(), dim as i32)?;
-    let filtered = filtered.try_with_column(residual_field, Arc::new(residual_arr))?;
-
-    Ok(filtered)
+        let parted_batch = parted_batch.try_with_column(residual_field, Arc::new(residual_arr))?;
+        parted_batches.push((part_id, parted_batch));
+    }
+    Ok(parted_batches)
 }
 
 /// Build specific partitions of IVF index.
@@ -181,11 +155,17 @@ pub(super) async fn build_partitions(
             let col = column.to_string();
             let range_copy = range.clone();
             // Filter out the rows that are not in the partition range.
-            let batch = tokio::task::spawn_blocking(move || {
+            let batches = tokio::task::spawn_blocking(move || {
                 filter_batch_by_partition(&batch, &col, &ivf_ref, metric_type, range_copy)
             })
             .await??;
             // Run product quantization.
+            stream::iter(batches::iter()).map(|(part_id, batch)| {
+                let arr = batch
+                .column_by_name(RESIDUAL_COLUMN)
+                .expect("The caller already checked column exist")
+                .as_fixed_size_list();
+            })
             let arr = batch
                 .column_by_name(RESIDUAL_COLUMN)
                 .expect("The caller already checked column exist")
