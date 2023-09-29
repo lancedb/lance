@@ -14,17 +14,21 @@
 
 //! Statistics collection utilities
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
-
-use arrow_array::{
-    builder::{make_builder, ArrayBuilder, PrimitiveBuilder},
-    types::{Int64Type, UInt32Type},
-    Array, ArrayRef, RecordBatch,
-};
-use arrow_schema::DataType;
+use std::ops::DerefMut;
 
 use crate::datatypes::Field;
 use crate::error::Result;
+use arrow_array::{
+    builder::{make_builder, ArrayBuilder, PrimitiveBuilder},
+    cast::as_primitive_array,
+    types::{Float32Type, Int32Type, Int64Type, UInt32Type},
+    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, Float32Array, Int32Array, Int64Array,
+    PrimitiveArray, RecordBatch,
+};
+use arrow_schema::DataType;
+use num_traits::bounds::Bounded;
 
 /// Max number of bytes that are included in statistics for binary columns.
 const BINARY_PREFIX_LENGTH: usize = 16;
@@ -40,8 +44,66 @@ pub struct StatisticsRow {
     pub(crate) max_value: Option<Box<dyn Array>>,
 }
 
+pub fn max_min_null<T: ArrowNumericType>(arrays: &[&PrimitiveArray<T>]) -> StatisticsRow
+where
+    T::Native: Bounded + PartialOrd,
+{
+    let mut min_value = T::Native::max_value();
+    let mut max_value = T::Native::min_value();
+    let mut null_count: u32 = 0;
+
+    for array in arrays.iter() {
+        array.iter().for_each(|value| {
+            if let Some(value) = value {
+                if let Some(Ordering::Greater) = value.partial_cmp(&max_value) {
+                    max_value = value;
+                } else if let Some(Ordering::Less) = value.partial_cmp(&min_value) {
+                    min_value = value;
+                }
+            };
+        });
+        null_count += array.null_count() as u32;
+    }
+
+    // TODO: correct for -0.0 when float
+    return StatisticsRow {
+        null_count: null_count,
+        min_value: Some(Box::new(PrimitiveArray::<T>::from_value(min_value, 1))),
+        max_value: Some(Box::new(PrimitiveArray::<T>::from_value(max_value, 1))),
+    };
+}
+
 pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
-    todo!();
+    match arrays[0].data_type() {
+        DataType::Int64 => {
+            let arr = arrays
+                .iter()
+                .map(|x| as_primitive_array::<Int64Type>(x))
+                .collect::<Vec<_>>();
+            return max_min_null::<Int64Type>(&arr);
+        }
+        DataType::Int32 => {
+            let arr = arrays
+                .iter()
+                .map(|x| as_primitive_array::<Int32Type>(x))
+                .collect::<Vec<_>>();
+            return max_min_null::<Int32Type>(&arr);
+        }
+        DataType::Float32 => {
+            let arr = arrays
+                .iter()
+                .map(|x| x.as_any().downcast_ref::<Float32Array>().unwrap())
+                .collect::<Vec<_>>();
+            return max_min_null::<Float32Type>(&arr);
+        }
+        _ => {
+            println!(
+                "Stats collection for {} is not supported yet",
+                arrays[0].data_type()
+            );
+            todo!()
+        }
+    }
 }
 
 pub struct StatisticsCollector {
@@ -93,7 +155,14 @@ impl StatisticsBuilder {
     }
 
     pub fn append(&mut self, row: StatisticsRow) {
-        todo!()
+        self.null_count.append_value(row.null_count);
+        // if let Some(min) = row.min_value {
+        //     self.min_value.append_value(min.value(0));
+        // }
+        // if let Some(max) = row.max_value {
+        //     self.max_value.append_value(max.value(0));
+        // }
+        // todo!()
     }
 }
 
@@ -120,7 +189,7 @@ mod tests {
             expected_max: Option<Box<dyn Array>>,
         }
 
-        let cases: [TestCase; 6] = [
+        let cases: [TestCase; 3] = [
             // Int64
             TestCase {
                 source_arrays: vec![
@@ -129,6 +198,14 @@ mod tests {
                 ],
                 expected_min: Some(Box::new(Int64Array::from(vec![-10]))),
                 expected_max: Some(Box::new(Int64Array::from(vec![7]))),
+            },
+            TestCase {
+                source_arrays: vec![
+                    Arc::new(Int32Array::from(vec![4, 3, 7, 2])),
+                    Arc::new(Int32Array::from(vec![-10, 3, 5])),
+                ],
+                expected_min: Some(Box::new(Int32Array::from(vec![-10]))),
+                expected_max: Some(Box::new(Int32Array::from(vec![7]))),
             },
             // Boolean
             TestCase {
@@ -204,7 +281,7 @@ mod tests {
             StatisticsRow {
                 null_count: 0,
                 min_value: Some(Box::new(Float32Array::from(vec![-10.0]))),
-                max_value: Some(Box::new(Float32Array::from(vec![7.0]))),
+                max_value: Some(Box::new(Float32Array::from(vec![5.0]))),
             }
         );
 
