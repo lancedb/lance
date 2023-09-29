@@ -12,17 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{ops::Range, collections::BTreeMap};
 use std::sync::Arc;
+use std::{collections::BTreeMap, ops::Range};
 
-use arrow_array::{UInt32Array, StructArray};
-use arrow_array::{
-    cast::AsArray,
-    types::{Float32Type, UInt32Type},
-    Array, BooleanArray, FixedSizeListArray, RecordBatch,
-};
+use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, RecordBatch};
+use arrow_array::{StructArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
-use arrow_select::{filter::filter_record_batch, take::take};
+use arrow_select::take::take;
 use futures::{
     stream::{self, repeat_with},
     StreamExt, TryStreamExt,
@@ -30,10 +26,11 @@ use futures::{
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
+use tracing::instrument;
 
 use crate::dataset::ROW_ID;
 use crate::index::vector::ivf::{
-    io::write_index_partitions, shuffler::ShufflerBuilder, Ivf, PARTITION_ID_COLUMN, PQ_CODE_COLUMN,
+    io::write_index_partitions, shuffler::ShufflerBuilder, Ivf, PQ_CODE_COLUMN,
 };
 use crate::index::vector::pq::ProductQuantizer;
 use crate::io::object_writer::ObjectWriter;
@@ -76,18 +73,17 @@ fn filter_batch_by_partition(
 
     let matrix = MatrixView::<Float32Type>::try_from(arr)?;
     let part_ids = ivf.compute_partitions(&matrix, metric_type);
-    // let selected: BooleanArray = BooleanArray::from_unary(&part_ids, |p| part_range.contains(&p));
-    // let partition_field = Field::new(PARTITION_ID_COLUMN, DataType::UInt32, false);
-    // let batch = batch.try_with_column(partition_field, Arc::new(part_ids))?;
-    // let filtered = filter_record_batch(&batch, &selected)?;
-
     // A map from partition ID and row IDs.
     let mut parted_map: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    part_ids.values().iter().enumerate().for_each(|(idx, &part_id)| {
-        if part_range.contains(&part_id) {
-            parted_map.entry(part_id).or_default().push(idx as u32);
-        }
-    });
+    part_ids
+        .values()
+        .iter()
+        .enumerate()
+        .for_each(|(idx, &part_id)| {
+            if part_range.contains(&part_id) {
+                parted_map.entry(part_id).or_default().push(idx as u32);
+            }
+        });
 
     let struct_arr = StructArray::from(batch.clone());
 
@@ -112,10 +108,12 @@ fn filter_batch_by_partition(
             .expect("The caller already checked column exist")
             .as_fixed_size_list();
         let origin = MatrixView::try_from(origin_vec_col)?;
-        let residual = ivf.compute_residual(&origin, &UInt32Array::from(vec![part_id; str_arr.len()]));
+        let residual =
+            ivf.compute_residual(&origin, &UInt32Array::from(vec![part_id; str_arr.len()]));
         let residual_arr =
-        FixedSizeListArray::try_new_from_values(residual.data().as_ref().clone(), dim as i32)?;
-        let parted_batch = parted_batch.try_with_column(residual_field, Arc::new(residual_arr))?;
+            FixedSizeListArray::try_new_from_values(residual.data().as_ref().clone(), dim as i32)?;
+        let parted_batch =
+            parted_batch.try_with_column(residual_field.clone(), Arc::new(residual_arr))?;
         parted_batches.push((part_id, parted_batch));
     }
     Ok(parted_batches)
@@ -124,6 +122,7 @@ fn filter_batch_by_partition(
 /// Build specific partitions of IVF index.
 ///
 ///
+#[instrument(level = "info", skip(writer, data, ivf, pq))]
 pub(super) async fn build_partitions(
     writer: &mut ObjectWriter,
     data: impl RecordBatchStream + Unpin,
@@ -150,7 +149,7 @@ pub(super) async fn build_partitions(
     let ivf_immutable = Arc::new(ivf.clone());
     let mut stream = data
         .zip(repeat_with(|| (part_range.clone(), ivf_immutable.clone())))
-        .map(move |(b, (range, ivf_ref))| async move {
+        .map(|(b, (range, ivf_ref))| async move {
             let batch = b?;
             let col = column.to_string();
             let range_copy = range.clone();
@@ -159,44 +158,31 @@ pub(super) async fn build_partitions(
                 filter_batch_by_partition(&batch, &col, &ivf_ref, metric_type, range_copy)
             })
             .await??;
-            // Run product quantization.
-            stream::iter(batches::iter()).map(|(part_id, batch)| {
+
+            let mut b = vec![];
+            for (part_id, batch) in batches {
                 let arr = batch
-                .column_by_name(RESIDUAL_COLUMN)
-                .expect("The caller already checked column exist")
-                .as_fixed_size_list();
-            })
-            let arr = batch
-                .column_by_name(RESIDUAL_COLUMN)
-                .expect("The caller already checked column exist")
-                .as_fixed_size_list();
-            let data = MatrixView::<Float32Type>::new(
-                Arc::new(arr.values().as_primitive::<Float32Type>().clone()),
-                arr.value_length() as usize,
-            );
-            let pq_code = pq.transform(&data, metric_type).await?;
-            let pq_field = Field::new(PQ_CODE_COLUMN, pq_code.data_type().clone(), false);
-            let batch = batch.try_with_column(pq_field, Arc::new(pq_code))?;
-            // Do not need to serialize original vector
-            let batch = batch.drop_column(column)?.drop_column(RESIDUAL_COLUMN)?;
-            Ok::<(arrow_array::RecordBatch, std::ops::Range<u32>), Error>((batch, range))
+                    .column_by_name(RESIDUAL_COLUMN)
+                    .expect("The caller already checked column exist")
+                    .as_fixed_size_list();
+                let data = MatrixView::<Float32Type>::new(
+                    Arc::new(arr.values().as_primitive::<Float32Type>().clone()),
+                    arr.value_length() as usize,
+                );
+                let pq_code = pq.transform(&data, metric_type).await?;
+                let pq_field = Field::new(PQ_CODE_COLUMN, pq_code.data_type().clone(), false);
+                let batch = batch.try_with_column(pq_field, Arc::new(pq_code))?;
+                // Do not need to serialize original vector
+                let batch = batch.drop_column(column)?.drop_column(RESIDUAL_COLUMN)?;
+                b.push((part_id, batch))
+            }
+            Ok::<Vec<(u32, RecordBatch)>, Error>(b)
         })
         .buffer_unordered(num_cpus::get())
-        .and_then(|batch_and_range| async move {
+        .and_then(|batches| async move {
             // Split batch into per-partition batches
-            let (batch, range) = batch_and_range;
-            Ok(stream::iter(range).map(move |part_id| {
-                let predictions = BooleanArray::from_unary(
-                    batch
-                        .column_by_name(PARTITION_ID_COLUMN)
-                        .unwrap()
-                        .as_primitive::<UInt32Type>(),
-                    |pid| pid == part_id,
-                );
-                let parted_batch =
-                    filter_record_batch(&batch, &predictions)?.drop_column(PARTITION_ID_COLUMN)?;
-                Ok::<(u32, RecordBatch), Error>((part_id, parted_batch))
-            }))
+            Ok(stream::iter(batches)
+                .map(move |(part_id, batch)| Ok::<(u32, RecordBatch), Error>((part_id, batch))))
         })
         .try_flatten_unordered(num_cpus::get())
         .boxed();
@@ -218,9 +204,8 @@ pub(super) async fn build_partitions(
     while let Some(result) = stream.next().await {
         let (part_id, batch) = result?;
         if batch.num_rows() == 0 {
-            continue;
+            shuffler_builder.insert(part_id, batch).await?;
         }
-        shuffler_builder.insert(part_id, batch).await?;
     }
 
     let shuffler = shuffler_builder.finish().await?;
