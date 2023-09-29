@@ -24,6 +24,7 @@ use std::sync::Arc;
 use arrow_array::Float32Array;
 use half::{bf16, f16};
 use num_traits::real::Real;
+use num_traits::{AsPrimitive, FromPrimitive};
 
 use super::dot::dot;
 use super::norm_l2::{norm_l2, Normalize};
@@ -182,18 +183,29 @@ impl Cosine for [f64] {
 /// Fallback non-SIMD implementation
 #[allow(dead_code)] // Does not fallback on aarch64.
 #[inline]
-fn cosine_scalar<T: Real + Sum>(x: &[T], x_norm: T, y: &[T]) -> T {
+fn cosine_scalar<T: Real + Sum + AsPrimitive<f64> + FromPrimitive>(
+    x: &[T],
+    x_norm: T,
+    y: &[T],
+) -> T {
     let y_sq = dot(y, y);
     let xy = dot(x, y);
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
-    T::one().sub(xy.div(x_norm.mul(y_sq.sqrt())))
+    // use f64 for overflow protection.
+    T::from_f64(1.0 - (xy.as_() / (x_norm.as_() * (y_sq.sqrt()).as_()))).unwrap()
 }
 
 #[inline]
-fn cosine_scalar_fast<T: Real + Sum>(x: &[T], x_norm: T, y: &[T], y_norm: T) -> T {
+fn cosine_scalar_fast<T: Real + Sum + AsPrimitive<f64> + FromPrimitive>(
+    x: &[T],
+    x_norm: T,
+    y: &[T],
+    y_norm: T,
+) -> T {
     let xy = dot(x, y);
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
-    T::one().sub(xy.div(x_norm.mul(y_norm)))
+    // use f64 for overflow protection.
+    T::from_f64(1.0 - (xy.as_() / (x_norm.as_() * y_norm.as_()))).unwrap()
 }
 
 /// Cosine distance function between two vectors.
