@@ -14,12 +14,14 @@
 
 //! Statistics collection utilities
 
+use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::ops::DerefMut;
+use std::sync::Arc;
 
-use crate::datatypes::Field;
+use crate::datatypes::{Field, Schema};
 use crate::error::Result;
+use arrow_array::builder::Float32Builder;
 use arrow_array::{
     builder::{make_builder, ArrayBuilder, PrimitiveBuilder},
     cast::as_primitive_array,
@@ -28,6 +30,7 @@ use arrow_array::{
     PrimitiveArray, RecordBatch,
 };
 use arrow_schema::DataType;
+use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
 use num_traits::bounds::Bounded;
 
 /// Max number of bytes that are included in statistics for binary columns.
@@ -45,8 +48,8 @@ pub struct StatisticsRow {
 }
 
 pub fn max_min_null<T: ArrowNumericType>(arrays: &[&PrimitiveArray<T>]) -> StatisticsRow
-where
-    T::Native: Bounded + PartialOrd,
+    where
+        T::Native: Bounded + PartialOrd,
 {
     let mut min_value = T::Native::max_value();
     let mut max_value = T::Native::min_value();
@@ -131,7 +134,56 @@ impl StatisticsCollector {
         self.num_rows.append_value(num_rows)
     }
 
+    // TODO: handle types
     pub fn finish(&mut self) -> Result<RecordBatch> {
+        let mut fields: Vec<ArrowField> = Vec::with_capacity(self.builders.len() + 1);
+
+        fields.push(ArrowField::new("num_values", DataType::Int64, false));
+        let _ = self.builders.iter().map(|(_, (field, builder))| {
+            fields.push(ArrowField::new(
+                &field.name,
+                field.data_type(),
+                field.nullable,
+            ));
+        });
+        let arrow_schema = ArrowSchema::new(fields);
+
+        let num_rows = self.num_rows.finish();
+        let min_values = self
+            .get_builder(0)
+            .unwrap()
+            .min_value
+            .as_any_mut()
+            .downcast_mut::<PrimitiveBuilder<Int64Type>>()
+            .unwrap()
+            .finish();
+        let max_values = self
+            .get_builder(0)
+            .unwrap()
+            .max_value
+            .as_any_mut()
+            .downcast_mut::<PrimitiveBuilder<Int64Type>>()
+            .unwrap()
+            .finish();
+        let null_count = self
+            .get_builder(0)
+            .unwrap()
+            .null_count
+            .as_any_mut()
+            .downcast_mut::<PrimitiveBuilder<Int64Type>>()
+            .unwrap()
+            .finish();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![
+                Arc::new(num_rows),
+                Arc::new(min_values),
+                Arc::new(max_values),
+                Arc::new(null_count),
+            ],
+        )
+            .unwrap();
         todo!()
     }
 }
@@ -140,6 +192,7 @@ pub struct StatisticsBuilder {
     null_count: PrimitiveBuilder<UInt32Type>,
     min_value: Box<dyn ArrayBuilder>,
     max_value: Box<dyn ArrayBuilder>,
+    dt: DataType,
 }
 
 impl StatisticsBuilder {
@@ -147,36 +200,66 @@ impl StatisticsBuilder {
         let null_count = PrimitiveBuilder::<UInt32Type>::new();
         let min_value = make_builder(data_type, 1);
         let max_value = make_builder(data_type, 1);
+        let dt = data_type.clone();
         Self {
             null_count,
             min_value,
             max_value,
+            dt,
+        }
+    }
+
+    pub fn statistics_appender<T: ArrowNumericType>(&mut self, row: StatisticsRow) {
+        self.null_count.append_value(row.null_count);
+        if let Some(min_value) = row.min_value {
+            let min_value = min_value
+                .as_any()
+                .downcast_ref::<PrimitiveArray<T>>()
+                .unwrap()
+                .value(0);
+            let min_builder = self
+                .min_value
+                .as_any_mut()
+                .downcast_mut::<PrimitiveBuilder<T>>()
+                .unwrap();
+            min_builder.append_value(min_value);
+        }
+        if let Some(max_value) = row.max_value {
+            let max_value = max_value
+                .as_any()
+                .downcast_ref::<PrimitiveArray<T>>()
+                .unwrap()
+                .value(0);
+            let max_builder = self
+                .max_value
+                .as_any_mut()
+                .downcast_mut::<PrimitiveBuilder<T>>()
+                .unwrap();
+            max_builder.append_value(max_value);
         }
     }
 
     pub fn append(&mut self, row: StatisticsRow) {
-        self.null_count.append_value(row.null_count);
-        // if let Some(min) = row.min_value {
-        //     self.min_value.append_value(min.value(0));
-        // }
-        // if let Some(max) = row.max_value {
-        //     self.max_value.append_value(max.value(0));
-        // }
-        // todo!()
+        let dt = match self.dt {
+            DataType::Int32 => {
+                self.statistics_appender::<Int32Type>(row);
+            }
+            DataType::Int64 => {
+                self.statistics_appender::<Int64Type>(row);
+            }
+            _ => todo!(),
+        };
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use arrow_array::{
         builder::StringDictionaryBuilder, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
         DurationMillisecondArray, Float32Array, Int32Array, Int64Array, StringArray, StructArray,
         TimestampMicrosecondArray,
     };
 
-    use crate::datatypes::Schema;
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
 
     use super::*;
@@ -189,7 +272,7 @@ mod tests {
             expected_max: Option<Box<dyn Array>>,
         }
 
-        let cases: [TestCase; 3] = [
+        let cases: [TestCase; 7] = [
             // Int64
             TestCase {
                 source_arrays: vec![
@@ -363,7 +446,7 @@ mod tests {
             BINARY_PREFIX_LENGTH
                 + 5
         ]
-        .as_ref()]))];
+            .as_ref()]))];
         let array_refs = arrays.iter().collect::<Vec<_>>();
         let stats = collect_statistics(&array_refs);
         assert_eq!(
@@ -375,7 +458,7 @@ mod tests {
                     0xFFu8;
                     BINARY_PREFIX_LENGTH
                 ]
-                .as_ref()]))),
+                    .as_ref()]))),
                 // We can't truncate the max value, so we return None
                 max_value: None,
             }
@@ -513,7 +596,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
 
         assert_eq!(batch, expected_batch);
     }
