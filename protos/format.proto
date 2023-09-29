@@ -112,6 +112,9 @@ message Manifest {
   // version of the table the transaction read from, and {uuid} is a 
   // hyphen-separated UUID.
   string transaction_file = 12;
+
+  // Details of the most recent remap operation to be run on the table.
+  Remap last_remap = 13;
 } // Manifest
 
 // Auxiliary Data attached to a version.
@@ -214,6 +217,13 @@ message DeletionFile {
   // The number of rows that are marked as deleted.
   uint64 num_deleted_rows = 4;
 } // DeletionFile
+
+message Remap {
+  // The version of the dataset the remap files were built from
+  uint64 version = 1;
+  // IDs of the remap files
+  repeated UUID remap_ids = 2;
+}
 
 // Metadata of one Lance file.
 message Metadata {

@@ -72,6 +72,7 @@ pub use write::{WriteMode, WriteParams};
 
 const INDICES_DIR: &str = "_indices";
 pub(crate) const DELETION_DIRS: &str = "_deletions";
+pub(crate) const REMAP_DIR: &str = "_remap";
 const DATA_DIR: &str = "data";
 pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;

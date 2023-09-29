@@ -108,6 +108,8 @@ message Transaction {
       //
       // This fragment ID is not yet assigned.
       repeated DataFragment new_fragments = 2;
+      // The uuid of the rewrite file associated with this group.
+      UUID remap_uuid = 3;
     }
 
     repeated RewriteGroup groups = 3;

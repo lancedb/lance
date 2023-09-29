@@ -174,6 +174,13 @@ impl Fragment {
             .into_iter()
             .collect()
     }
+
+    /// The first row id in this [`FileFragment`]
+    ///
+    /// Note: this may represent a deleted row
+    pub fn first_row_id(&self) -> u64 {
+        self.id << 32
+    }
 }
 
 impl From<&pb::DataFragment> for Fragment {
@@ -207,6 +214,28 @@ impl From<&Fragment> for pb::DataFragment {
             deletion_file,
             physical_rows: f.physical_rows as u64,
         }
+    }
+}
+
+pub struct RowId(u64);
+
+impl RowId {
+    pub const FRAGMENT_SIZE: u64 = 1 << 32;
+
+    pub fn new_from_id(row_id: u64) -> Self {
+        Self(row_id)
+    }
+
+    pub fn new_from_parts(fragment_id: u32, row_id: u32) -> Self {
+        Self(((fragment_id as u64) << 32) | row_id as u64)
+    }
+
+    pub fn fragment_id(&self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    pub fn row_id(&self) -> u32 {
+        self.0 as u32
     }
 }
 

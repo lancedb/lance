@@ -48,13 +48,14 @@
 use std::{collections::HashSet, sync::Arc};
 
 use object_store::path::Path;
+use uuid::Uuid;
 
 use crate::{
     datatypes::Schema,
     format::Index,
     format::{
         pb::{self, IndexMetadata},
-        Fragment, Manifest,
+        Fragment, Manifest, Remap,
     },
     io::{read_manifest, reader::read_manifest_indexes, ObjectStore},
 };
@@ -118,6 +119,9 @@ pub enum Operation {
 pub struct RewriteGroup {
     pub old_fragments: Vec<Fragment>,
     pub new_fragments: Vec<Fragment>,
+    // A remap file listing the row ids modified by this rewrite.
+    // Only None on old versions that did not support this feature.
+    pub remap_uuid: Option<Uuid>,
 }
 
 impl Operation {
@@ -292,6 +296,7 @@ impl Transaction {
         current_indices: Vec<Index>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
+        target_version: Option<u64>,
     ) -> Result<(Manifest, Vec<Index>)> {
         // Get the schema and the final fragment list
         let schema = match self.operation {
@@ -393,6 +398,20 @@ impl Transaction {
             Manifest::new(&schema, Arc::new(final_fragments))
         };
 
+        // new_from_previous will keep the old value of last_remap.  We need to replace it
+        // if we are doing a rewrite
+        match &self.operation {
+            Operation::Rewrite { groups } => {
+                let remap_uuids = groups.iter().map(|g| g.remap_uuid.unwrap()).collect();
+                manifest.last_remap = Some(Remap {
+                    version: target_version
+                        .expect("Unexpected use of rewrite to create a new dataset"),
+                    remap_uuids,
+                })
+            }
+            _ => (),
+        };
+
         manifest.tag = self.tag.clone();
 
         if config.auto_set_feature_flags {
@@ -490,6 +509,7 @@ impl TryFrom<&pb::Transaction> for Transaction {
                     vec![RewriteGroup {
                         old_fragments: old_fragments.iter().map(Fragment::from).collect(),
                         new_fragments: new_fragments.iter().map(Fragment::from).collect(),
+                        remap_uuid: None,
                     }]
                 };
                 Operation::Rewrite { groups }
@@ -536,9 +556,18 @@ impl TryFrom<&pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
     type Error = Error;
 
     fn try_from(message: &pb::transaction::rewrite::RewriteGroup) -> Result<Self> {
+        let remap_uuid = message
+            .remap_uuid
+            .clone()
+            .map(|uuid| Uuid::from_slice(uuid.uuid.as_slice()))
+            .transpose()
+            .map_err(|err| Error::Internal {
+                message: format!("could not parse uuid: {}", err),
+            })?;
         Ok(Self {
             old_fragments: message.old_fragments.iter().map(Fragment::from).collect(),
             new_fragments: message.new_fragments.iter().map(Fragment::from).collect(),
+            remap_uuid,
         })
     }
 }
@@ -618,6 +647,9 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
                 .iter()
                 .map(pb::DataFragment::from)
                 .collect(),
+            remap_uuid: value.remap_uuid.map(|uuid| pb::Uuid {
+                uuid: uuid.as_bytes().to_vec(),
+            }),
         }
     }
 }
@@ -663,6 +695,7 @@ mod tests {
                 groups: vec![RewriteGroup {
                     old_fragments: vec![fragment0.clone()],
                     new_fragments: vec![fragment1.clone()],
+                    remap_uuid: Some(Uuid::new_v4()),
                 }],
             },
         ];
@@ -720,6 +753,7 @@ mod tests {
                     groups: vec![RewriteGroup {
                         old_fragments: vec![fragment1.clone()],
                         new_fragments: vec![fragment0.clone()],
+                        remap_uuid: Some(Uuid::new_v4()),
                     }],
                 },
                 [false, true, false, true, true, false],
@@ -730,6 +764,7 @@ mod tests {
                     groups: vec![RewriteGroup {
                         old_fragments: vec![fragment0.clone(), fragment2.clone()],
                         new_fragments: vec![fragment0.clone()],
+                        remap_uuid: Some(Uuid::new_v4()),
                     }],
                 },
                 [false, true, true, true, true, true],
@@ -774,11 +809,13 @@ mod tests {
             RewriteGroup {
                 old_fragments: vec![Fragment::new(1), Fragment::new(2)],
                 new_fragments: vec![Fragment::new(0), Fragment::new(0)],
+                remap_uuid: Some(Uuid::new_v4()),
             },
             // These are not contiguous, so they will be inserted at the end.
             RewriteGroup {
                 old_fragments: vec![Fragment::new(5), Fragment::new(8)],
                 new_fragments: vec![Fragment::new(0)],
+                remap_uuid: Some(Uuid::new_v4()),
             },
         ];
 

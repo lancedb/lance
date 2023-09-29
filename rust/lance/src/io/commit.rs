@@ -487,7 +487,7 @@ pub(crate) async fn commit_new_dataset(
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
     let (mut manifest, indices) =
-        transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
+        transaction.build_manifest(None, vec![], &transaction_file, write_config, None)?;
 
     write_manifest_file(
         object_store,
@@ -668,6 +668,7 @@ pub(crate) async fn commit_transaction(
                 dataset.load_indices().await?,
                 &transaction_file,
                 write_config,
+                Some(target_version),
             )?,
         };
 

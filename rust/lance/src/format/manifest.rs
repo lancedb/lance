@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use chrono::prelude::*;
 use prost_types::Timestamp;
+use uuid::Uuid;
 
 use super::Fragment;
 use crate::datatypes::Schema;
@@ -27,6 +28,15 @@ use crate::error::{Error, Result};
 use crate::format::{pb, ProtoStruct};
 use crate::utils::temporal::SystemTime;
 use snafu::{location, Location};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Remap {
+    /// Version in which the remap was applied
+    pub version: u64,
+    /// UUIDs of the remap files
+    pub remap_uuids: Vec<Uuid>,
+}
+
 /// Manifest of a dataset
 ///
 ///  * Schema
@@ -67,6 +77,7 @@ pub struct Manifest {
 
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
+    pub last_remap: Option<Remap>,
 }
 
 impl Manifest {
@@ -83,6 +94,7 @@ impl Manifest {
             writer_feature_flags: 0,
             max_fragment_id: 0,
             transaction_file: None,
+            last_remap: None,
         }
     }
 
@@ -103,6 +115,7 @@ impl Manifest {
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
+            last_remap: previous.last_remap.clone(),
         }
     }
 
@@ -204,6 +217,14 @@ impl From<pb::Manifest> for Manifest {
             } else {
                 Some(p.transaction_file)
             },
+            last_remap: p.last_remap.map(|remap| Remap {
+                version: remap.version,
+                remap_uuids: remap
+                    .remap_ids
+                    .iter()
+                    .map(|u| Uuid::from_slice(u.uuid.as_slice()).unwrap())
+                    .collect(),
+            }),
         }
     }
 }
@@ -234,6 +255,16 @@ impl From<&Manifest> for pb::Manifest {
             writer_feature_flags: m.writer_feature_flags,
             max_fragment_id: m.max_fragment_id,
             transaction_file: m.transaction_file.clone().unwrap_or_default(),
+            last_remap: m.last_remap.as_ref().map(|remap| pb::Remap {
+                version: remap.version,
+                remap_ids: remap
+                    .remap_uuids
+                    .iter()
+                    .map(|u| pb::Uuid {
+                        uuid: u.as_bytes().to_vec(),
+                    })
+                    .collect(),
+            }),
         }
     }
 }

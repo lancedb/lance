@@ -86,13 +86,24 @@
 //! they can be committed in any order.
 use std::borrow::Cow;
 use std::ops::{AddAssign, Range};
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, RwLock};
+use std::task::Poll;
 
+use arrow_array::{RecordBatch, UInt64Array};
+use arrow_schema::SchemaRef;
+use datafusion::error::Result as DFResult;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::{ready, Stream, StreamExt, TryStreamExt};
+use pin_project::pin_project;
+use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
+use crate::dataset::ROW_ID;
+use crate::format::remap::RemapVector;
 use crate::io::commit::commit_transaction;
+use crate::io::remap::write_remap_vector;
 use crate::Result;
 use crate::{format::Fragment, Dataset};
 
@@ -498,6 +509,83 @@ pub struct RewriteResult {
     pub read_version: u64,
     /// The original fragments being replaced
     pub original_fragments: Vec<Fragment>,
+    pub remap_uuid: Uuid,
+}
+
+#[pin_project]
+struct RowIdCapture {
+    row_ids: Arc<RwLock<RoaringTreemap>>,
+    #[pin]
+    target: SendableRecordBatchStream,
+}
+
+impl RowIdCapture {
+    fn new_pinned(
+        target: SendableRecordBatchStream,
+        row_ids: Arc<RwLock<RoaringTreemap>>,
+    ) -> Pin<Box<Self>> {
+        Box::pin(Self { row_ids, target })
+    }
+
+    fn extract_row_ids(
+        row_ids: &mut RoaringTreemap,
+        batch: DFResult<RecordBatch>,
+    ) -> DFResult<RecordBatch> {
+        let batch = batch?;
+        dbg!("Received batch with {} rows", batch.num_rows());
+
+        let (row_id_idx, _) = batch
+            .schema()
+            .column_with_name(ROW_ID)
+            .expect("Received a batch without row ids");
+        let row_ids_arr = batch.column(row_id_idx);
+        let row_ids_itr = row_ids_arr
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect(&format!(
+                "Row ids had an unexpected type: {}",
+                row_ids_arr.data_type()
+            ))
+            .iter()
+            .map(|x| x.expect("Null row id encountered"));
+        row_ids.append(row_ids_itr).map_err(|err| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "Row ids did not arrive in sorted order: {}",
+                err
+            ))
+        })?;
+        dbg!("Now have extracted {} row ids", row_ids.len());
+        let non_row_ids_cols = (0..batch.num_columns())
+            .filter(|col| *col != row_id_idx)
+            .collect::<Vec<_>>();
+        Ok(batch.project(&non_row_ids_cols)?)
+    }
+}
+
+impl Stream for RowIdCapture {
+    type Item = DFResult<RecordBatch>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        let batch = ready!(this.target.poll_next_unpin(cx));
+        let mut row_ids = this.row_ids.write().unwrap();
+        match batch {
+            Some(batch) => {
+                let extracted = RowIdCapture::extract_row_ids(&mut row_ids, batch);
+                Poll::Ready(Some(extracted))
+            }
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+impl datafusion::physical_plan::RecordBatchStream for RowIdCapture {
+    fn schema(&self) -> SchemaRef {
+        self.target.schema()
+    }
 }
 
 /// Rewrite the files in a single task.
@@ -508,6 +596,7 @@ async fn rewrite_files(
     task: TaskData,
     options: &CompactionOptions,
 ) -> Result<RewriteResult> {
+    dbg!("Beginning rewrite_files");
     let mut metrics = CompactionMetrics::default();
 
     if task.fragments.is_empty() {
@@ -516,14 +605,17 @@ async fn rewrite_files(
             new_fragments: Vec::new(),
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
+            remap_uuid: Uuid::nil(),
         });
     }
 
     let fragments = task.fragments.to_vec();
     let mut scanner = dataset.scan();
-    scanner.with_fragments(fragments);
+    scanner.with_fragments(fragments).with_row_id();
 
     let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
+    let row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
+    let row_id_capture = RowIdCapture::new_pinned(data, row_ids.clone());
 
     let params = WriteParams {
         max_rows_per_file: options.target_rows_per_fragment,
@@ -535,10 +627,15 @@ async fn rewrite_files(
         dataset.object_store.clone(),
         &dataset.base,
         dataset.schema(),
-        data,
+        row_id_capture,
         params,
     )
     .await?;
+
+    let remap_ids = Arc::try_unwrap(row_ids).unwrap().into_inner().unwrap();
+    let remap_vector = RemapVector::from(remap_ids);
+    let remap_uuid =
+        write_remap_vector(&dataset.base, remap_vector, dataset.object_store.as_ref()).await?;
 
     metrics.files_removed = task
         .fragments
@@ -557,6 +654,7 @@ async fn rewrite_files(
         new_fragments,
         read_version: dataset.manifest.version,
         original_fragments: task.fragments,
+        remap_uuid,
     })
 }
 
@@ -582,6 +680,7 @@ pub async fn commit_compaction(
         let rewrite_group = RewriteGroup {
             old_fragments: task.original_fragments,
             new_fragments: task.new_fragments,
+            remap_uuid: Some(task.remap_uuid),
         };
         rewrite_groups.push(rewrite_group);
     }
@@ -611,11 +710,15 @@ pub async fn commit_compaction(
 #[cfg(test)]
 mod tests {
 
+    use std::ops::RangeBounds;
+
     use arrow_array::{Float32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use futures::TryStreamExt;
     use tempfile::tempdir;
+
+    use crate::{format::RowId, io::remap::read_remap_vector};
 
     use super::*;
 
@@ -747,6 +850,46 @@ mod tests {
         assert_eq!(plan.tasks().len(), 0);
     }
 
+    fn expect_remap<R: RangeBounds<u64> + Clone>(ranges: &[R]) -> RoaringTreemap {
+        let mut remap = RoaringTreemap::new();
+        ranges.iter().for_each(|r| {
+            remap.insert_range(r.clone());
+        });
+        remap
+    }
+
+    async fn load_remaps(dataset: &Dataset, uuids: &Vec<Uuid>) -> RoaringTreemap {
+        let mut total_remap = RoaringTreemap::new();
+        for uuid in uuids {
+            let remap = read_remap_vector(&dataset.base, uuid, &dataset.object_store)
+                .await
+                .unwrap();
+            total_remap |= RoaringTreemap::from(remap);
+        }
+        total_remap
+    }
+
+    async fn check_remap<R: RangeBounds<u64> + Clone>(
+        dataset: &Dataset,
+        num_remaps: usize,
+        expected_version: u64,
+        expected: &[R],
+    ) {
+        let last_remap = dataset.manifest.last_remap.as_ref();
+        assert!(last_remap.is_some());
+        let last_remap = last_remap.unwrap();
+        assert_eq!(last_remap.version, expected_version);
+        assert_eq!(last_remap.remap_uuids.len(), num_remaps);
+        let remap = load_remaps(dataset, &last_remap.remap_uuids).await;
+        let expected = expect_remap(expected);
+        assert_eq!(remap, expected);
+    }
+
+    fn row_ids(frag_id: u32, range: Range<u64>) -> Range<u64> {
+        (range.start + (frag_id as u64 * RowId::FRAGMENT_SIZE))
+            ..(range.end + (frag_id as u64 * RowId::FRAGMENT_SIZE))
+    }
+
     #[tokio::test]
     async fn test_compact_many() {
         let test_dir = tempdir().unwrap();
@@ -828,6 +971,26 @@ mod tests {
         assert_eq!(metrics.files_removed, 7); // 6 data files + 1 deletion file
         assert_eq!(metrics.files_added, 4);
 
+        check_remap(
+            &dataset,
+            2,
+            dataset.manifest.version,
+            &[
+                // 3 small fragments are rewritten entirely
+                row_ids(0, 0..400),
+                row_ids(1, 0..400),
+                row_ids(2, 0..400),
+                // frag 3 is skipped since it does not have enough missing data
+                // Only 800/1000 rows taken from frag 4
+                row_ids(4, 0..200),
+                row_ids(4, 400..1000),
+                // frags 5 & 6 compacted with frag 4
+                row_ids(5, 0..300),
+                row_ids(6, 0..300),
+            ],
+        )
+        .await;
+
         let fragment_ids = dataset
             .get_fragments()
             .iter()
@@ -888,6 +1051,14 @@ mod tests {
         let metrics = compact_files(&mut dataset, CompactionOptions::default())
             .await
             .unwrap();
+
+        check_remap(
+            &dataset,
+            plan.tasks().len(),
+            dataset.manifest.version,
+            &[row_ids(0, 0..5000), row_ids(1, 0..5000)],
+        )
+        .await;
 
         assert_eq!(metrics.files_removed, 4); // 2 fragments with 2 data files
         assert_eq!(metrics.files_added, 1); // 1 fragment with 1 data file
@@ -954,6 +1125,14 @@ mod tests {
         assert_eq!(metrics.files_removed, 2);
         assert_eq!(metrics.fragments_added, 1);
 
+        check_remap(
+            &dataset,
+            plan.tasks().len(),
+            dataset.manifest.version,
+            &[row_ids(0, 501..1000)],
+        )
+        .await;
+
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
         assert!(fragments[0].metadata.deletion_file.is_none());
@@ -1012,8 +1191,35 @@ mod tests {
             .unwrap();
         assert_eq!(dataset.manifest.version, 2);
 
+        check_remap(
+            &dataset,
+            1,
+            dataset.manifest.version,
+            &[
+                row_ids(6, 0..1000),
+                row_ids(7, 0..1000),
+                row_ids(8, 0..1000),
+            ],
+        )
+        .await;
+
         // Can commit the remaining tasks
         commit_compaction(&mut dataset, results).await.unwrap();
         assert_eq!(dataset.manifest.version, 3);
+
+        check_remap(
+            &dataset,
+            2,
+            dataset.manifest.version,
+            &[
+                row_ids(0, 0..1000),
+                row_ids(1, 0..1000),
+                row_ids(2, 0..1000),
+                row_ids(3, 0..1000),
+                row_ids(4, 0..1000),
+                row_ids(5, 0..1000),
+            ],
+        )
+        .await;
     }
 }
