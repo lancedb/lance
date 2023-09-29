@@ -457,7 +457,7 @@ impl KMeans {
                                     MetricType::Dot => vector.dot(centroid),
                                 },
                             ))
-                            .unwrap()
+                            .expect(format!("KMeans: argmin returns None. vec={vector:?}, idx={idx}").as_str())
                         })
                         .collect::<Vec<_>>()
                 })
