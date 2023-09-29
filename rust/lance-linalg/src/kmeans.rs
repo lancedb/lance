@@ -473,19 +473,27 @@ impl KMeans {
                                 } else {
                                     0.0
                                 };
-                                argmin_value(
-                                    centroids_array.chunks_exact(dimension).enumerate().map(
-                                        |(c_idx, centroid)| match metric_type {
-                                            MetricType::L2 => vector.l2(centroid),
-                                            MetricType::Cosine => centroid.cosine_with_norms(
-                                                norms.as_ref().as_ref().unwrap()[c_idx],
-                                                norm_vec,
-                                                vector,
-                                            ),
-                                            MetricType::Dot => vector.dot(centroid),
-                                        },
-                                    ),
-                                )
+                                let centroid_stream = centroids_array.chunks_exact(dimension);
+                                match metric_type {
+                                    MetricType::L2 => {
+                                        argmin_value(centroid_stream.map(|cent| vector.l2(cent)))
+                                    }
+                                    MetricType::Cosine => {
+                                        let centroid_norms = norms.as_ref().as_ref().unwrap();
+                                        argmin_value(centroid_stream.enumerate().map(
+                                            |(c_idx, cent)| {
+                                                cent.cosine_with_norms(
+                                                    centroid_norms[c_idx],
+                                                    norm_vec,
+                                                    vector,
+                                                )
+                                            },
+                                        ))
+                                    }
+                                    crate::distance::DistanceType::Dot => {
+                                        argmin_value(centroid_stream.map(|cent| vector.dot(cent)))
+                                    }
+                                }
                                 .unwrap()
                             })
                             .collect::<Vec<_>>()
