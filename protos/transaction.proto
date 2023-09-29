@@ -131,6 +131,12 @@ message Transaction {
     uint64 version = 1;
   }
 
+  // An operation that reserves fragment ids for future use in
+  // a rewrite operation.
+  message ReserveFragments {
+    uint32 num_fragments = 1;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -140,5 +146,6 @@ message Transaction {
     Rewrite rewrite = 104;
     Merge merge = 105;
     Restore restore = 106;
+    ReserveFragments reserve_fragments = 107;
   }
 }
