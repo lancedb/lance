@@ -12,16 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::ops::Range;
+use std::{ops::Range, collections::BTreeMap};
 use std::sync::Arc;
 
+use arrow_array::{UInt32Array, StructArray};
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt32Type},
     Array, BooleanArray, FixedSizeListArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
-use arrow_select::filter::filter_record_batch;
+use arrow_select::{filter::filter_record_batch, take::take};
 use futures::{
     stream::{self, repeat_with},
     StreamExt, TryStreamExt,
@@ -73,15 +74,49 @@ fn filter_batch_by_partition(
         .as_fixed_size_list();
     let dim = arr.value_length() as usize;
 
-    let matrix = MatrixView::new(
-        Arc::new(arr.values().as_primitive::<Float32Type>().clone()),
-        dim,
-    );
+    let matrix = MatrixView::<Float32Type>::try_from(arr)?;
     let part_ids = ivf.compute_partitions(&matrix, metric_type);
-    let selected: BooleanArray = BooleanArray::from_unary(&part_ids, |p| part_range.contains(&p));
-    let partition_field = Field::new(PARTITION_ID_COLUMN, DataType::UInt32, false);
-    let batch = batch.try_with_column(partition_field, Arc::new(part_ids))?;
-    let filtered = filter_record_batch(&batch, &selected)?;
+    // let selected: BooleanArray = BooleanArray::from_unary(&part_ids, |p| part_range.contains(&p));
+    // let partition_field = Field::new(PARTITION_ID_COLUMN, DataType::UInt32, false);
+    // let batch = batch.try_with_column(partition_field, Arc::new(part_ids))?;
+    // let filtered = filter_record_batch(&batch, &selected)?;
+
+    // A map from partition ID and row IDs.
+    let mut parted_map: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    part_ids.values().iter().enumerate().for_each(|(idx, &part_id)| {
+        if part_range.contains(&part_id) {
+            parted_map.entry(part_id).or_default().push(idx as u32);
+        }
+    });
+
+    let parted_batches = vec![];
+    let struct_arr = StructArray::from(batch.clone());
+
+    let residual_field = Field::new(
+        RESIDUAL_COLUMN,
+        DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+        ),
+        true,
+    );
+
+    for (&part_id, row_ids) in parted_map.iter() {
+        let indices = UInt32Array::from(row_ids.clone());
+        // Use `take` to select rows.
+        let str_arr = take(&struct_arr, &indices, None)?;
+        let parted_batch: RecordBatch = str_arr.as_struct().into();
+
+        let origin_vec_col = parted_batch
+            .column_by_name(column)
+            .expect("The caller already checked column exist")
+            .as_fixed_size_list();
+        let origin = MatrixView::try_from(origin_vec_col)?;
+        let residual = ivf.compute_residual(&origin, &UInt32Array::from(vec![part_id; str_arr.len()]));
+        let residual_col: FixedSizeListArray = (&residual).into();
+        let parted_batch =
+        parted_batches.push(parted_batch);
+    }
 
     // Filtered rows.
     let arr = filtered
