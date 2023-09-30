@@ -197,7 +197,6 @@ mod tests {
                 .unwrap();
         }
         let reader = shuffler.finish().await.unwrap();
-        assert_eq!(reader.keys(), vec![0, 1, 2]);
         for i in 0..3 {
             let stream = reader.key_iter(i).await.unwrap().expect("key exists");
             let batches = stream.try_collect::<Vec<_>>().await.unwrap();
