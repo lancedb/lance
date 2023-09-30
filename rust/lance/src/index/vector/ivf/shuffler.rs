@@ -134,7 +134,6 @@ pub struct Shuffler<'a> {
 }
 
 impl<'a> Shuffler<'a> {
-    #[allow(dead_code)]
     fn new(parted_groups: &BTreeMap<u32, Vec<u32>>, temp_dir: &'a TempDir) -> Self {
         Self {
             parted_groups: parted_groups.clone(),
@@ -142,13 +141,7 @@ impl<'a> Shuffler<'a> {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn keys(&self) -> Vec<u32> {
-        self.parted_groups.keys().copied().collect()
-    }
-
     /// Iterate over the shuffled [RecordBatch]s for a given partition key.
-    #[allow(dead_code)]
     pub async fn key_iter(&self, key: u32) -> Result<Option<impl RecordBatchStream + '_>> {
         if !self.parted_groups.contains_key(&key) {
             return Ok(None);

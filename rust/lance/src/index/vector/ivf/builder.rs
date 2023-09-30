@@ -203,7 +203,7 @@ pub(super) async fn build_partitions(
     let mut shuffler_builder = ShufflerBuilder::try_new(&schema, FLUSH_THRESHOLD).await?;
     while let Some(result) = stream.next().await {
         let (part_id, batch) = result?;
-        if batch.num_rows() == 0 {
+        if batch.num_rows() != 0 {
             shuffler_builder.insert(part_id, batch).await?;
         }
     }
