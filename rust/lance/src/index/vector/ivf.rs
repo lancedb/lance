@@ -36,6 +36,7 @@ use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
 use snafu::{location, Location};
+use tracing::{instrument, span, Level};
 
 #[cfg(feature = "opq")]
 use super::opq::train_opq;
@@ -60,7 +61,6 @@ mod builder;
 mod io;
 mod shuffler;
 
-const PARTITION_ID_COLUMN: &str = "__ivf_part_id";
 const RESIDUAL_COLUMN: &str = "__residual_vector";
 const PQ_CODE_COLUMN: &str = "__pq_code";
 
@@ -392,21 +392,28 @@ impl Ivf {
 
     /// Compute the partition for each row in the input Matrix.
     ///
+    #[instrument(skip(data))]
     pub fn compute_partitions(
         &self,
         data: &MatrixView<Float32Type>,
         metric_type: MetricType,
     ) -> UInt32Array {
         let ndim = data.ndim();
-        let centroids_arr = self.centroids.values().as_primitive::<Float32Type>();
+        let centroids_arr: &Float32Array = self.centroids.values().as_primitive();
+        let centroid_norms = centroids_arr
+            .values()
+            .chunks(ndim)
+            .map(|centroid| centroid.norm_l2())
+            .collect::<Vec<_>>();
         UInt32Array::from_iter_values(data.iter().map(|row| {
             argmin(
                 centroids_arr
                     .values()
                     .chunks(ndim)
-                    .map(|centroid| match metric_type {
+                    .zip(centroid_norms.iter())
+                    .map(|(centroid, &norm)| match metric_type {
                         MetricType::L2 => row.l2(centroid),
-                        MetricType::Cosine => row.cosine(centroid),
+                        MetricType::Cosine => centroid.cosine_fast(norm, row),
                         MetricType::Dot => row.dot(centroid),
                     }),
             )
@@ -421,6 +428,7 @@ impl Ivf {
     /// Parameters:
     ///  - *original*: original vector.
     ///  - *partitions*: partition ID of each original vector.
+    #[instrument(skip_all)]
     pub(super) fn compute_residual(
         &self,
         original: &MatrixView<Float32Type>,
@@ -667,9 +675,19 @@ pub async fn build_ivf_pq_index(
             pq_params.num_sub_vectors,
             pq_params.num_bits
         );
+        let expected_sample_size =
+            ProductQuantizer::num_centroids(pq_params.num_bits as u32) * pq_params.sample_rate;
+        let training_data = if training_data.num_rows() > expected_sample_size {
+            training_data.sample(expected_sample_size)
+        } else {
+            training_data
+        };
         // Compute the residual vector to train Product Quantizer.
-        let part_ids = ivf_model.compute_partitions(&training_data, metric_type);
-        let residuals = ivf_model.compute_residual(&training_data, &part_ids);
+        let part_ids = span!(Level::INFO, "compute partition")
+            .in_scope(|| ivf_model.compute_partitions(&training_data, metric_type));
+
+        let residuals = span!(Level::INFO, "compute residual")
+            .in_scope(|| ivf_model.compute_residual(&training_data, &part_ids));
         train_pq(&residuals, pq_params).await?
     };
     info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
