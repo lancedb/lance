@@ -694,6 +694,7 @@ pub async fn build_ivf_pq_index(
 
     // Transform data, compute residuals and sort by partition ids.
     let mut scanner = dataset.scan();
+    scanner.batch_readahead(num_cpus::get() * 2);
     scanner.project(&[column])?;
     scanner.with_row_id();
 
