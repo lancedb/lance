@@ -14,20 +14,20 @@
 
 //! Statistics collection utilities
 
-use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::datatypes::{Field, Schema};
 use crate::error::Result;
-use arrow_array::builder::Float32Builder;
 use arrow_array::{
     builder::{make_builder, ArrayBuilder, PrimitiveBuilder},
-    cast::as_primitive_array,
-    types::{BooleanType, Float32Type, Int32Type, Int64Type, UInt32Type},
-    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BooleanArray, Float32Array, Int32Array,
-    Int64Array, PrimitiveArray, RecordBatch,
+    types::{
+        Date32Type, Date64Type, DurationMillisecondType, Float32Type, Float64Type, Int16Type,
+        Int32Type, Int64Type, Int8Type, TimestampMicrosecondType, UInt16Type, UInt32Type,
+        UInt64Type, UInt8Type,
+    },
+    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, PrimitiveArray, RecordBatch,
 };
 use arrow_schema::DataType;
 use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
@@ -50,16 +50,20 @@ pub struct StatisticsRow {
     // pub(crate) max_value: Option<Box<dyn Array>>,
 }
 
-fn max_min_null<T: ArrowNumericType>(arrays: &[&PrimitiveArray<T>]) -> StatisticsRow
+fn get_statistics<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> StatisticsRow
 where
     T::Native: Bounded + PartialOrd,
     datafusion::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
 {
+    let arr = arrays
+        .iter()
+        .map(|x| x.as_any().downcast_ref::<PrimitiveArray<T>>().unwrap())
+        .collect::<Vec<_>>();
     let mut min_value = T::Native::max_value();
     let mut max_value = T::Native::min_value();
     let mut null_count: u32 = 0;
 
-    for array in arrays.iter() {
+    for array in arr.iter() {
         array.iter().for_each(|value| {
             if let Some(value) = value {
                 if let Some(Ordering::Greater) = value.partial_cmp(&max_value) {
@@ -71,7 +75,6 @@ where
         });
         null_count += array.null_count() as u32;
     }
-
     // TODO: correct for -0.0 when float
     return StatisticsRow {
         null_count: ScalarValue::UInt32(Some(null_count)),
@@ -82,34 +85,26 @@ where
 
 pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     match arrays[0].data_type() {
-        DataType::Int64 => {
-            let arr = arrays
-                .iter()
-                .map(|x| as_primitive_array::<Int64Type>(x))
-                .collect::<Vec<_>>();
-            return max_min_null::<Int64Type>(&arr);
-        }
-        DataType::Int32 => {
-            let arr = arrays
-                .iter()
-                .map(|x| as_primitive_array::<Int32Type>(x))
-                .collect::<Vec<_>>();
-            return max_min_null::<Int32Type>(&arr);
-        }
-        DataType::Float32 => {
-            let arr = arrays
-                .iter()
-                .map(|x| x.as_any().downcast_ref::<Float32Array>().unwrap())
-                .collect::<Vec<_>>();
-            return max_min_null::<Float32Type>(&arr);
-        }
-        // DataType::Boolean => {
-        //     let arr = arrays
-        //         .iter()
-        //         .map(|x| x.as_any().downcast_ref::<BooleanArray>().unwrap())
-        //         .collect::<Vec<_>>();
-        //     return max_min_null::<BooleanType>(&arr);
-        // }
+        DataType::Int8 => get_statistics::<Int8Type>(arrays),
+        DataType::UInt8 => get_statistics::<UInt8Type>(arrays),
+        DataType::Int16 => get_statistics::<Int16Type>(arrays),
+        DataType::UInt16 => get_statistics::<UInt16Type>(arrays),
+        DataType::Int32 => get_statistics::<Int32Type>(arrays),
+        DataType::UInt32 => get_statistics::<UInt32Type>(arrays),
+        DataType::Int64 => get_statistics::<Int64Type>(arrays),
+        DataType::UInt64 => get_statistics::<UInt64Type>(arrays),
+        DataType::Float32 => get_statistics::<Float32Type>(arrays),
+        DataType::Float64 => get_statistics::<Float64Type>(arrays),
+        DataType::Date32 => get_statistics::<Date32Type>(arrays),
+        DataType::Date64 => get_statistics::<Date64Type>(arrays),
+        DataType::Timestamp(_, _) => get_statistics::<TimestampMicrosecondType>(arrays), // TODO: timezones
+        DataType::Duration(_) => get_statistics::<DurationMillisecondType>(arrays),
+        // TODO: cover all types
+        // DataType::Decimal128(_, _) => { get_statistics::<Decimal128Type>(arrays) }
+        // DataType::Binary => { get_statistics::<BinaryType>(arrays) }
+        // DataType::Utf8 => { get_statistics::<Utf8Type>(arrays) }
+        // DataType::Boolean => { get_statistics::<BooleanType>(arrays) }
+        // DataType::Struct(_) => {  }
         _ => {
             println!(
                 "Stats collection for {} is not supported yet",
@@ -289,6 +284,7 @@ mod tests {
                 expected_min: ScalarValue::from(-10 as i64),
                 expected_max: ScalarValue::from(7 as i64),
             },
+            // Int32
             TestCase {
                 source_arrays: vec![
                     Arc::new(Int32Array::from(vec![4, 3, 7, 2])),
@@ -309,17 +305,23 @@ mod tests {
                     Arc::new(Date32Array::from(vec![53, 42])),
                     Arc::new(Date32Array::from(vec![68, 32])),
                 ],
-                expected_min: ScalarValue::from(32 as i32),
-                expected_max: ScalarValue::from(68 as i32),
+                expected_min: ScalarValue::Date32(Some(32)),
+                expected_max: ScalarValue::Date32(Some(68)),
             },
             // Timestamp
             TestCase {
                 source_arrays: vec![
-                    Arc::new(TimestampMicrosecondArray::from(vec![53, 42])),
-                    Arc::new(TimestampMicrosecondArray::from(vec![68, 32])),
+                    Arc::new(TimestampMicrosecondArray::from_vec(
+                        vec![53, 42],
+                        Some("UTC".into()),
+                    )),
+                    Arc::new(TimestampMicrosecondArray::from_vec(
+                        vec![68, 32],
+                        Some("UTC".into()),
+                    )),
                 ],
-                expected_min: ScalarValue::from(32 as i64),
-                expected_max: ScalarValue::from(68 as i64),
+                expected_min: ScalarValue::TimestampMicrosecond(Some(32), Some("UTC".into())),
+                expected_max: ScalarValue::TimestampMicrosecond(Some(68), Some("UTC".into())),
             },
             // Duration
             TestCase {
@@ -327,8 +329,8 @@ mod tests {
                     Arc::new(DurationMillisecondArray::from(vec![53, 42])),
                     Arc::new(DurationMillisecondArray::from(vec![68, 32])),
                 ],
-                expected_min: ScalarValue::from(32 as i64),
-                expected_max: ScalarValue::from(68 as i64),
+                expected_min: ScalarValue::DurationMillisecond(Some(32)),
+                expected_max: ScalarValue::DurationMillisecond(Some(68)),
             },
             // Decimal
             TestCase {
