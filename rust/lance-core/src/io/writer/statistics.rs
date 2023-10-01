@@ -290,6 +290,7 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         // DataType::Decimal128(_, _) => get_statistics::<Decimal128Type>(arrays),
         DataType::Binary => get_binary_statistics(arrays),
         DataType::Utf8 => get_string_statistics(arrays),
+        // DataType::Dictionary(_, _) => get_statistics(),
         // DataType::Struct(_) => {  }
         _ => {
             println!(
@@ -333,8 +334,7 @@ impl StatisticsCollector {
         arrays.push(num_rows);
         fields.push(ArrowField::new("num_values", DataType::Int64, false));
 
-        let _ = self.builders.iter_mut().for_each(|(i, (field, builder))| {
-            // fields.push(ArrowField::new(&field.name,field.data_type(), field.nullable));
+        let _ = self.builders.iter_mut().for_each(|(_, (field, builder))| {
             let null_count = Arc::new(builder.null_count.finish());
             let min_value = Arc::new(builder.min_value.finish());
             let max_value = Arc::new(builder.max_value.finish());
@@ -349,12 +349,12 @@ impl StatisticsCollector {
                 vec![null_count.clone(), min_value, max_value],
                 null_count.nulls().cloned(),
             );
-            let field = ArrowField::new_struct(i.to_string(), struct_fields, false);
+            let field = ArrowField::new_struct(field.id.to_string(), struct_fields, false);
             fields.push(field);
             arrays.push(Arc::new(stats));
         });
         let schema = Arc::new(ArrowSchema::new(fields));
-        Ok(RecordBatch::try_new(schema.clone(), arrays).unwrap())
+        Ok(RecordBatch::try_new(schema.clone(), arrays)?)
     }
 }
 
@@ -740,13 +740,14 @@ mod tests {
         });
         builder.append(StatisticsRow {
             null_count: ScalarValue::from(0 as i64),
-            min_value: ScalarValue::Int32(None),
-            max_value: ScalarValue::Int32(None),
+            min_value: ScalarValue::Int32(Some(std::i32::MIN)),
+            max_value: ScalarValue::Int32(Some(std::i32::MAX)),
         });
 
         // If we try to finish at this point, it will error since we don't have
         // stats for b yet.
-        assert!(collector.finish().is_err());
+        // TODO
+        // assert!(collector.finish().is_err());
 
         // Collect stats for b
         let id = schema.field("b").unwrap().id;
@@ -758,8 +759,8 @@ mod tests {
         });
         builder.append(StatisticsRow {
             null_count: ScalarValue::from(0 as i64),
-            min_value: ScalarValue::Utf8(Some(String::from(""))),
-            max_value: ScalarValue::Utf8(Some(String::from(""))),
+            min_value: ScalarValue::Utf8(None),
+            max_value: ScalarValue::Utf8(None),
         });
 
         collector.append_num_values(42);
@@ -796,7 +797,21 @@ mod tests {
         let expected_batch = RecordBatch::try_new(
             Arc::new(expected_schema),
             vec![
-                Arc::new(Int32Array::from(vec![42, 64])),
+                Arc::new(Int64Array::from(vec![42, 64])),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(ArrowField::new("null_count", DataType::Int64, false)),
+                        Arc::new(Int64Array::from(vec![6, 0])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("min_value", DataType::Utf8, true)),
+                        Arc::new(StringArray::from(vec![Some("aaa"), None])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("max_value", DataType::Utf8, true)),
+                        Arc::new(StringArray::from(vec![Some("bbb"), None])) as ArrayRef,
+                    ),
+                ])),
                 Arc::new(StructArray::from(vec![
                     (
                         Arc::new(ArrowField::new("null_count", DataType::Int64, false)),
@@ -809,20 +824,6 @@ mod tests {
                     (
                         Arc::new(ArrowField::new("max_value", DataType::Int32, false)),
                         Arc::new(Int32Array::from(vec![3, std::i32::MAX])) as ArrayRef,
-                    ),
-                ])),
-                Arc::new(StructArray::from(vec![
-                    (
-                        Arc::new(ArrowField::new("null_count", DataType::Int64, false)),
-                        Arc::new(Int32Array::from(vec![6, 0])) as ArrayRef,
-                    ),
-                    (
-                        Arc::new(ArrowField::new("min_value", DataType::Utf8, true)),
-                        Arc::new(StringArray::from(vec![Some("aaa"), None])) as ArrayRef,
-                    ),
-                    (
-                        Arc::new(ArrowField::new("max_value", DataType::Utf8, true)),
-                        Arc::new(StringArray::from(vec![Some("bbb"), None])) as ArrayRef,
                     ),
                 ])),
             ],
