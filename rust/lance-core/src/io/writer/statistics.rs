@@ -28,7 +28,8 @@ use arrow_array::{
         UInt64Type, UInt8Type,
     },
     Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, BooleanArray,
-    Decimal128Array, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    Decimal128Array, DurationMillisecondArray, Int32Array, Int64Array, PrimitiveArray, RecordBatch,
+    StringArray, StructArray, TimestampMicrosecondArray,
 };
 
 use arrow_schema::DataType;
@@ -80,6 +81,8 @@ where
 
     let mut scalar_min_value = ScalarValue::try_from(min_value).unwrap();
     let mut scalar_max_value = ScalarValue::try_from(max_value).unwrap();
+
+    // TODO: can type be inferred from scalar? Currently we'd lose timezones etc
     match arrays[0].data_type() {
         // TODO: add more float types?
         DataType::Float32 => {
@@ -98,13 +101,60 @@ where
                 scalar_max_value = ScalarValue::Float64(Some(0.0));
             }
         }
-        // DataType::Decimal128(_, _) => {
-        //     scalar_min_value = ScalarValue::try_new_decimal128(scalar_min_value.into(), 8, 8).unwrap();
-        //     scalar_max_value = ScalarValue::try_new_decimal128(scalar_max_value.into(), 8, 8).unwrap();
-        // }
         DataType::Date32 => {
-            // scalar_min_value = ScalarValue::Date32(Some(&scalar_min_value));
-            // ScalarValue::Date32(Some(scalar_max_value));
+            let min_value_date32 = scalar_min_value
+                .to_array()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0);
+            let max_value_date32 = scalar_max_value
+                .to_array()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0);
+            scalar_min_value = ScalarValue::Date32(Some(min_value_date32));
+            scalar_max_value = ScalarValue::Date32(Some(max_value_date32));
+        }
+        DataType::Timestamp(_, _) => {
+            // TODO: Grab the correct timezone from the array or should we ignore it for stats?
+            // let arr = arrays[0].as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+            // let tz = Some(Arc::new(arr.timezone().unwrap()));
+            let tz = Some("UTC".into());
+
+            let min_value_timestamp = scalar_min_value
+                .to_array()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0);
+            let max_value_timestamp = scalar_max_value
+                .to_array()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0);
+            scalar_min_value =
+                ScalarValue::TimestampMicrosecond(Some(min_value_timestamp), tz.clone());
+            scalar_max_value =
+                ScalarValue::TimestampMicrosecond(Some(max_value_timestamp), tz.clone());
+        }
+        DataType::Duration(_) => {
+            let min_value_duration = scalar_min_value
+                .to_array()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0);
+            let max_value_duration = scalar_max_value
+                .to_array()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0);
+            scalar_min_value = ScalarValue::DurationMillisecond(Some(min_value_duration));
+            scalar_max_value = ScalarValue::DurationMillisecond(Some(max_value_duration));
         }
         _ => {}
     }
@@ -143,6 +193,37 @@ fn get_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         null_count: ScalarValue::Int64(Some(null_count)),
         min_value: ScalarValue::Binary(Some(min_value)),
         max_value: ScalarValue::Binary(Some(max_value)),
+    };
+}
+
+fn get_decimal_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
+    // TODO: this should be done with Decimal128 not i128
+    let mut min_value = i128::MAX;
+    let mut max_value = i128::MIN;
+    let mut null_count: i64 = 0;
+
+    let arr = arrays
+        .iter()
+        .map(|x| x.as_any().downcast_ref::<Decimal128Array>().unwrap())
+        .collect::<Vec<_>>();
+
+    for array in arr.iter() {
+        array.iter().for_each(|value| {
+            if let Some(value) = value {
+                if let Some(Ordering::Greater) = value.partial_cmp(&max_value) {
+                    max_value = value;
+                } else if let Some(Ordering::Less) = value.partial_cmp(&min_value) {
+                    min_value = value;
+                }
+            };
+        });
+        null_count += array.null_count() as i64;
+    }
+
+    return StatisticsRow {
+        null_count: ScalarValue::Int64(Some(null_count)),
+        min_value: ScalarValue::Decimal128(Some(min_value), 8, 8),
+        max_value: ScalarValue::Decimal128(Some(max_value), 8, 8),
     };
 }
 
@@ -286,12 +367,12 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::Date64 => get_statistics::<Date64Type>(arrays),
         DataType::Timestamp(_, _) => get_statistics::<TimestampMicrosecondType>(arrays), // TODO: timezones
         DataType::Duration(_) => get_statistics::<DurationMillisecondType>(arrays),
-        // TODO: cover all types
-        // DataType::Decimal128(_, _) => get_statistics::<Decimal128Type>(arrays),
+        DataType::Decimal128(_, _) => get_decimal_statistics(arrays),
         DataType::Binary => get_binary_statistics(arrays),
         DataType::Utf8 => get_string_statistics(arrays),
-        // DataType::Dictionary(_, _) => get_statistics(),
-        // DataType::Struct(_) => {  }
+        // TODO: cover all types
+        // DataType::Dictionary(_, _) =>
+        // DataType::Struct(_) =>
         _ => {
             println!(
                 "Stats collection for {} is not supported yet",
@@ -481,9 +562,8 @@ impl StatisticsBuilder {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        builder::StringDictionaryBuilder, BinaryArray, BooleanArray, Date32Array,
-        DurationMillisecondArray, Float32Array, Int32Array, Int64Array, StringArray, StructArray,
-        TimestampMicrosecondArray,
+        builder::StringDictionaryBuilder, BinaryArray, BooleanArray, Date32Array, Float32Array,
+        Int32Array, Int64Array, StringArray, StructArray,
     };
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
