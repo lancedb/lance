@@ -983,7 +983,7 @@ mod tests {
             ),
         ]);
 
-        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        let schema = Schema::try_from(&arrow_schema).unwrap();
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
