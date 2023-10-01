@@ -857,3 +857,17 @@ def test_metadata(tmp_path: Path):
 
     data = data.replace_schema_metadata({"foo": base64.b64encode(pickle.dumps("foo"))})
     lance.write_dataset(data, tmp_path)
+
+
+def test_scan_with_row_ids(tmp_path: Path):
+    """Test expose physical row ids in the scanner."""
+    data = pa.table({"a": range(1000)})
+    ds = lance.write_dataset(data, tmp_path, max_rows_per_file=250)
+
+    tbl = ds.scanner(filter = "a % 10 == 0 AND a < 500", with_row_id=True).to_table()
+    assert '_rowid' in tbl.column_names
+    row_ids = tbl["_rowid"].to_pylist()
+    assert row_ids == list(range(0, 250, 10)) + list(range(2 ** 32, 2 ** 32 + 250, 10))
+
+    tbl2 = ds._take_rows(row_ids)
+    assert tbl2["a"] == tbl["a"]

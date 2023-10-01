@@ -273,6 +273,7 @@ impl Dataset {
         fragment_readahead: Option<usize>,
         scan_in_order: Option<bool>,
         fragments: Option<Vec<FileFragment>>,
+        with_row_id: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         if let Some(c) = columns {
@@ -305,6 +306,10 @@ impl Dataset {
         }
 
         scanner.scan_in_order(scan_in_order.unwrap_or(true));
+
+        if with_row_id.unwrap_or(false) {
+            scanner.with_row_id();
+        }
 
         if let Some(fragments) = fragments {
             let fragments = fragments
@@ -421,6 +426,33 @@ impl Dataset {
         .map_err(|err| PyIOError::new_err(err.to_string()))?;
         let batch = RT
             .block_on(Some(self_.py()), self_.ds.take(&row_indices, &projection))
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        crate::arrow::record_batch_to_pyarrow(self_.py(), &batch)
+    }
+
+    fn take_rows(
+        self_: PyRef<'_, Self>,
+        row_indices: Vec<u64>,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<PyObject> {
+        let projection = if let Some(columns) = columns {
+            self_.ds.schema().project(&columns)
+        } else {
+            Ok(self_.ds.schema().clone())
+        }
+        .map_err(|err| {
+            PyIOError::new_err(format!(
+                "TakeRows: failed to run projection over schema: {}",
+                err
+            ))
+        })?;
+
+        let batch = RT
+            .block_on(
+                Some(self_.py()),
+                self_.ds.take_rows(&row_indices, &projection),
+            )
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         crate::arrow::record_batch_to_pyarrow(self_.py(), &batch)
