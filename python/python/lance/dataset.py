@@ -120,9 +120,9 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_readahead: Optional[int] = None,
         scan_in_order: bool = True,
         fragments: Optional[Iterable[LanceFragment]] = None,
-        with_row_id: bool = False,
         *,
         prefilter: bool = False,
+        with_row_id: bool = False,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -176,9 +176,6 @@ class LanceDataset(pa.dataset.Dataset):
             number of rows (or be empty) if the rows closest to the query do not
             match the filter.  It's generally good when the filter is not very
             selective.
-        with_row_id: bool, default False
-            If set true, a column named ``_row_id`` will be added to the result, which
-            represents the internal id of the each row.
 
         Notes
         -----
@@ -239,6 +236,7 @@ class LanceDataset(pa.dataset.Dataset):
         scan_in_order: bool = True,
         *,
         prefilter: bool = False,
+        with_row_id: bool = False,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -297,6 +295,7 @@ class LanceDataset(pa.dataset.Dataset):
             fragment_readahead=fragment_readahead,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
+            with_row_id=with_row_id,
         ).to_table()
 
     @property
@@ -345,9 +344,9 @@ class LanceDataset(pa.dataset.Dataset):
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
         scan_in_order: bool = True,
-        with_row_id: bool = False,
         *,
         prefilter: bool = False,
+        with_row_id: bool = False,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
