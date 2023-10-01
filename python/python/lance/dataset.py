@@ -122,6 +122,7 @@ class LanceDataset(pa.dataset.Dataset):
         fragments: Optional[Iterable[LanceFragment]] = None,
         *,
         prefilter: bool = False,
+        with_row_id: bool = False,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -175,6 +176,7 @@ class LanceDataset(pa.dataset.Dataset):
             number of rows (or be empty) if the rows closest to the query do not
             match the filter.  It's generally good when the filter is not very
             selective.
+
         Notes
         -----
 
@@ -208,6 +210,7 @@ class LanceDataset(pa.dataset.Dataset):
             .fragment_readahead(fragment_readahead)
             .scan_in_order(scan_in_order)
             .with_fragments(fragments)
+            .with_row_id(with_row_id)
         )
         if nearest is not None:
             builder = builder.nearest(**nearest)
@@ -233,6 +236,7 @@ class LanceDataset(pa.dataset.Dataset):
         scan_in_order: bool = True,
         *,
         prefilter: bool = False,
+        with_row_id: bool = False,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -291,6 +295,7 @@ class LanceDataset(pa.dataset.Dataset):
             fragment_readahead=fragment_readahead,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
+            with_row_id=with_row_id,
         ).to_table()
 
     @property
@@ -341,6 +346,7 @@ class LanceDataset(pa.dataset.Dataset):
         scan_in_order: bool = True,
         *,
         prefilter: bool = False,
+        with_row_id: bool = False,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -365,6 +371,7 @@ class LanceDataset(pa.dataset.Dataset):
             fragment_readahead=fragment_readahead,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
+            with_row_id=with_row_id,
         ).to_batches()
 
     def take(
@@ -390,6 +397,32 @@ class LanceDataset(pa.dataset.Dataset):
         table : Table
         """
         return pa.Table.from_batches([self._ds.take(indices, columns)])
+
+    def _take_rows(
+        self,
+        row_ids: Union[List[int], pa.Array],
+        columns: Optional[List[str]] = None,
+        **kargs,
+    ) -> pa.Table:
+        """Select rows by row_ids.
+
+        **Unstable API**. Internal use only
+
+        Parameters
+        ----------
+        row_ids : List Array or array-like
+            row IDs to select in the dataset.
+        columns: list of strings, optional
+            List of column names to be fetched. All columns are fetched
+            if not specified.
+        **kwargs : dict, optional
+            See scanner() method for full parameter description.
+
+        Returns
+        -------
+        table : Table
+        """
+        return pa.Table.from_batches([self._ds.take_rows(row_ids, columns)])
 
     def head(self, num_rows, **kwargs):
         """
@@ -1187,6 +1220,7 @@ class ScannerBuilder:
         self._fragment_readahead = None
         self._scan_in_order = True
         self._fragments = None
+        self._with_row_id = False
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set batch size for Scanner"""
@@ -1242,6 +1276,11 @@ class ScannerBuilder:
 
     def prefilter(self, prefilter: bool) -> ScannerBuilder:
         self._prefilter = prefilter
+        return self
+
+    def with_row_id(self, with_row_id: bool = True) -> ScannerBuilder:
+        """Enable returns with physical row IDs."""
+        self._with_row_id = with_row_id
         return self
 
     def with_fragments(
@@ -1309,6 +1348,7 @@ class ScannerBuilder:
             self._fragment_readahead,
             self._scan_in_order,
             self._fragments,
+            self._with_row_id,
         )
         return LanceScanner(scanner, self.ds)
 

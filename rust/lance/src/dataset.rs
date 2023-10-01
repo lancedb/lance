@@ -853,11 +853,7 @@ impl Dataset {
     }
 
     /// Take rows by the internal ROW ids.
-    pub(crate) async fn take_rows(
-        &self,
-        row_ids: &[u64],
-        projection: &Schema,
-    ) -> Result<RecordBatch> {
+    pub async fn take_rows(&self, row_ids: &[u64], projection: &Schema) -> Result<RecordBatch> {
         if row_ids.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(projection.into())));
         }
