@@ -21,14 +21,16 @@ use std::sync::Arc;
 use crate::datatypes::{Field, Schema};
 use crate::error::Result;
 use arrow_array::{
-    builder::{make_builder, ArrayBuilder, PrimitiveBuilder},
+    builder::{make_builder, ArrayBuilder, PrimitiveBuilder, StringBuilder},
     types::{
         Date32Type, Date64Type, DurationMillisecondType, Float32Type, Float64Type, Int16Type,
         Int32Type, Int64Type, Int8Type, TimestampMicrosecondType, UInt16Type, UInt32Type,
         UInt64Type, UInt8Type,
     },
-    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, PrimitiveArray, RecordBatch,
+    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, BooleanArray,
+    Decimal128Array, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
+
 use arrow_schema::DataType;
 use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
 use datafusion::common::ScalarValue;
@@ -61,7 +63,7 @@ where
         .collect::<Vec<_>>();
     let mut min_value = T::Native::max_value();
     let mut max_value = T::Native::min_value();
-    let mut null_count: u32 = 0;
+    let mut null_count: i64 = 0;
 
     for array in arr.iter() {
         array.iter().for_each(|value| {
@@ -73,18 +75,203 @@ where
                 }
             };
         });
-        null_count += array.null_count() as u32;
+        null_count += array.null_count() as i64;
     }
-    // TODO: correct for -0.0 when float
+
+    let mut scalar_min_value = ScalarValue::try_from(min_value).unwrap();
+    let mut scalar_max_value = ScalarValue::try_from(max_value).unwrap();
+    match arrays[0].data_type() {
+        // TODO: add more float types?
+        DataType::Float32 => {
+            if scalar_min_value == ScalarValue::Float32(Some(0.0)) {
+                scalar_min_value = ScalarValue::Float32(Some(-0.0));
+            }
+            if scalar_max_value == ScalarValue::Float32(Some(-0.0)) {
+                scalar_max_value = ScalarValue::Float32(Some(0.0));
+            }
+        }
+        DataType::Float64 => {
+            if scalar_min_value == ScalarValue::Float64(Some(0.0)) {
+                scalar_min_value = ScalarValue::Float64(Some(-0.0));
+            }
+            if scalar_max_value == ScalarValue::Float64(Some(-0.0)) {
+                scalar_max_value = ScalarValue::Float64(Some(0.0));
+            }
+        }
+        // DataType::Decimal128(_, _) => {
+        //     scalar_min_value = ScalarValue::try_new_decimal128(scalar_min_value.into(), 8, 8).unwrap();
+        //     scalar_max_value = ScalarValue::try_new_decimal128(scalar_max_value.into(), 8, 8).unwrap();
+        // }
+        DataType::Date32 => {
+            // scalar_min_value = ScalarValue::Date32(Some(&scalar_min_value));
+            // ScalarValue::Date32(Some(scalar_max_value));
+        }
+        _ => {}
+    }
+
     return StatisticsRow {
-        null_count: ScalarValue::UInt32(Some(null_count)),
-        min_value: ScalarValue::from(min_value),
-        max_value: ScalarValue::from(max_value),
+        null_count: ScalarValue::Int64(Some(null_count)),
+        min_value: scalar_min_value,
+        max_value: scalar_max_value,
+    };
+}
+
+fn get_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
+    let mut min_value = vec![u8::MAX; BINARY_PREFIX_LENGTH];
+    let mut max_value = vec![u8::MIN; BINARY_PREFIX_LENGTH];
+    let mut null_count: i64 = 0;
+
+    let arr = arrays
+        .iter()
+        .map(|x| x.as_any().downcast_ref::<BinaryArray>().unwrap())
+        .collect::<Vec<_>>();
+
+    for array in arr.iter() {
+        array.iter().for_each(|value| {
+            if let Some(value) = value {
+                if let Some(Ordering::Greater) = value.partial_cmp(max_value.as_slice()) {
+                    max_value = value.to_vec();
+                } else if let Some(Ordering::Less) = value.partial_cmp(min_value.as_slice()) {
+                    min_value = value.to_vec();
+                }
+            };
+        });
+        null_count += array.null_count() as i64;
+    }
+
+    return StatisticsRow {
+        null_count: ScalarValue::Int64(Some(null_count)),
+        min_value: ScalarValue::Binary(Some(min_value)),
+        max_value: ScalarValue::Binary(Some(max_value)),
+    };
+}
+
+fn truncate_utf8(data: &str, length: usize) -> Option<Vec<u8>> {
+    // We return values like that at an earlier stage in the process.
+    assert!(data.len() >= length);
+    let mut char_indices = data.char_indices();
+
+    // We know `data` is a valid UTF8 encoded string, which means it has at least one valid UTF8 byte, which will make this loop exist.
+    while let Some((idx, c)) = char_indices.next_back() {
+        let split_point = idx + c.len_utf8();
+        if split_point <= length {
+            return data.as_bytes()[0..split_point].to_vec().into();
+        }
+    }
+
+    None
+}
+/// Returns `None` when it can't increment any byte.
+fn increment_utf8(mut data: Vec<u8>) -> Option<Vec<u8>> {
+    for idx in (0..data.len()).rev() {
+        let original = data[idx];
+        let (mut byte, mut overflow) = data[idx].overflowing_add(1);
+
+        // Until overflow: 0xFF -> 0x00
+        while !overflow {
+            data[idx] = byte;
+
+            if std::str::from_utf8(&data).is_ok() {
+                return Some(data);
+            }
+            (byte, overflow) = data[idx].overflowing_add(1);
+        }
+
+        data[idx] = original;
+    }
+
+    None
+}
+
+fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
+    let mut min_value = vec![u8::MAX; BINARY_PREFIX_LENGTH];
+    let mut max_value = vec![u8::MIN; BINARY_PREFIX_LENGTH];
+    let mut null_count: i64 = 0;
+
+    let arr = arrays
+        .iter()
+        .map(|x| x.as_any().downcast_ref::<StringArray>().unwrap())
+        .collect::<Vec<_>>();
+
+    for array in arr.iter() {
+        array.iter().for_each(|value| {
+            if let Some(value) = value {
+                if let Some(Ordering::Greater) = value.as_bytes().partial_cmp(max_value.as_slice())
+                {
+                    max_value = value.as_bytes().to_vec();
+                } else if let Some(Ordering::Less) =
+                    value.as_bytes().partial_cmp(min_value.as_slice())
+                {
+                    min_value = value.as_bytes().to_vec();
+                }
+            };
+        });
+        null_count += array.null_count() as i64;
+    }
+
+    if max_value.len() > BINARY_PREFIX_LENGTH {
+        let truncated =
+            truncate_utf8(&String::from_utf8(max_value).unwrap(), BINARY_PREFIX_LENGTH).unwrap();
+        max_value = increment_utf8(truncated).unwrap();
+        // max_value = increment_utf8(max_value).unwrap();
+    }
+    if min_value.len() > BINARY_PREFIX_LENGTH {
+        min_value =
+            truncate_utf8(&String::from_utf8(min_value).unwrap(), BINARY_PREFIX_LENGTH).unwrap();
+    }
+
+    let min_value = String::from_utf8(min_value).unwrap();
+    let max_value = String::from_utf8(max_value).unwrap();
+
+    return StatisticsRow {
+        null_count: ScalarValue::Int64(Some(null_count)),
+        min_value: ScalarValue::Utf8(Some(min_value)),
+        max_value: ScalarValue::Utf8(Some(max_value)),
+    };
+}
+
+fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
+    let mut true_present = false;
+    let mut false_present = false;
+
+    let arr = arrays
+        .iter()
+        .map(|x| x.as_any().downcast_ref::<BooleanArray>().unwrap())
+        .collect::<Vec<_>>();
+
+    for array in arr.iter() {
+        array.iter().for_each(|value| {
+            if let Some(value) = value {
+                if value {
+                    true_present = true;
+                } else {
+                    false_present = true;
+                }
+            };
+        });
+        if true_present && false_present {
+            break;
+        }
+    }
+
+    return StatisticsRow {
+        null_count: ScalarValue::Int64(Some(0)),
+        min_value: if false_present {
+            ScalarValue::Boolean(Some(false))
+        } else {
+            ScalarValue::Boolean(None)
+        },
+        max_value: if true_present {
+            ScalarValue::Boolean(Some(true))
+        } else {
+            ScalarValue::Boolean(None)
+        },
     };
 }
 
 pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     match arrays[0].data_type() {
+        DataType::Boolean => get_boolean_statistics(arrays),
         DataType::Int8 => get_statistics::<Int8Type>(arrays),
         DataType::UInt8 => get_statistics::<UInt8Type>(arrays),
         DataType::Int16 => get_statistics::<Int16Type>(arrays),
@@ -100,10 +287,9 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::Timestamp(_, _) => get_statistics::<TimestampMicrosecondType>(arrays), // TODO: timezones
         DataType::Duration(_) => get_statistics::<DurationMillisecondType>(arrays),
         // TODO: cover all types
-        // DataType::Decimal128(_, _) => { get_statistics::<Decimal128Type>(arrays) }
-        // DataType::Binary => { get_statistics::<BinaryType>(arrays) }
-        // DataType::Utf8 => { get_statistics::<Utf8Type>(arrays) }
-        // DataType::Boolean => { get_statistics::<BooleanType>(arrays) }
+        // DataType::Decimal128(_, _) => get_statistics::<Decimal128Type>(arrays),
+        DataType::Binary => get_binary_statistics(arrays),
+        DataType::Utf8 => get_string_statistics(arrays),
         // DataType::Struct(_) => {  }
         _ => {
             println!(
@@ -140,62 +326,40 @@ impl StatisticsCollector {
         self.num_rows.append_value(num_rows)
     }
 
-    // TODO: handle types
     pub fn finish(&mut self) -> Result<RecordBatch> {
-        let mut fields: Vec<ArrowField> = Vec::with_capacity(self.builders.len() + 1);
-
+        let mut arrays: Vec<ArrayRef> = vec![];
+        let mut fields: Vec<ArrowField> = vec![];
+        let num_rows = Arc::new(self.num_rows.finish());
+        arrays.push(num_rows);
         fields.push(ArrowField::new("num_values", DataType::Int64, false));
-        let _ = self.builders.iter().map(|(_, (field, builder))| {
-            fields.push(ArrowField::new(
-                &field.name,
-                field.data_type(),
-                field.nullable,
-            ));
+
+        let _ = self.builders.iter_mut().for_each(|(i, (field, builder))| {
+            // fields.push(ArrowField::new(&field.name,field.data_type(), field.nullable));
+            let null_count = Arc::new(builder.null_count.finish());
+            let min_value = Arc::new(builder.min_value.finish());
+            let max_value = Arc::new(builder.max_value.finish());
+            let struct_fields = vec![
+                ArrowField::new("null_count", DataType::Int64, false),
+                ArrowField::new("min_value", field.data_type(), field.nullable),
+                ArrowField::new("max_value", field.data_type(), field.nullable),
+            ];
+
+            let stats = StructArray::new(
+                struct_fields.clone().into(),
+                vec![null_count.clone(), min_value, max_value],
+                null_count.nulls().cloned(),
+            );
+            let field = ArrowField::new_struct(i.to_string(), struct_fields, false);
+            fields.push(field);
+            arrays.push(Arc::new(stats));
         });
-        let arrow_schema = ArrowSchema::new(fields);
-
-        let num_rows = self.num_rows.finish();
-        let min_values = self
-            .get_builder(0)
-            .unwrap()
-            .min_value
-            .as_any_mut()
-            .downcast_mut::<PrimitiveBuilder<Int64Type>>()
-            .unwrap()
-            .finish();
-        let max_values = self
-            .get_builder(0)
-            .unwrap()
-            .max_value
-            .as_any_mut()
-            .downcast_mut::<PrimitiveBuilder<Int64Type>>()
-            .unwrap()
-            .finish();
-        let null_count = self
-            .get_builder(0)
-            .unwrap()
-            .null_count
-            .as_any_mut()
-            .downcast_mut::<PrimitiveBuilder<Int64Type>>()
-            .unwrap()
-            .finish();
-
-        let batch = RecordBatch::try_new(
-            Arc::new(arrow_schema),
-            vec![
-                Arc::new(num_rows),
-                Arc::new(min_values),
-                Arc::new(max_values),
-                Arc::new(null_count),
-            ],
-        )
-        .unwrap();
-        todo!()
+        let schema = Arc::new(ArrowSchema::new(fields));
+        Ok(RecordBatch::try_new(schema.clone(), arrays).unwrap())
     }
 }
 
 pub struct StatisticsBuilder {
-    null_count: PrimitiveBuilder<UInt32Type>,
+    null_count: PrimitiveBuilder<Int64Type>,
     min_value: Box<dyn ArrayBuilder>,
     max_value: Box<dyn ArrayBuilder>,
     dt: DataType,
@@ -203,7 +367,7 @@ pub struct StatisticsBuilder {
 
 impl StatisticsBuilder {
     fn new(data_type: &DataType) -> Self {
-        let null_count = PrimitiveBuilder::<UInt32Type>::new();
+        let null_count = PrimitiveBuilder::<Int64Type>::new();
         let min_value = make_builder(data_type, 1);
         let max_value = make_builder(data_type, 1);
         let dt = data_type.clone();
@@ -215,54 +379,114 @@ impl StatisticsBuilder {
         }
     }
 
-    fn statistics_appender<T: ArrowNumericType>(&mut self, row: StatisticsRow) {
-        let ScalarValue::UInt32(Some(null_count)) = row.null_count else {
+    fn string_statistics_appender(&mut self, row: StatisticsRow) {
+        let ScalarValue::Int64(Some(null_count)) = row.null_count else {
             todo!()
         };
         self.null_count.append_value(null_count);
-        if let ScalarValue::Boolean(Some(min_value)) = row.min_value {
-            let min_value = min_value;
-            let min_builder = self
-                .min_value
-                .as_any_mut()
-                .downcast_mut::<PrimitiveBuilder<T>>()
-                .unwrap();
-            // min_builder.append_value(min_value);
-        }
-        if let ScalarValue::Boolean(Some(max_value)) = row.max_value {
-            let max_builder = self
-                .max_value
-                .as_any_mut()
-                .downcast_mut::<PrimitiveBuilder<T>>()
-                .unwrap();
-            // max_builder.append_value(max_value);
-        }
-        todo!();
+
+        let min_value_builder = self
+            .min_value
+            .as_any_mut()
+            .downcast_mut::<StringBuilder>()
+            .unwrap();
+        let binding = row.min_value.to_array();
+        let min_value = binding
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+
+        min_value_builder.append_value(min_value);
+
+        let max_value_builder = self
+            .max_value
+            .as_any_mut()
+            .downcast_mut::<StringBuilder>()
+            .unwrap();
+        let binding = row.max_value.to_array();
+        let max_value = binding
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        max_value_builder.append_value(max_value);
+    }
+
+    fn statistics_appender<T: arrow_array::ArrowPrimitiveType>(&mut self, row: StatisticsRow) {
+        let ScalarValue::Int64(Some(null_count)) = row.null_count else {
+            todo!()
+        };
+        self.null_count.append_value(null_count);
+
+        let min_value_builder = self
+            .min_value
+            .as_any_mut()
+            .downcast_mut::<PrimitiveBuilder<T>>()
+            .unwrap();
+        let min_value = row
+            .min_value
+            .to_array()
+            .as_any()
+            .downcast_ref::<PrimitiveArray<T>>()
+            .unwrap()
+            .value(0);
+        min_value_builder.append_value(min_value);
+
+        let max_value_builder = self
+            .max_value
+            .as_any_mut()
+            .downcast_mut::<PrimitiveBuilder<T>>()
+            .unwrap();
+        let max_value = row
+            .max_value
+            .to_array()
+            .as_any()
+            .downcast_ref::<PrimitiveArray<T>>()
+            .unwrap()
+            .value(0);
+        max_value_builder.append_value(max_value);
     }
 
     pub fn append(&mut self, row: StatisticsRow) {
-        let dt = match self.dt {
-            DataType::Int32 => {
-                self.statistics_appender::<Int32Type>(row);
+        match self.dt {
+            // DataType::Boolean => { self.statistics_appender::<BooleanType>(row) },
+            DataType::Int8 => self.statistics_appender::<Int8Type>(row),
+            DataType::UInt8 => self.statistics_appender::<UInt8Type>(row),
+            DataType::Int16 => self.statistics_appender::<Int16Type>(row),
+            DataType::UInt16 => self.statistics_appender::<UInt16Type>(row),
+            DataType::Int32 => self.statistics_appender::<Int32Type>(row),
+            DataType::UInt32 => self.statistics_appender::<UInt32Type>(row),
+            DataType::Int64 => self.statistics_appender::<Int64Type>(row),
+            DataType::UInt64 => self.statistics_appender::<UInt64Type>(row),
+            DataType::Float32 => self.statistics_appender::<Float32Type>(row),
+            DataType::Float64 => self.statistics_appender::<Float64Type>(row),
+            DataType::Date32 => self.statistics_appender::<Date32Type>(row),
+            DataType::Date64 => self.statistics_appender::<Date64Type>(row),
+            DataType::Timestamp(_, _) => self.statistics_appender::<TimestampMicrosecondType>(row),
+            DataType::Duration(_) => self.statistics_appender::<DurationMillisecondType>(row),
+            // TODO: cover all types
+            // DataType::Decimal128(_, _) => { get_statistics::<Decimal128Type>(arrays) }
+            // DataType::Binary => { get_statistics::<BinaryType>(arrays) }
+            DataType::Utf8 => self.string_statistics_appender(row),
+            // DataType::Struct(_) => {  }
+            _ => {
+                println!("Stats collection for {} is not supported yet", self.dt);
+                todo!()
             }
-            DataType::Int64 => {
-                self.statistics_appender::<Int64Type>(row);
-            }
-            _ => todo!(),
-        };
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        builder::StringDictionaryBuilder, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
+        builder::StringDictionaryBuilder, BinaryArray, BooleanArray, Date32Array,
         DurationMillisecondArray, Float32Array, Int32Array, Int64Array, StringArray, StructArray,
         TimestampMicrosecondArray,
     };
 
-    use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
-    use datafusion::common::ScalarValue::Utf8;
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
     use super::*;
 
@@ -311,13 +535,13 @@ mod tests {
             // Timestamp
             TestCase {
                 source_arrays: vec![
-                    Arc::new(TimestampMicrosecondArray::from_vec(
-                        vec![53, 42],
-                        Some("UTC".into()),
+                    Arc::new(TimestampMicrosecondArray::with_timezone_opt(
+                        vec![53, 42].into(),
+                        Some("UTC"),
                     )),
-                    Arc::new(TimestampMicrosecondArray::from_vec(
-                        vec![68, 32],
-                        Some("UTC".into()),
+                    Arc::new(TimestampMicrosecondArray::with_timezone_opt(
+                        vec![68, 32].into(),
+                        Some("UTC"),
                     )),
                 ],
                 expected_min: ScalarValue::TimestampMicrosecond(Some(32), Some("UTC".into())),
@@ -349,7 +573,7 @@ mod tests {
             assert_eq!(
                 stats,
                 StatisticsRow {
-                    null_count: ScalarValue::UInt32(Some(0)),
+                    null_count: ScalarValue::Int64(Some(0)),
                     min_value: case.expected_min,
                     max_value: case.expected_max,
                 },
@@ -371,7 +595,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(0 as u32),
+                null_count: ScalarValue::from(0 as i64),
                 min_value: ScalarValue::from(-10.0 as f32),
                 max_value: ScalarValue::from(5.0 as f32),
             }
@@ -388,22 +612,22 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(0 as u32),
+                null_count: ScalarValue::from(0 as i64),
                 min_value: ScalarValue::from(std::f32::NEG_INFINITY),
                 max_value: ScalarValue::from(std::f32::INFINITY),
             }
         );
 
-        // Zero is always positive
-        let arrays: Vec<ArrayRef> = vec![Arc::new(Float32Array::from(vec![4.0f32, -0.0]))];
+        // Max value for zero is always positive, min value for zero is always negative
+        let arrays: Vec<ArrayRef> = vec![Arc::new(Float32Array::from(vec![-0.0, 0.0]))];
         let array_refs = arrays.iter().collect::<Vec<_>>();
         let stats = collect_statistics(&array_refs);
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(0 as u32),
-                min_value: ScalarValue::from(0.0f32),
-                max_value: ScalarValue::from(4.0f32),
+                null_count: ScalarValue::from(0 as i64),
+                min_value: ScalarValue::from(-0.0f32),
+                max_value: ScalarValue::from(0.0f32),
             }
         );
     }
@@ -422,7 +646,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(1 as u32),
+                null_count: ScalarValue::from(1 as i64),
                 min_value: ScalarValue::from("bar"),
                 max_value: ScalarValue::from("yee"),
             }
@@ -439,7 +663,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(0 as u32),
+                null_count: ScalarValue::from(0 as i64),
                 // Bacteriologists is just 15 bytes, but the next character is multi-byte
                 // so we truncate before.
                 min_value: ScalarValue::from("bacteriologists"),
@@ -462,7 +686,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(0 as u32),
+                null_count: ScalarValue::from(0 as i64),
                 // We can truncate the minimum value, since the prefix is less than the full value
                 min_value: ScalarValue::Binary(Some(min_value)),
                 // We can't truncate the max value, so we return None
@@ -489,7 +713,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(1 as u32),
+                null_count: ScalarValue::from(1 as i64),
                 min_value: ScalarValue::from("abc"),
                 max_value: ScalarValue::from("def"),
             }
@@ -510,12 +734,12 @@ mod tests {
         let id = schema.field("a").unwrap().id;
         let builder = collector.get_builder(id).unwrap();
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(2 as u32),
+            null_count: ScalarValue::from(2 as i64),
             min_value: ScalarValue::from(1 as i32),
             max_value: ScalarValue::from(3 as i32),
         });
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(0 as u32),
+            null_count: ScalarValue::from(0 as i64),
             min_value: ScalarValue::Int32(None),
             max_value: ScalarValue::Int32(None),
         });
@@ -528,12 +752,12 @@ mod tests {
         let id = schema.field("b").unwrap().id;
         let builder = collector.get_builder(id).unwrap();
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(6 as u32),
+            null_count: ScalarValue::from(6 as i64),
             min_value: ScalarValue::from("aaa"),
             max_value: ScalarValue::from("bbb"),
         });
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(0 as u32),
+            null_count: ScalarValue::from(0 as i64),
             min_value: ScalarValue::Utf8(Some(String::from(""))),
             max_value: ScalarValue::Utf8(Some(String::from(""))),
         });
@@ -544,23 +768,24 @@ mod tests {
         // Now we can finish
         let batch = collector.finish().unwrap();
 
+        // TODO: Should the order of the fields be reversed? It's LIFO now.
         let expected_schema = ArrowSchema::new(vec![
             ArrowField::new("num_values", DataType::Int64, false),
-            ArrowField::new(
-                "0",
-                DataType::Struct(ArrowFields::from(vec![
-                    ArrowField::new("null_count", DataType::Int64, false),
-                    ArrowField::new("min_value", DataType::Int32, false),
-                    ArrowField::new("max_value", DataType::Int32, false),
-                ])),
-                false,
-            ),
             ArrowField::new(
                 "1",
                 DataType::Struct(ArrowFields::from(vec![
                     ArrowField::new("null_count", DataType::Int64, false),
                     ArrowField::new("min_value", DataType::Utf8, true),
                     ArrowField::new("max_value", DataType::Utf8, true),
+                ])),
+                false,
+            ),
+            ArrowField::new(
+                "0",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("null_count", DataType::Int64, false),
+                    ArrowField::new("min_value", DataType::Int32, false),
+                    ArrowField::new("max_value", DataType::Int32, false),
                 ])),
                 false,
             ),
