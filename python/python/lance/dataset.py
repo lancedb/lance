@@ -399,7 +399,12 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return pa.Table.from_batches([self._ds.take(indices, columns)])
 
-    def _take_rows(self, row_ids: Union[List[int], pa.Array], columns: Optional[List[str]] = None, **kargs) -> pa.Table:
+    def _take_rows(
+        self,
+        row_ids: Union[List[int], pa.Array],
+        columns: Optional[List[str]] = None,
+        **kargs,
+    ) -> pa.Table:
         """Select rows by row_ids.
 
         **Unstable API**. Internal use only
