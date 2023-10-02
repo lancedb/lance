@@ -143,7 +143,7 @@ impl FileWriter {
                 .iter()
                 .map(|batch| {
                     batch.column_by_name(&field.name).ok_or_else(|| Error::IO {
-                        message: format!("FileWriter::write: Field {} not found", field.name),
+                        message: format!("FileWriter::write: Field '{}' not found", field.name),
                         location: location!(),
                     })
                 })

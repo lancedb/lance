@@ -17,14 +17,14 @@ use std::collections::{BTreeMap, HashSet};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use object_store::path::Path;
-use path_absolutize::Absolutize;
+use snafu::{location, Location};
 use tempfile::TempDir;
 
 use crate::datatypes::Schema;
 use crate::io::reader::batches_stream;
 use crate::io::FileReader;
 use crate::{
-    error::Result,
+    error::{Error, Result},
     io::{FileWriter, ObjectStore, RecordBatchStream},
 };
 
@@ -64,17 +64,19 @@ pub struct ShufflerBuilder {
 }
 
 fn lance_buffer_path(dir: &TempDir) -> Result<Path> {
-    let file_path = dir.path().join(BUFFER_FILE_NAME);
-    let path = Path::from(file_path.absolutize()?.to_str().unwrap());
-    Ok(path)
+    let tmp_dir_path = Path::from_filesystem_path(dir.path()).map_err(|e| Error::IO {
+        message: format!("failed to get buffer path in shuffler: {}", e),
+        location: location!(),
+    })?;
+    Ok(tmp_dir_path.child(BUFFER_FILE_NAME))
 }
 
 impl ShufflerBuilder {
     #[allow(dead_code)]
     pub async fn try_new(schema: &ArrowSchema, flush_threshold: usize) -> Result<Self> {
-        // TODO: create a `ObjectWriter::tempfile()` method.
         let temp_dir = tempfile::tempdir()?;
-        let (object_store, _) = ObjectStore::from_uri(temp_dir.path().to_str().unwrap()).await?;
+
+        let object_store = ObjectStore::local();
         let path = lance_buffer_path(&temp_dir)?;
         let writer = object_store.create(&path).await?;
         let lance_schema = Schema::try_from(schema)?;
@@ -134,7 +136,6 @@ pub struct Shuffler<'a> {
 }
 
 impl<'a> Shuffler<'a> {
-    #[allow(dead_code)]
     fn new(parted_groups: &BTreeMap<u32, Vec<u32>>, temp_dir: &'a TempDir) -> Self {
         Self {
             parted_groups: parted_groups.clone(),
@@ -142,20 +143,20 @@ impl<'a> Shuffler<'a> {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn keys(&self) -> Vec<u32> {
-        self.parted_groups.keys().copied().collect()
-    }
-
     /// Iterate over the shuffled [RecordBatch]s for a given partition key.
-    #[allow(dead_code)]
     pub async fn key_iter(&self, key: u32) -> Result<Option<impl RecordBatchStream + '_>> {
         if !self.parted_groups.contains_key(&key) {
             return Ok(None);
         }
-        let file_path = lance_buffer_path(self.temp_dir)?;
-        let (object_store, _) = ObjectStore::from_uri("file://").await?;
-        let reader = FileReader::try_new(&object_store, &file_path).await?;
+
+        let object_store = ObjectStore::local();
+        let path = lance_buffer_path(self.temp_dir)?;
+        let reader = FileReader::try_new(&object_store, &path)
+            .await
+            .map_err(|e| Error::IO {
+                message: format!("failed to open shuffler buffer file: {}, {}", path, e),
+                location: location!(),
+            })?;
         let schema = reader.schema().clone();
 
         let group_ids = self
@@ -198,7 +199,6 @@ mod tests {
                 .unwrap();
         }
         let reader = shuffler.finish().await.unwrap();
-        assert_eq!(reader.keys(), vec![0, 1, 2]);
         for i in 0..3 {
             let stream = reader.key_iter(i).await.unwrap().expect("key exists");
             let batches = stream.try_collect::<Vec<_>>().await.unwrap();
