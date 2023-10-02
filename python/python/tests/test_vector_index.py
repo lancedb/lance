@@ -159,6 +159,22 @@ def test_use_index(dataset, tmp_path):
     assert np.all(expected == actual)
 
 
+def test_nearest_errors(dataset, tmp_path):
+    import pandas as pd
+
+    with pytest.raises(ValueError, match="does not match index column size"):
+        dataset.to_table(
+            columns=["id"],
+            nearest={"column": "vector", "q": np.random.randn(127), "k": 10},
+        )
+
+    df = pd.DataFrame({"a": [5], "b": [10]})
+    ds = lance.write_dataset(pa.Table.from_pandas(df), tmp_path / "dataset.lance")
+
+    with pytest.raises(TypeError, match="must be a vector"):
+        ds.to_table(nearest={"column": "a", "q": np.random.randn(128), "k": 10})
+
+
 def test_has_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
