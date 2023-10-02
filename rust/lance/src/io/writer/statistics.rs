@@ -18,7 +18,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::datatypes::{Field, Schema};
+use crate::datatypes::Field;
 use crate::error::Result;
 use arrow_array::{
     builder::{
@@ -30,13 +30,13 @@ use arrow_array::{
         UInt32Type, UInt64Type, UInt8Type,
     },
     Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, BooleanArray,
-    Decimal128Array, DictionaryArray, DurationMillisecondArray, Int32Array, Int64Array,
-    PrimitiveArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
+    Decimal128Array, DictionaryArray, Int32Array, Int64Array, PrimitiveArray, RecordBatch,
+    StringArray, StructArray,
 };
 use std::str;
 
 use arrow_schema::DataType;
-use arrow_schema::{ArrowError, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
+use arrow_schema::{ArrowError, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::common::ScalarValue;
 use num_traits::bounds::Bounded;
 
@@ -162,11 +162,11 @@ where
         _ => {}
     }
 
-    return StatisticsRow {
+    StatisticsRow {
         null_count: ScalarValue::Int64(Some(null_count)),
         min_value: scalar_min_value,
         max_value: scalar_max_value,
-    };
+    }
 }
 
 fn get_decimal_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
@@ -193,11 +193,11 @@ fn get_decimal_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         null_count += array.null_count() as i64;
     }
 
-    return StatisticsRow {
+    StatisticsRow {
         null_count: ScalarValue::Int64(Some(null_count)),
         min_value: ScalarValue::Decimal128(Some(min_value), 8, 8),
         max_value: ScalarValue::Decimal128(Some(max_value), 8, 8),
-    };
+    }
 }
 
 /// Truncate a UTF8 slice to the longest prefix that is still a valid UTF8 string, while being less than `length` bytes.
@@ -325,11 +325,11 @@ fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     let min_value = str::from_utf8(&min_value).unwrap();
     let max_value = str::from_utf8(&max_value).unwrap();
 
-    return StatisticsRow {
+    StatisticsRow {
         null_count: ScalarValue::Int64(Some(null_count)),
         min_value: ScalarValue::Utf8(Some(min_value.to_string())),
         max_value: ScalarValue::Utf8(Some(max_value.to_string())),
-    };
+    }
 }
 
 fn get_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
@@ -366,11 +366,11 @@ fn get_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         Some(max_value)
     };
 
-    return StatisticsRow {
+    StatisticsRow {
         null_count: ScalarValue::Int64(Some(null_count)),
         min_value: ScalarValue::Binary(min_value_scalar),
         max_value: ScalarValue::Binary(max_value_scalar),
-    };
+    }
 }
 
 fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
@@ -397,7 +397,7 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         }
     }
 
-    return StatisticsRow {
+    StatisticsRow {
         null_count: ScalarValue::Int64(Some(0)),
         min_value: if false_present {
             ScalarValue::Boolean(Some(false))
@@ -409,7 +409,7 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         } else {
             ScalarValue::Boolean(None)
         },
-    };
+    }
 }
 
 fn get_dictionary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
@@ -490,7 +490,7 @@ impl StatisticsCollector {
         arrays.push(num_rows);
         fields.push(ArrowField::new("num_values", DataType::Int64, false));
 
-        let _ = self.builders.iter_mut().for_each(|(_, (field, builder))| {
+        self.builders.iter_mut().for_each(|(_, (field, builder))| {
             let null_count = Arc::new(builder.null_count.finish());
             let min_value = Arc::new(builder.min_value.finish());
             let max_value = Arc::new(builder.max_value.finish());
@@ -709,8 +709,9 @@ impl StatisticsBuilder {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        builder::StringDictionaryBuilder, BinaryArray, BooleanArray, Date32Array, Float32Array,
-        Int32Array, Int64Array, StringArray, StructArray,
+        builder::StringDictionaryBuilder, BinaryArray, BooleanArray, Date32Array,
+        DurationMillisecondArray, Float32Array, Int32Array, Int64Array, StringArray, StructArray,
+        TimestampMicrosecondArray,
     };
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
@@ -732,8 +733,8 @@ mod tests {
                     Arc::new(Int64Array::from(vec![4, 3, 7, 2])),
                     Arc::new(Int64Array::from(vec![-10, 3, 5])),
                 ],
-                expected_min: ScalarValue::from(-10 as i64),
-                expected_max: ScalarValue::from(7 as i64),
+                expected_min: ScalarValue::from(-10_i64),
+                expected_max: ScalarValue::from(7_i64),
             },
             // Int32
             TestCase {
@@ -741,8 +742,8 @@ mod tests {
                     Arc::new(Int32Array::from(vec![4, 3, 7, 2])),
                     Arc::new(Int32Array::from(vec![-10, 3, 5])),
                 ],
-                expected_min: ScalarValue::from(-10 as i32),
-                expected_max: ScalarValue::from(7 as i32),
+                expected_min: ScalarValue::from(-10_i32),
+                expected_max: ScalarValue::from(7_i32),
             },
             // Boolean
             TestCase {
@@ -822,9 +823,9 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(0 as i64),
-                min_value: ScalarValue::from(-10.0 as f32),
-                max_value: ScalarValue::from(5.0 as f32),
+                null_count: ScalarValue::from(0_i64),
+                min_value: ScalarValue::from(-10.0_f32),
+                max_value: ScalarValue::from(5.0_f32),
             }
         );
 
@@ -839,7 +840,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(0 as i64),
+                null_count: ScalarValue::from(0_i64),
                 min_value: ScalarValue::from(std::f32::NEG_INFINITY),
                 max_value: ScalarValue::from(std::f32::INFINITY),
             }
@@ -852,9 +853,9 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(0 as i64),
-                min_value: ScalarValue::from(-0.0f32),
-                max_value: ScalarValue::from(0.0f32),
+                null_count: ScalarValue::from(0_i64),
+                min_value: ScalarValue::from(-0.0_f32),
+                max_value: ScalarValue::from(0.0_f32),
             }
         );
     }
@@ -873,7 +874,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(1 as i64),
+                null_count: ScalarValue::from(1_i64),
                 min_value: ScalarValue::from("bar"),
                 max_value: ScalarValue::from("yee"),
             }
@@ -890,7 +891,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(0 as i64),
+                null_count: ScalarValue::from(0_i64),
                 // Bacteriologists is just 15 bytes, but the next character is multi-byte
                 // so we truncate before.
                 min_value: ScalarValue::from("bacteriologists"),
@@ -913,7 +914,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(0 as i64),
+                null_count: ScalarValue::from(0_i64),
                 // We can truncate the minimum value, since the prefix is less than the full value
                 min_value: ScalarValue::Binary(Some(min_value)),
                 // We can't truncate the max value, so we return None
@@ -940,7 +941,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(1 as i64),
+                null_count: ScalarValue::from(1_i64),
                 min_value: ScalarValue::from("abc"),
                 max_value: ScalarValue::from("def"),
             }
@@ -949,6 +950,9 @@ mod tests {
 
     #[test]
     fn test_stats_collector() {
+        use crate::datatypes::Schema;
+        use arrow_schema::Fields as ArrowFields;
+
         // Check the output schema is correct
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, false),
@@ -961,12 +965,12 @@ mod tests {
         let id = schema.field("a").unwrap().id;
         let builder = collector.get_builder(id).unwrap();
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(2 as i64),
-            min_value: ScalarValue::from(1 as i32),
-            max_value: ScalarValue::from(3 as i32),
+            null_count: ScalarValue::from(2_i64),
+            min_value: ScalarValue::from(1_i32),
+            max_value: ScalarValue::from(3_i32),
         });
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(0 as i64),
+            null_count: ScalarValue::from(0_i64),
             min_value: ScalarValue::Int32(Some(std::i32::MIN)),
             max_value: ScalarValue::Int32(Some(std::i32::MAX)),
         });
@@ -981,12 +985,12 @@ mod tests {
         let id = schema.field("a").unwrap().id;
         let builder = collector.get_builder(id).unwrap();
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(2 as i64),
-            min_value: ScalarValue::from(1 as i32),
-            max_value: ScalarValue::from(3 as i32),
+            null_count: ScalarValue::from(2_i64),
+            min_value: ScalarValue::from(1_i32),
+            max_value: ScalarValue::from(3_i32),
         });
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(0 as i64),
+            null_count: ScalarValue::from(0_i64),
             min_value: ScalarValue::Int32(Some(std::i32::MIN)),
             max_value: ScalarValue::Int32(Some(std::i32::MAX)),
         });
@@ -995,12 +999,12 @@ mod tests {
         let id = schema.field("b").unwrap().id;
         let builder = collector.get_builder(id).unwrap();
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(6 as i64),
+            null_count: ScalarValue::from(6_i64),
             min_value: ScalarValue::from("aaa"),
             max_value: ScalarValue::from("bbb"),
         });
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(0 as i64),
+            null_count: ScalarValue::from(0_i64),
             min_value: ScalarValue::Utf8(None),
             max_value: ScalarValue::Utf8(None),
         });
