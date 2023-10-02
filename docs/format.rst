@@ -354,7 +354,8 @@ and timestamps), if the min and max are unknown (all values are null), then the
 minimum/maximum representable values should be used instead.
 
 For float data types, if the min and max are unknown, then use ``-Inf`` and ``+Inf``,
-respectively. ``NaN`` values should be ignored for the purpose of min and max
+respectively. (``-Inf`` and ``+Inf`` may also be used for min and max if those values
+are present in the arrays.) ``NaN`` values should be ignored for the purpose of min and max
 statistics. If the max value is zero (negative or positive), the max value
 should be recorded as ``+0.0``. Likewise, if the min value is zero (positive
 or negative), it should be recorded as ``-0.0``.
@@ -371,16 +372,15 @@ maximum value, then instead use null for the maximum.
     they are simply upper and lower bounds. Two common cases where they are not
     contained in the array is if the min or max original value was deleted and
     when binary data is truncated. Therefore, statistic should not be used to
-    compute queries such as ``SELECT max(col) FROM table``, except to identify
-    which pages and files definitely do not contain the min or max value.
+    compute queries such as ``SELECT max(col) FROM table``.
 
 Page-level statistics format
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Page-level statistics are stored as separate arrays within the Lance file. Each
-array is only one page long. The page offsets are stored in an array just like
-the data page table. The offset to the statistics page offsets is stored in the
-metadata.
+Page-level statistics are stored as arrays within the Lance file. Each array
+contains one page long and is ``num_pages`` long. The page offsets are stored in
+an array just like the data page table. The offset to the statistics page
+table is stored in the metadata.
 
 The schema for the statistics is:
 

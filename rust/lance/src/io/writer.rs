@@ -524,7 +524,8 @@ impl FileWriter {
                     .await?;
                 }
 
-                let page_table_position = stats_page_table.write(&mut self.object_writer, 0).await?;
+                let page_table_position =
+                    stats_page_table.write(&mut self.object_writer, 0).await?;
 
                 Ok(Some(StatisticsMetadata {
                     schema,
@@ -545,18 +546,18 @@ impl FileWriter {
             .await?;
         self.metadata.page_table_position = pos;
 
-        // Step 1.5 Write statistics.
+        // Step 2. Write statistics.
         self.metadata.stats_metadata = self.write_statistics().await?;
 
-        // Step 2. Write manifest and dictionary values.
+        // Step 3. Write manifest and dictionary values.
         let mut manifest = Manifest::new(&self.schema, Arc::new(vec![]));
         let pos = write_manifest(&mut self.object_writer, &mut manifest, None).await?;
 
-        // Step 3. Write metadata.
+        // Step 4. Write metadata.
         self.metadata.manifest_position = Some(pos);
         let pos = self.object_writer.write_struct(&self.metadata).await?;
 
-        // Step 4. Write magics.
+        // Step 5. Write magics.
         self.object_writer.write_magics(pos).await
     }
 }
