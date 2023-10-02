@@ -63,19 +63,21 @@ pub struct ShufflerBuilder {
     writer: FileWriter,
 }
 
-fn lance_buffer_path(dir: &TempDir) -> Path {
-    let file_path = dir.path().join(BUFFER_FILE_NAME);
-    Path::from(file_path.to_str().unwrap())
+fn lance_buffer_path(dir: &TempDir) -> Result<Path> {
+    let tmp_dir_path = Path::from_filesystem_path(dir.path()).map_err(|e| Error::IO {
+        message: format!("failed to get buffer path in shuffler: {}", e),
+        location: location!(),
+    })?;
+    Ok(tmp_dir_path.child(BUFFER_FILE_NAME))
 }
 
 impl ShufflerBuilder {
     #[allow(dead_code)]
     pub async fn try_new(schema: &ArrowSchema, flush_threshold: usize) -> Result<Self> {
-        // TODO: create a `ObjectWriter::tempfile()` method.
         let temp_dir = tempfile::tempdir()?;
 
         let object_store = ObjectStore::local();
-        let path = lance_buffer_path(&temp_dir);
+        let path = lance_buffer_path(&temp_dir)?;
         let writer = object_store.create(&path).await?;
         let lance_schema = Schema::try_from(schema)?;
         Ok(Self {
@@ -148,7 +150,7 @@ impl<'a> Shuffler<'a> {
         }
 
         let object_store = ObjectStore::local();
-        let path = lance_buffer_path(self.temp_dir);
+        let path = lance_buffer_path(self.temp_dir)?;
         let reader = FileReader::try_new(&object_store, &path)
             .await
             .map_err(|e| Error::IO {
