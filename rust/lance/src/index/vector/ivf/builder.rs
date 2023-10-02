@@ -15,10 +15,10 @@
 use std::sync::Arc;
 use std::{collections::BTreeMap, ops::Range};
 
-use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, RecordBatch};
-use arrow_array::{StructArray, UInt32Array};
+use arrow_array::{
+    cast::AsArray, types::Float32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
+};
 use arrow_schema::{DataType, Field, Schema};
-use arrow_select::take::take;
 use futures::{
     stream::{self, repeat_with},
     StreamExt, TryStreamExt,
@@ -33,8 +33,10 @@ use crate::index::vector::ivf::{
     io::write_index_partitions, shuffler::ShufflerBuilder, Ivf, PQ_CODE_COLUMN,
 };
 use crate::index::vector::pq::ProductQuantizer;
-use crate::io::object_writer::ObjectWriter;
-use crate::{io::RecordBatchStream, Error, Result};
+use crate::{
+    io::{object_writer::ObjectWriter, RecordBatchStream},
+    Error, Result,
+};
 
 use super::RESIDUAL_COLUMN;
 
@@ -85,8 +87,6 @@ fn filter_batch_by_partition(
             }
         });
 
-    let struct_arr = StructArray::from(batch.clone());
-
     let residual_field = Field::new(
         RESIDUAL_COLUMN,
         DataType::FixedSizeList(
@@ -100,16 +100,17 @@ fn filter_batch_by_partition(
     for (&part_id, row_ids) in parted_map.iter() {
         let indices = UInt32Array::from(row_ids.clone());
         // Use `take` to select rows.
-        let str_arr = take(&struct_arr, &indices, None)?;
-        let parted_batch: RecordBatch = str_arr.as_struct().into();
+        let parted_batch: RecordBatch = batch.take(&indices)?;
 
         let origin_vec_col = parted_batch
             .column_by_name(column)
             .expect("The caller already checked column exist")
             .as_fixed_size_list();
         let origin = MatrixView::try_from(origin_vec_col)?;
-        let residual =
-            ivf.compute_residual(&origin, &UInt32Array::from(vec![part_id; str_arr.len()]));
+        let residual = ivf.compute_residual(
+            &origin,
+            &UInt32Array::from(vec![part_id; parted_batch.num_rows()]),
+        );
         let residual_arr =
             FixedSizeListArray::try_new_from_values(residual.data().as_ref().clone(), dim as i32)?;
         let parted_batch =
