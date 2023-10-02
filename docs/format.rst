@@ -404,5 +404,5 @@ the format may add additional fields, but these changes will be backwards
 compatible.
 
 However, writers should not write extra fields that aren't described in this
-document. Until they are defined the specification, there is no guarantee that
-writers will be able to safely interpret new forms of statistics.
+document. Until they are defined in the specification, there is no guarantee that
+readers will be able to safely interpret new forms of statistics.
