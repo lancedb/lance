@@ -76,8 +76,12 @@ each array class's ``to_numpy`` method.
 ImageURI
 --------
 
-:class:`lance.arrow.ImageURIArray` is an Arrow extension array that stores
-URIs of images. It can be created by calling :func:`lance.arrow.ImageURIArray.from_uris`
+:class:`lance.arrow.ImageURIArray` is an array that stores the URI location of images
+in some other storage system. For example, ``file:///path/to/image.png`` for a local
+filesystem or ``s3://bucket/path/image.jpeg`` for an image on AWS S3. Use this
+array type when you want to lazily load images from an existing storage medium.
+
+It can be created by calling :func:`lance.arrow.ImageURIArray.from_uris`
 with a list of URIs represented by either :py:class:`pyarrow.StringArray` or an
 iterable that yields strings. Note that the URIs are not strongly validated and images
 are not read into memory automatically.

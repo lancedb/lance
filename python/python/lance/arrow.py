@@ -253,6 +253,9 @@ class EncodedImageArray(ImageArray):
         [[42, 42, 42, 255]]
         """
         import numpy as np
+        
+        if not hasattr(pa, "FixedShapeTensorType"):
+            raise NotImplementedError("This function requires PyArrow >= 12.0.0")
 
         if not decoder:
 
