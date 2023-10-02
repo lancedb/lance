@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::datatypes::{Field, Schema};
 use crate::error::Result;
+use arrow_array::builder::BooleanBuilder;
 use arrow_array::{
     builder::{make_builder, ArrayBuilder, PrimitiveBuilder, StringBuilder},
     types::{
@@ -28,9 +29,10 @@ use arrow_array::{
         UInt64Type, UInt8Type,
     },
     Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, BooleanArray,
-    Decimal128Array, DurationMillisecondArray, Int32Array, Int64Array, PrimitiveArray, RecordBatch,
-    StringArray, StructArray, TimestampMicrosecondArray,
+    Decimal128Array, DictionaryArray, DurationMillisecondArray, Int32Array, Int64Array,
+    PrimitiveArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
 };
+use std::str;
 
 use arrow_schema::DataType;
 use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
@@ -227,6 +229,7 @@ fn get_decimal_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     };
 }
 
+/// Truncate a UTF8 slice to the longest prefix that is still a valid UTF8 string, while being less than `length` bytes.
 fn truncate_utf8(data: &str, length: usize) -> Option<Vec<u8>> {
     // We return values like that at an earlier stage in the process.
     assert!(data.len() >= length);
@@ -242,6 +245,33 @@ fn truncate_utf8(data: &str, length: usize) -> Option<Vec<u8>> {
 
     None
 }
+
+/// Truncate a binary slice to make sure its length is less than `length`
+fn truncate_binary(data: &[u8], length: usize) -> Option<Vec<u8>> {
+    // We return values like that at an earlier stage in the process.
+    assert!(data.len() >= length);
+    // If all bytes are already maximal, no need to truncate
+
+    data[0..length].to_vec().into()
+}
+
+/// Try and increment the bytes from right to left.
+///
+/// Returns `None` if all bytes are set to `u8::MAX`.
+fn increment(mut data: Vec<u8>) -> Option<Vec<u8>> {
+    for byte in data.iter_mut().rev() {
+        let (incremented, overflow) = byte.overflowing_add(1);
+        *byte = incremented;
+
+        if !overflow {
+            return Some(data);
+        }
+    }
+
+    None
+}
+
+/// Try and increment the the string's bytes from right to left, returning when the result is a valid UTF8 string.
 /// Returns `None` when it can't increment any byte.
 fn increment_utf8(mut data: Vec<u8>) -> Option<Vec<u8>> {
     for idx in (0..data.len()).rev() {
@@ -252,7 +282,7 @@ fn increment_utf8(mut data: Vec<u8>) -> Option<Vec<u8>> {
         while !overflow {
             data[idx] = byte;
 
-            if std::str::from_utf8(&data).is_ok() {
+            if str::from_utf8(&data).is_ok() {
                 return Some(data);
             }
             (byte, overflow) = data[idx].overflowing_add(1);
@@ -262,6 +292,22 @@ fn increment_utf8(mut data: Vec<u8>) -> Option<Vec<u8>> {
     }
 
     None
+}
+
+fn truncate_min_value(data: &[u8]) -> Vec<u8> {
+    match str::from_utf8(data) {
+        Ok(str_data) => truncate_utf8(str_data, BINARY_PREFIX_LENGTH),
+        Err(_) => truncate_binary(data, BINARY_PREFIX_LENGTH),
+    }
+    .unwrap_or_else(|| data.to_vec())
+}
+
+fn truncate_max_value(data: &[u8]) -> Vec<u8> {
+    match str::from_utf8(data) {
+        Ok(str_data) => truncate_utf8(str_data, BINARY_PREFIX_LENGTH).and_then(increment_utf8),
+        Err(_) => truncate_binary(data, BINARY_PREFIX_LENGTH).and_then(increment),
+    }
+    .unwrap_or_else(|| data.to_vec())
 }
 
 fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
@@ -291,23 +337,18 @@ fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     }
 
     if max_value.len() > BINARY_PREFIX_LENGTH {
-        let truncated =
-            truncate_utf8(&String::from_utf8(max_value).unwrap(), BINARY_PREFIX_LENGTH).unwrap();
-        max_value = increment_utf8(truncated).unwrap();
-        // max_value = increment_utf8(max_value).unwrap();
+        max_value = truncate_max_value(&max_value);
     }
     if min_value.len() > BINARY_PREFIX_LENGTH {
-        min_value =
-            truncate_utf8(&String::from_utf8(min_value).unwrap(), BINARY_PREFIX_LENGTH).unwrap();
+        min_value = truncate_min_value(&min_value);
     }
-
-    let min_value = String::from_utf8(min_value).unwrap();
-    let max_value = String::from_utf8(max_value).unwrap();
+    let min_value = str::from_utf8(&min_value).unwrap();
+    let max_value = str::from_utf8(&max_value).unwrap();
 
     return StatisticsRow {
         null_count: ScalarValue::Int64(Some(null_count)),
-        min_value: ScalarValue::Utf8(Some(min_value)),
-        max_value: ScalarValue::Utf8(Some(max_value)),
+        min_value: ScalarValue::Utf8(Some(min_value.to_string())),
+        max_value: ScalarValue::Utf8(Some(max_value.to_string())),
     };
 }
 
@@ -350,6 +391,20 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     };
 }
 
+fn get_dictionary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
+    let arr = arrays
+        .iter()
+        .map(|x| {
+            x.as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let arr2 = arr.iter().map(|x| x.values()).collect::<Vec<_>>();
+    get_string_statistics(&arr2)
+}
+
 pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     match arrays[0].data_type() {
         DataType::Boolean => get_boolean_statistics(arrays),
@@ -370,8 +425,8 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::Decimal128(_, _) => get_decimal_statistics(arrays),
         DataType::Binary => get_binary_statistics(arrays),
         DataType::Utf8 => get_string_statistics(arrays),
+        DataType::Dictionary(_, _) => get_dictionary_statistics(arrays),
         // TODO: cover all types
-        // DataType::Dictionary(_, _) =>
         // DataType::Struct(_) =>
         _ => {
             println!(
@@ -529,9 +584,44 @@ impl StatisticsBuilder {
         max_value_builder.append_value(max_value);
     }
 
+    fn boolean_appender(&mut self, row: StatisticsRow) {
+        let ScalarValue::Int64(Some(null_count)) = row.null_count else {
+            todo!()
+        };
+        self.null_count.append_value(null_count);
+
+        let min_value_builder = self
+            .min_value
+            .as_any_mut()
+            .downcast_mut::<BooleanBuilder>()
+            .unwrap();
+        let min_value = row
+            .min_value
+            .to_array()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0);
+        min_value_builder.append_value(min_value);
+
+        let max_value_builder = self
+            .max_value
+            .as_any_mut()
+            .downcast_mut::<BooleanBuilder>()
+            .unwrap();
+        let max_value = row
+            .max_value
+            .to_array()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0);
+        max_value_builder.append_value(max_value);
+    }
+
     pub fn append(&mut self, row: StatisticsRow) {
         match self.dt {
-            // DataType::Boolean => { self.statistics_appender::<BooleanType>(row) },
+            DataType::Boolean => self.boolean_appender(row),
             DataType::Int8 => self.statistics_appender::<Int8Type>(row),
             DataType::UInt8 => self.statistics_appender::<UInt8Type>(row),
             DataType::Int16 => self.statistics_appender::<Int16Type>(row),
@@ -549,6 +639,7 @@ impl StatisticsBuilder {
             // TODO: cover all types
             // DataType::Decimal128(_, _) => { get_statistics::<Decimal128Type>(arrays) }
             // DataType::Binary => { get_statistics::<BinaryType>(arrays) }
+            DataType::Dictionary(_, _) => self.string_statistics_appender(row),
             DataType::Utf8 => self.string_statistics_appender(row),
             // DataType::Struct(_) => {  }
             _ => {
