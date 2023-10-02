@@ -988,8 +988,9 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
 
+        // TODO: collect_stats_for_fields: vec![0,1,3] once structs are supported
         let options = FileWriterOptions {
-            collect_stats_for_fields: vec![0, 2, 4],
+            collect_stats_for_fields: vec![0, 1],
         };
         let mut file_writer = FileWriter::try_new(&store, &path, schema, &options)
             .await
@@ -1027,7 +1028,6 @@ mod tests {
                 Arc::new(Int64Array::from(vec![10, 11])),
                 Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
                     Some(vec![Some(1i32), Some(2), Some(3)]),
-                    Some(vec![Some(4), Some(5)]),
                     Some(vec![]),
                 ])),
                 Arc::new(StructArray::from(vec![
