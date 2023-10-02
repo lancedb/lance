@@ -213,6 +213,3 @@ pub(super) async fn build_partitions(
 
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {}
