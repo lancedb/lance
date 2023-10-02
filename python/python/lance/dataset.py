@@ -284,8 +284,6 @@ class LanceDataset(pa.dataset.Dataset):
         1. nearest is executed first.
         2. The results are filtered afterwards.
         """
-        # if
-
         return self.scanner(
             columns=columns,
             filter=filter,
@@ -1314,7 +1312,7 @@ class ScannerBuilder:
         use_index: bool = True,
     ) -> ScannerBuilder:
         column_field = self.ds.schema.field_by_name(column)
-        q_size = len(q) if isinstance(q, (list, tuple)) else q.size
+        q_size = q.size if isinstance(q, np.ndarray) else len(q)
 
         if self.ds.schema.get_field_index(column) < 0:
             raise ValueError(f"Embedding column {column} not in dataset")
