@@ -15,7 +15,7 @@
 //! Statistics collection utilities
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::datatypes::Field;
@@ -208,7 +208,7 @@ fn truncate_utf8(data: &str, length: usize) -> Option<&str> {
     while let Some((idx, c)) = char_indices.next_back() {
         let split_point = idx + c.len_utf8();
         if split_point <= length {
-            return Some(data[0..split_point]);
+            return Some(&data[0..split_point]);
         }
     }
 
@@ -221,7 +221,7 @@ fn truncate_binary(data: &[u8], length: usize) -> Option<Vec<u8>> {
     assert!(data.len() >= length);
     // If all bytes are already maximal, no need to truncate
 
-    data[0..length].to_vec().into()
+    Some(data[0..length].to_vec())
 }
 
 /// Try and increment the bytes from right to left.
@@ -295,7 +295,7 @@ fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         array.iter().for_each(|value| {
             if let Some(value) = value {
                 let value = truncate_utf8(value);
-                if let Some(Ordering::Greater) = value.partial_cmp(max_value)) {
+                if let Some(Ordering::Greater) = value.partial_cmp(max_value) {
                     max_value = value;
                 }
                 if let Some(Ordering::Less) = value.partial_cmp(min_value.as_slice()) {
@@ -371,13 +371,17 @@ fn get_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     let mut true_present = false;
     let mut false_present = false;
+    let mut null_count: i64 = 0;
 
-    let arr = arrays
+    let arrs = arrays
         .iter()
-        .map(|x| x.as_any().downcast_ref::<BooleanArray>().unwrap())
+        .map(|x| {
+            null_count += x.null_count() as i64;
+            x.as_any().downcast_ref::<BooleanArray>().unwrap()
+        })
         .collect::<Vec<_>>();
 
-    for array in arr.iter() {
+    for array in arrs.iter() {
         array.iter().for_each(|value| {
             if let Some(value) = value {
                 if value {
@@ -393,7 +397,7 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     }
 
     StatisticsRow {
-        null_count: ScalarValue::Int64(Some(0)),
+        null_count: ScalarValue::Int64(Some(null_count)),
         min_value: if false_present {
             ScalarValue::Boolean(Some(false))
         } else if true_present {
@@ -457,7 +461,7 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
 pub struct StatisticsCollector {
     num_rows: PrimitiveBuilder<Int64Type>,
-    builders: HashMap<i32, (Field, StatisticsBuilder)>,
+    builders: BTreeMap<i32, (Field, StatisticsBuilder)>,
 }
 
 impl StatisticsCollector {
@@ -1017,20 +1021,20 @@ mod tests {
         let expected_schema = ArrowSchema::new(vec![
             ArrowField::new("num_values", DataType::Int64, false),
             ArrowField::new(
-                "1",
-                DataType::Struct(ArrowFields::from(vec![
-                    ArrowField::new("null_count", DataType::Int64, false),
-                    ArrowField::new("min_value", DataType::Utf8, true),
-                    ArrowField::new("max_value", DataType::Utf8, true),
-                ])),
-                false,
-            ),
-            ArrowField::new(
                 "0",
                 DataType::Struct(ArrowFields::from(vec![
                     ArrowField::new("null_count", DataType::Int64, false),
                     ArrowField::new("min_value", DataType::Int32, false),
                     ArrowField::new("max_value", DataType::Int32, false),
+                ])),
+                false,
+            ),
+            ArrowField::new(
+                "1",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("null_count", DataType::Int64, false),
+                    ArrowField::new("min_value", DataType::Utf8, true),
+                    ArrowField::new("max_value", DataType::Utf8, true),
                 ])),
                 false,
             ),
