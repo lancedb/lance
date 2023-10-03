@@ -45,9 +45,12 @@
 //! (1) Delete and rewrite are compatible with each other and themselves only if
 //! they affect distinct fragments. Otherwise, they conflict.
 
-use std::{collections::HashSet, ops::Range, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
 use object_store::path::Path;
+use roaring::RoaringBitmap;
+use snafu::{location, Location};
+use uuid::Uuid;
 
 use crate::{
     datatypes::Schema,
@@ -120,9 +123,16 @@ pub enum Operation {
 }
 
 #[derive(Debug, Clone)]
+pub struct RewrittenIndex {
+    pub old_id: Uuid,
+    pub new_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
 pub struct RewriteGroup {
     pub old_fragments: Vec<Fragment>,
     pub new_fragments: Vec<Fragment>,
+    pub rewritten_indices: Vec<RewrittenIndex>,
 }
 
 impl Operation {
@@ -274,13 +284,12 @@ impl Transaction {
     fn fragments_with_ids<'a, T>(
         new_fragments: T,
         fragment_id: &'a mut u64,
-        reserved_fragment_ids: Range<u64>,
     ) -> impl Iterator<Item = Fragment> + 'a
     where
         T: IntoIterator<Item = Fragment> + 'a,
     {
         new_fragments.into_iter().map(move |mut f| {
-            if !reserved_fragment_ids.contains(&f.id) {
+            if f.id == 0 {
                 f.id = *fragment_id;
                 *fragment_id += 1;
             }
@@ -315,7 +324,6 @@ impl Transaction {
         current_indices: Vec<Index>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
-        reserved_fragment_ids: Range<u64>,
     ) -> Result<(Manifest, Vec<Index>)> {
         // Get the schema and the final fragment list
         let schema = match self.operation {
@@ -359,7 +367,6 @@ impl Transaction {
                 final_fragments.extend(Self::fragments_with_ids(
                     fragments.clone(),
                     &mut fragment_id,
-                    reserved_fragment_ids,
                 ));
             }
             Operation::Delete {
@@ -382,7 +389,6 @@ impl Transaction {
                 final_fragments.extend(Self::fragments_with_ids(
                     fragments.clone(),
                     &mut fragment_id,
-                    reserved_fragment_ids,
                 ));
                 final_indices = Vec::new();
             }
@@ -394,8 +400,8 @@ impl Transaction {
                     groups,
                     &mut fragment_id,
                     current_version,
-                    reserved_fragment_ids,
                 )?;
+                Self::handle_rewrite_indices(&mut final_indices, groups)?;
             }
             Operation::CreateIndex { new_indices } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -441,12 +447,67 @@ impl Transaction {
         Ok((manifest, final_indices))
     }
 
+    fn recalculate_fragment_bitmap<X: IntoIterator<Item = u32>, Y: IntoIterator<Item = u32>>(
+        old: &RoaringBitmap,
+        removed: X,
+        added: Y,
+        index_id: &Uuid,
+    ) -> Result<RoaringBitmap> {
+        let mut new_bitmap = old.clone();
+        for remove in removed {
+            if !new_bitmap.remove(remove) {
+                return Err(Error::invalid_input(format!("The compaction plan modified the fragment with id {} and rewrote the index with id {} but that fragment was not part of that index", remove, index_id)));
+            }
+        }
+        for add in added {
+            new_bitmap.insert(add);
+        }
+        Ok(new_bitmap)
+    }
+
+    fn handle_rewrite_indices(indices: &mut [Index], groups: &[RewriteGroup]) -> Result<()> {
+        let mut modified_indices = HashSet::new();
+
+        for group in groups {
+            for rewritten_index in &group.rewritten_indices {
+                if !modified_indices.insert(rewritten_index.old_id) {
+                    return Err(Error::invalid_input(format!("An invalid compaction plan must have been generated because multiple tasks modified the same index: {}", rewritten_index.old_id)));
+                }
+
+                let index = indices
+                    .iter_mut()
+                    .find(|idx| idx.uuid == rewritten_index.old_id)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Invalid compaction plan refers to index {} which does not exist",
+                            rewritten_index.old_id
+                        ))
+                    })?;
+
+                dbg!("Old", &index.fragment_bitmap);
+                index.fragment_bitmap = Some(Self::recalculate_fragment_bitmap(
+                    index.fragment_bitmap.as_ref().ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Cannot rewrite index {} which did not store fragment bitmap",
+                            index.uuid
+                        ))
+                    })?,
+                    group.old_fragments.iter().map(|frag| frag.id as u32),
+                    group.new_fragments.iter().map(|frag| frag.id as u32),
+                    &index.uuid,
+                )?);
+                dbg!("New", &index.fragment_bitmap);
+                index.uuid = rewritten_index.new_id;
+            }
+        }
+        Ok(())
+    }
+
     fn handle_rewrite_fragments(
         final_fragments: &mut Vec<Fragment>,
         groups: &[RewriteGroup],
         fragment_id: &mut u64,
         version: u64,
-        reserved_fragment_ids: Range<u64>,
     ) -> Result<()> {
         for group in groups {
             // If the old fragments are contiguous, find the range
@@ -468,11 +529,7 @@ impl Transaction {
                 }
             };
 
-            let new_fragments = Self::fragments_with_ids(
-                group.new_fragments.clone(),
-                fragment_id,
-                reserved_fragment_ids.clone(),
-            );
+            let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id);
             if let Some(replace_range) = replace_range {
                 // Efficiently path using slice
                 final_fragments.splice(replace_range, new_fragments);
@@ -534,6 +591,7 @@ impl TryFrom<&pb::Transaction> for Transaction {
                     vec![RewriteGroup {
                         old_fragments: old_fragments.iter().map(Fragment::from).collect(),
                         new_fragments: new_fragments.iter().map(Fragment::from).collect(),
+                        rewritten_indices: Vec::new(),
                     }]
                 };
                 Operation::Rewrite { groups }
@@ -576,6 +634,31 @@ impl TryFrom<&pb::Transaction> for Transaction {
     }
 }
 
+impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
+    type Error = Error;
+
+    fn try_from(message: &pb::transaction::rewrite::RewrittenIndex) -> Result<Self> {
+        Ok(Self {
+            old_id: message
+                .old_id
+                .as_ref()
+                .map(Uuid::try_from)
+                .ok_or_else(|| Error::IO {
+                    message: "required field (old_id) missing from message".to_string(),
+                    location: location!(),
+                })??,
+            new_id: message
+                .new_id
+                .as_ref()
+                .map(Uuid::try_from)
+                .ok_or_else(|| Error::IO {
+                    message: "required field (new_id) missing from message".to_string(),
+                    location: location!(),
+                })??,
+        })
+    }
+}
+
 impl TryFrom<&pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
     type Error = Error;
 
@@ -583,6 +666,11 @@ impl TryFrom<&pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
         Ok(Self {
             old_fragments: message.old_fragments.iter().map(Fragment::from).collect(),
             new_fragments: message.new_fragments.iter().map(Fragment::from).collect(),
+            rewritten_indices: message
+                .rewritten_indices
+                .iter()
+                .map(RewrittenIndex::try_from)
+                .collect::<Result<_>>()?,
         })
     }
 }
@@ -654,6 +742,15 @@ impl From<&Transaction> for pb::Transaction {
     }
 }
 
+impl From<&RewrittenIndex> for pb::transaction::rewrite::RewrittenIndex {
+    fn from(value: &RewrittenIndex) -> Self {
+        Self {
+            old_id: Some((&value.old_id).into()),
+            new_id: Some((&value.new_id).into()),
+        }
+    }
+}
+
 impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
     fn from(value: &RewriteGroup) -> Self {
         Self {
@@ -666,6 +763,11 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
                 .new_fragments
                 .iter()
                 .map(pb::DataFragment::from)
+                .collect(),
+            rewritten_indices: value
+                .rewritten_indices
+                .iter()
+                .map(|rewritten| rewritten.into())
                 .collect(),
         }
     }
@@ -712,6 +814,7 @@ mod tests {
                 groups: vec![RewriteGroup {
                     old_fragments: vec![fragment0.clone()],
                     new_fragments: vec![fragment1.clone()],
+                    rewritten_indices: Vec::new(),
                 }],
             },
             Operation::ReserveFragments { num_fragments: 3 },
@@ -770,6 +873,7 @@ mod tests {
                     groups: vec![RewriteGroup {
                         old_fragments: vec![fragment1.clone()],
                         new_fragments: vec![fragment0.clone()],
+                        rewritten_indices: Vec::new(),
                     }],
                 },
                 [false, true, false, true, true, false, false],
@@ -780,6 +884,7 @@ mod tests {
                     groups: vec![RewriteGroup {
                         old_fragments: vec![fragment0.clone(), fragment2.clone()],
                         new_fragments: vec![fragment0.clone()],
+                        rewritten_indices: Vec::new(),
                     }],
                 },
                 [false, true, true, true, true, true, false],
@@ -830,6 +935,7 @@ mod tests {
                 old_fragments: vec![Fragment::new(1), Fragment::new(2)],
                 // These two fragments were previously reserved
                 new_fragments: vec![Fragment::new(15), Fragment::new(16)],
+                rewritten_indices: Vec::new(),
             },
             // These are not contiguous, so they will be inserted at the end.
             RewriteGroup {
@@ -837,6 +943,7 @@ mod tests {
                 // We pretend this id was not reserved.  Does not happen in practice today
                 // but we want to leave the door open.
                 new_fragments: vec![Fragment::new(0)],
+                rewritten_indices: Vec::new(),
             },
         ];
 
@@ -848,7 +955,6 @@ mod tests {
             &rewrite_groups,
             &mut fragment_id,
             version,
-            15..17,
         )
         .unwrap();
 

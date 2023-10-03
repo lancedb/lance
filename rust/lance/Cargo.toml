@@ -52,7 +52,8 @@ tokio = { workspace = true }
 url = "2.3"
 rand = { version = "0.8.3", features = ["small_rng"] }
 futures = { workspace = true }
-uuid = { version = "1.2", features = ["v4"] }
+uuid = { version = "1.2", features = ["v4", "serde"] }
+path-absolutize = "3.0.14"
 shellexpand = "3.0.0"
 arrow = { version = "43.0.0", features = ["prettyprint"] }
 num_cpus = "1.0"

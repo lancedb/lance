@@ -22,7 +22,6 @@ use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use chrono::Duration;
 use lance::arrow::as_fixed_size_list_array;
-use lance::dataset::transaction::RewriteGroup;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, scanner::Scanner as LanceScanner,
     transaction::Operation as LanceOperation, Dataset as LanceDataset, ReadParams, Version,
@@ -116,19 +115,6 @@ impl Operation {
             deleted_fragment_ids,
             predicate,
         };
-        Ok(Self(op))
-    }
-
-    #[staticmethod]
-    fn rewrite(groups: Vec<(Vec<FragmentMetadata>, Vec<FragmentMetadata>)>) -> PyResult<Self> {
-        let groups = groups
-            .into_iter()
-            .map(|(old_fragments, new_fragments)| RewriteGroup {
-                old_fragments: into_fragments(old_fragments),
-                new_fragments: into_fragments(new_fragments),
-            })
-            .collect::<Vec<_>>();
-        let op = LanceOperation::Rewrite { groups };
         Ok(Self(op))
     }
 

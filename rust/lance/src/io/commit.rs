@@ -34,7 +34,6 @@
 //! alternative to [CommitHandler].
 
 use std::future;
-use std::ops::Range;
 use std::sync::Arc;
 use std::{fmt::Debug, sync::atomic::AtomicBool};
 
@@ -407,24 +406,15 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
     }
 }
 
-pub const NO_RESERVED_FRAGMENTS: Range<u64> = 0..0;
-
 #[derive(Debug, Clone)]
 pub struct CommitConfig {
     pub num_retries: u32,
-    // Fragment ids that have been previously reserved.  This is
-    // currently only used for rewrite operations but may be used
-    // for other operations in the future.
-    pub reserved_fragment_ids: Range<u64>,
     // TODO: add isolation_level
 }
 
 impl Default for CommitConfig {
     fn default() -> Self {
-        Self {
-            num_retries: 5,
-            reserved_fragment_ids: NO_RESERVED_FRAGMENTS,
-        }
+        Self { num_retries: 5 }
     }
 }
 
@@ -496,13 +486,8 @@ pub(crate) async fn commit_new_dataset(
 ) -> Result<Manifest> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
-    let (mut manifest, indices) = transaction.build_manifest(
-        None,
-        vec![],
-        &transaction_file,
-        write_config,
-        NO_RESERVED_FRAGMENTS,
-    )?;
+    let (mut manifest, indices) =
+        transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
 
     write_manifest_file(
         object_store,
@@ -683,7 +668,6 @@ pub(crate) async fn commit_transaction(
                 dataset.load_indices().await?,
                 &transaction_file,
                 write_config,
-                commit_config.reserved_fragment_ids.clone(),
             )?,
         };
 

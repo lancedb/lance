@@ -98,6 +98,15 @@ message Transaction {
     // These fragments IDs are not yet assigned.
     repeated DataFragment new_fragments = 2;
 
+    // During a rewrite an index may be rewritten.  We only serialize the UUID
+    // since a rewrite should not change the other index parameters.
+    message RewrittenIndex {
+      // The id of the index that will be replaced
+      UUID old_id = 1;
+      // the id of the new index
+      UUID new_id = 2;
+    }
+
     // A group of rewrite files that are all part of the same rewrite.
     message RewriteGroup {
       // The old fragment that is being replaced
@@ -106,8 +115,10 @@ message Transaction {
       repeated DataFragment old_fragments = 1;
       // The new fragment
       //
-      // This fragment ID is not yet assigned.
+      // The ID should have been reserved by an earlier
+      // reserve operation
       repeated DataFragment new_fragments = 2;
+      repeated RewrittenIndex rewritten_indices = 3;
     }
 
     repeated RewriteGroup groups = 3;

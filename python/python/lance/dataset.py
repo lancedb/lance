@@ -1098,38 +1098,6 @@ class LanceOperation:
             )
 
     @dataclass
-    class Rewrite(BaseOperation):
-        """
-        Operation that rewrites fragments but does not change the data within them.
-
-        This is for rearranging the data.
-
-        The data are grouped, such that each group contains the old fragments
-        and the new fragments those are rewritten into.
-        """
-
-        groups: Iterable[RewriteGroup]
-
-        @dataclass
-        class RewriteGroup:
-            old_fragments: Iterable[FragmentMetadata]
-            new_fragments: Iterable[FragmentMetadata]
-
-            def __post_init__(self):
-                LanceOperation._validate_fragments(self.old_fragments)
-                LanceOperation._validate_fragments(self.new_fragments)
-
-        def _to_inner(self):
-            groups = [
-                (
-                    [f._metadata for f in g.old_fragments],
-                    [f._metadata for f in g.new_fragments],
-                )
-                for g in self.groups
-            ]
-            return _Operation.rewrite(groups)
-
-    @dataclass
     class Merge(BaseOperation):
         """
         Operation that adds columns. Unlike Overwrite, this should not change
