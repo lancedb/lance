@@ -41,7 +41,7 @@ use datafusion::common::ScalarValue;
 use num_traits::bounds::Bounded;
 
 /// Max number of bytes that are included in statistics for binary columns.
-const BINARY_PREFIX_LENGTH: usize = 16;
+const BINARY_PREFIX_LENGTH: usize = 64;
 
 /// Statistics for a single column chunk.
 #[derive(Debug, PartialEq)]
@@ -49,11 +49,9 @@ pub struct StatisticsRow {
     /// Number of nulls in this column chunk.
     pub(crate) null_count: ScalarValue,
     /// Minimum value in this column chunk, if any
-    // pub(crate) min_value: Option<Box<dyn Array>>,
     pub(crate) min_value: ScalarValue,
     /// Maximum value in this column chunk, if any
     pub(crate) max_value: ScalarValue,
-    // pub(crate) max_value: Option<Box<dyn Array>>,
 }
 
 fn get_statistics<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> StatisticsRow
@@ -201,7 +199,7 @@ fn get_decimal_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 }
 
 /// Truncate a UTF8 slice to the longest prefix that is still a valid UTF8 string, while being less than `length` bytes.
-fn truncate_utf8(data: &str, length: usize) -> Option<Vec<u8>> {
+fn truncate_utf8(data: &str, length: usize) -> Option<&str> {
     // We return values like that at an earlier stage in the process.
     assert!(data.len() >= length);
     let mut char_indices = data.char_indices();
@@ -210,7 +208,7 @@ fn truncate_utf8(data: &str, length: usize) -> Option<Vec<u8>> {
     while let Some((idx, c)) = char_indices.next_back() {
         let split_point = idx + c.len_utf8();
         if split_point <= length {
-            return data.as_bytes()[0..split_point].to_vec().into();
+            return Some(data[0..split_point]);
         }
     }
 
@@ -296,9 +294,9 @@ fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         total_count += array.len() as i64;
         array.iter().for_each(|value| {
             if let Some(value) = value {
-                let value = value.as_bytes();
-                if let Some(Ordering::Greater) = value.partial_cmp(max_value.as_slice()) {
-                    max_value = value.to_vec();
+                let value = truncate_utf8(value);
+                if let Some(Ordering::Greater) = value.partial_cmp(max_value)) {
+                    max_value = value;
                 }
                 if let Some(Ordering::Less) = value.partial_cmp(min_value.as_slice()) {
                     min_value = value.to_vec();
@@ -316,11 +314,8 @@ fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         };
     }
 
-    if max_value.len() > BINARY_PREFIX_LENGTH {
-        max_value = truncate_max_value(&max_value);
-    }
-    if min_value.len() > BINARY_PREFIX_LENGTH {
-        min_value = truncate_min_value(&min_value);
+    if let Some(max_value) = &mut max_value {
+        max_value = increment_utf8(max_value);
     }
     let min_value = str::from_utf8(&min_value).unwrap();
     let max_value = str::from_utf8(&max_value).unwrap();
@@ -401,6 +396,8 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         null_count: ScalarValue::Int64(Some(0)),
         min_value: if false_present {
             ScalarValue::Boolean(Some(false))
+        } else if true_present {
+            ScalarValue::Boolean(Some(true))
         } else {
             ScalarValue::Boolean(None)
         },
