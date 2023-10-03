@@ -192,7 +192,9 @@ def test_image_arrays(tmp_path: Path):
     )
 
     assert test_tensor.shape == (n, 1, 1, 4)
-    assert tf.math.reduce_all(tensor_image_array.to_tf() == test_tensor)
+    assert tf.math.reduce_all(
+        tf.convert_to_tensor(tensor_image_array.to_numpy()) == test_tensor
+    )
     assert tensor_image_array.to_encoded().to_tensor() == tensor_image_array
 
     def png_encoder(images):

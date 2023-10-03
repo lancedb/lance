@@ -142,7 +142,7 @@ class ImageArray(pa.ExtensionArray):
 
 class ImageURIArray(ImageArray):
     """
-    Array of image URIs. URIs may represent local files or remote files in
+    Array of image URIs. URIs may represent local files or remote files on the web,
     S3 or GCS if they are accessible by the machine executing this.
     """
 
@@ -167,18 +167,11 @@ class ImageURIArray(ImageArray):
         <lance.arrow.ImageURIArray object at 0x...>
         ['file::///tmp/1.png']
         """
-        from urllib.parse import urlparse
 
         if not isinstance(uris, pa.StringArray):
             uris = pa.array((str(uri) for uri in uris), type=pa.string())
         else:
             raise TypeError("Cannot build a ImageURIArray from {}".format(type(uris)))
-
-        for uri in uris:
-            # This is to catch malformed URIs
-            parsed_uri = urlparse(uri.as_py())
-            if not parsed_uri.scheme and not parsed_uri.scheme == "":
-                raise ValueError("URI {} is not a valid URI".format(uri))
 
         return cls.from_storage(ImageURIType(), uris)
 
@@ -200,13 +193,36 @@ class ImageURIArray(ImageArray):
         <lance.arrow.EncodedImageArray object at 0x...>
         [...]
         """
+        from urllib.error import URLError
+        from urllib.parse import urlparse
+        from urllib.request import Request, urlopen
+
         from pyarrow import fs
+
+        def download(url):
+            req = Request(url)
+            try:
+                return urlopen(req).read()
+            except URLError as e:
+                if hasattr(e, "reason"):
+                    print("Failed to reach the server: ", e.reason)
+                elif hasattr(e, "code"):
+                    print(
+                        "The server could not fulfill the request. Error code: ", e.code
+                    )
 
         images = []
         for uri in self.storage:
-            filesystem, path = fs.FileSystem.from_uri(uri.as_py())
-            with filesystem.open_input_stream(path) as f:
-                images.append(f.read())
+            parsed_uri = urlparse(uri.as_py())
+
+            if parsed_uri.scheme in ("s3", "gs", "file", ""):
+                filesystem, path = fs.FileSystem.from_uri(uri.as_py())
+                with filesystem.open_input_stream(path) as f:
+                    images.append(f.read())
+            elif parsed_uri.scheme == "https":
+                images.append(download(uri))
+            else:
+                raise ValueError("Invalid URI", uri.as_py())
 
         return EncodedImageArray.from_storage(
             EncodedImageType(), pa.array(images, type=pa.binary())
