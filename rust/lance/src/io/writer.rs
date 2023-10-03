@@ -619,11 +619,8 @@ mod tests {
         types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
         DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
         DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int32Array,
-        Int64Array, NullArray, StringArray, TimestampMicrosecondArray, TimestampSecondArray,
-        UInt8Array,
-        DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int64Array,
-        ListArray, NullArray, StringArray, TimestampMicrosecondArray, TimestampSecondArray,
-        UInt8Array,
+        Int64Array, ListArray, NullArray, StringArray, TimestampMicrosecondArray,
+        TimestampSecondArray, UInt8Array,
     };
     use arrow_buffer::i256;
     use arrow_schema::{
@@ -898,9 +895,10 @@ mod tests {
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
-            .await
-            .unwrap();
+        let mut file_writer =
+            FileWriter::try_new(&store, &path, schema.clone(), &FileWriterOptions::default())
+                .await
+                .unwrap();
         file_writer.write(&[data_batch.clone()]).await.unwrap();
         file_writer.set_statistics(stats_batch);
         file_writer.finish().await.unwrap();
@@ -1069,7 +1067,7 @@ mod tests {
                 ])),
             ],
         )
-            .unwrap();
+        .unwrap();
         file_writer.write(&[batch1]).await.unwrap();
 
         let batch2 = RecordBatch::try_new(
@@ -1093,7 +1091,7 @@ mod tests {
                 ])),
             ],
         )
-            .unwrap();
+        .unwrap();
         file_writer.write(&[batch2]).await.unwrap();
 
         file_writer.finish().await.unwrap();
