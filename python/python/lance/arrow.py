@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 import json
+import os
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Union
 
@@ -191,7 +192,7 @@ class ImageURIArray(ImageArray):
         >>> uri_array = ImageURIArray.from_uris(uris)
         >>> uri_array.read_uris()
         <lance.arrow.EncodedImageArray object at 0x...>
-        [...]
+        ...
         """
         from urllib.error import URLError
         from urllib.parse import urlparse
@@ -211,18 +212,22 @@ class ImageURIArray(ImageArray):
                         "The server could not fulfill the request. Error code: ", e.code
                     )
 
+        allowed_schemes = ["s3", "gs", "file", ""]
+        if os.name == "nt":
+            allowed_schemes.append("d")
+
         images = []
         for uri in self.storage:
             parsed_uri = urlparse(uri.as_py())
 
-            if parsed_uri.scheme in ("s3", "gs", "file", ""):
+            if parsed_uri.scheme in allowed_schemes:
                 filesystem, path = fs.FileSystem.from_uri(uri.as_py())
                 with filesystem.open_input_stream(path) as f:
                     images.append(f.read())
             elif parsed_uri.scheme == "https":
                 images.append(download(uri))
             else:
-                raise ValueError("Invalid URI", uri.as_py())
+                raise ValueError("Invalid URI", parsed_uri.scheme, uri.as_py())
 
         return EncodedImageArray.from_storage(
             EncodedImageType(), pa.array(images, type=pa.binary())
