@@ -228,11 +228,10 @@ impl Transaction {
             Operation::Restore { .. } => false,
             // ReserveFragments is compatible with anything that doesn't reset the
             // max fragment id.
-            Operation::ReserveFragments { .. } => match &other.operation {
-                Operation::Overwrite { .. } => true,
-                Operation::Restore { .. } => true,
-                _ => false,
-            },
+            Operation::ReserveFragments { .. } => matches!(
+                &other.operation,
+                Operation::Overwrite { .. } | Operation::Restore { .. }
+            ),
             Operation::CreateIndex { .. } => match &other.operation {
                 Operation::Append { .. } => false,
                 // Indices are identified by UUIDs, so they shouldn't conflict.
@@ -263,13 +262,12 @@ impl Transaction {
                 }
                 _ => true,
             },
-            // Merge changes the schema, but preserves row ids, so the only operation
-            // it's compatible with is CreateIndex.
-            Operation::Merge { .. } => match &other.operation {
-                Operation::CreateIndex { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                _ => true,
-            },
+            // Merge changes the schema, but preserves row ids, so the only operations
+            // it's compatible with is CreateIndex and ReserveFragments.
+            Operation::Merge { .. } => !matches!(
+                &other.operation,
+                Operation::CreateIndex { .. } | Operation::ReserveFragments { .. }
+            ),
         }
     }
 
