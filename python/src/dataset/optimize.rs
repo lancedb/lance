@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use lance::dataset::optimize::{
-    commit_compaction, compact_files, plan_compaction, CompactionMetrics, CompactionOptions,
-    CompactionPlan, CompactionTask, RewriteResult,
+use lance::dataset::{
+    index::DatasetIndexRemapperOptions,
+    optimize::{
+        commit_compaction, compact_files, plan_compaction, CompactionMetrics, CompactionOptions,
+        CompactionPlan, CompactionTask, RewriteResult,
+    },
 };
 use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple};
 
@@ -459,7 +462,7 @@ impl PyCompaction {
             parse_compaction_options(options)
         })?;
         let mut new_ds = dataset.ds.as_ref().clone();
-        let fut = compact_files(&mut new_ds, opts);
+        let fut = compact_files(&mut new_ds, opts, None);
         let metrics = RT.block_on(None, async move {
             fut.await.map_err(|err| PyIOError::new_err(err.to_string()))
         })?;
@@ -530,7 +533,11 @@ impl PyCompaction {
         let dataset = Python::with_gil(|py| dataset_ref.borrow(py).clone());
         let rewrites: Vec<RewriteResult> = rewrites.into_iter().map(|r| r.0).collect();
         let mut new_ds = dataset.ds.as_ref().clone();
-        let fut = commit_compaction(&mut new_ds, rewrites);
+        let fut = commit_compaction(
+            &mut new_ds,
+            rewrites,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+        );
         let metrics = RT
             .block_on(None, fut)
             .map_err(|err| PyIOError::new_err(err.to_string()))?;

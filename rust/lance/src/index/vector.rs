@@ -33,6 +33,7 @@ mod utils;
 
 use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
 use lance_linalg::distance::*;
+use tracing::instrument;
 use uuid::Uuid;
 
 use self::{
@@ -212,6 +213,7 @@ fn is_diskann(stages: &[StageParams]) -> bool {
 }
 
 /// Build a Vector Index
+#[instrument(skip(dataset))]
 pub(crate) async fn build_vector_index(
     dataset: &Dataset,
     column: &str,
@@ -268,6 +270,7 @@ pub(crate) async fn build_vector_index(
     Ok(())
 }
 
+#[instrument(skip_all, fields(old_uuid = old_uuid.to_string(), new_uuid = new_uuid.to_string(), num_rows = mapping.len()))]
 pub(crate) async fn remap_vector_index(
     dataset: Arc<Dataset>,
     column: &str,
