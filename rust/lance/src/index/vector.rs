@@ -15,8 +15,8 @@
 //! Vector Index for Fast Approximate Nearest Neighbor (ANN) Search
 //!
 
-use std::any::Any;
 use std::sync::Arc;
+use std::{any::Any, collections::HashMap};
 
 use arrow_array::Float32Array;
 
@@ -33,9 +33,10 @@ mod traits;
 mod utils;
 
 use lance_linalg::distance::*;
+use uuid::Uuid;
 
 use self::{
-    ivf::{build_ivf_pq_index, IVFIndex, IvfBuildParams},
+    ivf::{build_ivf_pq_index, remap_index_file, IVFIndex, IvfBuildParams},
     pq::{PQBuildParams, PQIndex},
 };
 
@@ -266,6 +267,27 @@ pub(crate) async fn build_vector_index(
     }
 
     Ok(())
+}
+
+pub(crate) async fn remap_vector_index(
+    dataset: Arc<Dataset>,
+    column: &str,
+    old_uuid: &Uuid,
+    new_uuid: &Uuid,
+    mapping: &HashMap<u64, Option<u64>>,
+) -> Result<()> {
+    let old_index = open_index(dataset.clone(), column, &old_uuid.to_string()).await?;
+    old_index.check_can_remap()?;
+    let ivf_index: &IVFIndex = old_index.as_any().downcast_ref().unwrap();
+
+    remap_index_file(
+        dataset.as_ref(),
+        &old_uuid.to_string(),
+        &new_uuid.to_string(),
+        ivf_index,
+        mapping,
+    )
+    .await
 }
 
 /// Open the Vector index on dataset, specified by the `uuid`.

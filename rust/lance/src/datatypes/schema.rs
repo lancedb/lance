@@ -226,6 +226,18 @@ impl Schema {
         self.fields_pre_order().map(|f| f.id).collect()
     }
 
+    pub(crate) fn field_by_id(&self, id: i32) -> Option<&Field> {
+        for field in self.fields.iter() {
+            if field.id == id {
+                return Some(field);
+            }
+            if let Some(descendant) = field.field_by_id(id) {
+                return Some(descendant);
+            }
+        }
+        None
+    }
+
     pub(crate) fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
         for field in self.fields.as_mut_slice() {
             if field.id == id {

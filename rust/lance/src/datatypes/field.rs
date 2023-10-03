@@ -455,6 +455,18 @@ impl Field {
         self.children.iter_mut().for_each(Self::reset_id);
     }
 
+    pub(super) fn field_by_id(&self, id: i32) -> Option<&Self> {
+        for child in self.children.iter() {
+            if child.id == id {
+                return Some(child);
+            }
+            if let Some(descendant) = child.field_by_id(id) {
+                return Some(descendant);
+            }
+        }
+        None
+    }
+
     // Find any nested child with a specific field id
     pub(super) fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Self> {
         for child in self.children.as_mut_slice() {
