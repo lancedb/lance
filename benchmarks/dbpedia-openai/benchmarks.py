@@ -47,9 +47,8 @@ def ground_truth(
 
 
 def compute_recall(gt: np.ndarray, result: np.ndarray) -> float:
-    print(gt, result)
     recalls = [
-        np.isin(rst, gt_vector) / rst.shape[0] for (rst, gt_vector) in zip(result, gt)
+        np.isin(rst, gt_vector).sum() / rst.shape[0] for (rst, gt_vector) in zip(result, gt)
     ]
     return np.mean(recalls)
 
@@ -68,6 +67,13 @@ def main():
     parser.add_argument(
         "--ood", action="store_true", help="out of distribution query", default=False
     )
+    parser.add_argument(
+        "-m",
+        "--metric",
+        choices=["l2", "cosine"],
+        default="cosine",
+        help="distance metric type",
+    )
     args = parser.parse_args()
 
     ds = lance.dataset(args.uri)
@@ -79,16 +85,26 @@ def main():
         queries = ds.take(
             np.random.randint(0, ds.count_rows(), size=20), columns=["openai"]
         )["openai"].to_numpy()
-    gt = ground_truth(ds, queries, args.top_k, "cosine")
+    gt = ground_truth(ds, queries, args.top_k, args.metric)
 
     for ivf in [256, 512, 1024]:
         for pq in [32, 96, 192]:
             ds.create_index(
-                "openai", "IVF_PQ", num_partitions=ivf, num_sub_vectors=pq, replace=True
+                "openai",
+                "IVF_PQ",
+                num_partitions=ivf,
+                num_sub_vectors=pq,
+                replace=True,
+                metric=args.metric,
             )
             for refine in [None, 2, 5, 10, 50, 100]:
                 results = run_query(
-                    ds, queries, args.top_k, "cosine", refine_factor=refine, nprobes=ivf // 10,
+                    ds,
+                    queries,
+                    args.top_k,
+                    args.metric,
+                    refine_factor=refine,
+                    nprobes=ivf // 10,
                 )
                 recall = compute_recall(gt, results)
                 print(
