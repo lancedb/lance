@@ -1311,8 +1311,25 @@ class ScannerBuilder:
         refine_factor: Optional[int] = None,
         use_index: bool = True,
     ) -> ScannerBuilder:
+        column_field = self.ds.schema.field_by_name(column)
+        q_size = q.size if isinstance(q, np.ndarray) else len(q)
+
         if self.ds.schema.get_field_index(column) < 0:
             raise ValueError(f"Embedding column {column} not in dataset")
+        if not (
+            isinstance(
+                column_field.type, (pa.FloatingPointArray, np.ndarray, list, tuple)
+            )
+            or pa.types.is_fixed_size_list(column_field.type)
+        ):
+            raise TypeError(
+                f"Query column {column} must be a vector. Got {column_field.type}."
+            )
+        if q_size != column_field.type.list_size:
+            raise ValueError(
+                f"Query vector size {q_size} does not match index column size"
+                f" {column_field.type.list_size}"
+            )
         if isinstance(q, (np.ndarray, list, tuple)):
             q = np.array(q).astype("float64")  # workaround for GH-608
             q = pa.FloatingPointArray.from_pandas(q, type=pa.float32())
