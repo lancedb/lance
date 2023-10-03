@@ -11,6 +11,7 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+import json
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Union
 
@@ -61,6 +62,8 @@ class FixedShapeImageTensorType(pa.ExtensionType):
     def __init__(self, arrow_type, shape):
         self.shape = shape
         self.arrow_type = arrow_type
+        assert len(shape) > 0
+
         length = 1
         for dim in shape:
             length *= dim
@@ -72,17 +75,11 @@ class FixedShapeImageTensorType(pa.ExtensionType):
         )
 
     def __arrow_ext_serialize__(self):
-        import json
-
-        serialized = json.dumps(
-            {"shape": self.shape, "parent_type": "FixedShapeImageTensorType"}
-        ).encode()
+        serialized = json.dumps({"shape": self.shape}).encode()
         return serialized
 
     @classmethod
     def __arrow_ext_deserialize__(cls, storage_type, serialized):
-        import json
-
         deserialized = json.loads(serialized.decode())
         return FixedShapeImageTensorType(storage_type.value_type, deserialized["shape"])
 
@@ -225,6 +222,13 @@ class EncodedImageArray(ImageArray):
 
     import numpy as np
 
+    def __repr__(self):
+        return "<lance.arrow.%s object at 0x%016x>\n%s" % (
+            type(self).__name__,
+            id(self),
+            repr(self.to_pylist()[0][:30]),
+        )
+
     def to_tensor(
         self, decoder: Optional[Callable[[pa.BinaryArray], np.ndarray]] = None
     ):
@@ -253,7 +257,7 @@ class EncodedImageArray(ImageArray):
         [[42, 42, 42, 255]]
         """
         import numpy as np
-        
+
         if not hasattr(pa, "FixedShapeTensorType"):
             raise NotImplementedError("This function requires PyArrow >= 12.0.0")
 
@@ -314,39 +318,27 @@ class FixedShapeImageTensorArray(ImageArray):
     Array of fixed shape tensors representing image pixels.
     """
 
-    def _to_numpy_ndarray(self):
-        ext_type = pa.fixed_shape_tensor(self.storage.type.value_type, self.type.shape)
-        tensor_array = pa.ExtensionArray.from_storage(ext_type, self.storage)
-        return tensor_array.to_numpy_ndarray()
-
-    def to_tf(self):
+    def to_numpy(self):
         """
-        Convert FixedShapeImageTensorArray to a tensorflow.Tensor.
+        Convert FixedShapeImageTensorArray to a numpy.ndarray.
 
         Returns
         -------
-        tf.Tensor
-            Tensor of images
+        numpy.ndarray
+            Array of images
 
         Examples
         --------
-        >>> import numpy as np
-        >>> arr = np.array([[[[42, 42, 42, 255]]]], dtype=np.uint8)
-        >>> arrow_type = pa.from_numpy_dtype(arr.dtype)
-        >>> shape = arr.shape[1:]
-        >>> tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(arr)
-        >>> tensor_image_array = FixedShapeImageTensorArray.from_storage(
-        ... FixedShapeImageTensorType(arrow_type, shape), tensor_array.storage)
-        >>> tensor_image_array.to_tf()
-        <tf.Tensor: shape=(1, 1, 1, 4), dtype=uint8, numpy=array([[[[ 42,  42,  42, 255\
-]]]], dtype=uint8)>
-        """
-        try:
-            import tensorflow as tf
-        except ImportError:
-            raise ImportError("Cannot convert to tf.Tensor without tensorflow")
 
-        return tf.convert_to_tensor(self._to_numpy_ndarray())
+        >>> import os
+        >>> uris = [os.path.join(os.path.dirname(__file__), "../tests/images/1.png")]
+        >>> tensor_image_array = ImageURIArray.from_uris(uris).read_uris().to_tensor()
+        >>> tensor_image_array.to_numpy()
+        array([[[[ 42,  42,  42, 255]]]], dtype=uint8)
+        """
+        ext_type = pa.fixed_shape_tensor(self.storage.type.value_type, self.type.shape)
+        tensor_array = pa.ExtensionArray.from_storage(ext_type, self.storage)
+        return tensor_array.to_numpy_ndarray()
 
     def to_encoded(self, encoder=None):
         """
@@ -382,10 +374,10 @@ class FixedShapeImageTensorArray(ImageArray):
             from PIL import Image
 
             encoded_images = []
-            buf = io.BytesIO()
             for y in x:
-                Image.fromarray(y).save(buf, format="PNG")
-                encoded_images.append(buf.getvalue())
+                with io.BytesIO() as buf:
+                    Image.fromarray(y).save(buf, format="PNG")
+                    encoded_images.append(buf.getvalue())
             return pa.array(encoded_images, type=pa.binary())
 
         def tensorflow_encoder(x):
@@ -415,7 +407,7 @@ class FixedShapeImageTensorArray(ImageArray):
                 )
 
         return EncodedImageArray.from_storage(
-            EncodedImageType(), encoder(self._to_numpy_ndarray())
+            EncodedImageType(), encoder(self.to_numpy())
         )
 
 

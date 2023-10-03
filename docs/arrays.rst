@@ -120,18 +120,25 @@ them as a new :class:`lance.arrow.EncodedImageArray` object.
 EncodedImage
 ------------
 
-:class:`lance.arrow.EncodedImageArray` is an Arrow extension array that stores
-jpeg/png/gif/bmp encoded images as :class:`pyarrow.BinaryArray`. It can be created by
-calling :func:`lance.arrow.ImageURIArray.read_uris` or
-:func:`lance.arrow.ImageTensorArray.to_encoded` or directly from
-:class:`pyarrow.BinaryArray`.
-It provides a :func:`lance.arrow.EncodedImageArray.image_to_tensor` method that will
-decode encoded images and return them as :class:`lance.arrow.FixedShapeImageTensorArray`.
+:class:`lance.arrow.EncodedImageArray` is an array that stores jpeg and png images in
+their encoded and compressed representation as they would appear written on disk.
+Use this array when you want to manipulate images in their compressed format such as
+when you're reading them from disk or embedding them into HTML.
+
+It can be created by calling :func:`lance.arrow.ImageURIArray.read_uris` on an existing
+:class:`lance.arrow.ImageURIArray`. This will read the referenced images into memory.
+It can also be created by calling :func:`lance.arrow.ImageArray.from_array` and passing
+it an array of encoded images already read into :class:`pyarrow.BinaryArray` or by
+calling :func:`lance.arrow.ImageTensorArray.to_encoded`.
+
+A :func:`lance.arrow.EncodedImageArray.image_to_tensor` method is provided to decode
+encoded images and return them as :class:`lance.arrow.FixedShapeImageTensorArray`, from
+which they can be converted to numpy arrays or TensorFlow tensors.
 For decoding images, it will first attempt to use a decoder provided via the optional
 function parameter. If decoder is not provided it will attempt to use
 `Pillow <https://pillow.readthedocs.io/en/stable/>`_ and
 `tensorflow <https://www.tensorflow.org/api_docs/python/tf/io/decode_image>`_ in that
-order. If neither library is available it will raise an exception.
+order. If neither library or custom decoder is available an exception will be raised.
 
 .. testcode::
 
@@ -159,17 +166,26 @@ order. If neither library is available it will raise an exception.
 FixedShapeImageTensor
 ---------------------
 
-:class:`lance.arrow.FixedShapeImageTensorArray` is an Arrow extension array that stores
-images stored as a :class:`pyarrow.FixedShapeTensorArray`. It can be created by calling
-:func:`lance.arrow.EncodedImageArray.image_to_tensor`. It provides methods for converting
-to TensorFlow (:func:`lance.arrow.FixedShapeImageTensorArray.tf`) and
-to :class:`lance.arrow.EncodedImageArray`
-(:func:`lance.arrow.FixedShapeImageTensorArray.to_encoded`).
-:func:`lance.arrow.FixedShapeImageTensorArray.to_encoded` will encode using provided
-custom encoder passed to the method. If encoder is not provided it will attempt to use
+:class:`lance.arrow.FixedShapeImageTensorArray` is an array that stores images as
+tensors where each individual pixel is represented as a numeric value. Typically images
+are stored as 3 dimensional tensors shaped (height, width, channels). In color images
+each pixel is represented by three values (channels) as per
+`RGB color model <https://en.wikipedia.org/wiki/RGB_color_model>`_.
+Images from this array can be read out as numpy arrays individually or stacked together
+into a single 4 dimensional numpy array shaped (batch_size, height, width, channels).
+
+It can be created by calling :func:`lance.arrow.EncodedImageArray.image_to_tensor` on a
+previously existing :class:`lance.arrow.EncodedImageArray`. This will decode encoded
+images and return them as a :class:`lance.arrow.FixedShapeImageTensorArray`. It can also be
+created by calling :func:`lance.arrow.ImageArray.from_array` and passing in a
+:class:`pyarrow.FixedShapeTensorArray`.
+
+It can be encoded into to :class:`lance.arrow.EncodedImageArray` by calling
+:func:`lance.arrow.FixedShapeImageTensorArray.to_encoded` and passing custom encoder
+If encoder is not provided it will attempt to use
 `tensorflow <https://www.tensorflow.org/api_docs/python/tf/io/encode_png>`_ and
-`Pillow <https://pillow.readthedocs.io/en/stable/>`_ in that order. Provided encoders will
-be encode to PNG. If neither library is available it will raise an exception.
+`Pillow <https://pillow.readthedocs.io/en/stable/>`_ in that order. Default encoders will
+encode to PNG. If neither library is available it will raise an exception.
 
 .. testcode::
 
@@ -185,14 +201,11 @@ be encode to PNG. If neither library is available it will raise an exception.
 
     uris = [os.path.join(os.path.dirname(__file__), "images/1.png")]
     tensor_images = ImageURIArray.from_uris(uris).read_uris().image_to_tensor()
-    print(tensor_images.to_tf())
     print(tensor_images.to_encoded())
     print(tensor_images.to_encoded(jpeg_encoder))
 
 .. testoutput::
 
-    <tf.Tensor: shape=(1, 1, 1, 4), dtype=uint8, numpy=
-    array([[[[ 42,  42,  42, 255]]]], dtype=uint8)>
     <lance.arrow.EncodedImageArray object at 0x...>
     [b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00...']
     <lance.arrow.EncodedImageArray object at 0x00007f8d90b91b40>
