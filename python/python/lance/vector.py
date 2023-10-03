@@ -15,8 +15,9 @@
 
 from typing import Optional, Union
 
-import numpy as np
 import pyarrow as pa
+
+from .dependencies import numpy as np
 
 
 def _normalize_vectors(vectors, ndim):
@@ -37,7 +38,7 @@ def _validate_ndim(values, ndim):
 
 
 def vec_to_table(
-    data: Union[dict, list, np.ndarray],
+    data: Union[dict, list, "np.ndarray"],
     names: Optional[Union[str, list]] = None,
     ndim: Optional[int] = None,
     check_ndim: bool = True,

@@ -20,12 +20,10 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterator, Optional, Union
 
-try:
-    import pandas as pd
-except ImportError:
-    pd = None
 import pyarrow as pa
 
+from .dependencies import _check_for_pandas
+from .dependencies import pandas as pd
 from .lance import _Fragment
 from .lance import _FragmentMetadata as _FragmentMetadata
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
@@ -175,7 +173,7 @@ class LanceFragment(pa.dataset.Fragment):
         -------
         FragmentMetadata
         """
-        if pd and isinstance(data, pd.DataFrame):
+        if _check_for_pandas(data) and isinstance(data, pd.DataFrame):
             reader = pa.Table.from_pandas(data, schema=schema).to_reader()
         elif isinstance(data, pa.Table):
             reader = data.to_reader()

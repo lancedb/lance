@@ -1,14 +1,15 @@
 import os
 
-import numpy.random
 import pytest
-
-# Make sure we have a consistent seed
-numpy.random.seed(42)
 
 
 @pytest.fixture(autouse=True)
 def doctest_setup(monkeypatch, tmpdir):
+    # Make sure we have a consistent seed
+    import numpy.random
+
+    numpy.random.seed(42)
+
     # disable color for doctests so we don't have to include
     # escape codes in docstrings
     monkeypatch.setitem(os.environ, "NO_COLOR", "1")

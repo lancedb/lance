@@ -15,33 +15,26 @@
 from datetime import datetime, timedelta
 from typing import Literal, Optional, Union
 
-import numpy as np
 import pyarrow as pa
 
+from .dependencies import _PANDAS_INSTALLED, _check_for_numpy, _check_for_pandas
+from .dependencies import numpy as np
+from .dependencies import pandas as pd
 from .lance import _KMeans
 
-try:
-    import pandas as pd
+ts_types = Union[datetime, "pd.Timestamp", str]
 
-    ts_types = Union[datetime, pd.Timestamp, str]
-except ImportError:
-    pd = None
-    ts_types = Union[datetime, str]
-
-
-try:
-    from pyarrow import FixedShapeTensorType
-
-    CENTROIDS_TYPE = FixedShapeTensorType
-    has_fixed_shape_tensor = True
-except ImportError:
-    has_fixed_shape_tensor = False
-    CENTROIDS_TYPE = pa.FixedSizeListType
+has_fixed_shape_tensor = hasattr(pa, "FixedShapeTensorType")
+CENTROIDS_TYPE = (
+    pa.FixedShapeTensorType if has_fixed_shape_tensor else pa.FixedSizeListType
+)
 
 
 def sanitize_ts(ts: ts_types) -> datetime:
     """Returns a python datetime object from various timestamp input types."""
-    if pd and isinstance(ts, str):
+    if _PANDAS_INSTALLED and isinstance(ts, str):
+        import pandas as pd
+
         ts = pd.to_datetime(ts).to_pydatetime()
     elif isinstance(ts, str):
         try:
@@ -50,7 +43,7 @@ def sanitize_ts(ts: ts_types) -> datetime:
             raise ValueError(
                 f"Failed to parse timestamp string {ts}. Try installing Pandas."
             )
-    elif pd and isinstance(ts, pd.Timestamp):
+    elif _check_for_pandas(ts) and isinstance(ts, pd.Timestamp):
         ts = ts.to_pydatetime()
     elif not isinstance(ts, datetime):
         raise TypeError(f"Unrecognized version timestamp {ts} of type {type(ts)}")
@@ -146,7 +139,7 @@ class KMeans:
                     f"got {len(data.type.shape)}-D"
                 )
             return self._to_fixed_size_list(data.storage)
-        elif isinstance(data, np.ndarray):
+        elif _check_for_numpy(data) and isinstance(data, np.ndarray):
             if len(data.shape) != 2:
                 raise ValueError(
                     f"Numpy array must be a 2-D array, got {len(data.shape)}-D"
@@ -160,7 +153,8 @@ class KMeans:
             raise ValueError("Data must be a FixedSizeListArray, Tensor or numpy array")
 
     def fit(
-        self, data: Union[pa.FixedSizeListArray, "pa.FixedShapeTensorArray", np.ndarray]
+        self,
+        data: Union[pa.FixedSizeListArray, "pa.FixedShapeTensorArray", "np.ndarray"],
     ):
         """Fit the model to the data.
 
@@ -173,7 +167,8 @@ class KMeans:
         self._kmeans.fit(arr)
 
     def predict(
-        self, data: Union[pa.FixedSizeListArray, "pa.FixedShapeTensorArray", np.ndarray]
+        self,
+        data: Union[pa.FixedSizeListArray, "pa.FixedShapeTensorArray", "np.ndarray"],
     ) -> pa.UInt32Array:
         """Predict the cluster for each vector in the data."""
         arr = self._to_fixed_size_list(data)

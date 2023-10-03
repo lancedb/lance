@@ -17,14 +17,10 @@ from pathlib import Path
 from typing import Optional, Union
 
 from lance.commit import CommitLock
+from lance.dependencies import pandas as pd
 
-try:
-    import pandas as pd
+ts_types = Union[datetime, "pd.Timestamp", str]
 
-    ts_types = Union[datetime, pd.Timestamp, str]
-except ImportError:
-    pd = None
-    ts_types = Union[datetime, str]
 
 from .dataset import (
     LanceDataset,

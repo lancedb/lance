@@ -25,7 +25,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.dataset
 from lance.optimize import Compaction
@@ -33,6 +32,9 @@ from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
 from .commit import CommitLock
+from .dependencies import _check_for_numpy, _check_for_pandas
+from .dependencies import numpy as np
+from .dependencies import pandas as pd
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import CleanupStats
 from .lance import CompactionMetrics as CompactionMetrics
@@ -40,26 +42,14 @@ from .lance import __version__ as __version__
 from .lance import _Dataset, _Operation, _Scanner, _write_dataset
 from .util import td_to_micros
 
-try:
-    import pandas as pd
-
-    ReaderLike = Union[
-        pd.Timestamp,
-        pa.Table,
-        pa.dataset.Dataset,
-        pa.dataset.Scanner,
-        Iterable[RecordBatch],
-        pa.RecordBatchReader,
-    ]
-except ImportError:
-    pd = None
-    ReaderLike = Union[
-        pa.Table,
-        pa.dataset.Dataset,
-        pa.dataset.Scanner,
-        Iterable[RecordBatch],
-        pa.RecordBatchReader,
-    ]
+ReaderLike = Union[
+    "pd.Timestamp",
+    pa.Table,
+    pa.dataset.Dataset,
+    pa.dataset.Scanner,
+    Iterable[RecordBatch],
+    pa.RecordBatchReader,
+]
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -643,7 +633,7 @@ class LanceDataset(pa.dataset.Dataset):
         metric: str = "L2",
         replace: bool = False,
         num_partitions: Optional[int] = None,
-        ivf_centroids: Optional[Union[np.ndarray, pa.FixedSizeListArray]] = None,
+        ivf_centroids: Optional[Union["np.ndarray", pa.FixedSizeListArray]] = None,
         num_sub_vectors: Optional[int] = None,
         **kwargs,
     ) -> LanceDataset:
@@ -764,7 +754,9 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["num_sub_vectors"] = num_sub_vectors
             if ivf_centroids is not None:
                 # User provided IVF centroids
-                if isinstance(ivf_centroids, np.ndarray):
+                if _check_for_numpy(ivf_centroids) and isinstance(
+                    ivf_centroids, np.ndarray
+                ):
                     if (
                         len(ivf_centroids.shape) != 2
                         or ivf_centroids.shape[0] != num_partitions
@@ -1304,7 +1296,7 @@ class ScannerBuilder:
     def nearest(
         self,
         column: str,
-        q: pa.FloatingPointArray | List[float] | np.ndarray,
+        q: pa.FloatingPointArray | List[float] | "np.ndarray",
         k: Optional[int] = None,
         metric: Optional[str] = None,
         nprobes: Optional[int] = None,
@@ -1312,13 +1304,15 @@ class ScannerBuilder:
         use_index: bool = True,
     ) -> ScannerBuilder:
         column_field = self.ds.schema.field_by_name(column)
-        q_size = q.size if isinstance(q, np.ndarray) else len(q)
+        q_size = q.size if _check_for_numpy(q) and isinstance(q, np.ndarray) else len(q)
 
         if self.ds.schema.get_field_index(column) < 0:
             raise ValueError(f"Embedding column {column} not in dataset")
         if not (
-            isinstance(
-                column_field.type, (pa.FloatingPointArray, np.ndarray, list, tuple)
+            isinstance(column_field.type, (pa.FloatingPointArray, list, tuple))
+            or (
+                _check_for_numpy(column_field.type)
+                and isinstance(column_field.type, np.ndarray)
             )
             or pa.types.is_fixed_size_list(column_field.type)
         ):
@@ -1330,9 +1324,13 @@ class ScannerBuilder:
                 f"Query vector size {q_size} does not match index column size"
                 f" {column_field.type.list_size}"
             )
-        if isinstance(q, (np.ndarray, list, tuple)):
+
+        if _check_for_numpy(np) and isinstance(q, np.ndarray):
             q = np.array(q).astype("float64")  # workaround for GH-608
             q = pa.FloatingPointArray.from_pandas(q, type=pa.float32())
+        elif isinstance(q, (list, tuple)):
+            q = pa.array(q, type=pa.float32())
+
         if not isinstance(q, pa.FloatingPointArray):
             raise TypeError("query vector must be list-like or pa.FloatingPointArray")
         if k is not None and int(k) <= 0:
@@ -1604,7 +1602,7 @@ def write_dataset(
 def _coerce_reader(
     data_obj: ReaderLike, schema: Optional[pa.Schema] = None
 ) -> pa.RecordBatchReader:
-    if pd and isinstance(data_obj, pd.DataFrame):
+    if _check_for_pandas(data_obj) and isinstance(data_obj, pd.DataFrame):
         return pa.Table.from_pandas(data_obj, schema=schema).to_reader()
     elif isinstance(data_obj, pa.Table):
         return data_obj.to_reader()
