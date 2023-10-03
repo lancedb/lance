@@ -14,6 +14,7 @@ def run_query(
     metric: str,
     *,
     refine_factor: int | None = None,
+    nprobes: int = 10,
     use_index: bool = True,
 ) -> list[list[str]]:
     results = []
@@ -25,6 +26,7 @@ def run_query(
                 "q": query,
                 "k": k,
                 "metric": metric,
+                "nprobes": nprobes,
                 "refine_factor": refine_factor,
                 "use_index": use_index,
             },
@@ -39,7 +41,17 @@ def ground_truth(
     top_k: int,
     metric: str,
 ) -> np.ndarray:
-    return run_query(dataset, queries, top_k, metric, refine_factor=None, use_index=False)
+    return run_query(
+        dataset, queries, top_k, metric, refine_factor=None, use_index=False
+    )
+
+
+def compute_recall(gt: np.ndarray, result: np.ndarray) -> float:
+    print(gt, result)
+    recalls = [
+        np.isin(rst, gt_vector) / rst.shape[0] for (rst, gt_vector) in zip(result, gt)
+    ]
+    return np.mean(recalls)
 
 
 def main():
@@ -50,25 +62,38 @@ def main():
         "--top-k",
         metavar="K",
         type=int,
-        default=10,
+        default=100,
         help="top k nearest neighbors",
+    )
+    parser.add_argument(
+        "--ood", action="store_true", help="out of distribution query", default=False
     )
     args = parser.parse_args()
 
     ds = lance.dataset(args.uri)
 
-    queries = np.random.rand(20, 1536)  # out of distribution
+    # queries = np.random.rand(20, 1536)  # out of distribution
+    if args.ood:
+        queries = np.random.rand(20, 1536) * 2 - 1  # make [-1, 1] distribubtion.
+    else:
+        queries = ds.take(
+            np.random.randint(0, ds.count_rows(), size=20), columns=["openai"]
+        )["openai"].to_numpy()
     gt = ground_truth(ds, queries, args.top_k, "cosine")
 
-    for ivf in [32, 128, 256, 1024]:
+    for ivf in [256, 512, 1024]:
         for pq in [32, 96, 192]:
             ds.create_index(
                 "openai", "IVF_PQ", num_partitions=ivf, num_sub_vectors=pq, replace=True
             )
-            for refine in [0, 2, 5, 10]:
-                results = run_query(ds, queries, args.top_k, "cosine", refine_factor=refine)
-                print(results)
-                print(f"IVF{ivf},PQ{pq}: refine={refine}, recall={0.0}")
+            for refine in [None, 2, 5, 10, 50, 100]:
+                results = run_query(
+                    ds, queries, args.top_k, "cosine", refine_factor=refine, nprobes=ivf // 10,
+                )
+                recall = compute_recall(gt, results)
+                print(
+                    f"IVF{ivf},PQ{pq}: refine={refine}, recall@{args.top_k}={recall:0.2f}"
+                )
 
 
 if __name__ == "__main__":
