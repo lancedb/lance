@@ -18,8 +18,8 @@ try:
     import torch
 except ImportError:
     pytest.skip(
-        "Tensorflow is not installed. Please install tensorflow to "
-        + "test lance.tf module.",
+        "Pytorch is not installed. Please install pytorch to "
+        + "test lance.torch module.",
         allow_module_level=True,
     )
 
