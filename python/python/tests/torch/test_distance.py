@@ -25,7 +25,7 @@ except ImportError:
 
 import numpy as np
 from lance.torch import preferred_device
-from lance.torch.distance import *
+from lance.torch.distance import cosine_distance, l2_distance
 
 device = preferred_device()
 
