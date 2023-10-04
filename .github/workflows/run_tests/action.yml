@@ -12,6 +12,8 @@ runs:
     working-directory: python
     shell: bash
     run: |
+      # Install cpu only pytorch
+      pip install torch --index-url https://download.pytorch.org/whl/cpu
       pip3 install $(ls target/wheels/pylance-*.whl)[tests]
   - name: Run python tests
     shell: bash
