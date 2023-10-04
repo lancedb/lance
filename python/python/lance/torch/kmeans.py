@@ -27,7 +27,9 @@ __all__ = ["KMeans"]
 
 
 # @torch.jit.script
-def _random_init(data: torch.Tensor, n: int, seed: Optional[int] = None) -> torch.Tensor:
+def _random_init(
+    data: torch.Tensor, n: int, seed: Optional[int] = None
+) -> torch.Tensor:
     if seed is not None:
         torch.random.manual_seed(seed)
     sample_idx = torch.randint(0, data.shape[0], (n,))
@@ -101,11 +103,12 @@ class KMeans:
             self.centroids = _random_init(data, self.k, self.seed)
 
         last_dist = 0
-        for _ in tqdm(range(self.max_iters)):
+        for i in tqdm(range(self.max_iters)):
             dist = self._fit_once(data)
             if (dist - last_dist) / dist < self.tolerance:
-                logging.info(f"KMeans::fit: early stop")
+                logging.info(f"KMeans::fit: early stop at iteration: {i}")
                 break
+            last_dist = dist
 
     def _fit_once(self, data) -> float:
         """Train KMean once and return the total distance."""
