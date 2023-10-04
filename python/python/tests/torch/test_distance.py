@@ -23,9 +23,9 @@ except ImportError:
         allow_module_level=True,
     )
 
-from lance.torch.distance import *
-from lance.torch import preferred_device
 import numpy as np
+from lance.torch import preferred_device
+from lance.torch.distance import *
 
 device = preferred_device()
 
