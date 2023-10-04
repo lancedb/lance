@@ -243,6 +243,36 @@ message Metadata {
   //   length = page_table[5][4][1];
   // ```
   uint64 page_table_position = 3;
+
+  message StatisticsMetadata {
+    // The schema of the statistics.
+    //
+    // This might be empty, meaning there are no statistics. It also might not 
+    // contain statistics for every field.
+    repeated Field schema = 1;
+
+    // The field ids of the statistics leaf fields.
+    //
+    // This plays a similar role to the `fields` field in the DataFile message.
+    // Each of these field ids corresponds to a field in the stats_schema. There
+    // is one per column in the stats page table.
+    repeated int32 fields = 2;
+
+    // The file position of the statistics page table
+    //
+    // The page table is a matrix of N x 2, where N = length of stats_fields. This is
+    // the same layout as the main page table, except there is always only one
+    // batch.
+    //
+    // For example, to get the stats column 5, we have:
+    // ```text
+    //   position = stats_page_table[5][0];
+    //   length = stats_page_table[5][1];
+    // ```
+	  uint64 page_table_position = 3;
+  }
+
+  StatisticsMetadata statistics = 4;
 } // Metadata
 
 // Supported encodings.

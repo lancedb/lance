@@ -13,7 +13,7 @@ use crate::{Error, Result};
 pub use fragment::*;
 pub use index::Index;
 pub use manifest::Manifest;
-pub use metadata::Metadata;
+pub use metadata::{Metadata, StatisticsMetadata};
 pub use page_table::{PageInfo, PageTable};
 use snafu::{location, Location};
 /// Protobuf definitions

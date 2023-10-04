@@ -177,6 +177,9 @@ pub struct FileReader {
 
     // deletion vector indicating which rows are deleting in the fragment
     deletion_vector: Option<Arc<DeletionVector>>,
+
+    /// Page table for statistics
+    stats_page_table: Arc<Option<PageTable>>,
 }
 
 impl std::fmt::Debug for FileReader {
@@ -214,26 +217,7 @@ impl FileReader {
         let object_reader = object_store.open(path).await?;
         let is_dataset = manifest.is_some();
 
-        let metadata = Self::load_from_cache(session, path, |_| async {
-            let file_size = object_reader.size().await?;
-            let begin = if file_size < object_store.block_size() {
-                0
-            } else {
-                file_size - object_store.block_size()
-            };
-            let tail_bytes = object_reader.get_range(begin..file_size).await?;
-            let metadata_pos = read_metadata_offset(&tail_bytes)?;
-
-            let metadata: Metadata = if metadata_pos < file_size - tail_bytes.len() {
-                // We have not read the metadata bytes yet.
-                read_struct(object_reader.as_ref(), metadata_pos).await?
-            } else {
-                let offset = tail_bytes.len() - (file_size - metadata_pos);
-                read_struct_from_buf(&tail_bytes.slice(offset..))?
-            };
-            Ok(metadata)
-        })
-        .await?;
+        let metadata = Self::read_metadata(object_reader.as_ref(), session).await?;
 
         // m is either
         // a ref if passed in as Some(&manifest), or
@@ -267,44 +251,57 @@ impl FileReader {
             None
         };
 
-        let page_table = Self::load_from_cache(session, path, |_| async {
-            // TODO: we should have a more efficient way to look up the fields
-            // present in a data file. We might want to include this info in the
-            // data file's metadata.
-            let field_ids = if let Some(fragment) = fragment.as_ref() {
-                Cow::Borrowed(
-                    &fragment
-                        .files
-                        .iter()
-                        .find(|f| path.to_string().ends_with(&f.path))
-                        .ok_or_else(|| Error::Internal {
-                            message: format!("File {} not found in fragment {:?}", path, fragment),
-                        })?
-                        .fields,
-                )
-            } else {
-                let max_id = manifest.schema.max_field_id().unwrap() as i32 + 1;
-                Cow::Owned((0..max_id).collect::<Vec<i32>>())
-            };
+        let page_table = async {
+            Self::load_from_cache(session, path, |_| async {
+                // TODO: we should have a more efficient way to look up the fields
+                // present in a data file. We might want to include this info in the
+                // data file's metadata.
+                let field_ids = if let Some(fragment) = fragment.as_ref() {
+                    Cow::Borrowed(
+                        &fragment
+                            .files
+                            .iter()
+                            .find(|f| path.to_string().ends_with(&f.path))
+                            .ok_or_else(|| Error::Internal {
+                                message: format!(
+                                    "File {} not found in fragment {:?}",
+                                    path, fragment
+                                ),
+                            })?
+                            .fields,
+                    )
+                } else {
+                    let max_id = manifest.schema.max_field_id().unwrap() as i32 + 1;
+                    Cow::Owned((0..max_id).collect::<Vec<i32>>())
+                };
 
-            PageTable::load(
-                object_reader.as_ref(),
-                metadata.page_table_position,
-                field_ids.len() as i32,
-                metadata.num_batches() as i32,
-                field_ids[0],
-            )
+                PageTable::load(
+                    object_reader.as_ref(),
+                    metadata.page_table_position,
+                    field_ids.len() as i32,
+                    metadata.num_batches() as i32,
+                    field_ids[0],
+                )
+                .await
+            })
             .await
-        })
-        .await?;
+        };
 
         let projection = manifest.schema.clone();
 
-        let deletion_vector = if let Some(fragment) = &fragment {
-            Self::load_deletion_vector(object_store, fragment, session).await?
-        } else {
-            None
+        let deletion_vector = async {
+            if let Some(fragment) = &fragment {
+                Self::load_deletion_vector(object_store, fragment, session).await
+            } else {
+                Ok(None)
+            }
         };
+
+        let stats_page_table = Self::read_stats_page_table(object_reader.as_ref(), session);
+
+        // Can concurrently load page tables and deletion vectors
+        let (page_table, deletion_vector, stats_page_table) =
+            futures::try_join!(page_table, deletion_vector, stats_page_table)?;
 
         Ok(Self {
             object_reader: object_reader.into(),
@@ -314,7 +311,63 @@ impl FileReader {
             fragment_id,
             with_row_id: false,
             deletion_vector,
+            stats_page_table,
         })
+    }
+
+    async fn read_metadata(
+        object_reader: &dyn ObjectReader,
+        session: Option<&Session>,
+    ) -> Result<Arc<Metadata>> {
+        Self::load_from_cache(session, object_reader.path(), |_| async {
+            let file_size = object_reader.size().await?;
+            let begin = if file_size < object_reader.block_size() {
+                0
+            } else {
+                file_size - object_reader.block_size()
+            };
+            let tail_bytes = object_reader.get_range(begin..file_size).await?;
+            let metadata_pos = read_metadata_offset(&tail_bytes)?;
+
+            let metadata: Metadata = if metadata_pos < file_size - tail_bytes.len() {
+                // We have not read the metadata bytes yet.
+                read_struct(object_reader, metadata_pos).await?
+            } else {
+                let offset = tail_bytes.len() - (file_size - metadata_pos);
+                read_struct_from_buf(&tail_bytes.slice(offset..))?
+            };
+            Ok(metadata)
+        })
+        .await
+    }
+
+    /// Get the statistics page table. This will read the metadata if it is not cached.
+    ///
+    /// The page table is cached.
+    async fn read_stats_page_table(
+        object_reader: &dyn ObjectReader,
+        session: Option<&Session>,
+    ) -> Result<Arc<Option<PageTable>>> {
+        // To prevent collisions, we cache this at a child path
+        Self::load_from_cache(session, &object_reader.path().child("stats"), |_| async {
+            let metadata = Self::read_metadata(object_reader, session).await?;
+
+            if let Some(stats_meta) = metadata.stats_metadata.as_ref() {
+                Ok(Some(
+                    PageTable::load(
+                        object_reader,
+                        stats_meta.page_table_position,
+                        stats_meta.leaf_field_ids.len() as i32,
+                        metadata.num_batches() as i32,
+                        0,
+                    )
+                    .await?,
+                ))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
     }
 
     /// Load some metadata about the fragment from the cache, if there is one.
@@ -472,6 +525,31 @@ impl FileReader {
 
         Ok(concat_batches(&schema, &batches)?)
     }
+
+    pub async fn read_page_stats(&self, projection: &Schema) -> Result<Option<RecordBatch>> {
+        if let Some(stats_page_table) = self.stats_page_table.as_ref() {
+            let arrays = futures::stream::iter(&projection.fields)
+                .map(|field| async move {
+                    read_array(
+                        self,
+                        field,
+                        0,
+                        stats_page_table,
+                        &ReadBatchParams::RangeFull,
+                    )
+                    .await
+                })
+                .buffered(num_cpus::get())
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            let schema = ArrowSchema::from(projection);
+            let batch = RecordBatch::try_new(Arc::new(schema), arrays)?;
+            Ok(Some(batch))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// Stream desired full batches from the file.
@@ -522,7 +600,7 @@ async fn read_batch(
 ) -> Result<RecordBatch> {
     // We box this because otherwise we get a higher-order lifetime error.
     let arrs = stream::iter(&schema.fields)
-        .map(|f| read_array(reader, f, batch_id, params))
+        .map(|f| async { read_array(reader, f, batch_id, &reader.page_table, params).await })
         .buffered(num_cpus::get() * 4)
         .try_collect::<Vec<_>>()
         .boxed();
@@ -590,6 +668,7 @@ async fn read_array(
     reader: &FileReader,
     field: &Field,
     batch_id: i32,
+    page_table: &PageTable,
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
     let data_type = field.data_type();
@@ -597,17 +676,23 @@ async fn read_array(
     use DataType::*;
 
     if data_type.is_fixed_stride() {
-        _read_fixed_stride_array(reader, field, batch_id, params).await
+        _read_fixed_stride_array(reader, field, batch_id, page_table, params).await
     } else {
         match data_type {
-            Null => read_null_array(reader, field, batch_id, params),
+            Null => read_null_array(field, batch_id, page_table, params),
             Utf8 | LargeUtf8 | Binary | LargeBinary => {
-                read_binary_array(reader, field, batch_id, params).await
+                read_binary_array(reader, field, batch_id, page_table, params).await
             }
-            Struct(_) => read_struct_array(reader, field, batch_id, params).await,
-            Dictionary(_, _) => read_dictionary_array(reader, field, batch_id, params).await,
-            List(_) => read_list_array::<Int32Type>(reader, field, batch_id, params).await,
-            LargeList(_) => read_list_array::<Int64Type>(reader, field, batch_id, params).await,
+            Struct(_) => read_struct_array(reader, field, batch_id, page_table, params).await,
+            Dictionary(_, _) => {
+                read_dictionary_array(reader, field, batch_id, page_table, params).await
+            }
+            List(_) => {
+                read_list_array::<Int32Type>(reader, field, batch_id, page_table, params).await
+            }
+            LargeList(_) => {
+                read_list_array::<Int64Type>(reader, field, batch_id, page_table, params).await
+            }
             _ => {
                 unimplemented!("{}", format!("No support for {data_type} yet"));
             }
@@ -634,9 +719,10 @@ async fn _read_fixed_stride_array(
     reader: &FileReader,
     field: &Field,
     batch_id: i32,
+    page_table: &PageTable,
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
-    let page_info = get_page_info(&reader.page_table, field, batch_id)?;
+    let page_info = get_page_info(page_table, field, batch_id)?;
 
     read_fixed_stride_array(
         reader.object_reader.as_ref(),
@@ -649,12 +735,12 @@ async fn _read_fixed_stride_array(
 }
 
 fn read_null_array(
-    reader: &FileReader,
     field: &Field,
     batch_id: i32,
+    page_table: &PageTable,
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
-    let page_info = get_page_info(&reader.page_table, field, batch_id)?;
+    let page_info = get_page_info(page_table, field, batch_id)?;
 
     let length_output = match params {
         ReadBatchParams::Indices(indices) => {
@@ -702,9 +788,10 @@ async fn read_binary_array(
     reader: &FileReader,
     field: &Field,
     batch_id: i32,
+    page_table: &PageTable,
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
-    let page_info = get_page_info(&reader.page_table, field, batch_id)?;
+    let page_info = get_page_info(page_table, field, batch_id)?;
 
     use crate::io::object_reader::read_binary_array;
     read_binary_array(
@@ -722,9 +809,10 @@ async fn read_dictionary_array(
     reader: &FileReader,
     field: &Field,
     batch_id: i32,
+    page_table: &PageTable,
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
-    let page_info = get_page_info(&reader.page_table, field, batch_id)?;
+    let page_info = get_page_info(page_table, field, batch_id)?;
     let data_type = field.data_type();
     let decoder = DictionaryDecoder::new(
         reader.object_reader.as_ref(),
@@ -747,12 +835,13 @@ async fn read_struct_array(
     reader: &FileReader,
     field: &Field,
     batch_id: i32,
+    page_table: &PageTable,
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
     // TODO: use tokio to make the reads in parallel.
     let mut sub_arrays: Vec<(FieldRef, ArrayRef)> = vec![];
     for child in field.children.as_slice() {
-        let arr = read_array(reader, child, batch_id, params).await?;
+        let arr = read_array(reader, child, batch_id, page_table, params).await?;
         sub_arrays.push((Arc::new(child.into()), arr));
     }
 
@@ -763,6 +852,7 @@ async fn take_list_array<T: ArrowNumericType>(
     reader: &FileReader,
     field: &Field,
     batch_id: i32,
+    page_table: &PageTable,
     positions: &PrimitiveArray<T>,
     indices: &UInt32Array,
 ) -> Result<ArrayRef>
@@ -786,6 +876,7 @@ where
                 reader,
                 &field.children[0],
                 batch_id,
+                page_table,
                 &(range.clone()).into(),
             )
             .await?,
@@ -813,6 +904,7 @@ async fn read_list_array<T: ArrowNumericType>(
     reader: &FileReader,
     field: &Field,
     batch_id: i32,
+    page_table: &PageTable,
     params: &ReadBatchParams,
 ) -> Result<ArrayRef>
 where
@@ -853,13 +945,20 @@ where
             positions.value(0).as_usize()..positions.value(positions.len() - 1).as_usize(),
         ),
         ReadBatchParams::Indices(indices) => {
-            return take_list_array(reader, field, batch_id, positions, indices).await;
+            return take_list_array(reader, field, batch_id, page_table, positions, indices).await;
         }
     };
 
     let start_position = positions.value(0);
     let offset_arr = subtract_scalar(positions, start_position)?;
-    let value_arrs = read_array(reader, &field.children[0], batch_id, &value_params).await?;
+    let value_arrs = read_array(
+        reader,
+        &field.children[0],
+        batch_id,
+        page_table,
+        &value_params,
+    )
+    .await?;
     let arr = try_new_generic_list_array(value_arrs, &offset_arr)?;
     Ok(Arc::new(arr) as ArrayRef)
 }
@@ -1404,7 +1503,7 @@ mod tests {
             field: &Field,
             params: ReadBatchParams,
         ) -> ArrayRef {
-            read_array(reader, field, 0, &params)
+            read_array(reader, field, 0, reader.page_table.as_ref(), &params)
                 .await
                 .expect("Error reading back the null array from file") as _
         }
@@ -1439,12 +1538,24 @@ mod tests {
 
         // raise error if take indices are out of bounds
         let params = ReadBatchParams::Indices(UInt32Array::from(vec![1, 9, 30, 72, 100]));
-        let arr = read_array(&reader, &schema.fields[1], 0, &params);
+        let arr = read_array(
+            &reader,
+            &schema.fields[1],
+            0,
+            reader.page_table.as_ref(),
+            &params,
+        );
         assert!(arr.await.is_err());
 
         // raise error if range indices are out of bounds
         let params = ReadBatchParams::RangeTo(..107);
-        let arr = read_array(&reader, &schema.fields[1], 0, &params);
+        let arr = read_array(
+            &reader,
+            &schema.fields[1],
+            0,
+            reader.page_table.as_ref(),
+            &params,
+        );
         assert!(arr.await.is_err());
     }
 
