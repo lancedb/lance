@@ -216,6 +216,16 @@ def test_image_arrays(tmp_path: Path):
     ):
         encoded_image_array.to_tensor()
 
+    pattern = r"(object at) 0x[\w\d]+(:?>)"
+    repl = r"\1 0x..\2"
+    assert re.sub(pattern, repl, encoded_image_array.__repr__()) == (
+        "<lance.arrow.EncodedImageArray object at 0x..>\n"
+        "[<tf.Tensor: shape=(1, 1, 4), dtype=uint8, numpy=array([[[ 42,  42,  42, "
+        "255]]], dtype=uint8)>, ..]\n"
+        "b'\\x89PNG\\r\\n\\x1a\\n\\x00\\x00\\x00\\rIHDR\\x00\\x00\\x00\\x01\\x00\\x00"
+        "\\x00\\x01\\x08\\x06\\x00\\x00\\x00\\x1f'"
+    )
+
 
 @requires_pyarrow_12
 def test_roundtrip_image_tensor(tmp_path: Path):

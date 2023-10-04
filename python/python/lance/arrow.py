@@ -244,9 +244,38 @@ class EncodedImageArray(ImageArray):
     import numpy as np
 
     def __repr__(self):
-        return "<lance.arrow.%s object at 0x%016x>\n%s" % (
+        def pillow_metadata_decoder(images):
+            import io
+
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(images[0].as_py()))
+            return img
+
+        def tensorflow_metadata_decoder(images):
+            import tensorflow as tf
+
+            img = tf.io.decode_image(images[0].as_py())
+            return img
+
+        decoders = (
+            ("tensorflow", tensorflow_metadata_decoder),
+            ("PIL", pillow_metadata_decoder),
+        )
+        decoder = None
+
+        for libname, metadata_decoder in decoders:
+            try:
+                __import__(libname)
+                decoder = metadata_decoder
+                break
+            except ImportError:
+                pass
+
+        return "<lance.arrow.%s object at 0x%016x>%s\n%s" % (
             type(self).__name__,
             id(self),
+            "\n[" + repr(decoder(self)) + ", ..]" if decoder else None,
             repr(self.to_pylist()[0][:30]),
         )
 
