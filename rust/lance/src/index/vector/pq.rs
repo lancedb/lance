@@ -185,7 +185,7 @@ impl PQIndex {
                         y2_table[idx]
                     })
                     .sum::<f32>();
-                1 - xy / (x_norm * y2.sqrt())
+                1.0 - xy / (x_norm * y2.sqrt())
             }),
         )))
     }
