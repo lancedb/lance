@@ -57,6 +57,7 @@ tests = [
     "ml_dtypes",
     "tensorflow",
     "semver",
+    "torch",
 ]
 benchmarks = [
     "pytest-benchmark",
