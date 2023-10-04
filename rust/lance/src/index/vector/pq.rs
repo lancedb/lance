@@ -159,11 +159,11 @@ impl PQIndex {
                 .map(|cent| cent.dot(key_sub_vector));
             xy_table.extend(xy);
 
-            let y_norm = sub_vector_centroids
+            let y2 = sub_vector_centroids
                 .values()
                 .chunks_exact(sub_vector_length)
                 .map(|cent| cent.norm_l2().powf(2.0));
-            y2_table.extend(y_norm);
+            y2_table.extend(y2);
         }
 
         // Compute distance from the pre-compute table.
@@ -177,7 +177,7 @@ impl PQIndex {
                         xy_table[idx]
                     })
                     .sum::<f32>();
-                let y_norm = c
+                let y2 = c
                     .iter()
                     .enumerate()
                     .map(|(sub_vec_idx, centroid)| {
@@ -185,7 +185,7 @@ impl PQIndex {
                         y2_table[idx]
                     })
                     .sum::<f32>();
-                1 - xy / (x_norm * y_norm.sqrt())
+                1 - xy / (x_norm * y2.sqrt())
             }),
         )))
     }
