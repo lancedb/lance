@@ -22,7 +22,7 @@ def test_kmeans(benchmark):
     data = np.random.random((65535, 16)).astype("f")
 
     def _f():
-        kmeans = KMeans(256, "l2")
+        kmeans = KMeans(8192, "l2")
         kmeans.fit(data)
 
     benchmark(_f)

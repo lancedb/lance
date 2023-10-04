@@ -105,7 +105,9 @@ class KMeans:
         last_dist = 0
         for i in tqdm(range(self.max_iters)):
             dist = self._fit_once(data)
-            if (dist - last_dist) / dist < self.tolerance:
+            if i % 10 == 0:
+                logging.debug("Distortion: %s, iter: %s", dist, i)
+            if abs(dist - last_dist) / dist < self.tolerance:
                 logging.info(f"KMeans::fit: early stop at iteration: {i}")
                 break
             last_dist = dist
