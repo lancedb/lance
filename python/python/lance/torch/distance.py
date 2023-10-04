@@ -45,6 +45,19 @@ def cosine_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 @torch.jit.script
 def l2_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Pair-wise L2 / Euclidean distance between two 2-D Tensors.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        A 2-D [N, D] tensor
+    y : torch.Tensor
+        A 2-D [M, D] tensor
+
+    Returns
+    -------
+    A 2-D [N, M] tensor of L2 distances between x and y.
+    """
     if len(x.shape) != 2 or len(y.shape) != 2:
         raise ValueError(
             f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
@@ -58,6 +71,24 @@ def l2_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return torch.stack(result)
 
 
-# @torch.jit.script
+@torch.jit.script
 def dot_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    pass
+    """Pair-wise dot distance between two 2-D Tensors.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        A 2-D [N, D] tensor
+    y : torch.Tensor
+        A 2-D [M, D] tensor
+
+    Returns
+    -------
+    A 2-D [N, M] tensor of cosine distances between x and y.
+    """
+    if len(x.shape) != 2 or len(y.shape) != 2:
+        raise ValueError(
+            f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
+        )
+
+    return 1 - x @ y.T
