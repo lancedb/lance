@@ -29,7 +29,7 @@ def test_kmeans(benchmark):
 
 
 @pytest.mark.benchmark(group="kmeans")
-def test_kmeans_gpu(benchmark):
+def test_kmeans_torch(benchmark):
     data = np.random.random((65535, 1536)).astype("f")
 
     from lance.torch.kmeans import KMeans
