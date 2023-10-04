@@ -12,29 +12,5 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import numpy as np
-import pytest
-from lance.util import KMeans
 
-
-@pytest.mark.benchmark(group="kmeans")
-def test_kmeans(benchmark):
-    data = np.random.random((65535, 16)).astype("f")
-
-    def _f():
-        kmeans = KMeans(256, "l2")
-        kmeans.fit(data)
-
-    benchmark(_f)
-
-
-@pytest.mark.benchmark(group="kmeans")
-def test_kmeans_gpu(benchmark):
-    data = np.random.random((65535, 1536)).astype("f")
-
-    from lance.torch.kmeans import KMeans
-    def _f():
-        kmeans = KMeans(256, metric="cosine", device="cuda")
-        kmeans.fit(data)
-
-    benchmark(_f)
+def test_kmeans_train()

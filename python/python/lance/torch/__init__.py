@@ -17,7 +17,7 @@ from typing import Optional
 try:
     import torch
 except ImportError:
-    raise ImportError("PyTorch is not installed")
+    raise ImportError("PyTorch>=2.0 is not installed")
 
 
 def preferred_device(device: Optional[str] = None) -> torch.device:
