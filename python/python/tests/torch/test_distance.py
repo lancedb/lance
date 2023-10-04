@@ -34,14 +34,18 @@ def test_cosine_distance():
     x = np.random.randn(20, 256).astype(np.float32)
     y = np.random.rand(100, 256).astype(np.float32)
 
-    dist = cosine_distance(torch.from_numpy(x).to(device), torch.from_numpy(y).to(device))
+    dist = cosine_distance(
+        torch.from_numpy(x).to(device), torch.from_numpy(y).to(device)
+    )
     assert dist.shape == (20, 100)
 
     # Brute-force / the simplest proof.
     expect = []
     for x_row in x:
         for y_row in y:
-            expect.append(1 - np.dot(x_row, y_row) / np.linalg.norm(x_row) / np.linalg.norm(y_row))
+            expect.append(
+                1 - np.dot(x_row, y_row) / np.linalg.norm(x_row) / np.linalg.norm(y_row)
+            )
     expect_arr = np.array(expect).astype(np.float32).reshape(20, 100)
     assert np.allclose(dist.cpu(), expect_arr)
 
