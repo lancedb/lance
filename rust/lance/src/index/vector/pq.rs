@@ -15,11 +15,10 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow::datatypes::Float32Type;
 use arrow_arith::aggregate::min;
 use arrow_array::{
-    builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray,
-    Float32Array, RecordBatch, UInt64Array, UInt8Array,
+    builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Array, ArrayRef,
+    FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -27,7 +26,7 @@ use arrow_select::take::take;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_linalg::{
-    distance::{l2::l2_distance_batch, norm_l2::norm_l2},
+    distance::{l2::l2_distance_batch, norm_l2::norm_l2, Dot, Normalize},
     kernels::argmin_opt,
     matrix::MatrixView,
 };
@@ -37,9 +36,9 @@ use serde::Serialize;
 use super::{MetricType, Query, VectorIndex};
 use crate::arrow::*;
 use crate::dataset::ROW_ID;
-use crate::index::prefilter::PreFilter;
-use crate::index::Index;
-use crate::index::{pb, vector::kmeans::train_kmeans, vector::DIST_COL};
+use crate::index::{
+    pb, prefilter::PreFilter, vector::kmeans::train_kmeans, vector::DIST_COL, Index,
+};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::{Error, Result};
 
@@ -130,53 +129,51 @@ impl PQIndex {
         }))
     }
 
-    fn cosine_distances(&self, key: &Float32Array, code: &UInt8Array) -> Result<ArrayRef> {
+    /// Pre-compute cosine distance to each sub-centroids.
+    ///
+    /// Parameters
+    ///  - query: the query vector, with shape (dimension, )
+    ///  - code: codebook for the PQ, with shame (num_sub_vectors, 2 ^ nbits)
+    ///
+    fn cosine_distances(&self, query: &Float32Array, code: &UInt8Array) -> Result<ArrayRef> {
         // Build two tables for cosine distance.
         //
         // xy table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
         // y_norm table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
-        let mut xy_table: Vec<f32> = vec![];
-        let mut y_norm_table: Vec<f32> = vec![];
+        let num_centroids = ProductQuantizer::num_centroids(self.nbits);
+        let mut xy_table: Vec<f32> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
+        let mut y2_table: Vec<f32> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
 
-        let x_norm = norm_l2(key.values()).powi(2);
-
+        let x_norm = norm_l2(query.values());
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {
-            let key_sub_vector: Float32Array = key.slice(i * sub_vector_length, sub_vector_length);
+            // The sub-vector section of the query vector.
+            let key_sub_vector =
+                &query.values()[i * sub_vector_length..(i + 1) * sub_vector_length];
             let sub_vector_centroids = self.pq.centroids(i).ok_or_else(|| Error::Index {
                 message: "PQIndex::cosine_distances: PQ is not initialized".to_string(),
             })?;
             let xy = sub_vector_centroids
-                .as_ref()
                 .values()
                 .chunks_exact(sub_vector_length)
-                .map(|cent| {
-                    // Accelerate this later.
-                    cent.iter()
-                        .zip(key_sub_vector.values().iter())
-                        .map(|(y, x)| (x - y).powi(2))
-                        .sum::<f32>()
-                });
+                .map(|cent| cent.dot(key_sub_vector));
             xy_table.extend(xy);
 
             let y_norm = sub_vector_centroids
-                .as_ref()
                 .values()
                 .chunks_exact(sub_vector_length)
-                .map(|cent| {
-                    // Accelerate this later.
-                    cent.iter().map(|y| y.powi(2)).sum::<f32>()
-                });
-            y_norm_table.extend(y_norm);
+                .map(|cent| cent.norm_l2().powf(2.0));
+            y2_table.extend(y_norm);
         }
 
+        // Compute distance from the pre-compute table.
         Ok(Arc::new(Float32Array::from_iter(
             code.values().chunks_exact(self.num_sub_vectors).map(|c| {
                 let xy = c
                     .iter()
                     .enumerate()
                     .map(|(sub_vec_idx, centroid)| {
-                        let idx = sub_vec_idx * 256 + *centroid as usize;
+                        let idx = sub_vec_idx * num_centroids + *centroid as usize;
                         xy_table[idx]
                     })
                     .sum::<f32>();
@@ -184,11 +181,11 @@ impl PQIndex {
                     .iter()
                     .enumerate()
                     .map(|(sub_vec_idx, centroid)| {
-                        let idx = sub_vec_idx * 256 + *centroid as usize;
-                        y_norm_table[idx]
+                        let idx = sub_vec_idx * num_centroids + *centroid as usize;
+                        y2_table[idx]
                     })
                     .sum::<f32>();
-                xy / (x_norm.sqrt() * y_norm.sqrt())
+                1 - xy / (x_norm * y_norm.sqrt())
             }),
         )))
     }
@@ -269,6 +266,7 @@ impl VectorIndex for PQIndex {
             self.filter_arrays(pre_filter).await?
         };
 
+        // Pre-compute distance table for each sub-vector.
         let distances = if self.metric_type == MetricType::L2 {
             self.fast_l2_distances(&query.key, code.as_ref())?
         } else {
