@@ -26,7 +26,7 @@ from .distance import cosine_distance, dot_distance, l2_distance
 __all__ = ["KMeans"]
 
 
-# @torch.jit.script
+@torch.jit.script
 def _random_init(
     data: torch.Tensor, n: int, seed: Optional[int] = None
 ) -> torch.Tensor:
@@ -112,7 +112,7 @@ class KMeans:
                 break
             last_dist = dist
 
-    def _fit_once(self, data) -> float:
+    def _fit_once(self, data: torch.Tensor) -> float:
         """Train KMean once and return the total distance."""
         assert self.centroids is not None
         part_ids = self.transform(data)
