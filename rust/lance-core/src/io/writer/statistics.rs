@@ -250,8 +250,6 @@ fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     let mut max_value = None;
     let mut null_count: i64 = 0;
     let mut total_count: i64 = 0;
-    let mut max_value_candidate = None;
-    let mut min_value_candidate = None;
 
     let arr = arrays
         .iter()
@@ -260,19 +258,12 @@ fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
     for array in arr.iter() {
         total_count += array.len() as i64;
+
         array.iter().for_each(|value| {
             if let Some(mut value) = value {
-                if value.len() > BINARY_PREFIX_LENGTH {
-                    min_value_candidate = truncate_utf8(value, BINARY_PREFIX_LENGTH);
-                    max_value_candidate = truncate_utf8(value, BINARY_PREFIX_LENGTH);
-                } else {
-                    min_value_candidate = Some(value);
-                    max_value_candidate = Some(value);
-                }
-
                 if let Some(mv) = min_value {
                     if let Some(Ordering::Less) = value.partial_cmp(mv) {
-                        min_value = min_value_candidate
+                        min_value = Some(value);
                     }
                 } else {
                     min_value = Some(value);
@@ -280,7 +271,7 @@ fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
                 if let Some(mx) = max_value {
                     if let Some(Ordering::Greater) = value.partial_cmp(mx) {
-                        max_value = max_value_candidate;
+                        max_value = Some(value);
                     }
                 } else {
                     max_value = Some(value);
@@ -288,6 +279,38 @@ fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
             }
         });
         null_count += array.null_count() as i64;
+    }
+
+    if let Some(mv) = min_value {
+        if mv.len() > BINARY_PREFIX_LENGTH {
+            min_value = truncate_utf8(mv, BINARY_PREFIX_LENGTH);
+        }
+    }
+
+    if let Some(mx) = max_value {
+        if mx.len() > BINARY_PREFIX_LENGTH {
+            max_value = truncate_utf8(mx, BINARY_PREFIX_LENGTH);
+            let mut data: Vec<u8> = max_value.unwrap().as_bytes().to_vec();
+
+            for idx in (0..data.len()).rev() {
+                let original = data[idx];
+                let (mut byte, mut overflow) = data[idx].overflowing_add(1);
+
+                // Until overflow: 0xFF -> 0x00
+                'outer: while !overflow {
+                    data[idx] = byte;
+                    let x = data.to_owned();
+                    max_value = Some(str::from_utf8(&x).unwrap());
+                    if str::from_utf8(&data).is_ok() {
+                        //     max_value = Some(str::from_utf8(&data.to_owned()).unwrap());
+                        break 'outer;
+                    }
+                    (byte, overflow) = data[idx].overflowing_add(1);
+                }
+
+                data[idx] = original;
+            }
+        }
     }
 
     StatisticsRow {
