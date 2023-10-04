@@ -43,6 +43,7 @@ jobs:
     - name: Install linting tools
       run: |
         pip install black isort ruff maturin tensorflow
+        pip install torch --index-url https://download.pytorch.org/whl/cpu
     - name: Lint Python
       run: |
         black --check python

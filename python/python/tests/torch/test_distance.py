@@ -27,16 +27,12 @@ import numpy as np
 from lance.torch import preferred_device
 from lance.torch.distance import cosine_distance, l2_distance
 
-device = preferred_device()
-
 
 def test_cosine_distance():
     x = np.random.randn(20, 256).astype(np.float32)
     y = np.random.rand(100, 256).astype(np.float32)
 
-    dist = cosine_distance(
-        torch.from_numpy(x).to(device), torch.from_numpy(y).to(device)
-    )
+    dist = cosine_distance(torch.from_numpy(x), torch.from_numpy(y))
     assert dist.shape == (20, 100)
 
     # Brute-force / the simplest proof.
@@ -54,7 +50,7 @@ def test_l2_distance():
     x = np.random.randn(20, 256).astype(np.float32)
     y = np.random.rand(100, 256).astype(np.float32)
 
-    dist = l2_distance(torch.from_numpy(x).to(device), torch.from_numpy(y).to(device))
+    dist = l2_distance(torch.from_numpy(x), torch.from_numpy(y))
     assert dist.shape == (20, 100)
     expect = []
     for x_row in x:
