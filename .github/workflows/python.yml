@@ -174,7 +174,7 @@ jobs:
       - uses: ./.github/workflows/run_tests
   aws-integtest:
     timeout-minutes: 45
-    runs-on: "ubuntu-22.04"
+    runs-on: "ubuntu-latest"
     defaults:
       run:
         shell: bash
@@ -211,7 +211,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.10"
+        python-version: "3.11"
     - name: create s3
       run: aws s3 mb s3://lance-integtest --endpoint http://localhost:9000
     - name: create ddb
@@ -227,6 +227,9 @@ jobs:
         workspaces: python
         prefix-key: "manylinux2014"  # use this to flush the cache
     - uses: ./.github/workflows/build_linux_wheel
+    - name: Install dependencies
+      run:
+        pip install torch --index-url https://download.pytorch.org/whl/cpu
     - uses: ./.github/workflows/run_integtests
     # Make sure wheels are not included in the Rust cache
     - name: Delete wheels
