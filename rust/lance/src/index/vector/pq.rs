@@ -133,7 +133,7 @@ impl PQIndex {
     ///
     /// Parameters
     ///  - query: the query vector, with shape (dimension, )
-    ///  - code: codebook for the PQ, with shame (num_sub_vectors, 2 ^ nbits)
+    ///  - code: the PQ code in one partition.
     ///
     fn cosine_distances(&self, query: &Float32Array, code: &UInt8Array) -> Result<ArrayRef> {
         // Build two tables for cosine distance.
