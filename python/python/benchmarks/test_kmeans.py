@@ -33,6 +33,7 @@ def test_kmeans_gpu(benchmark):
     data = np.random.random((65535, 1536)).astype("f")
 
     from lance.torch.kmeans import KMeans
+
     def _f():
         kmeans = KMeans(256, metric="cosine", device="cuda")
         kmeans.fit(data)

@@ -12,12 +12,13 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import logging
 from typing import Optional, Union
 
 import numpy as np
 import pyarrow as pa
 import torch
-from torch.func import vmap
+from tqdm import tqdm
 
 from . import preferred_device
 from .distance import cosine_distance, dot_distance, l2_distance
@@ -26,7 +27,9 @@ __all__ = ["KMeans"]
 
 
 # @torch.jit.script
-def _random_init(data: torch.Tensor, n: int) -> torch.Tensor:
+def _random_init(data: torch.Tensor, n: int, seed: Optional[int] = None) -> torch.Tensor:
+    if seed is not None:
+        torch.random.manual_seed(seed)
     sample_idx = torch.randint(0, data.shape[0], (n,))
     samples = data[sample_idx]
     return samples
@@ -38,9 +41,10 @@ class KMeans:
         k: int,
         *,
         metric: str = "l2",
-        max_iters: int = 50,
         redo: int = 2,
         init_method: str = "random",
+        max_iters: int = 50,
+        tolerance: float = 1e-6,
         seed: Optional[int] = None,
         device: Optional[str] = None,
     ):
@@ -64,11 +68,15 @@ class KMeans:
         self.centroids: Optional[torch.Tensor] = None
         self.init_method = init_method
         self.device = preferred_device(device)
+        self.tolerance = tolerance
+        self.seed = seed
 
     def __repr__(self):
         return f"KMeans(k={self.k}, metric={self.metric}, device={self.device})"
 
-    def _to_tensor(self, data: Union[pa.FixedSizeListArray, np.ndarray, torch.Tensor]) -> torch.Tensor:
+    def _to_tensor(
+        self, data: Union[pa.FixedSizeListArray, np.ndarray, torch.Tensor]
+    ) -> torch.Tensor:
         if isinstance(data, pa.FixedSizeListArray):
             data = torch.from_numpy(np.stack(data.to_numpy(zero_copy_only=False)))
         elif isinstance(data, np.ndarray):
@@ -90,23 +98,35 @@ class KMeans:
         data = self._to_tensor(data)
 
         if self.init_method == "random":
-            self.centroids = _random_init(data, self.k)
+            self.centroids = _random_init(data, self.k, self.seed)
 
-        for i in range(self.max_iters):
-            self._fit_once(data)
+        last_dist = 0
+        for _ in tqdm(range(self.max_iters)):
+            dist = self._fit_once(data)
+            if (dist - last_dist) / dist < self.tolerance:
+                logging.info(f"KMeans::fit: early stop")
+                break
 
-    def _fit_once(self, data):
+    def _fit_once(self, data) -> float:
+        """Train KMean once and return the total distance."""
         assert self.centroids is not None
         part_ids = self.transform(data)
         # compute new centroids
         new_centroids = []
+        total_dist = 0
         for i in range(self.k):
             parted_data = data[part_ids == i]
-            new_centroids.append(parted_data.mean(dim=0))
+            new_cent = parted_data.mean(dim=0)
+            new_centroids.append(new_cent)
+            all_dist = self.dist_func(parted_data, new_cent.reshape(1, -1))
+            total_dist += all_dist.sum()
 
         self.centroids = torch.stack(new_centroids)
+        return total_dist
 
-    def transform(self, data: Union[pa.Array, np.ndarray, torch.Tensor]):
+    def transform(
+        self, data: Union[pa.Array, np.ndarray, torch.Tensor]
+    ) -> torch.Tensor:
         assert self.centroids is not None
 
         data = self._to_tensor(data)
