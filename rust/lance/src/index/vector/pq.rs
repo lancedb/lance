@@ -22,7 +22,6 @@ use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray,
     Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
-use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
@@ -278,15 +277,15 @@ impl PartialEq for DistanceRowId {
 
 impl Eq for DistanceRowId {}
 
-// Note: this implementation of Ord is reversed.  This is because BinaryHeap gives us
-// the max items and we want the min items
 impl PartialOrd for DistanceRowId {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        other.distance().partial_cmp(&self.distance())
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for DistanceRowId {
+    // Note: this implementation of cmp is reversed.  This is because BinaryHeap gives us
+    // the max items and we want the min items
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         other.distance().total_cmp(&self.distance())
     }

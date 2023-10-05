@@ -26,11 +26,9 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::DataType;
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::{
-    future::BoxFuture,
     stream::{self, StreamExt},
-    FutureExt, TryStreamExt,
+    TryStreamExt,
 };
 use lance_arrow::*;
 use lance_linalg::{distance::*, kernels::argmin, matrix::MatrixView};
@@ -811,7 +809,7 @@ impl RemapWriteTask for RemapPageTask {
 
 fn generate_remap_tasks(
     offsets: &Vec<usize>,
-    lengths: &Vec<u32>,
+    lengths: &[u32],
 ) -> Result<Vec<Box<dyn RemapLoadTask>>> {
     let mut tasks: Vec<Box<dyn RemapLoadTask>> = Vec::with_capacity(offsets.len() * 2 + 1);
 
@@ -1130,8 +1128,7 @@ mod tests {
                 FixedSizeListArray::try_new_from_values(vectors_array.clone(), dim as i32).unwrap(),
             );
             let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
-            let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-            batches
+            RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone())
         }
 
         async fn generate_dataset(&mut self, test_uri: &str) -> Result<Dataset> {
@@ -1161,30 +1158,25 @@ mod tests {
                     metric_type: MetricType::L2,
                     use_index: true,
                 };
-                let search_result = index.search(&query, &prefilter).await.unwrap();
+                let search_result = index.search(&query, prefilter).await.unwrap();
 
                 let found_ids = search_result.column(1);
                 let found_ids = found_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
-                let expected_id = row_id_map(row_id as u64);
+                let expected_id = row_id_map(row_id);
 
                 match expected_id {
                     // Original id was deleted, results can be anything, just make sure they don't
                     // include the original id
-                    None => assert!(found_ids
-                        .iter()
-                        .find(|f_id| f_id.unwrap() == row_id as u64)
-                        .is_none()),
+                    None => assert!(!found_ids.iter().any(|f_id| f_id.unwrap() == row_id)),
                     // Original id remains or was remapped, make sure expected id in results
-                    Some(expected_id) => assert!(found_ids
-                        .iter()
-                        .find(|f_id| f_id.unwrap() == expected_id as u64)
-                        .is_some()),
+                    Some(expected_id) => {
+                        assert!(found_ids.iter().any(|f_id| f_id.unwrap() == expected_id))
+                    }
                 };
                 // The invalid row id should never show up in results
-                assert!(found_ids
+                assert!(!found_ids
                     .iter()
-                    .find(|f_id| f_id.unwrap() == RowId::TOMBSTONE_ROW)
-                    .is_none());
+                    .any(|f_id| f_id.unwrap() == RowId::TOMBSTONE_ROW));
             }
         }
     }
@@ -1282,8 +1274,8 @@ mod tests {
     const BIG_OFFSET: u64 = 10000;
 
     fn build_mapping(
-        row_ids_to_modify: &Vec<u64>,
-        row_ids_to_remove: &Vec<u64>,
+        row_ids_to_modify: &[u64],
+        row_ids_to_remove: &[u64],
         max_id: u64,
     ) -> HashMap<u64, Option<u64>> {
         // Some big number we can add to row ids so they are remapped but don't intersect with anything
@@ -1346,7 +1338,7 @@ mod tests {
 
         let prefilter = PreFilter::new(dataset.clone());
 
-        let is_not_remapped = |row_id| Some(row_id);
+        let is_not_remapped = Some;
         let is_remapped = |row_id| Some(row_id + BIG_OFFSET);
         let is_removed = |_| None;
         let max_id = test_data.get_vectors().len() as u64 / test_data.dim as u64;
@@ -1356,7 +1348,7 @@ mod tests {
         // input row, when used as a query, should be found in the results list with
         // the same id
         test_data
-            .check_index(&ivf_index, &prefilter, &row_ids, is_not_remapped)
+            .check_index(ivf_index, &prefilter, &row_ids, is_not_remapped)
             .await;
 
         // When remapping we change the id of 1/3 of the rows, we remove another 1/3,
@@ -1371,7 +1363,7 @@ mod tests {
         let new_uuid = Uuid::new_v4();
         let new_uuid_str = new_uuid.to_string();
 
-        remap_index_file(&dataset, &uuid_str, &new_uuid_str, &ivf_index, &mapping)
+        remap_index_file(&dataset, &uuid_str, &new_uuid_str, ivf_index, &mapping)
             .await
             .unwrap();
 
@@ -1386,20 +1378,15 @@ mod tests {
 
         // If the ids were remapped then make sure the new row id is in the results
         test_data
-            .check_index(&ivf_remapped, &prefilter, &row_ids_to_modify, is_remapped)
+            .check_index(ivf_remapped, &prefilter, row_ids_to_modify, is_remapped)
             .await;
         // If the ids were removed then make sure the old row id isn't in the results
         test_data
-            .check_index(&ivf_remapped, &prefilter, &row_ids_to_remove, is_removed)
+            .check_index(ivf_remapped, &prefilter, row_ids_to_remove, is_removed)
             .await;
         // If the ids were not remapped then make sure they still return the old id
         test_data
-            .check_index(
-                &ivf_remapped,
-                &prefilter,
-                &row_ids_to_remain,
-                is_not_remapped,
-            )
+            .check_index(ivf_remapped, &prefilter, row_ids_to_remain, is_not_remapped)
             .await;
     }
 }
