@@ -76,9 +76,56 @@ fn manifest_path(base: &Path, version: u64) -> Path {
         .child(format!("{version}.{MANIFEST_EXTENSION}"))
 }
 
-/// Get the latest manifest path
 fn latest_manifest_path(base: &Path) -> Path {
     base.child(LATEST_MANIFEST_NAME)
+}
+
+/// Get the latest manifest path
+async fn current_manifest_path(object_store: &ObjectStore, base: &Path) -> Result<Path> {
+    // TODO: list gives us the size, so we could also return the size of the manifest.
+    // That avoids a HEAD request later.
+    let mut manifest_files = object_store
+        .inner
+        .list(Some(&base.child(VERSIONS_DIR)))
+        .await?
+        .map(|meta| meta.map(|meta| meta.location))
+        .try_filter(|path| {
+            futures::future::ready(path.filename().unwrap().ends_with(MANIFEST_EXTENSION))
+        });
+
+    let mut current: Option<(u64, Path)> = None;
+
+    while let Some(path) = manifest_files.next().await {
+        let path = path?;
+        let Some(file_name) = path.filename() else {
+            continue;
+        };
+
+        let version = match file_name.split_once('.') {
+            Some((version_str, _)) => match version_str.parse::<u64>() {
+                Ok(version) => version,
+                Err(_) => continue,
+            },
+            None => continue,
+        };
+
+        if let Some((current_version, _)) = current {
+            if version > current_version {
+                current = Some((version, path));
+            }
+        } else {
+            current = Some((version, path));
+        }
+    }
+
+    if let Some((_, path)) = current {
+        Ok(path)
+    } else {
+        Err(Error::NotFound {
+            uri: manifest_path(base, 1).to_string(),
+            location: location!(),
+        })
+    }
 }
 
 fn make_staging_manifest_path(base: &Path) -> Result<Path> {
@@ -138,12 +185,10 @@ pub(crate) trait CommitHandler: Debug + Send + Sync {
     async fn resolve_latest_version(
         &self,
         base_path: &Path,
-        _object_store: &ObjectStore,
+        object_store: &ObjectStore,
     ) -> std::result::Result<Path, crate::Error> {
-        // use the _latest.manifest file to get the latest version
-        // TODO: this isn't 100% safe, we should list the /_versions directory and find the latest version
         // TODO: we need to pade 0's to the version number on the manifest file path
-        Ok(latest_manifest_path(base_path))
+        Ok(current_manifest_path(object_store, base_path).await?)
     }
 
     /// Get the path to a specific versioned manifest of a dataset at the base_path

@@ -327,24 +327,28 @@ impl Dataset {
                 .await?;
 
         // Read expected manifest path for the dataset
-        let latest_manifest_path = object_store
+        let dataset_exists = match object_store
             .commit_handler
             .resolve_latest_version(&base, &object_store)
-            .await?;
-        let flag_dataset_exists = object_store.exists(&latest_manifest_path).await?;
+            .await
+        {
+            Ok(_) => true,
+            Err(Error::NotFound { .. }) => false,
+            Err(e) => return Err(e),
+        };
 
         let (stream, schema) = reader_to_stream(batches)?;
 
         // Running checks for the different write modes
         // create + dataset already exists = error
-        if flag_dataset_exists && matches!(params.mode, WriteMode::Create) {
+        if dataset_exists && matches!(params.mode, WriteMode::Create) {
             return Err(Error::DatasetAlreadyExists {
                 uri: uri.to_owned(),
             });
         }
 
         // append + dataset doesn't already exists = warn + switch to create mode
-        if !flag_dataset_exists
+        if !dataset_exists
             && (matches!(params.mode, WriteMode::Append)
                 || matches!(params.mode, WriteMode::Overwrite))
         {
