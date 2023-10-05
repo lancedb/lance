@@ -134,7 +134,7 @@ def train_ivf_centroids(
     sample_rate: int = 256,
 ) -> np.ndarray:
     """Use accelerator (GPU or MPS) to train kmeans."""
-    if not CUDA_REGEX.match(accelerator):
+    if not (CUDA_REGEX.match(accelerator) or accelerator == "mps"):
         raise ValueError(
             "Train ivf centroids on accelerator: "
             + f"only support 'cuda' as accelerator, got '{accelerator}'."
@@ -148,8 +148,8 @@ def train_ivf_centroids(
     else:
         samples = dataset.sample(k * sample_rate)[column]
 
-    if CUDA_REGEX.match(accelerator):
-        logging.info("Training IVF partitions using GPU(Cuda)")
+    if CUDA_REGEX.match(accelerator) or accelerator == "mps":
+        logging.info(f"Training IVF partitions using GPU({accelerator})")
         # Pytorch installation warning will be raised here.
         from .torch.kmeans import KMeans
 
