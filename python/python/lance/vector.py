@@ -18,6 +18,8 @@ from typing import Optional, Union
 import numpy as np
 import pyarrow as pa
 
+from . import LanceDataset
+
 
 def _normalize_vectors(vectors, ndim):
     if ndim is None:
@@ -115,3 +117,34 @@ def vec_to_table(
             f"data must be dict, list, or ndarray, got {type(data)} instead"
         )
     return pa.Table.from_arrays(arrays, names=names)
+
+
+def train_ivf_centroids(
+    dataset: LanceDataset,
+    column: str,
+    k: int,
+    accelerator: str,
+    *,
+    sample_rate: int = 256,
+    **kwargs,
+) -> pa.FixedSizeListArray:
+    """Use accelerator to train args"""
+    if accelerator not in ["gpu", "cuda"]:
+        raise ValueError(
+            f"Train ivf centroids on accelerator: "
+            + f"only support 'cuda' as accelerator, got '{accelerator}'."
+        )
+
+    total_size = dataset.count_rows()
+    sample_size = min(k * sample_rate, total_size)
+
+    if total_size < k * sample_size:
+        samples = dataset.to_table(columns=[column])[column].to_numpy()
+    else:
+        samples = dataset.sample(k * sample_rate)[column].to_numpy()
+    print(samples)
+    if accelerator in ["gpu", "cuda"]:
+        from .torch.kmeans import KMeans
+
+        kmeans = KMeans(k)
+    pass

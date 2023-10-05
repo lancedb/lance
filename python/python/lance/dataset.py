@@ -645,6 +645,7 @@ class LanceDataset(pa.dataset.Dataset):
         num_partitions: Optional[int] = None,
         ivf_centroids: Optional[Union[np.ndarray, pa.FixedSizeListArray]] = None,
         num_sub_vectors: Optional[int] = None,
+        accelerator: Optional[str] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -672,6 +673,9 @@ class LanceDataset(pa.dataset.Dataset):
             clustering. If not provided, a new Kmean model will be trained.
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
+        accelerator : str, optional
+            If set, use accelerator to speed up training process. Accepted accelerator: "cuda".
+            If not set, use default CPU kmeans algorithm.
         kwargs :
             Parameters passed to the index building process.
 
@@ -762,6 +766,13 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             kwargs["num_partitions"] = num_partitions
             kwargs["num_sub_vectors"] = num_sub_vectors
+
+            if accelerator is not None and ivf_centroids is None:
+                # Use accelerator to train ivf centroids
+                from .vector import train_ivf_centroids
+
+                ivf_centroids = train_ivf_centroids(self, num_partitions, accelerator)
+
             if ivf_centroids is not None:
                 # User provided IVF centroids
                 if isinstance(ivf_centroids, np.ndarray):
