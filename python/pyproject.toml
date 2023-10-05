@@ -53,10 +53,11 @@ tests = [
     "pandas>=1.4,<2.1",
     "pytest",
     "duckdb",
-    "polars[pyarrow,pandas]",
     "ml_dtypes",
-    "tensorflow",
+    "polars[pyarrow,pandas]",
     "semver",
+    "tensorflow",
+    "tqdm",
 ]
 benchmarks = [
     "pytest-benchmark",
