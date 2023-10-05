@@ -154,7 +154,6 @@ fn get_decimal_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
 /// Truncate a UTF8 slice to the longest prefix that is still a valid UTF8 string, while being less than `length` bytes.
 fn truncate_utf8(data: &str, length: usize) -> Option<&str> {
-    // let length : usize = std::cmp::min(data.len(), length);
     // We return values like that at an earlier stage in the process.
     assert!(data.len() >= length);
     let mut char_indices = data.char_indices();
@@ -164,31 +163,6 @@ fn truncate_utf8(data: &str, length: usize) -> Option<&str> {
         let split_point = idx + c.len_utf8();
         if split_point <= length {
             return Some(&data[0..split_point]);
-        }
-    }
-
-    None
-}
-
-/// Truncate a binary slice to make sure its length is less than `length`
-fn truncate_binary(data: &[u8], length: usize) -> Option<Vec<u8>> {
-    // We return values like that at an earlier stage in the process.
-    assert!(data.len() >= length);
-    // If all bytes are already maximal, no need to truncate
-
-    Some(data[0..length].to_vec())
-}
-
-/// Try and increment the bytes from right to left.
-///
-/// Returns `None` if all bytes are set to `u8::MAX`.
-fn increment(mut data: Vec<u8>) -> Option<Vec<u8>> {
-    for byte in data.iter_mut().rev() {
-        let (incremented, overflow) = byte.overflowing_add(1);
-        *byte = incremented;
-
-        if !overflow {
-            return Some(data);
         }
     }
 
@@ -218,38 +192,35 @@ fn increment_utf8(mut data: Vec<u8>) -> Option<Vec<u8>> {
     None
 }
 
-fn truncate_min_value(data: &[u8]) -> Vec<u8> {
-    match str::from_utf8(data) {
-        Ok(str_data) => truncate_utf8(str_data, BINARY_PREFIX_LENGTH)
-            .unwrap()
-            .into(),
-        Err(_) => truncate_binary(data, BINARY_PREFIX_LENGTH).unwrap().into(),
-    }
-    // .unwrap_or_else(|| data.to_vec())
+/// Truncate a binary slice to make sure its length is less than `length`
+fn truncate_binary(data: &[u8], length: usize) -> Option<&[u8]> {
+    // We return values like that at an earlier stage in the process.
+    assert!(data.len() >= length);
+    // If all bytes are already maximal, no need to truncate
+
+    Some(&data[0..length])
 }
 
-fn truncate_max_value(data: &[u8]) -> Vec<u8> {
-    match str::from_utf8(data) {
-        Ok(str_data) => increment_utf8(
-            truncate_utf8(str_data, BINARY_PREFIX_LENGTH)
-                .unwrap()
-                .as_bytes()
-                .to_vec(),
-        )
-        .unwrap()
-        .into(),
-        Err(_) => truncate_binary(data, BINARY_PREFIX_LENGTH)
-            .and_then(increment)
-            .unwrap(),
+/// Try and increment the bytes from right to left.
+///
+/// Returns `None` if all bytes are set to `u8::MAX`.
+fn increment(mut data: Vec<u8>) -> Option<Vec<u8>> {
+    for byte in data.iter_mut().rev() {
+        let (incremented, overflow) = byte.overflowing_add(1);
+        *byte = incremented;
+
+        if !overflow {
+            return Some(data);
+        }
     }
-    // .unwrap_or_else(|| data.to_vec())
+
+    None
 }
 
 fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
-    let mut min_value = None;
-    let mut max_value = None;
+    let mut min_value: Option<&str> = None;
+    let mut max_value: Option<&str> = None;
     let mut null_count: i64 = 0;
-    let mut total_count: i64 = 0;
 
     let arr = arrays
         .iter()
@@ -257,59 +228,48 @@ fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         .collect::<Vec<_>>();
 
     for array in arr.iter() {
-        total_count += array.len() as i64;
-
         array.iter().for_each(|value| {
-            if let Some(mut value) = value {
-                if let Some(mv) = min_value {
-                    if let Some(Ordering::Less) = value.partial_cmp(mv) {
-                        min_value = Some(value);
+            if let Some(val) = value {
+                // TODO: don't compare full strings
+                // for i in (BINARY_PREFIX_LENGTH..val.len()).rev() {
+                //     if val.is_char_boundary(i) {
+                //         val = &val[..i];
+                //         break;
+                //     }
+                // }
+
+                if let Some(v) = min_value {
+                    if let Some(Ordering::Less) = val[..].partial_cmp(v) {
+                        min_value = Some(val);
                     }
                 } else {
-                    min_value = Some(value);
+                    min_value = Some(val);
                 }
 
-                if let Some(mx) = max_value {
-                    if let Some(Ordering::Greater) = value.partial_cmp(mx) {
-                        max_value = Some(value);
+                if let Some(v) = max_value {
+                    if let Some(Ordering::Greater) = val.partial_cmp(v) {
+                        max_value = Some(val);
                     }
                 } else {
-                    max_value = Some(value);
+                    max_value = Some(val);
                 }
             }
         });
         null_count += array.null_count() as i64;
     }
 
-    if let Some(mv) = min_value {
-        if mv.len() > BINARY_PREFIX_LENGTH {
-            min_value = truncate_utf8(mv, BINARY_PREFIX_LENGTH);
+    if let Some(v) = min_value {
+        if v.len() > BINARY_PREFIX_LENGTH {
+            min_value = truncate_utf8(v, BINARY_PREFIX_LENGTH);
         }
     }
 
-    if let Some(mx) = max_value {
-        if mx.len() > BINARY_PREFIX_LENGTH {
-            max_value = truncate_utf8(mx, BINARY_PREFIX_LENGTH);
-            let mut data: Vec<u8> = max_value.unwrap().as_bytes().to_vec();
-
-            for idx in (0..data.len()).rev() {
-                let original = data[idx];
-                let (mut byte, mut overflow) = data[idx].overflowing_add(1);
-
-                // Until overflow: 0xFF -> 0x00
-                'outer: while !overflow {
-                    data[idx] = byte;
-                    let x = data.to_owned();
-                    max_value = Some(str::from_utf8(&x).unwrap());
-                    if str::from_utf8(&data).is_ok() {
-                        //     max_value = Some(str::from_utf8(&data.to_owned()).unwrap());
-                        break 'outer;
-                    }
-                    (byte, overflow) = data[idx].overflowing_add(1);
-                }
-
-                data[idx] = original;
-            }
+    let max_value_bound: Vec<u8>;
+    if let Some(v) = max_value {
+        if v.len() > BINARY_PREFIX_LENGTH {
+            max_value = truncate_utf8(v, BINARY_PREFIX_LENGTH);
+            max_value_bound = increment_utf8(max_value.unwrap().as_bytes().to_vec()).unwrap();
+            max_value = Some(str::from_utf8(&max_value_bound).unwrap());
         }
     }
 
@@ -321,8 +281,8 @@ fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 }
 
 fn get_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
-    let mut min_value = vec![u8::MAX; BINARY_PREFIX_LENGTH];
-    let mut max_value = vec![u8::MIN; BINARY_PREFIX_LENGTH];
+    let mut min_value: Option<&[u8]> = None;
+    let mut max_value: Option<&[u8]> = None;
     let mut null_count: i64 = 0;
 
     let arr = arrays
@@ -332,32 +292,53 @@ fn get_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
     for array in arr.iter() {
         array.iter().for_each(|value| {
-            if let Some(value) = value {
-                if let Some(Ordering::Greater) = value.partial_cmp(max_value.as_slice()) {
-                    max_value = value.to_vec();
+            if let Some(val) = value {
+                // don't compare full buffers if possible
+                let val = &val[..std::cmp::min(BINARY_PREFIX_LENGTH + 4, val.len())];
+
+                if let Some(v) = min_value {
+                    if let Some(Ordering::Less) = val.partial_cmp(v) {
+                        min_value = Some(val);
+                    }
+                } else {
+                    min_value = Some(val);
                 }
-                if let Some(Ordering::Less) = value.partial_cmp(min_value.as_slice()) {
-                    min_value = value.to_vec();
+
+                if let Some(v) = max_value {
+                    if let Some(Ordering::Greater) = val.partial_cmp(v) {
+                        max_value = Some(val);
+                    }
+                } else {
+                    max_value = Some(val);
                 }
-            };
+            }
         });
         null_count += array.null_count() as i64;
     }
-    let min_value_scalar = if min_value.len() > BINARY_PREFIX_LENGTH {
-        None
-    } else {
-        Some(min_value)
-    };
-    let max_value_scalar = if max_value.len() > BINARY_PREFIX_LENGTH {
-        None
-    } else {
-        Some(max_value)
-    };
+
+    if let Some(v) = min_value {
+        if v.len() > BINARY_PREFIX_LENGTH {
+            min_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
+        }
+    }
+
+    let max_value_bound: Vec<u8>;
+    if let Some(v) = max_value {
+        if v.len() > BINARY_PREFIX_LENGTH {
+            max_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
+            if let Some(x) = increment(max_value.unwrap().to_vec()) {
+                max_value_bound = x;
+                max_value = Some(&max_value_bound);
+            } else {
+                max_value = None;
+            }
+        }
+    }
 
     StatisticsRow {
         null_count: ScalarValue::Int64(Some(null_count)),
-        min_value: ScalarValue::Binary(min_value_scalar),
-        max_value: ScalarValue::Binary(max_value_scalar),
+        min_value: ScalarValue::Binary(min_value.map(|x| x.to_vec())),
+        max_value: ScalarValue::Binary(max_value.map(|x| x.to_vec())),
     }
 }
 
@@ -838,6 +819,76 @@ mod tests {
     //     );
     // }
 
+        let filler = "48 chars of filler                              ";
+        // Prefixes are used if strings are too long. Multi-byte characters are
+        // not split.
+        let arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![
+            // filler + "bacteriologists🧑‍🔬",
+            // filler + "terrestial planet",
+            format!("{}{}", filler, "bacteriologists🧑‍🔬"),
+            format!("{}{}", filler, "terrestial planet"),
+        ]))];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        let stats = collect_statistics(&array_refs);
+        assert_eq!(
+            stats,
+            StatisticsRow {
+                null_count: ScalarValue::from(0_i64),
+                // Bacteriologists is just 15 bytes, but the next character is multi-byte
+                // so we truncate before.
+                min_value: ScalarValue::from(format!("{}{}", filler, "bacteriologists").as_str()),
+                // Increment the last character to make sure it's greater than max value
+                max_value: ScalarValue::from(format!("{}{}", filler, "terrestial planf").as_str()), // TODO: Should this end pland?
+            }
+        );
+
+        // If not truncated max value exists (in the edge case where the value is
+        // 0xFF up until the limit), just return null as max.)
+        let arrays: Vec<ArrayRef> = vec![Arc::new(BinaryArray::from(vec![vec![
+            0xFFu8;
+            BINARY_PREFIX_LENGTH
+                + 5
+        ]
+        .as_ref()]))];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        let stats = collect_statistics(&array_refs);
+        let min_value: Vec<u8> = vec![0xFFu8; BINARY_PREFIX_LENGTH];
+        assert_eq!(
+            stats,
+            StatisticsRow {
+                null_count: ScalarValue::from(0_i64),
+                // We can truncate the minimum value, since the prefix is less than the full value
+                min_value: ScalarValue::Binary(Some(min_value)),
+                // We can't truncate the max value, so we return None
+                max_value: ScalarValue::Binary(None),
+            }
+        );
+    }
+
+    #[test]
+    fn test_collect_dictionary_stats() {
+        // Dictionary stats are collected from the underlying values
+        let dictionary_values = StringArray::from(vec![None, Some("abc"), Some("def")]);
+        let mut builder =
+            StringDictionaryBuilder::<Int32Type>::new_with_dictionary(3, &dictionary_values)
+                .unwrap();
+        builder.append("def").unwrap();
+        builder.append_null();
+        builder.append("abc").unwrap();
+
+        let arr = builder.finish();
+        let arrays: Vec<ArrayRef> = vec![Arc::new(arr)];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        let stats = collect_statistics(&array_refs);
+        assert_eq!(
+            stats,
+            StatisticsRow {
+                null_count: ScalarValue::from(1_i64),
+                min_value: ScalarValue::from("abc"),
+                max_value: ScalarValue::from("def"),
+            }
+        );
+    }
     // #[test]
     // fn test_collect_dictionary_stats() {
     //     // Dictionary stats are collected from the underlying values
@@ -1028,6 +1079,31 @@ mod tests {
                     (
                         Arc::new(ArrowField::new("max_value", DataType::Int64, true)),
                         Arc::new(Int64Array::from(vec![3, std::i64::MAX])) as ArrayRef,
+                    ),
+                        Arc::new(ArrowField::new("null_count", DataType::Int64, false)),
+                        Arc::new(Int64Array::from(vec![2, 0])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("min_value", DataType::Int32, false)),
+                        Arc::new(Int32Array::from(vec![1, std::i32::MIN])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("max_value", DataType::Int32, false)),
+                        Arc::new(Int32Array::from(vec![3, std::i32::MAX])) as ArrayRef,
+                    ),
+                ])),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(ArrowField::new("null_count", DataType::Int64, false)),
+                        Arc::new(Int64Array::from(vec![6, 0])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("min_value", DataType::Utf8, true)),
+                        Arc::new(StringArray::from(vec![Some("aaa"), None])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("max_value", DataType::Utf8, true)),
+                        Arc::new(StringArray::from(vec![Some("bbb"), None])) as ArrayRef,
                     ),
                 ])),
             ],
