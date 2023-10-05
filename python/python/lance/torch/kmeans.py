@@ -61,6 +61,7 @@ class KMeans:
         The device to run the PyTorch algorithms. Default we will pick the most performant device
         on the host. See `lance.torch.preferred_device()`
     """
+
     def __init__(
         self,
         k: int,
