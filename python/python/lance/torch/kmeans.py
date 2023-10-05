@@ -58,8 +58,8 @@ class KMeans:
     seed: int, optional
         Random seed
     device: str, optional
-        The device to run the PyTorch algorithms. Default we will pick the most performant device
-        on the host. See `lance.torch.preferred_device()`
+        The device to run the PyTorch algorithms. Default we will pick
+        the most performant device on the host. See `lance.torch.preferred_device()`
     """
 
     def __init__(
