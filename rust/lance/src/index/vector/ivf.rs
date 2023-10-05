@@ -50,11 +50,8 @@ use crate::{
     dataset::Dataset,
     datatypes::Field,
     index::{pb, prefilter::PreFilter, vector::Transformer, Index},
-<<<<<<< HEAD
     io::RecordBatchStream,
-=======
     io::object_writer::ObjectWriter,
->>>>>>> e588a7e (Added the ability to remap IVF/PQ indices.  This can be used during compaction to notify)
 };
 use crate::{
     io::{local::to_local_path, object_reader::ObjectReader},
