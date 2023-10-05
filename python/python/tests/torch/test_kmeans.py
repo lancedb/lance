@@ -25,3 +25,4 @@ def test_kmeans():
     cluster_ids = kmeans.transform(arr)
     _, cnts = torch.unique(cluster_ids, return_counts=True)
     assert (cnts >= 1).all() and (cnts <= 8).all()
+    assert len(cnts) == 4  # all cluster has data
