@@ -84,41 +84,32 @@ fn latest_manifest_path(base: &Path) -> Path {
 async fn current_manifest_path(object_store: &ObjectStore, base: &Path) -> Result<Path> {
     // TODO: list gives us the size, so we could also return the size of the manifest.
     // That avoids a HEAD request later.
-    let mut manifest_files = object_store
+
+    // We use `list_with_delimiter` to avoid listing the contents of child directories.
+    let manifest_files = object_store
         .inner
-        .list(Some(&base.child(VERSIONS_DIR)))
-        .await?
-        .map(|meta| meta.map(|meta| meta.location))
-        .try_filter(|path| {
-            futures::future::ready(path.filename().unwrap().ends_with(MANIFEST_EXTENSION))
-        });
+        .list_with_delimiter(Some(&base.child(VERSIONS_DIR)))
+        .await?;
 
-    let mut current: Option<(u64, Path)> = None;
+    let current = manifest_files
+        .objects
+        .into_iter()
+        .map(|meta| meta.location)
+        .filter(|path| {
+            path.filename().is_some() && path.filename().unwrap().ends_with(MANIFEST_EXTENSION)
+        })
+        .filter_map(|path| {
+            let version = path
+                .filename()
+                .unwrap()
+                .split_once('.')
+                .and_then(|(version_str, _)| version_str.parse::<u64>().ok())?;
+            Some((version, path))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, path)| path);
 
-    while let Some(path) = manifest_files.next().await {
-        let path = path?;
-        let Some(file_name) = path.filename() else {
-            continue;
-        };
-
-        let version = match file_name.split_once('.') {
-            Some((version_str, _)) => match version_str.parse::<u64>() {
-                Ok(version) => version,
-                Err(_) => continue,
-            },
-            None => continue,
-        };
-
-        if let Some((current_version, _)) = current {
-            if version > current_version {
-                current = Some((version, path));
-            }
-        } else {
-            current = Some((version, path));
-        }
-    }
-
-    if let Some((_, path)) = current {
+    if let Some(path) = current {
         Ok(path)
     } else {
         Err(Error::NotFound {

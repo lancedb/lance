@@ -646,20 +646,24 @@ impl Dataset {
                 .await?;
 
         // Test if the dataset exists
-        let latest_manifest = object_store
+        let dataset_exists = match object_store
             .commit_handler
             .resolve_latest_version(&base, &object_store)
-            .await?;
-        let flag_dataset_exists = object_store.exists(&latest_manifest).await?;
+            .await
+        {
+            Ok(_) => true,
+            Err(Error::NotFound { .. }) => false,
+            Err(e) => return Err(e),
+        };
 
-        if !flag_dataset_exists && !matches!(operation, Operation::Overwrite { .. }) {
+        if !dataset_exists && !matches!(operation, Operation::Overwrite { .. }) {
             return Err(Error::DatasetNotFound {
                 path: base.to_string(),
                 source: "The dataset must already exist unless the operation is Overwrite".into(),
             });
         }
 
-        let dataset = if flag_dataset_exists {
+        let dataset = if dataset_exists {
             Some(
                 Self::open_with_params(
                     base_uri,
