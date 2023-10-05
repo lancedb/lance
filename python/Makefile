@@ -5,7 +5,7 @@ else
 endif
 
 test:
-	pytest -m 'not integration' -m 'not cuda' $(PYTEST_ARGS) python/tests
+	pytest -m 'not (integration and cuda)' $(PYTEST_ARGS) python/tests
 .PHONY: test
 
 integtest:
