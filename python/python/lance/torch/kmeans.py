@@ -38,15 +38,37 @@ def _random_init(
 
 
 class KMeans:
+    """K-Means trains over vectors and divide into K clusters.
+
+    This implement is built on PyTorch, supporting CPU, GPU and Apple Silicon GPU.
+
+    Parameters
+    ----------
+    k: int
+        The number of clusters
+    metric : str
+        Metric type, support "l2", "cosine" or "dot"
+    init: str
+        Initialization method. Only support "random" now.
+    max_iters: int
+        Max number of iterations to train the kmean model.
+    tolerance: float
+        Relative tolerance with regards to Frobenius norm of the difference in
+        the cluster centers of two consecutive iterations to declare convergence.
+    seed: int, optional
+        Random seed
+    device: str, optional
+        The device to run the PyTorch algorithms. Default we will pick the most performant device
+        on the host. See `lance.torch.preferred_device()`
+    """
     def __init__(
         self,
         k: int,
         *,
         metric: str = "l2",
-        redo: int = 2,
-        init_method: str = "random",
+        init: str = "random",
         max_iters: int = 50,
-        tolerance: float = 1e-6,
+        tolerance: float = 1e-4,
         seed: Optional[int] = None,
         device: Optional[str] = None,
     ):
@@ -66,9 +88,8 @@ class KMeans:
                 f"Only l2/cosine/dot is supported as metric type, got: {metric}"
             )
 
-        self.redo = redo
         self.centroids: Optional[torch.Tensor] = None
-        self.init_method = init_method
+        self.init = init
         self.device = preferred_device(device)
         self.tolerance = tolerance
         self.seed = seed
@@ -96,18 +117,28 @@ class KMeans:
         return data
 
     def fit(self, data: Union[pa.FixedSizeListArray, np.ndarray, torch.Tensor]):
+        """Fit - Train the kmeans models.
+
+        Parameters
+        ----------
+        data : pa.FixedSizeListArray, np.ndarray, or torch.Tensor
+            2-D input data to train kmeans.
+
+        """
         assert self.centroids is None
         data = self._to_tensor(data)
 
-        if self.init_method == "random":
+        if self.init == "random":
             self.centroids = _random_init(data, self.k, self.seed)
+        else:
+            raise ValueError("KMeans::fit: only random initialization is supported.")
 
         last_dist = 0
         for i in tqdm(range(self.max_iters)):
             dist = self._fit_once(data)
             if i % 10 == 0:
-                logging.debug("Distortion: %s, iter: %s", dist, i)
-            if abs(dist - last_dist) / dist < self.tolerance:
+                logging.debug("Total distance: %s, iter: %s", dist, i)
+            if abs((dist - last_dist) / dist) < self.tolerance:
                 logging.info(f"KMeans::fit: early stop at iteration: {i}")
                 break
             last_dist = dist

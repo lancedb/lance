@@ -19,10 +19,10 @@ from lance.util import KMeans
 
 @pytest.mark.benchmark(group="kmeans")
 def test_kmeans(benchmark):
-    data = np.random.random((65535, 16)).astype("f")
+    data = np.random.random((65535, 1536)).astype("f")
 
     def _f():
-        kmeans = KMeans(8192, "l2")
+        kmeans = KMeans(8192, "cosine")
         kmeans.fit(data)
 
     benchmark(_f)
@@ -35,7 +35,7 @@ def test_kmeans_torch(benchmark):
     from lance.torch.kmeans import KMeans
 
     def _f():
-        kmeans = KMeans(256, metric="cosine", device="cuda")
+        kmeans = KMeans(8192, metric="cosine", device="cuda")
         kmeans.fit(data)
 
     benchmark(_f)
