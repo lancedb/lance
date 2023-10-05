@@ -13,29 +13,16 @@
 #  limitations under the License.
 
 import numpy as np
-import pytest
-from lance.util import KMeans
+import torch
+from lance.torch.kmeans import KMeans
 
 
-@pytest.mark.benchmark(group="kmeans")
-def test_kmeans(benchmark):
-    data = np.random.random((65535, 1536)).astype("f")
+def test_kmeans():
+    arr = np.array(range(128)).reshape(-1, 8).astype(np.float32)
+    kmeans = KMeans(4, device="cpu")
+    kmeans.fit(arr)
 
-    def _f():
-        kmeans = KMeans(256, "cosine")
-        kmeans.fit(data)
-
-    benchmark(_f)
-
-
-@pytest.mark.benchmark(group="kmeans")
-def test_kmeans_torch(benchmark):
-    data = np.random.random((65535, 1536)).astype("f")
-
-    from lance.torch.kmeans import KMeans
-
-    def _f():
-        kmeans = KMeans(256, metric="cosine", device="cuda")
-        kmeans.fit(data)
-
-    benchmark(_f)
+    cluster_ids = kmeans.transform(arr)
+    _, cnts = torch.unique(cluster_ids, return_counts=True)
+    assert (cnts >= 1).all() and (cnts <= 8).all()
+    assert len(cnts) == 4  # all cluster has data

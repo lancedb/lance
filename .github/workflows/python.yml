@@ -42,7 +42,7 @@ jobs:
         workspaces: python
     - name: Install linting tools
       run: |
-        pip install black isort ruff maturin tensorflow
+        pip install black isort ruff maturin tensorflow tqdm
         pip install torch --index-url https://download.pytorch.org/whl/cpu
     - name: Lint Python
       run: |
@@ -61,7 +61,7 @@ jobs:
       run: |
         python -m venv venv
         source venv/bin/activate
-        pip install torch --index-url https://download.pytorch.org/whl/cpu
+        pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
         maturin develop --extras tests
     - name: Run doctest
       run: |
