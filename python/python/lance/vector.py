@@ -14,6 +14,7 @@
 """Embedding vector utilities"""
 
 import logging
+import re
 from typing import Optional, Union
 
 import numpy as np
@@ -120,6 +121,9 @@ def vec_to_table(
     return pa.Table.from_arrays(arrays, names=names)
 
 
+CUDA_REGEX = re.compile(r"^cuda(:\d+)?$")
+
+
 def train_ivf_centroids(
     dataset: LanceDataset,
     column: str,
@@ -130,8 +134,7 @@ def train_ivf_centroids(
     sample_rate: int = 256,
 ) -> np.ndarray:
     """Use accelerator (GPU or MPS) to train kmeans."""
-
-    if accelerator not in ["gpu", "cuda"]:
+    if not CUDA_REGEX.match(accelerator):
         raise ValueError(
             "Train ivf centroids on accelerator: "
             + f"only support 'cuda' as accelerator, got '{accelerator}'."
@@ -145,12 +148,12 @@ def train_ivf_centroids(
     else:
         samples = dataset.sample(k * sample_rate)[column]
 
-    if accelerator in ["gpu", "cuda"]:
+    if CUDA_REGEX.match(accelerator):
         logging.info("Training IVF partitions using GPU(Cuda)")
         # Pytorch installation warning will be raised here.
         from .torch.kmeans import KMeans
 
-        kmeans = KMeans(k, metric=metric_type, device="cuda")
+        kmeans = KMeans(k, metric=metric_type, device=accelerator)
         kmeans.fit(samples)
         return kmeans.centroids.cpu().numpy()
     else:

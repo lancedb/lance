@@ -156,12 +156,48 @@ def test_create_index_unsupported_accelerator(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
     with pytest.raises(ValueError):
-        dataset = dataset.create_index(
+        dataset.create_index(
             "vector",
             index_type="IVF_PQ",
             num_partitions=4,
             num_sub_vectors=16,
             accelerator="no-supported",
+        )
+
+    with pytest.raises(ValueError):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=16,
+            accelerator="0cuda",
+        )
+
+    with pytest.raises(ValueError):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=16,
+            accelerator="cuda-0",
+        )
+
+    with pytest.raises(ValueError):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=16,
+            accelerator="cuda:",
+        )
+
+    with pytest.raises(ValueError):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=16,
+            accelerator="cuda:abc",
         )
 
 
