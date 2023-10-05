@@ -676,7 +676,7 @@ class LanceDataset(pa.dataset.Dataset):
         accelerator : str, optional
             If set, use accelerator to speed up training process.
             Accepted accelerator: "cuda".
-            If not set, use default CPU kmeans algorithm.
+            If not set, use the CPU.
         kwargs :
             Parameters passed to the index building process.
 
