@@ -714,7 +714,7 @@ class LanceDataset(pa.dataset.Dataset):
         Experimental Accelerator (GPU) support:
 
         - *accelerate*: use GPU to train IVF partitions.
-            Only support CUDA (Nvidia) currently. Requires PyTorch being installed.
+            Only supports CUDA (Nvidia) currently. Requires PyTorch being installed.
 
         .. code-block:: python
 
