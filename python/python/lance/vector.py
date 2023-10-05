@@ -13,10 +13,14 @@
 
 """Embedding vector utilities"""
 
+import logging
+import re
 from typing import Optional, Union
 
 import numpy as np
 import pyarrow as pa
+
+from . import LanceDataset
 
 
 def _normalize_vectors(vectors, ndim):
@@ -115,3 +119,42 @@ def vec_to_table(
             f"data must be dict, list, or ndarray, got {type(data)} instead"
         )
     return pa.Table.from_arrays(arrays, names=names)
+
+
+CUDA_REGEX = re.compile(r"^cuda(:\d+)?$")
+
+
+def train_ivf_centroids(
+    dataset: LanceDataset,
+    column: str,
+    k: int,
+    metric_type: str,
+    accelerator: str,
+    *,
+    sample_rate: int = 256,
+) -> np.ndarray:
+    """Use accelerator (GPU or MPS) to train kmeans."""
+    if not (CUDA_REGEX.match(accelerator) or accelerator == "mps"):
+        raise ValueError(
+            "Train ivf centroids on accelerator: "
+            + f"only support 'cuda' as accelerator, got '{accelerator}'."
+        )
+
+    total_size = dataset.count_rows()
+    sample_size = min(k * sample_rate, total_size)
+
+    if total_size < k * sample_size:
+        samples = dataset.to_table(columns=[column])[column].combine_chunks()
+    else:
+        samples = dataset.sample(k * sample_rate)[column]
+
+    if CUDA_REGEX.match(accelerator) or accelerator == "mps":
+        logging.info(f"Training IVF partitions using GPU({accelerator})")
+        # Pytorch installation warning will be raised here.
+        from .torch.kmeans import KMeans
+
+        kmeans = KMeans(k, metric=metric_type, device=accelerator)
+        kmeans.fit(samples)
+        return kmeans.centroids.cpu().numpy()
+    else:
+        raise ValueError(f"unsupported accelerator type: {accelerator}")
