@@ -18,6 +18,14 @@ concurrency:
   group: "pages"
   cancel-in-progress: true
 
+env:
+  # Disable full debug symbol generation to speed up CI build and keep memory down
+  # "1" means line tables only, which is useful for panic tracebacks.
+  RUSTFLAGS: "-C debuginfo=1"
+  # according to: https://matklad.github.io/2021/09/04/fast-rust-builds.html
+  # CI builds are faster with incremental disabled.
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   # Single deploy job since we're just deploying
   deploy:
