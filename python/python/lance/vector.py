@@ -127,7 +127,7 @@ def train_ivf_centroids(
     accelerator: str,
     *,
     sample_rate: int = 256,
-) -> pa.FixedSizeListArray:
+) -> np.ndarray:
     """Use accelerator (GPU or MPS) to train kmeans."""
 
     if accelerator not in ["gpu", "cuda"]:
@@ -152,7 +152,4 @@ def train_ivf_centroids(
         kmeans.fit(samples)
         return kmeans.centroids.cpu().numpy()
     else:
-        raise ValueError(
-            f"Train ivf centroids on accelerator: "
-            + f"only support 'cuda' as accelerator, got '{accelerator}'."
-        )
+        raise ValueError(f"unsupported accelerator type: {accelerator}")
