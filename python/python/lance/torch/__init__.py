@@ -20,7 +20,7 @@ except ImportError:
     raise ImportError("PyTorch>=2.0 is not installed")
 
 
-def preferred_device(device: Optional[str] = None) -> torch.device:
+def preferred_device(device: Optional[str] = None):
     """Get the preferred device for computation.
 
     Parameters

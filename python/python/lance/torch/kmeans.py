@@ -13,7 +13,7 @@
 #  limitations under the License.
 
 import logging
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import pyarrow as pa
@@ -144,22 +144,39 @@ class KMeans:
                 break
             last_dist = dist
 
+    @staticmethod
+    def _split_centroids(
+        centroids: List[torch.Tensor], counts: List[int]
+    ) -> torch.Tensor:
+        for idx, cnt in enumerate(counts):
+            if cnt == 0:
+                max_idx = np.argmax(counts)
+                half_cnt = counts[max_idx] // 2
+                counts[idx], counts[max_idx] = half_cnt, half_cnt
+                centroids[idx] = centroids[max_idx] * 1.05
+                centroids[max_idx] = centroids[max_idx] / 1.05
+        return torch.stack(centroids)
+
     def _fit_once(self, data: torch.Tensor) -> float:
         """Train KMean once and return the total distance."""
         assert self.centroids is not None
         part_ids = self.transform(data)
         # compute new centroids
         new_centroids = []
-        total_dist = 0
+        num_rows = []
         for i in range(self.k):
-            parted_data = data[part_ids == i]
+            parted_idx = part_ids == i
+            parted_data = data[parted_idx]
             new_cent = parted_data.mean(dim=0)
             new_centroids.append(new_cent)
-            all_dist = self.dist_func(parted_data, new_cent.reshape(1, -1))
-            total_dist += all_dist.sum()
+            num_rows.append(parted_idx.sum().item())
 
-        self.centroids = torch.stack(new_centroids)
-        return total_dist
+        self.centroids = self._split_centroids(new_centroids, num_rows)
+
+        pairwise_dists = self.dist_func(data, self.centroids)
+        part_ids = pairwise_dists.argmin(dim=1, keepdim=True)
+        dists = pairwise_dists.take_along_dim(part_ids, dim=1)
+        return dists.sum().item()
 
     def transform(
         self, data: Union[pa.Array, np.ndarray, torch.Tensor]
