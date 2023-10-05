@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -40,6 +41,7 @@ use crate::{Error, Result};
 
 /// Product Quantization Index.
 ///
+#[derive(Clone)]
 pub struct PQIndex {
     /// Number of bits for the centroids.
     ///
@@ -287,7 +289,7 @@ impl VectorIndex for PQIndex {
         reader: &dyn ObjectReader,
         offset: usize,
         length: usize,
-    ) -> Result<Arc<dyn VectorIndex>> {
+    ) -> Result<Box<dyn VectorIndex>> {
         let pq_code_length = self.pq.num_sub_vectors * length;
         let pq_code =
             read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;
@@ -296,7 +298,7 @@ impl VectorIndex for PQIndex {
         let row_ids =
             read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
 
-        Ok(Arc::new(Self {
+        Ok(Box::new(Self {
             nbits: self.pq.num_bits,
             num_sub_vectors: self.pq.num_sub_vectors,
             dimension: self.pq.dimension,
@@ -305,6 +307,37 @@ impl VectorIndex for PQIndex {
             pq: self.pq.clone(),
             metric_type: self.metric_type,
         }))
+    }
+
+    fn check_can_remap(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        let code = self
+            .code
+            .as_ref()
+            .unwrap()
+            .values()
+            .chunks_exact(self.num_sub_vectors);
+        let row_ids = self.row_ids.as_ref().unwrap().values().iter();
+        let remapped = row_ids
+            .zip(code)
+            .filter_map(|(old_row_id, code)| {
+                let new_row_id = mapping.get(old_row_id).cloned();
+                // If the row id is not in the mapping then this row is not remapped and we keep as is
+                let new_row_id = new_row_id.unwrap_or(Some(*old_row_id));
+                new_row_id.map(|new_row_id| (new_row_id, code))
+            })
+            .collect::<Vec<_>>();
+
+        self.row_ids = Some(Arc::new(UInt64Array::from_iter_values(
+            remapped.iter().map(|(row_id, _)| *row_id),
+        )));
+        self.code = Some(Arc::new(UInt8Array::from_iter_values(
+            remapped.into_iter().flat_map(|(_, code)| code).copied(),
+        )));
+        Ok(())
     }
 }
 

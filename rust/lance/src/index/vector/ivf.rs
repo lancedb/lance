@@ -14,7 +14,7 @@
 
 //! IVF - Inverted File index.
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
 use arrow_arith::arithmetic::subtract_dyn;
 use arrow_array::{
@@ -31,7 +31,7 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
-use lance_core::io::WriteExt;
+use lance_core::io::{WriteExt, Writer};
 use lance_index::vector::{
     pq::{PQBuildParams, ProductQuantizer},
     RESIDUAL_COLUMN,
@@ -46,13 +46,16 @@ use tracing::{instrument, span, Level};
 #[cfg(feature = "opq")]
 use super::opq::train_opq;
 use super::{
-    pq::train_pq, utils::maybe_sample_training_data, MetricType, Query, VectorIndex,
-    INDEX_FILE_NAME,
+    pq::{train_pq, PQIndex},
+    utils::maybe_sample_training_data,
+    MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
 use crate::{
     dataset::Dataset,
     datatypes::Field,
+    encodings::plain::PlainEncoder,
     index::{pb, prefilter::PreFilter, vector::Transformer, Index},
+    io::object_writer::ObjectWriter,
     io::RecordBatchStream,
 };
 use crate::{
@@ -123,6 +126,7 @@ impl IVFIndex {
                 .sub_index
                 .load(self.reader.as_ref(), offset, length)
                 .await?;
+            let idx: Arc<dyn VectorIndex> = idx.into();
             self.session.index_cache.insert(&cache_key, idx.clone());
             idx
         };
@@ -240,9 +244,25 @@ impl VectorIndex for IVFIndex {
         _reader: &dyn ObjectReader,
         _offset: usize,
         _length: usize,
-    ) -> Result<Arc<dyn VectorIndex>> {
+    ) -> Result<Box<dyn VectorIndex>> {
         Err(Error::Index {
             message: "Flat index does not support load".to_string(),
+        })
+    }
+
+    fn check_can_remap(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        // This will be needed if we want to clean up IVF to allow more than just
+        // one layer (e.g. IVF -> IVF -> PQ).  We need to pass on the call to
+        // remap to the lower layers.
+
+        // Currently, remapping for IVF is implemented in remap_index_file which
+        // mirrors some of the other IVF routines like build_ivf_pq_index
+        Err(Error::Index {
+            message: "Remapping IVF in this way not supported".to_string(),
         })
     }
 }
@@ -719,6 +739,124 @@ pub async fn build_ivf_pq_index(
     .await
 }
 
+struct RemapPageTask {
+    offset: usize,
+    length: u32,
+    page: Option<Box<dyn VectorIndex>>,
+}
+
+impl RemapPageTask {
+    fn new(offset: usize, length: u32) -> Self {
+        Self {
+            offset,
+            length,
+            page: None,
+        }
+    }
+}
+
+impl RemapPageTask {
+    async fn load_and_remap(
+        mut self,
+        reader: &dyn ObjectReader,
+        index: &IVFIndex,
+        mapping: &HashMap<u64, Option<u64>>,
+    ) -> Result<Self> {
+        let mut page = index
+            .sub_index
+            .load(reader, self.offset, self.length as usize)
+            .await?;
+        page.remap(mapping)?;
+        self.page = Some(page);
+        Ok(self)
+    }
+
+    async fn write(self, writer: &mut ObjectWriter, ivf: &mut Ivf) -> Result<()> {
+        let page = self.page.as_ref().expect("Load was not called");
+        let page: &PQIndex = page
+            .as_any()
+            .downcast_ref()
+            .expect("Generic index writing not supported yet");
+        ivf.offsets.push(writer.tell());
+        ivf.lengths
+            .push(page.row_ids.as_ref().unwrap().len() as u32);
+        PlainEncoder::write(writer, &[page.code.as_ref().unwrap().as_ref()]).await?;
+        PlainEncoder::write(writer, &[page.row_ids.as_ref().unwrap().as_ref()]).await?;
+        Ok(())
+    }
+}
+
+fn generate_remap_tasks(offsets: &Vec<usize>, lengths: &[u32]) -> Result<Vec<RemapPageTask>> {
+    let mut tasks: Vec<RemapPageTask> = Vec::with_capacity(offsets.len() * 2 + 1);
+
+    for (offset, length) in offsets.iter().zip(lengths.iter()) {
+        tasks.push(RemapPageTask::new(*offset, *length));
+    }
+
+    Ok(tasks)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn remap_index_file(
+    dataset: &Dataset,
+    old_uuid: &str,
+    new_uuid: &str,
+    old_version: u64,
+    index: &IVFIndex,
+    mapping: &HashMap<u64, Option<u64>>,
+    name: String,
+    column: String,
+    transforms: Vec<pb::Transform>,
+) -> Result<()> {
+    let object_store = dataset.object_store();
+    let old_path = dataset.indices_dir().child(old_uuid).child(INDEX_FILE_NAME);
+    let new_path = dataset.indices_dir().child(new_uuid).child(INDEX_FILE_NAME);
+
+    let reader = object_store.open(&old_path).await?;
+    let mut writer = object_store.create(&new_path).await?;
+
+    let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;
+
+    let mut task_stream = stream::iter(tasks.into_iter())
+        .map(|task| task.load_and_remap(reader.as_ref(), index, mapping))
+        .buffered(num_cpus::get());
+
+    let mut ivf = Ivf {
+        centroids: index.ivf.centroids.clone(),
+        offsets: Vec::with_capacity(index.ivf.offsets.len()),
+        lengths: Vec::with_capacity(index.ivf.lengths.len()),
+    };
+    while let Some(write_task) = task_stream.try_next().await? {
+        write_task.write(&mut writer, &mut ivf).await?;
+    }
+
+    let pq_sub_index = index
+        .sub_index
+        .as_any()
+        .downcast_ref::<PQIndex>()
+        .ok_or_else(|| Error::NotSupported {
+            source: "Remapping a non-pq sub-index".into(),
+        })?;
+
+    let metadata = IvfPQIndexMetadata {
+        name,
+        column,
+        dimension: index.ivf.dimension() as u32,
+        dataset_version: old_version,
+        ivf,
+        metric_type: index.metric_type,
+        pq: pq_sub_index.pq.clone(),
+        transforms,
+    };
+
+    let metadata = pb::Index::try_from(&metadata)?;
+    let pos = writer.write_protobuf(&metadata).await?;
+    writer.write_magics(pos).await?;
+    writer.shutdown().await?;
+
+    Ok(())
+}
+
 /// Write the index to the index file.
 ///
 #[allow(clippy::too_many_arguments)]
@@ -807,18 +945,240 @@ async fn train_ivf_model(
 mod tests {
     use super::*;
 
-    use arrow_array::{cast::AsArray, RecordBatchIterator};
+    use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
-    use lance_testing::datagen::generate_random_array;
+    use lance_testing::datagen::{
+        generate_random_array, generate_scaled_random_array, sample_without_replacement,
+    };
+    use rand::{seq::SliceRandom, thread_rng};
     use tempfile::tempdir;
+    use uuid::Uuid;
 
     use std::collections::HashMap;
 
-    use crate::index::{vector::VectorIndexParams, DatasetIndexExt, IndexType};
+    use crate::{
+        format::RowAddress,
+        index::{
+            vector::{open_index, VectorIndexParams},
+            DatasetIndexExt, IndexType,
+        },
+    };
 
-    #[tokio::test]
-    async fn test_create_ivf_pq_with_centroids() {
-        const DIM: usize = 32;
+    const DIM: usize = 32;
+
+    /// This goal of this function is to generate data that behaves in a very deterministic way so that
+    /// we can evaluate the correctness of an IVF_PQ implementation.  Currently it is restricted to the
+    /// L2 distance metric.
+    ///
+    /// First, we generate a set of centroids.  These are generated randomly but we ensure that is
+    /// sufficient distance between each of the centroids.
+    ///
+    /// Then, we generate 256 vectors per centroid.  Each vector is generated by making a line by
+    /// adding / subtracting [1,1,1...,1] (with the centroid in the middle)
+    ///
+    /// The trained result should have our generated centroids (without these centroids actually being
+    /// a part of the input data) and the PQ codes for every data point should be identical and, given
+    /// any three data points a, b, and c that are in the same centroid then the distance between a and
+    /// b should be different than the distance between a and c.
+    struct WellKnownIvfPqData {
+        dim: u32,
+        num_centroids: u32,
+        centroids: Option<Float32Array>,
+        vectors: Option<Float32Array>,
+    }
+
+    impl WellKnownIvfPqData {
+        // Right now we are assuming 8-bit codes
+        const VALS_PER_CODE: u32 = 256;
+        const COLUMN: &'static str = "vector";
+
+        fn new(dim: u32, num_centroids: u32) -> Self {
+            Self {
+                dim,
+                num_centroids,
+                centroids: None,
+                vectors: None,
+            }
+        }
+
+        fn distance_between_points(&self) -> f32 {
+            (self.dim as f32).sqrt()
+        }
+
+        fn generate_centroids(&self) -> Float32Array {
+            const MAX_ATTEMPTS: u32 = 10;
+            let distance_needed =
+                self.distance_between_points() * Self::VALS_PER_CODE as f32 * 2_f32;
+            let mut attempts_remaining = MAX_ATTEMPTS;
+            let num_values = self.dim * self.num_centroids;
+            while attempts_remaining > 0 {
+                // Use some biggish numbers to ensure we get the distance we want but make them positive
+                // and not too big for easier debugging.
+                let centroids: Float32Array =
+                    generate_scaled_random_array(num_values as usize, 0_f32, 1000_f32);
+                let mut broken = false;
+                for (index, centroid) in centroids
+                    .values()
+                    .chunks_exact(self.dim as usize)
+                    .enumerate()
+                {
+                    let offset = (index + 1) * self.dim as usize;
+                    let length = centroids.len() - offset;
+                    if length == 0 {
+                        // This will be true for the last item since we ignore comparison with self
+                        continue;
+                    }
+                    let distances = l2_distance_batch(
+                        centroid,
+                        &centroids.values().slice(offset, length),
+                        self.dim as usize,
+                    );
+                    let min_distance = distances
+                        .values()
+                        .iter()
+                        .copied()
+                        .min_by(|a, b| a.total_cmp(b))
+                        .unwrap();
+                    // In theory we could just replace this one vector but, out of laziness, we just retry all of them
+                    if min_distance < distance_needed {
+                        broken = true;
+                        break;
+                    }
+                }
+                if !broken {
+                    return centroids;
+                }
+                attempts_remaining -= 1;
+            }
+            panic!(
+                "Unable to generate centroids with sufficient distance after {} attempts",
+                MAX_ATTEMPTS
+            );
+        }
+
+        fn get_centroids(&mut self) -> &Float32Array {
+            if self.centroids.is_some() {
+                return self.centroids.as_ref().unwrap();
+            }
+            self.centroids = Some(self.generate_centroids());
+            self.centroids.as_ref().unwrap()
+        }
+
+        fn get_centroids_as_list_arr(&mut self) -> Arc<FixedSizeListArray> {
+            Arc::new(
+                FixedSizeListArray::try_new_from_values(
+                    self.get_centroids().clone(),
+                    self.dim as i32,
+                )
+                .unwrap(),
+            )
+        }
+
+        fn generate_vectors(&mut self) -> Float32Array {
+            let dim = self.dim as usize;
+            let num_centroids = self.num_centroids;
+            let centroids = self.get_centroids();
+            let mut vectors: Vec<f32> =
+                vec![0_f32; Self::VALS_PER_CODE as usize * dim * num_centroids as usize];
+            for (centroid, dst_batch) in centroids
+                .values()
+                .chunks_exact(dim)
+                .zip(vectors.chunks_exact_mut(dim * Self::VALS_PER_CODE as usize))
+            {
+                for (offset, dst) in (-128..0).chain(1..129).zip(dst_batch.chunks_exact_mut(dim)) {
+                    for (cent_val, dst_val) in centroid.iter().zip(dst) {
+                        *dst_val = *cent_val + offset as f32;
+                    }
+                }
+            }
+            Float32Array::from(vectors)
+        }
+
+        fn get_vectors(&mut self) -> &Float32Array {
+            if self.vectors.is_some() {
+                return self.vectors.as_ref().unwrap();
+            }
+            self.vectors = Some(self.generate_vectors());
+            self.vectors.as_ref().unwrap()
+        }
+
+        fn get_vector(&mut self, idx: u32) -> Float32Array {
+            let dim = self.dim as usize;
+            let vectors = self.get_vectors();
+            let start = idx as usize * dim;
+            vectors.slice(start, dim)
+        }
+
+        fn generate_batches(&mut self) -> impl RecordBatchReader + Send + 'static {
+            let dim = self.dim as usize;
+            let vectors_array = self.get_vectors();
+
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                Self::COLUMN,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dim as i32,
+                ),
+                true,
+            )]));
+            let array = Arc::new(
+                FixedSizeListArray::try_new_from_values(vectors_array.clone(), dim as i32).unwrap(),
+            );
+            let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
+            RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone())
+        }
+
+        async fn generate_dataset(&mut self, test_uri: &str) -> Result<Dataset> {
+            let batches = self.generate_batches();
+            Dataset::write(batches, test_uri, None).await
+        }
+
+        async fn check_index<F: Fn(u64) -> Option<u64>>(
+            &mut self,
+            index: &IVFIndex,
+            prefilter: &PreFilter,
+            ids_to_test: &Vec<u64>,
+            row_id_map: F,
+        ) {
+            const ROWS_TO_TEST: u32 = 500;
+            let num_vectors = ids_to_test.len() as u32 / self.dim;
+            let num_tests = ROWS_TO_TEST.min(num_vectors);
+            let row_ids_to_test = sample_without_replacement(ids_to_test, num_tests);
+            for row_id in row_ids_to_test {
+                let row = self.get_vector(row_id as u32);
+                let query = Query {
+                    column: Self::COLUMN.to_string(),
+                    key: Arc::new(row),
+                    k: 5,
+                    nprobes: 1,
+                    refine_factor: None,
+                    metric_type: MetricType::L2,
+                    use_index: true,
+                };
+                let search_result = index.search(&query, prefilter).await.unwrap();
+
+                let found_ids = search_result.column(1);
+                let found_ids = found_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
+                let expected_id = row_id_map(row_id);
+
+                match expected_id {
+                    // Original id was deleted, results can be anything, just make sure they don't
+                    // include the original id
+                    None => assert!(!found_ids.iter().any(|f_id| f_id.unwrap() == row_id)),
+                    // Original id remains or was remapped, make sure expected id in results
+                    Some(expected_id) => {
+                        assert!(found_ids.iter().any(|f_id| f_id.unwrap() == expected_id))
+                    }
+                };
+                // The invalid row id should never show up in results
+                assert!(!found_ids
+                    .iter()
+                    .any(|f_id| f_id.unwrap() == RowAddress::TOMBSTONE_ROW));
+            }
+        }
+    }
+
+    async fn generate_test_dataset(test_uri: &str) -> (Dataset, Arc<FixedSizeListArray>) {
         let vectors = generate_random_array(1000 * DIM);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
@@ -838,11 +1198,17 @@ mod tests {
         let array = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
         let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
 
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        (dataset, array)
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_pq_with_centroids() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let (mut dataset, vector_array) = generate_test_dataset(test_uri).await;
 
         let centroids = generate_random_array(2 * DIM);
         let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
@@ -858,8 +1224,8 @@ mod tests {
             .await
             .unwrap();
 
-        let elem = array.value(10);
-        let query = elem.as_primitive::<Float32Type>();
+        let sample_query = vector_array.value(10);
+        let query = sample_query.as_primitive::<Float32Type>();
         let results = dataset
             .scan()
             .nearest("vector", query, 5)
@@ -872,5 +1238,162 @@ mod tests {
             .unwrap();
         assert_eq!(1, results.len());
         assert_eq!(5, results[0].num_rows());
+    }
+
+    fn partition_ids(mut ids: Vec<u64>, num_parts: u32) -> Vec<Vec<u64>> {
+        if num_parts > ids.len() as u32 {
+            panic!("Not enough ids to break into {num_parts} parts");
+        }
+        let mut rng = thread_rng();
+        ids.shuffle(&mut rng);
+
+        let values_per_part = ids.len() / num_parts as usize;
+        let parts_with_one_extra = ids.len() % num_parts as usize;
+
+        let mut parts = Vec::with_capacity(num_parts as usize);
+        let mut offset = 0;
+        for part_size in (0..num_parts).map(|part_idx| {
+            if part_idx < parts_with_one_extra as u32 {
+                values_per_part + 1
+            } else {
+                values_per_part
+            }
+        }) {
+            parts.push(Vec::from_iter(
+                ids[offset..(offset + part_size)].iter().copied(),
+            ));
+            offset += part_size;
+        }
+
+        parts
+    }
+
+    const BIG_OFFSET: u64 = 10000;
+
+    fn build_mapping(
+        row_ids_to_modify: &[u64],
+        row_ids_to_remove: &[u64],
+        max_id: u64,
+    ) -> HashMap<u64, Option<u64>> {
+        // Some big number we can add to row ids so they are remapped but don't intersect with anything
+        if max_id > BIG_OFFSET {
+            panic!("This logic will only work if the max row id is less than BIG_OFFSET");
+        }
+        row_ids_to_modify
+            .iter()
+            .copied()
+            .map(|val| (val, Some(val + BIG_OFFSET)))
+            .chain(row_ids_to_remove.iter().copied().map(|val| (val, None)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn remap_ivf_pq_index() {
+        // Use small numbers to keep runtime down
+        const DIM: u32 = 8;
+        const CENTROIDS: u32 = 2;
+        const NUM_SUBVECTORS: u32 = 4;
+        const NUM_BITS: u32 = 8;
+        const INDEX_NAME: &str = "my_index";
+
+        // In this test we create a sample dataset with reliable data, train an IVF PQ index
+        // remap the rows, and then verify that we can still search the index and will get
+        // back the remapped row ids.
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut test_data = WellKnownIvfPqData::new(DIM, CENTROIDS);
+
+        let dataset = Arc::new(test_data.generate_dataset(test_uri).await.unwrap());
+        let ivf_params = IvfBuildParams::try_with_centroids(
+            CENTROIDS as usize,
+            test_data.get_centroids_as_list_arr(),
+        )
+        .unwrap();
+        let pq_params = PQBuildParams::new(NUM_SUBVECTORS as usize, NUM_BITS as usize);
+
+        let uuid = Uuid::new_v4();
+        let uuid_str = uuid.to_string();
+
+        build_ivf_pq_index(
+            &dataset,
+            WellKnownIvfPqData::COLUMN,
+            INDEX_NAME,
+            &uuid_str,
+            MetricType::L2,
+            &ivf_params,
+            &pq_params,
+        )
+        .await
+        .unwrap();
+
+        let index = open_index(dataset.clone(), WellKnownIvfPqData::COLUMN, &uuid_str)
+            .await
+            .unwrap();
+        let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
+
+        let prefilter = PreFilter::new(dataset.clone());
+
+        let is_not_remapped = Some;
+        let is_remapped = |row_id| Some(row_id + BIG_OFFSET);
+        let is_removed = |_| None;
+        let max_id = test_data.get_vectors().len() as u64 / test_data.dim as u64;
+        let row_ids = Vec::from_iter(0..max_id);
+
+        // Sanity check to make sure the index we built is behaving correctly.  Any
+        // input row, when used as a query, should be found in the results list with
+        // the same id
+        test_data
+            .check_index(ivf_index, &prefilter, &row_ids, is_not_remapped)
+            .await;
+
+        // When remapping we change the id of 1/3 of the rows, we remove another 1/3,
+        // and we keep 1/3 as they are
+        let partitioned_row_ids = partition_ids(row_ids, 3);
+        let row_ids_to_modify = &partitioned_row_ids[0];
+        let row_ids_to_remove = &partitioned_row_ids[1];
+        let row_ids_to_remain = &partitioned_row_ids[2];
+
+        let mapping = build_mapping(row_ids_to_modify, row_ids_to_remove, max_id);
+
+        let new_uuid = Uuid::new_v4();
+        let new_uuid_str = new_uuid.to_string();
+
+        remap_index_file(
+            &dataset,
+            &uuid_str,
+            &new_uuid_str,
+            dataset.version().version,
+            ivf_index,
+            &mapping,
+            INDEX_NAME.to_string(),
+            WellKnownIvfPqData::COLUMN.to_string(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let remapped = open_index(
+            dataset.clone(),
+            WellKnownIvfPqData::COLUMN,
+            &new_uuid.to_string(),
+        )
+        .await
+        .unwrap();
+        let ivf_remapped = remapped.as_any().downcast_ref::<IVFIndex>().unwrap();
+
+        // If the ids were remapped then make sure the new row id is in the results
+        test_data
+            .check_index(ivf_remapped, &prefilter, row_ids_to_modify, is_remapped)
+            .await;
+        // If the ids were removed then make sure the old row id isn't in the results
+        test_data
+            .check_index(ivf_remapped, &prefilter, row_ids_to_remove, is_removed)
+            .await;
+        // If the ids were not remapped then make sure they still return the old id
+        test_data
+            .check_index(ivf_remapped, &prefilter, row_ids_to_remain, is_not_remapped)
+            .await;
     }
 }

@@ -326,6 +326,12 @@ impl VectorIndex for OPQIndex {
             message: "OPQ does not support load".to_string(),
         })
     }
+
+    fn check_can_remap(&self) -> Result<()> {
+        Err(Error::NotSupported {
+            source: "DiskANNIndex does not yet support remap".into(),
+        })
+    }
 }
 
 impl TryFrom<&OptimizedProductQuantizer> for Transform {
