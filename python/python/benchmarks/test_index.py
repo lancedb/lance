@@ -46,4 +46,21 @@ def test_create_ivf_pq(test_dataset, benchmark):
         num_partitions=8,
         num_sub_vectors=2,
         num_bits=8,
+        replace=True,
+    )
+
+
+@pytest.mark.benchmark(group="create_index")
+@pytest.mark.cuda
+def test_create_ivf_pq_cuda(test_dataset, benchmark):
+    benchmark(
+        test_dataset.create_index,
+        column="vector",
+        index_type="IVF_PQ",
+        metric_type="L2",
+        num_partitions=8,
+        num_sub_vectors=2,
+        num_bits=8,
+        accelerator="cuda",
+        replace=True,
     )

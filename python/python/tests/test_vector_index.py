@@ -128,6 +128,43 @@ def test_ann_append(tmp_path):
     print(run(dataset, q=np.array(q), assert_func=func))
 
 
+@pytest.mark.cuda
+def test_create_index_using_cuda(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        accelerator="cuda",
+    )
+    q = np.random.randn(128)
+    expected = dataset.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 10,  # Use non-default k
+        },
+    )["id"].to_numpy()
+    assert len(expected) == 10
+
+
+@pytest.mark.cuda
+def test_create_index_unsupported_accelerator(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    with pytest.raises(ValueError):
+        dataset = dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=16,
+            accelerator="no-supported",
+        )
+
+
 def test_use_index(dataset, tmp_path):
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
     ann_ds = ann_ds.create_index(

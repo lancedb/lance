@@ -14,6 +14,7 @@
 """Embedding vector utilities"""
 
 from typing import Optional, Union
+import logging
 
 import numpy as np
 import pyarrow as pa
@@ -140,11 +141,12 @@ def train_ivf_centroids(
     sample_size = min(k * sample_rate, total_size)
 
     if total_size < k * sample_size:
-        samples = dataset.to_table(columns=[column])[column]
+        samples = dataset.to_table(columns=[column])[column].combine_chunks()
     else:
         samples = dataset.sample(k * sample_rate)[column]
 
     if accelerator in ["gpu", "cuda"]:
+        logging.info("Training IVF partitions using GPU(Cuda)")
         # Pytorch installation warning will be raised here.
         from .torch.kmeans import KMeans
 
