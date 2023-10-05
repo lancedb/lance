@@ -13,8 +13,8 @@
 
 """Embedding vector utilities"""
 
-from typing import Optional, Union
 import logging
+from typing import Optional, Union
 
 import numpy as np
 import pyarrow as pa
@@ -133,7 +133,7 @@ def train_ivf_centroids(
 
     if accelerator not in ["gpu", "cuda"]:
         raise ValueError(
-            f"Train ivf centroids on accelerator: "
+            "Train ivf centroids on accelerator: "
             + f"only support 'cuda' as accelerator, got '{accelerator}'."
         )
 

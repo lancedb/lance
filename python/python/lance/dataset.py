@@ -674,7 +674,8 @@ class LanceDataset(pa.dataset.Dataset):
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
         accelerator : str, optional
-            If set, use accelerator to speed up training process. Accepted accelerator: "cuda".
+            If set, use accelerator to speed up training process.
+            Accepted accelerator: "cuda".
             If not set, use default CPU kmeans algorithm.
         kwargs :
             Parameters passed to the index building process.
@@ -712,8 +713,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         Experimental Accelerator (GPU) support:
 
-        - *accelerate*: use GPU to train IVF partitions. Only support CUDA (Nvidia) currently.
-                        Requires PyTorch being installed.
+        - *accelerate*: use GPU to train IVF partitions.
+            Only support CUDA (Nvidia) currently. Requires PyTorch being installed.
 
         .. code-block:: python
 
