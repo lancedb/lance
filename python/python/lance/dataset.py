@@ -674,7 +674,7 @@ class LanceDataset(pa.dataset.Dataset):
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
         accelerator : str, optional
-            If set, use accelerator to speed up training process.
+            If set, use an accelerator to speed up the training process.
             Accepted accelerator: "cuda".
             If not set, use the CPU.
         kwargs :
