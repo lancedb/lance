@@ -36,8 +36,8 @@ use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
 use snafu::{location, Location};
-use tracing::{instrument, span, Level};
 use tokio::io::AsyncWriteExt;
+use tracing::{instrument, span, Level};
 
 #[cfg(feature = "opq")]
 use super::opq::train_opq;
@@ -50,8 +50,8 @@ use crate::{
     dataset::Dataset,
     datatypes::Field,
     index::{pb, prefilter::PreFilter, vector::Transformer, Index},
-    io::RecordBatchStream,
     io::object_writer::ObjectWriter,
+    io::RecordBatchStream,
 };
 use crate::{
     io::{local::to_local_path, object_reader::ObjectReader},
