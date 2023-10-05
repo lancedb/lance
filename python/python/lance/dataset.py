@@ -645,6 +645,7 @@ class LanceDataset(pa.dataset.Dataset):
         num_partitions: Optional[int] = None,
         ivf_centroids: Optional[Union[np.ndarray, pa.FixedSizeListArray]] = None,
         num_sub_vectors: Optional[int] = None,
+        accelerator: Optional[str] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -672,6 +673,10 @@ class LanceDataset(pa.dataset.Dataset):
             clustering. If not provided, a new Kmean model will be trained.
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
+        accelerator : str, optional
+            If set, use an accelerator to speed up the training process.
+            Accepted accelerator: "cuda".
+            If not set, use the CPU.
         kwargs :
             Parameters passed to the index building process.
 
@@ -706,6 +711,23 @@ class LanceDataset(pa.dataset.Dataset):
                 num_sub_vectors=16
             )
 
+        Experimental Accelerator (GPU) support:
+
+        - *accelerate*: use GPU to train IVF partitions.
+            Only supports CUDA (Nvidia) currently. Requires PyTorch being installed.
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/sift.lance")
+            dataset.create_index(
+                "vector",
+                "IVF_PQ",
+                num_partitions=256,
+                num_sub_vectors=16,
+                accelerator="cuda"
+            )
 
         References
         ----------
@@ -762,6 +784,15 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             kwargs["num_partitions"] = num_partitions
             kwargs["num_sub_vectors"] = num_sub_vectors
+
+            if accelerator is not None and ivf_centroids is None:
+                # Use accelerator to train ivf centroids
+                from .vector import train_ivf_centroids
+
+                ivf_centroids = train_ivf_centroids(
+                    self, column[0], num_partitions, metric, accelerator
+                )
+
             if ivf_centroids is not None:
                 # User provided IVF centroids
                 if isinstance(ivf_centroids, np.ndarray):
@@ -1311,7 +1342,7 @@ class ScannerBuilder:
         refine_factor: Optional[int] = None,
         use_index: bool = True,
     ) -> ScannerBuilder:
-        column_field = self.ds.schema.field_by_name(column)
+        column_field = self.ds.schema.field(column)
         q_size = q.size if isinstance(q, np.ndarray) else len(q)
 
         if self.ds.schema.get_field_index(column) < 0:
