@@ -123,12 +123,13 @@ def train_ivf_centroids(
     dataset: LanceDataset,
     column: str,
     k: int,
+    metric_type: str,
     accelerator: str,
     *,
     sample_rate: int = 256,
-    **kwargs,
 ) -> pa.FixedSizeListArray:
-    """Use accelerator to train args"""
+    """Use accelerator (GPU or MPS) to train kmeans."""
+
     if accelerator not in ["gpu", "cuda"]:
         raise ValueError(
             f"Train ivf centroids on accelerator: "
@@ -139,12 +140,19 @@ def train_ivf_centroids(
     sample_size = min(k * sample_rate, total_size)
 
     if total_size < k * sample_size:
-        samples = dataset.to_table(columns=[column])[column].to_numpy()
+        samples = dataset.to_table(columns=[column])[column]
     else:
-        samples = dataset.sample(k * sample_rate)[column].to_numpy()
-    print(samples)
+        samples = dataset.sample(k * sample_rate)[column]
+
     if accelerator in ["gpu", "cuda"]:
+        # Pytorch installation warning will be raised here.
         from .torch.kmeans import KMeans
 
-        kmeans = KMeans(k)
-    pass
+        kmeans = KMeans(k, metric=metric_type, device="cuda")
+        kmeans.fit(samples)
+        return kmeans.centroids.cpu().numpy()
+    else:
+        raise ValueError(
+            f"Train ivf centroids on accelerator: "
+            + f"only support 'cuda' as accelerator, got '{accelerator}'."
+        )
