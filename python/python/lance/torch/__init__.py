@@ -35,6 +35,8 @@ def preferred_device(device: Optional[str] = None):
         Device to use for computation.
     """
     if device is not None:
+        if isinstance(device, str):
+            device = torch.device(device)
         return device
     if torch.cuda.is_available():
         return torch.device("cuda")

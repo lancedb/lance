@@ -13,7 +13,7 @@
 #  limitations under the License.
 
 import logging
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import numpy as np
 import pyarrow as pa
@@ -35,6 +35,21 @@ def _random_init(
     sample_idx = torch.randint(0, data.shape[0], (n,))
     samples = data[sample_idx]
     return samples
+
+
+@torch.jit.script
+def _new_centroids_mps(
+    part_ids: torch.Tensor, k: int, data: torch.Tensor
+) -> torch.Tensor:
+    # MPS does not have Torch.index_reduce_()
+    # See https://github.com/pytorch/pytorch/issues/77764
+    new_centroids = []
+    for i in range(k):
+        parted_idx = part_ids == i
+        parted_data = data[parted_idx]
+        new_cent = parted_data.mean(dim=0)
+        new_centroids.append(new_cent)
+    return torch.stack(new_centroids)
 
 
 class KMeans:
@@ -145,31 +160,36 @@ class KMeans:
             last_dist = dist
 
     @staticmethod
-    def _split_centroids(
-        centroids: List[torch.Tensor], counts: List[int]
-    ) -> torch.Tensor:
-        for idx, cnt in enumerate(counts):
+    def _split_centroids(centroids: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+        for idx, cnt in enumerate(counts.cpu()):
             if cnt == 0:
-                max_idx = np.argmax(counts)
+                max_idx = torch.argmax(counts).item()
                 half_cnt = counts[max_idx] // 2
                 counts[idx], counts[max_idx] = half_cnt, half_cnt
                 centroids[idx] = centroids[max_idx] * 1.05
                 centroids[max_idx] = centroids[max_idx] / 1.05
-        return torch.stack(centroids)
+        return centroids
+
+    @staticmethod
+    def _count_rows_in_clusters(part_ids: torch.Tensor, k: int) -> torch.Tensor:
+        ones = torch.ones(part_ids.shape[0]).to(part_ids.device)
+        num_rows = torch.zeros(k).to(part_ids.device)
+        num_rows.scatter_add_(0, part_ids, ones)
+        return num_rows
 
     def _fit_once(self, data: torch.Tensor) -> float:
         """Train KMean once and return the total distance."""
-        assert self.centroids is not None
         part_ids = self.transform(data)
-        # compute new centroids
-        new_centroids = []
-        num_rows = []
-        for i in range(self.k):
-            parted_idx = part_ids == i
-            parted_data = data[parted_idx]
-            new_cent = parted_data.mean(dim=0)
-            new_centroids.append(new_cent)
-            num_rows.append(parted_idx.sum().item())
+
+        num_rows = self._count_rows_in_clusters(part_ids, self.k)
+        if self.device.type == "cuda":
+            new_centroids = torch.empty_like(self.centroids).to(self.device)
+            new_centroids[:] = torch.nan
+            new_centroids.index_reduce_(
+                0, part_ids, data, reduce="mean", include_self=False
+            )
+        else:
+            new_centroids = _new_centroids_mps(part_ids, self.k, data)
 
         self.centroids = self._split_centroids(new_centroids, num_rows)
 
