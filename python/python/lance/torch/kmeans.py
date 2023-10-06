@@ -145,9 +145,7 @@ class KMeans:
             last_dist = dist
 
     @staticmethod
-    def _split_centroids(
-        centroids: torch.Tensor, counts: torch.Tensor
-    ) -> torch.Tensor:
+    def _split_centroids(centroids: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
         for idx, cnt in enumerate(counts.cpu()):
             if cnt == 0:
                 max_idx = torch.argmax(counts).item()
@@ -175,7 +173,9 @@ class KMeans:
         if self.device.type == "cuda":
             new_centroids = torch.empty_like(self.centroids).to(self.device)
             new_centroids[:] = torch.nan
-            new_centroids.index_reduce_(0, part_ids, data, reduce="mean", include_self=False)
+            new_centroids.index_reduce_(
+                0, part_ids, data, reduce="mean", include_self=False
+            )
         else:
             # MPS does not have Torch.index_reduce_()
             # See https://github.com/pytorch/pytorch/issues/77764
