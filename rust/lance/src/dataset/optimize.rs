@@ -99,17 +99,14 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::{AddAssign, Range};
-use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use std::task::Poll;
 
 use arrow_array::{RecordBatch, UInt64Array};
-use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::error::Result as DFResult;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::{ready, Stream, StreamExt, TryStreamExt};
-use pin_project::pin_project;
+use futures::{StreamExt, TryStreamExt};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -638,80 +635,63 @@ pub struct RewriteResult {
     pub remapped_indices: Vec<RemappedIndex>,
 }
 
-#[pin_project]
-struct RowIdCapture {
+fn extract_row_ids(
+    row_ids: &mut RoaringTreemap,
+    batch: DFResult<RecordBatch>,
+) -> DFResult<RecordBatch> {
+    let batch = batch?;
+
+    let (row_id_idx, _) = batch
+        .schema()
+        .column_with_name(ROW_ID)
+        .expect("Received a batch without row ids");
+    let row_ids_arr = batch.column(row_id_idx);
+    let row_ids_itr = row_ids_arr
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap_or_else(|| {
+            panic!(
+                "Row ids had an unexpected type: {}",
+                row_ids_arr.data_type()
+            )
+        })
+        .values()
+        .iter()
+        .copied();
+    row_ids.append(row_ids_itr).map_err(|err| {
+        datafusion::error::DataFusionError::Execution(format!(
+            "Row ids did not arrive in sorted order: {}",
+            err
+        ))
+    })?;
+    let non_row_ids_cols = (0..batch.num_columns())
+        .filter(|col| *col != row_id_idx)
+        .collect::<Vec<_>>();
+    Ok(batch.project(&non_row_ids_cols)?)
+}
+
+fn make_rowid_capture_stream(
     row_ids: Arc<RwLock<RoaringTreemap>>,
-    #[pin]
     target: SendableRecordBatchStream,
-}
+) -> Result<SendableRecordBatchStream> {
+    let schema = target.schema();
+    let stream = target.map(move |batch| {
+        let mut row_ids = row_ids.write().unwrap();
+        extract_row_ids(&mut row_ids, batch)
+    });
 
-impl RowIdCapture {
-    fn new_pinned(
-        target: SendableRecordBatchStream,
-        row_ids: Arc<RwLock<RoaringTreemap>>,
-    ) -> Pin<Box<Self>> {
-        Box::pin(Self { row_ids, target })
-    }
+    let (row_id_idx, _) = schema
+        .column_with_name(ROW_ID)
+        .expect("Received a batch without row ids");
 
-    fn extract_row_ids(
-        row_ids: &mut RoaringTreemap,
-        batch: DFResult<RecordBatch>,
-    ) -> DFResult<RecordBatch> {
-        let batch = batch?;
+    let non_row_ids_cols = (0..schema.fields.len())
+        .filter(|col| *col != row_id_idx)
+        .collect::<Vec<_>>();
 
-        let (row_id_idx, _) = batch
-            .schema()
-            .column_with_name(ROW_ID)
-            .expect("Received a batch without row ids");
-        let row_ids_arr = batch.column(row_id_idx);
-        let row_ids_itr = row_ids_arr
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap_or_else(|| {
-                panic!(
-                    "Row ids had an unexpected type: {}",
-                    row_ids_arr.data_type()
-                )
-            })
-            .iter()
-            .map(|x| x.expect("Null row id encountered"));
-        row_ids.append(row_ids_itr).map_err(|err| {
-            datafusion::error::DataFusionError::Execution(format!(
-                "Row ids did not arrive in sorted order: {}",
-                err
-            ))
-        })?;
-        let non_row_ids_cols = (0..batch.num_columns())
-            .filter(|col| *col != row_id_idx)
-            .collect::<Vec<_>>();
-        Ok(batch.project(&non_row_ids_cols)?)
-    }
-}
+    let schema = Arc::new(schema.project(&non_row_ids_cols)?);
 
-impl Stream for RowIdCapture {
-    type Item = DFResult<RecordBatch>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let mut this = self.project();
-        let batch = ready!(this.target.poll_next_unpin(cx));
-        let mut row_ids = this.row_ids.write().unwrap();
-        match batch {
-            Some(batch) => {
-                let extracted = Self::extract_row_ids(&mut row_ids, batch);
-                Poll::Ready(Some(extracted))
-            }
-            None => Poll::Ready(None),
-        }
-    }
-}
-
-impl datafusion::physical_plan::RecordBatchStream for RowIdCapture {
-    fn schema(&self) -> SchemaRef {
-        self.target.schema()
-    }
+    let stream = RecordBatchStreamAdapter::new(schema, stream);
+    Ok(Box::pin(stream))
 }
 
 struct MissingIds<'a, I: Iterator<Item = u64>> {
@@ -850,7 +830,7 @@ async fn rewrite_files<I: IndexRemapperOptions>(
 
     let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
     let row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
-    let data_no_row_ids = RowIdCapture::new_pinned(data, row_ids.clone());
+    let data_no_row_ids = make_rowid_capture_stream(row_ids.clone(), data)?;
 
     let params = WriteParams {
         max_rows_per_file: options.target_rows_per_fragment,
