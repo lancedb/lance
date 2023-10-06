@@ -42,7 +42,7 @@ use num_traits::bounds::Bounded;
 #[derive(Debug, PartialEq)]
 pub struct StatisticsRow {
     /// Number of nulls in this column chunk.
-    pub(crate) null_count: ScalarValue,
+    pub(crate) null_count: i64,
     /// Minimum value in this column chunk, if any
     pub(crate) min_value: ScalarValue,
     /// Maximum value in this column chunk, if any
@@ -115,7 +115,7 @@ where
     }
 
     StatisticsRow {
-        null_count: ScalarValue::Int64(Some(null_count)),
+        null_count,
         min_value: scalar_min_value,
         max_value: scalar_max_value,
     }
@@ -150,7 +150,7 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     }
 
     StatisticsRow {
-        null_count: ScalarValue::Int64(Some(null_count)),
+        null_count,
         min_value: if false_present {
             ScalarValue::Boolean(Some(false))
         } else if true_present {
@@ -161,7 +161,7 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         max_value: if true_present {
             ScalarValue::Boolean(Some(true))
         } else {
-            ScalarValue::Boolean(Some(false)
+            ScalarValue::Boolean(Some(false))
         },
     }
 }
@@ -192,7 +192,6 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 }
 
 pub struct StatisticsCollector {
-    num_rows: PrimitiveBuilder<Int64Type>,
     builders: BTreeMap<i32, (Field, StatisticsBuilder)>,
 }
 
@@ -202,26 +201,16 @@ impl StatisticsCollector {
             .iter()
             .map(|f| (f.id, (f.clone(), StatisticsBuilder::new(&f.data_type()))))
             .collect();
-        Self {
-            builders,
-            num_rows: PrimitiveBuilder::<Int64Type>::new(),
-        }
+        Self { builders }
     }
 
     pub fn get_builder(&mut self, field_id: i32) -> Option<&mut StatisticsBuilder> {
         self.builders.get_mut(&field_id).map(|(_, b)| b)
     }
 
-    pub fn append_num_values(&mut self, num_rows: i64) {
-        self.num_rows.append_value(num_rows)
-    }
-
     pub fn finish(&mut self) -> Result<RecordBatch> {
         let mut arrays: Vec<ArrayRef> = vec![];
         let mut fields: Vec<ArrowField> = vec![];
-        let num_rows = Arc::new(self.num_rows.finish());
-        arrays.push(num_rows);
-        fields.push(ArrowField::new("num_values", DataType::Int64, false));
 
         self.builders.iter_mut().for_each(|(_, (field, builder))| {
             let null_count = Arc::new(builder.null_count.finish());
@@ -276,10 +265,7 @@ impl StatisticsBuilder {
     }
 
     fn statistics_appender<T: arrow_array::ArrowPrimitiveType>(&mut self, row: StatisticsRow) {
-        let ScalarValue::Int64(Some(null_count)) = row.null_count else {
-            todo!()
-        };
-        self.null_count.append_value(null_count);
+        self.null_count.append_value(row.null_count);
 
         let min_value_builder = self
             .min_value
@@ -311,10 +297,7 @@ impl StatisticsBuilder {
     }
 
     fn boolean_appender(&mut self, row: StatisticsRow) {
-        let ScalarValue::Int64(Some(null_count)) = row.null_count else {
-            todo!()
-        };
-        self.null_count.append_value(null_count);
+        self.null_count.append_value(row.null_count);
 
         let min_value_builder = self
             .min_value
@@ -463,7 +446,7 @@ mod tests {
             assert_eq!(
                 stats,
                 StatisticsRow {
-                    null_count: ScalarValue::Int64(Some(0)),
+                    null_count: 0,
                     min_value: case.expected_min,
                     max_value: case.expected_max,
                 },
@@ -485,7 +468,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(0_i64),
+                null_count: 0_i64,
                 min_value: ScalarValue::from(-10.0_f32),
                 max_value: ScalarValue::from(5.0_f32),
             }
@@ -502,7 +485,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(0_i64),
+                null_count: 0_i64,
                 min_value: ScalarValue::from(std::f32::NEG_INFINITY),
                 max_value: ScalarValue::from(std::f32::INFINITY),
             }
@@ -515,7 +498,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: ScalarValue::from(0_i64),
+                null_count: 0_i64,
                 min_value: ScalarValue::from(-0.0_f32),
                 max_value: ScalarValue::from(0.0_f32),
             }
@@ -628,12 +611,12 @@ mod tests {
         let id = schema.field("a").unwrap().id;
         let builder = collector.get_builder(id).unwrap();
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(2_i64),
+            null_count: 2_i64,
             min_value: ScalarValue::from(1_i32),
             max_value: ScalarValue::from(3_i32),
         });
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(0_i64),
+            null_count: 0_i64,
             min_value: ScalarValue::Int32(Some(std::i32::MIN)),
             max_value: ScalarValue::Int32(Some(std::i32::MAX)),
         });
@@ -648,12 +631,12 @@ mod tests {
         let id = schema.field("a").unwrap().id;
         let builder = collector.get_builder(id).unwrap();
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(2_i64),
+            null_count: 2_i64,
             min_value: ScalarValue::from(1_i32),
             max_value: ScalarValue::from(3_i32),
         });
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(0_i64),
+            null_count: 0_i64,
             min_value: ScalarValue::Int32(Some(std::i32::MIN)),
             max_value: ScalarValue::Int32(Some(std::i32::MAX)),
         });
@@ -676,7 +659,7 @@ mod tests {
         let id = schema.field("c").unwrap().id;
         let builder = collector.get_builder(id).unwrap();
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(2_i64),
+            null_count: 2_i64,
             min_value: ScalarValue::from(1_i64),
             max_value: ScalarValue::from(3_i64),
         });
@@ -686,20 +669,16 @@ mod tests {
         //     max_value: ScalarValue::Int64(None),
         // });
         builder.append(StatisticsRow {
-            null_count: ScalarValue::from(0_i64),
+            null_count: 0_i64,
             min_value: ScalarValue::from(std::i64::MIN),
             max_value: ScalarValue::from(std::i64::MAX),
         });
-
-        collector.append_num_values(42);
-        collector.append_num_values(64);
 
         // Now we can finish
         let batch = collector.finish().unwrap();
 
         // Should we have a helper to compare batches?
         let expected_schema = ArrowSchema::new(vec![
-            ArrowField::new("num_values", DataType::Int64, false),
             ArrowField::new(
                 "0",
                 DataType::Struct(ArrowFields::from(vec![
@@ -734,7 +713,6 @@ mod tests {
         let expected_batch = RecordBatch::try_new(
             Arc::new(expected_schema),
             vec![
-                Arc::new(Int64Array::from(vec![42, 64])),
                 Arc::new(StructArray::from(vec![
                     (
                         Arc::new(ArrowField::new("null_count", DataType::Int64, false)),

@@ -200,10 +200,6 @@ impl FileWriter {
         let batch_length = batches.iter().map(|b| b.num_rows() as i32).sum();
         self.metadata.push_batch_length(batch_length);
 
-        if let Some(stats_collector) = &mut self.stats_collector {
-            stats_collector.append_num_values(batch_length as i64);
-        }
-
         self.batch_id += 1;
         Ok(())
     }
