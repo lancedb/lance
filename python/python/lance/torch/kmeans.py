@@ -34,7 +34,7 @@ def _random_init(data: np.ndarray, n: int, seed: Optional[int] = None) -> torch.
     return samples
 
 
-# @torch.jit.script
+@torch.jit.script
 def _new_centroids_mps(
     part_ids: List[torch.Tensor],
     k: int,
