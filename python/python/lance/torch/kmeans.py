@@ -37,6 +37,21 @@ def _random_init(
     return samples
 
 
+@torch.jit.script
+def _new_centroids_mps(
+    part_ids: torch.Tensor, k: int, data: torch.Tensor
+) -> torch.Tensor:
+    # MPS does not have Torch.index_reduce_()
+    # See https://github.com/pytorch/pytorch/issues/77764
+    new_centroids = []
+    for i in range(k):
+        parted_idx = part_ids == i
+        parted_data = data[parted_idx]
+        new_cent = parted_data.mean(dim=0)
+        new_centroids.append(new_cent)
+    return torch.stack(new_centroids)
+
+
 class KMeans:
     """K-Means trains over vectors and divide into K clusters.
 
@@ -164,10 +179,7 @@ class KMeans:
 
     def _fit_once(self, data: torch.Tensor) -> float:
         """Train KMean once and return the total distance."""
-        assert self.centroids is not None
         part_ids = self.transform(data)
-        # compute new centroids
-        new_centroids = []
 
         num_rows = self._count_rows_in_clusters(part_ids, self.k)
         if self.device.type == "cuda":
@@ -177,14 +189,7 @@ class KMeans:
                 0, part_ids, data, reduce="mean", include_self=False
             )
         else:
-            # MPS does not have Torch.index_reduce_()
-            # See https://github.com/pytorch/pytorch/issues/77764
-            for i in range(self.k):
-                parted_idx = part_ids == i
-                parted_data = data[parted_idx]
-                new_cent = parted_data.mean(dim=0)
-                new_centroids.append(new_cent)
-            new_centroids = torch.stack(new_centroids)
+            new_centroids = _new_centroids_mps(part_ids, self.k, data)
 
         self.centroids = self._split_centroids(new_centroids, num_rows)
 
