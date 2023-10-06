@@ -646,6 +646,9 @@ async fn read_batch(
     // TODO: This is a minor cop out. Pushing deletion vector in to the decoders is hard
     // so I'm going to just leave deletion filter at this layer for now.
     // We should push this down futurther when we get to statistics-based predicate pushdown
+
+    // This function is meant to be IO bound, but we are doing CPU-bound work here
+    // We should try to move this to later.
     let deletion_mask =
         deletion_vector.and_then(|v| v.build_predicate(row_ids.as_ref().unwrap().iter()));
 

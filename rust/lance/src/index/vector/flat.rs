@@ -123,9 +123,9 @@ fn concat_batches<'a>(
         let data_type = in_arrays[0].data_type();
         let array = match data_type {
             DataType::FixedSizeList(f, size) if f.data_type().is_floating() => {
-                concat_fsl(&in_arrays, *size)?
+                concat_fsl(in_arrays, *size)?
             }
-            _ => concat(&in_arrays)?,
+            _ => concat(in_arrays)?,
         };
         arrays.push(array);
     }

@@ -29,7 +29,7 @@ use arrow_select::{concat::concat_batches, take::take};
 use chrono::{prelude::*, Duration};
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use futures::FutureExt;
+use futures::{Future, FutureExt};
 use log::warn;
 use object_store::path::Path;
 use tracing::instrument;
@@ -858,6 +858,7 @@ impl Dataset {
             return Ok(RecordBatch::new_empty(Arc::new(projection.into())));
         }
 
+        let projection = Arc::new(projection.clone());
         let row_id_meta = check_row_ids(row_ids);
 
         if row_id_meta.contiguous {
@@ -873,12 +874,12 @@ impl Dataset {
                 Error::invalid_input(format!("row_id belongs to non-existant fragment: {start}"))
             })?;
 
-            let reader = fragment.open(projection).await?;
+            let reader = fragment.open(projection.as_ref()).await?;
             reader.read_range(range).await
         } else if row_id_meta.sorted {
             // Don't need to re-arrange data, just concatenate
 
-            let mut batches: Vec<RecordBatch> = Vec::new();
+            let mut batches: Vec<_> = Vec::new();
             let mut current_fragment = row_ids[0] >> 32;
             let mut current_start = 0;
             let mut row_ids_iter = row_ids.iter().enumerate();
@@ -908,13 +909,32 @@ impl Dataset {
                     ))
                 })?;
                 let row_ids: Vec<u32> = row_ids[range].iter().map(|x| *x as u32).collect();
-                let batch = fragment.take_rows(&row_ids, projection, false).await?;
-                batches.push(batch);
+
+                // manually implemented async for Send bound
+                #[allow(clippy::manual_async_fn)]
+                fn do_take(
+                    fragment: FileFragment,
+                    row_ids: Vec<u32>,
+                    projection: Arc<Schema>,
+                ) -> impl Future<Output = Result<RecordBatch>> + Send {
+                    async move {
+                        fragment
+                            .take_rows(&row_ids, projection.as_ref(), false)
+                            .await
+                    }
+                }
+
+                let batch_fut = do_take(fragment, row_ids, projection.clone());
+                batches.push(batch_fut);
             }
+            let batches: Vec<RecordBatch> = futures::stream::iter(batches)
+                .buffered(4 * num_cpus::get())
+                .try_collect()
+                .await?;
             Ok(concat_batches(&batches[0].schema(), &batches)?)
         } else {
             let projection_with_row_id = Schema::merge(
-                projection,
+                projection.as_ref(),
                 &ArrowSchema::new(vec![ArrowField::new(
                     ROW_ID,
                     arrow::datatypes::DataType::UInt64,
@@ -938,13 +958,28 @@ impl Dataset {
             });
 
             let fragments = self.get_fragments();
-            let fragment_and_indices = fragments.iter().filter_map(|f| {
-                let local_row_ids = row_ids_per_fragment.get(&(f.id() as u64))?;
+            let fragment_and_indices = fragments.into_iter().filter_map(|f| {
+                let local_row_ids = row_ids_per_fragment.remove(&(f.id() as u64))?;
                 Some((f, local_row_ids))
             });
 
+            // manually implemented async for Send bound
+            #[allow(clippy::manual_async_fn)]
+            fn do_take(
+                fragment: FileFragment,
+                row_ids: Vec<u32>,
+                projection: Arc<Schema>,
+            ) -> impl Future<Output = Result<RecordBatch>> + Send {
+                async move {
+                    fragment
+                        .take_rows(&row_ids, projection.as_ref(), true)
+                        .await
+                }
+            }
+
             let mut batches = stream::iter(fragment_and_indices)
-                .then(|(fragment, indices)| fragment.take_rows(indices, projection, true))
+                .map(|(fragment, indices)| do_take(fragment, indices, projection.clone()))
+                .buffered(4 * num_cpus::get())
                 .try_collect::<Vec<_>>()
                 .await?;
 

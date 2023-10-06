@@ -23,7 +23,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
-use futures::FutureExt;
+use futures::{Future, FutureExt};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 
@@ -64,17 +64,7 @@ impl Take {
                     (dataset.clone(), projection.clone())
                 }))
                 .map(|(batch, (dataset, extra))| async move {
-                    let batch = batch?;
-                    let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
-                    let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
-                    let rows = if extra.fields.is_empty() {
-                        batch
-                    } else {
-                        let new_columns = dataset.take_rows(row_ids.values(), &extra).await?;
-                        debug_assert_eq!(batch.num_rows(), new_columns.num_rows());
-                        batch.merge(&new_columns)?
-                    };
-                    Ok::<RecordBatch, Error>(rows)
+                    Self::take_batch(batch?, dataset, extra).await
                 })
                 .buffered(num_cpus::get())
                 .map(|r| r.map_err(|e| DataFusionError::Execution(e.to_string())))
@@ -106,6 +96,27 @@ impl Take {
             rx,
             bg_thread: Some(bg_thread),
             output_schema,
+        }
+    }
+
+    // manually implemented async for Send bound
+    #[allow(clippy::manual_async_fn)]
+    fn take_batch(
+        batch: RecordBatch,
+        dataset: Arc<Dataset>,
+        extra: Arc<Schema>,
+    ) -> impl Future<Output = Result<RecordBatch, Error>> + Send {
+        async move {
+            let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
+            let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
+            let rows = if extra.fields.is_empty() {
+                batch
+            } else {
+                let new_columns = dataset.take_rows(row_ids.values(), &extra).await?;
+                debug_assert_eq!(batch.num_rows(), new_columns.num_rows());
+                batch.merge(&new_columns)?
+            };
+            Ok::<RecordBatch, Error>(rows)
         }
     }
 }
