@@ -102,6 +102,3 @@ def _to_vec(lst):
     return pa.FixedSizeListArray.from_arrays(
         pa.array(np.array(lst).ravel(), type=pa.float32()), list_size=8
     )
-
-
-w
