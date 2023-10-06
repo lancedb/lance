@@ -151,7 +151,6 @@ def test_create_index_using_cuda(tmp_path):
     assert len(expected) == 10
 
 
-@pytest.mark.cuda
 def test_create_index_unsupported_accelerator(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)

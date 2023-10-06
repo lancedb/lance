@@ -16,26 +16,31 @@ import numpy as np
 import pytest
 from lance.util import KMeans
 
+CLUSTERS = 1024
+NUM_VECTORS = CLUSTERS * 256
+
 
 @pytest.mark.benchmark(group="kmeans")
 def test_kmeans(benchmark):
-    data = np.random.random((65535, 1536)).astype("f")
+    data = np.random.random((NUM_VECTORS, 1536)).astype("f")
 
     def _f():
-        kmeans = KMeans(256, "cosine")
+        kmeans = KMeans(CLUSTERS, "cosine")
         kmeans.fit(data)
 
     benchmark(_f)
 
 
 @pytest.mark.benchmark(group="kmeans")
+@pytest.mark.gpu
 def test_kmeans_torch(benchmark):
-    data = np.random.random((65535, 1536)).astype("f")
+    data = np.random.random((NUM_VECTORS, 1536)).astype("f")
 
+    from lance.torch import preferred_device
     from lance.torch.kmeans import KMeans
 
     def _f():
-        kmeans = KMeans(256, metric="cosine", device="cuda")
+        kmeans = KMeans(CLUSTERS, metric="cosine", device=preferred_device())
         kmeans.fit(data)
 
     benchmark(_f)
