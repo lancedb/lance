@@ -33,8 +33,10 @@ use arrow_array::{
         UInt8Type,
     },
     Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, BooleanArray,
-    Decimal128Array, DictionaryArray, Int32Array, Int64Array, PrimitiveArray, RecordBatch,
-    StringArray, StructArray,
+    Decimal128Array, Int16DictionaryArray, Int32Array, Int32DictionaryArray, Int64Array,
+    Int64DictionaryArray, Int8DictionaryArray, PrimitiveArray, RecordBatch, StringArray,
+    StructArray, UInt16DictionaryArray, UInt32DictionaryArray, UInt64DictionaryArray,
+    UInt8DictionaryArray,
 };
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use datafusion::common::ScalarValue;
@@ -578,17 +580,57 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     }
 }
 
-fn get_dictionary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
-    let arr = arrays
+fn cast_dictionary_arrays<'a, T: Array + 'static>(arrays: &'a [&'a ArrayRef]) -> Vec<&'a T> {
+    arrays
         .iter()
-        .map(|x| {
-            x.as_any()
-                .downcast_ref::<DictionaryArray<Int32Type>>()
-                .unwrap()
-        })
-        .map(|x| x.values())
-        .collect::<Vec<_>>();
-    get_string_statistics(&arr)
+        .map(|x| x.as_any().downcast_ref::<T>().unwrap())
+        .collect::<Vec<_>>()
+}
+
+fn get_dictionary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
+    let data_type = arrays[0].data_type();
+    match data_type {
+        DataType::Dictionary(key_type, _) => match key_type.as_ref() {
+            DataType::Int8 => {
+                let x = &cast_dictionary_arrays::<Int8DictionaryArray>(arrays);
+                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
+            }
+            DataType::Int16 => {
+                let x = &cast_dictionary_arrays::<Int16DictionaryArray>(arrays);
+                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
+            }
+            DataType::Int32 => {
+                let x = &cast_dictionary_arrays::<Int32DictionaryArray>(arrays);
+                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
+            }
+            DataType::Int64 => {
+                let x = &cast_dictionary_arrays::<Int64DictionaryArray>(arrays);
+                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
+            }
+            DataType::UInt8 => {
+                let x = &cast_dictionary_arrays::<UInt8DictionaryArray>(arrays);
+                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
+            }
+            DataType::UInt16 => {
+                let x = &cast_dictionary_arrays::<UInt16DictionaryArray>(arrays);
+                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
+            }
+            DataType::UInt32 => {
+                let x = &cast_dictionary_arrays::<UInt32DictionaryArray>(arrays);
+                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
+            }
+            DataType::UInt64 => {
+                let x = &cast_dictionary_arrays::<UInt64DictionaryArray>(arrays);
+                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
+            }
+            _ => {
+                panic!("Unsupported dictionary key type: {}", key_type);
+            }
+        },
+        _ => {
+            panic!("Unsupported data type for dictionary: {}", data_type);
+        }
+    }
 }
 
 pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
@@ -634,7 +676,6 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::Binary => get_binary_statistics(arrays),
         DataType::Utf8 => get_string_statistics(arrays),
         DataType::LargeUtf8 => get_string_statistics(arrays),
-        // TODO: Dictionary doesn't use key types yet
         DataType::Dictionary(_, _) => get_dictionary_statistics(arrays),
         // TODO: List, LargeList, FixedSizeList, FixedSizeBinary, BinaryArray, Struct
         _ => {
