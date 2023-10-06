@@ -38,17 +38,9 @@ def test_kmeans_torch(benchmark):
 
     from lance.torch import preferred_device
     from lance.torch.kmeans import KMeans
-    from torch.profiler import profile
 
     def _f():
         kmeans = KMeans(CLUSTERS, metric="cosine", device=preferred_device())
-        # with profile(
-        #     record_shapes=True,
-        #     profile_memory=True,
-        #     with_stack=True,
-        # ) as prof:
-        #     kmeans.fit(data)
-        # print(prof.key_averages().table(sort_by="self_cuda_time_total"))
         kmeans.fit(data)
 
     benchmark(_f)
