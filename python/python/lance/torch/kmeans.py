@@ -43,13 +43,12 @@ def _new_centroids_mps(
 ) -> torch.Tensor:
     # MPS does not have Torch.index_reduce_()
     # See https://github.com/pytorch/pytorch/issues/77764
-    new_centroids = []
-    for i in range(k):
-        parted_idx = part_ids == i
-        parted_data = data[parted_idx]
-        new_cent = parted_data.mean(dim=0)
-        new_centroids.append(new_cent)
-    return torch.stack(new_centroids)
+
+    # Use CPU makes for loop faster
+    new_centroids = torch.full((k, data.shape[1]), np.nan, device="cpu")
+    for (part_id, vector) in zip(part_ids.cpu(), data.cpu()):
+        new_centroids[part_id, :] = torch.nan_to_num(new_centroids[part_id, :]).add(vector)
+    return new_centroids.to(data.device)
 
 
 class KMeans:
@@ -179,12 +178,12 @@ class KMeans:
 
     def _fit_once(self, data: torch.Tensor) -> float:
         """Train KMean once and return the total distance."""
+        device = data.device
         part_ids = self.transform(data)
 
         num_rows = self._count_rows_in_clusters(part_ids, self.k)
         if self.device.type == "cuda":
-            new_centroids = torch.empty_like(self.centroids).to(self.device)
-            new_centroids[:] = torch.nan
+            new_centroids = torch.full_like(self.centroids, torch.nan, device=device)
             new_centroids.index_reduce_(
                 0, part_ids, data, reduce="mean", include_self=False
             )
