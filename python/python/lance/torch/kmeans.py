@@ -46,8 +46,10 @@ def _new_centroids_mps(
 
     # Use CPU makes for loop faster
     new_centroids = torch.full((k, data.shape[1]), np.nan, device="cpu")
-    for (part_id, vector) in zip(part_ids.cpu(), data.cpu()):
-        new_centroids[part_id, :] = torch.nan_to_num(new_centroids[part_id, :]).add(vector)
+    for part_id, vector in zip(part_ids.cpu(), data.cpu()):
+        new_centroids[part_id, :] = torch.nan_to_num(new_centroids[part_id, :]).add(
+            vector
+        )
     return new_centroids.to(data.device)
 
 
