@@ -14,6 +14,7 @@
 
 import logging
 from typing import Optional, Union
+import time
 
 import numpy as np
 import pyarrow as pa
@@ -26,30 +27,32 @@ from .distance import cosine_distance, dot_distance, l2_distance
 __all__ = ["KMeans"]
 
 
-@torch.jit.script
-def _random_init(
-    data: torch.Tensor, n: int, seed: Optional[int] = None
-) -> torch.Tensor:
+def _random_init(data: np.ndarray, n: int, seed: Optional[int] = None) -> torch.Tensor:
     if seed is not None:
-        torch.random.manual_seed(seed)
-    sample_idx = torch.randint(0, data.shape[0], (n,))
+        np.random.seed(seed)
+    sample_idx = np.random.randint(0, data.shape[0], (n,))
     samples = data[sample_idx]
     return samples
 
 
-@torch.jit.script
+# @torch.jit.script
 def _new_centroids_mps(
-    part_ids: torch.Tensor, k: int, data: torch.Tensor
+    part_ids: torch.Tensor,
+    k: int,
+    data: torch.Tensor,
+    cnts: torch.Tensor,
 ) -> torch.Tensor:
     # MPS does not have Torch.index_reduce_()
     # See https://github.com/pytorch/pytorch/issues/77764
 
     # Use CPU makes for loop faster
-    new_centroids = torch.full((k, data.shape[1]), np.nan, device="cpu")
+    new_centroids = torch.zeros((k, data.shape[1]), device="cpu")
+
     for part_id, vector in zip(part_ids.cpu(), data.cpu()):
-        new_centroids[part_id, :] = torch.nan_to_num(new_centroids[part_id, :]).add(
-            vector
-        )
+        new_centroids[part_id, :] = new_centroids[part_id, :].add(vector)
+    for idx, cnt in cnts.cpu():
+        if cnt > 0:
+            new_centroids[idx, :] = new_centroids[idx, :].div(cnt)
     return new_centroids.to(data.device)
 
 
@@ -143,13 +146,14 @@ class KMeans:
 
         """
         assert self.centroids is None
-        data = self._to_tensor(data)
 
         if self.init == "random":
+            start = time.time()
             self.centroids = _random_init(data, self.k, self.seed)
+            print("Randon init takes: ", time.time() - start)
         else:
             raise ValueError("KMeans::fit: only random initialization is supported.")
-
+        return
         last_dist = 0
         for i in tqdm(range(self.max_iters)):
             dist = self._fit_once(data)
@@ -181,8 +185,14 @@ class KMeans:
     def _fit_once(self, data: torch.Tensor) -> float:
         """Train KMean once and return the total distance."""
         device = data.device
-        part_ids = self.transform(data)
-
+        arr = data.cpu().numpy()
+        part_ids = []
+        for chunk in np.vsplit(arr, arr.shape[0] / 65536):
+            start = time.time()
+            part_ids.append(self.transform(chunk))
+            print(f"Transform {chunk.shape} chunk: {time.time() - start}")
+        part_ids = torch.cat(part_ids)
+        print(part_ids)
         num_rows = self._count_rows_in_clusters(part_ids, self.k)
         if self.device.type == "cuda":
             new_centroids = torch.full_like(self.centroids, torch.nan, device=device)
@@ -190,7 +200,7 @@ class KMeans:
                 0, part_ids, data, reduce="mean", include_self=False
             )
         else:
-            new_centroids = _new_centroids_mps(part_ids, self.k, data)
+            new_centroids = _new_centroids_mps(part_ids, self.k, data, num_rows)
 
         self.centroids = self._split_centroids(new_centroids, num_rows)
 
@@ -206,5 +216,4 @@ class KMeans:
 
         data = self._to_tensor(data)
         dists = self.dist_func(data, self.centroids)
-        part_ids = dists.argmin(dim=1)
-        return part_ids
+        return torch.argmin(dists, dim=1)

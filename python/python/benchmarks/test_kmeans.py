@@ -31,20 +31,22 @@ def test_kmeans(benchmark):
 @pytest.mark.benchmark(group="kmeans")
 @pytest.mark.gpu
 def test_kmeans_torch(benchmark):
-    data = np.random.random((65535, 1536)).astype("f")
+    clusters = 8192
+    data = np.random.random((clusters * 256, 1536)).astype("f")
 
     from lance.torch import preferred_device
     from lance.torch.kmeans import KMeans
     from torch.profiler import profile
 
     def _f():
-        kmeans = KMeans(256, metric="cosine", device=preferred_device())
-        with profile(
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
-        ) as prof:
-            kmeans.fit(data)
-        print(prof.key_averages().table(sort_by="self_cuda_time_total"))
+        kmeans = KMeans(clusters, metric="cosine", device=preferred_device())
+        # with profile(
+        #     record_shapes=True,
+        #     profile_memory=True,
+        #     with_stack=True,
+        # ) as prof:
+        #     kmeans.fit(data)
+        # print(prof.key_averages().table(sort_by="self_cuda_time_total"))
+        kmeans.fit(data)
 
     benchmark(_f)
