@@ -102,7 +102,6 @@ impl FileWriter {
             metadata: Metadata::default(),
             stats_collector,
             stats: None,
-            stats_collector,
         })
     }
 
@@ -140,15 +139,6 @@ impl FileWriter {
                 &mut self.page_table,
             )
             .await?;
-            // If we are collecting stats for this column, collect them
-            if let Some(stats_collector) = &mut self.stats_collector {
-                if let Some(stats_builder) = stats_collector.get_builder(field.id) {
-                    let stats_row = statistics::collect_statistics(&arrs);
-                    stats_builder.append(stats_row);
-                }
-            }
-
-            self.write_array(field, &arrs).await?;
         }
         let batch_length = batches.iter().map(|b| b.num_rows() as i32).sum();
         self.metadata.push_batch_length(batch_length);
@@ -576,8 +566,9 @@ mod tests {
     use arrow_array::{
         types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
         DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
-        DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int64Array,
-        NullArray, StringArray, TimestampMicrosecondArray, TimestampSecondArray, UInt8Array,
+        DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int32Array,
+        Int64Array, ListArray, NullArray, StringArray, TimestampMicrosecondArray,
+        TimestampSecondArray, UInt8Array,
     };
     use arrow_buffer::i256;
     use arrow_schema::{
