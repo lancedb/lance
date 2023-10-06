@@ -32,13 +32,9 @@ use arrow_array::{
         TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type,
         UInt8Type,
     },
-    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, BooleanArray, Date32Array,
-    Date64Array, Decimal128Array, DictionaryArray, DurationMicrosecondArray,
-    DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, Float64Array,
-    Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray, StructArray,
-    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray,
+    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, BooleanArray,
+    Decimal128Array, DictionaryArray, Int32Array, Int64Array, PrimitiveArray, RecordBatch,
+    StringArray, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use datafusion::common::ScalarValue;
@@ -933,8 +929,12 @@ impl StatisticsBuilder {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        builder::StringDictionaryBuilder, BinaryArray, BooleanArray, Float32Array, Int32Array,
-        Int64Array, StringArray, StructArray,
+        builder::StringDictionaryBuilder, BinaryArray, BooleanArray, Date32Array, Date64Array,
+        DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
+        DurationSecondArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
+        StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+        Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
     };
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
