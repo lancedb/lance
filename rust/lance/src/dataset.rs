@@ -861,6 +861,23 @@ impl Dataset {
         let projection = Arc::new(projection.clone());
         let row_id_meta = check_row_ids(row_ids);
 
+        // This method is mostly to annotate the send bound to avoid the
+        // higher-order lifetime error.
+        // manually implemented async for Send bound
+        #[allow(clippy::manual_async_fn)]
+        fn do_take(
+            fragment: FileFragment,
+            row_ids: Vec<u32>,
+            projection: Arc<Schema>,
+            with_row_id: bool,
+        ) -> impl Future<Output = Result<RecordBatch>> + Send {
+            async move {
+                fragment
+                    .take_rows(&row_ids, projection.as_ref(), with_row_id)
+                    .await
+            }
+        }
+
         if row_id_meta.contiguous {
             // Fastest path: Can use `read_range` directly
             let start = row_ids.first().expect("empty range passed to take_rows");
@@ -910,21 +927,7 @@ impl Dataset {
                 })?;
                 let row_ids: Vec<u32> = row_ids[range].iter().map(|x| *x as u32).collect();
 
-                // manually implemented async for Send bound
-                #[allow(clippy::manual_async_fn)]
-                fn do_take(
-                    fragment: FileFragment,
-                    row_ids: Vec<u32>,
-                    projection: Arc<Schema>,
-                ) -> impl Future<Output = Result<RecordBatch>> + Send {
-                    async move {
-                        fragment
-                            .take_rows(&row_ids, projection.as_ref(), false)
-                            .await
-                    }
-                }
-
-                let batch_fut = do_take(fragment, row_ids, projection.clone());
+                let batch_fut = do_take(fragment, row_ids, projection.clone(), false);
                 batches.push(batch_fut);
             }
             let batches: Vec<RecordBatch> = futures::stream::iter(batches)
@@ -963,22 +966,8 @@ impl Dataset {
                 Some((f, local_row_ids))
             });
 
-            // manually implemented async for Send bound
-            #[allow(clippy::manual_async_fn)]
-            fn do_take(
-                fragment: FileFragment,
-                row_ids: Vec<u32>,
-                projection: Arc<Schema>,
-            ) -> impl Future<Output = Result<RecordBatch>> + Send {
-                async move {
-                    fragment
-                        .take_rows(&row_ids, projection.as_ref(), true)
-                        .await
-                }
-            }
-
             let mut batches = stream::iter(fragment_and_indices)
-                .map(|(fragment, indices)| do_take(fragment, indices, projection.clone()))
+                .map(|(fragment, indices)| do_take(fragment, indices, projection.clone(), true))
                 .buffered(4 * num_cpus::get())
                 .try_collect::<Vec<_>>()
                 .await?;

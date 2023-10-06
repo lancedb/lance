@@ -17,10 +17,10 @@
 
 use std::sync::Arc;
 
-use arrow::array::as_primitive_array;
-use arrow::datatypes::Float32Type;
-use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
-use arrow_array::{Array, FixedSizeListArray};
+use arrow::{array::as_primitive_array, datatypes::Float32Type};
+use arrow_array::{
+    cast::as_struct_array, Array, ArrayRef, FixedSizeListArray, RecordBatch, StructArray,
+};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, SchemaRef};
 use arrow_select::{concat::concat, take::take};

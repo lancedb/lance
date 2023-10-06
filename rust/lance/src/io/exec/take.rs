@@ -99,6 +99,9 @@ impl Take {
         }
     }
 
+    /// Given a batch with a _rowid column, retrieve extra columns from dataset.
+    // This method mostly exists to annotate the Send bound so the compiler
+    // doesn't produce a higher-order lifetime error.
     // manually implemented async for Send bound
     #[allow(clippy::manual_async_fn)]
     fn take_batch(
