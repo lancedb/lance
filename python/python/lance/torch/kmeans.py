@@ -147,21 +147,25 @@ class KMeans:
         assert self.centroids is None
 
         if isinstance(data, pa.FixedSizeListArray):
-            arr = data.to_numpy(zero_copy_only=False)
+            arr = np.stack(data.to_numpy(zero_copy_only=False))
         elif isinstance(data, torch.Tensor):
             arr = data.cpu().numpy()
-        else:
+        elif isinstance(data, np.ndarray):
             arr = data
-        assert isinstance(data, np.ndarray)
+        else:
+            raise ValueError(
+                "Input data can only be FixedSizeListArray"
+                + f" or numpy ndarray: got {type(data)}"
+            )
 
         if self.init == "random":
-            self.centroids = self._to_tensor(_random_init(data, self.k, self.seed))
+            self.centroids = self._to_tensor(_random_init(arr, self.k, self.seed))
         else:
             raise ValueError("KMeans::fit: only random initialization is supported.")
 
         chunks = [
             torch.from_numpy(c).to(self.device)
-            for c in np.vsplit(arr, arr.shape[0] / 65536)
+            for c in np.vsplit(arr, int(np.ceil(arr.shape[0] / 65536)))
         ]
         del arr
         del data
