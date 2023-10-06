@@ -38,7 +38,10 @@ use arrow_array::{
     StructArray, UInt16DictionaryArray, UInt32DictionaryArray, UInt64DictionaryArray,
     UInt8DictionaryArray,
 };
-use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
+use arrow_schema::{
+    ArrowError, DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
+    TimeUnit,
+};
 use datafusion::common::ScalarValue;
 use num_traits::Bounded;
 use std::{i128, str};
@@ -633,6 +636,23 @@ fn get_dictionary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     }
 }
 
+fn collect_struct_statistics(arrays: &[&ArrayRef], fields: &ArrowFields) -> StatisticsRow {
+    // for (i, f) in subfields.iter().enumerate() {
+    //     let lance_field = self
+    //         .children
+    //         .iter_mut()
+    //         .find(|c| c.name == *f.name())
+    //         .unwrap();
+    //     let struct_arr = arr.as_struct();
+    //     lance_field.set_dictionary(struct_arr.column(i));
+    // }
+    StatisticsRow {
+        null_count: ScalarValue::Int64(Some(0)),
+        min_value: ScalarValue::Struct(None, fields.clone()),
+        max_value: ScalarValue::Struct(None, fields.clone()),
+    }
+}
+
 pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     match arrays[0].data_type() {
         DataType::Boolean => get_boolean_statistics(arrays),
@@ -677,6 +697,7 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::Utf8 => get_string_statistics(arrays),
         DataType::LargeUtf8 => get_string_statistics(arrays),
         DataType::Dictionary(_, _) => get_dictionary_statistics(arrays),
+        DataType::Struct(fields) => collect_struct_statistics(arrays, fields),
         // TODO: List, LargeList, FixedSizeList, FixedSizeBinary, BinaryArray, Struct
         _ => {
             println!(
@@ -1333,7 +1354,6 @@ mod tests {
     #[test]
     fn test_stats_collector() {
         use crate::datatypes::Schema;
-        use arrow_schema::Fields as ArrowFields;
 
         // Check the output schema is correct
         let arrow_schema = ArrowSchema::new(vec![
