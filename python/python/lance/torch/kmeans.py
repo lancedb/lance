@@ -107,6 +107,7 @@ class KMeans:
                 f"Only l2/cosine/dot is supported as metric type, got: {metric}"
             )
 
+        self.total_distance = 0
         self.centroids: Optional[torch.Tensor] = None
         self.init = init
         self.device = preferred_device(device)
@@ -170,14 +171,14 @@ class KMeans:
         del arr
         del data
 
-        last_dist = 0
+        self.total_distance = 0
         for i in tqdm(range(self.max_iters)):
             try:
-                last_dist = self._fit_once(chunks, last_dist)
+                self.total_distance = self._fit_once(chunks, self.total_distance)
             except StopIteration:
                 break
             if i % 10 == 0:
-                logging.debug("Total distance: %s, iter: %s", last_dist, i)
+                logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
 
     @staticmethod
     def _split_centroids(centroids: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
