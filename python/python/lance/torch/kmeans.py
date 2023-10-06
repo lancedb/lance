@@ -13,7 +13,7 @@
 #  limitations under the License.
 
 import logging
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import numpy as np
 import pyarrow as pa
