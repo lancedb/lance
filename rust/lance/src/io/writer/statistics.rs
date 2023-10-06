@@ -151,12 +151,10 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
     StatisticsRow {
         null_count,
-        min_value: if false_present {
-            ScalarValue::Boolean(Some(false))
-        } else if true_present {
+        min_value: if true_present && !false_present {
             ScalarValue::Boolean(Some(true))
         } else {
-            ScalarValue::Boolean(None)
+            ScalarValue::Boolean(Some(false))
         },
         max_value: if true_present {
             ScalarValue::Boolean(Some(true))
@@ -369,9 +367,10 @@ mod tests {
             source_arrays: Vec<ArrayRef>,
             expected_min: ScalarValue,
             expected_max: ScalarValue,
+            expected_null_count: i64,
         }
 
-        let cases: [TestCase; 4] = [
+        let cases: [TestCase; 8] = [
             // Int64
             TestCase {
                 source_arrays: vec![
@@ -380,6 +379,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::from(-10_i64),
                 expected_max: ScalarValue::from(7_i64),
+                expected_null_count: 0,
             },
             // Int32
             TestCase {
@@ -389,12 +389,46 @@ mod tests {
                 ],
                 expected_min: ScalarValue::from(-10_i32),
                 expected_max: ScalarValue::from(7_i32),
+                expected_null_count: 0,
             },
             // Boolean
             TestCase {
-                source_arrays: vec![Arc::new(BooleanArray::from(vec![true, false]))],
+                source_arrays: vec![Arc::new(BooleanArray::from(vec![Some(true), Some(false)]))],
                 expected_min: ScalarValue::from(false),
                 expected_max: ScalarValue::from(true),
+                expected_null_count: 0,
+            },
+            TestCase {
+                source_arrays: vec![Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(true),
+                    None,
+                ]))],
+                expected_min: ScalarValue::from(true),
+                expected_max: ScalarValue::from(true),
+                expected_null_count: 1,
+            },
+            TestCase {
+                source_arrays: vec![Arc::new(BooleanArray::from(vec![Some(false), Some(false)]))],
+                expected_min: ScalarValue::from(false),
+                expected_max: ScalarValue::from(false),
+                expected_null_count: 0,
+            },
+            TestCase {
+                source_arrays: vec![Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    None,
+                    Some(false),
+                ]))],
+                expected_min: ScalarValue::from(false),
+                expected_max: ScalarValue::from(true),
+                expected_null_count: 1,
+            },
+            TestCase {
+                source_arrays: vec![Arc::new(BooleanArray::from(vec![None, None, None]))],
+                expected_min: ScalarValue::from(false),
+                expected_max: ScalarValue::from(false),
+                expected_null_count: 3,
             },
             // Date
             TestCase {
@@ -404,6 +438,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::Date32(Some(32)),
                 expected_max: ScalarValue::Date32(Some(68)),
+                expected_null_count: 0,
             },
             // // Timestamp
             // TestCase {
@@ -446,7 +481,7 @@ mod tests {
             assert_eq!(
                 stats,
                 StatisticsRow {
-                    null_count: 0,
+                    null_count: case.expected_null_count,
                     min_value: case.expected_min,
                     max_value: case.expected_max,
                 },
