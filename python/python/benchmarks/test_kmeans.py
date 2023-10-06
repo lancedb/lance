@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 from lance.util import KMeans
 
-CLUSTERS = 8192
+CLUSTERS = 1024
 NUM_VECTORS = CLUSTERS * 256
 
 
