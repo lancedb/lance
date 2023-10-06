@@ -161,7 +161,7 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         max_value: if true_present {
             ScalarValue::Boolean(Some(true))
         } else {
-            ScalarValue::Boolean(None)
+            ScalarValue::Boolean(Some(false)
         },
     }
 }
