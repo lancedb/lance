@@ -14,7 +14,6 @@
 
 import logging
 from typing import List, Optional, Union
-import time
 
 import numpy as np
 import pyarrow as pa
