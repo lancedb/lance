@@ -151,16 +151,8 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
     StatisticsRow {
         null_count,
-        min_value: if true_present && !false_present {
-            ScalarValue::Boolean(Some(true))
-        } else {
-            ScalarValue::Boolean(Some(false))
-        },
-        max_value: if true_present {
-            ScalarValue::Boolean(Some(true))
-        } else {
-            ScalarValue::Boolean(Some(false))
-        },
+        min_value: ScalarValue::Boolean(Some(true_present && !false_present)),
+        max_value: ScalarValue::Boolean(Some(true_present || !false_present)),
     }
 }
 
@@ -427,7 +419,7 @@ mod tests {
             TestCase {
                 source_arrays: vec![Arc::new(BooleanArray::from(vec![None, None, None]))],
                 expected_min: ScalarValue::from(false),
-                expected_max: ScalarValue::from(false),
+                expected_max: ScalarValue::from(true),
                 expected_null_count: 3,
             },
             // Date
