@@ -44,14 +44,15 @@ def _new_centroids_mps(
     # MPS does not have Torch.index_reduce_()
     # See https://github.com/pytorch/pytorch/issues/77764
 
-    # Use CPU makes for loop faster
-    new_centroids = torch.zeros((k, data[0].shape[1]), device="cpu")
+    new_centroids = torch.zeros((k, data[0].shape[1]), device=data[0].device)
     for ids, chunk in zip(part_ids, data):
-        for part_id, vector in zip(ids.cpu(), chunk.cpu()):
-            new_centroids[part_id, :] = new_centroids[part_id, :].add(vector)
+        new_centroids.index_add_(0, ids, chunk)
     for idx, cnt in enumerate(cnts.cpu()):
-        if cnt > 0:
+        if cnt == 0:
+            new_centroids[idx, :] = torch.nan
+        else:
             new_centroids[idx, :] = new_centroids[idx, :].div(cnt)
+
     return new_centroids.to(data[0].device)
 
 
