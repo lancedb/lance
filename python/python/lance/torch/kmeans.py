@@ -48,8 +48,11 @@ def _new_centroids_mps(
     for ids, chunk in zip(part_ids, data):
         new_centroids.index_add_(0, ids, chunk)
     for idx, cnt in enumerate(cnts.cpu()):
-        if cnt > 0:
+        if cnt == 0:
+            new_centroids[idx, :] = torch.nan
+        else:
             new_centroids[idx, :] = new_centroids[idx, :].div(cnt)
+
     return new_centroids.to(data[0].device)
 
 
