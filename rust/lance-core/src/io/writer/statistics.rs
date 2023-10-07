@@ -24,22 +24,20 @@ use arrow_array::{
     builder::{
         make_builder, ArrayBuilder, BinaryBuilder, BooleanBuilder, PrimitiveBuilder, StringBuilder,
     },
+    cast::AsArray,
     types::{
-        Date32Type, Date64Type, Decimal128Type, DurationMicrosecondType, DurationMillisecondType,
-        DurationNanosecondType, DurationSecondType, Float32Type, Float64Type, Int16Type, Int32Type,
-        Int64Type, Int8Type, Time32MillisecondType, Time32SecondType, Time64MicrosecondType,
-        Time64NanosecondType, TimestampMicrosecondType, TimestampMillisecondType,
-        TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type,
-        UInt8Type,
+        ArrowDictionaryKeyType, Date32Type, Date64Type, Decimal128Type, DurationMicrosecondType,
+        DurationMillisecondType, DurationNanosecondType, DurationSecondType, Float32Type,
+        Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, Time32MillisecondType,
+        Time32SecondType, Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
+        TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type,
+        UInt32Type, UInt64Type, UInt8Type,
     },
     Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, BooleanArray,
-    Decimal128Array, Int16DictionaryArray, Int32Array, Int32DictionaryArray, Int64Array,
-    Int64DictionaryArray, Int8DictionaryArray, PrimitiveArray, RecordBatch, StringArray,
-    StructArray, UInt16DictionaryArray, UInt32DictionaryArray, UInt64DictionaryArray,
-    UInt8DictionaryArray,
+    Decimal128Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::{
-    ArrowError, DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
+    ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema,
     TimeUnit,
 };
 use datafusion::common::ScalarValue;
@@ -193,7 +191,7 @@ where
                 }
             }
         }
-        DataType::Timestamp(_, _) => {
+        DataType::Timestamp(_, tz) => {
             let min_value_timestamp = scalar_min_value
                 .to_array()
                 .as_any()
@@ -209,62 +207,28 @@ where
 
             match dt {
                 DataType::Timestamp(TimeUnit::Second, _) => {
-                    let tz: Arc<str> = arr[0]
-                        .as_any()
-                        .downcast_ref::<PrimitiveArray<TimestampSecondType>>()
-                        .unwrap()
-                        .timezone()
-                        .unwrap()
-                        .into();
                     scalar_min_value =
-                        ScalarValue::TimestampSecond(Some(min_value_timestamp), Some(tz.clone()));
+                        ScalarValue::TimestampSecond(Some(min_value_timestamp), tz.clone());
                     scalar_max_value =
-                        ScalarValue::TimestampSecond(Some(max_value_timestamp), Some(tz));
+                        ScalarValue::TimestampSecond(Some(max_value_timestamp), tz.clone());
                 }
                 DataType::Timestamp(TimeUnit::Millisecond, _) => {
-                    let tz: Arc<str> = arr[0]
-                        .as_any()
-                        .downcast_ref::<PrimitiveArray<TimestampMillisecondType>>()
-                        .unwrap()
-                        .timezone()
-                        .unwrap()
-                        .into();
-                    scalar_min_value = ScalarValue::TimestampMillisecond(
-                        Some(min_value_timestamp),
-                        Some(tz.clone()),
-                    );
+                    scalar_min_value =
+                        ScalarValue::TimestampMillisecond(Some(min_value_timestamp), tz.clone());
                     scalar_max_value =
-                        ScalarValue::TimestampMillisecond(Some(max_value_timestamp), Some(tz));
+                        ScalarValue::TimestampMillisecond(Some(max_value_timestamp), tz.clone());
                 }
                 DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                    let tz: Arc<str> = arr[0]
-                        .as_any()
-                        .downcast_ref::<PrimitiveArray<TimestampMicrosecondType>>()
-                        .unwrap()
-                        .timezone()
-                        .unwrap()
-                        .into();
-                    scalar_min_value = ScalarValue::TimestampMicrosecond(
-                        Some(min_value_timestamp),
-                        Some(tz.clone()),
-                    );
+                    scalar_min_value =
+                        ScalarValue::TimestampMicrosecond(Some(min_value_timestamp), tz.clone());
                     scalar_max_value =
-                        ScalarValue::TimestampMicrosecond(Some(max_value_timestamp), Some(tz));
+                        ScalarValue::TimestampMicrosecond(Some(max_value_timestamp), tz.clone());
                 }
                 DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                    let tz: Arc<str> = arr[0]
-                        .as_any()
-                        .downcast_ref::<PrimitiveArray<TimestampNanosecondType>>()
-                        .unwrap()
-                        .timezone()
-                        .unwrap()
-                        .into();
-                    scalar_min_value = ScalarValue::TimestampNanosecond(
-                        Some(min_value_timestamp),
-                        Some(tz.clone()),
-                    );
+                    scalar_min_value =
+                        ScalarValue::TimestampNanosecond(Some(min_value_timestamp), tz.clone());
                     scalar_max_value =
-                        ScalarValue::TimestampNanosecond(Some(max_value_timestamp), Some(tz));
+                        ScalarValue::TimestampNanosecond(Some(max_value_timestamp), tz.clone());
                 }
                 _ => {
                     todo!()
@@ -583,10 +547,13 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     }
 }
 
-fn cast_dictionary_arrays<'a, T: Array + 'static>(arrays: &'a [&'a ArrayRef]) -> Vec<&'a T> {
+fn cast_dictionary_arrays<'a, T: ArrowDictionaryKeyType + 'static>(
+    arrays: &'a [&'a ArrayRef],
+) -> Vec<&Arc<dyn Array>> {
     arrays
         .iter()
-        .map(|x| x.as_any().downcast_ref::<T>().unwrap())
+        .map(|x| x.as_dictionary::<T>())
+        .map(|c| c.values())
         .collect::<Vec<_>>()
 }
 
@@ -594,38 +561,14 @@ fn get_dictionary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     let data_type = arrays[0].data_type();
     match data_type {
         DataType::Dictionary(key_type, _) => match key_type.as_ref() {
-            DataType::Int8 => {
-                let x = &cast_dictionary_arrays::<Int8DictionaryArray>(arrays);
-                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
-            }
-            DataType::Int16 => {
-                let x = &cast_dictionary_arrays::<Int16DictionaryArray>(arrays);
-                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
-            }
-            DataType::Int32 => {
-                let x = &cast_dictionary_arrays::<Int32DictionaryArray>(arrays);
-                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
-            }
-            DataType::Int64 => {
-                let x = &cast_dictionary_arrays::<Int64DictionaryArray>(arrays);
-                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
-            }
-            DataType::UInt8 => {
-                let x = &cast_dictionary_arrays::<UInt8DictionaryArray>(arrays);
-                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
-            }
-            DataType::UInt16 => {
-                let x = &cast_dictionary_arrays::<UInt16DictionaryArray>(arrays);
-                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
-            }
-            DataType::UInt32 => {
-                let x = &cast_dictionary_arrays::<UInt32DictionaryArray>(arrays);
-                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
-            }
-            DataType::UInt64 => {
-                let x = &cast_dictionary_arrays::<UInt64DictionaryArray>(arrays);
-                collect_statistics(&x.iter().map(|c| c.values()).collect::<Vec<_>>())
-            }
+            DataType::Int8 => collect_statistics(&cast_dictionary_arrays::<Int8Type>(arrays)),
+            DataType::Int16 => collect_statistics(&cast_dictionary_arrays::<Int16Type>(arrays)),
+            DataType::Int32 => collect_statistics(&cast_dictionary_arrays::<Int32Type>(arrays)),
+            DataType::Int64 => collect_statistics(&cast_dictionary_arrays::<Int64Type>(arrays)),
+            DataType::UInt8 => collect_statistics(&cast_dictionary_arrays::<UInt8Type>(arrays)),
+            DataType::UInt16 => collect_statistics(&cast_dictionary_arrays::<UInt16Type>(arrays)),
+            DataType::UInt32 => collect_statistics(&cast_dictionary_arrays::<UInt32Type>(arrays)),
+            DataType::UInt64 => collect_statistics(&cast_dictionary_arrays::<UInt64Type>(arrays)),
             _ => {
                 panic!("Unsupported dictionary key type: {}", key_type);
             }
@@ -636,22 +579,26 @@ fn get_dictionary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     }
 }
 
-fn collect_struct_statistics(arrays: &[&ArrayRef], fields: &ArrowFields) -> StatisticsRow {
-    // for (i, f) in subfields.iter().enumerate() {
-    //     let lance_field = self
-    //         .children
-    //         .iter_mut()
-    //         .find(|c| c.name == *f.name())
-    //         .unwrap();
-    //     let struct_arr = arr.as_struct();
-    //     lance_field.set_dictionary(struct_arr.column(i));
-    // }
-    StatisticsRow {
-        null_count: ScalarValue::Int64(Some(0)),
-        min_value: ScalarValue::Struct(None, fields.clone()),
-        max_value: ScalarValue::Struct(None, fields.clone()),
-    }
-}
+// fn collect_struct_statistics(arrays: &[&ArrayRef], fields: &ArrowFields) -> StatisticsRow {
+//     let arr = arrays
+//         .iter()
+//         .map(|x| x.as_any().downcast_ref::<StructArray>().unwrap())
+//         .collect::<Vec<_>>();
+//     for (i, f) in fields.iter().enumerate() {
+//         //     let lance_field = self
+//         //         .children
+//         //         .iter_mut()
+//         //         .find(|c| c.name == *f.name())
+//         //         .unwrap();
+//         //     let struct_arr = arr.as_struct();
+//         //     lance_field.set_dictionary(struct_arr.column(i));
+//     }
+//     StatisticsRow {
+//         null_count: ScalarValue::Int64(Some(0)),
+//         min_value: ScalarValue::Struct(None, fields.clone()),
+//         max_value: ScalarValue::Struct(None, fields.clone()),
+//     }
+// }
 
 pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     match arrays[0].data_type() {
@@ -672,6 +619,7 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::Time32(TimeUnit::Millisecond) => get_statistics::<Time32MillisecondType>(arrays),
         DataType::Time64(TimeUnit::Microsecond) => get_statistics::<Time64MicrosecondType>(arrays),
         DataType::Time64(TimeUnit::Nanosecond) => get_statistics::<Time64NanosecondType>(arrays),
+        // TODO
         DataType::Timestamp(TimeUnit::Second, _) => get_statistics::<TimestampSecondType>(arrays),
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
             get_statistics::<TimestampMillisecondType>(arrays)
@@ -697,7 +645,8 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::Utf8 => get_string_statistics(arrays),
         DataType::LargeUtf8 => get_string_statistics(arrays),
         DataType::Dictionary(_, _) => get_dictionary_statistics(arrays),
-        DataType::Struct(fields) => collect_struct_statistics(arrays, fields),
+        // DataType::Struct(fields) => collect_struct_statistics(arrays, fields),
+        // DataType::FixedSizeList(field, length) => collect_fixed_size_list_statistics(arrays, field, length),
         // TODO: List, LargeList, FixedSizeList, FixedSizeBinary, BinaryArray, Struct
         _ => {
             println!(
@@ -710,7 +659,6 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 }
 
 pub struct StatisticsCollector {
-    num_rows: PrimitiveBuilder<Int64Type>,
     builders: BTreeMap<i32, (Field, StatisticsBuilder)>,
 }
 
@@ -720,26 +668,16 @@ impl StatisticsCollector {
             .iter()
             .map(|f| (f.id, (f.clone(), StatisticsBuilder::new(&f.data_type()))))
             .collect();
-        Self {
-            builders,
-            num_rows: PrimitiveBuilder::<Int64Type>::new(),
-        }
+        Self { builders }
     }
 
     pub fn get_builder(&mut self, field_id: i32) -> Option<&mut StatisticsBuilder> {
         self.builders.get_mut(&field_id).map(|(_, b)| b)
     }
 
-    pub fn append_num_values(&mut self, num_rows: i64) {
-        self.num_rows.append_value(num_rows)
-    }
-
     pub fn finish(&mut self) -> Result<RecordBatch> {
         let mut arrays: Vec<ArrayRef> = vec![];
         let mut fields: Vec<ArrowField> = vec![];
-        let num_rows = Arc::new(self.num_rows.finish());
-        arrays.push(num_rows);
-        fields.push(ArrowField::new("num_values", DataType::Int64, false));
 
         self.builders.iter_mut().for_each(|(_, (field, builder))| {
             let null_count = Arc::new(builder.null_count.finish());
@@ -1411,14 +1349,10 @@ mod tests {
             max_value: ScalarValue::Utf8(None),
         });
 
-        collector.append_num_values(42);
-        collector.append_num_values(64);
-
         // Now we can finish
         let batch = collector.finish().unwrap();
 
         let expected_schema = ArrowSchema::new(vec![
-            ArrowField::new("num_values", DataType::Int64, false),
             ArrowField::new(
                 "0",
                 DataType::Struct(ArrowFields::from(vec![
@@ -1444,7 +1378,6 @@ mod tests {
         let expected_batch = RecordBatch::try_new(
             Arc::new(expected_schema),
             vec![
-                Arc::new(Int64Array::from(vec![42, 64])),
                 Arc::new(StructArray::from(vec![
                     (
                         Arc::new(ArrowField::new("null_count", DataType::Int64, false)),
