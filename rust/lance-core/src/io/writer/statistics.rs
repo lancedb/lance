@@ -34,10 +34,10 @@ use arrow_array::{
         UInt32Type, UInt64Type, UInt8Type,
     },
     Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, BooleanArray,
-    Decimal128Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    Decimal128Array, Int32Array, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::{
-    ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema,
+    ArrowError, DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     TimeUnit,
 };
 use datafusion::common::ScalarValue;
@@ -65,7 +65,7 @@ where
 {
     let arr = arrays
         .iter()
-        .map(|x| x.as_any().downcast_ref::<PrimitiveArray<T>>().unwrap())
+        .map(|x| x.as_primitive::<T>())
         .collect::<Vec<_>>();
     let mut min_value = T::Native::max_value();
     let mut max_value = T::Native::min_value();
@@ -121,22 +121,6 @@ where
             scalar_min_value = ScalarValue::Date32(Some(min_value_date32));
             scalar_max_value = ScalarValue::Date32(Some(max_value_date32));
         }
-        DataType::Date64 => {
-            let min_value_date64 = scalar_min_value
-                .to_array()
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0);
-            let max_value_date64 = scalar_max_value
-                .to_array()
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0);
-            scalar_min_value = ScalarValue::Date64(Some(min_value_date64));
-            scalar_max_value = ScalarValue::Date64(Some(max_value_date64));
-        }
         DataType::Time32(_) => {
             let min_value_time32 = scalar_min_value
                 .to_array()
@@ -158,112 +142,6 @@ where
                 DataType::Time32(TimeUnit::Millisecond) => {
                     scalar_min_value = ScalarValue::Time32Millisecond(Some(min_value_time32));
                     scalar_max_value = ScalarValue::Time32Millisecond(Some(max_value_time32));
-                }
-                _ => {
-                    todo!()
-                }
-            }
-        }
-        DataType::Time64(_) => {
-            let min_value_time64 = scalar_min_value
-                .to_array()
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0);
-            let max_value_time64 = scalar_max_value
-                .to_array()
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0);
-            match dt {
-                DataType::Time64(TimeUnit::Microsecond) => {
-                    scalar_min_value = ScalarValue::Time64Microsecond(Some(min_value_time64));
-                    scalar_max_value = ScalarValue::Time64Microsecond(Some(max_value_time64));
-                }
-                DataType::Time64(TimeUnit::Nanosecond) => {
-                    scalar_min_value = ScalarValue::Time64Nanosecond(Some(min_value_time64));
-                    scalar_max_value = ScalarValue::Time64Nanosecond(Some(max_value_time64));
-                }
-                _ => {
-                    todo!()
-                }
-            }
-        }
-        DataType::Timestamp(_, tz) => {
-            let min_value_timestamp = scalar_min_value
-                .to_array()
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0);
-            let max_value_timestamp = scalar_max_value
-                .to_array()
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0);
-
-            match dt {
-                DataType::Timestamp(TimeUnit::Second, _) => {
-                    scalar_min_value =
-                        ScalarValue::TimestampSecond(Some(min_value_timestamp), tz.clone());
-                    scalar_max_value =
-                        ScalarValue::TimestampSecond(Some(max_value_timestamp), tz.clone());
-                }
-                DataType::Timestamp(TimeUnit::Millisecond, _) => {
-                    scalar_min_value =
-                        ScalarValue::TimestampMillisecond(Some(min_value_timestamp), tz.clone());
-                    scalar_max_value =
-                        ScalarValue::TimestampMillisecond(Some(max_value_timestamp), tz.clone());
-                }
-                DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                    scalar_min_value =
-                        ScalarValue::TimestampMicrosecond(Some(min_value_timestamp), tz.clone());
-                    scalar_max_value =
-                        ScalarValue::TimestampMicrosecond(Some(max_value_timestamp), tz.clone());
-                }
-                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                    scalar_min_value =
-                        ScalarValue::TimestampNanosecond(Some(min_value_timestamp), tz.clone());
-                    scalar_max_value =
-                        ScalarValue::TimestampNanosecond(Some(max_value_timestamp), tz.clone());
-                }
-                _ => {
-                    todo!()
-                }
-            }
-        }
-        DataType::Duration(_) => {
-            let min_value_duration = scalar_min_value
-                .to_array()
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0);
-            let max_value_duration = scalar_max_value
-                .to_array()
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0);
-            match dt {
-                DataType::Duration(TimeUnit::Second) => {
-                    scalar_min_value = ScalarValue::DurationSecond(Some(min_value_duration));
-                    scalar_max_value = ScalarValue::DurationSecond(Some(max_value_duration));
-                }
-                DataType::Duration(TimeUnit::Millisecond) => {
-                    scalar_min_value = ScalarValue::DurationMillisecond(Some(min_value_duration));
-                    scalar_max_value = ScalarValue::DurationMillisecond(Some(max_value_duration));
-                }
-                DataType::Duration(TimeUnit::Microsecond) => {
-                    scalar_min_value = ScalarValue::DurationMicrosecond(Some(min_value_duration));
-                    scalar_max_value = ScalarValue::DurationMicrosecond(Some(max_value_duration));
-                }
-                DataType::Duration(TimeUnit::Nanosecond) => {
-                    scalar_min_value = ScalarValue::DurationNanosecond(Some(min_value_duration));
-                    scalar_max_value = ScalarValue::DurationNanosecond(Some(max_value_duration));
                 }
                 _ => {
                     todo!()
@@ -580,25 +458,138 @@ fn get_dictionary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 }
 
 // fn collect_struct_statistics(arrays: &[&ArrayRef], fields: &ArrowFields) -> StatisticsRow {
+//     let stats : Vec<StatisticsRow>;
+//     for (i, f) in fields.iter().enumerate() {
+//         arrays
+//             .iter()
+//             .map(|x| x.as_struct())
+//             .for_each(|a| {
+//                 for (i, f) in fields.iter().enumerate() {
+//                     stats.push(collect_statistics(a.column(i)))
+//                 }
+//             }).collect::<Vec<_>>();
+//     }
 //     let arr = arrays
 //         .iter()
-//         .map(|x| x.as_any().downcast_ref::<StructArray>().unwrap())
-//         .collect::<Vec<_>>();
-//     for (i, f) in fields.iter().enumerate() {
-//         //     let lance_field = self
-//         //         .children
-//         //         .iter_mut()
-//         //         .find(|c| c.name == *f.name())
-//         //         .unwrap();
-//         //     let struct_arr = arr.as_struct();
-//         //     lance_field.set_dictionary(struct_arr.column(i));
-//     }
+//         .map(|x| x.as_struct())
+//         .for_each(|a| {
+//             for (i, f) in fields.iter().enumerate() {
+//                 stats.push(collect_statistics(a.column(i)))
+//             }
+//         }).collect::<Vec<_>>();
+//
 //     StatisticsRow {
 //         null_count: ScalarValue::Int64(Some(0)),
 //         min_value: ScalarValue::Struct(None, fields.clone()),
 //         max_value: ScalarValue::Struct(None, fields.clone()),
 //     }
 // }
+
+fn get_temporal_statistics<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> StatisticsRow
+where
+    T::Native: Bounded + PartialOrd,
+    datafusion::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
+    i64: From<<T as ArrowPrimitiveType>::Native>,
+{
+    let arr = arrays
+        .iter()
+        .map(|x| x.as_primitive::<T>())
+        .collect::<Vec<_>>();
+    let mut min_value = T::Native::max_value();
+    let mut max_value = T::Native::min_value();
+    let mut null_count: i64 = 0;
+
+    for array in arr.iter() {
+        array.iter().for_each(|value| {
+            if let Some(value) = value {
+                if let Some(Ordering::Greater) = value.partial_cmp(&max_value) {
+                    max_value = value;
+                } else if let Some(Ordering::Less) = value.partial_cmp(&min_value) {
+                    min_value = value;
+                }
+            };
+        });
+        null_count += array.null_count() as i64;
+    }
+
+    let mv = Some(min_value.into());
+    let mx = Some(max_value.into());
+    let min_value_scalar: ScalarValue;
+    let max_value_scalar: ScalarValue;
+
+    match arrays[0].data_type() {
+        DataType::Timestamp(TimeUnit::Second, tz) => {
+            min_value_scalar = ScalarValue::TimestampSecond(mv, tz.clone());
+            max_value_scalar = ScalarValue::TimestampSecond(mx, tz.clone());
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, tz) => {
+            min_value_scalar = ScalarValue::TimestampMillisecond(mv, tz.clone());
+            max_value_scalar = ScalarValue::TimestampMillisecond(mx, tz.clone());
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            min_value_scalar = ScalarValue::TimestampMicrosecond(mv, tz.clone());
+            max_value_scalar = ScalarValue::TimestampMicrosecond(mx, tz.clone());
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            min_value_scalar = ScalarValue::TimestampNanosecond(mv, tz.clone());
+            max_value_scalar = ScalarValue::TimestampNanosecond(mx, tz.clone());
+        }
+        // TODO
+        // DataType::Time32(TimeUnit::Millisecond) => {
+        //     min_value_scalar = ScalarValue::Time32Millisecond(min_value.into());
+        //     max_value_scalar = ScalarValue::Time32Millisecond(max_value.into());
+        // },
+        // DataType::Date32 => {
+        //     min_value_scalar = ScalarValue::Date32(mv);
+        //     max_value_scalar = ScalarValue::Date32(mx);
+        // },
+        DataType::Time64(TimeUnit::Microsecond) => {
+            min_value_scalar = ScalarValue::Time64Microsecond(mv);
+            max_value_scalar = ScalarValue::Time64Microsecond(mx);
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            min_value_scalar = ScalarValue::Time64Nanosecond(mv);
+            max_value_scalar = ScalarValue::Time64Nanosecond(mx);
+        }
+        DataType::Date64 => {
+            min_value_scalar = ScalarValue::Date64(mv);
+            max_value_scalar = ScalarValue::Date64(mx);
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            min_value_scalar = ScalarValue::Time64Microsecond(mv);
+            max_value_scalar = ScalarValue::Time64Microsecond(mx);
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            min_value_scalar = ScalarValue::Time64Nanosecond(mv);
+            max_value_scalar = ScalarValue::Time64Nanosecond(mx);
+        }
+        DataType::Duration(TimeUnit::Second) => {
+            min_value_scalar = ScalarValue::DurationSecond(mv);
+            max_value_scalar = ScalarValue::DurationSecond(mx);
+        }
+        DataType::Duration(TimeUnit::Millisecond) => {
+            min_value_scalar = ScalarValue::DurationMillisecond(mv);
+            max_value_scalar = ScalarValue::DurationMillisecond(mx);
+        }
+        DataType::Duration(TimeUnit::Microsecond) => {
+            min_value_scalar = ScalarValue::DurationMicrosecond(mv);
+            max_value_scalar = ScalarValue::DurationMicrosecond(mx);
+        }
+        DataType::Duration(TimeUnit::Nanosecond) => {
+            min_value_scalar = ScalarValue::DurationNanosecond(mv);
+            max_value_scalar = ScalarValue::DurationNanosecond(mx);
+        }
+        _ => {
+            todo!()
+        }
+    }
+
+    StatisticsRow {
+        null_count: ScalarValue::Int64(Some(null_count)),
+        min_value: min_value_scalar,
+        max_value: max_value_scalar,
+    }
+}
 
 pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     match arrays[0].data_type() {
@@ -613,33 +604,43 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::UInt64 => get_statistics::<UInt64Type>(arrays),
         DataType::Float32 => get_statistics::<Float32Type>(arrays),
         DataType::Float64 => get_statistics::<Float64Type>(arrays),
+
         DataType::Date32 => get_statistics::<Date32Type>(arrays),
-        DataType::Date64 => get_statistics::<Date64Type>(arrays),
         DataType::Time32(TimeUnit::Second) => get_statistics::<Time32SecondType>(arrays),
         DataType::Time32(TimeUnit::Millisecond) => get_statistics::<Time32MillisecondType>(arrays),
-        DataType::Time64(TimeUnit::Microsecond) => get_statistics::<Time64MicrosecondType>(arrays),
-        DataType::Time64(TimeUnit::Nanosecond) => get_statistics::<Time64NanosecondType>(arrays),
-        // TODO
-        DataType::Timestamp(TimeUnit::Second, _) => get_statistics::<TimestampSecondType>(arrays),
+
+        DataType::Date64 => get_temporal_statistics::<Date64Type>(arrays),
+        DataType::Time64(TimeUnit::Microsecond) => {
+            get_temporal_statistics::<Time64MicrosecondType>(arrays)
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            get_temporal_statistics::<Time64NanosecondType>(arrays)
+        }
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            get_temporal_statistics::<TimestampSecondType>(arrays)
+        }
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            get_statistics::<TimestampMillisecondType>(arrays)
+            get_temporal_statistics::<TimestampMillisecondType>(arrays)
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            get_statistics::<TimestampMicrosecondType>(arrays)
+            get_temporal_statistics::<TimestampMicrosecondType>(arrays)
         }
         DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            get_statistics::<TimestampNanosecondType>(arrays)
+            get_temporal_statistics::<TimestampNanosecondType>(arrays)
         }
-        DataType::Duration(TimeUnit::Second) => get_statistics::<DurationSecondType>(arrays),
+        DataType::Duration(TimeUnit::Second) => {
+            get_temporal_statistics::<DurationSecondType>(arrays)
+        }
         DataType::Duration(TimeUnit::Millisecond) => {
-            get_statistics::<DurationMillisecondType>(arrays)
+            get_temporal_statistics::<DurationMillisecondType>(arrays)
         }
         DataType::Duration(TimeUnit::Microsecond) => {
-            get_statistics::<DurationMicrosecondType>(arrays)
+            get_temporal_statistics::<DurationMicrosecondType>(arrays)
         }
         DataType::Duration(TimeUnit::Nanosecond) => {
-            get_statistics::<DurationNanosecondType>(arrays)
+            get_temporal_statistics::<DurationNanosecondType>(arrays)
         }
+
         DataType::Decimal128(_, _) => get_decimal_statistics(arrays),
         DataType::Binary => get_binary_statistics(arrays),
         DataType::Utf8 => get_string_statistics(arrays),
