@@ -33,8 +33,8 @@ use arrow_array::{
         TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type,
         UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, BooleanArray,
-    Decimal128Array, ListArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, Decimal128Array,
+    LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::{
     ArrowError, DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
@@ -222,6 +222,73 @@ fn increment(mut data: Vec<u8>) -> Option<Vec<u8>> {
     None
 }
 
+fn get_large_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
+    let mut min_value: Option<&str> = None;
+    let mut max_value: Option<&str> = None;
+    let mut null_count: i64 = 0;
+
+    let arr = arrays
+        .iter()
+        .map(|x| x.as_any().downcast_ref::<LargeStringArray>().unwrap()) // TODO as_string
+        .collect::<Vec<_>>();
+
+    for array in arr.iter() {
+        array.iter().for_each(|value| {
+            if let Some(val) = value {
+                // TODO: don't compare full strings
+                // for i in (BINARY_PREFIX_LENGTH..val.len()).rev() {
+                //     if val.is_char_boundary(i) {
+                //         val = &val[..i];
+                //         break;
+                //     }
+                // }
+                // TODO: if we discovered a max value greater than expressable
+                //  with BINARY_PREFIX_LENGTH we can skip comparing remaining values
+                //  in the array.
+                //  Same for min value.
+
+                if let Some(v) = min_value {
+                    if let Some(Ordering::Less) = val[..].partial_cmp(v) {
+                        min_value = Some(val);
+                    }
+                } else {
+                    min_value = Some(val);
+                }
+
+                if let Some(v) = max_value {
+                    if let Some(Ordering::Greater) = val.partial_cmp(v) {
+                        max_value = Some(val);
+                    }
+                } else {
+                    max_value = Some(val);
+                }
+            }
+        });
+        null_count += array.null_count() as i64;
+    }
+
+    if let Some(v) = min_value {
+        if v.len() > BINARY_PREFIX_LENGTH {
+            min_value = truncate_utf8(v, BINARY_PREFIX_LENGTH);
+        }
+    }
+
+    let max_value_bound: Vec<u8>;
+    if let Some(v) = max_value {
+        if v.len() > BINARY_PREFIX_LENGTH {
+            max_value = truncate_utf8(v, BINARY_PREFIX_LENGTH);
+            max_value_bound = increment_utf8(max_value.unwrap().as_bytes().to_vec()).unwrap();
+            max_value = Some(str::from_utf8(&max_value_bound).unwrap());
+        }
+    }
+
+    StatisticsRow {
+        null_count: ScalarValue::Int64(Some(null_count)),
+        min_value: ScalarValue::LargeUtf8(Some(min_value.unwrap().to_string())),
+        max_value: ScalarValue::LargeUtf8(Some(max_value.unwrap().to_string())),
+    }
+}
+
 fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     let mut min_value: Option<&str> = None;
     let mut max_value: Option<&str> = None;
@@ -243,7 +310,8 @@ fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
                 //     }
                 // }
                 // TODO: if we discovered a max value greater than expressable
-                //  with BINARY_PREFIX_LENGTH we can skip comparing remaining values.
+                //  with BINARY_PREFIX_LENGTH we can skip comparing remaining values
+                //  in the array.
                 //  Same for min value.
 
                 if let Some(v) = min_value {
@@ -361,10 +429,7 @@ fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         .map(|x| as_fixed_size_binary_array(x))
         .collect::<Vec<_>>();
 
-    let length = std::cmp::min(
-        BINARY_PREFIX_LENGTH,
-        arr[0].value_length().try_into().unwrap(),
-    );
+    let length = std::cmp::min(BINARY_PREFIX_LENGTH, arr[0].value_length() as usize);
 
     for array in arr.iter() {
         array.iter().for_each(|value| {
@@ -413,14 +478,8 @@ fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
     StatisticsRow {
         null_count: ScalarValue::Int64(Some(null_count)),
-        min_value: ScalarValue::FixedSizeBinary(
-            length.try_into().unwrap(),
-            min_value.map(|x| x.to_vec()),
-        ),
-        max_value: ScalarValue::FixedSizeBinary(
-            length.try_into().unwrap(),
-            max_value.map(|x| x.to_vec()),
-        ),
+        min_value: ScalarValue::FixedSizeBinary(length as i32, min_value.map(|x| x.to_vec())),
+        max_value: ScalarValue::FixedSizeBinary(length as i32, max_value.map(|x| x.to_vec())),
     }
 }
 
@@ -454,46 +513,61 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
     StatisticsRow {
         null_count: ScalarValue::Int64(Some(null_count)),
-        min_value: if false_present {
-            ScalarValue::Boolean(Some(false))
-        } else if true_present {
-            ScalarValue::Boolean(Some(true))
-        } else {
-            ScalarValue::Boolean(None)
-        },
-        max_value: if true_present {
-            ScalarValue::Boolean(Some(true))
-        } else {
-            ScalarValue::Boolean(None)
-        },
+        min_value: ScalarValue::Boolean(Some(true_present && !false_present)),
+        max_value: ScalarValue::Boolean(Some(true_present || !false_present)),
     }
 }
 
-fn get_list_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
-    let mut null_count: i64 = 0;
-
-    let arr = arrays
-        .iter()
-        .map(|x| x.as_any().downcast_ref::<ListArray>().unwrap())
-        .collect::<Vec<_>>();
-
-    // TODO
-    let child = arr[0].values();
-    let child_stats = collect_statistics(&[child]);
-    for array in arr.iter() {
-        null_count += array.null_count() as i64;
-    }
-    // TODO
-    let f = Arc::new(ArrowField::new("item", child.data_type().clone(), true));
-
-    StatisticsRow {
-        null_count: ScalarValue::Int64(Some(null_count)),
-        // min_value: ScalarValue::List(Some(child_stats.min_value)),
-        // max_value: ScalarValue::List(Some(child_stats.max_value)),
-        min_value: ScalarValue::List(Some(vec![]), f.clone()),
-        max_value: ScalarValue::List(Some(vec![]), f.clone()),
-    }
-}
+// fn get_list_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
+//     let max_length: usize = 16;
+//     let mut min_value: Option<&[i64]> = None; // TODO T::Native
+//     let mut max_value: Option<&[i64]> = None; // TODO T::Native
+//     let mut null_count: i64 = 0;
+//     let mut max_length: usize = 0;
+//
+//     let arr = arrays
+//         .iter()
+//         .map(|x| x.as_list::<i32>())
+//         .collect::<Vec<_>>();
+//     let DataType::List(dt) = arr[0].data_type();
+//     let value_type = dt.data_type();
+//
+//     for array in arr.iter() {
+//         array.iter().for_each(|value| {
+//             if let Some(value) = value {
+//                 let val = value.as_any().downcast_ref::<Int64Array>().unwrap();
+//                 if value.len() > max_length {
+//                     max_length = value.len();
+//                 }
+//
+//                 for i in 0..std::cmp::min(value.len(), max_length) {
+//                     if let Some(v) = min_value {
+//                         if let Some(Ordering::Less) = val.value(i).partial_cmp(&v[i]) {
+//                             min_value = Some(val.values());
+//                         }
+//                     } else {
+//                         min_value = Some(val.values());
+//                     }
+//
+//                     if let Some(v) = max_value {
+//                         if let Some(Ordering::Greater) = val.value(i).partial_cmp(&v[i]) {
+//                             max_value = Some(val.values());
+//                         }
+//                     } else {
+//                         max_value = Some(val.values());
+//                     }
+//                 }
+//             };
+//         });
+//         null_count += array.null_count() as i64;
+//     }
+//
+//     StatisticsRow {
+//         null_count: ScalarValue::Int64(Some(null_count)),
+//         min_value: ScalarValue::List(min_value, value_type.clone()),
+//         max_value: ScalarValue::List(max_value, value_type.clone()),
+//     }
+// }
 
 fn cast_dictionary_arrays<'a, T: ArrowDictionaryKeyType + 'static>(
     arrays: &'a [&'a ArrayRef],
@@ -708,10 +782,10 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::Binary => get_binary_statistics(arrays),
         DataType::FixedSizeBinary(_) => get_fixed_size_binary_statistics(arrays),
         DataType::Utf8 => get_string_statistics(arrays),
-        // DataType::LargeUtf8 => get_string_statistics::<LargeStringArray>(arrays),
+        DataType::LargeUtf8 => get_large_string_statistics(arrays),
         DataType::Dictionary(_, _) => get_dictionary_statistics(arrays),
         DataType::Struct(fields) => get_struct_statistics(arrays, fields),
-        DataType::List(field) => get_list_statistics(arrays),
+        // DataType::List(field) => get_list_statistics(arrays),
         // DataType::LargeList(field) => get_large_list_statistics(arrays, field),
         // DataType::FixedSizeList(field, length) => get_fixed_size_list_statistics(arrays, field, length),
 
@@ -908,13 +982,7 @@ impl StatisticsBuilder {
             .as_any_mut()
             .downcast_mut::<BooleanBuilder>()
             .unwrap();
-        let min_value = row
-            .min_value
-            .to_array()
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap()
-            .value(0);
+        let min_value = row.min_value.to_array().as_boolean().value(0);
         min_value_builder.append_value(min_value);
 
         let max_value_builder = self
@@ -922,13 +990,7 @@ impl StatisticsBuilder {
             .as_any_mut()
             .downcast_mut::<BooleanBuilder>()
             .unwrap();
-        let max_value = row
-            .max_value
-            .to_array()
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap()
-            .value(0);
+        let max_value = row.max_value.to_array().as_boolean().value(0);
         max_value_builder.append_value(max_value);
     }
 
