@@ -57,6 +57,15 @@ impl DeletionVector {
         }
     }
 
+    /// Remove indices that are present in the deletion vector
+    pub fn filter_iter(&self, iter: impl Iterator<Item = u32>) -> Vec<u32> {
+        match self {
+            Self::NoDeletions => iter.collect(),
+            Self::Set(set) => iter.filter(|val| !set.contains(val)).collect(),
+            Self::Bitmap(bitmap) => iter.filter(|val| bitmap.contains(*val)).collect(),
+        }
+    }
+
     pub fn build_predicate(&self, row_ids: Iter<u64>) -> Option<BooleanArray> {
         match self {
             Self::Bitmap(bitmap) => Some(

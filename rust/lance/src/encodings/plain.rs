@@ -26,10 +26,10 @@ use arrow::array::{as_boolean_array, BooleanBuilder};
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    make_array, new_empty_array, Array, ArrayRef, BooleanArray, FixedSizeBinaryArray,
-    FixedSizeListArray, UInt32Array, UInt8Array,
+    make_array, new_empty_array, Array, ArrayRef, ArrowNativeTypeOp, BooleanArray,
+    FixedSizeBinaryArray, FixedSizeListArray, UInt32Array, UInt8Array,
 };
-use arrow_buffer::{bit_util, Buffer};
+use arrow_buffer::{bit_util, i256, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 use arrow_select::concat::concat;
@@ -37,6 +37,7 @@ use arrow_select::take::take;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::Stream;
 use snafu::{location, Location};
 use tokio::io::AsyncWriteExt;
 
@@ -353,28 +354,65 @@ impl<'a> PlainDecoder<'a> {
     }
 }
 
-fn make_chunked_requests(
-    indices: &[u32],
+/// Parameters for a chunked request.
+#[derive(Debug, Clone)]
+struct TakeChunksPlan {
+    /// The array indices that are being fetched.
+    indices: UInt32Array,
+    /// The offset relative to the start of the whole array that this chunk will
+    /// be fetching.
+    offset: usize,
+    /// If true, the indices are a contiguous range and aren't fetching any
+    /// values that will need to be thrown out later.
+    is_contiguous: bool,
+}
+
+/// Group the indices into chunks, such that either:
+/// 1. the indices are contiguous (and non-repeating)
+/// 2. the values are within `min_io_size` of each other (and thus are worth
+///    grabbing in a single request)
+fn plan_take_chunks(
+    indices: &UInt32Array,
     byte_width: usize,
-    block_size: usize,
-) -> Vec<Range<usize>> {
-    let mut chunked_ranges = vec![];
-    let mut start: usize = 0;
-    // Note: limit the I/O size to the block size.
-    //
-    // Another option could be checking whether `indices[i]` and `indices[i+1]` are not
-    // farther way than the block size:
-    //    indices[i] * byte_width + block_size < indices[i+1] * byte_width
-    // It might allow slightly larger sequential reads.
-    for i in 0..indices.len() - 1 {
-        if indices[i + 1] as usize * byte_width > indices[start] as usize * byte_width + block_size
-        {
-            chunked_ranges.push(start..i + 1);
-            start = i + 1;
+    min_io_size: usize,
+) -> Result<Vec<TakeChunksPlan>> {
+    let mut chunks: Vec<TakeChunksPlan> = vec![];
+    let mut start_idx = 0;
+    let mut last_idx: i64 = -1;
+    let mut is_contiguous = true;
+    let mut out_offset = 0;
+    for i in 0..indices.len() {
+        let current = indices.value(i) as usize;
+        let curr_contiguous = i == 0 || current as i64 - last_idx == 1;
+
+        let within_min_io_size = |current, start_idx| {
+            let current_byte_pos = current * byte_width;
+            let start_byte_pos = indices.value(start_idx) as usize * byte_width;
+            current_byte_pos - start_byte_pos <= min_io_size
+        };
+
+        if !curr_contiguous && !within_min_io_size(current, start_idx) {
+            chunks.push(TakeChunksPlan {
+                indices: as_primitive_array(&indices.slice(start_idx, i - start_idx)).clone(),
+                offset: out_offset,
+                is_contiguous,
+            });
+            out_offset = i;
+            start_idx = i;
+            is_contiguous = true;
+        } else {
+            is_contiguous &= curr_contiguous;
         }
+
+        last_idx = current as i64;
     }
-    chunked_ranges.push(start..indices.len());
-    chunked_ranges
+    chunks.push(TakeChunksPlan {
+        indices: as_primitive_array(&indices.slice(start_idx, indices.len() - start_idx)).clone(),
+        offset: out_offset,
+        is_contiguous,
+    });
+
+    Ok(chunks)
 }
 
 #[async_trait]
@@ -383,6 +421,12 @@ impl<'a> Decoder for PlainDecoder<'a> {
         self.get(0..self.length).await
     }
 
+    /// Get the values of the array at the specified indices by making concurrent
+    /// requests for contiguous or nearly-contiguous ranges.
+    ///
+    /// It is assumed that the indices are sorted.
+    ///
+    /// This might be primitive, FSL, or FSB
     async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
         if indices.is_empty() {
             return Ok(new_empty_array(self.data_type));
@@ -395,25 +439,190 @@ impl<'a> Decoder for PlainDecoder<'a> {
         let block_size = self.reader.block_size();
         let byte_width = self.data_type.byte_width();
 
-        let chunked_ranges = make_chunked_requests(indices.values(), byte_width, block_size);
+        let chunked_ranges = plan_take_chunks(indices, byte_width, block_size)?;
 
-        let arrays = stream::iter(chunked_ranges)
-            .map(|cr| async move {
-                let index_chunk = indices.slice(cr.start, cr.len());
-                let request: &UInt32Array = as_primitive_array(&index_chunk);
+        // We want to do the CPU-bound work of allocating and concatenating
+        // chunks in parallel with the requests. So we'll put the CPU-bound work
+        // in background task.
+        let (tx, rx) = tokio::sync::mpsc::channel(num_cpus::get() * PARALLELISM_FACTOR);
 
-                let start = request.value(0);
-                let end = request.value(request.len() - 1);
+        let mut stream = stream::iter(chunked_ranges)
+            .map(|chunk| async move {
+                let start = chunk.indices.value(0);
+                let end = chunk.indices.value(chunk.indices.len() - 1);
                 let array = self.get(start as usize..end as usize + 1).await?;
-                let adjusted_offsets = subtract_scalar(request, start)?;
-                Ok::<ArrayRef, Error>(take(&array, &adjusted_offsets, None)?)
+                Ok::<_, Error>((chunk, array))
             })
-            .buffered(num_cpus::get() * PARALLELISM_FACTOR)
-            .try_collect::<Vec<_>>()
-            .await?;
-        let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-        Ok(concat(&references)?)
+            // The chunk already knows it's offset in the output array, so
+            // we can recieve the results out of order
+            .buffer_unordered(num_cpus::get() * PARALLELISM_FACTOR);
+
+        let (value_type, values_per_index) = match self.data_type {
+            DataType::FixedSizeList(inner, size) => (inner.data_type().clone(), *size),
+            DataType::FixedSizeBinary(size) => (DataType::UInt8, *size),
+            _ if self.data_type.is_primitive() => (self.data_type.clone(), 1),
+            _ => unreachable!(),
+        };
+
+        let values_length = indices.len() * values_per_index as usize;
+        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let buffer_building_task = tokio::task::spawn(async move {
+            match value_type.primitive_width() {
+                Some(1) => build_scalar_buffer::<u8>(chunk_stream, values_length).await,
+                Some(2) => build_scalar_buffer::<u16>(chunk_stream, values_length).await,
+                Some(4) => build_scalar_buffer::<u32>(chunk_stream, values_length).await,
+                Some(8) => build_scalar_buffer::<u64>(chunk_stream, values_length).await,
+                Some(16) => build_scalar_buffer::<i128>(chunk_stream, values_length).await,
+                Some(32) => build_scalar_buffer::<i256>(chunk_stream, values_length).await,
+                Some(width) => Err(Error::Internal {
+                    message: format!("Unexpected byte width for plain encoding: {width}"),
+                }),
+                None => unreachable!(),
+            }
+        });
+
+        while let Some(res) = stream.next().await {
+            tx.send(res).await.unwrap();
+        }
+        // Drop the sender so the reciever knows its the end of the stream.
+        drop(tx);
+
+        let buffer = buffer_building_task.await??;
+
+        // We have a buffer for values, but this still needs to be transformed
+        // back into the appropirate array type, which might be a FSL or FSB.
+        // If it's a FSL, we need to create a child array.
+        let builder_type = match self.data_type {
+            DataType::FixedSizeList(inner, _) => inner.data_type().clone(),
+            _ => self.data_type.clone(),
+        };
+        let builder_length = match self.data_type {
+            DataType::FixedSizeBinary(_) => indices.len(),
+            _ => values_length,
+        };
+        let array = ArrayDataBuilder::new(builder_type)
+            .len(builder_length)
+            .null_count(0)
+            .add_buffer(buffer)
+            .build()?;
+
+        let array = if let DataType::FixedSizeList(_, _) = self.data_type {
+            ArrayDataBuilder::new(self.data_type.clone())
+                .len(indices.len())
+                .null_count(0)
+                .add_child_data(array)
+                .build()?
+        } else {
+            array
+        };
+
+        Ok(make_array(array))
     }
+}
+
+fn get_values_buffer(array: &dyn Array) -> Buffer {
+    match array.data_type() {
+        DataType::FixedSizeList(_inner, _len) => {
+            as_fixed_size_list_array(array).values().to_data().buffers()[0].clone()
+        }
+        DataType::FixedSizeBinary(_len) => as_fixed_size_binary_array(array).value_data(),
+        _ if array.data_type().is_primitive() => array.to_data().buffers()[0].clone(),
+        _ => unreachable!("Only works on FSB, FSL, primitive arrays"),
+    }
+}
+
+/// Given an unordered stream of array slices, put together a contiguous
+/// scalar buffer.
+async fn build_scalar_buffer<T: ArrowNativeTypeOp>(
+    mut chunk_stream: impl Stream<Item = Result<(TakeChunksPlan, ArrayRef)>> + std::marker::Unpin,
+    values_length: usize,
+) -> Result<Buffer> {
+    // It's important we create a Vec<T> and not Vec<u8> for alignment purposes.
+    let mut buffer: Vec<T> = Vec::with_capacity(values_length);
+    // Safety: We provided the exact length we will fill, so all
+    // unitialized bytes will be overwritten by the end of this
+    // function.
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        buffer.set_len(values_length);
+    }
+
+    while let Some(res) = chunk_stream.next().await {
+        let (chunk, array): (TakeChunksPlan, ArrayRef) = res?;
+
+        // Some debug validation
+        let values_per_index = match &array.data_type() {
+            DataType::FixedSizeList(inner, values_per_index) => {
+                debug_assert_eq!(inner.data_type().byte_width(), std::mem::size_of::<T>());
+                *values_per_index as usize
+            }
+            DataType::FixedSizeBinary(values_per_index) => {
+                debug_assert_eq!(1, std::mem::size_of::<T>());
+                *values_per_index as usize
+            }
+            _ if array.data_type().is_primitive() => {
+                debug_assert_eq!(array.data_type().byte_width(), std::mem::size_of::<T>());
+                1
+            }
+            _ => {
+                panic!("build_scalar_buffer being applied to non-fixed-width data type.");
+            }
+        };
+
+        let mut offset_in_buffer = chunk.offset * values_per_index;
+
+        let array_buffer = get_values_buffer(array.as_ref());
+        let array_data: &[T] = array_buffer.typed_data();
+
+        if chunk.is_contiguous {
+            debug_assert_eq!(array_data.len(), chunk.indices.len() * values_per_index);
+            let write_range = offset_in_buffer..(offset_in_buffer + array_data.len());
+            buffer[write_range].copy_from_slice(array_data);
+        } else {
+            // This is essentially a manual implementation of take, except chunks
+            // come in at any order.
+            let indices = chunk.indices.values();
+            for index_range in contiguous_ranges(indices) {
+                // For FSL and FSB, each index might have multiple values, so
+                // need to scale the range for that. In addition, we'll need
+                // to substract the offset to get into our array.
+                let range_in_chunk: Range<usize> = {
+                    let start = (index_range.start - indices[0] as usize) * values_per_index;
+                    let end = (index_range.end - indices[0] as usize) * values_per_index;
+                    start..end
+                };
+                let range_in_output: Range<usize> =
+                    offset_in_buffer..(offset_in_buffer + range_in_chunk.len());
+                offset_in_buffer += range_in_chunk.len();
+
+                buffer[range_in_output].copy_from_slice(&array_data[range_in_chunk]);
+            }
+        }
+    }
+
+    Ok(Buffer::from_vec(buffer))
+}
+
+/// Iterate of index ranges that are contiguous indices in the slice.
+///
+/// For example [1, 2, 4, 7, 8] -> 1..3, 4..5, 7..9
+fn contiguous_ranges(indices: &[u32]) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut start = 0;
+    let mut end = 0;
+    std::iter::from_fn(move || {
+        if start == indices.len() {
+            return None;
+        }
+        // While we haven't reached the last index and the next one is contiguous
+        // extend the end
+        while end < indices.len() - 1 && indices[end] + 1 == indices[end + 1] {
+            end += 1;
+        }
+        let range = indices[start] as usize..(indices[end] as usize + 1);
+        start = end + 1;
+        end = start;
+        Some(range)
+    })
 }
 
 #[async_trait]
@@ -922,23 +1131,164 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_make_chunked_request() {
-        let byte_width: usize = 4096; // 4K
-        let prefetch_size: usize = 64 * 1024; // 64KB.
-        let u32_overflow: usize = u32::MAX as usize + 10;
+    #[tokio::test]
+    async fn test_take_fixed_size_list() {
+        let mut store = ObjectStore::memory();
+        store.set_block_size(256);
+        let path = Path::from("/take_fsl");
 
-        let indices: Vec<u32> = vec![
-            1,
-            10,
-            20,
-            100,
-            120,
-            (u32_overflow / byte_width) as u32, // Two overflow offsets
-            (u32_overflow / byte_width) as u32 + 100,
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "b",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
+            .await
+            .unwrap();
+
+        let array = Float32Array::from_iter((0..5000).map(|i| i as f32));
+        let array = FixedSizeListArray::try_new_from_values(array, 4).unwrap();
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
+        file_writer.write(&[batch]).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual = reader.take(&[2, 4, 5, 8, 800], &schema).await.unwrap();
+
+        let expected_values = Float32Array::from(vec![
+            8.0, 9.0, 10.0, 11.0, // first vector
+            16.0, 17.0, 18.0, 19.0, // second vector
+            20.0, 21.0, 22.0, 23.0, // third vector
+            32.0, 33.0, 34.0, 35.0, // fourth vector
+            3200.0, 3201.0, 3202.0, 3203.0, // final vector
+        ]);
+        let expected = FixedSizeListArray::try_new_from_values(expected_values, 4).unwrap();
+        assert_eq!(actual.column_by_name("b").unwrap().as_ref(), &expected);
+    }
+
+    #[tokio::test]
+    async fn test_take_fixed_size_binary() {
+        todo!()
+    }
+
+    #[test]
+    fn test_plan_take_chunks_plain() {
+        let indices = vec![1, 2, 101, 102, 10_000, 10_001];
+        let indices = UInt32Array::from(indices);
+
+        let chunks = plan_take_chunks(&indices, 4, 400).unwrap();
+        assert_eq!(chunks.len(), 2);
+
+        assert_eq!(chunks[0].offset, 0);
+        assert!(!chunks[0].is_contiguous);
+        // 101 gets included because it's just within IO size (101 - 1 = 100 * 4 = 400).
+        // 102 gets included because it's contiguous with last value.
+        assert_eq!(chunks[0].indices.values(), &[1, 2, 101, 102]);
+
+        assert_eq!(chunks[1].offset, 4);
+        assert!(chunks[1].is_contiguous);
+        assert_eq!(chunks[1].indices.values(), &[10_000, 10_001]);
+
+        // 0 min_io_size means only contiguous ranges.
+        let chunks = plan_take_chunks(&indices, 4, 0).unwrap();
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|chunk| chunk.is_contiguous));
+
+        assert_eq!(chunks[0].offset, 0);
+        assert_eq!(chunks[0].indices.values(), &[1, 2]);
+
+        assert_eq!(chunks[1].offset, 2);
+        assert_eq!(chunks[1].indices.values(), &[101, 102]);
+
+        assert_eq!(chunks[2].offset, 4);
+        assert_eq!(chunks[2].indices.values(), &[10_000, 10_001]);
+    }
+
+    #[test]
+    fn test_contiguous_ranges() {
+        let indices = vec![1, 2, 4, 7, 8, 42, 44];
+        let ranges: Vec<Range<usize>> = contiguous_ranges(&indices).collect();
+        assert_eq!(ranges, vec![1..3, 4..5, 7..9, 42..43, 44..45]);
+
+        let indices = vec![34];
+        let ranges: Vec<Range<usize>> = contiguous_ranges(&indices).collect();
+        assert_eq!(ranges, vec![34..35]);
+    }
+
+    #[tokio::test]
+    async fn test_build_scalar_buffer() {
+        // Three chunks, out of order
+        let chunks = vec![
+            // A multi-index contiguous chunk
+            TakeChunksPlan {
+                indices: vec![4, 5, 6].into(),
+                offset: 1,
+                is_contiguous: true,
+            },
+            // A single index chunk
+            TakeChunksPlan {
+                indices: vec![2].into(),
+                offset: 0,
+                is_contiguous: true,
+            },
+            // A non-contiguous multi-index chunk
+            TakeChunksPlan {
+                indices: vec![25, 27].into(),
+                offset: 4,
+                is_contiguous: false,
+            },
         ];
-        let chunks = make_chunked_requests(&indices, byte_width, prefetch_size);
-        assert_eq!(chunks.len(), 6, "got chunks: {:?}", chunks);
-        assert_eq!(chunks, vec![(0..2), (2..3), (3..4), (4..5), (5..6), (6..7)])
+
+        let arrays = vec![
+            Arc::new(Int32Array::from(vec![42, 56, 40])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![2])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![105, 102, 122])) as ArrayRef,
+        ];
+
+        let stream =
+            futures::stream::iter(chunks.clone().into_iter().zip(arrays.into_iter())).map(Ok);
+
+        let length = 6;
+        let buffer = build_scalar_buffer::<u32>(stream, length).await.unwrap();
+
+        assert_eq!(buffer.typed_data::<u32>(), &[2, 42, 56, 40, 105, 122]);
+
+        // Now with FixedSizeList
+        let arrays = vec![
+            vec![
+                1.0, 2.0, 3.0, // vec 4
+                4.0, 5.0, 6.0, // vec 5
+                7.0, 8.0, 9.0, // vec 6
+            ],
+            vec![
+                20.0, 21.0, 22.0, // vec 2
+            ],
+            vec![
+                90.0, 91.0, 92.0, // vec 25
+                666.0, 666.0, 666.0, // vec 26
+                401.0, 403.0, 405.0, // vec 27
+            ],
+        ];
+        let arrays = arrays.into_iter().map(|arr| {
+            let values = Float32Array::from(arr);
+            Arc::new(FixedSizeListArray::try_new_from_values(values, 3).unwrap()) as ArrayRef
+        });
+
+        let stream = futures::stream::iter(chunks.into_iter().zip(arrays.into_iter())).map(Ok);
+
+        let length = 6 * 3;
+        let buffer = build_scalar_buffer::<f32>(stream, length).await.unwrap();
+
+        let expected = &[
+            20.0, 21.0, 22.0, // vec 2
+            1.0, 2.0, 3.0, // vec 4
+            4.0, 5.0, 6.0, // vec 5
+            7.0, 8.0, 9.0, // vec 6
+            90.0, 91.0, 92.0, // vec 25
+            401.0, 403.0, 405.0, // vec 27
+        ];
+        assert_eq!(buffer.typed_data::<f32>(), expected);
     }
 }

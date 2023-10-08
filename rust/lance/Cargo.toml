@@ -49,6 +49,7 @@ prost = "0.10"
 prost-types = "0.10"
 roaring = "0.10.1"
 tokio = { workspace = true }
+tokio-stream = "0.1"
 url = "2.3"
 rand = { version = "0.8.3", features = ["small_rng"] }
 futures = { workspace = true }

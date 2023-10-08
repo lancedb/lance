@@ -20,6 +20,7 @@ use std::ops::{Range, RangeTo};
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
+use arrow_array::types::UInt64Type;
 use arrow_array::{
     builder::PrimitiveBuilder,
     cast::AsArray,
@@ -455,6 +456,53 @@ impl FileReader {
         self.metadata.is_empty()
     }
 
+    #[instrument(level = "debug", skip_all)]
+    fn filter_params(&self, batch_id: i32, params: ReadBatchParams) -> Result<ReadBatchParams> {
+        let batch_offset =
+            self.metadata.get_offset(batch_id).ok_or_else(|| {
+                Error::invalid_input(format!("batch_id {} out of range", batch_id))
+            })? as u32;
+        let batch_len = self.num_rows_in_batch(batch_id) as u32;
+
+        if let Some(deletion_vector) = &self.deletion_vector {
+            if deletion_vector.contains_range(batch_offset..batch_len) {
+                // There are rows we can skip scanning
+                let mut indices = match params {
+                    ReadBatchParams::Range(range) => {
+                        let range =
+                            (range.start as u32 + batch_offset)..(range.end as u32 + batch_offset);
+                        deletion_vector.filter_iter(range)
+                    }
+                    ReadBatchParams::RangeFrom(range) => {
+                        // range need to have an upper bound added.
+                        let range = (batch_offset + range.start as u32)..(batch_offset + batch_len);
+                        deletion_vector.filter_iter(range)
+                    }
+                    ReadBatchParams::RangeTo(range) => {
+                        // range needs to have a lower bound added
+                        let range = batch_offset..(batch_offset + range.end as u32);
+                        deletion_vector.filter_iter(range)
+                    }
+                    ReadBatchParams::Indices(indices) => deletion_vector
+                        .filter_iter(indices.values().iter().map(|val| val + batch_offset)),
+                    ReadBatchParams::RangeFull => {
+                        let range = batch_offset..(batch_offset + batch_len);
+                        deletion_vector.filter_iter(range)
+                    }
+                };
+                // Need to subtract the offset again.
+                for index in indices.iter_mut() {
+                    *index -= batch_offset;
+                }
+                Ok(ReadBatchParams::Indices(indices.into()))
+            } else {
+                Ok(params)
+            }
+        } else {
+            Ok(params)
+        }
+    }
+
     /// Read a batch of data from the file.
     ///
     /// The schema of the returned [RecordBatch] is set by [`FileReader::schema()`].
@@ -465,15 +513,10 @@ impl FileReader {
         params: impl Into<ReadBatchParams>,
         projection: &Schema,
     ) -> Result<RecordBatch> {
-        read_batch(
-            self,
-            &params.into(),
-            projection,
-            batch_id,
-            self.with_row_id,
-            self.deletion_vector.clone(),
-        )
-        .await
+        let params = params.into();
+        let params = self.filter_params(batch_id, params)?;
+
+        read_batch(self, &params, projection, batch_id, self.with_row_id, None).await
     }
 
     /// Read a range of records into one batch.
@@ -646,12 +689,6 @@ async fn read_batch(
     // TODO: This is a minor cop out. Pushing deletion vector in to the decoders is hard
     // so I'm going to just leave deletion filter at this layer for now.
     // We should push this down futurther when we get to statistics-based predicate pushdown
-
-    // This function is meant to be IO bound, but we are doing CPU-bound work here
-    // We should try to move this to later.
-    let deletion_mask =
-        deletion_vector.and_then(|v| v.build_predicate(row_ids.as_ref().unwrap().iter()));
-
     if with_row_id {
         let row_id_arr = Arc::new(UInt64Array::from(row_ids.unwrap()));
         batch = batch.try_with_column(
@@ -660,9 +697,30 @@ async fn read_batch(
         )?;
     }
 
-    match deletion_mask {
-        None => Ok(batch),
-        Some(mask) => Ok(filter_record_batch(&batch, &mask)?),
+    if let Some(deletion_vector) = deletion_vector {
+        batch = apply_deletions(batch, deletion_vector)?;
+    }
+
+    Ok(batch)
+}
+
+#[instrument(level = "debug", skip_all)]
+pub fn apply_deletions(
+    batch: RecordBatch,
+    deletion_vector: Arc<DeletionVector>,
+) -> Result<RecordBatch> {
+    let col = batch
+        .column_by_name(ROW_ID)
+        .ok_or_else(|| Error::Internal {
+            message: "Attempting to apply deletions to record batch without a _rowid column."
+                .to_string(),
+        })?;
+    let row_ids = col.as_primitive::<UInt64Type>().values().as_ref();
+    let deletion_mask = deletion_vector.build_predicate(row_ids.iter());
+    if let Some(mask) = deletion_mask {
+        Ok(filter_record_batch(&batch, &mask)?)
+    } else {
+        Ok(batch)
     }
 }
 
