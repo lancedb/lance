@@ -518,6 +518,55 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     }
 }
 
+// fn get_fixed_size_list_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
+//     let DataType::FixedSizeList(f, len) = arrays[0].data_type() else { todo!() };
+//     let mut null_count: i64 = 0;
+//     let int_values = Int64Array::from_iter(0..(*len as i64));
+//     let min_value = int_values;
+//     let max_value = int_values;
+//
+//     // let min_value = ScalarValue::Fixedsizelist(None, f.clone(), *len);
+//     // let max_value = FixedSizeListArrayNone, f.clone(), *len);
+//     // let max_value = None;
+//
+//     let arrs = arrays
+//         .iter()
+//         .map(|x| x.as_fixed_size_list())
+//         .collect::<Vec<_>>();
+//
+//     for array in arrs.iter() {
+//         for val in array.iter() {
+//             let Some(value) = val.unwrap().as_any().downcast_ref::<Int64Array>() else {
+//                 continue;
+//             };
+//
+//             for (i, Some(v)) in value.iter().enumerate() {
+//                 if let Some(Ordering::Less) = min_value.value(i).partial_cmp(&v) {
+//                     min_value = value.clone();
+//                     break;
+//                 }
+//
+//                 if let Some(Ordering::Greater) = max_value.value(i).partial_cmp(&v) {
+//                     max_value = value.clone();
+//                     break;
+//                 }
+//             }
+//         }
+//     }
+//
+//     // let min_value = ScalarValue::try_from_array(&min_value, 0).unwrap();
+//     // let min_value = ScalarValue::try_from_array(&min_value, 0).unwrap();
+//
+//
+//     let min_value = min_value.iter().map(|x| ScalarValue::from(x)).collect::<Vec<_>>();
+//     let max_value = max_value.iter().map(|x| ScalarValue::from(x)).collect::<Vec<_>>();
+//     StatisticsRow {
+//         null_count: ScalarValue::Int64(Some(null_count)),
+//         min_value: ScalarValue::Fixedsizelist(Some(min_value), f.clone(), *len),
+//         max_value: ScalarValue::Fixedsizelist(Some(max_value), f.clone(), *len),
+//     }
+// }
+
 // fn get_list_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 //     let max_length: usize = 16;
 //     let mut min_value: Option<&[i64]> = None; // TODO T::Native
@@ -529,43 +578,79 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 //         .iter()
 //         .map(|x| x.as_list::<i32>())
 //         .collect::<Vec<_>>();
-//     let DataType::List(dt) = arr[0].data_type();
+//     let DataType::List(dt) = arr[0].data_type() else {
+//         todo!()
+//     };
 //     let value_type = dt.data_type();
 //
-//     for array in arr.iter() {
-//         array.iter().for_each(|value| {
-//             if let Some(value) = value {
-//                 let val = value.as_any().downcast_ref::<Int64Array>().unwrap();
-//                 if value.len() > max_length {
-//                     max_length = value.len();
-//                 }
+//     // for array in arr.iter() {
+//     //     array.iter().for_each(|value| {
+//     //         if let Some(value) = value {
+//     //             let val = value.as_any().downcast_ref::<Int64Array>().unwrap();
+//     //             if value.len() > max_length {
+//     //                 max_length = value.len();
+//     //             }
+//     //
+//     //             for i in 0..std::cmp::min(value.len(), max_length) {
+//     //                 if let Some(v) = min_value {
+//     //                     if let Some(Ordering::Less) = val.value(i).partial_cmp(&v[i]) {
+//     //                         min_value = Some(val.values());
+//     //                     }
+//     //                 } else {
+//     //                     min_value = Some(val.values());
+//     //                 }
+//     //
+//     //                 if let Some(v) = max_value {
+//     //                     if let Some(Ordering::Greater) = val.value(i).partial_cmp(&v[i]) {
+//     //                         max_value = Some(val.values());
+//     //                     }
+//     //                 } else {
+//     //                     max_value = Some(val.values());
+//     //                 }
+//     //             }
+//     //         };
+//     //     });
+//     //     null_count += array.null_count() as i64;
+//     // }
 //
-//                 for i in 0..std::cmp::min(value.len(), max_length) {
-//                     if let Some(v) = min_value {
-//                         if let Some(Ordering::Less) = val.value(i).partial_cmp(&v[i]) {
-//                             min_value = Some(val.values());
-//                         }
-//                     } else {
-//                         min_value = Some(val.values());
-//                     }
+//     // let min_value = row.min_value.to_array()
+//     //     .as_any()
+//     //     .downcast_ref::<BinaryArray>()
+//     //     .unwrap()
+//     //     .value(0);
+//     // min_value.iter().map(|x| .to_vec()).collect::<Vec<_>>();
+//     // Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+//     //     Some(vec![Some(1i32), Some(2), Some(3)]),
+//     //     Some(vec![]),
+//     // ])),
 //
-//                     if let Some(v) = max_value {
-//                         if let Some(Ordering::Greater) = val.value(i).partial_cmp(&v[i]) {
-//                             max_value = Some(val.values());
-//                         }
-//                     } else {
-//                         max_value = Some(val.values());
-//                     }
-//                 }
-//             };
-//         });
-//         null_count += array.null_count() as i64;
-//     }
+//     // let min_value = ListArray::try_from(min_value.unwrap()).unwrap();
+//     // let min_value = ScalarValue::List::
+//
+//     // let min_value = ScalarValue::List(Some(min_value.unwrap().to_vec()), value_type.clone());
+//     /// let offsets = Int32Array::from_iter([0, 2, 7, 10]);
+//     /// let int_values = Int64Array::from_iter(0..10);
+//     /// let list_arr = try_new_generic_list_array(int_values, &offsets).unwrap();
+//     /// assert_eq!(list_arr,
+//     ///     ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+//     ///         Some(vec![Some(0), Some(1)]),
+//     ///         Some(vec![Some(2), Some(3), Some(4), Some(5), Some(6)]),
+//     ///         Some(vec![Some(7), Some(8), Some(9)]),
+//     /// ]))
+//     let list_array =
+//         try_new_generic_list_array(Int64Array::from_iter(0..10), &Int32Array::from_iter([0]))
+//             .unwrap();
+//     // let list_array = ListArray::from_iter_primitive::<Int64Type, _, _>(Some(
+//     //     vec![min_value.unwrap().to_vec()]
+//     // ));
+//     let list_array = ScalarValue::try_from_array(&list_array, 0).unwrap();
 //
 //     StatisticsRow {
 //         null_count: ScalarValue::Int64(Some(null_count)),
-//         min_value: ScalarValue::List(min_value, value_type.clone()),
-//         max_value: ScalarValue::List(max_value, value_type.clone()),
+//         min_value: list_array.clone(),
+//         max_value: list_array.clone(),
+//         // min_value: ScalarValue::List(list_array, value_type.clone()),
+//         // max_value: ScalarValue::List(list_array, value_type.clone()),
 //     }
 // }
 
@@ -780,16 +865,15 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
         DataType::Decimal128(_, _) => get_decimal_statistics(arrays),
         DataType::Binary => get_binary_statistics(arrays),
+        // DataType::LargeBinary => get_binary_statistics(arrays),
         DataType::FixedSizeBinary(_) => get_fixed_size_binary_statistics(arrays),
         DataType::Utf8 => get_string_statistics(arrays),
         DataType::LargeUtf8 => get_large_string_statistics(arrays),
         DataType::Dictionary(_, _) => get_dictionary_statistics(arrays),
         DataType::Struct(fields) => get_struct_statistics(arrays, fields),
-        // DataType::List(field) => get_list_statistics(arrays),
+        // DataType::List(_) => get_list_statistics(arrays),
         // DataType::LargeList(field) => get_large_list_statistics(arrays, field),
-        // DataType::FixedSizeList(field, length) => get_fixed_size_list_statistics(arrays, field, length),
-
-        // TODO: LargeUtf8, List, LargeList, FixedSizeList, FixedSizeBinary
+        // DataType::FixedSizeList(_, _) => get_fixed_size_list_statistics(arrays),
         _ => {
             println!(
                 "Stats collection for {} is not supported yet",
@@ -1060,11 +1144,12 @@ impl StatisticsBuilder {
 mod tests {
     use arrow_array::{
         builder::StringDictionaryBuilder, BinaryArray, BooleanArray, Date32Array, Date64Array,
-        DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
-        DurationSecondArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
-        StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
-        Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray,
+        DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
+        DurationNanosecondArray, DurationSecondArray, Float32Array, Float64Array, Int16Array,
+        Int32Array, Int64Array, Int8Array, StringArray, StructArray, Time32MillisecondArray,
+        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
@@ -1079,15 +1164,42 @@ mod tests {
             expected_max: ScalarValue,
         }
 
-        let cases: [TestCase; 19] = [
-            // Int64
+        let cases: [TestCase; 24] = [
+            // Int8
             TestCase {
                 source_arrays: vec![
-                    Arc::new(Int64Array::from(vec![4, 3, 7, 2])),
-                    Arc::new(Int64Array::from(vec![-10, 3, 5])),
+                    Arc::new(Int8Array::from(vec![4, 3, 7, 2])),
+                    Arc::new(Int8Array::from(vec![-10, 3, 5])),
                 ],
-                expected_min: ScalarValue::from(-10_i64),
-                expected_max: ScalarValue::from(7_i64),
+                expected_min: ScalarValue::from(-10_i8),
+                expected_max: ScalarValue::from(7_i8),
+            },
+            // UInt8
+            TestCase {
+                source_arrays: vec![
+                    Arc::new(UInt8Array::from(vec![4, 3, 7, 2])),
+                    Arc::new(UInt8Array::from(vec![10, 3, 5])),
+                ],
+                expected_min: ScalarValue::from(2_u8),
+                expected_max: ScalarValue::from(10_u8),
+            },
+            // Int16
+            TestCase {
+                source_arrays: vec![
+                    Arc::new(Int16Array::from(vec![4, 3, 7, 2])),
+                    Arc::new(Int16Array::from(vec![-10, 3, 5])),
+                ],
+                expected_min: ScalarValue::from(-10_i16),
+                expected_max: ScalarValue::from(7_i16),
+            },
+            // UInt16
+            TestCase {
+                source_arrays: vec![
+                    Arc::new(UInt16Array::from(vec![4, 3, 7, 2])),
+                    Arc::new(UInt16Array::from(vec![10, 3, 5])),
+                ],
+                expected_min: ScalarValue::from(2_u16),
+                expected_max: ScalarValue::from(10_u16),
             },
             // Int32
             TestCase {
@@ -1097,6 +1209,33 @@ mod tests {
                 ],
                 expected_min: ScalarValue::from(-10_i32),
                 expected_max: ScalarValue::from(7_i32),
+            },
+            // UInt32
+            TestCase {
+                source_arrays: vec![
+                    Arc::new(UInt32Array::from(vec![4, 3, 7, 2])),
+                    Arc::new(UInt32Array::from(vec![10, 3, 5])),
+                ],
+                expected_min: ScalarValue::from(2_u32),
+                expected_max: ScalarValue::from(10_u32),
+            },
+            // Int64
+            TestCase {
+                source_arrays: vec![
+                    Arc::new(Int64Array::from(vec![4, 3, 7, 2])),
+                    Arc::new(Int64Array::from(vec![-10, 3, 5])),
+                ],
+                expected_min: ScalarValue::from(-10_i64),
+                expected_max: ScalarValue::from(7_i64),
+            },
+            // UInt64
+            TestCase {
+                source_arrays: vec![
+                    Arc::new(UInt64Array::from(vec![4, 3, 7, 2])),
+                    Arc::new(UInt64Array::from(vec![10, 3, 5])),
+                ],
+                expected_min: ScalarValue::from(2_u64),
+                expected_max: ScalarValue::from(10_u64),
             },
             // Boolean
             TestCase {
@@ -1153,14 +1292,6 @@ mod tests {
                 ],
                 expected_min: ScalarValue::Time64Nanosecond(Some(32)),
                 expected_max: ScalarValue::Time64Nanosecond(Some(68)),
-            },
-            TestCase {
-                source_arrays: vec![
-                    Arc::new(Date64Array::from(vec![53, 42])),
-                    Arc::new(Date64Array::from(vec![68, 32])),
-                ],
-                expected_min: ScalarValue::Date64(Some(32)),
-                expected_max: ScalarValue::Date64(Some(68)),
             },
             // Timestamp
             TestCase {
@@ -1329,7 +1460,119 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_list_stats() {
+        // TODO(rok): list, fixed_size_list, large_list
+    }
+
+    #[test]
+    fn test_collect_struct_stats() {
+        let tz = Some("UTC".into());
+
+        let dictionary_1 = Arc::new(StringArray::from(vec!["d", "1"]));
+        let dictionary_2 = Arc::new(StringArray::from(vec!["z", "a"]));
+        let indices_1 = UInt32Array::from(vec![1, 0, 1, 1]);
+        let indices_2 = UInt32Array::from(vec![0, 0, 0, 0]);
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8));
+        let dictionary_array_1 = DictionaryArray::try_new(indices_1, dictionary_1).unwrap();
+        let dictionary_array_2 = DictionaryArray::try_new(indices_2, dictionary_2).unwrap();
+
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(ArrowField::new("a", dictionary_type.clone(), false)),
+                    Arc::new(dictionary_array_1) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new(
+                        "b",
+                        DataType::Timestamp(TimeUnit::Millisecond, tz.clone()),
+                        false,
+                    )),
+                    Arc::new(TimestampMillisecondArray::with_timezone_opt(
+                        vec![1, 0, 2, -202].into(),
+                        tz.clone(),
+                    )) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("c", DataType::Float32, false)),
+                    Arc::new(Float32Array::from(vec![4.0f32, 3.0, std::f32::NAN, 2.0])) as ArrayRef,
+                ),
+            ])),
+            Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(ArrowField::new("a", dictionary_type.clone(), true)),
+                    Arc::new(dictionary_array_2) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new(
+                        "b",
+                        DataType::Timestamp(TimeUnit::Millisecond, tz.clone()),
+                        false,
+                    )),
+                    Arc::new(TimestampMillisecondArray::with_timezone_opt(
+                        vec![1, 9999, 2, 42].into(),
+                        tz.clone(),
+                    )) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("c", DataType::Float32, true)),
+                    Arc::new(Float32Array::from(vec![-10.0f32, 3.0, 5.0, std::f32::NAN]))
+                        as ArrayRef,
+                ),
+            ])),
+        ];
+
+        let fields = ArrowFields::from(vec![
+            ArrowField::new("a", dictionary_type, false),
+            ArrowField::new(
+                "b",
+                DataType::Timestamp(TimeUnit::Millisecond, tz.clone()),
+                false,
+            ),
+            ArrowField::new("c", DataType::Float32, false),
+        ]);
+
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        let actual_stats = collect_statistics(&array_refs);
+        let expected_stats = StatisticsRow {
+            null_count: ScalarValue::Struct(
+                Some(vec![
+                    ScalarValue::from(0_i64),
+                    ScalarValue::from(0_i64),
+                    ScalarValue::from(0_i64),
+                ]),
+                fields.clone(),
+            ),
+            min_value: ScalarValue::Struct(
+                Some(vec![
+                    ScalarValue::from("1"),
+                    ScalarValue::TimestampMillisecond(Some(-202), tz.clone()),
+                    ScalarValue::from(-10_f32),
+                ]),
+                fields.clone(),
+            ),
+            max_value: ScalarValue::Struct(
+                Some(vec![
+                    ScalarValue::from("z"),
+                    ScalarValue::TimestampMillisecond(Some(9999), tz.clone()),
+                    ScalarValue::from(5_f32),
+                ]),
+                fields.clone(),
+            ),
+        };
+
+        assert_eq!(
+            actual_stats.min_value.get_datatype(),
+            expected_stats.min_value.get_datatype()
+        );
+        assert_eq!(actual_stats, expected_stats);
+    }
+
+    #[test]
     fn test_collect_binary_stats() {
+        // TODO(rok): large string, large binary, fixed size binary (get_fixed_size_binary_statistics)
+
         // Test string, binary with truncation and null values.
 
         // Whole strings are used if short enough
@@ -1398,6 +1641,7 @@ mod tests {
     fn test_collect_dictionary_stats() {
         // Dictionary stats are collected from the underlying values
         let dictionary_values = StringArray::from(vec![None, Some("abc"), Some("def")]);
+
         let mut builder =
             StringDictionaryBuilder::<Int32Type>::new_with_dictionary(3, &dictionary_values)
                 .unwrap();
@@ -1415,6 +1659,24 @@ mod tests {
                 null_count: ScalarValue::from(1_i64),
                 min_value: ScalarValue::from("abc"),
                 max_value: ScalarValue::from("def"),
+            }
+        );
+
+        let dictionary = Arc::new(StringArray::from(vec!["A", "C", "G", "T"]));
+        let indices_1 = UInt32Array::from(vec![1, 0, 2, 1]);
+        let indices_2 = UInt32Array::from(vec![0, 1, 3, 0]);
+        let dictionary_array_1 =
+            Arc::new(DictionaryArray::try_new(indices_1, dictionary.clone()).unwrap()) as ArrayRef;
+        let dictionary_array_2 =
+            Arc::new(DictionaryArray::try_new(indices_2, dictionary.clone()).unwrap()) as ArrayRef;
+        let array_refs = vec![&dictionary_array_1, &dictionary_array_2];
+        let stats = collect_statistics(&array_refs);
+        assert_eq!(
+            stats,
+            StatisticsRow {
+                null_count: ScalarValue::from(0_i64),
+                min_value: ScalarValue::from("A"),
+                max_value: ScalarValue::from("T"),
             }
         );
     }
