@@ -12,7 +12,6 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 import json
-import os
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Union
 
@@ -212,9 +211,7 @@ class ImageURIArray(ImageArray):
                         "The server could not fulfill the request. Error code: ", e.code
                     )
 
-        allowed_schemes = ["s3", "gs", "file", ""]
-        if os.name == "nt":
-            allowed_schemes.append("d")
+        allowed_schemes = ["s3", "gs", "file"]
 
         images = []
         for uri in self.storage:

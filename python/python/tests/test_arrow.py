@@ -152,8 +152,7 @@ def test_image_arrays(tmp_path: Path):
     n = 10
     png_uris = [
         "file://" + os.path.join(os.path.dirname(__file__), "images/1.png"),
-        os.path.join(os.path.dirname(__file__), "images/1.png"),
-    ] * int(n / 2)
+    ] * n
 
     if os.name == "nt":
         png_uris = [str(Path(x)) for x in png_uris]
@@ -207,9 +206,12 @@ def test_image_arrays(tmp_path: Path):
 
     assert tensor_image_array.to_encoded(png_encoder).to_tensor() == tensor_image_array
     uris = [
-        os.path.join(os.path.dirname(__file__), "images/1.png"),
-        os.path.join(os.path.dirname(__file__), "images/2.jpeg"),
+        "file://" + os.path.join(os.path.dirname(__file__), "images/1.png"),
+        "file://" + os.path.join(os.path.dirname(__file__), "images/2.jpeg"),
     ]
+    if os.name == "nt":
+        uris = [str(Path(x)) for x in uris]
+
     encoded_image_array = ImageArray.from_array(uris).read_uris()
     with pytest.raises(
         tf.errors.InvalidArgumentError, match="Shapes of all inputs must match"
