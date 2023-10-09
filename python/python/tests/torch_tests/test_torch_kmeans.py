@@ -13,11 +13,14 @@
 #  limitations under the License.
 
 import numpy as np
-import torch
-from lance.torch.kmeans import KMeans
+import pytest
+
+torch = pytest.importorskip("pytorch")
 
 
 def test_kmeans():
+    from lance.torch.kmeans import KMeans
+
     arr = np.array(range(128)).reshape(-1, 8).astype(np.float32)
     kmeans = KMeans(4, device="cpu")
     kmeans.fit(arr)

@@ -32,3 +32,30 @@ def s3_bucket() -> str:
 @pytest.fixture
 def ddb_table() -> str:
     return os.environ.get("TEST_DDB_TABLE", "lance-integtest")
+
+
+# These are initialization hooks and must have an exact name for pytest to pick them up
+# https://docs.pytest.org/en/7.1.x/reference/reference.html
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-integration",
+        action="store_true",
+        default=False,
+        help="Run integration tests (requires S3 buckets to be setup with access)",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    if not config.getoption("--run-integration"):
+        skipper = pytest.mark.skip(reason="--run-integration not specified")
+        for item in items:
+            if "integration" in item.keywords:
+                item.add_marker(skipper)
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "integration: mark test to run only on named environment"
+    )

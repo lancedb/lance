@@ -12,22 +12,15 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import numpy as np
 import pytest
 
-try:
-    import torch
-except ImportError:
-    pytest.skip(
-        "Pytorch is not installed. Please install pytorch to "
-        + "test lance.torch module.",
-        allow_module_level=True,
-    )
-
-import numpy as np
-from lance.torch.distance import cosine_distance, l2_distance
+torch = pytest.importorskip("torch")
 
 
 def test_cosine_distance():
+    from lance.torch.distance import cosine_distance
+
     x = np.random.randn(20, 256).astype(np.float32)
     y = np.random.rand(100, 256).astype(np.float32)
 
@@ -46,6 +39,8 @@ def test_cosine_distance():
 
 
 def test_l2_distance():
+    from lance.torch.distance import l2_distance
+
     x = np.random.randn(20, 256).astype(np.float32)
     y = np.random.rand(100, 256).astype(np.float32)
 

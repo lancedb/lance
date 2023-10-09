@@ -36,6 +36,8 @@ def test_kmeans(benchmark):
 def test_kmeans_torch(benchmark):
     data = np.random.random((NUM_VECTORS, 1536)).astype("f")
 
+    pytest.importorskip("torch")
+
     from lance.torch import preferred_device
     from lance.torch.kmeans import KMeans
 
