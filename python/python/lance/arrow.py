@@ -211,20 +211,15 @@ class ImageURIArray(ImageArray):
                         "The server could not fulfill the request. Error code: ", e.code
                     )
 
-        allowed_schemes = ["s3", "gs", "file"]
-
         images = []
         for uri in self.storage:
             parsed_uri = urlparse(uri.as_py())
-
-            if parsed_uri.scheme in allowed_schemes:
+            if parsed_uri.scheme in ("http", "https"):
+                images.append(download(uri))
+            else:
                 filesystem, path = fs.FileSystem.from_uri(uri.as_py())
                 with filesystem.open_input_stream(path) as f:
                     images.append(f.read())
-            elif parsed_uri.scheme == "https":
-                images.append(download(uri))
-            else:
-                raise ValueError("Invalid URI", parsed_uri.scheme, uri.as_py())
 
         return EncodedImageArray.from_storage(
             EncodedImageType(), pa.array(images, type=pa.binary())
