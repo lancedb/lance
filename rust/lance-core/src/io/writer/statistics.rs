@@ -34,7 +34,7 @@ use arrow_array::{
         UInt32Type, UInt64Type, UInt8Type,
     },
     Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, Decimal128Array,
-    LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    LargeBinaryArray, LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::{
     ArrowError, DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
@@ -356,6 +356,69 @@ fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     }
 }
 
+fn get_large_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
+    // TODO: refactor out comparison logic to share it with get_binary_statistics
+    let mut min_value: Option<&[u8]> = None;
+    let mut max_value: Option<&[u8]> = None;
+    let mut null_count: i64 = 0;
+
+    let arr = arrays
+        .iter()
+        .map(|x| x.as_any().downcast_ref::<LargeBinaryArray>().unwrap())
+        .collect::<Vec<_>>();
+
+    for array in arr.iter() {
+        array.iter().for_each(|value| {
+            if let Some(val) = value {
+                // don't compare full buffers if possible
+                let val = &val[..std::cmp::min(BINARY_PREFIX_LENGTH + 4, val.len())];
+
+                if let Some(v) = min_value {
+                    if let Some(Ordering::Less) = val.partial_cmp(v) {
+                        min_value = Some(val);
+                    }
+                } else {
+                    min_value = Some(val);
+                }
+
+                if let Some(v) = max_value {
+                    if let Some(Ordering::Greater) = val.partial_cmp(v) {
+                        max_value = Some(val);
+                    }
+                } else {
+                    max_value = Some(val);
+                }
+            }
+        });
+        null_count += array.null_count() as i64;
+    }
+
+    if let Some(v) = min_value {
+        if v.len() > BINARY_PREFIX_LENGTH {
+            min_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
+        }
+    }
+
+    let max_value_bound: Vec<u8>;
+    if let Some(v) = max_value {
+        if v.len() > BINARY_PREFIX_LENGTH {
+            max_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
+            if let Some(x) = increment(max_value.unwrap().to_vec()) {
+                max_value_bound = x;
+                max_value = Some(&max_value_bound);
+            } else {
+                max_value = None;
+            }
+        }
+    }
+
+    StatisticsRow {
+        null_count: ScalarValue::Int64(Some(null_count)),
+        min_value: ScalarValue::LargeBinary(min_value.map(|x| x.to_vec())),
+        max_value: ScalarValue::LargeBinary(max_value.map(|x| x.to_vec())),
+    }
+}
+
 fn get_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     let mut min_value: Option<&[u8]> = None;
     let mut max_value: Option<&[u8]> = None;
@@ -419,7 +482,6 @@ fn get_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 }
 
 fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
-    // TODO: not really tested yet
     let mut min_value: Option<&[u8]> = None;
     let mut max_value: Option<&[u8]> = None;
     let mut null_count: i64 = 0;
@@ -522,41 +584,33 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 //     let DataType::FixedSizeList(f, len) = arrays[0].data_type() else { todo!() };
 //     let mut null_count: i64 = 0;
 //     let int_values = Int64Array::from_iter(0..(*len as i64));
-//     let min_value = int_values;
-//     let max_value = int_values;
+//     let mut min_value = int_values.clone();
+//     let mut max_value = int_values.clone();
 //
-//     // let min_value = ScalarValue::Fixedsizelist(None, f.clone(), *len);
-//     // let max_value = FixedSizeListArrayNone, f.clone(), *len);
-//     // let max_value = None;
-//
-//     let arrs = arrays
-//         .iter()
-//         .map(|x| x.as_fixed_size_list())
-//         .collect::<Vec<_>>();
-//
-//     for array in arrs.iter() {
-//         for val in array.iter() {
-//             let Some(value) = val.unwrap().as_any().downcast_ref::<Int64Array>() else {
+//     arrays.iter().map(|x| x.as_fixed_size_list()).for_each(|array| {
+//         for row in array.iter() {
+//             if row.is_none() {
+//                 null_count += 1;
 //                 continue;
-//             };
+//             }
+//             let Some(row) = row else { continue; };
+//             let Some(values) = row.as_any().downcast_ref::<Int64Array>() else { todo!() };
 //
-//             for (i, Some(v)) in value.iter().enumerate() {
+//             for (i, v) in values.iter().enumerate().map(|(i, v)| (i, v.unwrap() as i64)) {
 //                 if let Some(Ordering::Less) = min_value.value(i).partial_cmp(&v) {
-//                     min_value = value.clone();
+//                     min_value = values.clone();
 //                     break;
 //                 }
+//             }
 //
+//             for (i, v) in values.iter().enumerate().map(|(i, v)| (i, v.unwrap() as i64)) {
 //                 if let Some(Ordering::Greater) = max_value.value(i).partial_cmp(&v) {
-//                     max_value = value.clone();
+//                     max_value = values.clone();
 //                     break;
 //                 }
 //             }
 //         }
-//     }
-//
-//     // let min_value = ScalarValue::try_from_array(&min_value, 0).unwrap();
-//     // let min_value = ScalarValue::try_from_array(&min_value, 0).unwrap();
-//
+//     });
 //
 //     let min_value = min_value.iter().map(|x| ScalarValue::from(x)).collect::<Vec<_>>();
 //     let max_value = max_value.iter().map(|x| ScalarValue::from(x)).collect::<Vec<_>>();
@@ -865,7 +919,7 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
         DataType::Decimal128(_, _) => get_decimal_statistics(arrays),
         DataType::Binary => get_binary_statistics(arrays),
-        // DataType::LargeBinary => get_binary_statistics(arrays),
+        DataType::LargeBinary => get_large_binary_statistics(arrays),
         DataType::FixedSizeBinary(_) => get_fixed_size_binary_statistics(arrays),
         DataType::Utf8 => get_string_statistics(arrays),
         DataType::LargeUtf8 => get_large_string_statistics(arrays),
@@ -1145,14 +1199,16 @@ mod tests {
     use arrow_array::{
         builder::StringDictionaryBuilder, BinaryArray, BooleanArray, Date32Array, Date64Array,
         DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
-        DurationNanosecondArray, DurationSecondArray, Float32Array, Float64Array, Int16Array,
-        Int32Array, Int64Array, Int8Array, StringArray, StructArray, Time32MillisecondArray,
-        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray,
+        Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+        LargeBinaryArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
+        UInt32Array, UInt64Array, UInt8Array,
     };
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use datafusion::common::ScalarValue::{Fixedsizelist, LargeBinary};
 
     use super::*;
 
@@ -1461,7 +1517,49 @@ mod tests {
 
     #[test]
     fn test_collect_list_stats() {
-        // TODO(rok): list, fixed_size_list, large_list
+        // TODO(rok): fixed_size_list, list, large_list
+        let len = 3;
+        let data1 = vec![
+            Some(vec![Some(0), Some(1), Some(2)]),
+            Some(vec![Some(3), Some(4), Some(5)]),
+            Some(vec![Some(6), Some(7), Some(8)]),
+        ];
+        let data2 = vec![
+            Some(vec![Some(0), Some(1), Some(2)]),
+            None,
+            Some(vec![Some(3), None, Some(5)]),
+            Some(vec![Some(6), Some(7), Some(8)]),
+        ];
+
+        let arrays = vec![
+            Arc::new(FixedSizeListArray::from_iter_primitive::<Int64Type, _, _>(
+                data1, len as i32,
+            )) as ArrayRef,
+            Arc::new(FixedSizeListArray::from_iter_primitive::<Int64Type, _, _>(
+                data2, len as i32,
+            )) as ArrayRef,
+        ];
+        let binding = arrays.iter().collect::<Vec<_>>();
+        let array_refs = binding.as_slice();
+        let stats = collect_statistics(&array_refs);
+
+        let expected_min_value = vec![0, 1, 2]
+            .iter()
+            .map(|x: &i64| ScalarValue::Int64(Some(*x)))
+            .collect::<Vec<_>>();
+        let expected_max_value = vec![0, 1, 2]
+            .iter()
+            .map(|x: &i64| ScalarValue::Int64(Some(*x)))
+            .collect::<Vec<_>>();
+        let field = Arc::new(ArrowField::new("a", DataType::Int32, false));
+        assert_eq!(
+            stats,
+            StatisticsRow {
+                null_count: ScalarValue::from(0_i64),
+                min_value: ScalarValue::Fixedsizelist(Some(expected_min_value), field.clone(), 3),
+                max_value: ScalarValue::Fixedsizelist(Some(expected_max_value), field.clone(), 3),
+            }
+        );
     }
 
     #[test]
@@ -1571,8 +1669,6 @@ mod tests {
 
     #[test]
     fn test_collect_binary_stats() {
-        // TODO(rok): large string, large binary, fixed size binary (get_fixed_size_binary_statistics)
-
         // Test string, binary with truncation and null values.
 
         // Whole strings are used if short enough
@@ -1595,8 +1691,6 @@ mod tests {
         // Prefixes are used if strings are too long. Multi-byte characters are
         // not split.
         let arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![
-            // filler + "bacteriologists🧑‍🔬",
-            // filler + "terrestial planet",
             format!("{}{}", filler, "bacteriologists🧑‍🔬"),
             format!("{}{}", filler, "terrestial planet"),
         ]))];
@@ -1611,6 +1705,46 @@ mod tests {
                 min_value: ScalarValue::from(format!("{}{}", filler, "bacteriologists").as_str()),
                 // Increment the last character to make sure it's greater than max value
                 max_value: ScalarValue::from(format!("{}{}", filler, "terrestial planf").as_str()),
+            }
+        );
+
+        // Whole strings are used if short enough
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(LargeStringArray::from(vec![Some("foo"), None, Some("bar")])),
+            Arc::new(LargeStringArray::from(vec!["yee", "haw"])),
+        ];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        let stats = collect_statistics(&array_refs);
+        assert_eq!(
+            stats,
+            StatisticsRow {
+                null_count: ScalarValue::from(1_i64),
+                min_value: ScalarValue::LargeUtf8(Some("bar".to_string())),
+                max_value: ScalarValue::LargeUtf8(Some("yee".to_string())),
+            }
+        );
+
+        let filler = "48 chars of filler                              ";
+        // Prefixes are used if strings are too long. Multi-byte characters are
+        // not split.
+        let arrays: Vec<ArrayRef> = vec![Arc::new(LargeStringArray::from(vec![
+            format!("{}{}", filler, "bacteriologists🧑‍🔬"),
+            format!("{}{}", filler, "terrestial planet"),
+        ]))];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        let stats = collect_statistics(&array_refs);
+        assert_eq!(
+            stats,
+            StatisticsRow {
+                null_count: ScalarValue::from(0_i64),
+                // Bacteriologists is just 15 bytes, but the next character is multi-byte
+                // so we truncate before.
+                min_value: ScalarValue::LargeUtf8(Some(format!("{}{}", filler, "bacteriologists"))),
+                // Increment the last character to make sure it's greater than max value
+                max_value: ScalarValue::LargeUtf8(Some(format!(
+                    "{}{}",
+                    filler, "terrestial planf"
+                ))),
             }
         );
 
@@ -1633,6 +1767,46 @@ mod tests {
                 min_value: ScalarValue::Binary(Some(min_value)),
                 // We can't truncate the max value, so we return None
                 max_value: ScalarValue::Binary(None),
+            }
+        );
+
+        let arrays: Vec<ArrayRef> = vec![Arc::new(LargeBinaryArray::from(vec![vec![
+            0xFFu8;
+            BINARY_PREFIX_LENGTH
+                + 5
+        ]
+        .as_ref()]))];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        let stats = collect_statistics(&array_refs);
+        let min_value: Vec<u8> = vec![0xFFu8; BINARY_PREFIX_LENGTH];
+        assert_eq!(
+            stats,
+            StatisticsRow {
+                null_count: ScalarValue::from(0_i64),
+                // We can truncate the minimum value, since the prefix is less than the full value
+                min_value: ScalarValue::LargeBinary(Some(min_value)),
+                // We can't truncate the max value, so we return None
+                max_value: ScalarValue::LargeBinary(None),
+            }
+        );
+
+        let arrays: Vec<ArrayRef> = vec![Arc::new(FixedSizeBinaryArray::from(vec![
+            Some(vec![0, 1].as_slice()),
+            Some(vec![2, 3].as_slice()),
+            Some(vec![4, 5].as_slice()),
+            Some(vec![6, 7].as_slice()),
+            Some(vec![8, 9].as_slice()),
+        ]))];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        let stats = collect_statistics(&array_refs);
+        let min_value: Vec<u8> = vec![0, 1];
+        let max_value: Vec<u8> = vec![8, 9];
+        assert_eq!(
+            stats,
+            StatisticsRow {
+                null_count: ScalarValue::from(0_i64),
+                min_value: ScalarValue::FixedSizeBinary(2, Some(min_value)),
+                max_value: ScalarValue::FixedSizeBinary(2, Some(max_value)),
             }
         );
     }
