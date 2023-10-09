@@ -30,7 +30,7 @@ use crate::io::ObjectStore;
 use crate::{Error, Result};
 
 use super::{
-    latest_manifest_path, make_staging_manifest_path, manifest_path, write_latest_manifest,
+    current_manifest_path, make_staging_manifest_path, manifest_path, write_latest_manifest,
     MANIFEST_EXTENSION,
 };
 
@@ -119,8 +119,8 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 Ok(object_store_manifest_path)
             }
             // Dataset not found in the external store, this could be because the dataset did not
-            // use external store for commit before. In this case, we use the _latest.manifest file
-            None => Ok(latest_manifest_path(base_path)),
+            // use external store for commit before. In this case, we search for the latest manifest
+            None => current_manifest_path(object_store, base_path).await,
         }
     }
 
@@ -251,7 +251,7 @@ mod test {
 
     use crate::{
         dataset::{ReadParams, WriteMode, WriteParams},
-        io::object_store::ObjectStoreParams,
+        io::{commit::latest_manifest_path, object_store::ObjectStoreParams},
         Dataset,
     };
 

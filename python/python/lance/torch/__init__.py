@@ -17,10 +17,10 @@ from typing import Optional
 try:
     import torch
 except ImportError:
-    raise ImportError("PyTorch is not installed")
+    raise ImportError("PyTorch>=2.0 is not installed")
 
 
-def preferred_device(device: Optional[str] = None) -> torch.device:
+def preferred_device(device: Optional[str] = None):
     """Get the preferred device for computation.
 
     Parameters
@@ -35,6 +35,8 @@ def preferred_device(device: Optional[str] = None) -> torch.device:
         Device to use for computation.
     """
     if device is not None:
+        if isinstance(device, str):
+            device = torch.device(device)
         return device
     if torch.cuda.is_available():
         return torch.device("cuda")
