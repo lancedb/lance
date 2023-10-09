@@ -50,11 +50,13 @@ impl Take {
     ///  - projection: extra columns to take from the dataset.
     ///  - output_schema: the output schema of the take node.
     ///  - child: the upstream stream to feed data in.
+    ///  - batch_readahead: max number of batches to readahead, potentially concurrently
     fn new(
         dataset: Arc<Dataset>,
         projection: Arc<Schema>,
         output_schema: SchemaRef,
         child: SendableRecordBatchStream,
+        batch_readahead: usize,
     ) -> Self {
         let (tx, rx) = mpsc::channel(4);
 
@@ -66,7 +68,7 @@ impl Take {
                 .map(|(batch, (dataset, extra))| async move {
                     Self::take_batch(batch?, dataset, extra).await
                 })
-                .buffered(num_cpus::get())
+                .buffered(batch_readahead)
                 .map(|r| r.map_err(|e| DataFusionError::Execution(e.to_string())))
                 .try_for_each(|b| async {
                     if tx.is_closed() {
@@ -176,6 +178,8 @@ pub struct TakeExec {
 
     /// Output schema is the merged schema between input schema and extra schema.
     output_schema: Schema,
+
+    batch_readahead: usize,
 }
 
 impl DisplayAs for TakeExec {
@@ -205,6 +209,7 @@ impl TakeExec {
         dataset: Arc<Dataset>,
         input: Arc<dyn ExecutionPlan>,
         extra_schema: Arc<Schema>,
+        batch_readahead: usize,
     ) -> Result<Self> {
         if input.schema().column_with_name(ROW_ID).is_none() {
             return Err(DataFusionError::Plan(
@@ -222,6 +227,7 @@ impl TakeExec {
             extra_schema: Arc::new(remaining_schema),
             input,
             output_schema,
+            batch_readahead,
         })
     }
 }
@@ -256,6 +262,7 @@ impl ExecutionPlan for TakeExec {
             extra_schema: self.extra_schema.clone(),
             input: _children[0].clone(),
             output_schema: self.output_schema.clone(),
+            batch_readahead: self.batch_readahead,
         }))
     }
 
@@ -270,6 +277,7 @@ impl ExecutionPlan for TakeExec {
             self.extra_schema.clone(),
             self.schema(),
             input_stream,
+            self.batch_readahead,
         )))
     }
 
@@ -348,7 +356,7 @@ mod tests {
             true,
             true,
         ));
-        let take_exec = TakeExec::try_new(dataset, input, extra_schema).unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, extra_schema, 10).unwrap();
         let schema = take_exec.schema();
         assert_eq!(
             schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
@@ -380,7 +388,7 @@ mod tests {
             true,
             true,
         ));
-        let take_exec = TakeExec::try_new(dataset, input, extra_schema).unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, extra_schema, 10).unwrap();
         let schema = take_exec.schema();
         assert_eq!(
             schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
@@ -412,6 +420,6 @@ mod tests {
             false,
             true,
         ));
-        assert!(TakeExec::try_new(dataset, input, extra_schema).is_err());
+        assert!(TakeExec::try_new(dataset, input, extra_schema, 10).is_err());
     }
 }
