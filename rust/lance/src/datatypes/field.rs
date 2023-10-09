@@ -455,8 +455,22 @@ impl Field {
         self.children.iter_mut().for_each(Self::reset_id);
     }
 
+    pub(crate) fn field_by_id(&self, id: impl Into<i32>) -> Option<&Self> {
+        let id = id.into();
+        for child in self.children.as_slice() {
+            if child.id == id {
+                return Some(child);
+            }
+            if let Some(grandchild) = child.field_by_id(id) {
+                return Some(grandchild);
+            }
+        }
+        None
+    }
+
     // Find any nested child with a specific field id
-    pub(super) fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Self> {
+    pub(super) fn mut_field_by_id(&mut self, id: impl Into<i32>) -> Option<&mut Self> {
+        let id = id.into();
         for child in self.children.as_mut_slice() {
             if child.id == id {
                 return Some(child);

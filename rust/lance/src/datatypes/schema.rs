@@ -226,7 +226,22 @@ impl Schema {
         self.fields_pre_order().map(|f| f.id).collect()
     }
 
-    pub(crate) fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
+    /// Get field by its id.
+    pub(crate) fn field_by_id(&self, id: impl Into<i32>) -> Option<&Field> {
+        let id = id.into();
+        for field in self.fields.iter() {
+            if field.id == id {
+                return Some(field);
+            }
+            if let Some(grandchild) = field.field_by_id(id) {
+                return Some(grandchild);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn mut_field_by_id(&mut self, id: impl Into<i32>) -> Option<&mut Field> {
+        let id = id.into();
         for field in self.fields.as_mut_slice() {
             if field.id == id {
                 return Some(field);
@@ -857,5 +872,29 @@ mod tests {
 
         let result = schema1.merge(&schema2).unwrap();
         assert_eq!(result, expected_schema);
+    }
+
+    #[test]
+    fn test_field_by_id() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let field = schema.field_by_id(1).unwrap();
+        assert_eq!(field.name, "b");
+
+        let field = schema.field_by_id(3).unwrap();
+        assert_eq!(field.name, "f2");
     }
 }
