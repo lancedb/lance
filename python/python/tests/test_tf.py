@@ -12,6 +12,8 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import warnings
+
 import ml_dtypes
 import numpy as np
 import pandas as pd
@@ -20,7 +22,9 @@ import pytest
 from lance.arrow import BFloat16Type, bfloat16_array
 
 try:
-    import tensorflow as tf  # noqa: F401
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        import tensorflow as tf  # noqa: F401
 except ImportError:
     pytest.skip(
         "Tensorflow is not installed. Please install tensorflow to "
