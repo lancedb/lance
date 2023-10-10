@@ -525,7 +525,7 @@ impl Scanner {
             let remaining_schema = filter_schema.exclude(plan.schema().as_ref())?;
             if !remaining_schema.fields.is_empty() {
                 // Not all columns for filter are ready, so we need to take them first
-                plan = self.take(plan, &remaining_schema)?;
+                plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
             }
             plan = Arc::new(FilterExec::try_new(predicates.clone(), plan)?);
         }
@@ -539,7 +539,7 @@ impl Scanner {
         let output_schema = self.output_schema()?;
         let remaining_schema = output_schema.exclude(plan.schema().as_ref())?;
         if !remaining_schema.fields.is_empty() {
-            plan = self.take(plan, &remaining_schema)?;
+            plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
         }
         plan = Arc::new(ProjectionExec::try_new(plan, output_schema)?);
 
@@ -608,7 +608,7 @@ impl Scanner {
 
             let knn_node = self.ann(q, index)?; // _distance, _rowid
             let with_vector = self.dataset.schema().project(&[&q.column])?;
-            let knn_node_with_vector = self.take(knn_node, &with_vector)?;
+            let knn_node_with_vector = self.take(knn_node, &with_vector, self.batch_readahead)?;
             let mut knn_node = if q.refine_factor.is_some() {
                 self.flat_knn(knn_node_with_vector, q)?
             } else {
@@ -665,7 +665,9 @@ impl Scanner {
                     true,
                     vector_scan_projection,
                     Arc::new(self.dataset.manifest.fragments_since(&ds.manifest)?),
-                    self.ordered,
+                    // We are re-ordering anyways, so no need to get data in data
+                    // in a deterministic order.
+                    false,
                 );
                 // first we do flat search on just the new data
                 let topk_appended = self.flat_knn(scan_node, q)?;
@@ -743,11 +745,13 @@ impl Scanner {
         &self,
         input: Arc<dyn ExecutionPlan>,
         projection: &Schema,
+        batch_readahead: usize,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(TakeExec::try_new(
             self.dataset.clone(),
             input,
             Arc::new(projection.clone()),
+            batch_readahead,
         )?))
     }
 

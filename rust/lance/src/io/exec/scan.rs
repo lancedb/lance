@@ -50,7 +50,7 @@ async fn open_file(
 fn scan_batches(
     reader: FragmentReader,
     read_size: usize,
-) -> impl Stream<Item = Result<impl Future<Output = Result<RecordBatch>>>> {
+) -> impl Stream<Item = Result<impl Future<Output = Result<RecordBatch>> + Send>> {
     // To make sure the reader lives long enough, we put it in an Arc.
     let reader = Arc::new(reader);
     let reader2 = reader.clone();
@@ -65,12 +65,14 @@ fn scan_batches(
         let reader = reader2.clone();
         // The Ok here is only here because try_flatten_unordered wants both the
         // outer *and* inner stream to be TryStream.
-        Ok(async move {
+        let task = tokio::task::spawn(async move {
             reader
                 .read_batch(batch_id, range)
                 .await
                 .map_err(DataFusionError::from)
-        })
+        });
+
+        Ok(async move { task.await.unwrap() })
     });
 
     Box::pin(batch_stream)
@@ -120,19 +122,30 @@ impl LanceStream {
 
         let inner_stream = if scan_in_order {
             stream::iter(file_fragments)
-                .then(move |file_fragment| {
-                    open_file(file_fragment, project_schema.clone(), with_row_id)
+                .map(move |file_fragment| {
+                    Ok(open_file(
+                        file_fragment,
+                        project_schema.clone(),
+                        with_row_id,
+                    ))
                 })
+                .try_buffered(fragment_readahead)
                 .map_ok(move |reader| scan_batches(reader, read_size))
+                // We must be waiting to finish a file before moving onto thenext. That's an issue.
                 .try_flatten()
                 // We buffer up to `batch_readahead` batches across all streams.
                 .try_buffered(batch_readahead)
                 .boxed()
         } else {
             stream::iter(file_fragments)
-                .then(move |file_fragment| {
-                    open_file(file_fragment, project_schema.clone(), with_row_id)
+                .map(move |file_fragment| {
+                    Ok(open_file(
+                        file_fragment,
+                        project_schema.clone(),
+                        with_row_id,
+                    ))
                 })
+                .try_buffered(fragment_readahead)
                 .map_ok(move |reader| scan_batches(reader, read_size))
                 // When we flatten the streams (one stream per fragment), we allow
                 // `fragment_readahead` stream to be read concurrently.
