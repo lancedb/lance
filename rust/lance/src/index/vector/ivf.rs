@@ -817,7 +817,7 @@ fn generate_remap_tasks(
     Ok(tasks)
 }
 
-pub async fn remap_index_file(
+pub(crate) async fn remap_index_file(
     dataset: &Dataset,
     old_uuid: &str,
     new_uuid: &str,
@@ -957,7 +957,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::{
-        format::RowId,
+        format::RowAddress,
         index::{
             vector::{open_index, VectorIndexParams},
             DatasetIndexExt, IndexType,
@@ -1173,7 +1173,7 @@ mod tests {
                 // The invalid row id should never show up in results
                 assert!(!found_ids
                     .iter()
-                    .any(|f_id| f_id.unwrap() == RowId::TOMBSTONE_ROW));
+                    .any(|f_id| f_id.unwrap() == RowAddress::TOMBSTONE_ROW));
             }
         }
     }

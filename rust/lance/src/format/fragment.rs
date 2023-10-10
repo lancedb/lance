@@ -210,9 +210,9 @@ impl From<&Fragment> for pb::DataFragment {
     }
 }
 
-pub struct RowId(u64);
+pub struct RowAddress(u64);
 
-impl RowId {
+impl RowAddress {
     pub const FRAGMENT_SIZE: u64 = 1 << 32;
     // A fragment id that will never be used
     pub const TOMBSTONE_FRAG: u32 = 0xffffffff;
@@ -240,19 +240,19 @@ impl RowId {
     }
 }
 
-impl From<RowId> for u64 {
-    fn from(row_id: RowId) -> Self {
+impl From<RowAddress> for u64 {
+    fn from(row_id: RowAddress) -> Self {
         row_id.0
     }
 }
 
-impl std::fmt::Debug for RowId {
+impl std::fmt::Debug for RowAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}", self) // use Display
     }
 }
 
-impl std::fmt::Display for RowId {
+impl std::fmt::Display for RowAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "({}, {})", self.fragment_id(), self.row_id())
     }

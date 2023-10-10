@@ -278,7 +278,13 @@ pub(crate) async fn remap_vector_index(
 ) -> Result<()> {
     let old_index = open_index(dataset.clone(), column, &old_uuid.to_string()).await?;
     old_index.check_can_remap()?;
-    let ivf_index: &IVFIndex = old_index.as_any().downcast_ref().unwrap();
+    let ivf_index: &IVFIndex =
+        old_index
+            .as_any()
+            .downcast_ref()
+            .ok_or_else(|| Error::NotSupported {
+                source: "Only IVF indexes can be remapped currently".into(),
+            })?;
 
     remap_index_file(
         dataset.as_ref(),
@@ -287,7 +293,8 @@ pub(crate) async fn remap_vector_index(
         ivf_index,
         mapping,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Open the Vector index on dataset, specified by the `uuid`.

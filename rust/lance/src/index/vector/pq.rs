@@ -40,7 +40,7 @@ use crate::index::prefilter::PreFilter;
 use crate::index::Index;
 use crate::index::{pb, vector::kmeans::train_kmeans, vector::DIST_COL};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
-use crate::{arrow::*, format::RowId};
+use crate::{arrow::*, format::RowAddress};
 use crate::{Error, Result};
 
 /// Product Quantization Index.
@@ -251,14 +251,23 @@ impl Index for PQIndex {
 }
 
 // Helper struct for zipped distance + row id that sorts by distance
-struct DistanceRowId((f32, u64));
+struct DistanceRowId {
+    distance: f32,
+    row_id: u64,
+}
+
+impl DistanceRowId {
+    fn new(distance: f32, row_id: u64) -> Self {
+        Self { distance, row_id }
+    }
+}
 
 impl DistanceRowId {
     fn distance(&self) -> f32 {
-        self.0 .0
+        self.distance
     }
     fn row_id(&self) -> u64 {
-        self.0 .1
+        self.row_id
     }
 }
 
@@ -341,8 +350,8 @@ impl VectorIndex for PQIndex {
             .iter()
             .copied()
             .zip(row_ids.values().iter().copied())
-            .filter(|(_, row_id)| *row_id != RowId::TOMBSTONE_ROW)
-            .map(|(distance, row_id)| DistanceRowId((distance, row_id)));
+            .filter(|(_, row_id)| *row_id != RowAddress::TOMBSTONE_ROW)
+            .map(|(distance, row_id)| DistanceRowId::new(distance, row_id));
 
         let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
 
@@ -407,7 +416,7 @@ impl VectorIndex for PQIndex {
                         .unwrap_or(Some(*old_row_id))
                         // If the row is in the mapping, but maps to None, then it is deleted, and we insert
                         // a tombstone in its place
-                        .unwrap_or(RowId::TOMBSTONE_ROW)
+                        .unwrap_or(RowAddress::TOMBSTONE_ROW)
                 },
             ));
 

@@ -80,6 +80,47 @@ pub trait IndexParams: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+#[allow(dead_code)]
+async fn remap_index(
+    dataset: &Dataset,
+    index_id: &Uuid,
+    row_id_map: &HashMap<u64, Option<u64>>,
+) -> Result<Uuid> {
+    // Load indices from the disk.
+    let indices = dataset.load_indices().await?;
+    let matched = indices
+        .iter()
+        .find(|i| i.uuid == *index_id)
+        .ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", index_id),
+        })?;
+
+    if matched.fields.len() > 1 {
+        return Err(Error::Index {
+            message: "Remapping indices with multiple fields is not supported".to_string(),
+        });
+    }
+    let field = matched
+        .fields
+        .first()
+        .expect("An index existed with no fields");
+
+    let field = dataset.schema().field_by_id(*field).unwrap();
+
+    let new_id = Uuid::new_v4();
+
+    remap_vector_index(
+        Arc::new(dataset.clone()),
+        &field.name,
+        index_id,
+        &new_id,
+        row_id_map,
+    )
+    .await?;
+
+    Ok(new_id)
+}
+
 /// Extends Dataset with secondary index.
 #[async_trait]
 pub trait DatasetIndexExt {
@@ -103,12 +144,6 @@ pub trait DatasetIndexExt {
         params: &dyn IndexParams,
         replace: bool,
     ) -> Result<()>;
-
-    async fn remap_index(
-        &self,
-        index_id: &Uuid,
-        row_id_map: &HashMap<u64, Option<u64>>,
-    ) -> Result<Uuid>;
 }
 
 #[async_trait]
@@ -198,41 +233,6 @@ impl DatasetIndexExt for Dataset {
         self.manifest = Arc::new(new_manifest);
 
         Ok(())
-    }
-
-    async fn remap_index(
-        &self,
-        index_id: &Uuid,
-        row_id_map: &HashMap<u64, Option<u64>>,
-    ) -> Result<Uuid> {
-        // Load indices from the disk.
-        let indices = self.load_indices().await?;
-        let matched = indices
-            .iter()
-            .find(|i| i.uuid == *index_id)
-            .ok_or_else(|| Error::Index {
-                message: format!("Index with id {} does not exist", index_id),
-            })?;
-
-        if matched.fields.len() > 1 {
-            return Err(Error::Index {
-                message: "Remapping indices with multiple fields is not supported".to_string(),
-            });
-        }
-        let field = matched
-            .fields
-            .first()
-            .expect("An index existed with no fields");
-
-        let field = self.schema().field_by_id(*field).unwrap();
-
-        let new_id = Uuid::new_v4();
-
-        let arc_self = Arc::new(self.clone());
-
-        remap_vector_index(arc_self, &field.name, index_id, &new_id, row_id_map).await?;
-
-        Ok(new_id)
     }
 }
 

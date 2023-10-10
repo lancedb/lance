@@ -108,6 +108,10 @@ impl ObjectWriter {
         Ok(())
     }
 
+    pub fn sizeof_magic() -> usize {
+        16
+    }
+
     pub async fn shutdown(&mut self) -> Result<()> {
         Ok(self.writer.shutdown().await?)
     }
