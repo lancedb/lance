@@ -128,9 +128,8 @@ def test_ann_append(tmp_path):
     print(run(dataset, q=np.array(q), assert_func=func))
 
 
+@pytest.mark.cuda
 def test_create_index_using_cuda(tmp_path):
-    pytest.importorskip("torch")
-
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
     dataset = dataset.create_index(

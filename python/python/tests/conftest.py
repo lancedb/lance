@@ -34,6 +34,13 @@ def ddb_table() -> str:
     return os.environ.get("TEST_DDB_TABLE", "lance-integtest")
 
 
+def disable_items_with_mark(items, mark, reason):
+    skipper = pytest.mark.skip(reason=reason)
+    for item in items:
+        if mark in item.keywords:
+            item.add_marker(skipper)
+
+
 # These are initialization hooks and must have an exact name for pytest to pick them up
 # https://docs.pytest.org/en/7.1.x/reference/reference.html
 
@@ -49,13 +56,36 @@ def pytest_addoption(parser):
 
 def pytest_collection_modifyitems(config, items):
     if not config.getoption("--run-integration"):
-        skipper = pytest.mark.skip(reason="--run-integration not specified")
-        for item in items:
-            if "integration" in item.keywords:
-                item.add_marker(skipper)
+        disable_items_with_mark(items, "integration", "--run-integration not specified")
+    try:
+        import torch
+
+        if not torch.cuda.is_available:
+            disable_items_with_mark(
+                items, "cuda", "torch is installed but cuda is not available"
+            )
+            if (
+                not torch.backends.mps.is_available()
+                or not torch.backends.mps.is_built()
+            ):
+                disable_items_with_mark(
+                    items, "gpu", "torch is installed but no gpu is available"
+                )
+    except ImportError as err:
+        reason = f"torch not installed ({err})"
+        disable_items_with_mark(items, "torch", reason)
+        disable_items_with_mark(items, "cuda", reason)
+        disable_items_with_mark(items, "gpu", reason)
 
 
 def pytest_configure(config):
     config.addinivalue_line(
         "markers", "integration: mark test to run only on named environment"
+    )
+    config.addinivalue_line(
+        "markers", "torch: tests which rely on pytorch being installed"
+    )
+    config.addinivalue_line("markers", "cuda: tests which rely on pytorch and cuda")
+    config.addinivalue_line(
+        "markers", "gpu: tests which rely on pytorch and some kind of gpu"
     )
