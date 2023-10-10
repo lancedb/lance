@@ -20,12 +20,10 @@ use std::sync::Arc;
 
 use crate::datatypes::Field;
 use crate::error::Result;
-use arrow_array::cast::as_generic_binary_array;
 use arrow_array::{
-    builder::{
-        make_builder, ArrayBuilder, BinaryBuilder, BooleanBuilder, PrimitiveBuilder, StringBuilder,
-    },
-    cast::AsArray,
+    builder::{make_builder, ArrayBuilder, BooleanBuilder, PrimitiveBuilder},
+    builder::{BinaryBuilder, StringBuilder},
+    cast::{as_generic_binary_array, AsArray},
     types::{
         ArrowDictionaryKeyType, Date32Type, Date64Type, Decimal128Type, DurationMicrosecondType,
         DurationMillisecondType, DurationNanosecondType, DurationSecondType, Float32Type,
@@ -40,8 +38,8 @@ use arrow_array::{
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use datafusion::common::ScalarValue;
 use lance_arrow::as_fixed_size_binary_array;
-use num_traits::Bounded;
-use std::{i128, str};
+use num_traits::bounds::Bounded;
+use std::str;
 
 /// Max number of bytes that are included in statistics for binary columns.
 const BINARY_PREFIX_LENGTH: usize = 64;
@@ -94,8 +92,7 @@ where
     let mut scalar_min_value = ScalarValue::try_from(min_value).unwrap();
     let mut scalar_max_value = ScalarValue::try_from(max_value).unwrap();
 
-    let dt = arrays[0].data_type();
-    match dt {
+    match arrays[0].data_type() {
         DataType::Float32 => {
             if scalar_min_value == ScalarValue::Float32(Some(0.0)) {
                 scalar_min_value = ScalarValue::Float32(Some(-0.0));
