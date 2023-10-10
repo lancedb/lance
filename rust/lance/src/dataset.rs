@@ -17,14 +17,17 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
+use arrow_array::Array;
 use arrow_array::{
     cast::as_struct_array, RecordBatch, RecordBatchReader, StructArray, UInt64Array,
 };
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+use arrow_select::interleave::interleave;
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::{prelude::*, Duration};
 use futures::future::BoxFuture;
@@ -812,51 +815,84 @@ impl Dataset {
         Ok(counts.iter().sum())
     }
 
-    pub async fn take(&self, row_indices: &[usize], projection: &Schema) -> Result<RecordBatch> {
-        let mut sorted_indices: Vec<u32> =
-            Vec::from_iter(row_indices.iter().map(|indice| *indice as u32));
-        sorted_indices.sort();
+    pub async fn take(&self, row_indices: &[u64], projection: &Schema) -> Result<RecordBatch> {
+        let mut sorted_indices: Vec<usize> = (0..row_indices.len()).collect();
+        sorted_indices.sort_by_key(|&i| row_indices[i]);
 
-        let mut row_count = 0;
+        let fragments = self.get_fragments();
+
+        // We will split into sub-requests for each fragment.
+        let mut sub_requests: Vec<(&FileFragment, Range<usize>)> = Vec::new();
+        // We will remap the row indices to the original row indices, using a pair
+        // of (request position, position in request)
+        let mut remap_index: Vec<(usize, usize)> = vec![(0, 0); row_indices.len()];
+        let mut local_ids_buffer: Vec<u32> = Vec::with_capacity(row_indices.len());
+
+        let mut fragments_iter = fragments.iter();
+        let mut current_fragment = fragments_iter.next().ok_or_else(|| Error::InvalidInput {
+            source: "Called take on an empty dataset.".to_string().into(),
+        })?;
+        let mut current_fragment_len = current_fragment.count_rows().await?;
+        let mut curr_fragment_offset: u64 = 0;
+        let mut current_fragment_end = current_fragment_len as u64;
         let mut start = 0;
-        let schema = Arc::new(ArrowSchema::from(projection));
-        let mut batches = Vec::with_capacity(sorted_indices.len());
-        for fragment in self.get_fragments().iter() {
-            if start >= sorted_indices.len() {
-                break;
-            }
+        let mut end = 0;
 
-            let max_row_indices = row_count + fragment.count_rows().await? as u32;
-            if sorted_indices[start] < max_row_indices {
-                let mut end = start;
-                sorted_indices[end] -= row_count;
-                while end + 1 < sorted_indices.len() && sorted_indices[end + 1] < max_row_indices {
-                    end += 1;
-                    sorted_indices[end] -= row_count;
-                }
-                batches.push(
-                    fragment
-                        .take(&sorted_indices[start..end + 1], projection)
-                        .await?,
-                );
+        for index in sorted_indices {
+            // Get the index
+            let row_index = row_indices[index];
 
-                // restore the row indices
-                for indice in sorted_indices[start..end + 1].iter_mut() {
-                    *indice += row_count;
+            // If the row index is beyond the current fragment, iterate
+            // until we find the fragment that contains it.
+            while row_index >= current_fragment_end {
+                // If we have a non-empty sub-request, add it to the list
+                if end - start > 0 {
+                    // If we have a non-empty sub-request, add it to the list
+                    sub_requests.push((current_fragment, start..end));
                 }
 
-                start = end + 1;
+                start = end;
+
+                current_fragment = fragments_iter.next().ok_or_else(|| Error::InvalidInput {
+                    source: format!(
+                        "Row index {} is beyond the range of the dataset.",
+                        row_index
+                    )
+                    .into(),
+                })?;
+                curr_fragment_offset += current_fragment_len as u64;
+                current_fragment_len = current_fragment.count_rows().await?;
+                current_fragment_end = curr_fragment_offset + current_fragment_len as u64;
             }
-            row_count = max_row_indices;
+
+            // Note that we cast to u32 *after* subtracting the offset,
+            // since it is possible for the global index to be larger than
+            // u32::MAX.
+            let local_index = (row_index - curr_fragment_offset) as u32;
+            local_ids_buffer.push(local_index);
+
+            remap_index[index] = (sub_requests.len(), end - start);
+
+            end += 1;
         }
 
-        let one_batch = concat_batches(&schema, &batches)?;
-        let remapping_index: UInt64Array = row_indices
-            .iter()
-            .map(|o| sorted_indices.binary_search(&(*o as u32)).unwrap() as u64)
-            .collect();
-        let struct_arr: StructArray = one_batch.into();
-        let reordered = take(&struct_arr, &remapping_index, None)?;
+        // flush last batch
+        if end - start > 0 {
+            sub_requests.push((current_fragment, start..end));
+        }
+
+        let batches = futures::stream::iter(sub_requests.into_iter())
+            .then(|(fragment, indices_range)| {
+                let local_ids = &local_ids_buffer[indices_range];
+                fragment.take(local_ids, projection)
+            })
+            // .buffered(num_cpus::get() * 4)
+            .try_collect::<Vec<RecordBatch>>()
+            .await?;
+
+        let struct_arrs: Vec<StructArray> = batches.into_iter().map(StructArray::from).collect();
+        let refs: Vec<_> = struct_arrs.iter().map(|x| x as &dyn Array).collect();
+        let reordered = interleave(&refs, &remap_index)?;
         Ok(as_struct_array(&reordered).into())
     }
 
@@ -1023,8 +1059,8 @@ impl Dataset {
     pub(crate) async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows().await?;
-        let ids = (0..num_rows).choose_multiple(&mut rand::thread_rng(), n);
-        self.take(&ids[..], projection).await
+        let ids = (0..num_rows as u64).choose_multiple(&mut rand::thread_rng(), n);
+        self.take(&ids, projection).await
     }
 
     /// Delete rows based on a predicate.
@@ -2037,7 +2073,7 @@ mod tests {
                     199, // 199
                     39,  // 39
                     40,  // 40
-                    100, // 100
+                    125, // 125
                 ],
                 &projection,
             )
@@ -2047,9 +2083,9 @@ mod tests {
             RecordBatch::try_new(
                 schema.clone(),
                 vec![
-                    Arc::new(Int32Array::from_iter_values([200, 199, 39, 40, 100])),
+                    Arc::new(Int32Array::from_iter_values([200, 199, 39, 40, 125])),
                     Arc::new(StringArray::from_iter_values(
-                        [200, 199, 39, 40, 100].iter().map(|v| format!("str-{v}"))
+                        [200, 199, 39, 40, 125].iter().map(|v| format!("str-{v}"))
                     )),
                 ],
             )
