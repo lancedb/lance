@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod statistics;
+
 use std::sync::Arc;
 
 use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
@@ -116,21 +118,46 @@ pub struct FileWriter {
     // Just for testing purposes.
     // TODO: replace this with stats collection logic.
     stats: Option<RecordBatch>,
+    stats_collector: Option<statistics::StatisticsCollector>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FileWriterOptions {
+    /// The field ids to collect statistics for.
+    pub collect_stats_for_fields: Vec<i32>,
 }
 
 impl FileWriter {
-    pub async fn try_new(object_store: &ObjectStore, path: &Path, schema: Schema) -> Result<Self> {
+    pub async fn try_new(
+        object_store: &ObjectStore,
+        path: &Path,
+        schema: Schema,
+        options: &FileWriterOptions,
+    ) -> Result<Self> {
         let object_writer = object_store.create(path).await?;
-        Self::with_object_writer(object_writer, schema)
+        Self::with_object_writer(object_writer, schema, options)
     }
 
-    pub fn with_object_writer(object_writer: ObjectWriter, schema: Schema) -> Result<Self> {
+    pub fn with_object_writer(
+        object_writer: ObjectWriter,
+        schema: Schema,
+        options: &FileWriterOptions,
+    ) -> Result<Self> {
+        let stats_collector = if !options.collect_stats_for_fields.is_empty() {
+            let stats_schema = schema.project_by_ids(&options.collect_stats_for_fields);
+            let stats_collector = statistics::StatisticsCollector::new(&stats_schema.fields);
+            Some(stats_collector)
+        } else {
+            None
+        };
+
         Ok(Self {
             object_writer,
             schema,
             batch_id: 0,
             page_table: PageTable::default(),
             metadata: Metadata::default(),
+            stats_collector,
             stats: None,
         })
     }
@@ -153,6 +180,14 @@ impl FileWriter {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
+            // If we are collecting stats for this column, collect them
+            if let Some(stats_collector) = &mut self.stats_collector {
+                if let Some(stats_builder) = stats_collector.get_builder(field.id) {
+                    let stats_row = statistics::collect_statistics(&arrs);
+                    stats_builder.append(stats_row);
+                }
+            }
+
             Self::write_array(
                 &mut self.object_writer,
                 field,
@@ -164,11 +199,19 @@ impl FileWriter {
         }
         let batch_length = batches.iter().map(|b| b.num_rows() as i32).sum();
         self.metadata.push_batch_length(batch_length);
+
         self.batch_id += 1;
         Ok(())
     }
 
     pub async fn finish(&mut self) -> Result<usize> {
+        // Finish the statistics
+        let _statistics = self
+            .stats_collector
+            .as_mut()
+            .map(|collector| collector.finish());
+
+        // TODO: write the statistics to the file
         self.write_footer().await?;
         self.object_writer.shutdown().await?;
         let num_rows = self
@@ -572,8 +615,8 @@ mod tests {
         types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
         DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
         DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int32Array,
-        Int64Array, NullArray, StringArray, TimestampMicrosecondArray, TimestampSecondArray,
-        UInt8Array,
+        Int64Array, ListArray, NullArray, StringArray, TimestampMicrosecondArray,
+        TimestampSecondArray, UInt8Array,
     };
     use arrow_buffer::i256;
     use arrow_schema::{
@@ -752,7 +795,9 @@ mod tests {
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema, &Default::default())
+            .await
+            .unwrap();
         file_writer.write(&[batch.clone()]).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -779,7 +824,9 @@ mod tests {
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema, &Default::default())
+            .await
+            .unwrap();
         file_writer.write(&[batch.clone()]).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -814,7 +861,9 @@ mod tests {
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema, &Default::default())
+            .await
+            .unwrap();
         file_writer.write(&[batch.clone()]).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -842,9 +891,10 @@ mod tests {
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
-            .await
-            .unwrap();
+        let mut file_writer =
+            FileWriter::try_new(&store, &path, schema.clone(), &FileWriterOptions::default())
+                .await
+                .unwrap();
         file_writer.write(&[data_batch.clone()]).await.unwrap();
         file_writer.set_statistics(stats_batch);
         file_writer.finish().await.unwrap();
@@ -951,5 +1001,97 @@ mod tests {
         let expected = batch.project_by_schema(arrow_projection.as_ref()).unwrap();
         let actual = roundtrip_stats_batch(batch, &projection).await.unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_collect_stats() {
+        // Validate:
+        // Only collects stats for requested columns
+        // Can collect stats in nested structs
+        // Won't collect stats for list columns (for now)
+
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int64, true),
+            ArrowField::new("i2", DataType::Int64, true),
+            ArrowField::new(
+                "l",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+                true,
+            ),
+            ArrowField::new(
+                "s",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("si", DataType::Int64, true),
+                    ArrowField::new("sb", DataType::Utf8, true),
+                ])),
+                true,
+            ),
+        ]);
+
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+
+        // TODO: collect_stats_for_fields: vec![0,1,3] once structs are supported
+        let options = FileWriterOptions {
+            collect_stats_for_fields: vec![0, 1],
+        };
+        let mut file_writer = FileWriter::try_new(&store, &path, schema, &options)
+            .await
+            .unwrap();
+
+        let batch1 = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![4, 5, 6])),
+                Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                    Some(vec![Some(1i32), Some(2), Some(3)]),
+                    Some(vec![Some(4), Some(5)]),
+                    Some(vec![]),
+                ])),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(ArrowField::new("si", DataType::Int64, true)),
+                        Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("sb", DataType::Utf8, true)),
+                        Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                    ),
+                ])),
+            ],
+        )
+        .unwrap();
+        file_writer.write(&[batch1]).await.unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(vec![5, 6])),
+                Arc::new(Int64Array::from(vec![10, 11])),
+                Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                    Some(vec![Some(1i32), Some(2), Some(3)]),
+                    Some(vec![]),
+                ])),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(ArrowField::new("si", DataType::Int64, true)),
+                        Arc::new(Int64Array::from(vec![4, 5])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("sb", DataType::Utf8, true)),
+                        Arc::new(StringArray::from(vec!["d", "e"])) as ArrayRef,
+                    ),
+                ])),
+            ],
+        )
+        .unwrap();
+        file_writer.write(&[batch2]).await.unwrap();
+
+        file_writer.finish().await.unwrap();
+
+        // TODO: read and test statistics
     }
 }

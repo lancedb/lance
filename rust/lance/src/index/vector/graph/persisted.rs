@@ -300,7 +300,7 @@ pub async fn write_graph<V: Vertex + Clone + Sync + Send>(
     ]));
     let schema = Schema::try_from(arrow_schema.as_ref())?;
 
-    let mut writer = FileWriter::try_new(object_store, path, schema).await?;
+    let mut writer = FileWriter::try_new(object_store, path, schema, &Default::default()).await?;
     for nodes in graph.nodes.as_slice().chunks(params.batch_size) {
         let mut vertex_builder =
             FixedSizeBinaryBuilder::with_capacity(nodes.len(), binary_size as i32);

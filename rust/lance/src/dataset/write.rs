@@ -183,9 +183,13 @@ impl WriterGenerator {
         fragment.add_file(&data_file_path, &self.schema);
 
         let full_path = self.base_dir.child(DATA_DIR).child(data_file_path);
-        let writer =
-            FileWriter::try_new(self.object_store.as_ref(), &full_path, self.schema.clone())
-                .await?;
+        let writer = FileWriter::try_new(
+            self.object_store.as_ref(),
+            &full_path,
+            self.schema.clone(),
+            &Default::default(),
+        )
+        .await?;
 
         Ok((writer, fragment))
     }

@@ -87,7 +87,13 @@ impl FileFragment {
         let filename = format!("{}.lance", Uuid::new_v4());
         let mut fragment = Fragment::with_file(id as u64, &filename, &schema, 0);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
-        let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
+        let mut writer = FileWriter::try_new(
+            &object_store,
+            &full_path,
+            schema.clone(),
+            &Default::default(),
+        )
+        .await?;
 
         progress.begin(&fragment, writer.multipart_id()).await?;
 
