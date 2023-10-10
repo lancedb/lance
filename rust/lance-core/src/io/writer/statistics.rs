@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::datatypes::Field;
 use crate::error::Result;
+use arrow_array::cast::as_generic_binary_array;
 use arrow_array::{
     builder::{
         make_builder, ArrayBuilder, BinaryBuilder, BooleanBuilder, PrimitiveBuilder, StringBuilder,
@@ -34,11 +35,9 @@ use arrow_array::{
         UInt32Type, UInt64Type, UInt8Type,
     },
     Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, Decimal128Array,
-    LargeBinaryArray, LargeStringArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray,
-    StructArray,
+    OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
-use datafusion::common::cast::as_binary_array;
 use datafusion::common::ScalarValue;
 use lance_arrow::as_fixed_size_binary_array;
 use num_traits::Bounded;
@@ -220,14 +219,14 @@ fn increment(mut data: Vec<u8>) -> Option<Vec<u8>> {
     None
 }
 
-fn get_large_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
+fn get_string_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> StatisticsRow {
     let mut min_value: Option<&str> = None;
     let mut max_value: Option<&str> = None;
     let mut null_count: i64 = 0;
 
     let arr = arrays
         .iter()
-        .map(|x| x.as_any().downcast_ref::<LargeStringArray>().unwrap()) // TODO as_string
+        .map(|x| x.as_string::<T>())
         .collect::<Vec<_>>();
 
     for array in arr.iter() {
@@ -280,89 +279,31 @@ fn get_large_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         }
     }
 
-    StatisticsRow {
-        null_count: ScalarValue::Int64(Some(null_count)),
-        min_value: ScalarValue::LargeUtf8(Some(min_value.unwrap().to_string())),
-        max_value: ScalarValue::LargeUtf8(Some(max_value.unwrap().to_string())),
+    match arrays[0].data_type() {
+        DataType::Utf8 => StatisticsRow {
+            null_count: ScalarValue::Int64(Some(null_count)),
+            min_value: ScalarValue::Utf8(Some(min_value.unwrap().to_string())),
+            max_value: ScalarValue::Utf8(Some(max_value.unwrap().to_string())),
+        },
+        DataType::LargeUtf8 => StatisticsRow {
+            null_count: ScalarValue::Int64(Some(null_count)),
+            min_value: ScalarValue::LargeUtf8(Some(min_value.unwrap().to_string())),
+            max_value: ScalarValue::LargeUtf8(Some(max_value.unwrap().to_string())),
+        },
+        _ => {
+            todo!()
+        }
     }
 }
 
-fn get_string_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
-    let mut min_value: Option<&str> = None;
-    let mut max_value: Option<&str> = None;
-    let mut null_count: i64 = 0;
-
-    let arr = arrays
-        .iter()
-        .map(|x| x.as_any().downcast_ref::<StringArray>().unwrap()) // TODO as_string
-        .collect::<Vec<_>>();
-
-    for array in arr.iter() {
-        array.iter().for_each(|value| {
-            if let Some(val) = value {
-                // TODO: don't compare full strings
-                // for i in (BINARY_PREFIX_LENGTH..val.len()).rev() {
-                //     if val.is_char_boundary(i) {
-                //         val = &val[..i];
-                //         break;
-                //     }
-                // }
-                // TODO: if we discovered a max value greater than expressable
-                //  with BINARY_PREFIX_LENGTH we can skip comparing remaining values
-                //  in the array.
-                //  Same for min value.
-
-                if let Some(v) = min_value {
-                    if let Some(Ordering::Less) = val[..].partial_cmp(v) {
-                        min_value = Some(val);
-                    }
-                } else {
-                    min_value = Some(val);
-                }
-
-                if let Some(v) = max_value {
-                    if let Some(Ordering::Greater) = val.partial_cmp(v) {
-                        max_value = Some(val);
-                    }
-                } else {
-                    max_value = Some(val);
-                }
-            }
-        });
-        null_count += array.null_count() as i64;
-    }
-
-    if let Some(v) = min_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            min_value = truncate_utf8(v, BINARY_PREFIX_LENGTH);
-        }
-    }
-
-    let max_value_bound: Vec<u8>;
-    if let Some(v) = max_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            max_value = truncate_utf8(v, BINARY_PREFIX_LENGTH);
-            max_value_bound = increment_utf8(max_value.unwrap().as_bytes().to_vec()).unwrap();
-            max_value = Some(str::from_utf8(&max_value_bound).unwrap());
-        }
-    }
-
-    StatisticsRow {
-        null_count: ScalarValue::Int64(Some(null_count)),
-        min_value: ScalarValue::from(min_value),
-        max_value: ScalarValue::from(max_value),
-    }
-}
-
-fn get_large_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
-    // TODO: refactor out comparison logic to share it with get_binary_statistics
+fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> StatisticsRow {
     let mut min_value: Option<&[u8]> = None;
     let mut max_value: Option<&[u8]> = None;
     let mut null_count: i64 = 0;
 
     let arr = arrays
         .iter()
-        .map(|x| x.as_any().downcast_ref::<LargeBinaryArray>().unwrap())
+        .map(|x| as_generic_binary_array::<T>(x))
         .collect::<Vec<_>>();
 
     for array in arr.iter() {
@@ -410,72 +351,20 @@ fn get_large_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         }
     }
 
-    StatisticsRow {
-        null_count: ScalarValue::Int64(Some(null_count)),
-        min_value: ScalarValue::LargeBinary(min_value.map(|x| x.to_vec())),
-        max_value: ScalarValue::LargeBinary(max_value.map(|x| x.to_vec())),
-    }
-}
-
-fn get_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
-    let mut min_value: Option<&[u8]> = None;
-    let mut max_value: Option<&[u8]> = None;
-    let mut null_count: i64 = 0;
-
-    let arr = arrays
-        .iter()
-        .map(|x| as_binary_array(x).unwrap())
-        .collect::<Vec<_>>();
-
-    for array in arr.iter() {
-        array.iter().for_each(|value| {
-            if let Some(val) = value {
-                // don't compare full buffers if possible
-                let val = &val[..std::cmp::min(BINARY_PREFIX_LENGTH + 4, val.len())];
-
-                if let Some(v) = min_value {
-                    if let Some(Ordering::Less) = val.partial_cmp(v) {
-                        min_value = Some(val);
-                    }
-                } else {
-                    min_value = Some(val);
-                }
-
-                if let Some(v) = max_value {
-                    if let Some(Ordering::Greater) = val.partial_cmp(v) {
-                        max_value = Some(val);
-                    }
-                } else {
-                    max_value = Some(val);
-                }
-            }
-        });
-        null_count += array.null_count() as i64;
-    }
-
-    if let Some(v) = min_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            min_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
+    match arrays[0].data_type() {
+        DataType::Binary => StatisticsRow {
+            null_count: ScalarValue::Int64(Some(null_count)),
+            min_value: ScalarValue::Binary(min_value.map(|x| x.to_vec())),
+            max_value: ScalarValue::Binary(max_value.map(|x| x.to_vec())),
+        },
+        DataType::LargeBinary => StatisticsRow {
+            null_count: ScalarValue::Int64(Some(null_count)),
+            min_value: ScalarValue::LargeBinary(min_value.map(|x| x.to_vec())),
+            max_value: ScalarValue::LargeBinary(max_value.map(|x| x.to_vec())),
+        },
+        _ => {
+            todo!()
         }
-    }
-
-    let max_value_bound: Vec<u8>;
-    if let Some(v) = max_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            max_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
-            if let Some(x) = increment(max_value.unwrap().to_vec()) {
-                max_value_bound = x;
-                max_value = Some(&max_value_bound);
-            } else {
-                max_value = None;
-            }
-        }
-    }
-
-    StatisticsRow {
-        null_count: ScalarValue::Int64(Some(null_count)),
-        min_value: ScalarValue::Binary(min_value.map(|x| x.to_vec())),
-        max_value: ScalarValue::Binary(max_value.map(|x| x.to_vec())),
     }
 }
 
@@ -755,6 +644,7 @@ where
     T::Native: Bounded + PartialOrd,
     i32: From<<T as ArrowPrimitiveType>::Native>,
 {
+    //TODO: can get_temporal_statistics_32 and get_temporal_statistics be merged?
     let (min_value, max_value, null_count) = get_minimal_primitive::<T>(arrays);
     let mv = Some(min_value.into());
     let mx = Some(max_value.into());
@@ -905,13 +795,12 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::Duration(TimeUnit::Nanosecond) => {
             get_temporal_statistics::<DurationNanosecondType>(arrays)
         }
-
         DataType::Decimal128(_, _) => get_decimal_statistics(arrays),
-        DataType::Binary => get_binary_statistics(arrays),
-        DataType::LargeBinary => get_large_binary_statistics(arrays),
+        DataType::Binary => get_binary_statistics::<i32>(arrays),
+        DataType::LargeBinary => get_binary_statistics::<i64>(arrays),
         DataType::FixedSizeBinary(_) => get_fixed_size_binary_statistics(arrays),
-        DataType::Utf8 => get_string_statistics(arrays),
-        DataType::LargeUtf8 => get_large_string_statistics(arrays),
+        DataType::Utf8 => get_string_statistics::<i32>(arrays),
+        DataType::LargeUtf8 => get_string_statistics::<i64>(arrays),
         DataType::Dictionary(_, _) => get_dictionary_statistics(arrays),
         DataType::Struct(_) => get_struct_statistics(arrays),
         DataType::List(_) => get_list_statistics::<Int64Type, i32>(arrays),
@@ -1191,7 +1080,7 @@ mod tests {
         DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
         DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray,
         Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-        LargeBinaryArray, LargeListArray, ListArray, StringArray, StructArray,
+        LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, StringArray, StructArray,
         Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
         TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
