@@ -34,12 +34,10 @@ use arrow_array::{
         UInt32Type, UInt64Type, UInt8Type,
     },
     Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, Decimal128Array,
-    LargeBinaryArray, LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    LargeBinaryArray, LargeStringArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray,
+    StructArray,
 };
-use arrow_schema::{
-    ArrowError, DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
-    TimeUnit,
-};
+use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use datafusion::common::cast::as_binary_array;
 use datafusion::common::ScalarValue;
 use lance_arrow::as_fixed_size_binary_array;
@@ -588,7 +586,7 @@ where
     let DataType::FixedSizeList(f, len) = arrays[0].data_type() else {
         todo!()
     };
-    let len = std::cmp::min(*len as usize, 16); // TODO: is this a reasonable lenght?
+    let len = std::cmp::min(*len as usize, 16); // TODO: is 16 a reasonable lenght?
     let mut null_count: i64 = 0;
     let mut max_value = vec![T::Native::min_value(); len].to_vec();
     let mut min_value = vec![T::Native::max_value(); len].to_vec();
@@ -634,23 +632,28 @@ where
     }
 }
 
-fn get_list_statistics<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> StatisticsRow
+fn get_list_statistics<T: ArrowNumericType, N>(arrays: &[&ArrayRef]) -> StatisticsRow
 where
     T::Native: Bounded + PartialOrd,
     datafusion::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
+    <T as ArrowPrimitiveType>::Native: OffsetSizeTrait,
+    N: arrow_array::OffsetSizeTrait,
 {
-    let max_length: usize = 16; // TODO: is this a reasonable lenght?
-    let DataType::List(f) = arrays[0].data_type() else {
-        todo!()
-    };
+    let max_comparison_length: usize = 16; // TODO: is 16 a reasonable lenght?
+    let first_length = arrays[0].as_list::<N>().value(0).len();
+    let mut max_length = first_length;
+    let mut min_length = first_length;
     let mut null_count: i64 = 0;
-    let mut max_value = vec![T::Native::min_value(); max_length].to_vec();
-    let mut min_value = vec![T::Native::max_value(); max_length].to_vec();
+    let mut max_value = vec![T::Native::min_value(); max_comparison_length].to_vec();
+    let mut min_value = vec![T::Native::max_value(); max_comparison_length].to_vec();
 
-    arrays.iter().map(|x| x.as_list::<i64>()).for_each(|array| {
+    let arrs = arrays.iter().map(|x| x.as_list::<N>()).collect::<Vec<_>>();
+    arrs.iter().for_each(|array| {
         null_count += array.null_count() as i64;
         for row in array.iter() {
             if let Some(row) = row {
+                max_length = std::cmp::max(max_length, row.len());
+                min_length = std::cmp::min(min_length, row.len());
                 let Some(values) = row.as_any().downcast_ref::<PrimitiveArray<T>>() else {
                     continue;
                 };
@@ -673,11 +676,14 @@ where
         }
     });
 
-    let min_value = min_value
+    let DataType::List(f) = arrays[0].data_type() else {
+        todo!()
+    };
+    let min_value = min_value[0..min_length]
         .iter()
         .map(|&x| ScalarValue::from(x))
         .collect::<Vec<_>>();
-    let max_value = max_value
+    let max_value = max_value[0..max_length]
         .iter()
         .map(|&x| ScalarValue::from(x))
         .collect::<Vec<_>>();
@@ -720,7 +726,10 @@ fn get_dictionary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     }
 }
 
-fn get_struct_statistics(arrays: &[&ArrayRef], fields: &ArrowFields) -> StatisticsRow {
+fn get_struct_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
+    let DataType::Struct(fields) = arrays[0].data_type() else {
+        todo!()
+    };
     let arr = arrays.iter().map(|x| x.as_struct()).collect::<Vec<_>>();
     let mut min_value: Vec<ScalarValue> = Vec::with_capacity(fields.len());
     let mut max_value: Vec<ScalarValue> = Vec::with_capacity(fields.len());
@@ -904,9 +913,9 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::Utf8 => get_string_statistics(arrays),
         DataType::LargeUtf8 => get_large_string_statistics(arrays),
         DataType::Dictionary(_, _) => get_dictionary_statistics(arrays),
-        DataType::Struct(fields) => get_struct_statistics(arrays, fields),
-        DataType::List(_) => get_list_statistics::<Int64Type>(arrays),
-        // DataType::LargeList(field) => get_large_list_statistics(arrays, field),
+        DataType::Struct(_) => get_struct_statistics(arrays),
+        DataType::List(_) => get_list_statistics::<Int64Type, i32>(arrays),
+        DataType::LargeList(_) => get_list_statistics::<Int64Type, i64>(arrays),
         DataType::FixedSizeList(_, _) => get_fixed_size_list_statistics::<Int64Type>(arrays),
 
         _ => {
@@ -1182,13 +1191,13 @@ mod tests {
         DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
         DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray,
         Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-        LargeBinaryArray, ListArray, StringArray, StructArray, Time32MillisecondArray,
-        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        LargeBinaryArray, LargeListArray, ListArray, StringArray, StructArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
         TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
 
-    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
 
     use super::*;
 
@@ -1497,8 +1506,6 @@ mod tests {
 
     #[test]
     fn test_collect_list_stats() {
-        // TODO: large_list
-
         let data1 = vec![
             Some(vec![Some(0)]),
             Some(vec![Some(9)]),
@@ -1511,15 +1518,7 @@ mod tests {
             Some(vec![Some(6), Some(7), Some(8)]),
         ];
 
-        let arrays = vec![
-            Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(data1)) as ArrayRef,
-            Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(data2)) as ArrayRef,
-        ];
-        let binding = arrays.iter().collect::<Vec<_>>();
-        let array_refs = binding.as_slice();
-        let stats = collect_statistics(array_refs);
-
-        let expected_min_value = [0, 1, 2]
+        let expected_min_value = [0]
             .iter()
             .map(|x: &i64| ScalarValue::Int64(Some(*x)))
             .collect::<Vec<_>>();
@@ -1527,26 +1526,37 @@ mod tests {
             .iter()
             .map(|x: &i64| ScalarValue::Int64(Some(*x)))
             .collect::<Vec<_>>();
-        let field = Arc::new(ArrowField::new("", DataType::Int64, true));
-
+        let field = Arc::new(ArrowField::new("", DataType::Int64, false));
         let expected_stats = StatisticsRow {
             null_count: ScalarValue::from(1_i64),
             min_value: ScalarValue::List(Some(expected_min_value), field.clone()),
             max_value: ScalarValue::List(Some(expected_max_value), field.clone()),
         };
 
-        assert_eq!(
-            stats.min_value.get_datatype(),
-            expected_stats.min_value.get_datatype()
-        );
-        assert_eq!(
-            stats.max_value.get_datatype(),
-            expected_stats.max_value.get_datatype()
-        );
-        assert_eq!(
-            stats.null_count.get_datatype(),
-            expected_stats.null_count.get_datatype()
-        );
+        let arrays = vec![
+            Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+                data1.clone(),
+            )) as ArrayRef,
+            Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+                data2.clone(),
+            )) as ArrayRef,
+        ];
+        let binding = arrays.iter().collect::<Vec<_>>();
+        let array_refs = binding.as_slice();
+        let stats = collect_statistics(array_refs);
+        assert_eq!(stats, expected_stats);
+
+        let arrays = vec![
+            Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(
+                data1.clone(),
+            )) as ArrayRef,
+            Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(
+                data2.clone(),
+            )) as ArrayRef,
+        ];
+        let binding = arrays.iter().collect::<Vec<_>>();
+        let array_refs = binding.as_slice();
+        let stats = collect_statistics(array_refs);
         assert_eq!(stats, expected_stats);
 
         let len = 3;
@@ -1589,19 +1599,6 @@ mod tests {
             min_value: ScalarValue::Fixedsizelist(Some(expected_min_value), field.clone(), 3),
             max_value: ScalarValue::Fixedsizelist(Some(expected_max_value), field.clone(), 3),
         };
-
-        assert_eq!(
-            stats.min_value.get_datatype(),
-            expected_stats.min_value.get_datatype()
-        );
-        assert_eq!(
-            stats.max_value.get_datatype(),
-            expected_stats.max_value.get_datatype()
-        );
-        assert_eq!(
-            stats.null_count.get_datatype(),
-            expected_stats.null_count.get_datatype()
-        );
         assert_eq!(stats, expected_stats);
     }
 
