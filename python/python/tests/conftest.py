@@ -60,7 +60,11 @@ def pytest_collection_modifyitems(config, items):
     try:
         import torch
 
+        print("TORCH IMPORTED")
+        print(torch)
+
         if not torch.cuda.is_available:
+            print("CUDA UNAVAILABLE")
             disable_items_with_mark(
                 items, "cuda", "torch is installed but cuda is not available"
             )
@@ -71,6 +75,8 @@ def pytest_collection_modifyitems(config, items):
                 disable_items_with_mark(
                     items, "gpu", "torch is installed but no gpu is available"
                 )
+        else:
+            print("CUDA AVAILABLE")
     except ImportError as err:
         reason = f"torch not installed ({err})"
         disable_items_with_mark(items, "torch", reason)
