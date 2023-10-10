@@ -60,11 +60,10 @@ def pytest_collection_modifyitems(config, items):
     try:
         import torch
 
-        print("TORCH IMPORTED")
-        print(torch)
-
-        if not torch.cuda.is_available:
-            print("CUDA UNAVAILABLE")
+        # torch.cuda.is_available will return True on some CI machines even though any
+        # attempt to use CUDA will then fail.  torch.cuda.device_count seems to be more
+        # reliable
+        if not torch.cuda.is_available or torch.cuda.device_count() <= 0:
             disable_items_with_mark(
                 items, "cuda", "torch is installed but cuda is not available"
             )
@@ -75,11 +74,7 @@ def pytest_collection_modifyitems(config, items):
                 disable_items_with_mark(
                     items, "gpu", "torch is installed but no gpu is available"
                 )
-        else:
-            print("CUDA AVAILABLE")
-            print(f"DEVICE COUNT: {torch.cuda.device_count()}")
     except ImportError as err:
-        print("NO TORCH")
         reason = f"torch not installed ({err})"
         disable_items_with_mark(items, "torch", reason)
         disable_items_with_mark(items, "cuda", reason)
