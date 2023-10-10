@@ -650,7 +650,7 @@ impl From<&Field> for pb::Field {
             extension_name: field
                 .extension_name()
                 .map(|name| name.to_owned())
-                .unwrap_or(String::new()),
+                .unwrap_or_default(),
             r#type: 0,
         }
     }
