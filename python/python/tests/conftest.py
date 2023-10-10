@@ -77,6 +77,7 @@ def pytest_collection_modifyitems(config, items):
                 )
         else:
             print("CUDA AVAILABLE")
+            print(f"DEVICE COUNT: {torch.cuda.device_count()}")
     except ImportError as err:
         print("NO TORCH")
         reason = f"torch not installed ({err})"
