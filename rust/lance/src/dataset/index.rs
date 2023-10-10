@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::format::{Fragment, Index};
-use crate::index::DatasetIndexExt;
+use crate::index::remap_index;
 use crate::Dataset;
 use crate::Result;
 
@@ -35,7 +35,7 @@ impl DatasetIndexRemapper {
         index: &Index,
         mapping: &HashMap<u64, Option<u64>>,
     ) -> Result<RemappedIndex> {
-        let new_uuid = self.dataset.remap_index(&index.uuid, mapping).await?;
+        let new_uuid = remap_index(&self.dataset, &index.uuid, mapping).await?;
         Ok(RemappedIndex::new(index.uuid, new_uuid))
     }
 }

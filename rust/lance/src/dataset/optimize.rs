@@ -112,7 +112,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::dataset::ROW_ID;
-use crate::format::RowId;
+use crate::format::RowAddress;
 use crate::io::commit::commit_transaction;
 use crate::Result;
 use crate::{format::Fragment, Dataset};
@@ -708,7 +708,7 @@ impl<'a, I: Iterator<Item = u64>> MissingIds<'a, I> {
         let first_frag = &fragments[0];
         Self {
             row_ids,
-            expected_row_id: first_frag.id * RowId::FRAGMENT_SIZE,
+            expected_row_id: first_frag.id * RowAddress::FRAGMENT_SIZE,
             current_fragment_idx: 0,
             last: None,
             fragments,
@@ -735,16 +735,16 @@ impl<'a, I: Iterator<Item = u64>> Iterator for MissingIds<'a, I> {
             };
 
             let current_fragment = &self.fragments[self.current_fragment_idx];
-            let frag = val / RowId::FRAGMENT_SIZE;
+            let frag = val / RowAddress::FRAGMENT_SIZE;
             let expected_row_id = self.expected_row_id;
             self.expected_row_id += 1;
-            if (self.expected_row_id % RowId::FRAGMENT_SIZE)
+            if (self.expected_row_id % RowAddress::FRAGMENT_SIZE)
                 == current_fragment.physical_rows as u64
             {
                 self.current_fragment_idx += 1;
                 if self.current_fragment_idx < self.fragments.len() {
                     self.expected_row_id =
-                        self.fragments[self.current_fragment_idx].id * RowId::FRAGMENT_SIZE;
+                        self.fragments[self.current_fragment_idx].id * RowAddress::FRAGMENT_SIZE;
                 }
             }
             if frag != current_fragment.id {
@@ -765,8 +765,12 @@ fn transpose_row_ids(
     new_fragments: &[Fragment],
 ) -> HashMap<u64, Option<u64>> {
     let new_ids = new_fragments.iter().flat_map(|frag| {
-        (0..frag.physical_rows as u32)
-            .map(|offset| Some(u64::from(RowId::new_from_parts(frag.id as u32, offset))))
+        (0..frag.physical_rows as u32).map(|offset| {
+            Some(u64::from(RowAddress::new_from_parts(
+                frag.id as u32,
+                offset,
+            )))
+        })
     });
     let mut mapping = row_ids.iter().zip(new_ids).collect::<HashMap<_, _>>();
     MissingIds::new(row_ids.into_iter(), old_fragments).for_each(|id| {
@@ -971,12 +975,12 @@ mod tests {
         ];
         let rows = [(0, 1), (0, 3), (0, 4), (3, 0), (3, 2)]
             .into_iter()
-            .map(|(frag, offset)| RowId::new_from_parts(frag, offset).into());
+            .map(|(frag, offset)| RowAddress::new_from_parts(frag, offset).into());
 
         let missing = MissingIds::new(rows, &frags).collect::<Vec<_>>();
         let expected_missing = [(0, 0), (0, 2), (3, 1)]
             .into_iter()
-            .map(|(frag, offset)| RowId::new_from_parts(frag, offset).into())
+            .map(|(frag, offset)| RowAddress::new_from_parts(frag, offset).into())
             .collect::<Vec<u64>>();
         assert_eq!(missing, expected_missing);
     }
@@ -1022,8 +1026,8 @@ mod tests {
                 .map(|key| {
                     format!(
                         "{}:{:?}",
-                        RowId::new_from_id(*key),
-                        map[key].map(RowId::new_from_id)
+                        RowAddress::new_from_id(*key),
+                        map[key].map(RowAddress::new_from_id)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1209,8 +1213,8 @@ mod tests {
     }
 
     fn row_ids(frag_idx: u32, offsets: Range<u32>) -> Range<u64> {
-        let start = RowId::new_from_parts(frag_idx, offsets.start);
-        let end = RowId::new_from_parts(frag_idx, offsets.end);
+        let start = RowAddress::new_from_parts(frag_idx, offsets.start);
+        let end = RowAddress::new_from_parts(frag_idx, offsets.end);
         start.into()..end.into()
     }
 
@@ -1228,7 +1232,7 @@ mod tests {
             for (old_id_range, is_found) in new_frag_ranges.iter() {
                 for old_id in old_id_range.clone() {
                     if *is_found {
-                        let new_id = RowId::new_from_parts(new_frag_idx, row_offset);
+                        let new_id = RowAddress::new_from_parts(new_frag_idx, row_offset);
                         expected_remap.insert(old_id, Some(new_id.into()));
                         row_offset += 1;
                     } else {

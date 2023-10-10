@@ -484,7 +484,6 @@ impl Transaction {
                         ))
                     })?;
 
-                dbg!("Old", &index.fragment_bitmap);
                 index.fragment_bitmap = Some(Self::recalculate_fragment_bitmap(
                     index.fragment_bitmap.as_ref().ok_or_else(|| {
                         Error::invalid_input(format!(
@@ -496,7 +495,6 @@ impl Transaction {
                     group.new_fragments.iter().map(|frag| frag.id as u32),
                     &index.uuid,
                 )?);
-                dbg!("New", &index.fragment_bitmap);
                 index.uuid = rewritten_index.new_id;
             }
         }

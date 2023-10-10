@@ -80,8 +80,7 @@ pub trait IndexParams: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-#[allow(dead_code)]
-async fn remap_index(
+pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
     row_id_map: &HashMap<u64, Option<u64>>,
