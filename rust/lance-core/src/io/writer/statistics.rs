@@ -23,7 +23,7 @@ use crate::error::Result;
 use arrow_array::{
     builder::{make_builder, ArrayBuilder, BooleanBuilder, PrimitiveBuilder},
     builder::{BinaryBuilder, StringBuilder},
-    cast::{as_generic_binary_array, AsArray},
+    cast::{as_generic_binary_array, as_primitive_array, AsArray},
     types::{
         ArrowDictionaryKeyType, Date32Type, Date64Type, Decimal128Type, DurationMicrosecondType,
         DurationMillisecondType, DurationNanosecondType, DurationSecondType, Float32Type,
@@ -32,7 +32,7 @@ use arrow_array::{
         TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type,
         UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, Decimal128Array,
+    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray,
     OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
@@ -55,13 +55,13 @@ pub struct StatisticsRow {
     pub(crate) max_value: ScalarValue,
 }
 
-fn get_minimal_primitive<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> (T::Native, T::Native, i64)
+fn get_primitive_statistics<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> (T::Native, T::Native, i64)
 where
     T::Native: Bounded + PartialOrd,
 {
     let arr = arrays
         .iter()
-        .map(|x| x.as_primitive::<T>())
+        .map(|x| as_primitive_array::<T>(x))
         .collect::<Vec<_>>();
     let mut min_value = T::Native::max_value();
     let mut max_value = T::Native::min_value();
@@ -84,10 +84,10 @@ where
 
 fn get_statistics<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> StatisticsRow
 where
-    T::Native: Bounded + PartialOrd,
+    T::Native: Bounded,
     datafusion::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
 {
-    let (min_value, max_value, null_count) = get_minimal_primitive::<T>(arrays);
+    let (min_value, max_value, null_count) = get_primitive_statistics::<T>(arrays);
 
     let mut scalar_min_value = ScalarValue::try_from(min_value).unwrap();
     let mut scalar_max_value = ScalarValue::try_from(max_value).unwrap();
@@ -120,30 +120,11 @@ where
 }
 
 fn get_decimal_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
-    let mut min_value = i128::MAX;
-    let mut max_value = i128::MIN;
-    let mut null_count: i64 = 0;
+    let (min_value, max_value, null_count) = get_primitive_statistics::<Decimal128Type>(arrays);
+    let array = as_primitive_array::<Decimal128Type>(arrays[0]);
+    let precision = array.precision();
+    let scale = array.scale();
 
-    let arr = arrays
-        .iter()
-        .map(|x| x.as_any().downcast_ref::<Decimal128Array>().unwrap())
-        .collect::<Vec<_>>();
-
-    for array in arr.iter() {
-        array.iter().for_each(|value| {
-            if let Some(value) = value {
-                if let Some(Ordering::Greater) = value.partial_cmp(&max_value) {
-                    max_value = value;
-                } else if let Some(Ordering::Less) = value.partial_cmp(&min_value) {
-                    min_value = value;
-                }
-            };
-        });
-        null_count += array.null_count() as i64;
-    }
-
-    let precision = arr[0].precision();
-    let scale = arr[0].scale();
     StatisticsRow {
         null_count: ScalarValue::Int64(Some(null_count)),
         min_value: ScalarValue::Decimal128(Some(min_value), precision, scale),
@@ -484,9 +465,7 @@ where
             null_count += array.null_count() as i64;
             for row in array.iter() {
                 if let Some(row) = row {
-                    let Some(values) = row.as_any().downcast_ref::<PrimitiveArray<T>>() else {
-                        continue;
-                    };
+                    let values = as_primitive_array::<T>(&row);
                     for (i, val) in values.iter().enumerate() {
                         if let Some(val) = val {
                             if let Some(Ordering::Greater) = val.partial_cmp(&max_value[i]) {
@@ -540,9 +519,7 @@ where
             if let Some(row) = row {
                 max_length = std::cmp::max(max_length, row.len());
                 min_length = std::cmp::min(min_length, row.len());
-                let Some(values) = row.as_any().downcast_ref::<PrimitiveArray<T>>() else {
-                    continue;
-                };
+                let values = as_primitive_array::<T>(&row);
                 for (i, val) in values.iter().enumerate() {
                     if let Some(val) = val {
                         if let Some(Ordering::Greater) = val.partial_cmp(&max_value[i]) {
@@ -642,7 +619,7 @@ where
     i32: From<<T as ArrowPrimitiveType>::Native>,
 {
     //TODO: can get_temporal_statistics_32 and get_temporal_statistics be merged?
-    let (min_value, max_value, null_count) = get_minimal_primitive::<T>(arrays);
+    let (min_value, max_value, null_count) = get_primitive_statistics::<T>(arrays);
     let mv = Some(min_value.into());
     let mx = Some(max_value.into());
     let min_value_scalar: ScalarValue;
@@ -678,7 +655,7 @@ where
     T::Native: Bounded + PartialOrd,
     i64: From<<T as ArrowPrimitiveType>::Native>,
 {
-    let (min_value, max_value, null_count) = get_minimal_primitive::<T>(arrays);
+    let (min_value, max_value, null_count) = get_primitive_statistics::<T>(arrays);
     let mv = Some(min_value.into());
     let mx = Some(max_value.into());
     let min_value_scalar: ScalarValue;
@@ -1093,6 +1070,7 @@ mod tests {
             source_arrays: Vec<ArrayRef>,
             expected_min: ScalarValue,
             expected_max: ScalarValue,
+            expected_null_count: i64,
         }
 
         let cases: [TestCase; 24] = [
@@ -1104,6 +1082,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::from(-10_i8),
                 expected_max: ScalarValue::from(7_i8),
+                expected_null_count: 0,
             },
             // UInt8
             TestCase {
@@ -1113,6 +1092,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::from(2_u8),
                 expected_max: ScalarValue::from(10_u8),
+                expected_null_count: 0,
             },
             // Int16
             TestCase {
@@ -1122,6 +1102,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::from(-10_i16),
                 expected_max: ScalarValue::from(7_i16),
+                expected_null_count: 0,
             },
             // UInt16
             TestCase {
@@ -1131,6 +1112,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::from(2_u16),
                 expected_max: ScalarValue::from(10_u16),
+                expected_null_count: 0,
             },
             // Int32
             TestCase {
@@ -1140,6 +1122,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::from(-10_i32),
                 expected_max: ScalarValue::from(7_i32),
+                expected_null_count: 0,
             },
             // UInt32
             TestCase {
@@ -1149,6 +1132,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::from(2_u32),
                 expected_max: ScalarValue::from(10_u32),
+                expected_null_count: 0,
             },
             // Int64
             TestCase {
@@ -1158,6 +1142,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::from(-10_i64),
                 expected_max: ScalarValue::from(7_i64),
+                expected_null_count: 0,
             },
             // UInt64
             TestCase {
@@ -1167,12 +1152,14 @@ mod tests {
                 ],
                 expected_min: ScalarValue::from(2_u64),
                 expected_max: ScalarValue::from(10_u64),
+                expected_null_count: 0,
             },
             // Boolean
             TestCase {
                 source_arrays: vec![Arc::new(BooleanArray::from(vec![true, false]))],
                 expected_min: ScalarValue::from(false),
                 expected_max: ScalarValue::from(true),
+                expected_null_count: 0,
             },
             // Date
             TestCase {
@@ -1182,6 +1169,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::Date32(Some(32)),
                 expected_max: ScalarValue::Date32(Some(68)),
+                expected_null_count: 0,
             },
             TestCase {
                 source_arrays: vec![
@@ -1190,6 +1178,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::Date64(Some(32)),
                 expected_max: ScalarValue::Date64(Some(68)),
+                expected_null_count: 0,
             },
             // Time
             TestCase {
@@ -1199,6 +1188,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::Time32Second(Some(32)),
                 expected_max: ScalarValue::Time32Second(Some(68)),
+                expected_null_count: 0,
             },
             TestCase {
                 source_arrays: vec![
@@ -1207,6 +1197,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::Time32Millisecond(Some(32)),
                 expected_max: ScalarValue::Time32Millisecond(Some(68)),
+                expected_null_count: 0,
             },
             TestCase {
                 source_arrays: vec![
@@ -1215,6 +1206,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::Time64Microsecond(Some(32)),
                 expected_max: ScalarValue::Time64Microsecond(Some(68)),
+                expected_null_count: 0,
             },
             TestCase {
                 source_arrays: vec![
@@ -1223,6 +1215,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::Time64Nanosecond(Some(32)),
                 expected_max: ScalarValue::Time64Nanosecond(Some(68)),
+                expected_null_count: 0,
             },
             // Timestamp
             TestCase {
@@ -1238,6 +1231,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::TimestampSecond(Some(32), Some("UTC".into())),
                 expected_max: ScalarValue::TimestampSecond(Some(68), Some("UTC".into())),
+                expected_null_count: 0,
             },
             TestCase {
                 source_arrays: vec![
@@ -1252,6 +1246,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::TimestampMillisecond(Some(32), Some("UTC".into())),
                 expected_max: ScalarValue::TimestampMillisecond(Some(68), Some("UTC".into())),
+                expected_null_count: 0,
             },
             TestCase {
                 source_arrays: vec![
@@ -1266,6 +1261,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::TimestampMicrosecond(Some(32), Some("UTC".into())),
                 expected_max: ScalarValue::TimestampMicrosecond(Some(68), Some("UTC".into())),
+                expected_null_count: 0,
             },
             TestCase {
                 source_arrays: vec![
@@ -1280,6 +1276,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::TimestampNanosecond(Some(32), Some("UTC".into())),
                 expected_max: ScalarValue::TimestampNanosecond(Some(68), Some("UTC".into())),
+                expected_null_count: 0,
             },
             // Duration
             TestCase {
@@ -1289,6 +1286,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::DurationSecond(Some(32)),
                 expected_max: ScalarValue::DurationSecond(Some(68)),
+                expected_null_count: 0,
             },
             TestCase {
                 source_arrays: vec![
@@ -1297,6 +1295,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::DurationMillisecond(Some(32)),
                 expected_max: ScalarValue::DurationMillisecond(Some(68)),
+                expected_null_count: 0,
             },
             TestCase {
                 source_arrays: vec![
@@ -1305,6 +1304,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::DurationMicrosecond(Some(32)),
                 expected_max: ScalarValue::DurationMicrosecond(Some(68)),
+                expected_null_count: 0,
             },
             TestCase {
                 source_arrays: vec![
@@ -1313,6 +1313,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::DurationNanosecond(Some(32)),
                 expected_max: ScalarValue::DurationNanosecond(Some(68)),
+                expected_null_count: 0,
             },
             // Decimal
             TestCase {
@@ -1322,6 +1323,7 @@ mod tests {
                 ],
                 expected_min: ScalarValue::try_new_decimal128(32, 38, 10).unwrap(),
                 expected_max: ScalarValue::try_new_decimal128(68, 38, 10).unwrap(),
+                expected_null_count: 0,
             },
         ];
 
@@ -1331,9 +1333,9 @@ mod tests {
             assert_eq!(
                 stats,
                 StatisticsRow {
-                    null_count: ScalarValue::Int64(Some(0)),
                     min_value: case.expected_min,
                     max_value: case.expected_max,
+                    null_count: case.expected_null_count.into(),
                 },
                 "Statistics are wrong for input data: {:?}",
                 case.source_arrays
