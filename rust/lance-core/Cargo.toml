@@ -1,0 +1,25 @@
+[package]
+name = "lance-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arrow-schema.workspace = true
+tokio.workspace = true
+datafusion-common.workspace = true
+datafusion-sql.workspace = true
+object_store.workspace = true
+prost-types.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+snafu.workspace = true
+url.workspace = true
