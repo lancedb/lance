@@ -23,7 +23,7 @@ use std::slice::from_raw_parts;
 use std::sync::Arc;
 
 use arrow::array::{as_boolean_array, BooleanBuilder};
-use arrow_arith::arithmetic::subtract_scalar;
+use arrow_arith::numeric::sub;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
     make_array, new_empty_array, Array, ArrayRef, BooleanArray, FixedSizeBinaryArray,
@@ -342,7 +342,7 @@ impl<'a> PlainDecoder<'a> {
                 let end = request.value(request.len() - 1);
                 let array = self.get(start as usize..end as usize + 1).await?;
 
-                let shifted_indices = subtract_scalar(request, start)?;
+                let shifted_indices = sub(request, &UInt32Array::new_scalar(start))?;
                 Ok::<ArrayRef, Error>(take(&array, &shifted_indices, None)?)
             })
             .buffered(num_cpus::get())
@@ -405,7 +405,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
                 let start = request.value(0);
                 let end = request.value(request.len() - 1);
                 let array = self.get(start as usize..end as usize + 1).await?;
-                let adjusted_offsets = subtract_scalar(request, start)?;
+                let adjusted_offsets = sub(request, &UInt32Array::new_scalar(start))?;
                 Ok::<ArrayRef, Error>(take(&array, &adjusted_offsets, None)?)
             })
             .buffered(num_cpus::get() * PARALLELISM_FACTOR)

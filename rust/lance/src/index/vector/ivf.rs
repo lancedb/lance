@@ -16,7 +16,7 @@
 
 use std::{any::Any, sync::Arc};
 
-use arrow_arith::arithmetic::subtract_dyn;
+use arrow_arith::numeric::sub;
 use arrow_array::{
     cast::{as_primitive_array, as_struct_array, AsArray},
     types::Float32Type,
@@ -125,7 +125,7 @@ impl IVFIndex {
         };
 
         let partition_centroids = self.ivf.centroids.value(partition_id);
-        let residual_key = subtract_dyn(query.key.as_ref(), &partition_centroids)?;
+        let residual_key = sub(query.key.as_ref(), &partition_centroids)?;
         // Query in partition.
         let mut part_query = query.clone();
         part_query.key = as_primitive_array(&residual_key).clone().into();
