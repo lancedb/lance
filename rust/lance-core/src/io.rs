@@ -12,7 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod error;
-pub mod io;
+use async_trait::async_trait;
+use tokio::io::AsyncWrite;
 
-pub use error::{Error, Result};
+/// A trait for writing to a file on local file system or object store.
+#[async_trait]
+pub trait Write: AsyncWrite + Unpin + Send {
+    /// Tell the current offset.
+    fn tell(&self) -> usize;
+}

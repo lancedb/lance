@@ -15,14 +15,13 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use arrow_array::Array;
+use lance_core::io::Write as LanceWrite;
 use object_store::{path::Path, MultipartId};
 use pin_project::pin_project;
 use prost::Message;
 use snafu::{location, Location};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::encodings::plain::PlainEncoder;
 use crate::format::{ProtoStruct, MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use crate::io::ObjectStore;
 use crate::{Error, Result};
@@ -31,11 +30,9 @@ use crate::{Error, Result};
 ///
 #[pin_project]
 pub struct ObjectWriter {
-    store: ObjectStore,
-
     // TODO: wrap writer with a BufWriter.
     #[pin]
-    writer: Box<dyn AsyncWrite + Unpin + Send>,
+    writer: Box<dyn AsyncWrite + Send + Unpin>,
 
     pub(crate) multipart_id: MultipartId,
 
@@ -55,16 +52,10 @@ impl ObjectWriter {
                 })?;
 
         Ok(Self {
-            store: object_store.clone(),
             writer,
             multipart_id,
             cursor: 0,
         })
-    }
-
-    /// Tell the current position (file size).
-    pub fn tell(&self) -> usize {
-        self.cursor
     }
 
     /// Write a protobuf message to the object, and returns the file position of the protobuf.
@@ -87,18 +78,6 @@ impl ObjectWriter {
         self.write_protobuf(&msg).await
     }
 
-    /// Write arrays, as single array, using plain encoding
-    ///
-    /// Returns the file position if success.
-    pub async fn write_plain_encoded_array(&mut self, arrays: &[&dyn Array]) -> Result<usize> {
-        if arrays.is_empty() {
-            return Ok(self.tell());
-        }
-        let data_type = arrays[0].data_type();
-        let mut encoder = PlainEncoder::new(self, data_type);
-        encoder.encode(arrays).await
-    }
-
     /// Write magics to the tail of a file before closing the file.
     pub async fn write_magics(&mut self, pos: usize) -> Result<()> {
         self.write_i64_le(pos as i64).await?;
@@ -109,7 +88,13 @@ impl ObjectWriter {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
-        Ok(self.writer.shutdown().await?)
+        Ok(self.writer.as_mut().shutdown().await?)
+    }
+}
+
+impl LanceWrite for ObjectWriter {
+    fn tell(&self) -> usize {
+        self.cursor
     }
 }
 
