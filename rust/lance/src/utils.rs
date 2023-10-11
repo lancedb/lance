@@ -23,6 +23,7 @@ pub mod temporal;
 pub mod testing;
 #[cfg(feature = "tfrecord")]
 pub mod tfrecord;
+pub(crate) mod tokio;
 
 // Re-export
 pub use lance_linalg::kmeans;

@@ -34,16 +34,17 @@ use rand::SeedableRng;
 use serde::Serialize;
 
 use super::{MetricType, Query, VectorIndex};
-use crate::arrow::*;
 use crate::dataset::ROW_ID;
 use crate::index::{
     pb, prefilter::PreFilter, vector::kmeans::train_kmeans, vector::DIST_COL, Index,
 };
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
+use crate::{arrow::*, utils::tokio::spawn_cpu};
 use crate::{Error, Result};
 
 /// Product Quantization Index.
 ///
+#[derive(Clone)]
 pub struct PQIndex {
     /// Number of bits for the centroids.
     ///
@@ -266,25 +267,30 @@ impl VectorIndex for PQIndex {
             self.filter_arrays(pre_filter).await?
         };
 
-        // Pre-compute distance table for each sub-vector.
-        let distances = if self.metric_type == MetricType::L2 {
-            self.fast_l2_distances(&query.key, code.as_ref())?
-        } else {
-            self.cosine_distances(&query.key, code.as_ref())?
-        };
+        let this = self.clone();
+        let query = query.clone();
+        spawn_cpu(move || {
+            // Pre-compute distance table for each sub-vector.
+            let distances = if this.metric_type == MetricType::L2 {
+                this.fast_l2_distances(&query.key, code.as_ref())?
+            } else {
+                this.cosine_distances(&query.key, code.as_ref())?
+            };
 
-        debug_assert_eq!(distances.len(), row_ids.len());
+            debug_assert_eq!(distances.len(), row_ids.len());
 
-        let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
-        let indices = sort_to_indices(&distances, None, Some(limit))?;
-        let distances = take(&distances, &indices, None)?;
-        let row_ids = take(row_ids.as_ref(), &indices, None)?;
+            let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
+            let indices = sort_to_indices(&distances, None, Some(limit))?;
+            let distances = take(&distances, &indices, None)?;
+            let row_ids = take(row_ids.as_ref(), &indices, None)?;
 
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new(DIST_COL, DataType::Float32, false),
-            ArrowField::new(ROW_ID, DataType::UInt64, false),
-        ]));
-        Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(DIST_COL, DataType::Float32, false),
+                ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ]));
+            Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
+        })
+        .await
     }
 
     fn is_loadable(&self) -> bool {
