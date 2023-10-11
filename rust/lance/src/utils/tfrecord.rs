@@ -18,6 +18,7 @@
 //! [read_tfrecord] to read the file into an Arrow record batch stream.
 
 use arrow::buffer::OffsetBuffer;
+use arrow::datatypes::ArrowPrimitiveType;
 use arrow_array::builder::PrimitiveBuilder;
 use arrow_array::{ArrayRef, FixedSizeListArray, ListArray};
 use arrow_buffer::ScalarBuffer;
