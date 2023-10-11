@@ -19,7 +19,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aws_sdk_dynamodb::operation::{get_item::builders::GetItemFluentBuilder, put_item::builders::PutItemFluentBuilder, query::builders::QueryFluentBuilder};
+use aws_sdk_dynamodb::operation::{
+    get_item::builders::GetItemFluentBuilder, put_item::builders::PutItemFluentBuilder,
+    query::builders::QueryFluentBuilder,
+};
 use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
 use aws_sdk_dynamodb::Client;
 use snafu::OptionExt;
