@@ -1,15 +1,15 @@
 ifeq ($(CI), true)
-    PYTEST_ARGS = -v --durations=30
+    PYTEST_ARGS = -vvv -s -W error::DeprecationWarning -W error::FutureWarning --durations=30
 else
-    PYTEST_ARGS = -v
+    PYTEST_ARGS = -vvv -s -W error::DeprecationWarning -W error::FutureWarning
 endif
 
 test:
-	pytest -m 'not (integration or cuda)' $(PYTEST_ARGS) python/tests
+	pytest $(PYTEST_ARGS) python/tests
 .PHONY: test
 
 integtest:
-	pytest -m 'integration' $(PYTEST_ARGS) python/tests
+	pytest --run-integration $(PYTEST_ARGS) python/tests
 .PHONY: integtest
 
 format:
