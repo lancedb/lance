@@ -390,7 +390,7 @@ impl Scanner {
         let session_config = SessionConfig::new();
         let runtime_config = RuntimeConfig::new();
         let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
-        let session_state = SessionState::with_config_rt(session_config, runtime_env);
+        let session_state = SessionState::new_with_config_rt(session_config, runtime_env);
         // NOTE: we are only executing the first partition here. Therefore, if
         // the plan has more than one partition, we will be missing data.
         assert_eq!(plan.output_partitioning().partition_count(), 1);

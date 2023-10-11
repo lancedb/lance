@@ -159,15 +159,22 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+fn arrow_io_error_from_msg(message: String) -> ArrowError {
+    ArrowError::IoError(
+        message.clone(),
+        std::io::Error::new(std::io::ErrorKind::Other, message),
+    )
+}
+
 impl From<Error> for ArrowError {
     fn from(value: Error) -> Self {
         match value {
-            Error::Arrow { message: err } => Self::IoError(err), // we lose the error type converting to LanceError
-            Error::IO { message: err, .. } => Self::IoError(err),
-            Error::Schema { message: err, .. } => Self::SchemaError(err),
-            Error::Index { message: err } => Self::IoError(err),
-            Error::Stop => Self::IoError("early stop".to_string()),
-            e => Self::IoError(e.to_string()), // Find a more scalable way of doing this
+            Error::Arrow { message } => arrow_io_error_from_msg(message), // we lose the error type converting to LanceError
+            Error::IO { message, .. } => arrow_io_error_from_msg(message),
+            Error::Schema { message, .. } => Self::SchemaError(message),
+            Error::Index { message } => arrow_io_error_from_msg(message),
+            Error::Stop => arrow_io_error_from_msg("early stop".to_string()),
+            e => arrow_io_error_from_msg(e.to_string()), // Find a more scalable way of doing this
         }
     }
 }
