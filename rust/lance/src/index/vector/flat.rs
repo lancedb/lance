@@ -39,6 +39,7 @@ fn distance_field() -> ArrowField {
     ArrowField::new(DIST_COL, DataType::Float32, false)
 }
 
+#[instrument(skip_all)]
 pub async fn flat_search(
     stream: impl RecordBatchStream + 'static,
     query: &Query,

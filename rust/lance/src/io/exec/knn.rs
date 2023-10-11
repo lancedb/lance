@@ -47,6 +47,7 @@ pub struct KNNFlatStream {
 
 impl KNNFlatStream {
     /// Construct a [`KNNFlatStream`] node.
+    #[instrument(skip_all, name = "KNNFlatStream::new")]
     pub(crate) fn new(child: SendableRecordBatchStream, query: &Query) -> Self {
         let stream = DatasetRecordBatchStream::new(child);
         Self::from_stream(stream, query)
@@ -56,26 +57,29 @@ impl KNNFlatStream {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
         let q = query.clone();
-        let bg_thread = tokio::spawn(async move {
-            let batch = match flat_search(stream, &q).await {
-                Ok(b) => b,
-                Err(e) => {
-                    tx.send(Err(DataFusionError::Execution(format!(
-                        "Failed to compute distances: {e}"
-                    ))))
-                    .await
-                    .expect("KNNFlat failed to send message");
-                    return;
-                }
-            };
-
-            if !tx.is_closed() {
-                if let Err(e) = tx.send(Ok(batch)).await {
-                    eprintln!("KNNFlat tx.send error: {e}")
+        let bg_thread = tokio::spawn(
+            async move {
+                let batch = match flat_search(stream, &q).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tx.send(Err(DataFusionError::Execution(format!(
+                            "Failed to compute distances: {e}"
+                        ))))
+                        .await
+                        .expect("KNNFlat failed to send message");
+                        return;
+                    }
                 };
+
+                if !tx.is_closed() {
+                    if let Err(e) = tx.send(Ok(batch)).await {
+                        eprintln!("KNNFlat tx.send error: {e}")
+                    };
+                }
+                drop(tx);
             }
-            drop(tx);
-        });
+            .in_current_span(),
+        );
 
         Self {
             rx,
