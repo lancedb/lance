@@ -34,7 +34,7 @@ use crate::{Error, Result};
 pub struct ObjectWriter {
     // TODO: wrap writer with a BufWriter.
     #[pin]
-    writer: Box<dyn AsyncWrite + Unpin + Send>,
+    writer: Box<dyn AsyncWrite + Send + Unpin>,
 
     pub(crate) multipart_id: MultipartId,
 
@@ -102,7 +102,7 @@ impl ObjectWriter {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
-        Ok(self.writer.shutdown().await?)
+        Ok(self.writer.as_mut().shutdown().await?)
     }
 }
 

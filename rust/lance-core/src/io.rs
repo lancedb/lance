@@ -15,7 +15,7 @@
 use tokio::io::AsyncWrite;
 
 /// A trait for writing to a file on local file system or object store.
-pub trait Write: AsyncWrite + Send + Sync {
+pub trait Write: AsyncWrite + Unpin + Send {
     /// Tell the current offset.
     fn tell(&self) -> usize;
 }

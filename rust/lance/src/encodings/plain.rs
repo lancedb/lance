@@ -37,6 +37,7 @@ use arrow_select::take::take;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use lance_core::io::Write;
 use snafu::{location, Location};
 use tokio::io::AsyncWriteExt;
 
@@ -44,7 +45,6 @@ use crate::arrow::*;
 use crate::encodings::AsyncIndex;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
-use crate::io::object_writer::ObjectWriter;
 use crate::io::ReadBatchParams;
 use crate::Error;
 
@@ -58,12 +58,12 @@ const PARALLELISM_FACTOR: usize = 4;
 /// Encoder for plain encoding.
 ///
 pub struct PlainEncoder<'a> {
-    writer: &'a mut ObjectWriter,
+    writer: &'a mut dyn Write,
     data_type: &'a DataType,
 }
 
 impl<'a> PlainEncoder<'a> {
-    pub fn new(writer: &'a mut ObjectWriter, data_type: &'a DataType) -> PlainEncoder<'a> {
+    pub fn new(writer: &'a mut dyn Write, data_type: &'a DataType) -> PlainEncoder<'a> {
         PlainEncoder { writer, data_type }
     }
 

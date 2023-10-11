@@ -503,6 +503,7 @@ mod tests {
     };
     use object_store::path::Path;
 
+    use crate::io::object_writer::ObjectWriter;
     use crate::io::ObjectStore;
 
     async fn write_test_data<O: OffsetSizeTrait>(
