@@ -18,7 +18,7 @@ use super::{shuffler::Shuffler, Ivf};
 use crate::dataset::ROW_ID;
 use crate::io::object_writer::ObjectWriter;
 use crate::Result;
-use lance_index::vector::ivf::PQ_CODE_COLUMN;
+use lance_index::vector::PQ_CODE_COLUMN;
 
 /// Write each partition of IVF_PQ index to the index file.
 ///

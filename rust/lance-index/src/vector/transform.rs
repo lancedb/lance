@@ -15,10 +15,9 @@
 //! Vector Transforms
 //!
 
-use arrow_array::{types::Float32Type, RecordBatch};
+use arrow_array::RecordBatch;
 
 use lance_core::Result;
-use lance_linalg::MatrixView;
 
 /// Transform of a Vector Matrix.
 ///
@@ -27,38 +26,4 @@ pub trait Transformer: std::fmt::Debug + Sync + Send {
     /// Transform a [`RecordBatch`] of vectors
     ///
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch>;
-}
-
-/// Compute the residual vector of a Vector Matrix to their centroids.
-#[derive(Clone)]
-pub struct ResidualTransform {
-    centroids: MatrixView<Float32Type>,
-
-    /// Partition Column
-    part_col: String,
-
-    /// Vector Column
-    vec_col: String,
-}
-
-impl std::fmt::Debug for ResidualTransform {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ResidualTransform")
-    }
-}
-
-impl ResidualTransform {
-    pub fn new(centroids: MatrixView<Float32Type>, part_col: &str, column: &str) -> Self {
-        Self {
-            centroids,
-            part_col: part_col.to_owned(),
-            vec_col: column.to_owned(),
-        }
-    }
-}
-
-impl Transformer for ResidualTransform {
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        todo!()
-    }
 }

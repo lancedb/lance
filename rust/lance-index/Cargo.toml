@@ -15,6 +15,7 @@ rust-version.workspace = true
 arrow-schema.workspace = true
 arrow-array.workspace = true
 arrow-ord.workspace = true
+futures.workspace = true
 lance-arrow.workspace = true
 lance-core.workspace = true
 lance-linalg.workspace = true

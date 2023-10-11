@@ -24,7 +24,7 @@ use futures::{
     StreamExt, TryStreamExt,
 };
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
-use lance_index::vector::{transform::Transformer, PQ_CODE_COLUMN};
+use lance_index::vector::PQ_CODE_COLUMN;
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 use tracing::instrument;
@@ -117,15 +117,6 @@ fn filter_batch_by_partition(
         parted_batches.push((part_id, parted_batch));
     }
     Ok(parted_batches)
-}
-
-pub(crate) async fn shuffle_partitions(
-    shuffler: &mut ShufflerBuilder,
-    ivf: &Ivf,
-    transforms: &[Arc<dyn Transformer>],
-    stream: impl RecordBatchStream + Unpin,
-) -> Result<()> {
-    todo!()
 }
 
 /// Build specific partitions of IVF index.

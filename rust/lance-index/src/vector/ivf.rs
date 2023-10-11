@@ -30,15 +30,13 @@ use lance_linalg::{
 use snafu::{location, Location};
 use tracing::instrument;
 
+use super::PART_ID_COLUMN;
 use crate::vector::transform::Transformer;
-
-pub const PQ_CODE_COLUMN: &str = "__pq_code";
-pub const PART_ID_COLUMN: &str = "__ivf_part_id";
 
 /// IVF - IVF file partition
 ///
 #[derive(Debug, Clone)]
-pub(crate) struct Ivf {
+pub struct Ivf {
     /// KMean model of the IVF
     ///
     /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
@@ -122,7 +120,14 @@ impl Ivf {
         let part_ids = self.compute_partitions(&matrix);
 
         let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), false);
-        let batch = batch.try_with_column(field, Arc::new(part_ids))?;
+        let mut batch = batch.try_with_column(field, Arc::new(part_ids))?;
+
+        // Transform each batch
+        for transform in self.transforms.as_slice() {
+            batch = transform.transform(&batch)?;
+        }
+
+        // Divide by partition.
         Ok(vec![])
         // todo!()
     }
