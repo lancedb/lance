@@ -273,6 +273,7 @@ impl Index for IVFIndex {
 
 #[async_trait]
 impl VectorIndex for IVFIndex {
+    #[instrument(skip_all, name = "IVFIndex::search")]
     async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch> {
         let partition_ids =
             self.ivf

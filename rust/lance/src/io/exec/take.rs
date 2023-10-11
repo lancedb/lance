@@ -26,6 +26,7 @@ use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
+use tracing::{instrument, Instrument};
 
 use crate::dataset::{Dataset, ROW_ID};
 use crate::datatypes::Schema;
@@ -51,6 +52,7 @@ impl Take {
     ///  - output_schema: the output schema of the take node.
     ///  - child: the upstream stream to feed data in.
     ///  - batch_readahead: max number of batches to readahead, potentially concurrently
+    #[instrument(skip_all, name = "Take::new")]
     fn new(
         dataset: Arc<Dataset>,
         projection: Arc<Schema>,
@@ -60,39 +62,42 @@ impl Take {
     ) -> Self {
         let (tx, rx) = mpsc::channel(4);
 
-        let bg_thread = tokio::spawn(async move {
-            if let Err(e) = child
-                .zip(stream::repeat_with(|| {
-                    (dataset.clone(), projection.clone())
-                }))
-                .map(|(batch, (dataset, extra))| async move {
-                    Self::take_batch(batch?, dataset, extra).await
-                })
-                .buffered(batch_readahead)
-                .map(|r| r.map_err(|e| DataFusionError::Execution(e.to_string())))
-                .try_for_each(|b| async {
-                    if tx.is_closed() {
-                        eprintln!("ExecNode(Take): channel closed");
-                        return Err(DataFusionError::Execution(
-                            "ExecNode(Take): channel closed".to_string(),
-                        ));
-                    }
-                    if let Err(e) = tx.send(Ok(b)).await {
+        let bg_thread = tokio::spawn(
+            async move {
+                if let Err(e) = child
+                    .zip(stream::repeat_with(|| {
+                        (dataset.clone(), projection.clone())
+                    }))
+                    .map(|(batch, (dataset, extra))| async move {
+                        Self::take_batch(batch?, dataset, extra).await
+                    })
+                    .buffered(batch_readahead)
+                    .map(|r| r.map_err(|e| DataFusionError::Execution(e.to_string())))
+                    .try_for_each(|b| async {
+                        if tx.is_closed() {
+                            eprintln!("ExecNode(Take): channel closed");
+                            return Err(DataFusionError::Execution(
+                                "ExecNode(Take): channel closed".to_string(),
+                            ));
+                        }
+                        if let Err(e) = tx.send(Ok(b)).await {
+                            eprintln!("ExecNode(Take): {}", e);
+                            return Err(DataFusionError::Execution(
+                                "ExecNode(Take): channel closed".to_string(),
+                            ));
+                        }
+                        Ok(())
+                    })
+                    .await
+                {
+                    if let Err(e) = tx.send(Err(e)).await {
                         eprintln!("ExecNode(Take): {}", e);
-                        return Err(DataFusionError::Execution(
-                            "ExecNode(Take): channel closed".to_string(),
-                        ));
                     }
-                    Ok(())
-                })
-                .await
-            {
-                if let Err(e) = tx.send(Err(e)).await {
-                    eprintln!("ExecNode(Take): {}", e);
                 }
+                drop(tx)
             }
-            drop(tx)
-        });
+            .in_current_span(),
+        );
 
         Self {
             rx,
@@ -106,6 +111,7 @@ impl Take {
     // doesn't produce a higher-order lifetime error.
     // manually implemented async for Send bound
     #[allow(clippy::manual_async_fn)]
+    #[instrument(skip_all)]
     fn take_batch(
         batch: RecordBatch,
         dataset: Arc<Dataset>,
@@ -123,6 +129,7 @@ impl Take {
             };
             Ok::<RecordBatch, Error>(rows)
         }
+        .in_current_span()
     }
 }
 
