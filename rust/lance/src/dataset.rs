@@ -385,8 +385,8 @@ impl Dataset {
                 let m = d.manifest.as_ref();
                 if schema != m.schema {
                     return Err(Error::SchemaMismatch {
-                        original: m.schema.clone(),
-                        new: schema,
+                        // original: m.schema.clone(),
+                        // new: schema,
                     });
                 }
             }
@@ -479,8 +479,8 @@ impl Dataset {
         // Return Error if append and input schema differ
         if self.manifest.schema != schema {
             return Err(Error::SchemaMismatch {
-                original: self.manifest.schema.clone(),
-                new: schema,
+                // original: self.manifest.schema.clone(),
+                // new: schema,
             });
         }
 
