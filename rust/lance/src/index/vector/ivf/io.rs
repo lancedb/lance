@@ -16,7 +16,7 @@ use futures::StreamExt;
 
 use super::{shuffler::Shuffler, Ivf};
 use crate::dataset::ROW_ID;
-use crate::io::object_writer::ObjectWriter;
+use crate::encodings::plain::PlainEncoder;
 use crate::Result;
 use lance_core::io::Write;
 use lance_index::vector::PQ_CODE_COLUMN;
@@ -25,7 +25,7 @@ use lance_index::vector::PQ_CODE_COLUMN;
 ///
 /// Partitioned index data is already sorted in the [Shuffler].
 pub(super) async fn write_index_partitions(
-    writer: &mut ObjectWriter,
+    writer: &mut dyn Write,
     ivf: &mut Ivf,
     shuffler: &Shuffler<'_>,
 ) -> Result<()> {
@@ -45,12 +45,10 @@ pub(super) async fn write_index_partitions(
             ivf.add_partition(writer.tell(), total_records as u32);
 
             let pq_refs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-            writer.write_plain_encoded_array(pq_refs.as_slice()).await?;
+            PlainEncoder::write(writer, pq_refs.as_slice()).await?;
 
             let row_ids_refs = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-            writer
-                .write_plain_encoded_array(row_ids_refs.as_slice())
-                .await?;
+            PlainEncoder::write(writer, row_ids_refs.as_slice()).await?;
         } else {
             ivf.add_partition(writer.tell(), 0);
         }

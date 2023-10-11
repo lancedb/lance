@@ -15,7 +15,6 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use arrow_array::Array;
 use lance_core::io::Write as LanceWrite;
 use object_store::{path::Path, MultipartId};
 use pin_project::pin_project;
@@ -23,7 +22,6 @@ use prost::Message;
 use snafu::{location, Location};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::encodings::plain::PlainEncoder;
 use crate::format::{ProtoStruct, MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use crate::io::ObjectStore;
 use crate::{Error, Result};
@@ -78,18 +76,6 @@ impl ObjectWriter {
     ) -> Result<usize> {
         let msg: M = M::from(obj);
         self.write_protobuf(&msg).await
-    }
-
-    /// Write arrays, as single array, using plain encoding
-    ///
-    /// Returns the file position if success.
-    pub async fn write_plain_encoded_array(&mut self, arrays: &[&dyn Array]) -> Result<usize> {
-        if arrays.is_empty() {
-            return Ok(self.tell());
-        }
-        let data_type = arrays[0].data_type();
-        let mut encoder = PlainEncoder::new(self, data_type);
-        encoder.encode(arrays).await
     }
 
     /// Write magics to the tail of a file before closing the file.

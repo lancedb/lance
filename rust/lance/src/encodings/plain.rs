@@ -67,6 +67,16 @@ impl<'a> PlainEncoder<'a> {
         PlainEncoder { writer, data_type }
     }
 
+    /// Write an continuous plain-encoded array to the writer.
+    pub async fn write(writer: &'a mut dyn Write, arrays: &[&'a dyn Array]) -> Result<usize> {
+        let pos = writer.tell();
+        if !arrays.is_empty() {
+            let mut encoder = Self::new(writer, arrays[0].data_type());
+            encoder.encode(arrays).await?;
+        }
+        Ok(pos)
+    }
+
     /// Encode an slice of an Array of a batch.
     /// Returns the offset of the metadata
     pub async fn encode(&mut self, arrays: &[&dyn Array]) -> Result<usize> {
