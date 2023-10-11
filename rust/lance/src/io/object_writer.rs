@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use arrow_array::Array;
+use lance_core::io::Write as LanceWrite;
 use object_store::{path::Path, MultipartId};
 use pin_project::pin_project;
 use prost::Message;
@@ -31,8 +32,6 @@ use crate::{Error, Result};
 ///
 #[pin_project]
 pub struct ObjectWriter {
-    store: ObjectStore,
-
     // TODO: wrap writer with a BufWriter.
     #[pin]
     writer: Box<dyn AsyncWrite + Unpin + Send>,
@@ -55,16 +54,10 @@ impl ObjectWriter {
                 })?;
 
         Ok(Self {
-            store: object_store.clone(),
             writer,
             multipart_id,
             cursor: 0,
         })
-    }
-
-    /// Tell the current position (file size).
-    pub fn tell(&self) -> usize {
-        self.cursor
     }
 
     /// Write a protobuf message to the object, and returns the file position of the protobuf.
@@ -110,6 +103,12 @@ impl ObjectWriter {
 
     pub async fn shutdown(&mut self) -> Result<()> {
         Ok(self.writer.shutdown().await?)
+    }
+}
+
+impl LanceWrite for ObjectWriter {
+    fn tell(&self) -> usize {
+        self.cursor
     }
 }
 

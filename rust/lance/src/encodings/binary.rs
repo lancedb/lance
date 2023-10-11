@@ -36,6 +36,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::io::Write;
 use tokio::io::AsyncWriteExt;
 
 use super::Encoder;
@@ -43,17 +44,16 @@ use super::{plain::PlainDecoder, AsyncIndex};
 use crate::encodings::Decoder;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
-use crate::io::object_writer::ObjectWriter;
 use crate::io::ReadBatchParams;
 use snafu::{location, Location};
 
 /// Encoder for Var-binary encoding.
 pub struct BinaryEncoder<'a> {
-    writer: &'a mut ObjectWriter,
+    writer: &'a mut dyn Write,
 }
 
 impl<'a> BinaryEncoder<'a> {
-    pub fn new(writer: &'a mut ObjectWriter) -> Self {
+    pub fn new(writer: &'a mut dyn Write) -> Self {
         Self { writer }
     }
 

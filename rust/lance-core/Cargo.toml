@@ -13,7 +13,7 @@ rust-version.workspace = true
 
 [dependencies]
 arrow-schema.workspace = true
-tokio.workspace = true
+async-trait.workspace = true
 datafusion-common.workspace = true
 datafusion-sql.workspace = true
 object_store.workspace = true
@@ -22,4 +22,5 @@ prost.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 snafu.workspace = true
+tokio.workspace = true
 url.workspace = true
