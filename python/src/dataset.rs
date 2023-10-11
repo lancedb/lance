@@ -415,7 +415,7 @@ impl Dataset {
 
     fn take(
         self_: PyRef<'_, Self>,
-        row_indices: Vec<usize>,
+        row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
         let projection = if let Some(columns) = columns {
