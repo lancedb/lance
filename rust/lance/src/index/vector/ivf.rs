@@ -31,6 +31,7 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
+use lance_index::vector::RESIDUAL_COLUMN;
 use lance_linalg::{distance::*, kernels::argmin, matrix::MatrixView};
 use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -60,8 +61,6 @@ use crate::{Error, Result};
 mod builder;
 mod io;
 mod shuffler;
-
-const RESIDUAL_COLUMN: &str = "__residual_vector";
 
 /// IVF Index.
 pub struct IVFIndex {

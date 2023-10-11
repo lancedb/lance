@@ -59,6 +59,9 @@ impl ResidualTransform {
 }
 
 impl Transformer for ResidualTransform {
+    /// Replace the original vector in the [`RecordBatch`] to residual vectors.
+    ///
+    /// The new [`RecordBatch`] will have a new column named [`RESIDUAL_COLUMN`].
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let part_ids = batch.column_by_name(&self.part_col).ok_or(Error::Index {
             message: format!(

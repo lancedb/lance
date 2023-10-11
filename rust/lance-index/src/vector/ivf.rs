@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{sync::Arc, vec};
+//! IVF - Inverted File Index
+
+use std::sync::Arc;
 
 use arrow_array::{
     cast::AsArray, types::Float32Type, Array, ArrayRef, FixedSizeListArray, Float32Array,
@@ -67,18 +69,8 @@ impl Ivf {
         self.centroids.value_length() as usize
     }
 
-    /// Number of IVF partitions.
-    fn num_partitions(&self) -> usize {
-        self.centroids.len()
-    }
-
     /// Use the query vector to find `nprobes` closest partitions.
-    fn find_partitions(
-        &self,
-        query: &Float32Array,
-        nprobes: usize,
-        metric_type: MetricType,
-    ) -> Result<UInt32Array> {
+    pub fn find_partitions(&self, query: &Float32Array, nprobes: usize) -> Result<UInt32Array> {
         if query.len() != self.dimension() {
             return Err(Error::IO {
                 message: format!(
@@ -89,7 +81,7 @@ impl Ivf {
                 location: location!(),
             });
         }
-        let dist_func = metric_type.batch_func();
+        let dist_func = self.metric_type.batch_func();
         let centroid_values = self.centroids.values();
         let distances = dist_func(
             query.values(),
@@ -101,11 +93,14 @@ impl Ivf {
     }
 
     /// Partition a batch of vectors into multiple batches, each batch contains vectors and other data.
-    pub fn partition_transform(
-        &self,
-        batch: &RecordBatch,
-        column: &str,
-    ) -> Result<Vec<(u32, RecordBatch)>> {
+    ///
+    /// It transform a [RecordBatch] that contains one vector column into a record batch with
+    /// schema `(PART_ID_COLUMN, ...)`, where [PART_ID_COLUMN] has the partition id for each vector.
+    ///
+    /// Note that the vector column might be transformed by the `transforms` in the IVF.
+    ///
+    /// **Warning**: unstable API.
+    pub fn partition_transform(&self, batch: &RecordBatch, column: &str) -> Result<RecordBatch> {
         let vector_arr = batch.column_by_name(column).ok_or(Error::Index {
             message: format!("Column {} does not exist.", column),
         })?;
@@ -127,9 +122,7 @@ impl Ivf {
             batch = transform.transform(&batch)?;
         }
 
-        // Divide by partition.
-        Ok(vec![])
-        // todo!()
+        Ok(batch)
     }
 
     /// Compute the partition for each row in the input Matrix.

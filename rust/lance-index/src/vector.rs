@@ -19,6 +19,7 @@ pub mod ivf;
 pub mod residual;
 pub mod transform;
 
+// TODO: Make these crate private once the migration from lance to lance-index is done.
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
 pub const PART_ID_COLUMN: &str = "__ivf_part_id";
 

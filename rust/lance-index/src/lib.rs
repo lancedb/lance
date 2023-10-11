@@ -12,4 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Lance secondary index library
+
 pub mod vector;
