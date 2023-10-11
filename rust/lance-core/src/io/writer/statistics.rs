@@ -32,8 +32,8 @@ use arrow_array::{
         TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type,
         UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray,
-    OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray,
+    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, OffsetSizeTrait,
+    PrimitiveArray, RecordBatch, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use datafusion::common::ScalarValue;
@@ -55,7 +55,9 @@ pub struct StatisticsRow {
     pub(crate) max_value: ScalarValue,
 }
 
-fn get_primitive_statistics<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> (T::Native, T::Native, i64)
+fn get_primitive_statistics<T: ArrowNumericType>(
+    arrays: &[&ArrayRef],
+) -> (T::Native, T::Native, i64)
 where
     T::Native: Bounded + PartialOrd,
 {
@@ -1051,7 +1053,7 @@ impl StatisticsBuilder {
 mod tests {
     use arrow_array::{
         builder::StringDictionaryBuilder, BinaryArray, BooleanArray, Date32Array, Date64Array,
-        DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
+        Decimal128Array, DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
         DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray,
         Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
         LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, StringArray, StructArray,
