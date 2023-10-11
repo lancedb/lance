@@ -24,14 +24,13 @@ use futures::{
     StreamExt, TryStreamExt,
 };
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_index::vector::{transform::Transformer, PQ_CODE_COLUMN};
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 use tracing::instrument;
 
 use crate::dataset::ROW_ID;
-use crate::index::vector::ivf::{
-    io::write_index_partitions, shuffler::ShufflerBuilder, Ivf, PQ_CODE_COLUMN,
-};
+use crate::index::vector::ivf::{io::write_index_partitions, shuffler::ShufflerBuilder, Ivf};
 use crate::index::vector::pq::ProductQuantizer;
 use crate::{
     io::{object_writer::ObjectWriter, RecordBatchStream},
@@ -118,6 +117,15 @@ fn filter_batch_by_partition(
         parted_batches.push((part_id, parted_batch));
     }
     Ok(parted_batches)
+}
+
+pub(crate) async fn shuffle_partitions(
+    shuffler: &mut ShufflerBuilder,
+    ivf: &Ivf,
+    transforms: &[Arc<dyn Transformer>],
+    stream: impl RecordBatchStream + Unpin,
+) -> Result<()> {
+    todo!()
 }
 
 /// Build specific partitions of IVF index.

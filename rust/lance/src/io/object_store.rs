@@ -42,7 +42,7 @@ use snafu::{location, Location};
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 use url::Url;
 
-use crate::error::{Error, Result};
+use lance_core::error::{Error, Result};
 use crate::io::object_reader::CloudObjectReader;
 use crate::io::object_writer::ObjectWriter;
 
@@ -55,18 +55,6 @@ use super::local::LocalObjectReader;
 use super::object_reader::ObjectReader;
 
 mod tracing;
-
-// This is a bit odd but some object_store functions only accept
-// Stream<Result<T, ObjectStoreError>> and so we need to convert
-// to ObjectStoreError to call the methods.
-impl From<Error> for ObjectStoreError {
-    fn from(err: Error) -> Self {
-        Self::Generic {
-            store: "N/A",
-            source: Box::new(err),
-        }
-    }
-}
 
 /// Wraps [ObjectStore](object_store::ObjectStore)
 #[derive(Debug, Clone)]

@@ -62,7 +62,6 @@ mod io;
 mod shuffler;
 
 const RESIDUAL_COLUMN: &str = "__residual_vector";
-const PQ_CODE_COLUMN: &str = "__pq_code";
 
 /// IVF Index.
 pub struct IVFIndex {

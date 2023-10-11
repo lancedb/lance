@@ -18,23 +18,22 @@
 use arrow_schema::ArrowError;
 use snafu::{location, Location, Snafu};
 
-use crate::datatypes::Schema;
-
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-pub(crate) fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
+pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
     Box::new(e)
 }
 
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
+#[snafu(visibility(pub))]
 pub enum Error {
     #[snafu(display("Invalid user input: {source}"))]
     InvalidInput { source: BoxedError },
     #[snafu(display("Dataset already exists: {uri}"))]
     DatasetAlreadyExists { uri: String },
-    #[snafu(display("Append with different schema: original={original} new={new}"))]
-    SchemaMismatch { original: Schema, new: Schema },
+    // #[snafu(display("Append with different schema: original={original} new={new}"))]
+    #[snafu(display("Append with different schema:"))]
+    SchemaMismatch {  },
     #[snafu(display("Dataset at path {path} was not found: {source}"))]
     DatasetNotFound { path: String, source: BoxedError },
     #[snafu(display("Encountered corrupt file {path}: {source}"))]
@@ -152,6 +151,14 @@ impl From<url::ParseError> for Error {
     }
 }
 
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Arrow {
+            message: e.to_string(),
+        }
+    }
+}
+
 impl From<Error> for ArrowError {
     fn from(value: Error) -> Self {
         match value {
@@ -165,8 +172,8 @@ impl From<Error> for ArrowError {
     }
 }
 
-impl From<datafusion::sql::sqlparser::parser::ParserError> for Error {
-    fn from(e: datafusion::sql::sqlparser::parser::ParserError) -> Self {
+impl From<datafusion_sql::sqlparser::parser::ParserError> for Error {
+    fn from(e: datafusion_sql::sqlparser::parser::ParserError) -> Self {
         Self::IO {
             message: e.to_string(),
             location: location!(),
@@ -174,8 +181,8 @@ impl From<datafusion::sql::sqlparser::parser::ParserError> for Error {
     }
 }
 
-impl From<datafusion::sql::sqlparser::tokenizer::TokenizerError> for Error {
-    fn from(e: datafusion::sql::sqlparser::tokenizer::TokenizerError) -> Self {
+impl From<datafusion_sql::sqlparser::tokenizer::TokenizerError> for Error {
+    fn from(e: datafusion_sql::sqlparser::tokenizer::TokenizerError) -> Self {
         Self::IO {
             message: e.to_string(),
             location: location!(),
@@ -183,17 +190,29 @@ impl From<datafusion::sql::sqlparser::tokenizer::TokenizerError> for Error {
     }
 }
 
-impl From<Error> for datafusion::error::DataFusionError {
+impl From<Error> for datafusion_common::DataFusionError {
     fn from(e: Error) -> Self {
         Self::Execution(e.to_string())
     }
 }
 
-impl From<datafusion::error::DataFusionError> for Error {
-    fn from(e: datafusion::error::DataFusionError) -> Self {
+impl From<datafusion_common::DataFusionError> for Error {
+    fn from(e: datafusion_common::DataFusionError) -> Self {
         Self::IO {
             message: e.to_string(),
             location: location!(),
+        }
+    }
+}
+
+// This is a bit odd but some object_store functions only accept
+// Stream<Result<T, ObjectStoreError>> and so we need to convert
+// to ObjectStoreError to call the methods.
+impl From<Error> for object_store::Error {
+    fn from(err: Error) -> Self {
+        Self::Generic {
+            store: "N/A",
+            source: Box::new(err),
         }
     }
 }

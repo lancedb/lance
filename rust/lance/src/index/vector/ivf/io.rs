@@ -16,7 +16,7 @@ use futures::StreamExt;
 
 use super::{shuffler::Shuffler, Ivf};
 use crate::dataset::ROW_ID;
-use crate::index::vector::ivf::PQ_CODE_COLUMN;
+use lance_index::vector::ivf::PQ_CODE_COLUMN;
 use crate::io::object_writer::ObjectWriter;
 use crate::Result;
 
