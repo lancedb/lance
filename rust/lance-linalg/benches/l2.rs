@@ -14,10 +14,14 @@
 
 use arrow_arith::{
     aggregate::sum,
-    arithmetic::{multiply, subtract},
     arity::binary,
+    numeric::{mul, sub},
 };
-use arrow_array::{cast::as_primitive_array, Float32Array};
+use arrow_array::{
+    cast::{as_primitive_array, AsArray},
+    types::Float32Type,
+    Float32Array,
+};
 use criterion::{criterion_group, criterion_main, Criterion};
 
 #[cfg(target_os = "linux")]
@@ -28,9 +32,9 @@ use lance_testing::datagen::generate_random_array_with_seed;
 
 #[inline]
 fn l2_arrow(x: &Float32Array, y: &Float32Array) -> f32 {
-    let s = subtract(x, y).unwrap();
-    let m = multiply(&s, &s).unwrap();
-    sum(&m).unwrap()
+    let s = sub(x, y).unwrap();
+    let m = mul(&s, &s).unwrap();
+    sum(m.as_primitive::<Float32Type>()).unwrap()
 }
 
 #[inline]

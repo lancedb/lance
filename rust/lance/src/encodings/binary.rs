@@ -20,13 +20,15 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use arrow_arith::arithmetic::subtract_scalar;
+use arrow_arith::numeric::sub;
 use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
 use arrow_array::cast::AsArray;
 use arrow_array::{
     cast::as_primitive_array,
     new_empty_array,
-    types::{BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, Utf8Type},
+    types::{
+        BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, UInt32Type, Utf8Type,
+    },
     Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, UInt32Array,
 };
 use arrow_buffer::{bit_util, ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
@@ -214,12 +216,14 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
         let start = positions.value(range.start);
         let end = positions.value(range.end);
 
+        let start_scalar = Int64Array::new_scalar(start);
+
         let slice = positions.slice(range.start, range.len() + 1);
         let offset_data = if T::Offset::IS_LARGE {
-            subtract_scalar(&slice, start)?.into_data()
+            sub(&slice, &start_scalar)?.into_data()
         } else {
             cast(
-                &(Arc::new(subtract_scalar(&slice, start)?) as ArrayRef),
+                &(Arc::new(sub(&slice, &start_scalar)?) as ArrayRef),
                 &DataType::Int32,
             )?
             .into_data()
@@ -281,18 +285,19 @@ fn plan_take_chunks(
     min_io_size: i64,
 ) -> Result<Vec<TakeChunksPlan>> {
     let start = indices.value(0);
-    let indices = subtract_scalar(indices, start)?;
+    let indices = sub(indices, &UInt32Array::new_scalar(start))?;
+    let indices_ref = indices.as_primitive::<UInt32Type>();
 
     let mut chunks: Vec<TakeChunksPlan> = vec![];
     let mut start_idx = 0;
     let mut last_idx: i64 = -1;
     let mut is_contiguous = true;
     for i in 0..indices.len() {
-        let current = indices.value(i) as usize;
+        let current = indices_ref.value(i) as usize;
         let curr_contiguous = current == start_idx || current as i64 - last_idx == 1;
 
         if !curr_contiguous
-            && positions.value(current) - positions.value(indices.value(start_idx) as usize)
+            && positions.value(current) - positions.value(indices_ref.value(start_idx) as usize)
                 > min_io_size
         {
             chunks.push(TakeChunksPlan {
