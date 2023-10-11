@@ -33,7 +33,7 @@ pub enum Error {
     DatasetAlreadyExists { uri: String },
     // #[snafu(display("Append with different schema: original={original} new={new}"))]
     #[snafu(display("Append with different schema:"))]
-    SchemaMismatch {  },
+    SchemaMismatch {},
     #[snafu(display("Dataset at path {path} was not found: {source}"))]
     DatasetNotFound { path: String, source: BoxedError },
     #[snafu(display("Encountered corrupt file {path}: {source}"))]

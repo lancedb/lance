@@ -42,9 +42,9 @@ use snafu::{location, Location};
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 use url::Url;
 
-use lance_core::error::{Error, Result};
 use crate::io::object_reader::CloudObjectReader;
 use crate::io::object_writer::ObjectWriter;
+use lance_core::error::{Error, Result};
 
 use self::tracing::ObjectStoreTracingExt;
 

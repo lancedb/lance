@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{sync::Arc, vec};
 
 use arrow_array::{
     cast::AsArray, types::Float32Type, Array, ArrayRef, FixedSizeListArray, Float32Array,
     RecordBatch, UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
+use arrow_schema::Field;
+use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
 use lance_linalg::{
     distance::{Cosine, Dot, MetricType, Normalize, L2},
@@ -31,6 +33,7 @@ use tracing::instrument;
 use crate::vector::transform::Transformer;
 
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
+pub const PART_ID_COLUMN: &str = "__ivf_part_id";
 
 /// IVF - IVF file partition
 ///
@@ -104,18 +107,30 @@ impl Ivf {
         &self,
         batch: &RecordBatch,
         column: &str,
-    ) -> Vec<(u32, RecordBatch)> {
-        todo!()
+    ) -> Result<Vec<(u32, RecordBatch)>> {
+        let vector_arr = batch.column_by_name(column).ok_or(Error::Index {
+            message: format!("Column {} does not exist.", column),
+        })?;
+        let data = vector_arr.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "Column {} is not a vector type: {}",
+                column,
+                vector_arr.data_type()
+            ),
+        })?;
+        let matrix = MatrixView::<Float32Type>::try_from(data)?;
+        let part_ids = self.compute_partitions(&matrix);
+
+        let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), false);
+        let batch = batch.try_with_column(field, Arc::new(part_ids))?;
+        Ok(vec![])
+        // todo!()
     }
 
     /// Compute the partition for each row in the input Matrix.
     ///
     #[instrument(skip(data))]
-    fn compute_partitions(
-        &self,
-        data: &MatrixView<Float32Type>,
-        metric_type: MetricType,
-    ) -> UInt32Array {
+    fn compute_partitions(&self, data: &MatrixView<Float32Type>) -> UInt32Array {
         let ndim = data.ndim();
         let centroids_arr: &Float32Array = self.centroids.values().as_primitive();
         let centroid_norms = centroids_arr
@@ -129,7 +144,7 @@ impl Ivf {
                     .values()
                     .chunks(ndim)
                     .zip(centroid_norms.iter())
-                    .map(|(centroid, &norm)| match metric_type {
+                    .map(|(centroid, &norm)| match self.metric_type {
                         MetricType::L2 => row.l2(centroid),
                         MetricType::Cosine => centroid.cosine_fast(norm, row),
                         MetricType::Dot => row.dot(centroid),
