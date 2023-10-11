@@ -816,6 +816,11 @@ impl Dataset {
     }
 
     pub async fn take(&self, row_indices: &[u64], projection: &Schema) -> Result<RecordBatch> {
+        if row_indices.is_empty() {
+            let schema = Arc::new(projection.into());
+            return Ok(RecordBatch::new_empty(schema));
+        }
+
         let mut sorted_indices: Vec<usize> = (0..row_indices.len()).collect();
         sorted_indices.sort_by_key(|&i| row_indices[i]);
 
