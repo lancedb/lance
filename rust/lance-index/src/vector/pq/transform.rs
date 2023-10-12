@@ -23,7 +23,7 @@ use lance_core::{Error, Result};
 use lance_linalg::MatrixView;
 
 use super::ProductQuantizer;
-use crate::vector::{transform::Transformer, PQ_CODE_COLUMN};
+use crate::vector::transform::Transformer;
 
 /// Product Quantizer Transformer
 ///
@@ -76,7 +76,7 @@ impl Transformer for PQTransformer {
             })?
             .try_into()?;
         let pq_code = self.quantizer.transform(&data).await?;
-        let pq_field = Field::new(PQ_CODE_COLUMN, pq_code.data_type().clone(), false);
+        let pq_field = Field::new(&self.output_column, pq_code.data_type().clone(), false);
         let batch = batch.try_with_column(pq_field, Arc::new(pq_code))?;
         let batch = batch.drop_column(&self.input_column)?;
         Ok(batch)
@@ -84,4 +84,43 @@ impl Transformer for PQTransformer {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    use arrow_array::{FixedSizeListArray, Float32Array, Int32Array};
+    use arrow_schema::{DataType, Schema};
+    use lance_arrow::FixedSizeListArrayExt;
+
+    use crate::vector::pq::PQBuildParams;
+
+    #[tokio::test]
+    async fn test_pq_transform() {
+        let values = Float32Array::from_iter((0..16000).map(|v| v as f32));
+        let dim = 16;
+        let arr = Arc::new(FixedSizeListArray::try_new_from_values(values, 16).unwrap());
+        let mat: MatrixView<Float32Type> = arr.as_ref().try_into().unwrap();
+
+        let params = PQBuildParams::new(1, 8);
+        let pq = ProductQuantizer::train(&mat, &params).await.unwrap();
+
+        let schema = Schema::new(vec![
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                true,
+            ),
+            Field::new("other", DataType::Int32, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![arr, Arc::new(Int32Array::from_iter_values(0..1000))],
+        )
+        .unwrap();
+
+        let transformer = PQTransformer::new(pq, "vec", "pq_code");
+        let batch = transformer.transform(&batch).await.unwrap();
+        assert!(batch.column_by_name("vec").is_none());
+        assert!(batch.column_by_name("pq_code").is_some());
+        assert_eq!(batch.num_rows(), 1000)
+    }
+}
