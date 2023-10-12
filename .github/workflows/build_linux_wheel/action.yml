@@ -32,11 +32,17 @@ runs:
       working-directory: python
       run: |
         docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2014_aarch64 tools/
+    - name: Setup QEMU for ARM
+      if: ${{ inputs.arm-build == 'true' }}
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64
     - name: Build wheel
       uses: PyO3/maturin-action@v1
       with:
         command: build
         args: ${{ inputs.args }}
         working-directory: python
+        target: aarch64-unknown-linux-gnu
         container: pylance_manylinux
         docker-options: "-e SOME_FLAG_TO_INVALIDATE_CACHE=1"

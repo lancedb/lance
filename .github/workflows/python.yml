@@ -100,8 +100,10 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: [ "11" ]
-    runs-on: buildjet-4vcpu-ubuntu-2204-arm
+        # NOCOMMIT: here for testing if gitconig fixes OOM
+        python-minor-version: [ "8" ]
+    # runs-on: buildjet-4vcpu-ubuntu-2204-arm
+    runs-on: "ubuntu-22.04"
     defaults:
       run:
         shell: bash
@@ -120,12 +122,15 @@ jobs:
         sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.${{ matrix.python-minor-version }} 1
         sudo apt install python3-pip
         sudo apt install python3.${{ matrix.python-minor-version }}-distutils
-    - uses: Swatinem/rust-cache@v2
-      with:
-        workspaces: python
-        prefix-key: "manylinux2014"  # use this to flush the cache
+    # NOCOMMIT: here for testing if gitconfig fixes OOM
+    # - uses: Swatinem/rust-cache@v2
+    #   with:
+    #     workspaces: python
+    #     prefix-key: "manylinux2014"  # use this to flush the cache
     - uses: ./.github/workflows/build_linux_wheel
       with:
+        # NOCOMMIT: here for testing if the git config fixes OOM
+        args: "--release"
         arm-build: "true"
     - uses: ./.github/workflows/run_tests
     # Make sure wheels are not included in the Rust cache
