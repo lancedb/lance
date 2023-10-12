@@ -23,6 +23,7 @@ use arrow_array::{
 use arrow_select::concat::concat_batches;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::*;
+use lance_core::io::WriteExt;
 use lance_linalg::{distance::l2_distance, kernels::argmin_opt, matrix::MatrixView};
 use ordered_float::OrderedFloat;
 use rand::{distributions::Uniform, prelude::*, Rng, SeedableRng};

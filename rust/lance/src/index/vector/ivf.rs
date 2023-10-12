@@ -31,6 +31,7 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
+use lance_core::io::WriteExt;
 use lance_index::vector::RESIDUAL_COLUMN;
 use lance_linalg::{distance::*, kernels::argmin, matrix::MatrixView};
 use log::info;

@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod error;
-pub mod format;
-pub mod io;
+use prost::Message;
 
-pub use error::{Error, Result};
+pub const MAJOR_VERSION: i16 = 0;
+pub const MINOR_VERSION: i16 = 1;
+pub const MAGIC: &[u8; 4] = b"LANC";
+pub const INDEX_MAGIC: &[u8; 8] = b"LANC_IDX";
+
+pub trait ProtoStruct {
+    type Proto: Message;
+}

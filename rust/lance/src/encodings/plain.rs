@@ -37,7 +37,7 @@ use arrow_select::take::take;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use lance_core::io::Write;
+use lance_core::io::Writer;
 use snafu::{location, Location};
 use tokio::io::AsyncWriteExt;
 
@@ -58,17 +58,17 @@ const PARALLELISM_FACTOR: usize = 4;
 /// Encoder for plain encoding.
 ///
 pub struct PlainEncoder<'a> {
-    writer: &'a mut dyn Write,
+    writer: &'a mut dyn Writer,
     data_type: &'a DataType,
 }
 
 impl<'a> PlainEncoder<'a> {
-    pub fn new(writer: &'a mut dyn Write, data_type: &'a DataType) -> PlainEncoder<'a> {
+    pub fn new(writer: &'a mut dyn Writer, data_type: &'a DataType) -> PlainEncoder<'a> {
         PlainEncoder { writer, data_type }
     }
 
     /// Write an continuous plain-encoded array to the writer.
-    pub async fn write(writer: &'a mut dyn Write, arrays: &[&'a dyn Array]) -> Result<usize> {
+    pub async fn write(writer: &'a mut dyn Writer, arrays: &[&'a dyn Array]) -> Result<usize> {
         let pos = writer.tell();
         if !arrays.is_empty() {
             let mut encoder = Self::new(writer, arrays[0].data_type());

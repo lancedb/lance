@@ -58,6 +58,7 @@ half = { "version" = "=2.2.1", default-features = false, features = [
     "num-traits",
 ] }
 approx = "0.5.1"
+bytes = "1.3"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
 datafusion-common = "28.0"
 datafusion-sql = "28.0"

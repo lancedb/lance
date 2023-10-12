@@ -36,7 +36,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::io::Write;
+use lance_core::io::Writer;
 use tokio::io::AsyncWriteExt;
 
 use super::Encoder;
@@ -49,11 +49,11 @@ use snafu::{location, Location};
 
 /// Encoder for Var-binary encoding.
 pub struct BinaryEncoder<'a> {
-    writer: &'a mut dyn Write,
+    writer: &'a mut dyn Writer,
 }
 
 impl<'a> BinaryEncoder<'a> {
-    pub fn new(writer: &'a mut dyn Write) -> Self {
+    pub fn new(writer: &'a mut dyn Writer) -> Self {
         Self { writer }
     }
 

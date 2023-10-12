@@ -29,7 +29,7 @@ use arrow_array::types::{
 use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray, UInt32Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use lance_core::io::Write;
+use lance_core::io::Writer;
 use snafu::{location, Location};
 
 use super::plain::PlainEncoder;
@@ -42,12 +42,12 @@ use crate::Error;
 
 /// Encoder for Dictionary encoding.
 pub struct DictionaryEncoder<'a> {
-    writer: &'a mut dyn Write,
+    writer: &'a mut dyn Writer,
     key_type: &'a DataType,
 }
 
 impl<'a> DictionaryEncoder<'a> {
-    pub fn new(writer: &'a mut dyn Write, key_type: &'a DataType) -> Self {
+    pub fn new(writer: &'a mut dyn Writer, key_type: &'a DataType) -> Self {
         Self { writer, key_type }
     }
 
