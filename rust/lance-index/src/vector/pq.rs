@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use arrow_arith::aggregate::min;
 use arrow_array::{
-    builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Array,
-    FixedSizeListArray, Float32Array, UInt8Array,
+    builder::Float32Builder, cast::AsArray, types::Float32Type, Array, FixedSizeListArray,
+    Float32Array, UInt8Array,
 };
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
@@ -252,7 +252,7 @@ impl ProductQuantizer {
                     (0..vec.len())
                         .map(|i| {
                             let value = vec.value(i);
-                            let vector: &Float32Array = as_primitive_array(value.as_ref());
+                            let vector: &Float32Array = value.as_primitive();
                             let distances =
                                 dist_func(vector.values(), centroid.values(), vector.len());
                             min(distances.as_ref()).unwrap_or(0.0)
@@ -335,8 +335,7 @@ impl ProductQuantizer {
         // TODO: parallel training.
         for (i, sub_vec) in sub_vectors.iter().enumerate() {
             // Centroids for one sub vector.
-            let values = sub_vec.values();
-            let flatten_array: &Float32Array = as_primitive_array(&values);
+            let flatten_array: &Float32Array = sub_vec.values().as_primitive();
             let prev_centroids = self.centroids(i);
             let centroids = train_kmeans(
                 flatten_array,
@@ -381,7 +380,7 @@ impl ProductQuantizer {
 
         for i in 0..data.num_rows() {
             let code_arr = pq_code.value(i);
-            let code: &UInt8Array = as_primitive_array(code_arr.as_ref());
+            let code: &UInt8Array = code_arr.as_primitive();
             for sub_vec_id in 0..code.len() {
                 let centroid = code.value(sub_vec_id) as usize;
                 let sub_vector: Float32Array = data.data().slice(
