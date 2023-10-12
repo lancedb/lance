@@ -26,6 +26,8 @@ use lance_linalg::kernels::argmin_opt;
 use lance_linalg::{distance::MetricType, MatrixView};
 use rand::SeedableRng;
 
+pub mod transform;
+
 use super::kmeans::train_kmeans;
 
 /// Parameters for building product quantization.
@@ -137,6 +139,9 @@ pub struct ProductQuantizer {
     /// Vector dimension.
     pub dimension: usize,
 
+    /// Distance type.
+    pub metric_type: MetricType,
+
     /// PQ codebook
     ///
     /// ```((2 ^ nbits) * num_subvector * sub_vector_length)``` of `f32`
@@ -174,13 +179,20 @@ fn get_sub_vector_centroids(
 
 impl ProductQuantizer {
     /// Create a [`ProductQuantizer`] with pre-trained codebook.
-    pub fn new(m: usize, nbits: u32, dimension: usize, codebook: Arc<Float32Array>) -> Self {
+    pub fn new(
+        m: usize,
+        nbits: u32,
+        dimension: usize,
+        codebook: Arc<Float32Array>,
+        metric_type: MetricType,
+    ) -> Self {
         assert_eq!(nbits, 8, "nbits can only be 8");
         Self {
             num_bits: nbits,
             num_sub_vectors: m,
             dimension,
             codebook,
+            metric_type,
         }
     }
 
@@ -274,12 +286,8 @@ impl ProductQuantizer {
     }
 
     /// Transform the vector array to PQ code array.
-    pub async fn transform(
-        &self,
-        data: &MatrixView<Float32Type>,
-        metric_type: MetricType,
-    ) -> Result<FixedSizeListArray> {
-        let dist_func = metric_type.batch_func();
+    pub async fn transform(&self, data: &MatrixView<Float32Type>) -> Result<FixedSizeListArray> {
+        let dist_func = self.metric_type.batch_func();
 
         let flatten_data = data.data();
         let num_sub_vectors = self.num_sub_vectors;
@@ -378,6 +386,7 @@ impl ProductQuantizer {
             params.num_bits as u32,
             dimension,
             Arc::new(pd_centroids),
+            params.metric_type,
         ))
     }
 
@@ -487,10 +496,11 @@ mod tests {
             num_sub_vectors: 2,
             dimension: dim,
             codebook: centroids,
+            metric_type: MetricType::L2,
         };
         // Iteratively train for 10 times.
         for _ in 0..10 {
-            let code = actual_pq.transform(&mat, MetricType::L2).await.unwrap();
+            let code = actual_pq.transform(&mat).await.unwrap();
             actual_pq.reset_centroids(&mat, &code).unwrap();
             params.codebook = Some(actual_pq.codebook.clone());
             actual_pq = ProductQuantizer::train(&mat, &params).await.unwrap();

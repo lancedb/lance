@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::{collections::BTreeMap, ops::Range};
 
 use arrow_array::{
-    cast::AsArray, types::Float32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
+    cast::AsArray, types::Float32Type, FixedSizeListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use futures::{
@@ -25,7 +25,11 @@ use futures::{
 };
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::io::Writer;
-use lance_index::vector::{pq::ProductQuantizer, PQ_CODE_COLUMN};
+use lance_index::vector::{
+    pq::{transform::PQTransformer, ProductQuantizer},
+    transform::Transformer,
+    PQ_CODE_COLUMN,
+};
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 use tracing::instrument;
@@ -144,9 +148,16 @@ pub(super) async fn build_partitions(
     }
 
     let ivf_immutable = Arc::new(ivf.clone());
+    let pq_transform = Arc::new(PQTransformer::new(pq, RESIDUAL_COLUMN, PQ_CODE_COLUMN));
     let mut stream = data
-        .zip(repeat_with(|| (part_range.clone(), ivf_immutable.clone())))
-        .map(|(b, (range, ivf_ref))| async move {
+        .zip(repeat_with(|| {
+            (
+                part_range.clone(),
+                ivf_immutable.clone(),
+                pq_transform.clone(),
+            )
+        }))
+        .map(|(b, (range, ivf_ref, pq_transformer))| async move {
             let batch = b?;
             let col = column.to_string();
             let range_copy = range.clone();
@@ -158,19 +169,7 @@ pub(super) async fn build_partitions(
 
             let mut b = vec![];
             for (part_id, batch) in batches {
-                let arr = batch
-                    .column_by_name(RESIDUAL_COLUMN)
-                    .expect("The caller already checked column exist")
-                    .as_fixed_size_list();
-                let data = MatrixView::<Float32Type>::new(
-                    Arc::new(arr.values().as_primitive::<Float32Type>().clone()),
-                    arr.value_length() as usize,
-                );
-                let pq_code = pq.transform(&data, metric_type).await?;
-                let pq_field = Field::new(PQ_CODE_COLUMN, pq_code.data_type().clone(), false);
-                let batch = batch.try_with_column(pq_field, Arc::new(pq_code))?;
-                // Do not need to serialize original vector
-                let batch = batch.drop_column(column)?.drop_column(RESIDUAL_COLUMN)?;
+                let batch = pq_transformer.transform(&batch).await?;
                 b.push((part_id, batch))
             }
             Ok::<Vec<(u32, RecordBatch)>, Error>(b)

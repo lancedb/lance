@@ -374,7 +374,15 @@ pub(crate) async fn open_index(
                         message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
                     });
                 };
-                let pq = Arc::new(ProductQuantizer::try_from(pq_proto).unwrap());
+                let pq = Arc::new(ProductQuantizer::new(
+                    pq_proto.num_sub_vectors as usize,
+                    pq_proto.num_bits,
+                    pq_proto.dimension as usize,
+                    Arc::new(Float32Array::from_iter_values(
+                        pq_proto.codebook.iter().copied(),
+                    )),
+                    metric_type,
+                ));
                 last_stage = Some(Arc::new(PQIndex::new(pq, metric_type)));
             }
             Some(Stage::Diskann(diskann_proto)) => {
