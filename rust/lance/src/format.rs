@@ -1,7 +1,6 @@
 //! On-disk format
 
 use arrow_buffer::ToByteSlice;
-use prost::Message;
 use uuid::Uuid;
 
 mod fragment;
@@ -29,11 +28,6 @@ pub mod pb {
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::use_self)]
     include!(concat!(env!("OUT_DIR"), "/lance.format.pb.rs"));
-}
-
-/// Annotation on a struct that can be converted a Protobuf message.
-pub trait ProtoStruct {
-    type Proto: Message;
 }
 
 impl TryFrom<&pb::Uuid> for Uuid {

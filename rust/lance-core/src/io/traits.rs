@@ -30,8 +30,9 @@ pub trait Writer: AsyncWrite + Unpin + Send {
     fn tell(&self) -> usize;
 }
 
+/// Lance Write Extension.
 #[async_trait]
-pub trait LanceWrite: Writer {
+pub trait WriteExt: Writer {
     /// Write a protobuf message to the object, and returns the file position of the protobuf.
     async fn write_protobuf(&mut self, msg: &impl Message) -> Result<usize> {
         let offset = self.tell();

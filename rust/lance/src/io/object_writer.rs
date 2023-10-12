@@ -15,14 +15,12 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use lance_core::io::Writer as LanceWrite;
+use lance_core::io::{WriteExt, Writer as LanceWrite};
 use object_store::{path::Path, MultipartId};
 use pin_project::pin_project;
-use prost::Message;
 use snafu::{location, Location};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::format::{ProtoStruct, MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use crate::io::ObjectStore;
 use crate::{Error, Result};
 
@@ -58,35 +56,6 @@ impl ObjectWriter {
         })
     }
 
-    /// Write a protobuf message to the object, and returns the file position of the protobuf.
-    pub async fn write_protobuf(&mut self, msg: &impl Message) -> Result<usize> {
-        let offset = self.tell();
-
-        let len = msg.encoded_len();
-
-        self.write_u32_le(len as u32).await?;
-        self.write_all(&msg.encode_to_vec()).await?;
-
-        Ok(offset)
-    }
-
-    pub async fn write_struct<'b, M: Message + From<&'b T>, T: ProtoStruct<Proto = M> + 'b>(
-        &mut self,
-        obj: &'b T,
-    ) -> Result<usize> {
-        let msg: M = M::from(obj);
-        self.write_protobuf(&msg).await
-    }
-
-    /// Write magics to the tail of a file before closing the file.
-    pub async fn write_magics(&mut self, pos: usize) -> Result<()> {
-        self.write_i64_le(pos as i64).await?;
-        self.write_i16_le(MAJOR_VERSION).await?;
-        self.write_i16_le(MINOR_VERSION).await?;
-        self.write_all(MAGIC).await?;
-        Ok(())
-    }
-
     pub async fn shutdown(&mut self) -> Result<()> {
         Ok(self.writer.as_mut().shutdown().await?)
     }
@@ -97,6 +66,8 @@ impl LanceWrite for ObjectWriter {
         self.cursor
     }
 }
+
+impl WriteExt for ObjectWriter {}
 
 impl AsyncWrite for ObjectWriter {
     fn poll_write(

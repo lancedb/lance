@@ -23,7 +23,7 @@ use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
-use lance_core::io::Writer;
+use lance_core::io::{WriteExt, Writer};
 use object_store::path::Path;
 use snafu::{location, Location};
 

@@ -24,6 +24,7 @@ use futures::{
     StreamExt, TryStreamExt,
 };
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_core::io::Writer;
 use lance_index::vector::PQ_CODE_COLUMN;
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
@@ -32,10 +33,7 @@ use tracing::instrument;
 use crate::dataset::ROW_ID;
 use crate::index::vector::ivf::{io::write_index_partitions, shuffler::ShufflerBuilder, Ivf};
 use crate::index::vector::pq::ProductQuantizer;
-use crate::{
-    io::{object_writer::ObjectWriter, RecordBatchStream},
-    Error, Result,
-};
+use crate::{io::RecordBatchStream, Error, Result};
 
 use super::RESIDUAL_COLUMN;
 
@@ -124,7 +122,7 @@ fn filter_batch_by_partition(
 ///
 #[instrument(level = "info", skip(writer, data, ivf, pq))]
 pub(super) async fn build_partitions(
-    writer: &mut ObjectWriter,
+    writer: &mut dyn Writer,
     data: impl RecordBatchStream + Unpin,
     column: &str,
     ivf: &mut Ivf,

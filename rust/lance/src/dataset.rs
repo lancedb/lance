@@ -33,6 +33,7 @@ use chrono::{prelude::*, Duration};
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt};
+use lance_core::io::WriteExt;
 use log::warn;
 use object_store::path::Path;
 use tracing::instrument;

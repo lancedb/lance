@@ -989,6 +989,7 @@ mod tests {
     };
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
+    use lance_core::io::WriteExt;
     use rand::{distributions::Alphanumeric, Rng};
     use roaring::RoaringBitmap;
     use tempfile::tempdir;
