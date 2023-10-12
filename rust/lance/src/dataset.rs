@@ -43,6 +43,7 @@ pub mod cleanup;
 mod feature_flags;
 pub mod fragment;
 mod hash_joiner;
+pub mod index;
 pub mod optimize;
 pub mod progress;
 pub mod scanner;

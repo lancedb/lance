@@ -21,10 +21,11 @@ use arrow_array::{Float32Array, RecordBatch};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use chrono::Duration;
+use lance::arrow::as_fixed_size_list_array;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, scanner::Scanner as LanceScanner,
-    transaction::Operation as LanceOperation, transaction::RewriteGroup, Dataset as LanceDataset,
-    ReadParams, Version, WriteMode, WriteParams,
+    transaction::Operation as LanceOperation, Dataset as LanceDataset, ReadParams, Version,
+    WriteMode, WriteParams,
 };
 use lance::datatypes::Schema;
 use lance::format::Fragment;
@@ -33,7 +34,6 @@ use lance::index::{
     DatasetIndexExt, IndexType,
 };
 use lance::io::object_store::ObjectStoreParams;
-use lance_arrow::as_fixed_size_list_array;
 use lance_index::vector::pq::PQBuildParams;
 use lance_linalg::distance::MetricType;
 use pyo3::prelude::*;
@@ -116,19 +116,6 @@ impl Operation {
             deleted_fragment_ids,
             predicate,
         };
-        Ok(Self(op))
-    }
-
-    #[staticmethod]
-    fn rewrite(groups: Vec<(Vec<FragmentMetadata>, Vec<FragmentMetadata>)>) -> PyResult<Self> {
-        let groups = groups
-            .into_iter()
-            .map(|(old_fragments, new_fragments)| RewriteGroup {
-                old_fragments: into_fragments(old_fragments),
-                new_fragments: into_fragments(new_fragments),
-            })
-            .collect::<Vec<_>>();
-        let op = LanceOperation::Rewrite { groups };
         Ok(Self(op))
     }
 
