@@ -20,7 +20,6 @@ lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
-bytes = "1.3"
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
@@ -34,6 +33,7 @@ arrow-select = { workspace = true }
 async-recursion = "1.0"
 async-trait = "0.1.60"
 byteorder = "1.4.3"
+bytes = "1.3"
 chrono = "0.4.23"
 clap = { version = "4.1.1", features = ["derive"], optional = true }
 # This is already used by datafusion

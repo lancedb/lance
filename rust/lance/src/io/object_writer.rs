@@ -15,7 +15,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use lance_core::io::Write as LanceWrite;
+use lance_core::io::Writer as LanceWrite;
 use object_store::{path::Path, MultipartId};
 use pin_project::pin_project;
 use prost::Message;

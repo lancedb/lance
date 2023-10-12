@@ -15,7 +15,7 @@
 use arrow_array::builder::Int64Builder;
 use arrow_array::{Array, Int64Array};
 use arrow_schema::DataType;
-use lance_core::io::Write;
+use lance_core::io::Writer;
 use std::collections::BTreeMap;
 use tokio::io::AsyncWriteExt;
 

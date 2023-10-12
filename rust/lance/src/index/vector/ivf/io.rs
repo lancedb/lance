@@ -18,14 +18,14 @@ use super::{shuffler::Shuffler, Ivf};
 use crate::dataset::ROW_ID;
 use crate::encodings::plain::PlainEncoder;
 use crate::Result;
-use lance_core::io::Write;
+use lance_core::io::Writer;
 use lance_index::vector::PQ_CODE_COLUMN;
 
 /// Write each partition of IVF_PQ index to the index file.
 ///
 /// Partitioned index data is already sorted in the [Shuffler].
 pub(super) async fn write_index_partitions(
-    writer: &mut dyn Write,
+    writer: &mut dyn Writer,
     ivf: &mut Ivf,
     shuffler: &Shuffler<'_>,
 ) -> Result<()> {
