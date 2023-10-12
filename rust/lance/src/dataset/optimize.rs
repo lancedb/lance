@@ -890,14 +890,6 @@ pub async fn commit_compaction(
         let rewrite_group = RewriteGroup {
             old_fragments: task.original_fragments,
             new_fragments: task.new_fragments,
-            // rewritten_indices: task
-            //     .remapped_indices
-            //     .iter()
-            //     .map(|rewritten| RewrittenIndex {
-            //         old_id: rewritten.original,
-            //         new_id: rewritten.new,
-            //     })
-            //     .collect(),
         };
         row_id_map.extend(task.row_id_map);
         rewrite_groups.push(rewrite_group);
