@@ -31,13 +31,8 @@
 //!
 //! In addition to the rules above there may be restrictions due to indexes.
 //! When a fragment is compacted its row ids change and any index that contained
-//! that fragment will be remapped.  There can only be one compaction task per
-//! index and all fragments in that task must be indexed fragments.
-//!
-//! This means, in some rare cases, compaction may need to run multiple times
-//! to compact all of the data.  However, this should only realistically happen
-//! if an index is created based on a very large number of un-compacted fragments
-//! that cannot all be compacted into a single fragment.
+//! that fragment will be remapped.  However, we cannot combine indexed fragments
+//! with unindexed fragments.
 //!
 //! ```rust
 //! # use std::sync::Arc;
