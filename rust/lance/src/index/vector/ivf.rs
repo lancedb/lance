@@ -766,7 +766,7 @@ async fn write_index_file(
         dataset_version: dataset.version().version,
         metric_type,
         ivf,
-        pq: pq.into(),
+        pq,
         transforms,
     };
 

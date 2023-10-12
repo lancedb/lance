@@ -53,7 +53,7 @@ use super::RESIDUAL_COLUMN;
 ///   Shuffler: a shuffler that stored the shuffled data.
 ///
 /// TODO: move this to `lance-index` crate.
-pub(crate) async fn shuffle_dataset(
+pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin,
     column: &str,
     ivf: Arc<lance_index::vector::ivf::Ivf>,
@@ -70,7 +70,7 @@ pub(crate) async fn shuffle_dataset(
         .buffer_unordered(num_cpus::get())
         .and_then(|batch| async move {
             // Collecting partition ID and row ID.
-            let parted_batches = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 let part_id = batch
                     .column_by_name(PART_ID_COLUMN)
                     .expect("The caller already checked column exist");
@@ -88,8 +88,7 @@ pub(crate) async fn shuffle_dataset(
                     })
                     .collect::<Result<Vec<_>>>()
             })
-            .await?;
-            parted_batches
+            .await?
         })
         .boxed();
 

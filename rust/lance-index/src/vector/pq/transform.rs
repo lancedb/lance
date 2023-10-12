@@ -117,7 +117,7 @@ mod tests {
         )
         .unwrap();
 
-        let transformer = PQTransformer::new(&pq, "vec", "pq_code");
+        let transformer = PQTransformer::new(pq.into(), "vec", "pq_code");
         let batch = transformer.transform(&batch).await.unwrap();
         assert!(batch.column_by_name("vec").is_none());
         assert!(batch.column_by_name("pq_code").is_some());
