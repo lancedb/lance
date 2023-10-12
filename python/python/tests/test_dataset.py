@@ -477,34 +477,6 @@ def test_delete_with_commit(tmp_path: Path):
     assert tbl == half_table
 
 
-def test_rewrite_with_commit(tmp_path: Path):
-    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
-    base_dir = tmp_path / "test"
-
-    lance.write_dataset(table, base_dir)
-    lance.write_dataset(table, base_dir, mode="append")
-
-    combined = pa.Table.from_pydict(
-        {
-            "a": list(range(100)) + list(range(100)),
-            "b": list(range(100)) + list(range(100)),
-        }
-    )
-
-    to_be_rewrote = [lf.metadata for lf in lance.dataset(base_dir).get_fragments()]
-
-    fragment = lance.fragment.LanceFragment.create(base_dir, combined)
-    group = lance.LanceOperation.Rewrite.RewriteGroup(to_be_rewrote, [fragment])
-    rewrite = lance.LanceOperation.Rewrite([group])
-
-    dataset = lance.LanceDataset.commit(base_dir, rewrite, read_version=1)
-
-    tbl = dataset.to_table()
-    assert tbl == combined
-
-    assert len(lance.dataset(base_dir).get_fragments()) == 1
-
-
 def test_restore_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

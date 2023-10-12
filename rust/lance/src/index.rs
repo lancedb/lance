@@ -16,6 +16,7 @@
 //!
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -34,6 +35,7 @@ pub mod vector;
 
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::format::Index as IndexMetadata;
+use crate::index::vector::remap_vector_index;
 use crate::io::commit::commit_transaction;
 use crate::{dataset::Dataset, Error, Result};
 
@@ -76,6 +78,47 @@ pub trait IndexBuilder {
 
 pub trait IndexParams: Send + Sync {
     fn as_any(&self) -> &dyn Any;
+}
+
+pub(crate) async fn remap_index(
+    dataset: &Dataset,
+    index_id: &Uuid,
+    row_id_map: &HashMap<u64, Option<u64>>,
+) -> Result<Uuid> {
+    // Load indices from the disk.
+    let indices = dataset.load_indices().await?;
+    let matched = indices
+        .iter()
+        .find(|i| i.uuid == *index_id)
+        .ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", index_id),
+        })?;
+
+    if matched.fields.len() > 1 {
+        return Err(Error::Index {
+            message: "Remapping indices with multiple fields is not supported".to_string(),
+        });
+    }
+    let field = matched
+        .fields
+        .first()
+        .expect("An index existed with no fields");
+
+    let field = dataset.schema().field_by_id(*field).unwrap();
+
+    let new_id = Uuid::new_v4();
+
+    remap_vector_index(
+        Arc::new(dataset.clone()),
+        &field.name,
+        index_id,
+        &new_id,
+        matched,
+        row_id_map,
+    )
+    .await?;
+
+    Ok(new_id)
 }
 
 /// Extends Dataset with secondary index.

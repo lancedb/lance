@@ -15,7 +15,7 @@
 use std::{
     any::Any,
     cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap, HashSet},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -265,9 +265,21 @@ impl VectorIndex for DiskANNIndex {
         _reader: &dyn ObjectReader,
         _offset: usize,
         _length: usize,
-    ) -> Result<Arc<dyn VectorIndex>> {
+    ) -> Result<Box<dyn VectorIndex>> {
         Err(Error::Index {
             message: "DiskANNIndex is not loadable".to_string(),
+        })
+    }
+
+    fn check_can_remap(&self) -> Result<()> {
+        Err(Error::NotSupported {
+            source: "DiskANNIndex does not yet support remap".into(),
+        })
+    }
+
+    fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        Err(Error::NotSupported {
+            source: "DiskANNIndex does not yet support remap".into(),
         })
     }
 }

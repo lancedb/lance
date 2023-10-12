@@ -15,7 +15,7 @@
 //! Traits for vector index.
 //!
 
-use std::sync::Arc;
+use std::collections::HashMap;
 
 use arrow_array::types::Float32Type;
 use arrow_array::RecordBatch;
@@ -58,13 +58,27 @@ pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// is loaded on demand by IVF.
     fn is_loadable(&self) -> bool;
 
+    /// If the index can be remapped return Ok.  Else return an error
+    /// explaining why not
+    fn check_can_remap(&self) -> Result<()>;
+
     /// Load the index from the reader on-demand.
     async fn load(
         &self,
         reader: &dyn ObjectReader,
         offset: usize,
         length: usize,
-    ) -> Result<Arc<dyn VectorIndex>>;
+    ) -> Result<Box<dyn VectorIndex>>;
+
+    /// Remap the index according to mapping
+    ///
+    /// Each item in mapping describes an old row id -> new row id
+    /// pair.  If old row id -> None then that row id has been
+    /// deleted and can be removed from the index.
+    ///
+    /// If an old row id is not in the mapping then it should be
+    /// left alone.
+    fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>;
 }
 
 /// Transformer on vectors.

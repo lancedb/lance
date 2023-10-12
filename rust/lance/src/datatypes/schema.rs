@@ -227,7 +227,6 @@ impl Schema {
     }
 
     /// Get field by its id.
-    #[allow(dead_code)]
     pub(crate) fn field_by_id(&self, id: impl Into<i32>) -> Option<&Field> {
         let id = id.into();
         for field in self.fields.iter() {

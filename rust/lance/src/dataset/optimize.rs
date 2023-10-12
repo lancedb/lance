@@ -29,12 +29,19 @@
 //! 2. If a fragment has a higher percentage of deleted rows than the provided
 //!    threshold.
 //!
+//! In addition to the rules above there may be restrictions due to indexes.
+//! When a fragment is compacted its row ids change and any index that contained
+//! that fragment will be remapped.  However, we cannot combine indexed fragments
+//! with unindexed fragments.
+//!
 //! ```rust
 //! # use std::sync::Arc;
 //! # use tokio::runtime::Runtime;
 //! # use arrow_array::{RecordBatch, RecordBatchIterator, Int64Array};
 //! # use arrow_schema::{Schema, Field, DataType};
 //! use lance::{dataset::WriteParams, Dataset, dataset::optimize::compact_files};
+//! // Remapping indices is ignored in this example.
+//! use lance::dataset::optimize::IgnoreRemap;
 //!
 //! # let mut rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
@@ -54,7 +61,7 @@
 //! assert_eq!(dataset.get_fragments().len(), 100);
 //!
 //! // Use compact_files() to consolidate the data to 1 fragment
-//! let metrics = compact_files(&mut dataset, Default::default()).await.unwrap();
+//! let metrics = compact_files(&mut dataset, Default::default(), None).await.unwrap();
 //! assert_eq!(metrics.fragments_removed, 100);
 //! assert_eq!(metrics.fragments_added, 1);
 //! assert_eq!(dataset.get_fragments().len(), 1);
@@ -85,20 +92,63 @@
 //! you wish. As long as the tasks don't rewrite any of the same fragments,
 //! they can be committed in any order.
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::{AddAssign, Range};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
+use arrow_array::{RecordBatch, UInt64Array};
+use async_trait::async_trait;
+use datafusion::error::Result as DFResult;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
+use crate::dataset::ROW_ID;
+use crate::format::RowAddress;
 use crate::io::commit::commit_transaction;
 use crate::Result;
 use crate::{format::Fragment, Dataset};
 
 use super::fragment::FileFragment;
-use super::transaction::{Operation, RewriteGroup, Transaction};
+use super::index::DatasetIndexRemapperOptions;
+use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
 use super::{write_fragments, WriteMode, WriteParams};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemappedIndex {
+    original: Uuid,
+    new: Uuid,
+}
+
+impl RemappedIndex {
+    pub fn new(original: Uuid, new: Uuid) -> Self {
+        Self { original, new }
+    }
+}
+
+/// When compaction runs the row ids will change.  This typically means that
+/// indices will need to be remapped.  The details of how this happens are not
+/// a part of the compaction process and so a trait is defined here to allow
+/// for inversion of control.
+#[async_trait]
+pub trait IndexRemapper: Send + Sync {
+    async fn remap_indices(
+        &self,
+        index_map: HashMap<u64, Option<u64>>,
+        affected_fragment_ids: &[u64],
+    ) -> Result<Vec<RemappedIndex>>;
+}
+
+/// Options for creating an [IndexRemapper]
+///
+/// Currently we don't have any options but we may need options in the future and so we
+/// want to keep a placeholder
+pub trait IndexRemapperOptions: Send + Sync {
+    fn create_remapper(&self, dataset: &Dataset) -> Result<Box<dyn IndexRemapper>>;
+}
 
 /// Options to be passed to [compact_files].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,6 +186,26 @@ impl Default for CompactionOptions {
             materialize_deletions_threshold: 0.1,
             num_threads: num_cpus::get(),
         }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IgnoreRemap {}
+
+#[async_trait]
+impl IndexRemapper for IgnoreRemap {
+    async fn remap_indices(
+        &self,
+        _: HashMap<u64, Option<u64>>,
+        _: &[u64],
+    ) -> Result<Vec<RemappedIndex>> {
+        Ok(Vec::new())
+    }
+}
+
+impl IndexRemapperOptions for IgnoreRemap {
+    fn create_remapper(&self, _: &Dataset) -> Result<Box<dyn IndexRemapper>> {
+        Ok(Box::new(Self {}))
     }
 }
 
@@ -184,6 +254,7 @@ impl AddAssign for CompactionMetrics {
 pub async fn compact_files(
     dataset: &mut Dataset,
     mut options: CompactionOptions,
+    remap_options: Option<Arc<dyn IndexRemapperOptions>>,
 ) -> Result<CompactionMetrics> {
     options.validate();
 
@@ -201,7 +272,8 @@ pub async fn compact_files(
         .buffer_unordered(options.num_threads);
 
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
-    let metrics = commit_compaction(dataset, completed_tasks).await?;
+    let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
+    let metrics = commit_compaction(dataset, completed_tasks, remap_options).await?;
 
     Ok(metrics)
 }
@@ -349,6 +421,7 @@ struct CandidateBin {
     pub pos_range: Range<usize>,
     pub candidacy: Vec<CompactionCandidacy>,
     pub row_counts: Vec<usize>,
+    pub indices: Vec<usize>,
 }
 
 impl CandidateBin {
@@ -385,6 +458,8 @@ impl CandidateBin {
                     pos_range: self.pos_range.start..(self.pos_range.start + bin_len),
                     candidacy: self.candidacy.drain(0..bin_len).collect(),
                     row_counts: self.row_counts.drain(0..bin_len).collect(),
+                    // By the time we are splitting for size we are done considering indices
+                    indices: Vec::new(),
                 });
                 self.pos_range.start += bin_len;
             } else {
@@ -396,6 +471,21 @@ impl CandidateBin {
 
         bins
     }
+}
+
+async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
+    let indices = dataset.load_indices().await?;
+    let mut index_fragmaps = Vec::with_capacity(indices.len());
+    for index in indices {
+        if let Some(fragment_bitmap) = index.fragment_bitmap {
+            index_fragmaps.push(fragment_bitmap.clone());
+        } else {
+            let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
+            let frags = 0..dataset_at_index.manifest.max_fragment_id;
+            index_fragmaps.push(RoaringBitmap::from_sorted_iter(frags).unwrap());
+        }
+    }
+    Ok(index_fragmaps)
 }
 
 /// Formulate a plan to compact the files in a dataset
@@ -421,6 +511,16 @@ pub async fn plan_compaction(
         })
         .buffered(num_cpus::get() * 2);
 
+    let index_fragmaps = load_index_fragmaps(dataset).await?;
+    let indices_containing_frag = |frag_id: u32| {
+        index_fragmaps
+            .iter()
+            .enumerate()
+            .filter(|(_, bitmap)| bitmap.contains(frag_id))
+            .map(|(pos, _)| pos)
+            .collect::<Vec<_>>()
+    };
+
     let mut candidate_bins: Vec<CandidateBin> = Vec::new();
     let mut current_bin: Option<CandidateBin> = None;
     let mut i = 0;
@@ -441,6 +541,8 @@ pub async fn plan_compaction(
             None
         };
 
+        let indices = indices_containing_frag(fragment.id as u32);
+
         match (candidacy, &mut current_bin) {
             (None, None) => {} // keep searching
             (Some(candidacy), None) => {
@@ -450,14 +552,29 @@ pub async fn plan_compaction(
                     pos_range: i..(i + 1),
                     candidacy: vec![candidacy],
                     row_counts: vec![metrics.num_rows()],
+                    indices,
                 });
             }
             (Some(candidacy), Some(bin)) => {
-                // Add to current bin
-                bin.fragments.push(fragment);
-                bin.pos_range.end += 1;
-                bin.candidacy.push(candidacy);
-                bin.row_counts.push(metrics.num_rows());
+                // We cannot mix "indexed" and "non-indexed" fragments and so we only consider
+                // the existing bin if it contains the same indices
+                if bin.indices == indices {
+                    // Add to current bin
+                    bin.fragments.push(fragment);
+                    bin.pos_range.end += 1;
+                    bin.candidacy.push(candidacy);
+                    bin.row_counts.push(metrics.num_rows());
+                } else {
+                    // Index set is different.  Complete previous bin and start new one
+                    candidate_bins.push(current_bin.take().unwrap());
+                    current_bin = Some(CandidateBin {
+                        fragments: vec![fragment],
+                        pos_range: i..(i + 1),
+                        candidacy: vec![candidacy],
+                        row_counts: vec![metrics.num_rows()],
+                        indices,
+                    });
+                }
             }
             (None, Some(_)) => {
                 // Bin is complete
@@ -490,7 +607,7 @@ pub async fn plan_compaction(
 /// The result of a single compaction task.
 ///
 /// This should be passed to [commit_compaction()] to commit the operation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RewriteResult {
     pub metrics: CompactionMetrics,
     pub new_fragments: Vec<Fragment>,
@@ -498,6 +615,180 @@ pub struct RewriteResult {
     pub read_version: u64,
     /// The original fragments being replaced
     pub original_fragments: Vec<Fragment>,
+    pub row_id_map: HashMap<u64, Option<u64>>,
+}
+
+fn extract_row_ids(
+    row_ids: &mut RoaringTreemap,
+    batch: DFResult<RecordBatch>,
+) -> DFResult<RecordBatch> {
+    let batch = batch?;
+
+    let (row_id_idx, _) = batch
+        .schema()
+        .column_with_name(ROW_ID)
+        .expect("Received a batch without row ids");
+    let row_ids_arr = batch.column(row_id_idx);
+    let row_ids_itr = row_ids_arr
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap_or_else(|| {
+            panic!(
+                "Row ids had an unexpected type: {}",
+                row_ids_arr.data_type()
+            )
+        })
+        .values()
+        .iter()
+        .copied();
+    row_ids.append(row_ids_itr).map_err(|err| {
+        datafusion::error::DataFusionError::Execution(format!(
+            "Row ids did not arrive in sorted order: {}",
+            err
+        ))
+    })?;
+    let non_row_ids_cols = (0..batch.num_columns())
+        .filter(|col| *col != row_id_idx)
+        .collect::<Vec<_>>();
+    Ok(batch.project(&non_row_ids_cols)?)
+}
+
+fn make_rowid_capture_stream(
+    row_ids: Arc<RwLock<RoaringTreemap>>,
+    target: SendableRecordBatchStream,
+) -> Result<SendableRecordBatchStream> {
+    let schema = target.schema();
+    let stream = target.map(move |batch| {
+        let mut row_ids = row_ids.write().unwrap();
+        extract_row_ids(&mut row_ids, batch)
+    });
+
+    let (row_id_idx, _) = schema
+        .column_with_name(ROW_ID)
+        .expect("Received a batch without row ids");
+
+    let non_row_ids_cols = (0..schema.fields.len())
+        .filter(|col| *col != row_id_idx)
+        .collect::<Vec<_>>();
+
+    let schema = Arc::new(schema.project(&non_row_ids_cols)?);
+
+    let stream = RecordBatchStreamAdapter::new(schema, stream);
+    Ok(Box::pin(stream))
+}
+
+struct MissingIds<'a, I: Iterator<Item = u64>> {
+    row_ids: I,
+    expected_row_id: u64,
+    current_fragment_idx: usize,
+    last: Option<u64>,
+    fragments: &'a Vec<Fragment>,
+}
+
+impl<'a, I: Iterator<Item = u64>> MissingIds<'a, I> {
+    fn new(row_ids: I, fragments: &'a Vec<Fragment>) -> Self {
+        assert!(!fragments.is_empty());
+        let first_frag = &fragments[0];
+        Self {
+            row_ids,
+            expected_row_id: first_frag.id * RowAddress::FRAGMENT_SIZE,
+            current_fragment_idx: 0,
+            last: None,
+            fragments,
+        }
+    }
+}
+
+impl<'a, I: Iterator<Item = u64>> Iterator for MissingIds<'a, I> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.current_fragment_idx >= self.fragments.len() {
+                return None;
+            }
+            let val = if let Some(last) = self.last {
+                self.last = None;
+                last
+            } else {
+                // If we've exhausted row_ids but we aren't done then use 0 which
+                // is guaranteed to not match because that would mean that row_ids
+                // was empty and we check for that earlier.
+                self.row_ids.next().unwrap_or(0)
+            };
+
+            let current_fragment = &self.fragments[self.current_fragment_idx];
+            let frag = val / RowAddress::FRAGMENT_SIZE;
+            let expected_row_id = self.expected_row_id;
+            self.expected_row_id += 1;
+            if (self.expected_row_id % RowAddress::FRAGMENT_SIZE)
+                == current_fragment.physical_rows as u64
+            {
+                self.current_fragment_idx += 1;
+                if self.current_fragment_idx < self.fragments.len() {
+                    self.expected_row_id =
+                        self.fragments[self.current_fragment_idx].id * RowAddress::FRAGMENT_SIZE;
+                }
+            }
+            if frag != current_fragment.id {
+                self.last = Some(val);
+                return Some(expected_row_id);
+            }
+            if val != expected_row_id {
+                self.last = Some(val);
+                return Some(expected_row_id);
+            }
+        }
+    }
+}
+
+fn transpose_row_ids(
+    row_ids: RoaringTreemap,
+    old_fragments: &Vec<Fragment>,
+    new_fragments: &[Fragment],
+) -> HashMap<u64, Option<u64>> {
+    let new_ids = new_fragments.iter().flat_map(|frag| {
+        (0..frag.physical_rows as u32).map(|offset| {
+            Some(u64::from(RowAddress::new_from_parts(
+                frag.id as u32,
+                offset,
+            )))
+        })
+    });
+    let mut mapping = row_ids.iter().zip(new_ids).collect::<HashMap<_, _>>();
+    MissingIds::new(row_ids.into_iter(), old_fragments).for_each(|id| {
+        mapping.insert(id, None);
+    });
+    mapping
+}
+
+async fn reserve_fragment_ids(dataset: &Dataset, fragments: &mut Vec<Fragment>) -> Result<()> {
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::ReserveFragments {
+            num_fragments: fragments.len() as u32,
+        },
+        None,
+    );
+
+    let manifest = commit_transaction(
+        dataset,
+        dataset.object_store(),
+        &transaction,
+        &Default::default(),
+        &Default::default(),
+    )
+    .await?;
+
+    // Need +1 since max_fragment_id is inclusive in this case and ranges are exclusive
+    let new_max_exclusive = manifest.max_fragment_id + 1;
+    let reserved_ids = (new_max_exclusive - fragments.len() as u32)..(new_max_exclusive);
+
+    for (fragment, new_id) in fragments.iter_mut().zip(reserved_ids) {
+        fragment.id = new_id as u64;
+    }
+
+    Ok(())
 }
 
 /// Rewrite the files in a single task.
@@ -516,14 +807,17 @@ async fn rewrite_files(
             new_fragments: Vec::new(),
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
+            row_id_map: HashMap::new(),
         });
     }
 
     let fragments = task.fragments.to_vec();
     let mut scanner = dataset.scan();
-    scanner.with_fragments(fragments);
+    scanner.with_fragments(fragments.clone()).with_row_id();
 
     let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
+    let row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
+    let data_no_row_ids = make_rowid_capture_stream(row_ids.clone(), data)?;
 
     let params = WriteParams {
         max_rows_per_file: options.target_rows_per_fragment,
@@ -531,14 +825,24 @@ async fn rewrite_files(
         mode: WriteMode::Append,
         ..Default::default()
     };
-    let new_fragments = write_fragments(
+    let mut new_fragments = write_fragments(
         dataset.object_store.clone(),
         &dataset.base,
         dataset.schema(),
-        data,
+        data_no_row_ids,
         params,
     )
     .await?;
+
+    let row_ids = Arc::try_unwrap(row_ids)
+        .expect("Row ids lock still owned")
+        .into_inner()
+        .expect("Row ids mutex still locked");
+
+    reserve_fragment_ids(&dataset, &mut new_fragments).await?;
+
+    let row_id_map: HashMap<u64, Option<u64>> =
+        transpose_row_ids(row_ids, &fragments, &new_fragments);
 
     metrics.files_removed = task
         .fragments
@@ -557,6 +861,7 @@ async fn rewrite_files(
         new_fragments,
         read_version: dataset.manifest.version,
         original_fragments: task.fragments,
+        row_id_map,
     })
 }
 
@@ -569,6 +874,7 @@ async fn rewrite_files(
 pub async fn commit_compaction(
     dataset: &mut Dataset,
     completed_tasks: Vec<RewriteResult>,
+    options: Arc<dyn IndexRemapperOptions>,
 ) -> Result<CompactionMetrics> {
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
@@ -577,19 +883,40 @@ pub async fn commit_compaction(
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
     let mut metrics = CompactionMetrics::default();
 
+    let mut row_id_map: HashMap<u64, Option<u64>> = HashMap::new();
+
     for task in completed_tasks {
         metrics += task.metrics;
         let rewrite_group = RewriteGroup {
             old_fragments: task.original_fragments,
             new_fragments: task.new_fragments,
         };
+        row_id_map.extend(task.row_id_map);
         rewrite_groups.push(rewrite_group);
     }
+
+    let index_remapper = options.create_remapper(dataset)?;
+    let affected_ids = rewrite_groups
+        .iter()
+        .flat_map(|group| group.old_fragments.iter().map(|frag| frag.id))
+        .collect::<Vec<_>>();
+
+    let remapped_indices = index_remapper
+        .remap_indices(row_id_map, &affected_ids)
+        .await?;
+    let rewritten_indices = remapped_indices
+        .iter()
+        .map(|rewritten| RewrittenIndex {
+            old_id: rewritten.original,
+            new_id: rewritten.new,
+        })
+        .collect();
 
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::Rewrite {
             groups: rewrite_groups,
+            rewritten_indices,
         },
         None,
     );
@@ -620,12 +947,138 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_missing_indices() {
+        // Sanity test to make sure MissingIds works.  Does not test actual functionality so
+        // feel free to remove if it becomes inconvenient
+        let frags = vec![
+            Fragment {
+                id: 0,
+                files: Vec::new(),
+                deletion_file: None,
+                physical_rows: 5,
+            },
+            Fragment {
+                id: 3,
+                files: Vec::new(),
+                deletion_file: None,
+                physical_rows: 3,
+            },
+        ];
+        let rows = [(0, 1), (0, 3), (0, 4), (3, 0), (3, 2)]
+            .into_iter()
+            .map(|(frag, offset)| RowAddress::new_from_parts(frag, offset).into());
+
+        let missing = MissingIds::new(rows, &frags).collect::<Vec<_>>();
+        let expected_missing = [(0, 0), (0, 2), (3, 1)]
+            .into_iter()
+            .map(|(frag, offset)| RowAddress::new_from_parts(frag, offset).into())
+            .collect::<Vec<u64>>();
+        assert_eq!(missing, expected_missing);
+    }
+
+    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+    struct IgnoreRemap {}
+
+    #[async_trait]
+    impl IndexRemapper for IgnoreRemap {
+        async fn remap_indices(
+            &self,
+            _: HashMap<u64, Option<u64>>,
+            _: &[u64],
+        ) -> Result<Vec<RemappedIndex>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl IndexRemapperOptions for IgnoreRemap {
+        fn create_remapper(&self, _: &Dataset) -> Result<Box<dyn IndexRemapper>> {
+            Ok(Box::new(Self {}))
+        }
+    }
+
+    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+    struct MockIndexRemapperExpectation {
+        expected: HashMap<u64, Option<u64>>,
+        answer: Vec<RemappedIndex>,
+    }
+
+    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+    struct MockIndexRemapper {
+        expectations: Vec<MockIndexRemapperExpectation>,
+    }
+
+    impl MockIndexRemapper {
+        fn stringify_map(map: &HashMap<u64, Option<u64>>) -> String {
+            let mut sorted_keys = map.keys().collect::<Vec<_>>();
+            sorted_keys.sort();
+            let mut first_keys = sorted_keys
+                .into_iter()
+                .take(10)
+                .map(|key| {
+                    format!(
+                        "{}:{:?}",
+                        RowAddress::new_from_id(*key),
+                        map[key].map(RowAddress::new_from_id)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            if map.len() > 10 {
+                first_keys.push_str(", ...");
+            }
+            let mut result_str = format!("(len={})", map.len());
+            result_str.push_str(&first_keys);
+            result_str
+        }
+
+        fn in_any_order(expectations: &[Self]) -> Self {
+            let expectations = expectations
+                .iter()
+                .flat_map(|item| item.expectations.clone())
+                .collect::<Vec<_>>();
+            Self { expectations }
+        }
+    }
+
+    #[async_trait]
+    impl IndexRemapper for MockIndexRemapper {
+        async fn remap_indices(
+            &self,
+            index_map: HashMap<u64, Option<u64>>,
+            _: &[u64],
+        ) -> Result<Vec<RemappedIndex>> {
+            for expectation in &self.expectations {
+                if expectation.expected == index_map {
+                    return Ok(expectation.answer.clone());
+                }
+            }
+            panic!(
+                "Unexpected index map (len={}): {}\n  Options: {}",
+                index_map.len(),
+                Self::stringify_map(&index_map),
+                self.expectations
+                    .iter()
+                    .map(|expectation| Self::stringify_map(&expectation.expected))
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
+            );
+        }
+    }
+
+    impl IndexRemapperOptions for MockIndexRemapper {
+        fn create_remapper(&self, _: &Dataset) -> Result<Box<dyn IndexRemapper>> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    #[test]
     fn test_candidate_bin() {
         let empty_bin = CandidateBin {
             fragments: vec![],
             pos_range: 0..0,
             candidacy: vec![],
             row_counts: vec![],
+            indices: vec![],
         };
         assert!(empty_bin.is_noop());
 
@@ -640,6 +1093,7 @@ mod tests {
             pos_range: 0..1,
             candidacy: vec![CompactionCandidacy::CompactWithNeighbors],
             row_counts: vec![100],
+            indices: vec![],
         };
         assert!(single_bin.is_noop());
 
@@ -648,6 +1102,7 @@ mod tests {
             pos_range: 0..1,
             candidacy: vec![CompactionCandidacy::CompactItself],
             row_counts: vec![100],
+            indices: vec![],
         };
         // Not a no-op because it's CompactItself
         assert!(!single_bin.is_noop());
@@ -659,6 +1114,7 @@ mod tests {
                 .take(8)
                 .collect(),
             row_counts: vec![100, 400, 200, 200, 400, 300, 300, 100],
+            indices: vec![],
             // Will group into: [[100, 400], [200, 200, 400], [300, 300, 100]]
             // with size = 500
         };
@@ -696,7 +1152,7 @@ mod tests {
             .unwrap();
         assert_eq!(plan.tasks().len(), 0);
 
-        let metrics = compact_files(&mut dataset, CompactionOptions::default())
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap();
 
@@ -747,6 +1203,43 @@ mod tests {
         assert_eq!(plan.tasks().len(), 0);
     }
 
+    fn row_ids(frag_idx: u32, offsets: Range<u32>) -> Range<u64> {
+        let start = RowAddress::new_from_parts(frag_idx, offsets.start);
+        let end = RowAddress::new_from_parts(frag_idx, offsets.end);
+        start.into()..end.into()
+    }
+
+    // The outer list has one item per new fragment
+    // The inner list has ranges of old row ids that map to the new fragment, in order
+    fn expect_remap(
+        ranges: &[Vec<(Range<u64>, bool)>],
+        starting_new_frag_idx: u32,
+    ) -> MockIndexRemapper {
+        let mut expected_remap: HashMap<u64, Option<u64>> = HashMap::new();
+        expected_remap.reserve(ranges.iter().map(|r| r.len()).sum());
+        for (new_frag_offset, new_frag_ranges) in ranges.iter().enumerate() {
+            let new_frag_idx = starting_new_frag_idx + new_frag_offset as u32;
+            let mut row_offset = 0;
+            for (old_id_range, is_found) in new_frag_ranges.iter() {
+                for old_id in old_id_range.clone() {
+                    if *is_found {
+                        let new_id = RowAddress::new_from_parts(new_frag_idx, row_offset);
+                        expected_remap.insert(old_id, Some(new_id.into()));
+                        row_offset += 1;
+                    } else {
+                        expected_remap.insert(old_id, None);
+                    }
+                }
+            }
+        }
+        MockIndexRemapper {
+            expectations: vec![MockIndexRemapperExpectation {
+                expected: expected_remap,
+                answer: vec![],
+            }],
+        }
+    }
+
     #[tokio::test]
     async fn test_compact_many() {
         let test_dir = tempdir().unwrap();
@@ -792,6 +1285,54 @@ mod tests {
             .await
             .unwrap();
 
+        let first_new_frag_idx = 7;
+        // Predicting the remap is difficult.  One task will remap to fragments 7/8 and the other
+        // will remap to fragments 9/10 but we don't know which is which and so we just allow ourselves
+        // to expect both possibilities.
+        let remap_a = expect_remap(
+            &[
+                vec![
+                    // 3 small fragments are rewritten to frags 7 & 8
+                    (row_ids(0, 0..400), true),
+                    (row_ids(1, 0..400), true),
+                    (row_ids(2, 0..200), true),
+                ],
+                vec![(row_ids(2, 200..400), true)],
+                // frag 3 is skipped since it does not have enough missing data
+                // Frags 4, 5, and 6 are rewritten to frags 9 & 10
+                vec![
+                    // Only 800 of the 1000 rows taken from frag 4
+                    (row_ids(4, 0..200), true),
+                    (row_ids(4, 200..400), false),
+                    (row_ids(4, 400..1000), true),
+                    // frags 5 compacted with frag 4
+                    (row_ids(5, 0..200), true),
+                ],
+                vec![(row_ids(5, 200..300), true), (row_ids(6, 0..300), true)],
+            ],
+            first_new_frag_idx,
+        );
+        let remap_b = expect_remap(
+            &[
+                // Frags 4, 5, and 6 are rewritten to frags 7 & 8
+                vec![
+                    (row_ids(4, 0..200), true),
+                    (row_ids(4, 200..400), false),
+                    (row_ids(4, 400..1000), true),
+                    (row_ids(5, 0..200), true),
+                ],
+                vec![(row_ids(5, 200..300), true), (row_ids(6, 0..300), true)],
+                // 3 small fragments rewritten to frags 9 & 10
+                vec![
+                    (row_ids(0, 0..400), true),
+                    (row_ids(1, 0..400), true),
+                    (row_ids(2, 0..200), true),
+                ],
+                vec![(row_ids(2, 200..400), true)],
+            ],
+            first_new_frag_idx,
+        );
+
         // Create compaction plan
         let options = CompactionOptions {
             target_rows_per_fragment: 1000,
@@ -819,8 +1360,12 @@ mod tests {
             vec![4, 5, 6]
         );
 
+        let mock_remapper = MockIndexRemapper::in_any_order(&[remap_a, remap_b]);
+
         // Run compaction
-        let metrics = compact_files(&mut dataset, options).await.unwrap();
+        let metrics = compact_files(&mut dataset, options, Some(Arc::new(mock_remapper)))
+            .await
+            .unwrap();
 
         // Assert on metrics
         assert_eq!(metrics.fragments_removed, 6);
@@ -879,13 +1424,27 @@ mod tests {
 
         dataset.merge(reader, "a", "a").await.unwrap();
 
-        let plan = plan_compaction(&dataset, &CompactionOptions::default())
-            .await
-            .unwrap();
+        let expected_remap = expect_remap(
+            &[vec![
+                // 3 small fragments are rewritten entirely
+                (row_ids(0, 0..5000), true),
+                (row_ids(1, 0..5000), true),
+            ]],
+            2,
+        );
+
+        let plan = plan_compaction(
+            &dataset,
+            &CompactionOptions {
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(plan.tasks().len(), 1);
         assert_eq!(plan.tasks()[0].fragments.len(), 2);
 
-        let metrics = compact_files(&mut dataset, CompactionOptions::default())
+        let metrics = compact_files(&mut dataset, plan.options, Some(Arc::new(expected_remap)))
             .await
             .unwrap();
 
@@ -949,7 +1508,7 @@ mod tests {
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks().len(), 1);
 
-        let metrics = compact_files(&mut dataset, options).await.unwrap();
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
         assert_eq!(metrics.fragments_removed, 1);
         assert_eq!(metrics.files_removed, 2);
         assert_eq!(metrics.fragments_added, 1);
@@ -1007,13 +1566,23 @@ mod tests {
         assert_eq!(results[0].metrics.files_added, 1);
 
         // Just commit the last task
-        commit_compaction(&mut dataset, vec![results.pop().unwrap()])
-            .await
-            .unwrap();
-        assert_eq!(dataset.manifest.version, 2);
+        commit_compaction(
+            &mut dataset,
+            vec![results.pop().unwrap()],
+            Arc::new(IgnoreRemap::default()),
+        )
+        .await
+        .unwrap();
+        // 1 commit for each task's reserve fragments plus 1 for
+        // the call to commit_compaction
+        assert_eq!(dataset.manifest.version, 5);
 
         // Can commit the remaining tasks
-        commit_compaction(&mut dataset, results).await.unwrap();
-        assert_eq!(dataset.manifest.version, 3);
+        commit_compaction(&mut dataset, results, Arc::new(IgnoreRemap::default()))
+            .await
+            .unwrap();
+        // The reserve fragments call already happened for this task
+        // and so we just see the bump from the commit_compaction
+        assert_eq!(dataset.manifest.version, 6);
     }
 }

@@ -14,8 +14,9 @@
 
 //! Data generation utilities for unit tests
 
-use std::iter::repeat_with;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::{iter::repeat_with, ops::Range};
 
 use arrow_array::{
     ArrowNumericType, Float32Array, Int32Array, NativeAdapter, PrimitiveArray, RecordBatch,
@@ -24,7 +25,9 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance_arrow::{fixed_size_list_type, FixedSizeListArrayExt};
 use num_traits::{real::Real, FromPrimitive};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{
+    distributions::Uniform, prelude::Distribution, rngs::StdRng, seq::SliceRandom, Rng, SeedableRng,
+};
 
 pub trait ArrayGenerator {
     fn generate(&mut self, length: usize) -> Arc<dyn arrow_array::Array>;
@@ -209,12 +212,51 @@ where
     PrimitiveArray::<T>::from_iter(repeat_with(|| T::Native::from_f32(rng.gen::<f32>())).take(n))
 }
 
-/// Create a random float32 array.
+/// Create a random float32 array where each element is uniformly
+/// distributed between [0..1]
 pub fn generate_random_array(n: usize) -> Float32Array {
     let mut rng = rand::thread_rng();
-    Float32Array::from(
-        repeat_with(|| rng.gen::<f32>())
-            .take(n)
-            .collect::<Vec<f32>>(),
-    )
+    Float32Array::from_iter_values(repeat_with(|| rng.gen::<f32>()).take(n))
+}
+
+/// Create a random float32 array where each element is uniformly
+/// distributed across the given range
+pub fn generate_scaled_random_array(n: usize, min: f32, max: f32) -> Float32Array {
+    let mut rng = rand::thread_rng();
+    let distribution = Uniform::new(min, max);
+    Float32Array::from_iter_values(repeat_with(|| distribution.sample(&mut rng)).take(n))
+}
+
+pub fn sample_indices(range: Range<usize>, num_picks: u32) -> Vec<usize> {
+    let mut rng = rand::thread_rng();
+    let dist = Uniform::new(range.start, range.end);
+    let ratio = num_picks as f32 / range.len() as f32;
+    if ratio < 0.1_f32 && num_picks > 1000 {
+        // We want to pick a large number of values from a big range.  Better to
+        // use a set and potential retries
+        let mut picked = HashSet::<usize>::with_capacity(num_picks as usize);
+        let mut ordered_picked = Vec::with_capacity(num_picks as usize);
+        while picked.len() < num_picks as usize {
+            let val = dist.sample(&mut rng);
+            if picked.insert(val) {
+                ordered_picked.push(val);
+            }
+        }
+        ordered_picked
+    } else {
+        // We want to pick most of the range, or a small number of values.  Go ahead
+        // and just materialize the range and shuffle
+        let mut values = Vec::from_iter(range);
+        values.partial_shuffle(&mut rng, num_picks as usize);
+        values.truncate(num_picks as usize);
+        values
+    }
+}
+
+pub fn sample_without_replacement<T: Copy>(choices: &[T], num_picks: u32) -> Vec<T> {
+    let mut rng = rand::thread_rng();
+    let mut shuffled = Vec::from(choices);
+    shuffled.partial_shuffle(&mut rng, num_picks as usize);
+    shuffled.truncate(num_picks as usize);
+    shuffled
 }
