@@ -27,7 +27,7 @@ use lance_index::vector::PQ_CODE_COLUMN;
 pub(super) async fn write_index_partitions(
     writer: &mut dyn Writer,
     ivf: &mut Ivf,
-    shuffler: &Shuffler<'_>,
+    shuffler: &Shuffler,
 ) -> Result<()> {
     for part_id in 0..ivf.num_partitions() as u32 {
         if let Some(mut stream) = shuffler.key_iter(part_id).await? {

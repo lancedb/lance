@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
@@ -58,7 +59,7 @@ pub struct ShufflerBuilder {
 
     /// We need to keep the temp_dir with Shuffler because ObjectStore crate does not
     /// work with a NamedTempFile.
-    temp_dir: TempDir,
+    temp_dir: Arc<TempDir>,
 
     writer: FileWriter,
 }
@@ -74,7 +75,7 @@ fn lance_buffer_path(dir: &TempDir) -> Result<Path> {
 impl ShufflerBuilder {
     #[allow(dead_code)]
     pub async fn try_new(schema: &ArrowSchema, flush_threshold: usize) -> Result<Self> {
-        let temp_dir = tempfile::tempdir()?;
+        let temp_dir = Arc::new(tempfile::tempdir()?);
 
         let object_store = ObjectStore::local();
         let path = lance_buffer_path(&temp_dir)?;
@@ -120,11 +121,11 @@ impl ShufflerBuilder {
             }
         }
         self.writer.finish().await?;
-        Ok(Shuffler::new(&self.parted_groups, &self.temp_dir))
+        Ok(Shuffler::new(&self.parted_groups, self.temp_dir.clone()))
     }
 }
 
-pub struct Shuffler<'a> {
+pub struct Shuffler {
     /// Partition ID to file-group ID mapping, in memory.
     /// No external dependency is required, because we don't need to guarantee the
     /// persistence of this mapping, as well as the temp files.
@@ -132,11 +133,11 @@ pub struct Shuffler<'a> {
 
     /// We need to keep the temp_dir with Shuffler because ObjectStore crate does not
     /// work with a NamedTempFile.
-    temp_dir: &'a TempDir,
+    temp_dir: Arc<TempDir>,
 }
 
-impl<'a> Shuffler<'a> {
-    fn new(parted_groups: &BTreeMap<u32, Vec<u32>>, temp_dir: &'a TempDir) -> Self {
+impl Shuffler {
+    fn new(parted_groups: &BTreeMap<u32, Vec<u32>>, temp_dir: Arc<TempDir>) -> Self {
         Self {
             parted_groups: parted_groups.clone(),
             temp_dir,
@@ -150,7 +151,7 @@ impl<'a> Shuffler<'a> {
         }
 
         let object_store = ObjectStore::local();
-        let path = lance_buffer_path(self.temp_dir)?;
+        let path = lance_buffer_path(self.temp_dir.as_ref())?;
         let reader = FileReader::try_new(&object_store, &path)
             .await
             .map_err(|e| Error::IO {
