@@ -114,6 +114,7 @@ async fn remap_index(
         &field.name,
         index_id,
         &new_id,
+        matched,
         row_id_map,
     )
     .await?;

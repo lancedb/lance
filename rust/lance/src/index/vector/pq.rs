@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::{any::Any, collections::BinaryHeap};
 
 use arrow::datatypes::Float32Type;
 use arrow_arith::aggregate::min;
@@ -22,6 +22,7 @@ use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray,
     Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
+use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
@@ -35,12 +36,12 @@ use rand::SeedableRng;
 use serde::Serialize;
 
 use super::{MetricType, Query, VectorIndex};
+use crate::arrow::*;
 use crate::dataset::ROW_ID;
 use crate::index::prefilter::PreFilter;
 use crate::index::Index;
 use crate::index::{pb, vector::kmeans::train_kmeans, vector::DIST_COL};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
-use crate::{arrow::*, format::RowAddress};
 use crate::{Error, Result};
 
 /// Product Quantization Index.
@@ -250,69 +251,6 @@ impl Index for PQIndex {
     }
 }
 
-// Helper struct for zipped distance + row id that sorts by distance
-struct DistanceRowId {
-    distance: f32,
-    row_id: u64,
-}
-
-impl DistanceRowId {
-    fn new(distance: f32, row_id: u64) -> Self {
-        Self { distance, row_id }
-    }
-}
-
-impl DistanceRowId {
-    fn distance(&self) -> f32 {
-        self.distance
-    }
-    fn row_id(&self) -> u64 {
-        self.row_id
-    }
-}
-
-impl PartialEq for DistanceRowId {
-    fn eq(&self, other: &Self) -> bool {
-        // Note: we don't use == here, which is only PartialEq, since Ord
-        // requires Eq and so we use total_cmp which does satisfy Eq.  That
-        // being said, I don't know if this matters.  So feel free to just go
-        // back to == if this method is affecting perf
-        matches!(
-            self.distance().total_cmp(&other.distance()),
-            std::cmp::Ordering::Equal
-        )
-    }
-}
-
-impl Eq for DistanceRowId {}
-
-impl PartialOrd for DistanceRowId {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for DistanceRowId {
-    // Note: this implementation of cmp is reversed.  This is because BinaryHeap gives us
-    // the max items and we want the min items
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.distance().total_cmp(&self.distance())
-    }
-}
-
-// Helper function to take the top K items from an iterator in O(N) + K*log(N) time
-fn top_k<I: Iterator>(iter: I, k: usize) -> Vec<I::Item>
-where
-    I::Item: Ord,
-{
-    let mut heap = BinaryHeap::from_iter(iter);
-    let mut items = Vec::with_capacity(k);
-    while !heap.is_empty() && items.len() < k {
-        items.push(heap.pop().unwrap());
-    }
-    items
-}
-
 #[async_trait]
 impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
@@ -341,28 +279,10 @@ impl VectorIndex for PQIndex {
 
         debug_assert_eq!(distances.len(), row_ids.len());
 
-        // Remove any tombstone rows from consideration when sorting
-        let distance_ids = distances
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap()
-            .values()
-            .iter()
-            .copied()
-            .zip(row_ids.values().iter().copied())
-            .filter(|(_, row_id)| *row_id != RowAddress::TOMBSTONE_ROW)
-            .map(|(distance, row_id)| DistanceRowId::new(distance, row_id));
-
         let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
-
-        let top_distance_ids = top_k(distance_ids, limit);
-
-        let distances = Arc::new(Float32Array::from_iter_values(
-            top_distance_ids.iter().map(|dist_id| dist_id.distance()),
-        ));
-        let row_ids = Arc::new(UInt64Array::from_iter_values(
-            top_distance_ids.iter().map(|dist_id| dist_id.row_id()),
-        ));
+        let indices = sort_to_indices(&distances, None, Some(limit))?;
+        let distances = take(&distances, &indices, None)?;
+        let row_ids = take(row_ids.as_ref(), &indices, None)?;
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new(DIST_COL, DataType::Float32, false),
@@ -406,21 +326,29 @@ impl VectorIndex for PQIndex {
     }
 
     fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        let remapped_ids =
-            UInt64Array::from_iter_values(self.row_ids.as_ref().unwrap().values().iter().map(
-                |old_row_id| {
-                    mapping
-                        .get(old_row_id)
-                        .cloned()
-                        // If the row id is not in the mapping then this row is not remapped and we keep as is
-                        .unwrap_or(Some(*old_row_id))
-                        // If the row is in the mapping, but maps to None, then it is deleted, and we insert
-                        // a tombstone in its place
-                        .unwrap_or(RowAddress::TOMBSTONE_ROW)
-                },
-            ));
+        let code = self
+            .code
+            .as_ref()
+            .unwrap()
+            .values()
+            .chunks_exact(self.num_sub_vectors);
+        let row_ids = self.row_ids.as_ref().unwrap().values().iter();
+        let remapped = row_ids
+            .zip(code)
+            .filter_map(|(old_row_id, code)| {
+                let new_row_id = mapping.get(old_row_id).cloned();
+                // If the row id is not in the mapping then this row is not remapped and we keep as is
+                let new_row_id = new_row_id.unwrap_or(Some(*old_row_id));
+                new_row_id.map(|new_row_id| (new_row_id, code))
+            })
+            .collect::<Vec<_>>();
 
-        self.row_ids = Some(Arc::new(remapped_ids));
+        self.row_ids = Some(Arc::new(UInt64Array::from_iter_values(
+            remapped.iter().map(|(row_id, _)| *row_id),
+        )));
+        self.code = Some(Arc::new(UInt8Array::from_iter_values(
+            remapped.into_iter().flat_map(|(_, code)| code).copied(),
+        )));
         Ok(())
     }
 }

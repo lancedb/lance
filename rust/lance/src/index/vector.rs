@@ -274,6 +274,7 @@ pub(crate) async fn remap_vector_index(
     column: &str,
     old_uuid: &Uuid,
     new_uuid: &Uuid,
+    old_metadata: &crate::format::Index,
     mapping: &HashMap<u64, Option<u64>>,
 ) -> Result<()> {
     let old_index = open_index(dataset.clone(), column, &old_uuid.to_string()).await?;
@@ -290,8 +291,15 @@ pub(crate) async fn remap_vector_index(
         dataset.as_ref(),
         &old_uuid.to_string(),
         &new_uuid.to_string(),
+        old_metadata.dataset_version,
         ivf_index,
         mapping,
+        old_metadata.name.clone(),
+        column.to_string(),
+        // We can safely assume there are no transforms today.  We assert above that the
+        // top stage is IVF and IVF does not support transforms between IVF and PQ.  This
+        // will be fixed in the future.
+        vec![],
     )
     .await?;
     Ok(())

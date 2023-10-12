@@ -36,7 +36,6 @@ use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
 use snafu::{location, Location};
-use tokio::io::AsyncWriteExt;
 use tracing::{instrument, span, Level};
 
 #[cfg(feature = "opq")]
@@ -737,21 +736,6 @@ pub async fn build_ivf_pq_index(
     .await
 }
 
-#[async_trait]
-trait RemapWriteTask: Send {
-    async fn write(self: Box<Self>, writer: &mut ObjectWriter) -> Result<()>;
-}
-
-#[async_trait]
-trait RemapLoadTask: Send {
-    async fn load_and_remap(
-        self: Box<Self>,
-        reader: &dyn ObjectReader,
-        index: &IVFIndex,
-        mapping: &HashMap<u64, Option<u64>>,
-    ) -> Result<Box<dyn RemapWriteTask>>;
-}
-
 struct RemapPageTask {
     offset: usize,
     length: u32,
@@ -768,14 +752,13 @@ impl RemapPageTask {
     }
 }
 
-#[async_trait]
-impl RemapLoadTask for RemapPageTask {
+impl RemapPageTask {
     async fn load_and_remap(
-        mut self: Box<Self>,
+        mut self,
         reader: &dyn ObjectReader,
         index: &IVFIndex,
         mapping: &HashMap<u64, Option<u64>>,
-    ) -> Result<Box<dyn RemapWriteTask>> {
+    ) -> Result<Self> {
         let mut page = index
             .sub_index
             .load(reader, self.offset, self.length as usize)
@@ -784,16 +767,16 @@ impl RemapLoadTask for RemapPageTask {
         self.page = Some(page);
         Ok(self)
     }
-}
 
-#[async_trait]
-impl RemapWriteTask for RemapPageTask {
-    async fn write(self: Box<Self>, writer: &mut ObjectWriter) -> Result<()> {
+    async fn write(self, writer: &mut ObjectWriter, ivf: &mut Ivf) -> Result<()> {
         let page = self.page.as_ref().expect("Load was not called");
         let page: &PQIndex = page
             .as_any()
             .downcast_ref()
             .expect("Generic index writing not supported yet");
+        ivf.offsets.push(writer.tell());
+        ivf.lengths
+            .push(page.row_ids.as_ref().unwrap().len() as u32);
         writer
             .write_plain_encoded_array(&[page.code.as_ref().unwrap().as_ref()])
             .await?;
@@ -804,25 +787,27 @@ impl RemapWriteTask for RemapPageTask {
     }
 }
 
-fn generate_remap_tasks(
-    offsets: &Vec<usize>,
-    lengths: &[u32],
-) -> Result<Vec<Box<dyn RemapLoadTask>>> {
-    let mut tasks: Vec<Box<dyn RemapLoadTask>> = Vec::with_capacity(offsets.len() * 2 + 1);
+fn generate_remap_tasks(offsets: &Vec<usize>, lengths: &[u32]) -> Result<Vec<RemapPageTask>> {
+    let mut tasks: Vec<RemapPageTask> = Vec::with_capacity(offsets.len() * 2 + 1);
 
     for (offset, length) in offsets.iter().zip(lengths.iter()) {
-        tasks.push(Box::new(RemapPageTask::new(*offset, *length)));
+        tasks.push(RemapPageTask::new(*offset, *length));
     }
 
     Ok(tasks)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn remap_index_file(
     dataset: &Dataset,
     old_uuid: &str,
     new_uuid: &str,
+    old_version: u64,
     index: &IVFIndex,
     mapping: &HashMap<u64, Option<u64>>,
+    name: String,
+    column: String,
+    transforms: Vec<pb::Transform>,
 ) -> Result<()> {
     let object_store = dataset.object_store();
     let old_path = dataset.indices_dir().child(old_uuid).child(INDEX_FILE_NAME);
@@ -834,26 +819,42 @@ pub(crate) async fn remap_index_file(
     let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;
 
     let mut task_stream = stream::iter(tasks.into_iter())
-        .then(|task| task.load_and_remap(reader.as_ref(), index, mapping));
-    // The below doesn't work today because of a bogus higher-rank lifetime error
-    // .map(|task| task.load_and_remap(reader.as_ref(), index, mapping))
-    // .buffered(num_cpus::get());
+        .map(|task| task.load_and_remap(reader.as_ref(), index, mapping))
+        .buffered(num_cpus::get());
 
+    let mut ivf = Ivf {
+        centroids: index.ivf.centroids.clone(),
+        offsets: Vec::with_capacity(index.ivf.offsets.len()),
+        lengths: Vec::with_capacity(index.ivf.lengths.len()),
+    };
     while let Some(write_task) = task_stream.try_next().await? {
-        write_task.write(&mut writer).await?;
+        write_task.write(&mut writer, &mut ivf).await?;
     }
 
-    // The index doesn't currently write down where the pages end.  So we wait
-    // for the remapping to finish and then see how many bytes we copied.  This
-    // will tell us since the remapped file should be the same size.  Now we just
-    // copy the remaining bytes
-    let pos = writer.tell();
-    let file_size = reader.size().await?;
-    let remaining = reader.get_range(pos..file_size).await?;
+    let pq_sub_index = index
+        .sub_index
+        .as_any()
+        .downcast_ref::<PQIndex>()
+        .ok_or_else(|| Error::NotSupported {
+            source: "Remapping a non-pq sub-index".into(),
+        })?;
 
-    writer.write_all(&remaining).await?;
+    let metadata = IvfPQIndexMetadata {
+        name,
+        column,
+        dimension: index.ivf.dimension() as u32,
+        dataset_version: old_version,
+        ivf,
+        metric_type: index.metric_type,
+        pq: pq_sub_index.pq.clone(),
+        transforms,
+    };
 
+    let metadata = pb::Index::try_from(&metadata)?;
+    let pos = writer.write_protobuf(&metadata).await?;
+    writer.write_magics(pos).await?;
     writer.shutdown().await?;
+
     Ok(())
 }
 
@@ -1360,9 +1361,19 @@ mod tests {
         let new_uuid = Uuid::new_v4();
         let new_uuid_str = new_uuid.to_string();
 
-        remap_index_file(&dataset, &uuid_str, &new_uuid_str, ivf_index, &mapping)
-            .await
-            .unwrap();
+        remap_index_file(
+            &dataset,
+            &uuid_str,
+            &new_uuid_str,
+            dataset.version().version,
+            ivf_index,
+            &mapping,
+            INDEX_NAME.to_string(),
+            WellKnownIvfPqData::COLUMN.to_string(),
+            vec![],
+        )
+        .await
+        .unwrap();
 
         let remapped = open_index(
             dataset.clone(),
