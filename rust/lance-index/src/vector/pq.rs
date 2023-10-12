@@ -176,7 +176,7 @@ impl ProductQuantizer {
         dimension: usize,
         codebook: Arc<Float32Array>,
     ) -> Self {
-        assert!(nbits == 8, "nbits can only be 8");
+        assert_eq!(nbits, 8, "nbits can only be 8");
         Self {
             num_bits: nbits,
             num_sub_vectors: m,
