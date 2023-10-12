@@ -32,7 +32,7 @@ use arrow_array::{
         TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type,
         UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, BinaryArray, OffsetSizeTrait,
+    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, OffsetSizeTrait,
     PrimitiveArray, RecordBatch, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
@@ -61,15 +61,14 @@ fn get_primitive_statistics<T: ArrowNumericType>(
 where
     T::Native: Bounded + PartialOrd,
 {
-    let arr = arrays
-        .iter()
-        .map(|x| as_primitive_array::<T>(x))
-        .collect::<Vec<_>>();
     let mut min_value = T::Native::max_value();
     let mut max_value = T::Native::min_value();
     let mut null_count: i64 = 0;
+    let arrays_iterator = arrays
+        .iter()
+        .map(|x| as_primitive_array::<T>(x));
 
-    for array in arr.iter() {
+    for array in arrays_iterator {
         array.iter().for_each(|value| {
             if let Some(value) = value {
                 if let Some(Ordering::Greater) = value.partial_cmp(&max_value) {
@@ -204,12 +203,11 @@ fn get_string_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
     let mut max_value: Option<&str> = None;
     let mut null_count: i64 = 0;
 
-    let arr = arrays
+    let array_iterator = arrays
         .iter()
-        .map(|x| x.as_string::<T>())
-        .collect::<Vec<_>>();
+        .map(|x| x.as_string::<T>());
 
-    for array in arr.iter() {
+    for array in array_iterator {
         array.iter().for_each(|value| {
             if let Some(val) = value {
                 // TODO: don't compare full strings
@@ -281,12 +279,11 @@ fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
     let mut max_value: Option<&[u8]> = None;
     let mut null_count: i64 = 0;
 
-    let arr = arrays
+    let array_iterator = arrays
         .iter()
-        .map(|x| as_generic_binary_array::<T>(x))
-        .collect::<Vec<_>>();
+        .map(|x| as_generic_binary_array::<T>(x));
 
-    for array in arr.iter() {
+    for array in array_iterator {
         array.iter().for_each(|value| {
             if let Some(val) = value {
                 // don't compare full buffers if possible
@@ -353,14 +350,14 @@ fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     let mut max_value: Option<&[u8]> = None;
     let mut null_count: i64 = 0;
 
-    let arr = arrays
+    let array_iterator = arrays
         .iter()
-        .map(|x| as_fixed_size_binary_array(x))
-        .collect::<Vec<_>>();
+        .map(|x| as_fixed_size_binary_array(x));
 
-    let length = std::cmp::min(BINARY_PREFIX_LENGTH, arr[0].value_length() as usize);
+    let length = as_fixed_size_binary_array(arrays[0]).value_length() as usize;
+    let length = std::cmp::min(BINARY_PREFIX_LENGTH, length);
 
-    for array in arr.iter() {
+    for array in array_iterator {
         array.iter().for_each(|value| {
             if let Some(val) = value {
                 // don't compare full buffers if possible
@@ -417,15 +414,14 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     let mut false_present = false;
     let mut null_count: i64 = 0;
 
-    let arrs = arrays
+    let array_iterator = arrays
         .iter()
         .map(|x| {
             null_count += x.null_count() as i64;
             x.as_boolean()
-        })
-        .collect::<Vec<_>>();
+        });
 
-    for array in arrs.iter() {
+    for array in array_iterator {
         array.iter().for_each(|value| {
             if let Some(value) = value {
                 if value {
@@ -564,8 +560,7 @@ fn cast_dictionary_arrays<'a, T: ArrowDictionaryKeyType + 'static>(
 ) -> Vec<&Arc<dyn Array>> {
     arrays
         .iter()
-        .map(|x| x.as_dictionary::<T>())
-        .map(|c| c.values())
+        .map(|x| x.as_dictionary::<T>().values())
         .collect::<Vec<_>>()
 }
 
@@ -615,108 +610,124 @@ fn get_struct_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     }
 }
 
-fn get_temporal_statistics_32<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> StatisticsRow
-where
-    T::Native: Bounded + PartialOrd,
-    i32: From<<T as ArrowPrimitiveType>::Native>,
-{
-    //TODO: can get_temporal_statistics_32 and get_temporal_statistics be merged?
-    let (min_value, max_value, null_count) = get_primitive_statistics::<T>(arrays);
-    let mv = Some(min_value.into());
-    let mx = Some(max_value.into());
-    let min_value_scalar: ScalarValue;
-    let max_value_scalar: ScalarValue;
-
+fn get_temporal_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     match arrays[0].data_type() {
         DataType::Time32(TimeUnit::Second) => {
-            min_value_scalar = ScalarValue::Time32Second(mv);
-            max_value_scalar = ScalarValue::Time32Second(mx);
+            let (min_value, max_value, null_count) = get_primitive_statistics::<Time32SecondType>(arrays);
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(null_count)),
+                min_value: ScalarValue::Time32Second(Some(min_value)),
+                max_value: ScalarValue::Time32Second(Some(max_value)),
+            }
         }
         DataType::Time32(TimeUnit::Millisecond) => {
-            min_value_scalar = ScalarValue::Time32Millisecond(mv);
-            max_value_scalar = ScalarValue::Time32Millisecond(mx);
+            let (min_value, max_value, null_count) = get_primitive_statistics::<Time32MillisecondType>(arrays);
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(null_count)),
+                min_value: ScalarValue::Time32Millisecond(Some(min_value)),
+                max_value: ScalarValue::Time32Millisecond(Some(max_value)),
+            }
         }
         DataType::Date32 => {
-            min_value_scalar = ScalarValue::Date32(mv);
-            max_value_scalar = ScalarValue::Date32(mx);
+            let (min_value, max_value, null_count) = get_primitive_statistics::<Date32Type>(arrays);
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(null_count)),
+                min_value: ScalarValue::Date32(Some(min_value)),
+                max_value: ScalarValue::Date32(Some(max_value)),
+            }
         }
-        _ => {
-            todo!()
-        }
-    }
 
-    StatisticsRow {
-        null_count: ScalarValue::Int64(Some(null_count)),
-        min_value: min_value_scalar,
-        max_value: max_value_scalar,
-    }
-}
-
-fn get_temporal_statistics<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> StatisticsRow
-where
-    T::Native: Bounded + PartialOrd,
-    i64: From<<T as ArrowPrimitiveType>::Native>,
-{
-    let (min_value, max_value, null_count) = get_primitive_statistics::<T>(arrays);
-    let mv = Some(min_value.into());
-    let mx = Some(max_value.into());
-    let min_value_scalar: ScalarValue;
-    let max_value_scalar: ScalarValue;
-
-    match arrays[0].data_type() {
         DataType::Timestamp(TimeUnit::Second, tz) => {
-            min_value_scalar = ScalarValue::TimestampSecond(mv, tz.clone());
-            max_value_scalar = ScalarValue::TimestampSecond(mx, tz.clone());
+            let (min_value, max_value, null_count) = get_primitive_statistics::<TimestampSecondType>(arrays);
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(null_count)),
+                min_value: ScalarValue::TimestampSecond(Some(min_value), tz.clone()),
+                max_value: ScalarValue::TimestampSecond(Some(max_value), tz.clone()),
+            }
         }
         DataType::Timestamp(TimeUnit::Millisecond, tz) => {
-            min_value_scalar = ScalarValue::TimestampMillisecond(mv, tz.clone());
-            max_value_scalar = ScalarValue::TimestampMillisecond(mx, tz.clone());
+            let (min_value, max_value, null_count) = get_primitive_statistics::<TimestampMillisecondType>(arrays);
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(null_count)),
+                min_value: ScalarValue::TimestampMillisecond(Some(min_value), tz.clone()),
+                max_value: ScalarValue::TimestampMillisecond(Some(max_value), tz.clone()),
+            }
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            min_value_scalar = ScalarValue::TimestampMicrosecond(mv, tz.clone());
-            max_value_scalar = ScalarValue::TimestampMicrosecond(mx, tz.clone());
+            let (min_value, max_value, null_count) = get_primitive_statistics::<TimestampMicrosecondType>(arrays);
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(null_count)),
+                min_value: ScalarValue::TimestampMicrosecond(Some(min_value), tz.clone()),
+                max_value: ScalarValue::TimestampMicrosecond(Some(max_value), tz.clone()),
+            }
         }
         DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
-            min_value_scalar = ScalarValue::TimestampNanosecond(mv, tz.clone());
-            max_value_scalar = ScalarValue::TimestampNanosecond(mx, tz.clone());
+            let (min_value, max_value, null_count) = get_primitive_statistics::<TimestampNanosecondType>(arrays);
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(null_count)),
+                min_value: ScalarValue::TimestampNanosecond(Some(min_value), tz.clone()),
+                max_value: ScalarValue::TimestampNanosecond(Some(max_value), tz.clone()),
+            }
         }
         DataType::Time64(TimeUnit::Microsecond) => {
-            min_value_scalar = ScalarValue::Time64Microsecond(mv);
-            max_value_scalar = ScalarValue::Time64Microsecond(mx);
+            let (min_value, max_value, null_count) = get_primitive_statistics::<Time64MicrosecondType>(arrays);
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(null_count)),
+                min_value: ScalarValue::Time64Microsecond(Some(min_value)),
+                max_value: ScalarValue::Time64Microsecond(Some(max_value)),
+            }
         }
         DataType::Time64(TimeUnit::Nanosecond) => {
-            min_value_scalar = ScalarValue::Time64Nanosecond(mv);
-            max_value_scalar = ScalarValue::Time64Nanosecond(mx);
+            let (min_value, max_value, null_count) = get_primitive_statistics::<Time64NanosecondType>(arrays);
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(null_count)),
+                min_value: ScalarValue::Time64Nanosecond(Some(min_value)),
+                max_value: ScalarValue::Time64Nanosecond(Some(max_value)),
+            }
         }
         DataType::Date64 => {
-            min_value_scalar = ScalarValue::Date64(mv);
-            max_value_scalar = ScalarValue::Date64(mx);
+            let (min_value, max_value, null_count) = get_primitive_statistics::<Date64Type>(arrays);
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(null_count)),
+                min_value: ScalarValue::Date64(Some(min_value)),
+                max_value: ScalarValue::Date64(Some(max_value)),
+            }
         }
         DataType::Duration(TimeUnit::Second) => {
-            min_value_scalar = ScalarValue::DurationSecond(mv);
-            max_value_scalar = ScalarValue::DurationSecond(mx);
+            let (min_value, max_value, null_count) = get_primitive_statistics::<DurationSecondType>(arrays);
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(null_count)),
+                min_value: ScalarValue::DurationSecond(Some(min_value)),
+                max_value: ScalarValue::DurationSecond(Some(max_value)),
+            }
         }
         DataType::Duration(TimeUnit::Millisecond) => {
-            min_value_scalar = ScalarValue::DurationMillisecond(mv);
-            max_value_scalar = ScalarValue::DurationMillisecond(mx);
+            let (min_value, max_value, null_count) = get_primitive_statistics::<DurationMillisecondType>(arrays);
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(null_count)),
+                min_value: ScalarValue::DurationMillisecond(Some(min_value)),
+                max_value: ScalarValue::DurationMillisecond(Some(max_value)),
+            }
         }
         DataType::Duration(TimeUnit::Microsecond) => {
-            min_value_scalar = ScalarValue::DurationMicrosecond(mv);
-            max_value_scalar = ScalarValue::DurationMicrosecond(mx);
+            let (min_value, max_value, null_count) = get_primitive_statistics::<DurationMicrosecondType>(arrays);
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(null_count)),
+                min_value: ScalarValue::DurationMicrosecond(Some(min_value)),
+                max_value: ScalarValue::DurationMicrosecond(Some(max_value)),
+            }
         }
         DataType::Duration(TimeUnit::Nanosecond) => {
-            min_value_scalar = ScalarValue::DurationNanosecond(mv);
-            max_value_scalar = ScalarValue::DurationNanosecond(mx);
+            let (min_value, max_value, null_count) = get_primitive_statistics::<DurationNanosecondType>(arrays);
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(null_count)),
+                min_value: ScalarValue::DurationNanosecond(Some(min_value)),
+                max_value: ScalarValue::DurationNanosecond(Some(max_value)),
+            }
         }
         _ => {
             todo!()
         }
-    }
-
-    StatisticsRow {
-        null_count: ScalarValue::Int64(Some(null_count)),
-        min_value: min_value_scalar,
-        max_value: max_value_scalar,
     }
 }
 
@@ -733,44 +744,12 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::UInt64 => get_statistics::<UInt64Type>(arrays),
         DataType::Float32 => get_statistics::<Float32Type>(arrays),
         DataType::Float64 => get_statistics::<Float64Type>(arrays),
-        DataType::Date32 => get_temporal_statistics_32::<Date32Type>(arrays),
-        DataType::Time32(TimeUnit::Second) => {
-            get_temporal_statistics_32::<Time32SecondType>(arrays)
-        }
-        DataType::Time32(TimeUnit::Millisecond) => {
-            get_temporal_statistics_32::<Time32MillisecondType>(arrays)
-        }
-        DataType::Date64 => get_temporal_statistics::<Date64Type>(arrays),
-        DataType::Time64(TimeUnit::Microsecond) => {
-            get_temporal_statistics::<Time64MicrosecondType>(arrays)
-        }
-        DataType::Time64(TimeUnit::Nanosecond) => {
-            get_temporal_statistics::<Time64NanosecondType>(arrays)
-        }
-        DataType::Timestamp(TimeUnit::Second, _) => {
-            get_temporal_statistics::<TimestampSecondType>(arrays)
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            get_temporal_statistics::<TimestampMillisecondType>(arrays)
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            get_temporal_statistics::<TimestampMicrosecondType>(arrays)
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            get_temporal_statistics::<TimestampNanosecondType>(arrays)
-        }
-        DataType::Duration(TimeUnit::Second) => {
-            get_temporal_statistics::<DurationSecondType>(arrays)
-        }
-        DataType::Duration(TimeUnit::Millisecond) => {
-            get_temporal_statistics::<DurationMillisecondType>(arrays)
-        }
-        DataType::Duration(TimeUnit::Microsecond) => {
-            get_temporal_statistics::<DurationMicrosecondType>(arrays)
-        }
-        DataType::Duration(TimeUnit::Nanosecond) => {
-            get_temporal_statistics::<DurationNanosecondType>(arrays)
-        }
+        DataType::Date32 => get_temporal_statistics(arrays),
+        DataType::Time32(_) => get_temporal_statistics(arrays),
+        DataType::Date64 => get_temporal_statistics(arrays),
+        DataType::Time64(_) => get_temporal_statistics(arrays),
+        DataType::Timestamp(_, _) => get_temporal_statistics(arrays),
+        DataType::Duration(_) => get_temporal_statistics(arrays),
         DataType::Decimal128(_, _) => get_decimal_statistics(arrays),
         DataType::Binary => get_binary_statistics::<i32>(arrays),
         DataType::LargeBinary => get_binary_statistics::<i64>(arrays),
@@ -782,7 +761,6 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::List(_) => get_list_statistics::<Int64Type, i32>(arrays),
         DataType::LargeList(_) => get_list_statistics::<Int64Type, i64>(arrays),
         DataType::FixedSizeList(_, _) => get_fixed_size_list_statistics::<Int64Type>(arrays),
-
         _ => {
             println!(
                 "Stats collection for {} is not supported yet",
@@ -867,27 +845,27 @@ impl StatisticsBuilder {
     }
 
     fn string_statistics_appender(&mut self, row: StatisticsRow) {
-        let ScalarValue::Int64(Some(null_count)) = row.null_count else {
-            todo!()
-        };
-        self.null_count.append_value(null_count);
-
         let min_value_builder = self
             .min_value
             .as_any_mut()
             .downcast_mut::<StringBuilder>()
             .unwrap();
+        let max_value_builder = self
+            .max_value
+            .as_any_mut()
+            .downcast_mut::<StringBuilder>()
+            .unwrap();
+
+        if let ScalarValue::Int64(Some(null_count)) = row.null_count {
+            self.null_count.append_value(null_count);
+        } else { todo!() };
+
         if let ScalarValue::Utf8(Some(min_value)) = row.min_value {
             min_value_builder.append_value(min_value);
         } else {
             min_value_builder.append_null();
         }
 
-        let max_value_builder = self
-            .max_value
-            .as_any_mut()
-            .downcast_mut::<StringBuilder>()
-            .unwrap();
         if let ScalarValue::Utf8(Some(max_value)) = row.max_value {
             max_value_builder.append_value(max_value);
         } else {
@@ -899,33 +877,26 @@ impl StatisticsBuilder {
         let ScalarValue::Int64(Some(null_count)) = row.null_count else {
             todo!()
         };
-        self.null_count.append_value(null_count);
+        let ScalarValue::Binary(Some(min_value)) = row.min_value else {
+            todo!()
+        };
+        let ScalarValue::Binary(Some(max_value)) = row.max_value else {
+            todo!()
+        };
 
         let min_value_builder = self
             .min_value
             .as_any_mut()
             .downcast_mut::<BinaryBuilder>()
             .unwrap();
-        let binding = row.min_value.to_array();
-        let min_value = binding
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap()
-            .value(0);
-
-        min_value_builder.append_value(min_value);
-
         let max_value_builder = self
             .max_value
             .as_any_mut()
             .downcast_mut::<BinaryBuilder>()
             .unwrap();
-        let binding = row.max_value.to_array();
-        let max_value = binding
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap()
-            .value(0);
+
+        self.null_count.append_value(null_count);
+        min_value_builder.append_value(min_value);
         max_value_builder.append_value(max_value);
     }
 
@@ -965,25 +936,23 @@ impl StatisticsBuilder {
     }
 
     fn boolean_appender(&mut self, row: StatisticsRow) {
-        let ScalarValue::Int64(Some(null_count)) = row.null_count else {
-            todo!()
-        };
-        self.null_count.append_value(null_count);
+        let ScalarValue::Int64(Some(null_count)) = row.null_count else { todo!() };
+        let ScalarValue::Boolean(Some(max_value)) = row.max_value else { todo!() };
+        let ScalarValue::Boolean(Some(min_value)) = row.min_value else { todo!() };
 
         let min_value_builder = self
             .min_value
             .as_any_mut()
             .downcast_mut::<BooleanBuilder>()
             .unwrap();
-        let min_value = row.min_value.to_array().as_boolean().value(0);
-        min_value_builder.append_value(min_value);
-
         let max_value_builder = self
             .max_value
             .as_any_mut()
             .downcast_mut::<BooleanBuilder>()
             .unwrap();
-        let max_value = row.max_value.to_array().as_boolean().value(0);
+
+        self.null_count.append_value(null_count);
+        min_value_builder.append_value(min_value);
         max_value_builder.append_value(max_value);
     }
 
