@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use arrow_array::RecordBatch;
+use lance_core::{Error, Result};
+
 use super::transform::Transformer;
 
-use lance_core::{Error, Result};
 
 pub struct PQTransformer {
     quantizer: ProductQuantizer,
@@ -34,6 +36,7 @@ impl PQTransformer {
 
 impl Transformer for PQTransformer {
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let input_arr = batch.column_by_name(&self.input_column)
         todo!()
     }
 }
