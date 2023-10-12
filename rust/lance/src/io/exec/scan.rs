@@ -28,6 +28,7 @@ use datafusion::physical_plan::{
 use futures::stream::Stream;
 use futures::{stream, Future};
 use futures::{StreamExt, TryStreamExt};
+use tracing::Instrument;
 
 use crate::dataset::fragment::{FileFragment, FragmentReader};
 use crate::dataset::{Dataset, ROW_ID};
@@ -65,12 +66,15 @@ fn scan_batches(
         let reader = reader2.clone();
         // The Ok here is only here because try_flatten_unordered wants both the
         // outer *and* inner stream to be TryStream.
-        let task = tokio::task::spawn(async move {
-            reader
-                .read_batch(batch_id, range)
-                .await
-                .map_err(DataFusionError::from)
-        });
+        let task = tokio::task::spawn(
+            async move {
+                reader
+                    .read_batch(batch_id, range)
+                    .await
+                    .map_err(DataFusionError::from)
+            }
+            .in_current_span(),
+        );
 
         Ok(async move { task.await.unwrap() })
     });

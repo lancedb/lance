@@ -33,6 +33,7 @@ use tracing::{instrument, Instrument};
 
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::{Dataset, ROW_ID};
+use crate::format::Index;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::flat::flat_search;
 use crate::index::vector::{open_index, Query, DIST_COL};
@@ -252,30 +253,29 @@ pub struct KNNIndexStream {
 }
 
 impl KNNIndexStream {
+    async fn knn_stream(
+        query: Query,
+        dataset: Arc<Dataset>,
+        index_meta: Index,
+    ) -> Result<RecordBatch> {
+        let index =
+            open_index(dataset.clone(), &query.column, &index_meta.uuid.to_string()).await?;
+        let pre_filter = Arc::new(PreFilter::new(dataset, index_meta));
+        index.search(&query, pre_filter).await
+    }
+
     #[instrument(level = "debug", skip_all, name = "KNNIndexStream::new")]
-    pub fn new(dataset: Arc<Dataset>, index_name: &str, query: &Query) -> Self {
+    pub fn new(dataset: Arc<Dataset>, index: &Index, query: &Query) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         let q = query.clone();
-        let name = index_name.to_string();
+        let index = index.clone();
         let bg_thread = tokio::spawn(
             async move {
-                let index = match open_index(dataset.clone(), &q.column, &name).await {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
-                            "Failed to open vector index: {name}: {e}"
-                        ))))
-                        .await
-                        .expect("KNNFlat failed to send message");
-                        return;
-                    }
-                };
-                let pre_filter = PreFilter::new(dataset);
-                let result = match index.search(&q, &pre_filter).await {
+                let result = match Self::knn_stream(q, dataset, index).await {
                     Ok(b) => b,
                     Err(e) => {
                         tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
-                            "Failed to compute distances: {e}"
+                            "Failed to calculate KNN: {e}"
                         ))))
                         .await
                         .expect("KNNIndex failed to send message");
@@ -343,8 +343,8 @@ impl Stream for KNNIndexStream {
 pub struct KNNIndexExec {
     /// Dataset to read from.
     dataset: Arc<Dataset>,
-    /// The UUID of the index.
-    index_name: String,
+    /// The index metadata
+    index: Index,
     /// The vector query to execute.
     query: Query,
 }
@@ -353,7 +353,7 @@ impl DisplayAs for KNNIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "KNNIndex: name={}, k={}", self.index_name, self.query.k)
+                write!(f, "KNNIndex: name={}, k={}", self.index.uuid, self.query.k)
             }
         }
     }
@@ -361,7 +361,7 @@ impl DisplayAs for KNNIndexExec {
 
 impl KNNIndexExec {
     /// Create a new [KNNIndexExec].
-    pub fn try_new(dataset: Arc<Dataset>, index_name: &str, query: &Query) -> Result<Self> {
+    pub fn try_new(dataset: Arc<Dataset>, index: Index, query: &Query) -> Result<Self> {
         let schema = dataset.schema();
         if schema.field(query.column.as_str()).is_none() {
             return Err(Error::IO {
@@ -375,7 +375,7 @@ impl KNNIndexExec {
 
         Ok(Self {
             dataset,
-            index_name: index_name.to_string(),
+            index,
             query: query.clone(),
         })
     }
@@ -420,7 +420,7 @@ impl ExecutionPlan for KNNIndexExec {
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
         Ok(Box::pin(KNNIndexStream::new(
             self.dataset.clone(),
-            &self.index_name,
+            &self.index,
             &self.query,
         )))
     }

@@ -81,6 +81,16 @@ impl Default for DeletionVector {
     }
 }
 
+impl From<&DeletionVector> for RoaringBitmap {
+    fn from(value: &DeletionVector) -> Self {
+        match value {
+            DeletionVector::Bitmap(bitmap) => bitmap.clone(),
+            DeletionVector::Set(set) => Self::from_iter(set.iter()),
+            DeletionVector::NoDeletions => Self::new(),
+        }
+    }
+}
+
 impl PartialEq for DeletionVector {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {

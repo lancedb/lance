@@ -722,7 +722,7 @@ impl Scanner {
     fn ann(&self, q: &Query, index: &Index) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(KNNIndexExec::try_new(
             self.dataset.clone(),
-            &index.uuid.to_string(),
+            index.clone(),
             q,
         )?))
     }
