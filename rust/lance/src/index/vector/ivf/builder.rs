@@ -166,7 +166,7 @@ pub(super) async fn build_partitions(
                     Arc::new(arr.values().as_primitive::<Float32Type>().clone()),
                     arr.value_length() as usize,
                 );
-                let pq_code = pq.transform(&data, metric_type).await?;
+                let pq_code = pq.transform(&data).await?;
                 let pq_field = Field::new(PQ_CODE_COLUMN, pq_code.data_type().clone(), false);
                 let batch = batch.try_with_column(pq_field, Arc::new(pq_code))?;
                 // Do not need to serialize original vector

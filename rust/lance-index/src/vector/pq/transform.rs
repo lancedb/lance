@@ -12,11 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow_array::RecordBatch;
+use std::fmt::{Debug, Formatter};
+
+use arrow_array::{cast::AsArray, types::Float32Type, Array, RecordBatch};
+use async_trait::async_trait;
 use lance_core::{Error, Result};
+use lance_linalg::MatrixView;
 
-use super::transform::Transformer;
-
+use super::ProductQuantizer;
+use crate::vector::transform::Transformer;
 
 pub struct PQTransformer {
     quantizer: ProductQuantizer,
@@ -34,9 +38,41 @@ impl PQTransformer {
     }
 }
 
+impl Debug for PQTransformer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PQTransformer(input={}, output={})",
+            self.input_column, self.output_column
+        )
+    }
+}
+
+#[async_trait]
 impl Transformer for PQTransformer {
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let input_arr = batch.column_by_name(&self.input_column)
+    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let input_arr = batch
+            .column_by_name(&self.input_column)
+            .ok_or(Error::Index {
+                message: format!(
+                    "PQ Transform: column {} not found in batch",
+                    self.input_column
+                ),
+            })?;
+        let data: MatrixView<Float32Type> = input_arr
+            .as_fixed_size_list_opt()
+            .ok_or(Error::Index {
+                message: format!(
+                    "PQ Transform: column {} is not a fixed size list, got {}",
+                    self.input_column,
+                    input_arr.data_type(),
+                ),
+            })?
+            .try_into()?;
+        let pq_code = self.quantizer.transform(&data).await?;
         todo!()
     }
 }
+
+#[cfg(test)]
+mod tests {}

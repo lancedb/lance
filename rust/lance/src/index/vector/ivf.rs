@@ -669,6 +669,7 @@ pub async fn build_ivf_pq_index(
             pq_params.num_bits as u32,
             dim,
             codebook.clone(),
+            metric_type,
         )
     } else {
         log::info!(

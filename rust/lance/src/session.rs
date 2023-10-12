@@ -109,6 +109,7 @@ mod tests {
             8,
             1,
             Arc::new(vec![0.0f32; 8].into()),
+            MetricType::L2,
         ));
         let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
         no_cache.index_cache.insert("abc", idx);
@@ -127,6 +128,7 @@ mod tests {
             8,
             1,
             Arc::new(vec![0.0f32; 8].into()),
+            MetricType::L2,
         ));
         let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
         session.index_cache.insert("abc", idx.clone());
@@ -143,6 +145,7 @@ mod tests {
                 8,
                 1,
                 Arc::new(vec![0.0f32; 8].into()),
+                MetricType::L2,
             ));
             let idx_other = Arc::new(PQIndex::new(pq_other, MetricType::L2));
             session

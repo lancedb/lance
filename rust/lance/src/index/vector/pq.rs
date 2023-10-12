@@ -308,19 +308,6 @@ impl VectorIndex for PQIndex {
     }
 }
 
-impl From<&pb::Pq> for ProductQuantizer {
-    fn from(proto: &pb::Pq) -> Self {
-        Self {
-            num_bits: proto.num_bits,
-            num_sub_vectors: proto.num_sub_vectors as usize,
-            dimension: proto.dimension as usize,
-            codebook: Arc::new(Float32Array::from_iter_values(
-                proto.codebook.iter().copied(),
-            )),
-        }
-    }
-}
-
 #[allow(clippy::fallible_impl_from)]
 impl From<&ProductQuantizer> for pb::Pq {
     fn from(pq: &ProductQuantizer) -> Self {

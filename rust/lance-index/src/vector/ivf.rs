@@ -118,7 +118,11 @@ impl Ivf {
     /// Note that the vector column might be transformed by the `transforms` in the IVF.
     ///
     /// **Warning**: unstable API.
-    pub fn partition_transform(&self, batch: &RecordBatch, column: &str) -> Result<RecordBatch> {
+    pub async fn partition_transform(
+        &self,
+        batch: &RecordBatch,
+        column: &str,
+    ) -> Result<RecordBatch> {
         let vector_arr = batch.column_by_name(column).ok_or(Error::Index {
             message: format!("Column {} does not exist.", column),
         })?;
@@ -154,7 +158,7 @@ impl Ivf {
 
         // Transform each batch
         for transform in self.transforms.as_slice() {
-            batch = transform.transform(&batch)?;
+            batch = transform.transform(&batch).await?;
         }
 
         Ok(batch)

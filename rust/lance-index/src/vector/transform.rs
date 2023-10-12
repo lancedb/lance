@@ -16,14 +16,16 @@
 //!
 
 use arrow_array::RecordBatch;
+use async_trait::async_trait;
 
 use lance_core::Result;
 
 /// Transform of a Vector Matrix.
 ///
 ///
+#[async_trait]
 pub trait Transformer: std::fmt::Debug + Sync + Send {
     /// Transform a [`RecordBatch`] of vectors
     ///
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch>;
+    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch>;
 }

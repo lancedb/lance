@@ -17,6 +17,7 @@ arrow-ord.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
 arrow-arith.workspace = true
+async-trait.workspace = true
 futures.workspace = true
 lance-arrow.workspace = true
 lance-core.workspace = true
