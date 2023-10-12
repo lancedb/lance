@@ -641,59 +641,43 @@ impl Scanner {
         knn_node: Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Check if we've created new versions since the index
-        let version = index.dataset_version;
-        if version != self.dataset.version().version {
-            // If we've added more rows, then we'll have new fragments
-            let ds = self.dataset.checkout_version(version).await?;
-            let max_fragment_id_idx = ds.manifest.max_fragment_id().ok_or_else(|| Error::IO {
-                message: "No fragments in index version".to_string(),
-                location: location!(),
-            })?;
-            let max_fragment_id_ds =
-                self.dataset
-                    .manifest
-                    .max_fragment_id()
-                    .ok_or_else(|| Error::IO {
-                        message: "No fragments in dataset version".to_string(),
-                        location: location!(),
-                    })?;
-            // If we have new fragments, then we need to do a combined search
-            if max_fragment_id_idx < max_fragment_id_ds {
-                let vector_scan_projection =
-                    Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-                let scan_node = self.scan_fragments(
-                    true,
-                    vector_scan_projection,
-                    Arc::new(self.dataset.manifest.fragments_since(&ds.manifest)?),
-                    // We are re-ordering anyways, so no need to get data in data
-                    // in a deterministic order.
-                    false,
-                );
-                // first we do flat search on just the new data
-                let topk_appended = self.flat_knn(scan_node, q)?;
+        let unindexed_fragments = index.unindexed_fragments(self.dataset.as_ref()).await?;
+        if !unindexed_fragments.is_empty() {
+            let vector_scan_projection =
+                Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
+            let scan_node = self.scan_fragments(
+                true,
+                vector_scan_projection,
+                Arc::new(unindexed_fragments),
+                // We are re-ordering anyways, so no need to get data in data
+                // in a deterministic order.
+                false,
+            );
+            // first we do flat search on just the new data
+            let topk_appended = self.flat_knn(scan_node, q)?;
 
-                // To do a union, we need to make the schemas match. Right now
-                // knn_node: _distance, _rowid, vector
-                // topk_appended: vector, _rowid, _distance
-                let new_schema = Schema::try_from(
-                    &topk_appended
-                        .schema()
-                        .project(&[2, 1, 0])?
-                        .with_metadata(knn_node.schema().metadata.clone()),
-                )?;
-                let topk_appended = ProjectionExec::try_new(topk_appended, Arc::new(new_schema))?;
-                assert_eq!(topk_appended.schema(), knn_node.schema());
-                // union
-                let unioned = UnionExec::new(vec![Arc::new(topk_appended), knn_node]);
-                // Enforce only 1 partition.
-                let unioned = RepartitionExec::try_new(
-                    Arc::new(unioned),
-                    datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
-                )?;
-                // then we do a flat search on KNN(new data) + ANN(indexed data)
-                return self.flat_knn(Arc::new(unioned), q);
-            }
+            // To do a union, we need to make the schemas match. Right now
+            // knn_node: _distance, _rowid, vector
+            // topk_appended: vector, _rowid, _distance
+            let new_schema = Schema::try_from(
+                &topk_appended
+                    .schema()
+                    .project(&[2, 1, 0])?
+                    .with_metadata(knn_node.schema().metadata.clone()),
+            )?;
+            let topk_appended = ProjectionExec::try_new(topk_appended, Arc::new(new_schema))?;
+            assert_eq!(topk_appended.schema(), knn_node.schema());
+            // union
+            let unioned = UnionExec::new(vec![Arc::new(topk_appended), knn_node]);
+            // Enforce only 1 partition.
+            let unioned = RepartitionExec::try_new(
+                Arc::new(unioned),
+                datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
+            )?;
+            // then we do a flat search on KNN(new data) + ANN(indexed data)
+            return self.flat_knn(Arc::new(unioned), q);
         }
+
         Ok(knn_node)
     }
 
