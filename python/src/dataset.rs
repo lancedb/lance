@@ -21,20 +21,20 @@ use arrow_array::{Float32Array, RecordBatch};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use chrono::Duration;
-use lance::arrow::as_fixed_size_list_array;
-use lance::dataset::transaction::RewriteGroup;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, scanner::Scanner as LanceScanner,
-    transaction::Operation as LanceOperation, Dataset as LanceDataset, ReadParams, Version,
-    WriteMode, WriteParams,
+    transaction::Operation as LanceOperation, transaction::RewriteGroup, Dataset as LanceDataset,
+    ReadParams, Version, WriteMode, WriteParams,
 };
 use lance::datatypes::Schema;
 use lance::format::Fragment;
 use lance::index::{
-    vector::{diskann::DiskANNParams, ivf::IvfBuildParams, pq::PQBuildParams, VectorIndexParams},
+    vector::{diskann::DiskANNParams, ivf::IvfBuildParams, VectorIndexParams},
     DatasetIndexExt, IndexType,
 };
 use lance::io::object_store::ObjectStoreParams;
+use lance_arrow::as_fixed_size_list_array;
+use lance_index::vector::pq::PQBuildParams;
 use lance_linalg::distance::MetricType;
 use pyo3::prelude::*;
 use pyo3::types::PySet;

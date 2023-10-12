@@ -25,14 +25,13 @@ use futures::{
 };
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::io::Writer;
-use lance_index::vector::PQ_CODE_COLUMN;
+use lance_index::vector::{pq::ProductQuantizer, PQ_CODE_COLUMN};
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 use tracing::instrument;
 
 use crate::dataset::ROW_ID;
 use crate::index::vector::ivf::{io::write_index_partitions, shuffler::ShufflerBuilder, Ivf};
-use crate::index::vector::pq::ProductQuantizer;
 use crate::{io::RecordBatchStream, Error, Result};
 
 use super::RESIDUAL_COLUMN;

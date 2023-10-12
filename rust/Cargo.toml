@@ -42,6 +42,7 @@ lance-linalg = { version = "=0.8.4", path = "./lance-linalg" }
 lance-testing = { version = "=0.8.4", path = "./lance-testing" }
 lance-test-macros = { version = "=0.8.4", path = "./lance-test-macros" }
 # Note that this one does not include pyarrow
+approx = "0.5.1"
 arrow = { version = "43.0.0", optional = false }
 arrow-arith = "43.0"
 arrow-array = "43.0"
@@ -57,7 +58,6 @@ async-trait = "0.1.60"
 half = { "version" = "=2.2.1", default-features = false, features = [
     "num-traits",
 ] }
-approx = "0.5.1"
 bytes = "1.3"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
 datafusion-common = "28.0"
