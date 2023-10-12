@@ -1417,7 +1417,7 @@ mod tests {
             fragment_bitmap: None,
         };
 
-        let prefilter = Arc::new(PreFilter::new(dataset.clone(), index_meta));
+        let prefilter = Arc::new(PreFilter::new(dataset.clone(), index_meta, None));
 
         let is_not_remapped = Some;
         let is_remapped = |row_id| Some(row_id + BIG_OFFSET);

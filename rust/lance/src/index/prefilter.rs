@@ -20,6 +20,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use futures::future;
 use futures::stream;
 use futures::{StreamExt, TryStreamExt};
@@ -33,17 +34,25 @@ use crate::format::RowAddress;
 use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
 
+#[async_trait]
+pub trait AllowListLoader: Send + 'static {
+    async fn load(self: Box<Self>) -> Result<Arc<RoaringTreemap>>;
+}
+
 /// Filter out row ids that we know are not relevant to the query. This currently
 /// is just deleted rows.
 pub struct PreFilter {
     dataset: Arc<Dataset>,
-    has_deletion_vectors: bool,
-    has_missing_fragments: bool,
-    block_list: Arc<SharedPrerequisite<Arc<RoaringTreemap>>>,
+    block_list: Option<Arc<SharedPrerequisite<Arc<RoaringTreemap>>>>,
+    allow_list: Option<Arc<SharedPrerequisite<Arc<RoaringTreemap>>>>,
 }
 
 impl PreFilter {
-    pub fn new(dataset: Arc<Dataset>, index: Index) -> Self {
+    pub fn new(
+        dataset: Arc<Dataset>,
+        index: Index,
+        allow_list: Option<Box<dyn AllowListLoader>>,
+    ) -> Self {
         let dataset_ref = dataset.as_ref();
         let mut has_fragment = Vec::new();
         let mut has_deletion_vectors = false;
@@ -61,19 +70,24 @@ impl PreFilter {
         }
         let has_missing_fragments = has_fragment.iter().any(|&x| !x);
         let dataset_clone = dataset.clone();
-        let block_list = SharedPrerequisite::spawn(
-            Self::load_block_list(dataset_clone, index).in_current_span(),
-        );
+        let block_list = if has_missing_fragments || has_deletion_vectors {
+            Some(SharedPrerequisite::spawn(
+                Self::load_block_list(dataset_clone, index).in_current_span(),
+            ))
+        } else {
+            None
+        };
+        let allow_list = allow_list
+            .map(|allow_list| SharedPrerequisite::spawn(allow_list.load().in_current_span()));
         Self {
             dataset,
-            has_deletion_vectors,
-            has_missing_fragments,
             block_list,
+            allow_list,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        !self.has_deletion_vectors && !self.has_missing_fragments
+        self.block_list.is_none() && self.allow_list.is_none()
     }
 
     /// Check whether a single row id should be included in the query.
@@ -138,7 +152,13 @@ impl PreFilter {
     /// must first call this method to ensure it is fully loaded.  This
     /// allows `filter_row_ids` to be a synchronous method.
     pub async fn wait_for_ready(&self) -> Result<()> {
-        self.block_list.wait_ready().await
+        if let Some(block_list) = &self.block_list {
+            block_list.wait_ready().await?;
+        }
+        if let Some(allow_list) = &self.allow_list {
+            allow_list.wait_ready().await?;
+        }
+        Ok(())
     }
 
     /// Check whether a slice of row ids should be included in a query.
@@ -149,12 +169,40 @@ impl PreFilter {
     /// This method must be called after `wait_for_ready`
     #[instrument(level = "debug", skip_all)]
     pub fn filter_row_ids(&self, row_ids: &[u64]) -> Vec<u64> {
-        let block_list = self.block_list.get_ready();
-        row_ids
-            .iter()
-            .enumerate()
-            .filter(|(_, row_id)| !block_list.contains(**row_id))
-            .map(|(idx, _)| idx as u64)
-            .collect::<Vec<_>>()
+        let enumerated_ids = row_ids.iter().enumerate();
+        match (&self.block_list, &self.allow_list) {
+            (Some(block_list), Some(allow_list)) => {
+                // Only take rows that are both in the allow list and not in the block list
+                let block_list = block_list.get_ready();
+                let allow_list = allow_list.get_ready();
+                enumerated_ids
+                    .filter(|(_, row_id)| {
+                        !block_list.contains(**row_id) && allow_list.contains(**row_id)
+                    })
+                    .map(|(idx, _)| idx as u64)
+                    .collect()
+            }
+            (Some(block_list), None) => {
+                // Take rows that are not in the block list
+                let block_list = block_list.get_ready();
+                enumerated_ids
+                    .filter(|(_, row_id)| !block_list.contains(**row_id))
+                    .map(|(idx, _)| idx as u64)
+                    .collect()
+            }
+            (None, Some(allow_list)) => {
+                // Take rows that are in the allow list
+                let allow_list = allow_list.get_ready();
+                enumerated_ids
+                    .filter(|(_, row_id)| allow_list.contains(**row_id))
+                    .map(|(idx, _)| idx as u64)
+                    .collect()
+            }
+            (None, None) => {
+                // We should not encounter this case because callers should
+                // check is_empty first.
+                panic!("filter_row_ids called but prefilter has nothing to filter with")
+            }
+        }
     }
 }

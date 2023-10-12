@@ -11,6 +11,7 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+import itertools
 import shutil
 from pathlib import Path
 from typing import NamedTuple, Union
@@ -168,3 +169,28 @@ def test_ivf_pq_index_search(test_dataset, benchmark):
         ),
     )
     assert result.num_rows > 0
+
+
+@pytest.mark.benchmark(group="query_ann")
+@pytest.mark.parametrize(
+    "selectivity, prefilter, use_index",
+    list(itertools.product((0.25, 0.75), (False, True), (False, True))),
+)
+def test_filtered_search(test_dataset, benchmark, selectivity, prefilter, use_index):
+    q = pc.random(N_DIMS).cast(pa.float32())
+    threshold = int(round(selectivity * NUM_ROWS))
+    result = benchmark(
+        test_dataset.to_table,
+        nearest=dict(
+            column="vector",
+            q=q,
+            k=100,
+            nprobes=10,
+            use_index=use_index,
+        ),
+        prefilter=prefilter,
+        filter=f"filterable <= {threshold}",
+    )
+    # With post-filtering it is possible we don't get any results
+    if prefilter:
+        assert result.num_rows > 0
