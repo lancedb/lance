@@ -28,14 +28,14 @@ use crate::vector::transform::Transformer;
 /// Product Quantizer Transformer
 ///
 /// It transforms a column of vectors into a column of PQ codes.
-pub struct PQTransformer {
-    quantizer: ProductQuantizer,
+pub struct PQTransformer<'a> {
+    quantizer: &'a ProductQuantizer,
     input_column: String,
     output_column: String,
 }
 
-impl PQTransformer {
-    pub fn new(quantizer: ProductQuantizer, input_column: &str, output_column: &str) -> Self {
+impl<'a> PQTransformer<'a> {
+    pub fn new(quantizer: &'a ProductQuantizer, input_column: &str, output_column: &str) -> Self {
         Self {
             quantizer,
             input_column: input_column.to_owned(),
@@ -44,7 +44,7 @@ impl PQTransformer {
     }
 }
 
-impl Debug for PQTransformer {
+impl Debug for PQTransformer<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -55,7 +55,7 @@ impl Debug for PQTransformer {
 }
 
 #[async_trait]
-impl Transformer for PQTransformer {
+impl Transformer for PQTransformer<'_> {
     async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let input_arr = batch
             .column_by_name(&self.input_column)
@@ -117,7 +117,7 @@ mod tests {
         )
         .unwrap();
 
-        let transformer = PQTransformer::new(pq, "vec", "pq_code");
+        let transformer = PQTransformer::new(&pq, "vec", "pq_code");
         let batch = transformer.transform(&batch).await.unwrap();
         assert!(batch.column_by_name("vec").is_none());
         assert!(batch.column_by_name("pq_code").is_some());
