@@ -162,5 +162,5 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     metrics = Compaction.commit(dataset, [result1])
     assert metrics.fragments_removed == 2
     assert metrics.fragments_added == 1
-    // Compaction occurs in two transactions so it increments the version by 2.
+    # Compaction occurs in two transactions so it increments the version by 2.
     assert dataset.version == 3
