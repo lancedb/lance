@@ -13,15 +13,21 @@
 // limitations under the License.
 
 use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, types::Float32Type, Array, RecordBatch};
+use arrow_schema::Field;
 use async_trait::async_trait;
+use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
 use lance_linalg::MatrixView;
 
 use super::ProductQuantizer;
-use crate::vector::transform::Transformer;
+use crate::vector::{transform::Transformer, PQ_CODE_COLUMN};
 
+/// Product Quantizer Transformer
+///
+/// It transforms a column of vectors into a column of PQ codes.
 pub struct PQTransformer {
     quantizer: ProductQuantizer,
     input_column: String,
@@ -70,7 +76,10 @@ impl Transformer for PQTransformer {
             })?
             .try_into()?;
         let pq_code = self.quantizer.transform(&data).await?;
-        todo!()
+        let pq_field = Field::new(PQ_CODE_COLUMN, pq_code.data_type().clone(), false);
+        let batch = batch.try_with_column(pq_field, Arc::new(pq_code))?;
+        let batch = batch.drop_column(&self.input_column)?;
+        Ok(batch)
     }
 }
 
