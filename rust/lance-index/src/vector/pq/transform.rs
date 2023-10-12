@@ -121,6 +121,7 @@ mod tests {
         let batch = transformer.transform(&batch).await.unwrap();
         assert!(batch.column_by_name("vec").is_none());
         assert!(batch.column_by_name("pq_code").is_some());
+        assert!(batch.column_by_name("other").is_some());
         assert_eq!(batch.num_rows(), 1000)
     }
 }
