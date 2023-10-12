@@ -57,7 +57,8 @@ pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin,
     column: &str,
     ivf: Arc<lance_index::vector::ivf::Ivf>,
-    // TODO: make this auto-generated from transformer chain.
+    // TODO: Once the transformer can generate schema automatically,
+    // we can remove `num_sub_vectors`.
     num_sub_vectors: usize,
 ) -> Result<Shuffler> {
     let mut stream = data
