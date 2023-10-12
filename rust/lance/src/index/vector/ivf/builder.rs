@@ -120,6 +120,72 @@ fn filter_batch_by_partition(
     Ok(parted_batches)
 }
 
+/// Shuffle a dataset into each partitions.
+///
+/// Parameters
+/// ----------
+///   *data*: input data stream.
+///   *column*: column name of the vector column.
+///   *ivf*: IVF model.
+///   *part_range*: range of partition IDs to shuffle.
+pub(crate) async fn shuffle_dataset(
+    data: impl RecordBatchStream + Unpin,
+    column: &str,
+    ivf: Arc<lance_index::vector::ivf::Ivf>,
+    part_range: Range<u32>,
+) -> Result<Shuffler> {
+    let mut stream = data
+        .zip(repeat_with(|| (ivf.clone(), part_range.clone())))
+        .map(|(b, (ivf, range))| async move {
+            let batch = b?;
+            let col = column.to_string();
+            let range_copy = range.clone();
+            // Filter out the rows that are not in the partition range.
+            let batches = tokio::task::spawn_blocking(move || {
+                filter_batch_by_partition(&batch, &col, &ivf_ref, metric_type, range_copy)
+            })
+            .await??;
+
+            let mut b = vec![];
+            for (part_id, batch) in batches {
+                let batch = pq_transformer.transform(&batch).await?;
+                b.push((part_id, batch))
+            }
+            Ok::<Vec<(u32, RecordBatch)>, Error>(b)
+        })
+        .buffer_unordered(num_cpus::get())
+        .and_then(|batches| async move {
+            // Split batch into per-partition batches
+            Ok(stream::iter(batches)
+                .map(move |(part_id, batch)| Ok::<(u32, RecordBatch), Error>((part_id, batch))))
+        })
+        .try_flatten_unordered(num_cpus::get())
+        .boxed();
+
+    // TODO: dynamically detect schema from the transforms.
+    let schema = Schema::new(vec![
+        Field::new(ROW_ID, DataType::UInt64, false),
+        Field::new(
+            PQ_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, false)),
+                pq.num_sub_vectors as i32,
+            ),
+            false,
+        ),
+    ]);
+    const FLUSH_THRESHOLD: usize = 2 * 1024;
+
+    let mut shuffler_builder = ShufflerBuilder::try_new(&schema, FLUSH_THRESHOLD).await?;
+    while let Some(result) = stream.next().await {
+        let (part_id, batch) = result?;
+        if batch.num_rows() != 0 {
+            shuffler_builder.insert(part_id, batch).await?;
+        }
+    }
+    shuffler_builder.finish().await
+}
+
 /// Build specific partitions of IVF index.
 ///
 ///
