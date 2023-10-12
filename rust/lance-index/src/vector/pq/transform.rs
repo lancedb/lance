@@ -28,14 +28,14 @@ use crate::vector::transform::Transformer;
 /// Product Quantizer Transformer
 ///
 /// It transforms a column of vectors into a column of PQ codes.
-pub struct PQTransformer<'a> {
-    quantizer: &'a ProductQuantizer,
+pub struct PQTransformer {
+    quantizer: Arc<ProductQuantizer>,
     input_column: String,
     output_column: String,
 }
 
-impl<'a> PQTransformer<'a> {
-    pub fn new(quantizer: &'a ProductQuantizer, input_column: &str, output_column: &str) -> Self {
+impl PQTransformer {
+    pub fn new(quantizer: Arc<ProductQuantizer>, input_column: &str, output_column: &str) -> Self {
         Self {
             quantizer,
             input_column: input_column.to_owned(),
@@ -44,7 +44,7 @@ impl<'a> PQTransformer<'a> {
     }
 }
 
-impl Debug for PQTransformer<'_> {
+impl Debug for PQTransformer {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -55,7 +55,7 @@ impl Debug for PQTransformer<'_> {
 }
 
 #[async_trait]
-impl Transformer for PQTransformer<'_> {
+impl Transformer for PQTransformer {
     async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let input_arr = batch
             .column_by_name(&self.input_column)

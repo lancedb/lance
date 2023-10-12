@@ -713,7 +713,7 @@ pub async fn build_ivf_pq_index(
         uuid,
         &transforms,
         ivf_model,
-        pq,
+        pq.into(),
         metric_type,
         stream,
     )
@@ -730,7 +730,7 @@ async fn write_index_file(
     uuid: &str,
     transformers: &[Box<dyn Transformer>],
     mut ivf: Ivf,
-    pq: ProductQuantizer,
+    pq: Arc<ProductQuantizer>,
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin,
 ) -> Result<()> {
@@ -745,7 +745,7 @@ async fn write_index_file(
         stream,
         column,
         &mut ivf,
-        &pq,
+        pq.clone(),
         metric_type,
         0..num_partitions,
     )
