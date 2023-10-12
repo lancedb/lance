@@ -32,7 +32,10 @@ use futures::{
 };
 use lance_arrow::*;
 use lance_core::io::WriteExt;
-use lance_index::vector::RESIDUAL_COLUMN;
+use lance_index::vector::{
+    pq::{PQBuildParams, ProductQuantizer},
+    RESIDUAL_COLUMN,
+};
 use lance_linalg::{distance::*, kernels::argmin, matrix::MatrixView};
 use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -43,9 +46,8 @@ use tracing::{instrument, span, Level};
 #[cfg(feature = "opq")]
 use super::opq::train_opq;
 use super::{
-    pq::{train_pq, PQBuildParams, ProductQuantizer},
-    utils::maybe_sample_training_data,
-    MetricType, Query, VectorIndex, INDEX_FILE_NAME,
+    pq::train_pq, utils::maybe_sample_training_data, MetricType, Query, VectorIndex,
+    INDEX_FILE_NAME,
 };
 use crate::{
     dataset::Dataset,
@@ -783,7 +785,7 @@ async fn train_ivf_model(
 ) -> Result<Ivf> {
     let rng = SmallRng::from_entropy();
     const REDOS: usize = 1;
-    let centroids = super::kmeans::train_kmeans(
+    let centroids = lance_index::vector::kmeans::train_kmeans(
         data.data().as_ref(),
         None,
         data.num_columns(),

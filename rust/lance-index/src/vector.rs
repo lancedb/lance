@@ -16,6 +16,7 @@
 //!
 
 pub mod ivf;
+pub mod kmeans;
 pub mod pq;
 pub mod residual;
 pub mod transform;

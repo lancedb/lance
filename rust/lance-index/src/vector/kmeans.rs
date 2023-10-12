@@ -19,10 +19,10 @@ use lance_arrow::FixedSizeListArrayExt;
 use log::info;
 use rand::{seq::IteratorRandom, Rng};
 
-use crate::index::vector::MetricType;
-use crate::{
-    utils::kmeans::{KMeans, KMeansParams},
-    Result,
+use lance_core::{Error, Result};
+use lance_linalg::{
+    distance::MetricType,
+    kmeans::{KMeans, KMeansParams},
 };
 
 /// Train KMeans model and returns the centroids of each cluster.
@@ -40,7 +40,7 @@ pub async fn train_kmeans(
 ) -> Result<Float32Array> {
     let num_rows = array.len() / dimension;
     if num_rows < k {
-        return Err(crate::Error::Index{message: format!(
+        return Err(Error::Index{message: format!(
             "KMeans: can not train {k} centroids with {num_rows} vectors, choose a smaller K (< {num_rows}) instead"
         )});
     }

@@ -23,8 +23,8 @@ use super::{
     graph::{Vertex, VertexSerDe},
     MetricType,
 };
-use crate::index::vector::pq::PQBuildParams;
 pub(crate) use builder::build_diskann_index;
+use lance_index::vector::pq::PQBuildParams;
 pub(crate) use row_vertex::RowVertex;
 pub(crate) use search::DiskANNIndex;
 

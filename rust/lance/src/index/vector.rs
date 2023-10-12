@@ -25,18 +25,18 @@ pub mod flat;
 #[allow(dead_code)]
 mod graph;
 pub mod ivf;
-mod kmeans;
 #[cfg(feature = "opq")]
 pub mod opq;
 pub mod pq;
 mod traits;
 mod utils;
 
+use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
 use lance_linalg::distance::*;
 
 use self::{
     ivf::{build_ivf_pq_index, IVFIndex, IvfBuildParams},
-    pq::{PQBuildParams, PQIndex},
+    pq::PQIndex,
 };
 
 use super::{pb, IndexParams};
@@ -49,7 +49,6 @@ use crate::{
         vector::{
             diskann::{DiskANNIndex, DiskANNParams},
             ivf::Ivf,
-            pq::ProductQuantizer,
         },
     },
     io::{

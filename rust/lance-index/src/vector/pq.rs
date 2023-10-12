@@ -12,19 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cmp::min;
 use std::sync::Arc;
 
+use arrow_arith::aggregate::min;
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Array,
     FixedSizeListArray, Float32Array, UInt8Array,
 };
-use futures::stream;
+use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::kernels::argmin_opt;
 use lance_linalg::{distance::MetricType, MatrixView};
 use rand::SeedableRng;
+
+use super::kmeans::train_kmeans;
 
 /// Parameters for building product quantization.
 #[derive(Debug, Clone)]

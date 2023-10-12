@@ -15,31 +15,25 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow_arith::aggregate::min;
 use arrow_array::{
-    builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Array, ArrayRef,
-    FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
+    cast::as_primitive_array, types::Float32Type, Array, ArrayRef, FixedSizeListArray,
+    Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
-use futures::{stream, StreamExt, TryStreamExt};
 use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
 use lance_linalg::{
     distance::{l2::l2_distance_batch, norm_l2::norm_l2, Dot, Normalize},
-    kernels::argmin_opt,
     matrix::MatrixView,
 };
-use rand::SeedableRng;
 use serde::Serialize;
 
 use super::{MetricType, Query, VectorIndex};
 use crate::arrow::*;
 use crate::dataset::ROW_ID;
-use crate::index::{
-    pb, prefilter::PreFilter, vector::kmeans::train_kmeans, vector::DIST_COL, Index,
-};
+use crate::index::{pb, prefilter::PreFilter, vector::DIST_COL, Index};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::{Error, Result};
 
