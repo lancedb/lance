@@ -19,7 +19,7 @@ use arrow_array::{
     builder::Float32Builder, cast::AsArray, types::Float32Type, Array, FixedSizeListArray,
     Float32Array, UInt8Array,
 };
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, stream::repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::kernels::argmin_opt;
@@ -154,34 +154,33 @@ pub struct ProductQuantizer {
     /// // Centroids for a sub-vector.
     /// Codebook[sub_vector_id][pq_code]
     /// ```
-    pub codebook: Option<Arc<Float32Array>>,
+    pub codebook: Arc<Float32Array>,
+}
+
+fn get_sub_vector_centroids(
+    codebook: &Float32Array,
+    dimension: usize,
+    num_bits: impl Into<u32>,
+    num_sub_vectors: usize,
+    sub_vector_idx: usize,
+) -> &[f32] {
+    assert!(sub_vector_idx < num_sub_vectors);
+
+    let num_centroids = ProductQuantizer::num_centroids(num_bits.into());
+    let sub_vector_width = dimension / num_sub_vectors;
+    &codebook.as_slice()[sub_vector_idx * num_centroids * sub_vector_width
+        ..(sub_vector_idx + 1) * num_centroids * sub_vector_width]
 }
 
 impl ProductQuantizer {
-    /// Build a Product quantizer with `m` sub-vectors, and `nbits` to present centroids.
-    pub fn new(m: usize, nbits: u32, dimension: usize) -> Self {
-        assert_eq!(nbits, 8, "nbits can only be 8");
-        Self {
-            num_bits: nbits,
-            num_sub_vectors: m,
-            dimension,
-            codebook: None,
-        }
-    }
-
     /// Create a [`ProductQuantizer`] with pre-trained codebook.
-    pub fn new_with_codebook(
-        m: usize,
-        nbits: u32,
-        dimension: usize,
-        codebook: Arc<Float32Array>,
-    ) -> Self {
+    pub fn new(m: usize, nbits: u32, dimension: usize, codebook: Arc<Float32Array>) -> Self {
         assert_eq!(nbits, 8, "nbits can only be 8");
         Self {
             num_bits: nbits,
             num_sub_vectors: m,
             dimension,
-            codebook: Some(codebook),
+            codebook,
         }
     }
 
@@ -197,18 +196,14 @@ impl ProductQuantizer {
     /// Get the centroids for one sub-vector.
     ///
     /// Returns a flatten `num_centroids * sub_vector_width` f32 array.
-    pub fn centroids(&self, sub_vector_idx: usize) -> Option<Arc<Float32Array>> {
-        assert!(sub_vector_idx < self.num_sub_vectors);
-        self.codebook.as_ref()?;
-
-        let num_centroids = Self::num_centroids(self.num_bits);
-        let sub_vector_width = self.dimension / self.num_sub_vectors;
-        let codebook = self.codebook.as_ref().unwrap();
-        let arr = codebook.slice(
-            sub_vector_idx * num_centroids * sub_vector_width,
-            num_centroids * sub_vector_width,
-        );
-        Some(Arc::new(arr))
+    pub fn centroids(&self, sub_vector_idx: usize) -> &[f32] {
+        get_sub_vector_centroids(
+            self.codebook.as_ref(),
+            self.dimension,
+            self.num_bits,
+            self.num_sub_vectors,
+            sub_vector_idx,
+        )
     }
 
     /// Reconstruct a vector from its PQ code.
@@ -219,9 +214,9 @@ impl ProductQuantizer {
         let mut builder = Float32Builder::with_capacity(self.dimension);
         let sub_vector_dim = self.dimension / self.num_sub_vectors;
         for (i, sub_code) in code.iter().enumerate() {
-            let centroids = self.centroids(i).unwrap();
+            let centroids = self.centroids(i);
             builder.append_slice(
-                &centroids.values()[*sub_code as usize * sub_vector_dim
+                &centroids[*sub_code as usize * sub_vector_dim
                     ..(*sub_code as usize + 1) * sub_vector_dim],
             );
         }
@@ -241,20 +236,29 @@ impl ProductQuantizer {
         debug_assert_eq!(sub_vectors.len(), self.num_sub_vectors);
 
         let vectors = sub_vectors.to_vec();
-        let all_centroids = (0..sub_vectors.len())
-            .map(|idx| self.centroids(idx).unwrap())
-            .collect::<Vec<_>>();
+        let codebook = self.codebook.clone();
+        let dimension = self.dimension;
+        let num_bits = self.num_bits;
+        let num_sub_vectors = self.num_sub_vectors;
         let distortion = stream::iter(vectors)
-            .zip(stream::iter(all_centroids))
-            .map(|(vec, centroid)| async move {
+            .zip(repeat_with(|| codebook.clone()))
+            .enumerate()
+            .map(|(sub_idx, (vec, codebook))| async move {
+                let cb = codebook.clone();
                 tokio::task::spawn_blocking(move || {
                     let dist_func = metric_type.batch_func();
+                    let centroid = get_sub_vector_centroids(
+                        cb.as_ref(),
+                        dimension,
+                        num_bits,
+                        num_sub_vectors,
+                        sub_idx,
+                    );
                     (0..vec.len())
                         .map(|i| {
                             let value = vec.value(i);
                             let vector: &Float32Array = value.as_primitive();
-                            let distances =
-                                dist_func(vector.values(), centroid.values(), vector.len());
+                            let distances = dist_func(vector.values(), centroid, vector.len());
                             min(distances.as_ref()).unwrap_or(0.0)
                         })
                         .sum::<f32>() as f64 // in case of overflow
@@ -275,16 +279,21 @@ impl ProductQuantizer {
         data: &MatrixView<Float32Type>,
         metric_type: MetricType,
     ) -> Result<FixedSizeListArray> {
-        let all_centroids = (0..self.num_sub_vectors)
-            .map(|idx| self.centroids(idx).unwrap())
-            .collect::<Vec<_>>();
         let dist_func = metric_type.batch_func();
 
         let flatten_data = data.data();
         let num_sub_vectors = self.num_sub_vectors;
         let dim = self.dimension;
         let num_rows = data.num_rows();
+        let num_bits = self.num_bits;
+        let codebook = self.codebook.clone();
+
         let values = tokio::task::spawn_blocking(move || {
+            let all_centroids = (0..num_sub_vectors)
+                .map(|idx| {
+                    get_sub_vector_centroids(codebook.as_ref(), dim, num_bits, num_sub_vectors, idx)
+                })
+                .collect::<Vec<_>>();
             let flatten_values = flatten_data.values();
             let capacity = num_sub_vectors * num_rows;
             let mut builder: Vec<u8> = vec![0; capacity];
@@ -296,11 +305,10 @@ impl ProductQuantizer {
                 for sub_idx in 0..num_sub_vectors {
                     let offset = row_offset + sub_idx * sub_dim;
                     let sub_vector = &flatten_values[offset..offset + sub_dim];
-                    let centroids = all_centroids[sub_idx].as_ref();
+                    let centroids = all_centroids[sub_idx];
                     // TODO(lei): use kmeans.compute_membership()
                     let code =
-                        argmin_opt(dist_func(sub_vector, centroids.values(), sub_dim).iter())
-                            .unwrap();
+                        argmin_opt(dist_func(sub_vector, centroids, sub_dim).iter()).unwrap();
                     builder[i * num_sub_vectors + sub_idx] = code as u8;
                 }
             }
@@ -315,31 +323,39 @@ impl ProductQuantizer {
     }
 
     /// Train [`ProductQuantizer`] using vectors.
-    pub async fn train(
-        &mut self,
-        data: &MatrixView<Float32Type>,
-        params: &PQBuildParams,
-    ) -> Result<()> {
-        assert!(data.num_columns() % self.num_sub_vectors == 0);
+    pub async fn train(data: &MatrixView<Float32Type>, params: &PQBuildParams) -> Result<Self> {
+        assert_eq!(data.num_columns() % params.num_sub_vectors, 0);
         assert_eq!(data.data().null_count(), 0);
 
-        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
-        let num_centroids = 2_usize.pow(self.num_bits);
+        let sub_vectors = divide_to_subvectors(data, params.num_sub_vectors);
+        let num_centroids = 2_usize.pow(params.num_bits as u32);
         let dimension = data.num_columns();
-        let sub_vector_dimension = dimension / self.num_sub_vectors;
+        let sub_vector_dimension = dimension / params.num_sub_vectors;
 
         let mut codebook_builder = Float32Builder::with_capacity(num_centroids * dimension);
         let rng = rand::rngs::SmallRng::from_entropy();
 
         const REDOS: usize = 1;
         // TODO: parallel training.
-        for (i, sub_vec) in sub_vectors.iter().enumerate() {
+        let prev_centroids = params.codebook.clone();
+        for sub_vec in sub_vectors.iter() {
             // Centroids for one sub vector.
             let flatten_array: &Float32Array = sub_vec.values().as_primitive();
-            let prev_centroids = self.centroids(i);
             let centroids = train_kmeans(
                 flatten_array,
-                prev_centroids,
+                prev_centroids.as_ref().map(|centroids| {
+                    Arc::new(Float32Array::from_iter_values(
+                        get_sub_vector_centroids(
+                            centroids.as_ref(),
+                            dimension,
+                            params.num_bits as u32,
+                            params.num_sub_vectors,
+                            0,
+                        )
+                        .iter()
+                        .cloned(),
+                    ))
+                }),
                 sub_vector_dimension,
                 num_centroids,
                 params.max_iters as u32,
@@ -349,15 +365,20 @@ impl ProductQuantizer {
                 params.sample_rate,
             )
             .await?;
+
             // TODO: COPIED COPIED COPIED
             unsafe {
                 codebook_builder.append_trusted_len_iter(centroids.values().iter().copied());
             }
         }
         let pd_centroids = codebook_builder.finish();
-        self.codebook = Some(Arc::new(pd_centroids));
 
-        Ok(())
+        Ok(Self::new(
+            params.num_sub_vectors,
+            params.num_bits as u32,
+            dimension,
+            Arc::new(pd_centroids),
+        ))
     }
 
     /// Reset the centroids from the OPQ training.
@@ -407,8 +428,82 @@ impl ProductQuantizer {
         }
 
         let pd_centroids = builder.finish();
-        self.codebook = Some(Arc::new(pd_centroids));
+        self.codebook = Arc::new(pd_centroids);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::relative_eq;
+
+    #[test]
+    fn test_divide_to_subvectors() {
+        let values = Float32Array::from_iter((0..320).map(|v| v as f32));
+        // A [10, 32] array.
+        let mat = MatrixView::new(values.into(), 32);
+        let sub_vectors = divide_to_subvectors(&mat, 4);
+        assert_eq!(sub_vectors.len(), 4);
+        assert_eq!(sub_vectors[0].len(), 10);
+        assert_eq!(sub_vectors[0].value_length(), 8);
+
+        assert_eq!(
+            sub_vectors[0].as_ref(),
+            &FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                (0..10)
+                    .map(|i| {
+                        Some(
+                            (i * 32..i * 32 + 8)
+                                .map(|v| Some(v as f32))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                8
+            )
+        );
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn test_train_pq_iteratively() {
+        let mut params = PQBuildParams::new(2, 8);
+        params.max_iters = 1;
+
+        let values = Float32Array::from_iter((0..16000).map(|v| v as f32));
+        // A 16-dim array.
+        let dim = 16;
+        let mat = MatrixView::new(values.into(), dim);
+        let pq = ProductQuantizer::train(&mat, &params).await.unwrap();
+
+        // Init centroids
+        let centroids = pq.codebook.clone();
+
+        // Keep training 10 times
+        let mut actual_pq = ProductQuantizer {
+            num_bits: 8,
+            num_sub_vectors: 2,
+            dimension: dim,
+            codebook: centroids,
+        };
+        // Iteratively train for 10 times.
+        for _ in 0..10 {
+            let code = actual_pq.transform(&mat, MetricType::L2).await.unwrap();
+            actual_pq.reset_centroids(&mat, &code).unwrap();
+            params.codebook = Some(actual_pq.codebook.clone());
+            actual_pq = ProductQuantizer::train(&mat, &params).await.unwrap();
+        }
+
+        let result = pq.codebook;
+        let expected = actual_pq.codebook;
+        result
+            .values()
+            .iter()
+            .zip(expected.values())
+            .for_each(|(&r, &e)| {
+                assert!(relative_eq!(r, e));
+            });
     }
 }

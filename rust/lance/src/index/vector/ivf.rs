@@ -664,7 +664,7 @@ pub async fn build_ivf_pq_index(
 
     let start = std::time::Instant::now();
     let pq = if let Some(codebook) = &pq_params.codebook {
-        ProductQuantizer::new_with_codebook(
+        ProductQuantizer::new(
             pq_params.num_sub_vectors,
             pq_params.num_bits as u32,
             dim,

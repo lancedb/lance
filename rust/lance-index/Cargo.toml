@@ -27,3 +27,6 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+approx.workspace = true

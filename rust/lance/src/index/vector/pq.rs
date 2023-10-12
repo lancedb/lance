@@ -97,12 +97,10 @@ impl PQIndex {
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {
             let from = key.slice(i * sub_vector_length, sub_vector_length);
-            let subvec_centroids = self.pq.centroids(i).ok_or_else(|| Error::Index {
-                message: "PQIndex::l2_distances: PQ is not initialized".to_string(),
-            })?;
+            let subvec_centroids = self.pq.centroids(i);
             let distances = l2_distance_batch(
                 as_primitive_array::<Float32Type>(&from).values(),
-                subvec_centroids.values(),
+                subvec_centroids,
                 sub_vector_length,
             );
             distance_table.extend(distances.values());
@@ -145,17 +143,13 @@ impl PQIndex {
             // The sub-vector section of the query vector.
             let key_sub_vector =
                 &query.values()[i * sub_vector_length..(i + 1) * sub_vector_length];
-            let sub_vector_centroids = self.pq.centroids(i).ok_or_else(|| Error::Index {
-                message: "PQIndex::cosine_distances: PQ is not initialized".to_string(),
-            })?;
+            let sub_vector_centroids = self.pq.centroids(i);
             let xy = sub_vector_centroids
-                .values()
                 .chunks_exact(sub_vector_length)
                 .map(|cent| cent.dot(key_sub_vector));
             xy_table.extend(xy);
 
             let y2 = sub_vector_centroids
-                .values()
                 .chunks_exact(sub_vector_length)
                 .map(|cent| cent.norm_l2().powf(2.0));
             y2_table.extend(y2);
@@ -319,9 +313,9 @@ impl From<&pb::Pq> for ProductQuantizer {
             num_bits: proto.num_bits,
             num_sub_vectors: proto.num_sub_vectors as usize,
             dimension: proto.dimension as usize,
-            codebook: Some(Arc::new(Float32Array::from_iter_values(
+            codebook: Arc::new(Float32Array::from_iter_values(
                 proto.codebook.iter().copied(),
-            ))),
+            )),
         }
     }
 }
@@ -333,7 +327,7 @@ impl From<&ProductQuantizer> for pb::Pq {
             num_bits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors as u32,
             dimension: pq.dimension as u32,
-            codebook: pq.codebook.as_ref().unwrap().values().to_vec(),
+            codebook: pq.codebook.values().to_vec(),
         }
     }
 }
@@ -343,89 +337,8 @@ pub(crate) async fn train_pq(
     data: &MatrixView<Float32Type>,
     params: &PQBuildParams,
 ) -> Result<ProductQuantizer> {
-    let mut pq = ProductQuantizer::new(
-        params.num_sub_vectors,
-        params.num_bits as u32,
-        data.num_columns(),
-    );
-    pq.train(data, params).await?;
-    Ok(pq)
+    ProductQuantizer::train(data, params).await
 }
 
 #[cfg(test)]
-mod tests {
-
-    use super::*;
-    use approx::relative_eq;
-    use arrow_array::types::Float32Type;
-
-    #[test]
-    fn test_divide_to_subvectors() {
-        let values = Float32Array::from_iter((0..320).map(|v| v as f32));
-        // A [10, 32] array.
-        let mat = MatrixView::new(values.into(), 32);
-        let sub_vectors = divide_to_subvectors(&mat, 4);
-        assert_eq!(sub_vectors.len(), 4);
-        assert_eq!(sub_vectors[0].len(), 10);
-        assert_eq!(sub_vectors[0].value_length(), 8);
-
-        assert_eq!(
-            sub_vectors[0].as_ref(),
-            &FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                (0..10)
-                    .map(|i| {
-                        Some(
-                            (i * 32..i * 32 + 8)
-                                .map(|v| Some(v as f32))
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-                8
-            )
-        );
-    }
-
-    #[ignore]
-    #[tokio::test]
-    async fn test_train_pq_iteratively() {
-        let mut params = PQBuildParams::new(2, 8);
-        params.max_iters = 1;
-
-        let values = Float32Array::from_iter((0..16000).map(|v| v as f32));
-        // A 16-dim array.
-        let dim = 16;
-        let mat = MatrixView::new(values.into(), dim);
-        let mut pq = ProductQuantizer::new(2, 8, dim);
-        pq.train(&mat, &params).await.unwrap();
-
-        // Init centroids
-        let centroids = pq.codebook.as_ref().unwrap().clone();
-
-        // Keep training 10 times
-        pq.train(&mat, &params).await.unwrap();
-
-        let mut actual_pq = ProductQuantizer {
-            num_bits: 8,
-            num_sub_vectors: 2,
-            dimension: dim,
-            codebook: Some(centroids),
-        };
-        // Iteratively train for 10 times.
-        for _ in 0..10 {
-            let code = actual_pq.transform(&mat, MetricType::L2).await.unwrap();
-            actual_pq.reset_centroids(&mat, &code).unwrap();
-            actual_pq.train(&mat, &params).await.unwrap();
-        }
-
-        let result = pq.codebook.unwrap();
-        let expected = actual_pq.codebook.unwrap();
-        result
-            .values()
-            .iter()
-            .zip(expected.values())
-            .for_each(|(&r, &e)| {
-                assert!(relative_eq!(r, e));
-            });
-    }
-}
+mod tests {}

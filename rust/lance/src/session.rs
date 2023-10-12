@@ -94,7 +94,8 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::index::vector::pq::{PQIndex, ProductQuantizer};
+    use crate::index::vector::pq::PQIndex;
+    use lance_index::vector::pq::ProductQuantizer;
     use lance_linalg::distance::MetricType;
 
     #[test]
@@ -103,7 +104,12 @@ mod tests {
         assert!(no_cache.index_cache.get("abc").is_none());
         let no_cache = Arc::new(no_cache);
 
-        let pq = Arc::new(ProductQuantizer::new(1, 8, 1));
+        let pq = Arc::new(ProductQuantizer::new(
+            1,
+            8,
+            1,
+            Arc::new(vec![0.0f32; 8].into()),
+        ));
         let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
         no_cache.index_cache.insert("abc", idx);
 
@@ -116,7 +122,12 @@ mod tests {
         let session = Session::new(10, 1);
         let session = Arc::new(session);
 
-        let pq = Arc::new(ProductQuantizer::new(1, 8, 1));
+        let pq = Arc::new(ProductQuantizer::new(
+            1,
+            8,
+            1,
+            Arc::new(vec![0.0f32; 8].into()),
+        ));
         let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
         session.index_cache.insert("abc", idx.clone());
 
@@ -127,7 +138,12 @@ mod tests {
         assert_eq!(session.index_cache.len(), 1);
 
         for iter_idx in 0..100 {
-            let pq_other = Arc::new(ProductQuantizer::new(16, 8, 1));
+            let pq_other = Arc::new(ProductQuantizer::new(
+                1,
+                8,
+                1,
+                Arc::new(vec![0.0f32; 8].into()),
+            ));
             let idx_other = Arc::new(PQIndex::new(pq_other, MetricType::L2));
             session
                 .index_cache

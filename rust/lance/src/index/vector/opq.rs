@@ -195,9 +195,7 @@ impl Transformer for OptimizedProductQuantizer {
         };
 
         // Run a few iterations to get the initialized centroids.
-        let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
-        pq.train(&train, self.metric_type, OPQ_PQ_INIT_ITERATIONS)
-            .await?;
+        let pq = ProductQuantizer::train(&train, self.metric_type, OPQ_PQ_INIT_ITERATIONS).await?;
         let mut pq_code = pq.transform(&train, self.metric_type).await?;
 
         // Initialize R (rotation matrix)
