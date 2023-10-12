@@ -23,7 +23,8 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
-use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
+// Re-export
+pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
 use lance_linalg::{
     distance::{l2::l2_distance_batch, norm_l2::norm_l2, Dot, Normalize},
     matrix::MatrixView,
