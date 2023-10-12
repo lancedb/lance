@@ -92,7 +92,7 @@ impl PQIndex {
             nbits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors,
             dimension: pq.dimension,
-            pq: pq,
+            pq,
             code,
             row_ids,
             metric_type,
@@ -282,7 +282,7 @@ impl IndexShardLoader for PQShardLoader {
         shard_index: usize,
     ) -> Result<Box<dyn VectorIndex>> {
         if shard_index >= self.lengths.len() {
-            return Err(Error::invalid_input(&format!("PQ index metadata only had information for {} partitions but was asked to load partition at index {}", self.lengths.len(), shard_index)));
+            return Err(Error::invalid_input(format!("PQ index metadata only had information for {} partitions but was asked to load partition at index {}", self.lengths.len(), shard_index)));
         }
         let length = self.lengths[shard_index];
         let offset = self.offsets[shard_index];

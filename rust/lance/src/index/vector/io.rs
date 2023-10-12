@@ -15,7 +15,7 @@ use crate::{
 use super::{IndexShardLoader, VectorIndex};
 
 /// A helper with some common I/O operations that indexes need to perform
-pub(crate) struct IndexReader {
+pub struct IndexReader {
     reader: Arc<dyn ObjectReader>,
     session: Option<Arc<Session>>,
     block_size: usize,
