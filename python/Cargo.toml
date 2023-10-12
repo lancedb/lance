@@ -22,6 +22,8 @@ futures = "0.3"
 half = { version = "2.1", default-features = false, features = ["num-traits"] }
 lance = { path = "../rust/lance", features = ["tensorflow", "dynamodb"] }
 lance-arrow = { path = "../rust/lance-arrow" }
+lance-core = { path = "../rust/lance-core" }
+lance-index = { path = "../rust/lance-index" }
 lance-linalg = { path = "../rust/lance-linalg" }
 lazy_static = "1"
 log = "0.4"
