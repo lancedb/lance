@@ -40,7 +40,7 @@ use crate::{io::RecordBatchStream, Error, Result};
 
 use super::RESIDUAL_COLUMN;
 
-/// Disk-based shuffle a strema of [RecordBatch] into each IVF partition.
+/// Disk-based shuffle a stream of [RecordBatch] into each IVF partition.
 /// Sub-quantizer will be applied if provided.
 ///
 /// Parameters
