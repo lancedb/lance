@@ -21,8 +21,10 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::*;
+use crate::dataset::Dataset;
 use crate::Error;
 use snafu::{location, Location};
+
 /// Index metadata
 #[derive(Debug, Clone)]
 pub struct Index {
@@ -42,6 +44,42 @@ pub struct Index {
     ///
     /// If this is None, then this is unknown.
     pub fragment_bitmap: Option<RoaringBitmap>,
+}
+
+impl Index {
+    /// Returns the fragment ids that are not indexed by this index.
+    pub async fn unindexed_fragments(&self, dataset: &Dataset) -> Result<Vec<Fragment>> {
+        if self.dataset_version == dataset.version().version {
+            return Ok(vec![]);
+        }
+        if let Some(bitmap) = self.fragment_bitmap.as_ref() {
+            Ok(dataset
+                .fragments()
+                .iter()
+                .filter(|f| !bitmap.contains(f.id as u32))
+                .cloned()
+                .collect::<Vec<_>>())
+        } else {
+            let ds = dataset.checkout_version(self.dataset_version).await?;
+            let max_fragment_id_idx = ds.manifest.max_fragment_id().ok_or_else(|| Error::IO {
+                message: "No fragments in index version".to_string(),
+                location: location!(),
+            })?;
+            let max_fragment_id_ds =
+                dataset
+                    .manifest
+                    .max_fragment_id()
+                    .ok_or_else(|| Error::IO {
+                        message: "No fragments in dataset version".to_string(),
+                        location: location!(),
+                    })?;
+            if max_fragment_id_idx < max_fragment_id_ds {
+                dataset.manifest.fragments_since(&ds.manifest)
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
 }
 
 impl TryFrom<&pb::IndexMetadata> for Index {
