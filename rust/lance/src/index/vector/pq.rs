@@ -25,6 +25,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
+use lance_core::io::Write;
 use lance_linalg::{
     distance::{l2::l2_distance_batch, norm_l2::norm_l2, Dot, Normalize},
     kernels::argmin_opt,
@@ -33,13 +34,14 @@ use lance_linalg::{
 use rand::SeedableRng;
 use serde::Serialize;
 
-use super::{MetricType, Query, VectorIndex};
-use crate::arrow::*;
+use super::{IndexShardLoader, MetricType, Query, VectorIndex};
 use crate::dataset::ROW_ID;
 use crate::index::{
     pb, prefilter::PreFilter, vector::kmeans::train_kmeans, vector::DIST_COL, Index,
 };
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
+use crate::io::object_writer::ObjectWriter;
+use crate::{arrow::*, encodings::plain::PlainEncoder};
 use crate::{Error, Result};
 
 /// Product Quantization Index.
@@ -60,10 +62,10 @@ pub struct PQIndex {
     pub pq: Arc<ProductQuantizer>,
 
     /// PQ code
-    pub code: Option<Arc<UInt8Array>>,
+    pub code: Arc<UInt8Array>,
 
     /// ROW Id used to refer to the actual row in dataset.
-    pub row_ids: Option<Arc<UInt64Array>>,
+    pub row_ids: Arc<UInt64Array>,
 
     /// Metric type.
     metric_type: MetricType,
@@ -80,15 +82,19 @@ impl std::fmt::Debug for PQIndex {
 }
 
 impl PQIndex {
-    /// Load a PQ index (page) from the disk.
-    pub(crate) fn new(pq: Arc<ProductQuantizer>, metric_type: MetricType) -> Self {
+    pub fn new(
+        pq: Arc<ProductQuantizer>,
+        metric_type: MetricType,
+        code: Arc<UInt8Array>,
+        row_ids: Arc<UInt64Array>,
+    ) -> Self {
         Self {
             nbits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors,
             dimension: pq.dimension,
-            code: None,
-            row_ids: None,
-            pq,
+            pq: pq,
+            code,
+            row_ids,
             metric_type,
         }
     }
@@ -195,13 +201,8 @@ impl PQIndex {
         &self,
         pre_filter: &PreFilter,
     ) -> Result<(Arc<UInt8Array>, Arc<UInt64Array>)> {
-        if self.code.is_none() || self.row_ids.is_none() {
-            return Err(Error::Index {
-                message: "PQIndex::filter_arrays: PQ is not initialized".to_string(),
-            });
-        }
-        let code = self.code.clone().unwrap();
-        let row_ids = self.row_ids.clone().unwrap();
+        let code = self.code.clone();
+        let row_ids = self.row_ids.clone();
         let indices_to_keep = pre_filter.filter_row_ids(row_ids.values()).await?;
         let indices_to_keep = UInt64Array::from(indices_to_keep);
 
@@ -218,6 +219,117 @@ impl PQIndex {
         let code = Arc::new(as_primitive_array(&code).clone());
 
         Ok((code, row_ids))
+    }
+}
+
+/// When embedding a PQ index into a partitioned index like IVF we
+/// store the codes / row_ids into the file and the file offset & # of rows
+/// as metadata
+pub struct PQShardLoader {
+    offsets: Vec<usize>,
+    lengths: Vec<u32>,
+    metadata: Arc<ProductQuantizer>,
+    metric_type: MetricType,
+}
+
+impl std::fmt::Debug for PQShardLoader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PQ(m={}, nbits={}, {})",
+            self.metadata.num_sub_vectors, self.metadata.num_bits, self.metric_type
+        )
+    }
+}
+
+impl PQShardLoader {
+    pub fn new(metadata: Arc<ProductQuantizer>, metric_type: MetricType) -> Self {
+        Self {
+            offsets: Vec::new(),
+            lengths: Vec::new(),
+            metadata,
+            metric_type,
+        }
+    }
+
+    pub fn initialize(&mut self, offsets: Vec<usize>, lengths: Vec<u32>) {
+        self.offsets = offsets;
+        self.lengths = lengths;
+    }
+}
+
+impl Index for PQShardLoader {
+    fn statistics(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(PQIndexStatistics {
+            index_type: "PQ".to_string(),
+            nbits: self.metadata.num_bits,
+            num_sub_vectors: self.metadata.num_sub_vectors,
+            dimension: self.metadata.dimension,
+            metric_type: self.metric_type.to_string(),
+        })?)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[async_trait]
+impl IndexShardLoader for PQShardLoader {
+    async fn load(
+        &self,
+        reader: &dyn ObjectReader,
+        shard_index: usize,
+    ) -> Result<Box<dyn VectorIndex>> {
+        if shard_index >= self.lengths.len() {
+            return Err(Error::invalid_input(&format!("PQ index metadata only had information for {} partitions but was asked to load partition at index {}", self.lengths.len(), shard_index)));
+        }
+        let length = self.lengths[shard_index];
+        let offset = self.offsets[shard_index];
+        let pq_code_length = self.metadata.num_sub_vectors * length as usize;
+        let pq_code =
+            read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;
+
+        let row_id_offset = offset + pq_code_length /* *1 */;
+        let row_ids = read_fixed_stride_array(
+            reader,
+            &DataType::UInt64,
+            row_id_offset,
+            length as usize,
+            ..,
+        )
+        .await?;
+
+        Ok(Box::new(PQIndex {
+            nbits: self.metadata.num_bits,
+            num_sub_vectors: self.metadata.num_sub_vectors,
+            dimension: self.metadata.dimension,
+            code: Arc::new(as_primitive_array(&pq_code).clone()),
+            row_ids: Arc::new(as_primitive_array(&row_ids).clone()),
+            pq: self.metadata.clone(),
+            metric_type: self.metric_type,
+        }))
+    }
+
+    async fn store(
+        &mut self,
+        index: Arc<dyn VectorIndex>,
+        writer: &mut ObjectWriter,
+        shard_index: usize,
+    ) -> Result<()> {
+        if self.offsets.len() != shard_index {
+            return Err(Error::invalid_input("Shards stored out of order"));
+        }
+        let pq_index = index.as_any().downcast_ref::<PQIndex>().ok_or_else(|| Error::Internal { message: "Metadata described a nested PQ index but was asked to store an index of a different type".into() })?;
+        self.offsets.push(writer.tell());
+        self.lengths.push(pq_index.row_ids.len() as u32);
+        PlainEncoder::write(writer, &[pq_index.code.as_ref()]).await?;
+        PlainEncoder::write(writer, &[pq_index.row_ids.as_ref()]).await?;
+        Ok(())
+    }
+
+    fn any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -251,17 +363,8 @@ impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
     async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch> {
-        if self.code.is_none() || self.row_ids.is_none() {
-            return Err(Error::Index {
-                message: "PQIndex::search: PQ is not initialized".to_string(),
-            });
-        }
-
         let (code, row_ids) = if pre_filter.is_empty() {
-            (
-                self.code.as_ref().unwrap().clone(),
-                self.row_ids.as_ref().unwrap().clone(),
-            )
+            (self.code.clone(), self.row_ids.clone())
         } else {
             self.filter_arrays(pre_filter).await?
         };
@@ -289,32 +392,6 @@ impl VectorIndex for PQIndex {
 
     fn is_loadable(&self) -> bool {
         true
-    }
-
-    /// Load a PQ index (page) from the disk.
-    async fn load(
-        &self,
-        reader: &dyn ObjectReader,
-        offset: usize,
-        length: usize,
-    ) -> Result<Arc<dyn VectorIndex>> {
-        let pq_code_length = self.pq.num_sub_vectors * length;
-        let pq_code =
-            read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;
-
-        let row_id_offset = offset + pq_code_length /* *1 */;
-        let row_ids =
-            read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
-
-        Ok(Arc::new(Self {
-            nbits: self.pq.num_bits,
-            num_sub_vectors: self.pq.num_sub_vectors,
-            dimension: self.pq.dimension,
-            code: Some(Arc::new(as_primitive_array(&pq_code).clone())),
-            row_ids: Some(Arc::new(as_primitive_array(&row_ids).clone())),
-            pq: self.pq.clone(),
-            metric_type: self.metric_type,
-        }))
     }
 }
 

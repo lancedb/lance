@@ -24,6 +24,7 @@ pub mod diskann;
 pub mod flat;
 #[allow(dead_code)]
 mod graph;
+mod io;
 pub mod ivf;
 mod kmeans;
 #[cfg(feature = "opq")]
@@ -36,12 +37,13 @@ use lance_linalg::distance::*;
 
 use self::{
     ivf::{build_ivf_pq_index, IVFIndex, IvfBuildParams},
-    pq::{PQBuildParams, PQIndex},
+    pq::PQBuildParams,
 };
 
 use super::{pb, IndexParams};
 #[cfg(feature = "opq")]
 use crate::index::vector::opq::{OPQIndex, OptimizedProductQuantizer};
+use crate::index::vector::{io::IndexReader, pq::PQShardLoader};
 use crate::{
     dataset::Dataset,
     index::{
@@ -52,10 +54,7 @@ use crate::{
             pq::ProductQuantizer,
         },
     },
-    io::{
-        object_reader::{read_message, ObjectReader},
-        read_message_from_buf, read_metadata_offset,
-    },
+    io::object_reader::ObjectReader,
     Error, Result,
 };
 pub use traits::*;
@@ -283,23 +282,12 @@ pub(crate) async fn open_index(
 
     let object_store = dataset.object_store();
     let reader: Arc<dyn ObjectReader> = object_store.open(&index_file).await?.into();
-
-    let file_size = reader.size().await?;
-    let block_size = object_store.block_size();
-    let begin = if file_size < block_size {
-        0
-    } else {
-        file_size - block_size
-    };
-    let tail_bytes = reader.get_range(begin..file_size).await?;
-    let metadata_pos = read_metadata_offset(&tail_bytes)?;
-    let proto: pb::Index = if metadata_pos < file_size - tail_bytes.len() {
-        // We have not read the metadata bytes yet.
-        read_message(reader.as_ref(), metadata_pos).await?
-    } else {
-        let offset = tail_bytes.len() - (file_size - metadata_pos);
-        read_message_from_buf(&tail_bytes.slice(offset..))?
-    };
+    let index_reader = Arc::new(IndexReader::new(
+        reader,
+        dataset.session.clone(),
+        object_store.block_size(),
+    ));
+    let proto: pb::Index = index_reader.read_tail_proto().await?;
 
     if proto.columns.len() != 1 {
         return Err(Error::Index {
@@ -323,6 +311,7 @@ pub(crate) async fn open_index(
         .into();
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
+    let mut last_shard_loader: Option<Box<dyn IndexShardLoader>> = None;
 
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
@@ -354,20 +343,32 @@ pub(crate) async fn open_index(
                 }
             }
             Some(Stage::Ivf(ivf_pb)) => {
-                if last_stage.is_none() {
+                if last_shard_loader.is_none() {
                     return Err(Error::Index {
-                        message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
+                        message: format!(
+                            "Invalid vector index stages (no valid sub-index for IVF): {:?}",
+                            vec_idx.stages
+                        ),
                     });
                 }
+                // TODO: Store the offsets / lengths as part of the PQ proto instead of at the IVF message
+                let mut pq_shard_loader = last_shard_loader.unwrap();
+                last_shard_loader = None;
                 let ivf = Ivf::try_from(ivf_pb)?;
-                last_stage = Some(Arc::new(IVFIndex::try_new(
-                    dataset.session.clone(),
+                pq_shard_loader
+                    .any_mut()
+                    .downcast_mut::<PQShardLoader>()
+                    .ok_or_else(|| {
+                        Error::invalid_input("Non-PQ sub-indexes not yet supported for IVF")
+                    })?
+                    .initialize(ivf.offsets.clone(), ivf.lengths.clone());
+                last_stage = Some(Arc::new(IVFIndex::new(
                     uuid,
                     ivf,
-                    reader.clone(),
-                    last_stage.unwrap(),
                     metric_type,
-                )?));
+                    index_reader.clone(),
+                    pq_shard_loader.into(),
+                )));
             }
             Some(Stage::Pq(pq_proto)) => {
                 if last_stage.is_some() {
@@ -376,7 +377,7 @@ pub(crate) async fn open_index(
                     });
                 };
                 let pq = Arc::new(ProductQuantizer::try_from(pq_proto).unwrap());
-                last_stage = Some(Arc::new(PQIndex::new(pq, metric_type)));
+                last_shard_loader = Some(Box::new(PQShardLoader::new(pq, metric_type)));
             }
             Some(Stage::Diskann(diskann_proto)) => {
                 if last_stage.is_some() {

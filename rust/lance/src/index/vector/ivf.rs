@@ -42,19 +42,17 @@ use tracing::{instrument, span, Level};
 #[cfg(feature = "opq")]
 use super::opq::train_opq;
 use super::{
+    io::IndexReader,
     pq::{train_pq, PQBuildParams, ProductQuantizer},
     utils::maybe_sample_training_data,
-    MetricType, Query, VectorIndex, INDEX_FILE_NAME,
+    IndexShardLoader, MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
+use crate::io::local::to_local_path;
 use crate::{
     dataset::Dataset,
     datatypes::Field,
     index::{pb, prefilter::PreFilter, vector::Transformer, Index},
     io::RecordBatchStream,
-};
-use crate::{
-    io::{local::to_local_path, object_reader::ObjectReader},
-    session::Session,
 };
 use crate::{Error, Result};
 
@@ -69,39 +67,29 @@ pub struct IVFIndex {
     /// Ivf model
     ivf: Ivf,
 
-    reader: Arc<dyn ObjectReader>,
-
-    /// Index in each partition.
-    sub_index: Arc<dyn VectorIndex>,
-
     metric_type: MetricType,
 
-    session: Arc<Session>,
+    shard_loader: Arc<dyn IndexShardLoader>,
+
+    reader: Arc<IndexReader>,
 }
 
 impl IVFIndex {
     /// Create a new IVF index.
-    pub(crate) fn try_new(
-        session: Arc<Session>,
+    pub(crate) fn new(
         uuid: &str,
         ivf: Ivf,
-        reader: Arc<dyn ObjectReader>,
-        sub_index: Arc<dyn VectorIndex>,
         metric_type: MetricType,
-    ) -> Result<Self> {
-        if !sub_index.is_loadable() {
-            return Err(Error::Index {
-                message: format!("IVF sub index must be loadable, got: {:?}", sub_index),
-            });
-        }
-        Ok(Self {
+        reader: Arc<IndexReader>,
+        shard_loader: Arc<dyn IndexShardLoader>,
+    ) -> Self {
+        Self {
             uuid: uuid.to_owned(),
-            session,
             ivf,
-            reader,
-            sub_index,
             metric_type,
-        })
+            reader,
+            shard_loader,
+        }
     }
 
     async fn search_in_partition(
@@ -111,18 +99,10 @@ impl IVFIndex {
         pre_filter: &PreFilter,
     ) -> Result<RecordBatch> {
         let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
-        let part_index = if let Some(part_idx) = self.session.index_cache.get(&cache_key) {
-            part_idx
-        } else {
-            let offset = self.ivf.offsets[partition_id];
-            let length = self.ivf.lengths[partition_id] as usize;
-            let idx = self
-                .sub_index
-                .load(self.reader.as_ref(), offset, length)
-                .await?;
-            self.session.index_cache.insert(&cache_key, idx.clone());
-            idx
-        };
+        let part_index = self
+            .reader
+            .load_sub_index(self.shard_loader.as_ref(), &cache_key, partition_id)
+            .await?;
 
         let partition_centroids = self.ivf.centroids.value(partition_id);
         let residual_key = subtract_dyn(query.key.as_ref(), &partition_centroids)?;
@@ -136,7 +116,7 @@ impl IVFIndex {
 
 impl std::fmt::Debug for IVFIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Ivf({}) -> {:?}", self.metric_type, self.sub_index)
+        write!(f, "Ivf({}) -> {:?}", self.metric_type, self.shard_loader)
     }
 }
 
@@ -188,7 +168,7 @@ impl Index for IVFIndex {
             uri: to_local_path(self.reader.path()),
             metric_type: self.metric_type.to_string(),
             num_partitions: self.ivf.num_partitions(),
-            sub_index: self.sub_index.statistics()?,
+            sub_index: self.shard_loader.statistics()?,
             partitions: partitions_statistics,
         })?)
     }
@@ -231,22 +211,11 @@ impl VectorIndex for IVFIndex {
     fn is_loadable(&self) -> bool {
         false
     }
-
-    async fn load(
-        &self,
-        _reader: &dyn ObjectReader,
-        _offset: usize,
-        _length: usize,
-    ) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::Index {
-            message: "Flat index does not support load".to_string(),
-        })
-    }
 }
 
-/// Ivf PQ index metadata.
+/// Ivf index metadata.
 ///
-/// It contains the on-disk data for a IVF PQ index.
+/// It contains the on-disk data for an IVF index.
 #[derive(Debug)]
 pub struct IvfPQIndexMetadata {
     /// Index name
@@ -329,10 +298,10 @@ pub(crate) struct Ivf {
     centroids: Arc<FixedSizeListArray>,
 
     /// Offset of each partition in the file.
-    offsets: Vec<usize>,
+    pub offsets: Vec<usize>,
 
     /// Number of vectors in each partition.
-    lengths: Vec<u32>,
+    pub lengths: Vec<u32>,
 }
 
 impl Ivf {

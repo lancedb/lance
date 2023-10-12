@@ -94,8 +94,19 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::index::vector::pq::{PQIndex, ProductQuantizer};
+    use crate::index::vector::{
+        pq::{PQIndex, ProductQuantizer},
+        VectorIndex,
+    };
+    use arrow_array::{UInt64Array, UInt8Array};
     use lance_linalg::distance::MetricType;
+
+    fn dummy_index(num_sub_vectors: usize) -> Arc<dyn VectorIndex> {
+        let pq = Arc::new(ProductQuantizer::new(num_sub_vectors, 8, 1));
+        let empty_code = Arc::new(UInt8Array::from_value(0, 0));
+        let empty_row_ids = Arc::new(UInt64Array::from_value(0, 0));
+        Arc::new(PQIndex::new(pq, MetricType::L2, empty_code, empty_row_ids))
+    }
 
     #[test]
     fn test_disable_index_cache() {
@@ -103,9 +114,7 @@ mod tests {
         assert!(no_cache.index_cache.get("abc").is_none());
         let no_cache = Arc::new(no_cache);
 
-        let pq = Arc::new(ProductQuantizer::new(1, 8, 1));
-        let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
-        no_cache.index_cache.insert("abc", idx);
+        no_cache.index_cache.insert("abc", dummy_index(1));
 
         assert!(no_cache.index_cache.get("abc").is_none());
         assert_eq!(no_cache.index_cache.len(), 0);
@@ -116,22 +125,21 @@ mod tests {
         let session = Session::new(10, 1);
         let session = Arc::new(session);
 
-        let pq = Arc::new(ProductQuantizer::new(1, 8, 1));
-        let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
-        session.index_cache.insert("abc", idx.clone());
+        session.index_cache.insert("abc", dummy_index(1));
 
         let found = session.index_cache.get("abc");
         assert!(found.is_some());
-        assert_eq!(format!("{:?}", found.unwrap()), format!("{:?}", idx));
+        assert_eq!(
+            format!("{:?}", found.unwrap()),
+            format!("{:?}", dummy_index(1))
+        );
         assert!(session.index_cache.get("abc").is_some());
         assert_eq!(session.index_cache.len(), 1);
 
         for iter_idx in 0..100 {
-            let pq_other = Arc::new(ProductQuantizer::new(16, 8, 1));
-            let idx_other = Arc::new(PQIndex::new(pq_other, MetricType::L2));
             session
                 .index_cache
-                .insert(format!("{iter_idx}").as_str(), idx_other.clone());
+                .insert(format!("{iter_idx}").as_str(), dummy_index(16));
         }
 
         // Capacity is 10 so there should be at most 10 items

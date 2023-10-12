@@ -27,6 +27,13 @@ use ordered_float::OrderedFloat;
 use serde::Serialize;
 
 use super::row_vertex::{RowVertex, RowVertexSerDe};
+use crate::index::{
+    vector::VectorIndex,
+    vector::{
+        graph::{Graph, VertexWithDistance},
+        Query,
+    },
+};
 use crate::{
     dataset::{Dataset, ROW_ID},
     index::{
@@ -38,17 +45,6 @@ use crate::{
         Index,
     },
     Result,
-};
-use crate::{
-    index::{
-        vector::VectorIndex,
-        vector::{
-            graph::{Graph, VertexWithDistance},
-            Query,
-        },
-    },
-    io::object_reader::ObjectReader,
-    Error,
 };
 
 /// DiskANN search state.
@@ -258,17 +254,6 @@ impl VectorIndex for DiskANNIndex {
 
     fn is_loadable(&self) -> bool {
         false
-    }
-
-    async fn load(
-        &self,
-        _reader: &dyn ObjectReader,
-        _offset: usize,
-        _length: usize,
-    ) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::Index {
-            message: "DiskANNIndex is not loadable".to_string(),
-        })
     }
 }
 

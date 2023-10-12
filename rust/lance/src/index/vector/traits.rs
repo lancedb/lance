@@ -15,7 +15,7 @@
 //! Traits for vector index.
 //!
 
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use arrow_array::types::Float32Type;
 use arrow_array::RecordBatch;
@@ -29,6 +29,34 @@ use crate::{
     io::{object_reader::ObjectReader, object_writer::ObjectWriter},
     Result,
 };
+
+/// Some indices can be split into shards / partitions and embedded into an
+/// index file.  When that happens we typically store some global metadata about
+/// the index that contains the location and size of the shards.  That metadata
+/// can be deserialized into a shard loader which later loads the actual shards
+///
+/// Currently this is only implemented for PQ which stores the offset & # of rows
+/// for each shard.
+#[async_trait]
+pub(crate) trait IndexShardLoader: Index + Send + Sync + std::fmt::Debug {
+    /// Load the shard at the given index
+    async fn load(
+        &self,
+        reader: &dyn ObjectReader,
+        shard_index: usize,
+    ) -> Result<Box<dyn VectorIndex>>;
+
+    /// Store the shard into the disk, at the current location, and update the shard
+    /// loader metadata
+    async fn store(
+        &mut self,
+        index: Arc<dyn VectorIndex>,
+        writer: &mut ObjectWriter,
+        shard_index: usize,
+    ) -> Result<()>;
+
+    fn any_mut(&mut self) -> &mut dyn Any;
+}
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
 #[async_trait]
@@ -57,14 +85,6 @@ pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// If the index is loadable by IVF, so it can be a sub-index that
     /// is loaded on demand by IVF.
     fn is_loadable(&self) -> bool;
-
-    /// Load the index from the reader on-demand.
-    async fn load(
-        &self,
-        reader: &dyn ObjectReader,
-        offset: usize,
-        length: usize,
-    ) -> Result<Arc<dyn VectorIndex>>;
 }
 
 /// Transformer on vectors.
