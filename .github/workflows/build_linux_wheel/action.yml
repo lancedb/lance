@@ -20,23 +20,31 @@ runs:
       shell: bash
       run: |
         echo "ARM BUILD: ${{ inputs.arm-build }}"
-    - name: Build manylinux image
+    - name: Build x86_64 Manylinux wheel
       if: ${{ inputs.arm-build == 'false' }}
-      shell: bash
-      working-directory: python
-      run: |
-        docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2014  tools/
-    - name: Build manylinux image (arm)
-      if: ${{ inputs.arm-build == 'true' }}
-      shell: bash
-      working-directory: python
-      run: |
-        docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2014_aarch64 tools/
-    - name: Build wheel
       uses: PyO3/maturin-action@v1
       with:
         command: build
-        args: ${{ inputs.args }}
         working-directory: python
-        container: pylance_manylinux
-        docker-options: "-e SOME_FLAG_TO_INVALIDATE_CACHE=1"
+        target: x86_64-unknown-linux-gnu
+        manylinux: "2_17"
+        args: ${{ inputs.args }}
+        before-script-linux: |
+          yum install -y openssl-devel \
+            && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-x86_64.zip > /tmp/protoc.zip \
+            && unzip /tmp/protoc.zip -d /usr/local \
+            && rm -rf /tmp/*
+    - name: Build Arm Manylinux Wheel
+      if: ${{ inputs.arm-build == 'true' }}
+      uses: PyO3/maturin-action@v1
+      with:
+        command: build
+        working-directory: python
+        target: aarch64-unknown-linux-gnu
+        manylinux: "2_17"
+        args: ${{ inputs.args }}
+        before-script-linux: |
+          apt install -y unzip \
+            && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-aarch_64.zip > /tmp/protoc.zip \
+            && unzip /tmp/protoc.zip -d /usr/local \
+            && rm -rf /tmp/*
