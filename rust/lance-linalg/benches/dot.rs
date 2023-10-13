@@ -14,8 +14,9 @@
 
 use std::iter::Sum;
 
-use arrow_arith::{aggregate::sum, arithmetic::multiply};
+use arrow_arith::{aggregate::sum, numeric::mul};
 use arrow_array::{
+    cast::AsArray,
     types::{Float16Type, Float32Type, Float64Type},
     ArrowNumericType, Float16Array, Float32Array, NativeAdapter, PrimitiveArray,
 };
@@ -30,8 +31,8 @@ use lance_testing::datagen::generate_random_array_with_seed;
 
 #[inline]
 fn dot_arrow_artiy<T: ArrowNumericType>(x: &PrimitiveArray<T>, y: &PrimitiveArray<T>) -> T::Native {
-    let m = multiply(x, y).unwrap();
-    sum(&m).unwrap()
+    let m = mul(x, y).unwrap();
+    sum(m.as_primitive::<T>()).unwrap()
 }
 
 fn run_bench<T: ArrowNumericType>(c: &mut Criterion)

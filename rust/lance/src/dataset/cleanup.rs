@@ -1131,12 +1131,5 @@ mod tests {
         cleanup_partial_writes(dataset.object_store(), objects)
             .await
             .unwrap();
-
-        // Assert directly calling abort returns not found on first one.
-        assert!(store
-            .inner
-            .abort_multipart(&path1, &multipart_id)
-            .await
-            .is_err());
     }
 }

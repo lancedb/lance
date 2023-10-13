@@ -661,8 +661,8 @@ impl FragmentReader {
 #[cfg(test)]
 mod tests {
 
-    use arrow_arith::arithmetic::multiply_scalar;
-    use arrow_array::{cast::AsArray, ArrayRef, Int32Array, RecordBatchIterator, StringArray};
+    use arrow_arith::numeric::mul;
+    use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
     use futures::TryStreamExt;
@@ -949,7 +949,7 @@ mod tests {
             )]));
             while let Some(batch) = updater.next().await.unwrap() {
                 let input_col = batch.column_by_name("i").unwrap();
-                let result_col: Int32Array = multiply_scalar(input_col.as_primitive(), 2).unwrap();
+                let result_col = mul(input_col, &Int32Array::new_scalar(2)).unwrap();
                 let batch = RecordBatch::try_new(
                     new_schema.clone(),
                     vec![Arc::new(result_col) as ArrayRef],

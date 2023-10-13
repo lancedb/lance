@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use std::ops::{Range, RangeTo};
 use std::sync::Arc;
 
-use arrow_arith::arithmetic::subtract_scalar;
+use arrow_arith::numeric::sub;
 use arrow_array::{
     builder::PrimitiveBuilder,
     cast::AsArray,
@@ -954,8 +954,9 @@ where
         }
     };
 
-    let start_position = positions.value(0);
-    let offset_arr = subtract_scalar(positions, start_position)?;
+    let start_position = PrimitiveArray::<T>::new_scalar(positions.value(0));
+    let offset_arr = sub(positions, &start_position)?;
+    let offset_arr_ref = offset_arr.as_primitive::<T>();
     let value_arrs = read_array(
         reader,
         &field.children[0],
@@ -964,7 +965,7 @@ where
         &value_params,
     )
     .await?;
-    let arr = try_new_generic_list_array(value_arrs, &offset_arr)?;
+    let arr = try_new_generic_list_array(value_arrs, offset_arr_ref)?;
     Ok(Arc::new(arr) as ArrayRef)
 }
 
@@ -1529,22 +1530,22 @@ mod tests {
 
         let arr = read_array_w_params(&reader, &schema.fields[1], ReadBatchParams::RangeFull).await;
         assert_eq!(100, arr.len());
-        assert_eq!(100, arr.null_count());
+        assert_eq!(arr.data_type(), &DataType::Null);
 
         let arr =
             read_array_w_params(&reader, &schema.fields[1], ReadBatchParams::Range(10..25)).await;
         assert_eq!(15, arr.len());
-        assert_eq!(15, arr.null_count());
+        assert_eq!(arr.data_type(), &DataType::Null);
 
         let arr =
             read_array_w_params(&reader, &schema.fields[1], ReadBatchParams::RangeFrom(60..)).await;
         assert_eq!(40, arr.len());
-        assert_eq!(40, arr.null_count());
+        assert_eq!(arr.data_type(), &DataType::Null);
 
         let arr =
             read_array_w_params(&reader, &schema.fields[1], ReadBatchParams::RangeTo(..25)).await;
         assert_eq!(25, arr.len());
-        assert_eq!(25, arr.null_count());
+        assert_eq!(arr.data_type(), &DataType::Null);
 
         let arr = read_array_w_params(
             &reader,
@@ -1553,7 +1554,7 @@ mod tests {
         )
         .await;
         assert_eq!(4, arr.len());
-        assert_eq!(4, arr.null_count());
+        assert_eq!(arr.data_type(), &DataType::Null);
 
         // raise error if take indices are out of bounds
         let params = ReadBatchParams::Indices(UInt32Array::from(vec![1, 9, 30, 72, 100]));

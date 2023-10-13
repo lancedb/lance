@@ -41,7 +41,7 @@ pub struct HashJoiner {
 }
 
 fn column_to_rows(column: ArrayRef) -> Result<Rows> {
-    let mut row_converter = RowConverter::new(vec![SortField::new(column.data_type().clone())])?;
+    let row_converter = RowConverter::new(vec![SortField::new(column.data_type().clone())])?;
     let rows = row_converter.convert_columns(&[column])?;
     Ok(rows)
 }
