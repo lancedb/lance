@@ -54,6 +54,8 @@ arrow-ord = "47.0"
 arrow-row = "47.0"
 arrow-schema = "47.0"
 arrow-select = "47.0"
+async-recursion = "1.0"
+async-trait = "0.1.60"
 half = { "version" = "=2.2.1", default-features = false, features = [
     "num-traits",
 ] }
