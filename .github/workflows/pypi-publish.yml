@@ -10,9 +10,9 @@ jobs:
     strategy:
       matrix:
         python-minor-version: [ "8" ]
-        arm:
-          - "false"
-          - "true"
+        platform:
+          - x86_64
+          - aarch64
     runs-on: "ubuntu-22.04"
     steps:
     - uses: actions/checkout@v3
@@ -27,7 +27,7 @@ jobs:
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
         args: "--release"
-        arm-build: ${{ matrix.arm }}
+        arm-build: ${{ matrix.platform == 'aarch64' }} 
     - uses: ./.github/workflows/upload_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
