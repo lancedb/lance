@@ -111,8 +111,7 @@ mod tests {
             .unwrap();
         assert_eq!(object_writer.tell(), 0);
 
-        let mut buf = Vec::<u8>::new();
-        buf.resize(256, 0);
+        let buf = vec![0; 256];
         assert_eq!(object_writer.write(buf.as_slice()).await.unwrap(), 256);
         assert_eq!(object_writer.tell(), 256);
 

@@ -35,8 +35,12 @@ use lance_linalg::{
 use snafu::{location, Location};
 use tracing::instrument;
 
-use super::PART_ID_COLUMN;
-use crate::vector::transform::Transformer;
+use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
+use crate::vector::{
+    pq::{transform::PQTransformer, ProductQuantizer},
+    residual::ResidualTransform,
+    transform::Transformer,
+};
 
 /// IVF - IVF file partition
 ///
@@ -68,6 +72,31 @@ impl Ivf {
             centroids,
             metric_type,
             transforms,
+            partition_range: None,
+        }
+    }
+
+    pub fn new_with_pq(
+        centroids: MatrixView<Float32Type>,
+        metric_type: MetricType,
+        vector_column: &str,
+        pq: Arc<ProductQuantizer>,
+    ) -> Self {
+        Self {
+            centroids: centroids.clone(),
+            metric_type,
+            transforms: vec![
+                Arc::new(ResidualTransform::new(
+                    centroids,
+                    PART_ID_COLUMN,
+                    vector_column,
+                )),
+                Arc::new(PQTransformer::new(
+                    pq.clone(),
+                    RESIDUAL_COLUMN,
+                    PQ_CODE_COLUMN,
+                )),
+            ],
             partition_range: None,
         }
     }

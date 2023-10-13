@@ -29,12 +29,14 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
 }
 
+pub(crate) mod append;
 pub(crate) mod cache;
 pub(crate) mod prefilter;
 pub mod vector;
 
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::format::Index as IndexMetadata;
+use crate::index::append::append_index;
 use crate::index::vector::remap_vector_index;
 use crate::io::commit::commit_transaction;
 use crate::{dataset::Dataset, Error, Result};
@@ -144,6 +146,9 @@ pub trait DatasetIndexExt {
         params: &dyn IndexParams,
         replace: bool,
     ) -> Result<()>;
+
+    /// Optimize indices.
+    async fn optimize_indices(&mut self) -> Result<()>;
 }
 
 #[async_trait]
@@ -233,6 +238,58 @@ impl DatasetIndexExt for Dataset {
 
         self.manifest = Arc::new(new_manifest);
 
+        Ok(())
+    }
+
+    async fn optimize_indices(&mut self) -> Result<()> {
+        let dataset = Arc::new(self.clone());
+        // Append index
+        let indices = self.load_indices().await?;
+
+        let mut new_indices = vec![];
+        let mut removed_indices = vec![];
+        for idx in indices.as_slice() {
+            if idx.dataset_version == self.manifest.version {
+                continue;
+            }
+            let Some(new_id) = append_index(dataset.clone(), idx).await? else {
+                continue;
+            };
+
+            let new_idx = IndexMetadata {
+                uuid: new_id,
+                name: idx.name.clone(),
+                fields: idx.fields.clone(),
+                dataset_version: self.manifest.version,
+                fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+            };
+            removed_indices.push(idx.clone());
+            new_indices.push(new_idx);
+        }
+
+        if new_indices.is_empty() {
+            return Ok(());
+        }
+
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            },
+            None,
+        );
+
+        let new_manifest = commit_transaction(
+            self,
+            self.object_store(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+        )
+        .await?;
+
+        self.manifest = Arc::new(new_manifest);
         Ok(())
     }
 }

@@ -166,7 +166,7 @@ pub(super) async fn build_partitions(
         part_range.clone(),
     );
     let shuffler = shuffle_dataset(data, column, Arc::new(ivf_model), pq.num_sub_vectors).await?;
-    write_index_partitions(writer, ivf, &shuffler).await?;
+    write_index_partitions(writer, ivf, &shuffler, None).await?;
 
     Ok(())
 }
