@@ -352,5 +352,5 @@ def test_optimize_index(dataset, tmp_path):
     indices_dir = dataset_uri / "_indices"
     assert len(list(indices_dir.iterdir())) == 1
 
-    ds = ds.optimize.indices()
+    ds = ds.optimize.optimize_indices()
     assert len(list(indices_dir.iterdir())) == 2

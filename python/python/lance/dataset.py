@@ -1548,7 +1548,7 @@ class DatasetOptimizer:
         )
         return Compaction.execute(self._dataset, opts)
 
-    def indices(self, **kwargs):
+    def optimize_indices(self, **kwargs):
         """Optimizes index performance.
 
         As new data arrives it is not added to existing indexes automatically.
