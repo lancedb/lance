@@ -12,14 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::StreamExt;
+use std::sync::Arc;
 
-use super::{shuffler::Shuffler, Ivf};
-use crate::dataset::ROW_ID;
-use crate::encodings::plain::PlainEncoder;
-use crate::Result;
+use arrow_array::Array;
+use futures::StreamExt;
 use lance_core::io::Writer;
 use lance_index::vector::PQ_CODE_COLUMN;
+
+use super::{shuffler::Shuffler, IVFIndex, Ivf};
+use crate::dataset::ROW_ID;
+use crate::encodings::plain::PlainEncoder;
+use crate::index::vector::pq::PQIndex;
+use crate::Result;
 
 /// Write each partition of IVF_PQ index to the index file.
 ///
@@ -28,11 +32,20 @@ pub(super) async fn write_index_partitions(
     writer: &mut dyn Writer,
     ivf: &mut Ivf,
     shuffler: &Shuffler,
+    existing_partitions: Option<&IVFIndex>,
 ) -> Result<()> {
     for part_id in 0..ivf.num_partitions() as u32 {
+        let mut pq_array = Vec::<Arc<dyn Array>>::new();
+        let mut row_id_array = Vec::<Arc<dyn Array>>::new();
+
+        if let Some(existing_idx) = existing_partitions.as_ref() {
+            let part = existing_idx.load_partition(part_id as usize).await?;
+            let pq_idx = part.as_any().downcast_ref::<PQIndex>().unwrap();
+            pq_array.push(pq_idx.code.as_ref().unwrap().clone());
+            row_id_array.push(pq_idx.row_ids.as_ref().unwrap().clone());
+        }
+
         if let Some(mut stream) = shuffler.key_iter(part_id).await? {
-            let mut pq_array = vec![];
-            let mut row_id_array = vec![];
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
                 let arr = batch.column_by_name(PQ_CODE_COLUMN).unwrap();
@@ -40,8 +53,10 @@ pub(super) async fn write_index_partitions(
                 let arr = batch.column_by_name(ROW_ID).unwrap();
                 row_id_array.push(arr.clone());
             }
-            let total_records = row_id_array.iter().map(|a| a.len()).sum::<usize>();
+        }
 
+        let total_records = row_id_array.iter().map(|a| a.len()).sum::<usize>();
+        if total_records > 0 {
             ivf.add_partition(writer.tell(), total_records as u32);
 
             let pq_refs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();

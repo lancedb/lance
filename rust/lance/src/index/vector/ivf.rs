@@ -41,7 +41,9 @@ use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
 use snafu::{location, Location};
+use tokio::io::AsyncWriteExt;
 use tracing::{instrument, span, Level};
+use uuid::Uuid;
 
 #[cfg(feature = "opq")]
 use super::opq::train_opq;
@@ -50,11 +52,18 @@ use super::{
     utils::maybe_sample_training_data,
     MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
+use crate::format::Index as IndexMetadata;
+use crate::index::vector::ivf::io::write_index_partitions;
 use crate::{
     dataset::Dataset,
     datatypes::Field,
     encodings::plain::PlainEncoder,
-    index::{pb, prefilter::PreFilter, vector::Transformer, Index},
+    index::{
+        pb,
+        prefilter::PreFilter,
+        vector::{ivf::builder::shuffle_dataset, Transformer},
+        Index,
+    },
     io::object_writer::ObjectWriter,
     io::RecordBatchStream,
 };
@@ -110,12 +119,8 @@ impl IVFIndex {
         })
     }
 
-    async fn search_in_partition(
-        &self,
-        partition_id: usize,
-        query: &Query,
-        pre_filter: &PreFilter,
-    ) -> Result<RecordBatch> {
+    /// Load one partition of the IVF sub-index.
+    pub(crate) async fn load_partition(&self, partition_id: usize) -> Result<Arc<dyn VectorIndex>> {
         let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
         let part_index = if let Some(part_idx) = self.session.index_cache.get(&cache_key) {
             part_idx
@@ -130,6 +135,16 @@ impl IVFIndex {
             self.session.index_cache.insert(&cache_key, idx.clone());
             idx
         };
+        return Ok(part_index);
+    }
+
+    async fn search_in_partition(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: &PreFilter,
+    ) -> Result<RecordBatch> {
+        let part_index = self.load_partition(partition_id).await?;
 
         let partition_centroids = self.ivf.centroids.value(partition_id);
         let residual_key = subtract_dyn(query.key.as_ref(), &partition_centroids)?;
@@ -138,6 +153,59 @@ impl IVFIndex {
         part_query.key = as_primitive_array(&residual_key).clone().into();
         let batch = part_index.search(&part_query, pre_filter).await?;
         Ok(batch)
+    }
+
+    pub(crate) async fn append(
+        &self,
+        dataset: &Dataset,
+        data: impl RecordBatchStream + Unpin,
+        metadata: &IndexMetadata,
+        column: &str,
+    ) -> Result<Uuid> {
+        let new_uuid = Uuid::new_v4();
+        let object_store = dataset.object_store();
+        let index_file = dataset
+            .indices_dir()
+            .child(new_uuid.to_string())
+            .child(INDEX_FILE_NAME);
+        let mut writer = object_store.create(&index_file).await?;
+
+        let pq_index = self
+            .sub_index
+            .as_any()
+            .downcast_ref::<PQIndex>()
+            .ok_or(Error::Index {
+                message: "Only support append to IVF_PQ".to_string(),
+            })?;
+
+        // TODO: merge two IVF implementations.
+        let ivf = Arc::new(lance_index::vector::ivf::Ivf::new_with_pq(
+            self.ivf.centroids.as_ref().try_into()?,
+            self.metric_type,
+            column,
+            pq_index.pq.clone(),
+        ));
+        let shuffler = shuffle_dataset(data, column, ivf, pq_index.pq.num_sub_vectors).await?;
+
+        let mut ivf_mut = self.ivf.clone();
+        write_index_partitions(&mut writer, &mut ivf_mut, &shuffler, Some(self)).await?;
+        let metadata = IvfPQIndexMetadata {
+            name: metadata.name.to_string(),
+            column: column.to_string(),
+            dimension: self.ivf.dimension() as u32,
+            dataset_version: dataset.version().version,
+            metric_type: self.metric_type,
+            ivf: ivf_mut,
+            pq: pq_index.pq.clone(),
+            transforms: vec![],
+        };
+
+        let metadata = pb::Index::try_from(&metadata)?;
+        let pos = writer.write_protobuf(&metadata).await?;
+        writer.write_magics(pos).await?;
+        writer.shutdown().await?;
+
+        Ok(new_uuid)
     }
 }
 

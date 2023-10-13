@@ -29,6 +29,7 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
 }
 
+pub(crate) mod append;
 pub(crate) mod cache;
 pub(crate) mod prefilter;
 pub mod vector;
@@ -37,6 +38,7 @@ use crate::dataset::transaction::{Operation, Transaction};
 use crate::format::Index as IndexMetadata;
 use crate::index::vector::remap_vector_index;
 use crate::io::commit::commit_transaction;
+use crate::io::RecordBatchStream;
 use crate::{dataset::Dataset, Error, Result};
 
 use self::vector::{build_vector_index, VectorIndexParams};
