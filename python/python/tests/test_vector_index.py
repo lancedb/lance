@@ -354,3 +354,75 @@ def test_optimize_index(dataset, tmp_path):
 
     ds = ds.optimize.optimize_indices()
     assert len(list(indices_dir.iterdir())) == 2
+
+
+def create_uniform_table(min, max, nvec, offset, ndim=8):
+    mat = np.random.uniform(min, max, (nvec, ndim))
+    # rowid = np.arange(offset, offset + nvec)
+    tbl = vec_to_table(data=mat)
+    tbl = pa.Table.from_pydict(
+        {
+            "vector": tbl.column(0).chunk(0),
+            "filterable": np.arange(offset, offset + nvec),
+        }
+    )
+    return tbl
+
+
+def test_optimize_index_recall(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    data = create_uniform_table(min=0, max=1, nvec=300, offset=0)
+
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=150)
+    dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=2, num_sub_vectors=2
+    )
+    assert len(dataset.get_fragments()) == 2
+
+    sample_indices = random.sample(range(300), 50)
+    sample_query_indices = sample_indices[0:40]
+    sample_delete_indices = sample_indices[40:]
+    vecs = data.column("vector").chunk(0)
+    sample_queries = [
+        {"column": "vector", "q": vecs[i].values, "k": 5} for i in sample_query_indices
+    ]
+    sample_delete_queries = [
+        {"column": "vector", "q": vecs[i].values, "k": 5} for i in sample_delete_indices
+    ]
+
+    def has_target(target, results):
+        for item in results:
+            if item.values == target:
+                return True
+        return False
+
+    def check_index(has_knn_combined, delete_has_happened):
+        for query in sample_queries:
+            results = dataset.to_table(nearest=query).column("vector")
+            assert has_target(query["q"], results)
+            plan = dataset.scanner(nearest=query).explain_plan()
+            assert ("KNNFlat" in plan) == has_knn_combined
+        for query in sample_delete_queries:
+            results = dataset.to_table(nearest=query).column("vector")
+            assert delete_has_happened != has_target(query["q"], results)
+
+    # Original state is 2 indexed fragments of size 150.  This should not require
+    # a combined scan
+    check_index(has_knn_combined=False, delete_has_happened=False)
+
+    # Add a new fragment, now a combined scan is required
+    extra_data = create_uniform_table(min=1000, max=1001, nvec=100, offset=300)
+    dataset = lance.write_dataset(
+        extra_data, base_dir, mode="append", max_rows_per_file=100
+    )
+    check_index(has_knn_combined=True, delete_has_happened=False)
+
+    for row_id in sample_delete_indices:
+        dataset.delete(f"filterable == {row_id}")
+
+    # Delete some rows, combined KNN still needed
+    check_index(has_knn_combined=True, delete_has_happened=True)
+
+    # Optimize the index, combined KNN should no longer be needed
+    dataset.optimize.optimize_indices()
+    check_index(has_knn_combined=False, delete_has_happened=True)
