@@ -223,3 +223,52 @@ sophisticated enough to represent asynchronous parallel work.
 
 As a result, a single instrumented async method may appear as many different
 spans in the UI.
+
+
+## Building wheels locally
+
+### Linux
+
+On Mac or Linux, you can build manylinux wheels locally for Linux. The easiest
+way to do this is to use `zig` with `maturin build`. Before you do this, you'll
+need to make you (1) [install zig](https://github.com/ziglang/zig/wiki/Install-Zig-from-a-Package-Manager)
+and (2) install the toolchains:
+
+```shell
+rustup target add x86_64-unknown-linux-gnu
+rustup target add aarch64-unknown-linux-gnu
+```
+
+For x86 Linux:
+
+```shell
+maturin build --release --zig \
+    --target x86_64-unknown-linux-gnu \
+    --compatibility manylinux2014 \
+    --out wheels
+```
+
+For ARM / aarch64 Linux:
+
+```shell
+maturin build --release --zig \
+    --target aarch_64-unknown-linux-gnu \
+    --compatibility manylinux2014 \
+    --out wheels
+```
+
+### MacOS
+
+On a Mac, you can build wheels locally for MacOS:
+
+```shell
+maturin build --release \
+    --target aarch64-apple-darwin \
+    --out wheels
+```
+
+```shell
+maturin build --release \
+    --target x86_64-apple-darwin \
+    --out wheels
+```

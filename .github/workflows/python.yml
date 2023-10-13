@@ -131,33 +131,6 @@ jobs:
     # Make sure wheels are not included in the Rust cache
     - name: Delete wheels
       run: sudo rm -rf target/wheels
-  linux-release-test:
-    timeout-minutes: 60
-    strategy:
-      matrix:
-        python-minor-version: [ "8" ]
-        arm:
-          - "false"
-          - "true"
-    runs-on: "ubuntu-22.04"
-    steps:
-    - uses: actions/checkout@v3
-      with:
-        fetch-depth: 0
-        lfs: true
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: 3.${{ matrix.python-minor-version }}
-    - uses: ./.github/workflows/build_linux_wheel
-      with:
-        python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release"
-        arm-build: ${{ matrix.arm }}
-    - uses: ./.github/workflows/upload_wheel
-      with:
-        repo: "pypi"
-
   mac:
     timeout-minutes: 45
     runs-on: "macos-12"
