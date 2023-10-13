@@ -271,7 +271,9 @@ impl DatasetIndexExt for Dataset {
 
         let transaction = Transaction::new(
             self.manifest.version,
-            Operation::ModifyIndex { new_indices },
+            Operation::ModifyIndex {
+                modified_indices: new_indices,
+            },
             None,
         );
 

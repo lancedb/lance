@@ -164,6 +164,5 @@ message Transaction {
     Merge merge = 105;
     Restore restore = 106;
     ReserveFragments reserve_fragments = 107;
-
   }
 }
