@@ -26,7 +26,7 @@ jobs:
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release"
+        args: "--release --strip"
         arm-build: ${{ matrix.platform == 'aarch64' }} 
     - uses: ./.github/workflows/upload_wheel
       with:
@@ -79,7 +79,7 @@ jobs:
       - uses: ./.github/workflows/build_windows_wheel
         with:
           python-minor-version: ${{ matrix.python-minor-version }}
-          args: "--release"
+          args: "--release --strip"
           vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
       - uses: ./.github/workflows/upload_wheel
         with:

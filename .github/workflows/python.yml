@@ -131,34 +131,6 @@ jobs:
     # Make sure wheels are not included in the Rust cache
     - name: Delete wheels
       run: sudo rm -rf target/wheels
-  # TODO: delete this before merge
-  linux-release-test:
-    timeout-minutes: 60
-    strategy:
-      matrix:
-        python-minor-version: [ "8" ]
-        platform:
-          - x86_64
-          - aarch64
-    runs-on: "ubuntu-22.04"
-    steps:
-    - uses: actions/checkout@v3
-      with:
-        fetch-depth: 0
-        lfs: true
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: 3.${{ matrix.python-minor-version }}
-    - uses: ./.github/workflows/build_linux_wheel
-      with:
-        python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release --strip"
-        arm-build: ${{ matrix.platform == 'aarch64' }} 
-    - name: Upload test wheel
-      uses: actions/upload-artifact@v3
-      with:
-        path: python/target/wheels/pylance-*.whl
   mac:
     timeout-minutes: 45
     runs-on: "macos-12"
