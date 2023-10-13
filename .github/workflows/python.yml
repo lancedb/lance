@@ -153,7 +153,7 @@ jobs:
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release"
+        args: "--release --strip"
         arm-build: ${{ matrix.platform == 'aarch64' }} 
     - name: Upload test wheel
       uses: actions/upload-artifact@v3
