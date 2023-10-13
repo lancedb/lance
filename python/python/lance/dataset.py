@@ -1495,7 +1495,8 @@ class DatasetOptimizer:
         self._dataset = dataset
 
     def __call__(self, *args, **kwargs):
-        return self.optimize(*args, **kwargs)
+        self.compact_files()
+        self.optimize_indices()
 
     def compact_files(
         self,
@@ -1557,7 +1558,11 @@ class DatasetOptimizer:
         return Compaction.execute(self._dataset, opts)
 
     def optimize_indices(self, **kwargs) -> LanceDataset:
-        """Optimize index."""
+        """Optimize indices in the dataset.
+
+        Including:
+        - Update the index with newly added rows.
+        """
         return self._dataset.optimize_indices(**kwargs)
 
 
