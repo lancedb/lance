@@ -11,6 +11,7 @@ inputs:
     default: ""
   arm-build:
     description: "Build for arm64 instead of x86_64"
+    # Note: this does *not* mean the host is arm64, since we might be cross-compiling.
     required: false
     default: 'false'
 runs:
@@ -20,23 +21,37 @@ runs:
       shell: bash
       run: |
         echo "ARM BUILD: ${{ inputs.arm-build }}"
-    - name: Build manylinux image
+    - name: Build x86_64 Manylinux wheel
       if: ${{ inputs.arm-build == 'false' }}
-      shell: bash
-      working-directory: python
-      run: |
-        docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2014  tools/
-    - name: Build manylinux image (arm)
-      if: ${{ inputs.arm-build == 'true' }}
-      shell: bash
-      working-directory: python
-      run: |
-        docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2014_aarch64 tools/
-    - name: Build wheel
       uses: PyO3/maturin-action@v1
       with:
         command: build
-        args: ${{ inputs.args }}
         working-directory: python
-        container: pylance_manylinux
-        docker-options: "-e SOME_FLAG_TO_INVALIDATE_CACHE=1"
+        target: x86_64-unknown-linux-gnu
+        manylinux: "2_17"
+        args: ${{ inputs.args }}
+        before-script-linux: |
+          yum install -y openssl-devel \
+            && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-$(uname -m).zip > /tmp/protoc.zip \
+            && unzip /tmp/protoc.zip -d /usr/local \
+            && rm /tmp/protoc.zip
+    - name: Build Arm Manylinux Wheel
+      if: ${{ inputs.arm-build == 'true' }}
+      uses: PyO3/maturin-action@v1
+      with:
+        command: build
+        working-directory: python
+        target: aarch64-unknown-linux-gnu
+        manylinux: "2_17"
+        args: ${{ inputs.args }}
+        before-script-linux: |
+          set -e
+          apt install -y unzip
+          if [ $(uname -m) = "x86_64" ]; then
+            PROTOC_ARCH="x86_64"
+          else
+            PROTOC_ARCH="aarch_64"
+          fi
+          curl -L https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-$PROTOC_ARCH.zip > /tmp/protoc.zip \
+            && unzip /tmp/protoc.zip -d /usr/local \
+            && rm /tmp/protoc.zip
