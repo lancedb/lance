@@ -70,8 +70,10 @@ pub(crate) async fn append_index(
 mod tests {
     use super::*;
 
+    use arrow_array::cast::AsArray;
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
+    use futures::TryStreamExt;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::pq::PQBuildParams;
     use lance_linalg::distance::MetricType;
@@ -105,7 +107,8 @@ mod tests {
         let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
         let ivf_params = IvfBuildParams::new(2);
-        let pq_params = PQBuildParams::default();
+        let mut pq_params = PQBuildParams::default();
+        pq_params.num_sub_vectors = 2;
         let params = VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params);
 
         dataset
@@ -123,9 +126,51 @@ mod tests {
         let index = &dataset.load_indices().await.unwrap()[0];
         assert!(index.unindexed_fragments(&dataset).await.unwrap().len() > 0);
 
-        let uuid = append_index(Arc::new(dataset.clone()), &index)
+        let q = array.value(5);
+        let mut scanner = dataset.scan();
+        scanner.nearest("vector", q.as_primitive(), 10).unwrap();
+        let results = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert!(uuid.is_some());
+
+        dataset.optimize_indices().await.unwrap();
+        let index = &dataset.load_indices().await.unwrap()[0];
+        assert!(index
+            .unindexed_fragments(&dataset)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // There should be two indices directories existed.
+        let object_store = dataset.object_store();
+        let index_dirs = object_store
+            .read_dir_all(&dataset.indices_dir(), None)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(index_dirs.len(), 2);
+
+        let mut scanner = dataset.scan();
+        scanner.nearest("vector", q.as_primitive(), 10).unwrap();
+        let results = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let vectors = &results[0]["vector"];
+        // Second batch of vectors should be in the index.
+        let contained = vectors.as_fixed_size_list().iter().any(|v| {
+            let vec = v.as_ref().unwrap();
+            array.iter().any(|a| a.as_ref().unwrap() == vec)
+        });
+        assert!(contained);
     }
 }
