@@ -525,6 +525,14 @@ impl Dataset {
         })
     }
 
+    fn optimize_indices(&mut self, _kwargs: Option<&PyDict>) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.optimize_indices())
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     fn create_index(
         &mut self,
         columns: Vec<&str>,

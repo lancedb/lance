@@ -90,6 +90,9 @@ class LanceDataset(pa.dataset.Dataset):
         self._uri, version = state
         self._ds = _Dataset(self._uri, version)
 
+    def __len__(self):
+        return self.count_rows()
+
     @property
     def uri(self) -> str:
         """
@@ -101,7 +104,7 @@ class LanceDataset(pa.dataset.Dataset):
     def list_indices(self) -> List[Dict[str, Any]]:
         return self._ds.load_indices()
 
-    def index_statistics(self, index_name: Optional[str] = None) -> Dict[str, Any]:
+    def index_statistics(self, index_name: str) -> Dict[str, Any]:
         return json.loads(self._ds.index_statistics(index_name))
 
     @property
@@ -1544,6 +1547,21 @@ class DatasetOptimizer:
             num_threads=num_threads,
         )
         return Compaction.execute(self._dataset, opts)
+
+    def optimize_indices(self, **kwargs):
+        """Optimizes index performance.
+
+        As new data arrives it is not added to existing indexes automatically.
+        When searching we need to perform an indexed search of the old data plus
+        an expensive unindexed search on the new data.  As the amount of new
+        unindexed data grows this can have an impact on search latency.
+        This function will add the new data to existing indexes, restoring the
+        performance.  This function does not retrain the index, it only assigns
+        the new data to existing partitions.  This means an update is much quicker
+        than retraining the entire index but may have less accuracy (especially
+        if the new data exhibits new patterns, concepts, or trends)
+        """
+        self._dataset._ds.optimize_indices(**kwargs)
 
 
 def write_dataset(
