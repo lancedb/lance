@@ -41,7 +41,6 @@ use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
 use snafu::{location, Location};
-use tokio::io::AsyncWriteExt;
 use tracing::{instrument, span, Level};
 use uuid::Uuid;
 
@@ -191,7 +190,7 @@ impl IVFIndex {
         ));
         let shuffler = shuffle_dataset(data, column, ivf, pq_index.pq.num_sub_vectors).await?;
 
-        let mut ivf_mut = self.ivf.clone();
+        let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
         write_index_partitions(&mut writer, &mut ivf_mut, &shuffler, Some(self)).await?;
         let metadata = IvfPQIndexMetadata {
             name: metadata.name.to_string(),

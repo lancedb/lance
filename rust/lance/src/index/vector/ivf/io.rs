@@ -41,8 +41,10 @@ pub(super) async fn write_index_partitions(
         if let Some(existing_idx) = existing_partitions.as_ref() {
             let part = existing_idx.load_partition(part_id as usize).await?;
             let pq_idx = part.as_any().downcast_ref::<PQIndex>().unwrap();
-            pq_array.push(pq_idx.code.as_ref().unwrap().clone());
-            row_id_array.push(pq_idx.row_ids.as_ref().unwrap().clone());
+            if pq_idx.code.is_some() {
+                pq_array.push(pq_idx.code.as_ref().unwrap().clone());
+                row_id_array.push(pq_idx.row_ids.as_ref().unwrap().clone());
+            }
         }
 
         if let Some(mut stream) = shuffler.key_iter(part_id).await? {
@@ -56,16 +58,13 @@ pub(super) async fn write_index_partitions(
         }
 
         let total_records = row_id_array.iter().map(|a| a.len()).sum::<usize>();
+        ivf.add_partition(writer.tell(), total_records as u32);
         if total_records > 0 {
-            ivf.add_partition(writer.tell(), total_records as u32);
-
             let pq_refs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-            PlainEncoder::write(writer, pq_refs.as_slice()).await?;
+            PlainEncoder::write(writer, &pq_refs).await?;
 
             let row_ids_refs = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
             PlainEncoder::write(writer, row_ids_refs.as_slice()).await?;
-        } else {
-            ivf.add_partition(writer.tell(), 0);
         }
     }
     Ok(())

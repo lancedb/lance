@@ -68,7 +68,63 @@ pub(crate) async fn append_index(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::pq::PQBuildParams;
+    use lance_linalg::distance::MetricType;
+    use lance_testing::datagen::generate_random_array;
+    use tempfile::tempdir;
+
+    use crate::index::vector::ivf::IvfBuildParams;
+    use crate::index::vector::VectorIndexParams;
+    use crate::index::{DatasetIndexExt, IndexType};
 
     #[tokio::test]
-    fn test_append_index() {}
+    async fn test_append_index() {
+        const DIM: usize = 64;
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let vectors = generate_random_array(1000 * DIM);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+        let array = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
+        let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
+
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let ivf_params = IvfBuildParams::new(2);
+        let pq_params = PQBuildParams::default();
+        let params = VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params);
+
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let vectors = generate_random_array(1000 * DIM);
+        let array = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
+        let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
+
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        dataset.append(batches, None).await.unwrap();
+
+        let index = &dataset.load_indices().await.unwrap()[0];
+        assert!(index.unindexed_fragments(&dataset).await.unwrap().len() > 0);
+
+        let uuid = append_index(Arc::new(dataset.clone()), &index)
+            .await
+            .unwrap();
+    }
 }

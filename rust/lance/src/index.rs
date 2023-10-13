@@ -38,7 +38,6 @@ use crate::dataset::transaction::{Operation, Transaction};
 use crate::format::Index as IndexMetadata;
 use crate::index::vector::remap_vector_index;
 use crate::io::commit::commit_transaction;
-use crate::io::RecordBatchStream;
 use crate::{dataset::Dataset, Error, Result};
 
 use self::vector::{build_vector_index, VectorIndexParams};
