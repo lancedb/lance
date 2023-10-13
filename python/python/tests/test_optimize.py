@@ -129,7 +129,7 @@ def test_index_remapping(tmp_path: Path):
 def test_index_remapping_multiple_rewrite_tasks(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     ds = lance.write_dataset(
-        create_table(min=0, max=1, nvec=300), base_dir, mode="overwrite"
+        create_table(min=0, max=1, nvec=300), base_dir, max_rows_per_file=150
     )
     ds = ds.create_index(
         "vector",
@@ -137,23 +137,27 @@ def test_index_remapping_multiple_rewrite_tasks(tmp_path: Path):
         num_partitions=4,
         num_sub_vectors=2,
     )
-
     assert ds.has_index
-
-    tbl = create_table(min=0, max=1, nvec=200)
-    ds = lance.write_dataset(tbl, base_dir, mode="append")
+    ds = lance.write_dataset(
+        create_table(min=0, max=1, nvec=300),
+        base_dir,
+        mode="append",
+        max_rows_per_file=150,
+    )
 
     ds.delete("id % 4 == 0")
-    # We have a dataset with 2 small fragments.  Both fragments will
-    # be compacted with themselves since they have many deleted rows.
-    #
-    # However, they should not be compacted together because one of
-    # them is indexed and the other is not.
+    fragments = list(ds.get_fragments())
+    assert len(fragments) == 4
+
+    # We have a dataset with 4 small fragments.  2 are indexed and
+    # 2 are not.  The indexed fragments and the non-indexed fragments
+    # cannot be combined and so we should end up with 2 fragments after
+    # compaction
     ds.optimize.compact_files()
 
     fragments = list(ds.get_fragments())
-
     assert len(fragments) == 2
+
     index = ds.list_indices()[0]
     frag_ids = index["fragment_ids"]
 
