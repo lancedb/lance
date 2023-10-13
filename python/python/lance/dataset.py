@@ -1489,13 +1489,6 @@ class DatasetOptimizer:
     def __init__(self, dataset: LanceDataset):
         self._dataset = dataset
 
-    def all(self, *args, **kwargs):
-        """Apply all optimizations to the dataset.
-
-        """
-        self.compact_files(*args, **args)
-        self.indices(*args, **kwargs)
-
     def compact_files(
         self,
         *,
