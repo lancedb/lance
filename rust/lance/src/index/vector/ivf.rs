@@ -51,23 +51,22 @@ use super::{
     utils::maybe_sample_training_data,
     MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
-use crate::format::Index as IndexMetadata;
-use crate::index::vector::ivf::io::write_index_partitions;
 use crate::{
     dataset::Dataset,
     datatypes::Field,
     encodings::plain::PlainEncoder,
+    format::Index as IndexMetadata,
     index::{
         pb,
         prefilter::PreFilter,
-        vector::{ivf::builder::shuffle_dataset, Transformer},
+        vector::{
+            ivf::{builder::shuffle_dataset, io::write_index_partitions},
+            Transformer,
+        },
         Index,
     },
-    io::object_writer::ObjectWriter,
     io::RecordBatchStream,
-};
-use crate::{
-    io::{local::to_local_path, object_reader::ObjectReader},
+    io::{local::to_local_path, object_reader::ObjectReader, object_writer::ObjectWriter},
     session::Session,
 };
 use crate::{Error, Result};

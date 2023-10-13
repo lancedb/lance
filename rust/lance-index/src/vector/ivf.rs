@@ -17,9 +17,6 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::vector::pq::transform::PQTransformer;
-use crate::vector::pq::ProductQuantizer;
-use crate::vector::residual::ResidualTransform;
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt32Type},
@@ -39,7 +36,11 @@ use snafu::{location, Location};
 use tracing::instrument;
 
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
-use crate::vector::transform::Transformer;
+use crate::vector::{
+    pq::{transform::PQTransformer, ProductQuantizer},
+    residual::ResidualTransform,
+    transform::Transformer,
+};
 
 /// IVF - IVF file partition
 ///
