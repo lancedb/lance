@@ -69,8 +69,6 @@ def test_index_remapping(tmp_path: Path):
         {"column": "vector", "q": vecs[i].values, "k": 5} for i in sample_query_indices
     ]
 
-    first = sample_queries[0]
-
     def has_target(target, results):
         for item in results:
             if item.values == target:
@@ -78,7 +76,6 @@ def test_index_remapping(tmp_path: Path):
         return False
 
     def check_index(has_knn_combined):
-        print(dataset.scanner(nearest=first).explain_plan())
         for query in sample_queries:
             results = dataset.to_table(nearest=query).column("vector")
             assert has_target(query["q"], results)
