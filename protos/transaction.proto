@@ -82,6 +82,15 @@ message Transaction {
     repeated IndexMetadata new_indices = 1;
   }
 
+  // An operation that modifies existing indices.
+  //
+  //  - old_indices: the indices that are being replaced
+  //  - new_indices: the modified indices
+  message ModifyIndex {
+    repeated IndexMetadata old_indices = 1;
+    repeated IndexMetadata new_indices = 2;
+  }
+
   // An operation that rewrites but does not change the data in the table. These
   // kinds of operations just rearrange data.
   message Rewrite {
@@ -160,5 +169,6 @@ message Transaction {
     Merge merge = 105;
     Restore restore = 106;
     ReserveFragments reserve_fragments = 107;
+    ModifyIndex modify_index = 108;
   }
 }
