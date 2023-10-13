@@ -525,20 +525,11 @@ impl Dataset {
         })
     }
 
-    fn optimize(&mut self, kwargs: Option<&PyDict>) -> PyResult<()> {
-        let mut optimize_index = true;
-        if let Some(kwargs) = kwargs {
-            if let Some(o) = kwargs.get_item("index") {
-                optimize_index = PyAny::downcast::<PyBool>(o)?.extract()?
-            };
-        }
-
-        if optimize_index {
-            let mut new_self = self.ds.as_ref().clone();
-            RT.block_on(None, new_self.optimize_indices())
-                .map_err(|err| PyIOError::new_err(err.to_string()))?;
-            self.ds = Arc::new(new_self);
-        }
+    fn optimize_indices(&mut self, _kwargs: Option<&PyDict>,) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.optimize_indices())
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
         Ok(())
     }
 

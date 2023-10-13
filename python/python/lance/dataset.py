@@ -90,6 +90,9 @@ class LanceDataset(pa.dataset.Dataset):
         self._uri, version = state
         self._ds = _Dataset(self._uri, version)
 
+    def __len__(self):
+        return self.count_rows()
+
     @property
     def uri(self) -> str:
         """
@@ -101,7 +104,7 @@ class LanceDataset(pa.dataset.Dataset):
     def list_indices(self) -> List[Dict[str, Any]]:
         return self._ds.load_indices()
 
-    def index_statistics(self, index_name: Optional[str] = None) -> Dict[str, Any]:
+    def index_statistics(self, index_name: str) -> Dict[str, Any]:
         return json.loads(self._ds.index_statistics(index_name))
 
     @property
@@ -635,15 +638,6 @@ class LanceDataset(pa.dataset.Dataset):
             td_to_micros(older_than), delete_unverified
         )
 
-    def optimize(self, index: bool = True, **kwargs) -> LanceDataset:
-        """Optimize the dataset and indices.
-
-        Parameters
-        ----------
-        """
-
-        pass
-
     def create_index(
         self,
         column: str,
@@ -830,6 +824,11 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["replace"] = replace
 
         self._ds.create_index(column, index_type, name, metric, kwargs)
+        return LanceDataset(self.uri)
+
+    def optimize_indices(self, **kwargs) -> LanceDataset:
+        """Optimize indices."""
+        self._ds.optimize_indices(kwargs)
         return LanceDataset(self.uri)
 
     @staticmethod
@@ -1495,6 +1494,9 @@ class DatasetOptimizer:
     def __init__(self, dataset: LanceDataset):
         self._dataset = dataset
 
+    def __call__(self, *args, **kwargs):
+        return self.optimize(*args, **kwargs)
+
     def compact_files(
         self,
         *,
@@ -1553,6 +1555,10 @@ class DatasetOptimizer:
             num_threads=num_threads,
         )
         return Compaction.execute(self._dataset, opts)
+
+    def optimize_indices(self, **kwargs) -> LanceDataset:
+        """Optimize index."""
+        return self._dataset.optimize_indices(**kwargs)
 
 
 def write_dataset(
