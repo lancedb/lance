@@ -14,12 +14,13 @@
 
 use std::sync::Arc;
 
-use arrow_array::Array;
+use arrow_array::{Array, FixedSizeListArray};
 use futures::StreamExt;
+use lance_arrow::*;
 use lance_core::io::Writer;
 use lance_index::vector::PQ_CODE_COLUMN;
 
-use super::{shuffler::Shuffler, IVFIndex, Ivf};
+use super::{build_ivf_pq_index, shuffler::Shuffler, IVFIndex, Ivf};
 use crate::dataset::ROW_ID;
 use crate::encodings::plain::PlainEncoder;
 use crate::index::vector::pq::PQIndex;
@@ -42,7 +43,12 @@ pub(super) async fn write_index_partitions(
             let part = existing_idx.load_partition(part_id as usize).await?;
             let pq_idx = part.as_any().downcast_ref::<PQIndex>().unwrap();
             if pq_idx.code.is_some() {
-                pq_array.push(pq_idx.code.as_ref().unwrap().clone());
+                let pq_code_arr = pq_idx.code.as_ref().unwrap().clone();
+                let pq_code_fixed_size_arr = FixedSizeListArray::try_new_from_values(
+                    pq_code_arr.as_ref().clone(),
+                    pq_idx.dimension as i32,
+                )?;
+                pq_array.push(Arc::new(pq_code_fixed_size_arr));
                 row_id_array.push(pq_idx.row_ids.as_ref().unwrap().clone());
             }
         }
