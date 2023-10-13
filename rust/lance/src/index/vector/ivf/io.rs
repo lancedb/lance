@@ -49,7 +49,6 @@ pub(super) async fn write_index_partitions(
                     pq_idx.num_sub_vectors as i32,
                 )?;
                 pq_array.push(Arc::new(pq_code_fixed_size_arr));
-                println!("pq_idx.row_ids: {:#?}", pq_idx.row_ids.as_ref());
                 row_id_array.push(pq_idx.row_ids.as_ref().unwrap().clone());
             }
         }

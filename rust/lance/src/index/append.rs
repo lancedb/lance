@@ -107,8 +107,10 @@ mod tests {
         let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
         let ivf_params = IvfBuildParams::new(IVF_PARTITIONS);
-        let mut pq_params = PQBuildParams::default();
-        pq_params.num_sub_vectors = 2;
+        let pq_params = PQBuildParams {
+            num_sub_vectors: 2,
+            ..Default::default()
+        };
         let params = VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params);
 
         dataset
@@ -124,7 +126,11 @@ mod tests {
         dataset.append(batches, None).await.unwrap();
 
         let index = &dataset.load_indices().await.unwrap()[0];
-        assert!(index.unindexed_fragments(&dataset).await.unwrap().len() > 0);
+        assert!(!index
+            .unindexed_fragments(&dataset)
+            .await
+            .unwrap()
+            .is_empty());
 
         let q = array.value(5);
         let mut scanner = dataset.scan();
