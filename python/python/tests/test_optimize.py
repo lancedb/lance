@@ -49,7 +49,10 @@ def test_dataset_optimize(tmp_path: Path):
 def create_table(min, max, nvec, ndim=8):
     mat = np.random.uniform(min, max, (nvec, ndim))
     tbl = vec_to_table(data=mat)
-    print(tbl)
+    # Add id column for filtering
+    tbl = pa.Table.from_pydict(
+        {"vector": tbl.column(0).chunk(0), "id": np.arange(0, nvec)}
+    )
     return tbl
 
 
@@ -118,6 +121,45 @@ def test_index_remapping(tmp_path: Path):
 
     # Now a combined scan is required
     check_index(has_knn_combined=True)
+
+
+def test_index_remapping_multiple_rewrite_tasks(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    ds = lance.write_dataset(
+        create_table(min=0, max=1, nvec=300), base_dir, max_rows_per_file=150
+    )
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=2,
+    )
+    assert ds.has_index
+    ds = lance.write_dataset(
+        create_table(min=0, max=1, nvec=300),
+        base_dir,
+        mode="append",
+        max_rows_per_file=150,
+    )
+
+    ds.delete("id % 4 == 0")
+    fragments = list(ds.get_fragments())
+    assert len(fragments) == 4
+
+    # We have a dataset with 4 small fragments.  2 are indexed and
+    # 2 are not.  The indexed fragments and the non-indexed fragments
+    # cannot be combined and so we should end up with 2 fragments after
+    # compaction
+    ds.optimize.compact_files()
+
+    fragments = list(ds.get_fragments())
+    assert len(fragments) == 2
+
+    index = ds.list_indices()[0]
+    frag_ids = index["fragment_ids"]
+
+    assert len(frag_ids) == 1
+    assert list(frag_ids)[0] == fragments[0].fragment_id
 
 
 def test_dataset_distributed_optimize(tmp_path: Path):

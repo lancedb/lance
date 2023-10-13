@@ -468,18 +468,32 @@ impl Transaction {
 
     fn recalculate_fragment_bitmap(
         old: &RoaringBitmap,
-        removed: &[u32],
-        added: &[u32],
-        index_id: &Uuid,
+        groups: &[RewriteGroup],
     ) -> Result<RoaringBitmap> {
         let mut new_bitmap = old.clone();
-        for remove in removed {
-            if !new_bitmap.remove(*remove) {
-                return Err(Error::invalid_input(format!("The compaction plan modified the fragment with id {} and rewrote the index with id {} but that fragment was not part of that index", remove, index_id)));
+        for group in groups {
+            let any_in_index = group
+                .old_fragments
+                .iter()
+                .any(|frag| old.contains(frag.id as u32));
+            let all_in_index = group
+                .old_fragments
+                .iter()
+                .all(|frag| old.contains(frag.id as u32));
+            // Any rewrite group may or may not be covered by the index.  However, if any fragment
+            // in a rewrite group was previously covered by the index then all fragments in the rewrite
+            // group must have been previously covered by the index.  plan_compaction takes care of
+            // this for us so this should be safe to assume.
+            if any_in_index {
+                if all_in_index {
+                    for frag_id in group.old_fragments.iter().map(|frag| frag.id as u32) {
+                        new_bitmap.remove(frag_id);
+                    }
+                    new_bitmap.extend(group.new_fragments.iter().map(|frag| frag.id as u32));
+                } else {
+                    return Err(Error::invalid_input("The compaction plan included a rewrite group that was a split of indexed and non-indexed data"));
+                }
             }
-        }
-        for add in added {
-            new_bitmap.insert(*add);
         }
         Ok(new_bitmap)
     }
@@ -490,14 +504,6 @@ impl Transaction {
         groups: &[RewriteGroup],
     ) -> Result<()> {
         let mut modified_indices = HashSet::new();
-        let old_frag_ids = groups
-            .iter()
-            .flat_map(|group| group.old_fragments.iter().map(|frag| frag.id as u32))
-            .collect::<Vec<_>>();
-        let new_frag_ids = groups
-            .iter()
-            .flat_map(|group| group.new_fragments.iter().map(|frag| frag.id as u32))
-            .collect::<Vec<_>>();
 
         for rewritten_index in rewritten_indices {
             if !modified_indices.insert(rewritten_index.old_id) {
@@ -521,9 +527,7 @@ impl Transaction {
                         index.uuid
                     ))
                 })?,
-                &old_frag_ids,
-                &new_frag_ids,
-                &index.uuid,
+                groups,
             )?);
             index.uuid = rewritten_index.new_id;
         }
