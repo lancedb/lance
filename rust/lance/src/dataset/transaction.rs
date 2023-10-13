@@ -279,7 +279,7 @@ impl Transaction {
                 _ => true,
             },
             Operation::Delete { .. } => match &other.operation {
-                Operation::CreateIndex { .. } => false,
+                Operation::CreateIndex { .. } | Operation::ModifyIndex { .. } => false,
                 Operation::ReserveFragments { .. } => false,
                 Operation::Delete { .. } => {
                     // If we update the same fragments, we conflict.

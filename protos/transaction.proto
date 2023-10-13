@@ -87,7 +87,7 @@ message Transaction {
   //  - old_indices: the indices that are being replaced
   //  - new_indices: the modified indices
   message ModifyIndex {
-    repeated IndexMetadata old_indices = 1;
+    repeated IndexMetadata removed_indices = 1;
     repeated IndexMetadata new_indices = 2;
   }
 
