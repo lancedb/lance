@@ -30,7 +30,6 @@ jobs:
         arm-build: ${{ matrix.platform == 'aarch64' }} 
     - uses: ./.github/workflows/upload_wheel
       with:
-        python-minor-version: ${{ matrix.python-minor-version }}
         token: ${{ secrets.PYPI_TOKEN }}
         repo: "pypi"
   mac:
