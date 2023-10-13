@@ -65,3 +65,10 @@ pub(crate) async fn append_index(
         .await?;
     Ok(Some(new_index))
 }
+
+#[cfg(test)]
+mod tests {
+
+    #[tokio::test]
+    fn test_append_index() {}
+}

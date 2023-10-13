@@ -120,6 +120,10 @@ impl IVFIndex {
     }
 
     /// Load one partition of the IVF sub-index.
+    ///
+    /// Parameters
+    /// ----------
+    ///  - partition_id: partition ID.
     pub(crate) async fn load_partition(&self, partition_id: usize) -> Result<Arc<dyn VectorIndex>> {
         let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
         let part_index = if let Some(part_idx) = self.session.index_cache.get(&cache_key) {
