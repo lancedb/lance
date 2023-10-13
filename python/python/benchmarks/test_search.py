@@ -44,7 +44,7 @@ def find_or_clean(dataset_path: Path) -> Union[lance.LanceDataset, None]:
 def create_table(num_rows, offset) -> pa.Table:
     values = pc.random(num_rows * N_DIMS).cast(pa.float32())
     vectors = pa.FixedSizeListArray.from_arrays(values, N_DIMS)
-    filterable = pa.array(range(start=offset, stop=offset + num_rows))
+    filterable = pa.array(range(offset, offset + num_rows))
     return pa.table({"vector": vectors, "filterable": filterable})
 
 
