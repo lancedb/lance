@@ -273,7 +273,7 @@ impl Index for IVFIndex {
 
 #[async_trait]
 impl VectorIndex for IVFIndex {
-    #[instrument(skip_all, name = "IVFIndex::search")]
+    #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
     async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch> {
         let partition_ids =
             self.ivf
@@ -484,7 +484,7 @@ impl Ivf {
 
     /// Compute the partition for each row in the input Matrix.
     ///
-    #[instrument(skip(data))]
+    #[instrument(level = "debug", skip(data))]
     pub fn compute_partitions(
         &self,
         data: &MatrixView<Float32Type>,
@@ -520,7 +520,7 @@ impl Ivf {
     /// Parameters:
     ///  - *original*: original vector.
     ///  - *partitions*: partition ID of each original vector.
-    #[instrument(skip_all)]
+    #[instrument(level = "debug", skip_all)]
     pub(super) fn compute_residual(
         &self,
         original: &MatrixView<Float32Type>,

@@ -52,7 +52,7 @@ impl Take {
     ///  - output_schema: the output schema of the take node.
     ///  - child: the upstream stream to feed data in.
     ///  - batch_readahead: max number of batches to readahead, potentially concurrently
-    #[instrument(skip_all, name = "Take::new")]
+    #[instrument(level = "debug", skip_all, name = "Take::new")]
     fn new(
         dataset: Arc<Dataset>,
         projection: Arc<Schema>,
@@ -111,7 +111,7 @@ impl Take {
     // doesn't produce a higher-order lifetime error.
     // manually implemented async for Send bound
     #[allow(clippy::manual_async_fn)]
-    #[instrument(skip_all)]
+    #[instrument(level = "debug", skip_all)]
     fn take_batch(
         batch: RecordBatch,
         dataset: Arc<Dataset>,

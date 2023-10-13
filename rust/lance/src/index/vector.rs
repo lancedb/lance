@@ -308,7 +308,7 @@ pub(crate) async fn remap_vector_index(
 }
 
 /// Open the Vector index on dataset, specified by the `uuid`.
-#[instrument(skip(dataset))]
+#[instrument(level = "debug", skip(dataset))]
 pub(crate) async fn open_index(
     dataset: Arc<Dataset>,
     column: &str,

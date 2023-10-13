@@ -47,7 +47,7 @@ pub struct KNNFlatStream {
 
 impl KNNFlatStream {
     /// Construct a [`KNNFlatStream`] node.
-    #[instrument(skip_all, name = "KNNFlatStream::new")]
+    #[instrument(level = "debug", skip_all, name = "KNNFlatStream::new")]
     pub(crate) fn new(child: SendableRecordBatchStream, query: &Query) -> Self {
         let stream = DatasetRecordBatchStream::new(child);
         Self::from_stream(stream, query)
@@ -252,7 +252,7 @@ pub struct KNNIndexStream {
 }
 
 impl KNNIndexStream {
-    #[instrument(skip_all, name = "KNNIndexStream::new")]
+    #[instrument(level = "debug", skip_all, name = "KNNIndexStream::new")]
     pub fn new(dataset: Arc<Dataset>, index_name: &str, query: &Query) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         let q = query.clone();

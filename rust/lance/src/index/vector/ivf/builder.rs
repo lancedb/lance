@@ -123,7 +123,7 @@ pub async fn shuffle_dataset(
 /// Build specific partitions of IVF index.
 ///
 ///
-#[instrument(level = "info", skip(writer, data, ivf, pq))]
+#[instrument(level = "debug", skip(writer, data, ivf, pq))]
 pub(super) async fn build_partitions(
     writer: &mut dyn Writer,
     data: impl RecordBatchStream + Unpin,

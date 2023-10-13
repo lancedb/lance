@@ -195,7 +195,7 @@ impl Ivf {
 
     /// Compute the partition for each row in the input Matrix.
     ///
-    #[instrument(skip(data))]
+    #[instrument(level = "debug", skip(data))]
     fn compute_partitions(&self, data: &MatrixView<Float32Type>) -> UInt32Array {
         let ndim = data.ndim();
         let centroids_arr = self.centroids.data();
