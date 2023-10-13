@@ -257,7 +257,7 @@ impl DatasetIndexExt for Dataset {
 
             let new_idx = IndexMetadata {
                 uuid: new_id,
-                name: idx.name.to_string(),
+                name: idx.name.clone(),
                 fields: idx.fields.clone(),
                 dataset_version: self.manifest.version,
                 fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),

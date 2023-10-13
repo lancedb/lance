@@ -138,7 +138,7 @@ impl IVFIndex {
             self.session.index_cache.insert(&cache_key, idx.clone());
             idx
         };
-        return Ok(part_index);
+        Ok(part_index)
     }
 
     async fn search_in_partition(
@@ -193,7 +193,7 @@ impl IVFIndex {
         let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
         write_index_partitions(&mut writer, &mut ivf_mut, &shuffler, Some(self)).await?;
         let metadata = IvfPQIndexMetadata {
-            name: metadata.name.to_string(),
+            name: metadata.name.clone(),
             column: column.to_string(),
             dimension: self.ivf.dimension() as u32,
             dataset_version: dataset.version().version,

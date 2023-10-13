@@ -24,7 +24,7 @@ use crate::index::vector::ivf::IVFIndex;
 use crate::index::vector::open_index;
 
 /// Append new data to the index, without re-train.
-pub(crate) async fn append_index(
+pub async fn append_index(
     dataset: Arc<Dataset>,
     old_index: &IndexMetadata,
 ) -> Result<Option<Uuid>> {
