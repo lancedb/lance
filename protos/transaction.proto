@@ -77,9 +77,13 @@ message Transaction {
     map<string, bytes> schema_metadata = 3;
   }
 
-  // Add a new secondary index.
+  // Add or replace a new secondary index.
+  //
+  // - new_indices: the modified indices
+  // - removed_indices: the indices that are being replaced
   message CreateIndex {
     repeated IndexMetadata new_indices = 1;
+    repeated IndexMetadata removed_indices = 2;
   }
 
   // An operation that rewrites but does not change the data in the table. These

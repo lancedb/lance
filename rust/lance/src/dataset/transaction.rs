@@ -103,6 +103,8 @@ pub enum Operation {
     CreateIndex {
         /// The new secondary indices that are being added
         new_indices: Vec<Index>,
+        /// The indices that have been modified.
+        removed_indices: Vec<Index>,
     },
     /// Data is rewritten but *not* modified. This is used for things like
     /// compaction or re-ordering. Contains the old fragments and the new
@@ -414,12 +416,18 @@ impl Transaction {
                 )?;
                 Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
             }
-            Operation::CreateIndex { new_indices } => {
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 final_indices.retain(|existing_index| {
                     !new_indices
                         .iter()
                         .any(|new_index| new_index.name == existing_index.name)
+                        && !removed_indices
+                            .iter()
+                            .any(|old_index| old_index.uuid == existing_index.uuid)
                 });
                 final_indices.extend(new_indices.clone());
             }
@@ -625,8 +633,13 @@ impl TryFrom<&pb::Transaction> for Transaction {
             }
             Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
                 new_indices,
+                removed_indices,
             })) => Operation::CreateIndex {
                 new_indices: new_indices
+                    .iter()
+                    .map(Index::try_from)
+                    .collect::<Result<_>>()?,
+                removed_indices: removed_indices
                     .iter()
                     .map(Index::try_from)
                     .collect::<Result<_>>()?,
@@ -743,11 +756,13 @@ impl From<&Transaction> for pb::Transaction {
                     .collect(),
                 ..Default::default()
             }),
-            Operation::CreateIndex { new_indices } => {
-                pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
-                    new_indices: new_indices.iter().map(IndexMetadata::from).collect(),
-                })
-            }
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            } => pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
+                new_indices: new_indices.iter().map(IndexMetadata::from).collect(),
+                removed_indices: removed_indices.iter().map(IndexMetadata::from).collect(),
+            }),
             Operation::Merge { fragments, schema } => {
                 pb::transaction::Operation::Merge(pb::transaction::Merge {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
@@ -818,6 +833,7 @@ mod tests {
             },
             Operation::CreateIndex {
                 new_indices: vec![index0.clone()],
+                removed_indices: vec![index0.clone()],
             },
             Operation::Delete {
                 updated_fragments: vec![fragment0.clone()],
@@ -884,7 +900,8 @@ mod tests {
             ),
             (
                 Operation::CreateIndex {
-                    new_indices: vec![index0],
+                    new_indices: vec![index0.clone()],
+                    removed_indices: vec![index0.clone()],
                 },
                 // Will only conflict with operations that modify row ids.
                 [false, false, false, false, true, true, false],

@@ -217,6 +217,7 @@ impl DatasetIndexExt for Dataset {
             self.manifest.version,
             Operation::CreateIndex {
                 new_indices: vec![new_idx],
+                removed_indices: vec![],
             },
             None,
         );
