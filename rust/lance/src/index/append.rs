@@ -20,8 +20,7 @@ use uuid::Uuid;
 
 use crate::dataset::Dataset;
 use crate::format::Index as IndexMetadata;
-use crate::index::vector::ivf::IVFIndex;
-use crate::index::vector::open_index;
+use crate::index::vector::{ivf::IVFIndex, open_index};
 
 /// Append new data to the index, without re-train.
 pub async fn append_index(
@@ -73,20 +72,21 @@ mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
-    use futures::TryStreamExt;
+    use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::pq::PQBuildParams;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
-    use crate::index::vector::ivf::IvfBuildParams;
-    use crate::index::vector::VectorIndexParams;
+    use crate::index::vector::{ivf::IvfBuildParams, pq::PQIndex, VectorIndexParams};
     use crate::index::{DatasetIndexExt, IndexType};
 
     #[tokio::test]
     async fn test_append_index() {
         const DIM: usize = 64;
+        const IVF_PARTITIONS: usize = 2;
+
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -106,7 +106,7 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
-        let ivf_params = IvfBuildParams::new(2);
+        let ivf_params = IvfBuildParams::new(IVF_PARTITIONS);
         let mut pq_params = PQBuildParams::default();
         pq_params.num_sub_vectors = 2;
         let params = VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params);
@@ -136,6 +136,7 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+        assert_eq!(results[0].num_rows(), 10); // Flat search.
 
         dataset.optimize_indices().await.unwrap();
         let index = &dataset.load_indices().await.unwrap()[0];
@@ -172,5 +173,23 @@ mod tests {
             array.iter().any(|a| a.as_ref().unwrap() == vec)
         });
         assert!(contained);
+
+        // Check that the index has all 2000 rows.
+        let binding = open_index(Arc::new(dataset), "vector", index.uuid.to_string().as_str())
+            .await
+            .unwrap();
+        let ivf_index = binding.as_any().downcast_ref::<IVFIndex>().unwrap();
+        let row_in_index = stream::iter(0..IVF_PARTITIONS)
+            .map(|part_id| async move {
+                let part = ivf_index.load_partition(part_id).await.unwrap();
+                let pq_idx = part.as_any().downcast_ref::<PQIndex>().unwrap();
+                pq_idx.row_ids.as_ref().unwrap().len()
+            })
+            .buffered(2)
+            .collect::<Vec<usize>>()
+            .await
+            .iter()
+            .sum::<usize>();
+        assert_eq!(row_in_index, 2000);
     }
 }

@@ -247,6 +247,7 @@ impl DatasetIndexExt for Dataset {
         let indices = self.load_indices().await?;
 
         let mut new_indices = vec![];
+        let mut removed_indices = vec![];
         for idx in indices.as_slice() {
             if idx.dataset_version == self.manifest.version {
                 continue;
@@ -262,6 +263,7 @@ impl DatasetIndexExt for Dataset {
                 dataset_version: self.manifest.version,
                 fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
             };
+            removed_indices.push(idx.clone());
             new_indices.push(new_idx);
         }
 
@@ -271,8 +273,9 @@ impl DatasetIndexExt for Dataset {
 
         let transaction = Transaction::new(
             self.manifest.version,
-            Operation::ModifyIndex {
-                modified_indices: new_indices,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices,
             },
             None,
         );
