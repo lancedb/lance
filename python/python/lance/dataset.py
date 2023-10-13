@@ -635,6 +635,15 @@ class LanceDataset(pa.dataset.Dataset):
             td_to_micros(older_than), delete_unverified
         )
 
+    def optimize(self, index: bool = True, **kwargs) -> LanceDataset:
+        """Optimize the dataset and indices.
+
+        Parameters
+        ----------
+        """
+
+        pass
+
     def create_index(
         self,
         column: str,

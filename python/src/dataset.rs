@@ -525,6 +525,10 @@ impl Dataset {
         })
     }
 
+    fn optimize(&mut self, kwargs: Option<&PyDict>) -> PyResult<()> {
+        Ok(())
+    }
+
     fn create_index(
         &mut self,
         columns: Vec<&str>,
