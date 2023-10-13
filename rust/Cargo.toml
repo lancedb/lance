@@ -59,16 +59,14 @@ half = { "version" = "=2.2.1", default-features = false, features = [
 ] }
 bytes = "1.3"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
-datafusion-common = { git = "https://github.com/apache/arrow-datafusion.git", tag = "32.0.0-rc1" }
-# datafusion-common = "32.0"
-datafusion-sql = { git = "https://github.com/apache/arrow-datafusion.git", tag = "32.0.0-rc1" }
-# datafusion-sql = "32.0"
+datafusion-common = "32.0"
+datafusion-sql = "32.0"
 either = "1.0"
 futures = "0.3"
 log = "0.4"
 num_cpus = "1.0"
 num-traits = "0.2"
-object_store = { version = "0.6.1", features = ["aws", "gcp", "azure"] }
+object_store = { version = "0.7.1", features = ["aws", "gcp", "azure"] }
 pprof = { version = "0.12", features = ["flamegraph", "criterion"] }
 prost = "0.10"
 prost-types = "0.10"

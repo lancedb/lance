@@ -59,10 +59,9 @@ shellexpand = "3.0.0"
 arrow = { version = "47.0.0", features = ["prettyprint"] }
 num_cpus = "1.0"
 # TODO: use datafusion sub-modules to reduce build size?
-datafusion = { git = "https://github.com/apache/arrow-datafusion.git", tag = "32.0.0-rc1", default-features = false, features = ["regex_expressions"] }
-# datafusion = { version = "32.0.0", default-features = false, features = [
-#     "regex_expressions",
-# ] }
+datafusion = { version = "32.0.0", default-features = false, features = [
+    "regex_expressions",
+] }
 lapack = { version = "0.19.0", optional = true }
 cblas = { version = "0.4.0", optional = true }
 lru_time_cache = "0.11"
