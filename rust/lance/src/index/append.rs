@@ -126,5 +126,6 @@ mod tests {
         let uuid = append_index(Arc::new(dataset.clone()), &index)
             .await
             .unwrap();
+        assert!(uuid.is_some());
     }
 }

@@ -20,7 +20,7 @@ use lance_arrow::*;
 use lance_core::io::Writer;
 use lance_index::vector::PQ_CODE_COLUMN;
 
-use super::{build_ivf_pq_index, shuffler::Shuffler, IVFIndex, Ivf};
+use super::{shuffler::Shuffler, IVFIndex, Ivf};
 use crate::dataset::ROW_ID;
 use crate::encodings::plain::PlainEncoder;
 use crate::index::vector::pq::PQIndex;

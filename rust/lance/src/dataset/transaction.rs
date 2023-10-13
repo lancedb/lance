@@ -106,6 +106,11 @@ pub enum Operation {
         /// The indices that have been modified.
         removed_indices: Vec<Index>,
     },
+    /// Modify and replace existing indices.
+    ModifyIndex {
+        /// The index to append to
+        new_indices: Vec<Index>,
+    },
     /// Data is rewritten but *not* modified. This is used for things like
     /// compaction or re-ordering. Contains the old fragments and the new
     /// ones that have been replaced.
@@ -155,6 +160,7 @@ impl Operation {
             Self::Append { .. }
             | Self::Overwrite { .. }
             | Self::CreateIndex { .. }
+            | Self::ModifyIndex { .. }
             | Self::ReserveFragments { .. }
             | Self::Restore { .. } => Box::new(std::iter::empty()),
             Self::Delete {
@@ -189,6 +195,7 @@ impl Operation {
             Self::Delete { .. } => "Delete",
             Self::Overwrite { .. } => "Overwrite",
             Self::CreateIndex { .. } => "CreateIndex",
+            Self::ModifyIndex { .. } => "ModifyIndex",
             Self::Rewrite { .. } => "Rewrite",
             Self::Merge { .. } => "Merge",
             Self::ReserveFragments { .. } => "ReserveFragments",
@@ -220,8 +227,7 @@ impl Transaction {
                 // Append is compatible with anything that doesn't change the schema
                 Operation::Append { .. } => false,
                 Operation::Rewrite { .. } => false,
-                Operation::CreateIndex { .. } => false,
-                Operation::Delete { .. } => false,
+                Operation::CreateIndex { .. } | Operation::ModifyIndex { .. } => false,
                 Operation::ReserveFragments { .. } => false,
                 _ => true,
             },
@@ -252,7 +258,8 @@ impl Transaction {
                 &other.operation,
                 Operation::Overwrite { .. } | Operation::Restore { .. }
             ),
-            Operation::CreateIndex { .. } => match &other.operation {
+            Operation::CreateIndex { .. } | Operation::ModifyIndex { .. } => match &other.operation
+            {
                 Operation::Append { .. } => false,
                 // Indices are identified by UUIDs, so they shouldn't conflict.
                 Operation::CreateIndex { .. } => false,
@@ -428,6 +435,15 @@ impl Transaction {
                         && !removed_indices
                             .iter()
                             .any(|old_index| old_index.uuid == existing_index.uuid)
+                });
+                final_indices.extend(new_indices.clone());
+            }
+            Operation::ModifyIndex { new_indices } => {
+                final_fragments.extend(maybe_existing_fragments?.clone());
+                final_indices.retain(|existing_index| {
+                    !new_indices
+                        .iter()
+                        .any(|new_index| new_index.name == existing_index.name)
                 });
                 final_indices.extend(new_indices.clone());
             }
