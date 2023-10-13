@@ -38,6 +38,7 @@ use datafusion::scalar::ScalarValue;
 use futures::stream::{Stream, StreamExt};
 use lance_linalg::distance::MetricType;
 use log::debug;
+use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
 use crate::datafusion::physical_expr::column_names_in_expr;
@@ -398,12 +399,14 @@ impl Scanner {
     }
 
     /// Create a stream from the Scanner.
+    #[instrument(skip_all)]
     pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
         let plan = self.create_plan().await?;
         Ok(DatasetRecordBatchStream::new(self.execute_plan(plan)?))
     }
 
     /// Scan and return the number of matching rows
+    #[instrument(skip_all)]
     pub async fn count_rows(&self) -> Result<u64> {
         let plan = self.create_plan().await?;
         // Datafusion interprets COUNT(*) as COUNT(1)
@@ -763,11 +766,13 @@ impl Scanner {
 pub struct DatasetRecordBatchStream {
     #[pin]
     exec_node: SendableRecordBatchStream,
+    span: Span,
 }
 
 impl DatasetRecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
-        Self { exec_node }
+        let span = info_span!("DatasetRecordBatchStream");
+        Self { exec_node, span }
     }
 }
 
@@ -782,6 +787,7 @@ impl Stream for DatasetRecordBatchStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
+        let _guard = this.span.enter();
         match this.exec_node.poll_next_unpin(cx) {
             Poll::Ready(result) => Poll::Ready(result.map(|r| {
                 r.map_err(|e| Error::IO {

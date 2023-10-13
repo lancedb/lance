@@ -31,6 +31,7 @@ use lance_linalg::{
     matrix::MatrixView,
 };
 use serde::Serialize;
+use tracing::instrument;
 
 use super::{MetricType, Query, VectorIndex};
 use crate::dataset::ROW_ID;
@@ -242,6 +243,7 @@ impl Index for PQIndex {
 impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
+    #[instrument(level = "debug", skip_all, name = "PQIndex::search")]
     async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch> {
         if self.code.is_none() || self.row_ids.is_none() {
             return Err(Error::Index {

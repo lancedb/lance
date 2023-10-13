@@ -304,6 +304,7 @@ impl Index for OPQIndex {
 
 #[async_trait]
 impl VectorIndex for OPQIndex {
+    #[instrument(level = "debug", skip_all, name = "OPQIndex::search")]
     async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch> {
         let mat = MatrixView::new(query.key.clone(), query.key.len());
         let transformed = self.opq.transform(&mat).await?;

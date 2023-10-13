@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
 use serde::Serialize;
+use tracing::instrument;
 
 use super::row_vertex::{RowVertex, RowVertexSerDe};
 use crate::{
@@ -222,6 +223,7 @@ impl Index for DiskANNIndex {
 
 #[async_trait]
 impl VectorIndex for DiskANNIndex {
+    #[instrument(level = "debug", skip_all, name = "DiskANNIndex::search")]
     async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch> {
         let state = greedy_search(&self.graph, 0, query.key.values(), query.k, query.k * 2).await?;
         let schema = Arc::new(Schema::new(vec![
