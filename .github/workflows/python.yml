@@ -155,10 +155,10 @@ jobs:
         python-minor-version: ${{ matrix.python-minor-version }}
         args: "--release"
         arm-build: ${{ matrix.platform == 'aarch64' }} 
-    - uses: ./.github/workflows/upload_wheel
+    - name: Upload test wheel
+      uses: actions/upload-artifact@v3
       with:
-        token: ${{ secrets.PYPI_TOKEN }}
-        repo: "testpypi"
+        path: python/target/wheels/pylance-*.whl
   mac:
     timeout-minutes: 45
     runs-on: "macos-12"
