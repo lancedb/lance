@@ -425,7 +425,7 @@ impl Transaction {
                     !new_indices
                         .iter()
                         .any(|new_index| new_index.name == existing_index.name)
-                        || removed_indices
+                        && !removed_indices
                             .iter()
                             .any(|old_index| old_index.uuid == existing_index.uuid)
                 });
