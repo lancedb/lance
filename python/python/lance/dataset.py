@@ -826,11 +826,6 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.create_index(column, index_type, name, metric, kwargs)
         return LanceDataset(self.uri)
 
-    def optimize_indices(self, **kwargs) -> LanceDataset:
-        """Optimize indices."""
-        self._ds.optimize_indices(kwargs)
-        return LanceDataset(self.uri)
-
     @staticmethod
     def _commit(
         base_uri: Union[str, Path],
@@ -1494,9 +1489,12 @@ class DatasetOptimizer:
     def __init__(self, dataset: LanceDataset):
         self._dataset = dataset
 
-    def __call__(self, *args, **kwargs):
-        self.compact_files()
-        self.optimize_indices()
+    def all(self, *args, **kwargs):
+        """Apply all optimizations to the dataset.
+
+        """
+        self.compact_files(*args, **args)
+        self.indices(*args, **kwargs)
 
     def compact_files(
         self,
@@ -1557,13 +1555,20 @@ class DatasetOptimizer:
         )
         return Compaction.execute(self._dataset, opts)
 
-    def optimize_indices(self, **kwargs) -> LanceDataset:
-        """Optimize indices in the dataset.
+    def indices(self, **kwargs):
+        """Optimizes index performance.
 
-        Including:
-        - Update the index with newly added rows.
+        As new data arrives it is not added to existing indexes automatically.
+        When searching we need to perform an indexed search of the old data plus
+        an expensive unindexed search on the new data.  As the amount of new
+        unindexed data grows this can have an impact on search latency.
+        This function will add the new data to existing indexes, restoring the
+        performance.  This function does not retrain the index, it only assigns
+        the new data to existing partitions.  This means an update is much quicker
+        than retraining the entire index but may have less accuracy (especially
+        if the new data exhibits new patterns, concepts, or trends)
         """
-        return self._dataset.optimize_indices(**kwargs)
+        self._dataset._ds.optimize_indices(**kwargs)
 
 
 def write_dataset(
