@@ -78,6 +78,7 @@ serde_json = { version = "1" }
 snafu = "0.7.4"
 tempfile = "3"
 tokio = { version = "1.23", features = ["rt-multi-thread", "macros"] }
+tokio-stream = "0"
 tracing = "0.1"
 url = "2.3"
 

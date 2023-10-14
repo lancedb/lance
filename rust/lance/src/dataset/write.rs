@@ -62,6 +62,11 @@ pub struct WriteParams {
     pub store_params: Option<ObjectStoreParams>,
 
     pub progress: Option<Arc<dyn WriteFragmentProgress>>,
+
+    /// If the last fragment is smaller than this size
+    /// Any new write will be compacted into the last fragment
+    /// Has no effect if the last fragment is covered by an index
+    pub tail_compaction_size: Option<usize>,
 }
 
 impl Default for WriteParams {
@@ -72,6 +77,7 @@ impl Default for WriteParams {
             mode: WriteMode::Create,
             store_params: None,
             progress: None,
+            tail_compaction_size: None,
         }
     }
 }

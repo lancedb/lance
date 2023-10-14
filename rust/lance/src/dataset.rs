@@ -30,6 +30,8 @@ use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::interleave::interleave;
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::{prelude::*, Duration};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt};
@@ -55,7 +57,7 @@ use self::cleanup::RemovalStats;
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::Scanner;
-use self::transaction::{Operation, Transaction};
+use self::transaction::{Operation, RewriteGroup, Transaction};
 use self::write::{reader_to_stream, write_fragments};
 use crate::datatypes::Schema;
 use crate::error::box_error;
@@ -486,17 +488,63 @@ impl Dataset {
             });
         }
 
-        let fragments = write_fragments(
-            object_store.clone(),
-            &self.base,
-            &schema,
-            stream,
-            params.clone(),
-        )
-        .await?;
+        let transaction = match (params.tail_compaction_size, self.get_fragments().last()) {
+            (Some(tail_compact_thresh), Some(last_frag))
+                if last_frag.count_rows().await? <= tail_compact_thresh =>
+            {
+                let last_data = last_frag.scan().try_into_stream().await?;
+                let last_frag_stream: SendableRecordBatchStream = last_data.into();
+                let arrow_schema = last_frag_stream.schema();
+                let merged_stream = {
+                    // need to scope this use because TokioStreamExt collides with futures::StreamExt
+                    use tokio_stream::StreamExt as TokioStreamExt;
+                    RecordBatchStreamAdapter::new(arrow_schema, last_frag_stream.merge(stream))
+                };
 
-        let transaction =
-            Transaction::new(self.manifest.version, Operation::Append { fragments }, None);
+                let fragments = write_fragments(
+                    object_store.clone(),
+                    &self.base,
+                    &schema,
+                    Box::pin(merged_stream),
+                    params.clone(),
+                )
+                .await?;
+
+                if fragments.len() > 1 {
+                    return Err(Error::InvalidInput {
+                        source: "When attempting to run tail compaction, ".into(),
+                    });
+                }
+                // maybe we should roll append into a rewrite somehow?
+                // append and rewrite are both remove and/or appending fragments
+
+                // Concurrent writes fails on this path
+                // NOCOMMIT: explain how this interacts with concurrent
+                Transaction::new(
+                    self.manifest.version,
+                    Operation::Rewrite {
+                        groups: vec![RewriteGroup {
+                            old_fragments: vec![last_frag.metadata.clone()],
+                            new_fragments: fragments,
+                        }],
+                        rewritten_indices: vec![],
+                    },
+                    None,
+                )
+            }
+            _ => {
+                let fragments = write_fragments(
+                    object_store.clone(),
+                    &self.base,
+                    &schema,
+                    stream,
+                    params.clone(),
+                )
+                .await?;
+
+                Transaction::new(self.manifest.version, Operation::Append { fragments }, None)
+            }
+        };
 
         let new_manifest = commit_transaction(
             self,
