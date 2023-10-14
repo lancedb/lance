@@ -31,7 +31,7 @@ use crate::Dataset;
 /// Filter out row ids that we know are not relevant to the query. This currently
 /// is just deleted rows.
 pub struct PreFilter {
-    dataset: Arc<Dataset>,
+    dataset: Option<Arc<Dataset>>,
     has_deletion_vectors: bool,
     has_missing_fragments: bool,
 }
@@ -55,21 +55,29 @@ impl PreFilter {
         }
         let has_missing_fragments = has_fragment.iter().any(|&x| !x);
         Self {
-            dataset,
+            dataset: Some(dataset),
             has_deletion_vectors,
             has_missing_fragments,
         }
     }
 
+    pub fn new_empty() -> Self {
+        Self {
+            dataset: None,
+            has_deletion_vectors: false,
+            has_missing_fragments: false,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
-        !self.has_deletion_vectors && !self.has_missing_fragments
+        self.dataset.is_none() || (!self.has_deletion_vectors && !self.has_missing_fragments)
     }
 
     /// Check whether a single row id should be included in the query.
     pub async fn check_one(&self, row_id: u64) -> Result<bool> {
         let fragment_id = (row_id >> 32) as u32;
         // If the fragment isn't found, then it must have been deleted.
-        let Some(fragment) = self.dataset.get_fragment(fragment_id as usize) else {
+        let Some(fragment) = self.dataset.as_ref().expect("").get_fragment(fragment_id as usize) else {
             return Ok(false);
         };
         // If the fragment has no deletion vector, then the row must be there.
@@ -90,7 +98,7 @@ impl PreFilter {
         for row_id in row_ids {
             let fragment_id = (row_id >> 32) as u32;
             if let Entry::Vacant(entry) = relevant_fragments.entry(fragment_id) {
-                if let Some(fragment) = dataset.get_fragment(fragment_id as usize) {
+                if let Some(fragment) = dataset.expect("").get_fragment(fragment_id as usize) {
                     entry.insert(fragment);
                 }
             }

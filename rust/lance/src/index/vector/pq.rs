@@ -80,7 +80,7 @@ impl std::fmt::Debug for PQIndex {
 
 impl PQIndex {
     /// Load a PQ index (page) from the disk.
-    pub(crate) fn new(pq: Arc<ProductQuantizer>, metric_type: MetricType) -> Self {
+    pub fn new(pq: Arc<ProductQuantizer>, metric_type: MetricType) -> Self {
         Self {
             nbits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors,

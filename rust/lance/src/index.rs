@@ -31,7 +31,7 @@ pub mod pb {
 
 pub(crate) mod append;
 pub(crate) mod cache;
-pub(crate) mod prefilter;
+pub mod prefilter;
 pub mod vector;
 
 use crate::dataset::transaction::{Operation, Transaction};
@@ -44,7 +44,7 @@ use crate::{dataset::Dataset, Error, Result};
 use self::vector::{build_vector_index, VectorIndexParams};
 
 /// Trait of a secondary index.
-pub(crate) trait Index: Send + Sync {
+pub trait Index: Send + Sync {
     /// Cast to [Any].
     fn as_any(&self) -> &dyn Any;
 

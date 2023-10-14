@@ -33,7 +33,7 @@ use crate::{
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
 #[async_trait]
 #[allow(clippy::redundant_pub_crate)]
-pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
+pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// Search the vector for nearest neighbors.
     ///
     /// It returns a [RecordBatch] with Schema of:
