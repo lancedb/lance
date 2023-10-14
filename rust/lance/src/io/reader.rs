@@ -27,7 +27,8 @@ use arrow_array::{
     ArrayRef, ArrowNativeTypeOp, ArrowNumericType, NullArray, OffsetSizeTrait, PrimitiveArray,
     RecordBatch, StructArray, UInt32Array, UInt64Array,
 };
-use arrow_buffer::ArrowNativeType;
+use arrow_array::{make_array, BooleanArray};
+use arrow_buffer::{ArrowNativeType, NullBuffer};
 use arrow_schema::{DataType, Field as ArrowField, FieldRef, Schema as ArrowSchema};
 use arrow_select::{
     concat::{concat, concat_batches},
@@ -177,6 +178,11 @@ pub struct FileReader {
     /// actual data.
     with_row_id: bool,
 
+    /// If true, instead of removing deleted rows, all the columns will have
+    /// nulls as deleted rows. This is used as a performance optimization to
+    /// avoid copying data.
+    make_deletions_null: bool,
+
     // deletion vector indicating which rows are deleting in the fragment
     deletion_vector: Option<Arc<DeletionVector>>,
 
@@ -312,6 +318,7 @@ impl FileReader {
             page_table,
             fragment_id,
             with_row_id: false,
+            make_deletions_null: false,
             deletion_vector,
             stats_page_table,
         })
@@ -432,6 +439,14 @@ impl FileReader {
     /// Instruct the FileReader to return meta row id column.
     pub(crate) fn with_row_id(&mut self, v: bool) -> &mut Self {
         self.with_row_id = v;
+        self
+    }
+
+    /// Instruct the FileReader to return deleted rows as nulls, instead of
+    /// removing them. Batches that are entirely deleted will still be returned
+    /// as empty batches.
+    pub(crate) fn with_make_deletions_null(&mut self, val: bool) -> &mut Self {
+        self.make_deletions_null = val;
         self
     }
 
@@ -665,10 +680,48 @@ async fn read_batch(
         )?;
     }
 
-    match deletion_mask {
-        None => Ok(batch),
-        Some(mask) => Ok(filter_record_batch(&batch, &mask)?),
+    match (deletion_mask, reader.make_deletions_null) {
+        (None, _) => Ok(batch),
+        (Some(mask), false) => Ok(filter_record_batch(&batch, &mask)?),
+        (Some(mask), true) => Ok(apply_deletions_as_nulls(batch, &mask)?),
     }
+}
+
+/// Apply a mask to the batch, where rows are "deleted" by making all values
+/// null. This is used as a performance optimization to avoid copying data.
+fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<RecordBatch> {
+    // Transform mask into null buffer. Null means deleted, though note that
+    // null buffers are actually validity buffers, so True means not null
+    // and thus not deleted.
+    let mask_buffer = NullBuffer::new(mask.values().clone());
+
+    match mask_buffer.null_count() {
+        // All rows are deleted
+        n if n == mask_buffer.len() => return Ok(RecordBatch::new_empty(batch.schema())),
+        // No rows are deleted
+        0 => return Ok(batch),
+        _ => {}
+    }
+
+    // For each column convert to data
+    let new_columns = batch
+        .columns()
+        .iter()
+        .map(|col| {
+            let col_data = col.to_data();
+            // If it already has a validity bitmap, then AND it with the mask.
+            // Otherwise, use the boolean buffer as the mask.
+            let null_buffer = NullBuffer::union(col_data.nulls(), Some(&mask_buffer));
+
+            Ok(col_data
+                .into_builder()
+                .null_bit_buffer(null_buffer.map(|b| b.buffer().clone()))
+                .build()
+                .map(make_array)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(RecordBatch::try_new(batch.schema(), new_columns)?)
 }
 
 #[async_recursion]

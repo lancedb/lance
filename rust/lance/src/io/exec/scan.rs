@@ -39,10 +39,14 @@ async fn open_file(
     file_fragment: FileFragment,
     projection: Arc<Schema>,
     with_row_id: bool,
+    with_make_deletions_null: bool,
 ) -> Result<FragmentReader> {
     let mut reader = file_fragment.open(projection.as_ref()).await?;
     if with_row_id {
         reader.with_row_id();
+    };
+    if with_make_deletions_null {
+        reader.with_make_deletions_null();
     };
     Ok(reader)
 }
@@ -115,6 +119,7 @@ impl LanceStream {
         batch_readahead: usize,
         fragment_readahead: usize,
         with_row_id: bool,
+        with_make_deletions_null: bool,
         scan_in_order: bool,
     ) -> Result<Self> {
         let project_schema = projection.clone();
@@ -131,6 +136,7 @@ impl LanceStream {
                         file_fragment,
                         project_schema.clone(),
                         with_row_id,
+                        with_make_deletions_null,
                     ))
                 })
                 .try_buffered(fragment_readahead)
@@ -147,6 +153,7 @@ impl LanceStream {
                         file_fragment,
                         project_schema.clone(),
                         with_row_id,
+                        with_make_deletions_null,
                     ))
                 })
                 .try_buffered(fragment_readahead)
@@ -207,6 +214,7 @@ pub struct LanceScanExec {
     batch_readahead: usize,
     fragment_readahead: usize,
     with_row_id: bool,
+    with_make_deletions_null: bool,
     ordered_output: bool,
 }
 
@@ -244,6 +252,7 @@ impl LanceScanExec {
         batch_readahead: usize,
         fragment_readahead: usize,
         with_row_id: bool,
+        with_make_deletions_null: bool,
         ordered_ouput: bool,
     ) -> Self {
         Self {
@@ -254,6 +263,7 @@ impl LanceScanExec {
             batch_readahead,
             fragment_readahead,
             with_row_id,
+            with_make_deletions_null,
             ordered_output: ordered_ouput,
         }
     }
@@ -308,6 +318,7 @@ impl ExecutionPlan for LanceScanExec {
             self.batch_readahead,
             self.fragment_readahead,
             self.with_row_id,
+            self.with_make_deletions_null,
             self.ordered_output,
         )?))
     }
