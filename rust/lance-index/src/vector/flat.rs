@@ -18,18 +18,17 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    cast::AsArray, types::Float32Type, Array, ArrayRef, FixedSizeListArray, RecordBatch,
-    StructArray,
+    cast::AsArray, make_array, Array, ArrayRef, FixedSizeListArray, RecordBatch, StructArray,
 };
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::{DataType, Field as ArrowField, SchemaRef};
+use arrow_schema::{DataType, Field as ArrowField, SchemaRef, SortOptions};
 use arrow_select::{concat::concat, take::take};
 use futures::{
     future,
     stream::{repeat_with, StreamExt, TryStreamExt},
 };
 use lance_arrow::*;
-use lance_core::{io::RecordBatchStream, Error, Result};
+use lance_core::{io::RecordBatchStream, Error, Result, ROW_ID};
 use lance_linalg::distance::DistanceType;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -37,7 +36,7 @@ use tracing::instrument;
 use super::{Query, DIST_COL};
 
 fn distance_field() -> ArrowField {
-    ArrowField::new(DIST_COL, DataType::Float32, false)
+    ArrowField::new(DIST_COL, DataType::Float32, true)
 }
 
 #[instrument(level = "debug", skip_all)]
@@ -87,17 +86,37 @@ async fn flat_search_batch(
         .ok_or_else(|| Error::Schema {
             message: format!("column {} does not exist in dataset", query.column),
             location: location!(),
-        })?
-        .clone();
-    let flatten_vectors = as_fixed_size_list_array(vectors.as_ref()).values().clone();
-    tokio::task::spawn_blocking(move || {
-        let distances = mt.batch_func()(
-            key.values(),
-            flatten_vectors.as_primitive::<Float32Type>().values(),
-            key.len(),
-        ) as ArrayRef;
+        })?;
 
-        let indices = sort_to_indices(&distances, None, Some(k))?;
+    // A selection vector may have been applied to _rowid column, so we need to
+    // push that onto vectors if possible.
+    let vectors = as_fixed_size_list_array(vectors.as_ref()).clone();
+    let validity_buffer = if let Some(rowids) = batch.column_by_name(ROW_ID) {
+        rowids.nulls().map(|nulls| nulls.buffer().clone())
+    } else {
+        None
+    };
+
+    let vectors = vectors
+        .into_data()
+        .into_builder()
+        .null_bit_buffer(validity_buffer)
+        .build()
+        .map(make_array)?;
+    let vectors = as_fixed_size_list_array(vectors.as_ref()).clone();
+
+    tokio::task::spawn_blocking(move || {
+        let distances = mt.arrow_batch_func()(key.values(), &vectors) as ArrayRef;
+
+        // We don't want any nulls in result, so limit to k or the number of valid values.
+        let k = std::cmp::min(k, distances.len() - distances.null_count());
+
+        let sort_options = SortOptions {
+            nulls_first: false,
+            ..Default::default()
+        };
+        let indices = sort_to_indices(&distances, Some(sort_options), Some(k))?;
+
         let batch_with_distance = batch.try_with_column(distance_field(), distances)?;
         let struct_arr = StructArray::from(batch_with_distance);
         let selected_arr = take(&struct_arr, &indices, None)?;

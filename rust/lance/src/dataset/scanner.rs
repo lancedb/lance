@@ -36,7 +36,8 @@ use datafusion::physical_plan::{
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use futures::stream::{Stream, StreamExt};
-use lance_index::vector::Query;
+use lance_core::ROW_ID_FIELD;
+use lance_index::vector::{Query, DIST_COL};
 use lance_linalg::distance::MetricType;
 use log::debug;
 use tracing::{info_span, instrument, Span};
@@ -52,8 +53,7 @@ use crate::io::{
 use crate::utils::sql::parse_sql_filter;
 use crate::{Error, Result};
 use snafu::{location, Location};
-/// Column name for the meta row ID.
-pub const ROW_ID: &str = "_rowid";
+
 pub const DEFAULT_BATCH_SIZE: usize = 8192;
 
 // Same as pyarrow Dataset::scanner()
@@ -373,10 +373,10 @@ impl Scanner {
                 location: location!(),
             })?;
             extra_columns.push(vector_field);
-            extra_columns.push(ArrowField::new("_distance", DataType::Float32, false));
+            extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
         };
         if self.with_row_id {
-            extra_columns.push(ArrowField::new(ROW_ID, DataType::UInt64, false));
+            extra_columns.push(ROW_ID_FIELD.clone());
         }
 
         let schema = if !extra_columns.is_empty() {
@@ -686,6 +686,9 @@ impl Scanner {
     }
 
     /// Create an Execution plan with a scan node
+    ///
+    /// Setting `with_make_deletions_null` will use the validity of the _rowid
+    /// column as a selection vector. Read more in [crate::io::FileReader].
     fn scan(
         &self,
         with_row_id: bool,
@@ -838,6 +841,7 @@ mod test {
     use arrow_schema::DataType;
     use arrow_select::take;
     use futures::TryStreamExt;
+    use lance_index::vector::DIST_COL;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use tempfile::tempdir;
 
@@ -1109,7 +1113,7 @@ mod test {
                         ),
                         true,
                     ),
-                    ArrowField::new("_distance", DataType::Float32, false),
+                    ArrowField::new(DIST_COL, DataType::Float32, true),
                 ])
             );
 
@@ -1273,7 +1277,7 @@ mod test {
                     ),
                     true,
                 ),
-                ArrowField::new("_distance", DataType::Float32, false),
+                ArrowField::new("_distance", DataType::Float32, true),
             ])
         );
 
@@ -1327,7 +1331,7 @@ mod test {
                     ),
                     true,
                 ),
-                ArrowField::new("_distance", DataType::Float32, false),
+                ArrowField::new(DIST_COL, DataType::Float32, true),
             ])
         );
 
@@ -1377,7 +1381,7 @@ mod test {
                     ),
                     true,
                 ),
-                ArrowField::new("_distance", DataType::Float32, false),
+                ArrowField::new("_distance", DataType::Float32, true),
             ])
         );
 

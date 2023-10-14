@@ -29,7 +29,7 @@ use arrow_array::{
 };
 use arrow_array::{make_array, BooleanArray};
 use arrow_buffer::{ArrowNativeType, NullBuffer};
-use arrow_schema::{DataType, Field as ArrowField, FieldRef, Schema as ArrowSchema};
+use arrow_schema::{DataType, FieldRef, Schema as ArrowSchema};
 use arrow_select::{
     concat::{concat, concat_batches},
     filter::filter_record_batch,
@@ -45,7 +45,7 @@ use lance_core::{
         read_fixed_stride_array, ReadBatchParams, Reader, RecordBatchStream,
         RecordBatchStreamAdapter,
     },
-    Error, Result,
+    Error, Result, ROW_ID, ROW_ID_FIELD,
 };
 use object_store::path::Path;
 use prost::Message;
@@ -55,7 +55,6 @@ use tracing::instrument;
 use super::deletion::{read_deletion_file, DeletionVector};
 use super::deletion_file_path;
 use super::object_reader::read_message;
-use crate::dataset::ROW_ID;
 use crate::format::{pb, Fragment, Index, Manifest, Metadata, PageTable};
 use crate::io::{object_reader::read_struct, read_metadata_offset, read_struct_from_buf};
 use crate::session::Session;
@@ -178,8 +177,8 @@ pub struct FileReader {
     /// actual data.
     with_row_id: bool,
 
-    /// If true, instead of removing deleted rows, all the columns will have
-    /// nulls as deleted rows. This is used as a performance optimization to
+    /// If true, instead of removing deleted rows, the _rowid column value may be
+    /// marked as null. This is used as a performance optimization to
     /// avoid copying data.
     make_deletions_null: bool,
 
@@ -442,9 +441,11 @@ impl FileReader {
         self
     }
 
-    /// Instruct the FileReader to return deleted rows as nulls, instead of
-    /// removing them. Batches that are entirely deleted will still be returned
-    /// as empty batches.
+    /// Instruct the FileReader that instead of removing deleted rows, it may
+    /// simply mark the _rowid value as null. Some rows may still be removed,
+    /// for example if the entire batch is deleted. This is a performance
+    /// optimization where the null bitmap of the _rowid column serves as a
+    /// selection vector.
     pub(crate) fn with_make_deletions_null(&mut self, val: bool) -> &mut Self {
         self.make_deletions_null = val;
         self
@@ -537,7 +538,7 @@ impl FileReader {
 
         let mut schema = ArrowSchema::from(projection);
         if self.with_row_id {
-            schema = schema.try_with_column(ArrowField::new(ROW_ID, DataType::UInt64, false))?;
+            schema = schema.try_with_column(ROW_ID_FIELD.clone())?;
         }
         let schema = Arc::new(schema);
 
@@ -674,10 +675,7 @@ async fn read_batch(
 
     if with_row_id {
         let row_id_arr = Arc::new(UInt64Array::from(row_ids.unwrap()));
-        batch = batch.try_with_column(
-            ArrowField::new("_rowid", DataType::UInt64, false),
-            row_id_arr,
-        )?;
+        batch = batch.try_with_column(ROW_ID_FIELD.clone(), row_id_arr)?;
     }
 
     match (deletion_mask, reader.make_deletions_null) {
@@ -687,8 +685,8 @@ async fn read_batch(
     }
 }
 
-/// Apply a mask to the batch, where rows are "deleted" by making all values
-/// null. This is used as a performance optimization to avoid copying data.
+/// Apply a mask to the batch, where rows are "deleted" by the _rowid column null.
+/// This is used as a performance optimization to avoid copying data.
 fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<RecordBatch> {
     // Transform mask into null buffer. Null means deleted, though note that
     // null buffers are actually validity buffers, so True means not null
@@ -705,19 +703,25 @@ fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<R
 
     // For each column convert to data
     let new_columns = batch
-        .columns()
+        .schema()
+        .fields()
         .iter()
-        .map(|col| {
-            let col_data = col.to_data();
-            // If it already has a validity bitmap, then AND it with the mask.
-            // Otherwise, use the boolean buffer as the mask.
-            let null_buffer = NullBuffer::union(col_data.nulls(), Some(&mask_buffer));
+        .zip(batch.columns())
+        .map(|(field, col)| {
+            if field.name() == ROW_ID {
+                let col_data = col.to_data();
+                // If it already has a validity bitmap, then AND it with the mask.
+                // Otherwise, use the boolean buffer as the mask.
+                let null_buffer = NullBuffer::union(col_data.nulls(), Some(&mask_buffer));
 
-            Ok(col_data
-                .into_builder()
-                .null_bit_buffer(null_buffer.map(|b| b.buffer().clone()))
-                .build()
-                .map(make_array)?)
+                Ok(col_data
+                    .into_builder()
+                    .null_bit_buffer(null_buffer.map(|b| b.buffer().clone()))
+                    .build()
+                    .map(make_array)?)
+            } else {
+                Ok(col.clone())
+            }
         })
         .collect::<Result<Vec<_>>>()?;
 

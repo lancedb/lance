@@ -26,6 +26,7 @@ use datafusion::physical_plan::{
 };
 use futures::stream::Stream;
 use futures::FutureExt;
+use lance_core::ROW_ID_FIELD;
 use lance_index::vector::{flat::flat_search, Query, DIST_COL};
 use snafu::{location, Location};
 use tokio::sync::mpsc::Receiver;
@@ -33,7 +34,7 @@ use tokio::task::JoinHandle;
 use tracing::{instrument, Instrument};
 
 use crate::dataset::scanner::DatasetRecordBatchStream;
-use crate::dataset::{Dataset, ROW_ID};
+use crate::dataset::Dataset;
 use crate::format::Index;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::open_index;
@@ -121,8 +122,8 @@ impl Stream for KNNFlatStream {
 impl DFRecordBatchStream for KNNFlatStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("_distance", DataType::Float32, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(DIST_COL, DataType::Float32, true),
+            ROW_ID_FIELD.clone(),
         ]))
     }
 }
@@ -199,7 +200,7 @@ impl ExecutionPlan for KNNFlatExec {
         let input_schema = self.input.schema();
         let mut fields = input_schema.fields().to_vec();
         if input_schema.field_with_name(DIST_COL).is_err() {
-            fields.push(Arc::new(Field::new(DIST_COL, DataType::Float32, false)));
+            fields.push(Arc::new(Field::new(DIST_COL, DataType::Float32, true)));
         }
 
         Arc::new(Schema::new_with_metadata(
@@ -303,8 +304,8 @@ impl KNNIndexStream {
 impl DFRecordBatchStream for KNNIndexStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new(DIST_COL, DataType::Float32, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(DIST_COL, DataType::Float32, true),
+            ROW_ID_FIELD.clone(),
         ]))
     }
 }
@@ -388,8 +389,8 @@ impl ExecutionPlan for KNNIndexExec {
 
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new(DIST_COL, DataType::Float32, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(DIST_COL, DataType::Float32, true),
+            ROW_ID_FIELD.clone(),
         ]))
     }
 
@@ -580,7 +581,7 @@ mod tests {
                     true,
                 ),
                 ArrowField::new("uri", DataType::Utf8, true),
-                ArrowField::new(DIST_COL, DataType::Float32, false),
+                ArrowField::new(DIST_COL, DataType::Float32, true),
             ])
         );
     }

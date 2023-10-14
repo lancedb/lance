@@ -22,6 +22,7 @@ use std::{
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
+use lance_core::ROW_ID_FIELD;
 use lance_index::vector::{Query, DIST_COL};
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
@@ -30,7 +31,7 @@ use tracing::instrument;
 
 use super::row_vertex::{RowVertex, RowVertexSerDe};
 use crate::{
-    dataset::{Dataset, ROW_ID},
+    dataset::Dataset,
     index::{
         prefilter::PreFilter,
         vector::graph::{GraphReadParams, PersistedGraph},
@@ -222,8 +223,8 @@ impl VectorIndex for DiskANNIndex {
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
         let state = greedy_search(&self.graph, 0, query.key.values(), query.k, query.k * 2).await?;
         let schema = Arc::new(Schema::new(vec![
-            Field::new(ROW_ID, DataType::UInt64, false),
-            Field::new(DIST_COL, DataType::Float32, false),
+            ROW_ID_FIELD.clone(),
+            Field::new(DIST_COL, DataType::Float32, true),
         ]));
 
         let mut candidates = Vec::with_capacity(query.k);

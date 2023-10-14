@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
@@ -28,10 +28,11 @@ use datafusion::physical_plan::{
 use futures::stream::Stream;
 use futures::{stream, Future};
 use futures::{StreamExt, TryStreamExt};
+use lance_core::ROW_ID_FIELD;
 use tracing::Instrument;
 
 use crate::dataset::fragment::{FileFragment, FragmentReader};
-use crate::dataset::{Dataset, ROW_ID};
+use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 use crate::format::Fragment;
 
@@ -188,7 +189,7 @@ impl RecordBatchStream for LanceStream {
         let schema: ArrowSchema = self.projection.as_ref().into();
         if self.with_row_id {
             let mut fields: Vec<Arc<Field>> = schema.fields.to_vec();
-            fields.push(Arc::new(Field::new(ROW_ID, DataType::UInt64, false)));
+            fields.push(Arc::new(ROW_ID_FIELD.clone()));
             Arc::new(ArrowSchema::new(fields))
         } else {
             Arc::new(schema)
@@ -278,7 +279,7 @@ impl ExecutionPlan for LanceScanExec {
         let schema: ArrowSchema = self.projection.as_ref().into();
         if self.with_row_id {
             let mut fields: Vec<Arc<Field>> = schema.fields.to_vec();
-            fields.push(Arc::new(Field::new(ROW_ID, DataType::UInt64, false)));
+            fields.push(Arc::new(ROW_ID_FIELD.clone()));
             Arc::new(ArrowSchema::new(fields))
         } else {
             Arc::new(schema)

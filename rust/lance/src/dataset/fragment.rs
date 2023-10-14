@@ -751,32 +751,30 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut dataset = create_dataset(test_uri).await;
-        dataset.delete("i >= 80 and i < 95").await.unwrap();
+        dataset.delete("i >= 0 and i < 15").await.unwrap();
 
-        let fragment = &dataset.get_fragments()[2];
+        let fragment = &dataset.get_fragments()[0];
         let mut reader = fragment.open(dataset.schema()).await.unwrap();
         reader.with_make_deletions_null();
+        reader.with_row_id();
 
         // Since the first batch is all deleted, it will return an empty batch.
         let batch1 = reader.read_batch(0, ..).await.unwrap();
         assert_eq!(batch1.num_rows(), 0);
 
         // The second batch is partially deleted, so the deleted rows will be
-        // marked null across all columns.
+        // marked null with null row ids.
         let batch2 = reader.read_batch(1, ..).await.unwrap();
-        for i in 0..batch2.num_columns() {
-            assert_eq!(batch2.column(i).null_count(), 5);
-        }
         assert_eq!(
-            batch2.column_by_name("i").unwrap().as_ref(),
-            &Int32Array::from_iter((90..100).map(|v| if v < 95 { None } else { Some(v) }))
+            batch2.column_by_name(ROW_ID).unwrap().as_ref(),
+            &UInt64Array::from_iter((10..20).map(|v| if v < 15 { None } else { Some(v) }))
         );
 
         // The final batch is not deleted, so it will be returned as-is.
         let batch3 = reader.read_batch(2, ..).await.unwrap();
         assert_eq!(
-            batch3.column_by_name("i").unwrap().as_ref(),
-            &Int32Array::from_iter_values(100..110)
+            batch3.column_by_name(ROW_ID).unwrap().as_ref(),
+            &UInt64Array::from_iter_values(20..30)
         );
     }
 

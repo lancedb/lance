@@ -426,3 +426,40 @@ def test_optimize_index_recall(tmp_path: Path):
     # Optimize the index, combined KNN should no longer be needed
     dataset.optimize.optimize_indices()
     check_index(has_knn_combined=False, delete_has_happened=True)
+
+
+def test_knn_with_deletions(tmp_path):
+    dims = 5
+    values = pa.array(
+        [x for val in range(50) for x in [float(val)] * 5], type=pa.float32()
+    )
+    tbl = pa.Table.from_pydict(
+        {
+            "vector": pa.FixedSizeListArray.from_arrays(values, dims),
+            "filterable": pa.array(range(50)),
+        }
+    )
+    dataset = lance.write_dataset(tbl, tmp_path, max_rows_per_group=10)
+
+    dataset.delete("not (filterable % 5 == 0)")
+
+    # Do KNN with k=100, should return 10 vectors
+    expected = [
+        [0.0] * 5,
+        [5.0] * 5,
+        [10.0] * 5,
+        [15.0] * 5,
+        [20.0] * 5,
+        [25.0] * 5,
+        [30.0] * 5,
+        [35.0] * 5,
+        [40.0] * 5,
+        [45.0] * 5,
+    ]
+
+    results = dataset.to_table(
+        nearest={"column": "vector", "q": [0.0] * 5, "k": 100}
+    ).column("vector")
+    assert len(results) == 10
+
+    assert expected == [r.as_py() for r in results]
