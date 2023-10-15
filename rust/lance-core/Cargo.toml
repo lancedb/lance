@@ -12,11 +12,14 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+arrow-array.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 datafusion-common.workspace = true
 datafusion-sql.workspace = true
+futures.workspace = true
+pin-project.workspace = true
 object_store.workspace = true
 prost.workspace = true
 serde_json.workspace = true

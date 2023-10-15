@@ -72,6 +72,7 @@ object_store = { version = "0.7.1", features = ["aws", "gcp", "azure"] }
 pprof = { version = "0.12", features = ["flamegraph", "criterion"] }
 prost = "0.10"
 prost-types = "0.10"
+pin-project = "1.0"
 rand = { version = "0.8.3", features = ["small_rng"] }
 serde = { version = "^1" }
 serde_json = { version = "1" }
