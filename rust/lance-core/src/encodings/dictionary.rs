@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Dictionary encoding.
 //!
@@ -217,10 +214,9 @@ mod tests {
     use super::*;
 
     use crate::encodings::plain::PlainEncoder;
+    use crate::io::local::LocalObjectReader;
     use arrow_array::{Array, StringArray};
     use arrow_buffer::ArrowNativeType;
-    // use lance::io::{object_writer::ObjectWriter, ObjectStore};
-    use object_store::path::Path;
 
     async fn test_dict_decoder_for_type<T: ArrowDictionaryKeyType>() {
         let value_array: StringArray = vec![Some("a"), Some("b"), Some("c"), Some("d")]
@@ -244,35 +240,34 @@ mod tests {
         let keys2_ref = arr2.keys() as &dyn Array;
         let arrs: Vec<&dyn Array> = vec![keys1_ref, keys2_ref];
 
-        // let store = ObjectStore::memory();
-        // let path = Path::from("/foo");
-        //
-        // let pos;
-        // {
-        //     let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
-        //     let mut encoder = PlainEncoder::new(&mut object_writer, arr1.keys().data_type());
-        //     pos = encoder.encode(arrs.as_slice()).await.unwrap();
-        //     object_writer.shutdown().await.unwrap();
-        // }
-        //
-        // let reader = store.open(&path).await.unwrap();
-        // let decoder = DictionaryDecoder::new(
-        //     reader.as_ref(),
-        //     pos,
-        //     arr1.len() + arr2.len(),
-        //     arr1.data_type(),
-        //     value_array_ref.clone(),
-        // );
-        //
-        // let decoded_data = decoder.decode().await.unwrap();
-        // let expected_data: DictionaryArray<T> = vec!["a", "b", "b", "d"].into_iter().collect();
-        // assert_eq!(
-        //     &expected_data,
-        //     decoded_data
-        //         .as_any()
-        //         .downcast_ref::<DictionaryArray<T>>()
-        //         .unwrap()
-        // );
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("foo");
+
+        let pos;
+        {
+            let mut object_writer = tokio::fs::File::create(&path).await.unwrap();
+            let mut encoder = PlainEncoder::new(&mut object_writer, arr1.keys().data_type());
+            pos = encoder.encode(arrs.as_slice()).await.unwrap();
+        }
+
+        let reader = LocalObjectReader::open_local_path(&path, 2048).unwrap();
+        let decoder = DictionaryDecoder::new(
+            reader.as_ref(),
+            pos,
+            arr1.len() + arr2.len(),
+            arr1.data_type(),
+            value_array_ref.clone(),
+        );
+
+        let decoded_data = decoder.decode().await.unwrap();
+        let expected_data: DictionaryArray<T> = vec!["a", "b", "b", "d"].into_iter().collect();
+        assert_eq!(
+            &expected_data,
+            decoded_data
+                .as_any()
+                .downcast_ref::<DictionaryArray<T>>()
+                .unwrap()
+        );
     }
 
     #[tokio::test]

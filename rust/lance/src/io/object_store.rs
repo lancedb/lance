@@ -55,7 +55,6 @@ use self::tracing::ObjectStoreTracingExt;
 use super::commit::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore};
 use super::commit::{CommitHandler, CommitLock, RenameCommitHandler, UnsafeCommitHandler};
 use super::local::LocalObjectReader;
-use super::object_reader::ObjectReader;
 
 mod tracing;
 
@@ -613,7 +612,7 @@ impl ObjectStore {
         object_store.create(&os_path).await
     }
 
-    /// Open an [ObjectReader] from local [std::path::Path]
+    /// Open an [Reader] from local [std::path::Path]
     pub async fn open_local(path: &std::path::Path) -> Result<Box<dyn Reader>> {
         let object_store = Self::local();
         let os_path = Path::from(path.to_str().unwrap());

@@ -981,15 +981,14 @@ mod tests {
     use crate::io::deletion::write_deletion_file;
     use crate::io::deletion::DeletionVector;
     use crate::io::ObjectStore;
-    use arrow::array::LargeListBuilder;
-    use arrow_array::builder::StringDictionaryBuilder;
-    use arrow_array::types::Int32Type;
     use arrow_array::{
-        builder::{Int32Builder, ListBuilder, StringBuilder},
+        builder::{
+            Int32Builder, LargeListBuilder, ListBuilder, StringBuilder, StringDictionaryBuilder,
+        },
         cast::{as_string_array, as_struct_array},
-        types::UInt8Type,
-        Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, NullArray,
-        StringArray, StructArray, UInt32Array, UInt8Array,
+        types::{Int32Type, UInt8Type},
+        Array, BooleanArray, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray,
+        NullArray, StringArray, StructArray, UInt32Array, UInt8Array,
     };
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
@@ -1814,5 +1813,37 @@ mod tests {
                 .unwrap()
             )
         }
+    }
+
+    #[tokio::test]
+    async fn test_take_boolean_beyond_chunk() {
+        let mut store = ObjectStore::memory();
+        store.set_block_size(256);
+        let path = Path::from("/take_bools");
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Boolean,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut file_writer =
+            FileWriter::try_new(&store, &path, schema.clone(), &Default::default())
+                .await
+                .unwrap();
+
+        let array = BooleanArray::from((0..5000).map(|v| v % 5 == 0).collect::<Vec<_>>());
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
+        file_writer.write(&[batch]).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual = reader.take(&[2, 4, 5, 8, 4555], &schema).await.unwrap();
+
+        assert_eq!(
+            actual.column_by_name("b").unwrap().as_ref(),
+            &BooleanArray::from(vec![false, false, true, false, true])
+        );
     }
 }

@@ -492,58 +492,52 @@ impl AsyncIndex<ReadBatchParams> for PlainDecoder<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
     use std::ops::Deref;
     use std::sync::Arc;
 
-    use arrow::compute::concat_batches;
     use arrow_array::*;
-    use arrow_schema::{Field, Schema as ArrowSchema};
-    use object_store::path::Path;
+    use arrow_schema::Field;
     use rand::prelude::*;
     use tempfile;
 
-    // TODO: migrate them to lance-core.
-    use crate::io::local::LocalObjectReader;
-    use crate::io::{Reader, Writer};
-
     use super::*;
+    use crate::io::local::LocalObjectReader;
 
-    // #[tokio::test]
-    // async fn test_encode_decode_primitive_array() {
-    //     let int_types = vec![
-    //         DataType::Int8,
-    //         DataType::Int16,
-    //         DataType::Int32,
-    //         DataType::Int64,
-    //         DataType::UInt8,
-    //         DataType::UInt16,
-    //         DataType::UInt32,
-    //         DataType::UInt64,
-    //     ];
-    //     let input: Vec<i64> = Vec::from_iter(1..127_i64);
-    //     for t in int_types {
-    //         let buffer = Buffer::from_slice_ref(input.as_slice());
-    //         let mut arrs: Vec<ArrayRef> = Vec::new();
-    //         for _ in 0..10 {
-    //             arrs.push(Arc::new(make_array_(&t, &buffer).await));
-    //         }
-    //         test_round_trip(arrs.as_slice(), t).await;
-    //     }
-    //
-    //     let float_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
-    //     let mut rng = rand::thread_rng();
-    //     let input: Vec<f64> = (1..127).map(|_| rng.gen()).collect();
-    //     for t in float_types {
-    //         let buffer = Buffer::from_slice_ref(input.as_slice());
-    //         let mut arrs: Vec<ArrayRef> = Vec::new();
-    //
-    //         for _ in 0..10 {
-    //             arrs.push(Arc::new(make_array_(&t, &buffer).await));
-    //         }
-    //         test_round_trip(arrs.as_slice(), t).await;
-    //     }
-    // }
+    #[tokio::test]
+    async fn test_encode_decode_primitive_array() {
+        let int_types = vec![
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ];
+        let input: Vec<i64> = Vec::from_iter(1..127_i64);
+        for t in int_types {
+            let buffer = Buffer::from_slice_ref(input.as_slice());
+            let mut arrs: Vec<ArrayRef> = Vec::new();
+            for _ in 0..10 {
+                arrs.push(Arc::new(make_array_(&t, &buffer).await));
+            }
+            test_round_trip(arrs.as_slice(), t).await;
+        }
+
+        let float_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
+        let mut rng = rand::thread_rng();
+        let input: Vec<f64> = (1..127).map(|_| rng.gen()).collect();
+        for t in float_types {
+            let buffer = Buffer::from_slice_ref(input.as_slice());
+            let mut arrs: Vec<ArrayRef> = Vec::new();
+
+            for _ in 0..10 {
+                arrs.push(Arc::new(make_array_(&t, &buffer).await));
+            }
+            test_round_trip(arrs.as_slice(), t).await;
+        }
+    }
 
     async fn test_round_trip(expected: &[ArrayRef], data_type: DataType) {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -560,6 +554,7 @@ mod tests {
                 encoder.encode(expected_as_array.as_slice()).await.unwrap(),
                 0
             );
+            writer.flush().await.unwrap();
         }
 
         let reader = LocalObjectReader::open_local_path(&path, 1024).unwrap();
@@ -681,6 +676,7 @@ mod tests {
             let mut writer = tokio::fs::File::create(&path).await.unwrap();
             let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
             assert_eq!(encoder.encode(&[&array]).await.unwrap(), 0);
+            writer.flush().await.unwrap();
         }
 
         let reader = LocalObjectReader::open_local_path(&path, 2048).unwrap();
@@ -715,80 +711,38 @@ mod tests {
         assert!(decoder.get(3..1000).await.is_err());
     }
 
-    // #[tokio::test]
-    // async fn test_take() {
-    //     let store = ObjectStore::memory();
-    //     let path = Path::from("/takes");
-    //     let array = Int32Array::from_iter_values(0..100);
-    //
-    //     let mut writer = store.create(&path).await.unwrap();
-    //     let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
-    //     assert_eq!(encoder.encode(&[&array]).await.unwrap(), 0);
-    //     writer.shutdown().await.unwrap();
-    //
-    //     let reader = store.open(&path).await.unwrap();
-    //     assert!(reader.size().await.unwrap() > 0);
-    //     let decoder =
-    //         PlainDecoder::new(reader.as_ref(), array.data_type(), 0, array.len()).unwrap();
-    //
-    //     let results = decoder
-    //         .take(&UInt32Array::from_iter(
-    //             [2, 4, 5, 20, 30, 55, 60].iter().map(|i| *i as u32),
-    //         ))
-    //         .await
-    //         .unwrap();
-    //     assert_eq!(
-    //         results.as_ref(),
-    //         &Int32Array::from_iter_values([2, 4, 5, 20, 30, 55, 60])
-    //     );
-    // }
+    #[tokio::test]
+    async fn test_take() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let path = test_dir.path().join("takes");
 
-    // async fn read_file_as_one_batch(object_store: &ObjectStore, path: &Path) -> RecordBatch {
-    //     let reader = FileReader::try_new(object_store, path).await.unwrap();
-    //     let mut batches = vec![];
-    //     for i in 0..reader.num_batches() {
-    //         batches.push(
-    //             reader
-    //                 .read_batch(i as i32, .., reader.schema())
-    //                 .await
-    //                 .unwrap(),
-    //         );
-    //     }
-    //     let arrow_schema = Arc::new(reader.schema().into());
-    //     concat_batches(&arrow_schema, &batches).unwrap()
-    // }
+        let array = Int32Array::from_iter_values(0..100);
 
-    /// Test encoding arrays that share the same underneath buffer.
-    // #[tokio::test]
-    // async fn test_encode_slice() {
-    //     let store = ObjectStore::memory();
-    //     let path = Path::from("/shared_slice");
-    //
-    //     let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-    //         "i",
-    //         DataType::Int32,
-    //         false,
-    //     )]));
-    //     let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-    //     let mut file_writer = FileWriter::try_new(&store, &path, schema, &Default::default())
-    //         .await
-    //         .unwrap();
-    //
-    //     let array = Int32Array::from_iter_values(0..1000);
-    //
-    //     for i in (0..1000).step_by(4) {
-    //         let data = array.slice(i, 4);
-    //         file_writer
-    //             .write(&[RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(data)]).unwrap()])
-    //             .await
-    //             .unwrap();
-    //     }
-    //     file_writer.finish().await.unwrap();
-    //     assert!(store.size(&path).await.unwrap() < 2 * 8 * 1000);
-    //
-    //     let batch = read_file_as_one_batch(&store, &path).await;
-    //     assert_eq!(batch.column_by_name("i").unwrap().as_ref(), &array);
-    // }
+        {
+            let mut writer = tokio::fs::File::create(&path).await.unwrap();
+            let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
+            assert_eq!(encoder.encode(&[&array]).await.unwrap(), 0);
+        }
+
+        let reader = LocalObjectReader::open_local_path(&path, 2048).unwrap();
+        assert!(reader.size().await.unwrap() > 0);
+        let decoder =
+            PlainDecoder::new(reader.as_ref(), array.data_type(), 0, array.len()).unwrap();
+
+        let results = decoder
+            .take(&UInt32Array::from_iter(
+                [2, 4, 5, 20, 30, 55, 60].iter().map(|i| *i as u32),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            results.as_ref(),
+            &Int32Array::from_iter_values([2, 4, 5, 20, 30, 55, 60])
+        );
+    }
+
+    // Re-eanble the following tests once the Lance FileReader / FileWrite is migrated.
+
     // #[tokio::test]
     // async fn test_boolean_slice() {
     //     let store = ObjectStore::memory();
@@ -900,38 +854,6 @@ mod tests {
     //     assert_eq!(
     //         actual.column_by_name("b").unwrap().as_ref(),
     //         &BooleanArray::from(vec![false, false, true, false, false, false, true])
-    //     );
-    // }
-    //
-    // #[tokio::test]
-    // async fn test_take_boolean_beyond_chunk() {
-    //     let mut store = ObjectStore::memory();
-    //     store.set_block_size(256);
-    //     let path = Path::from("/take_bools");
-    //
-    //     let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-    //         "b",
-    //         DataType::Boolean,
-    //         false,
-    //     )]));
-    //     let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-    //     let mut file_writer =
-    //         FileWriter::try_new(&store, &path, schema.clone(), &Default::default())
-    //             .await
-    //             .unwrap();
-    //
-    //     let array = BooleanArray::from((0..5000).map(|v| v % 5 == 0).collect::<Vec<_>>());
-    //     let batch =
-    //         RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
-    //     file_writer.write(&[batch]).await.unwrap();
-    //     file_writer.finish().await.unwrap();
-    //
-    //     let reader = FileReader::try_new(&store, &path).await.unwrap();
-    //     let actual = reader.take(&[2, 4, 5, 8, 4555], &schema).await.unwrap();
-    //
-    //     assert_eq!(
-    //         actual.column_by_name("b").unwrap().as_ref(),
-    //         &BooleanArray::from(vec![false, false, true, false, true])
     //     );
     // }
 
