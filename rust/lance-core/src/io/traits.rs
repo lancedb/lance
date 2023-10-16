@@ -27,7 +27,7 @@ use crate::Result;
 #[async_trait]
 pub trait Writer: AsyncWrite + Unpin + Send {
     /// Tell the current offset.
-    fn tell(&self) -> usize;
+    async fn tell(&mut self) -> usize;
 }
 
 /// Lance Write Extension.
@@ -35,7 +35,7 @@ pub trait Writer: AsyncWrite + Unpin + Send {
 pub trait WriteExt: Writer {
     /// Write a protobuf message to the object, and returns the file position of the protobuf.
     async fn write_protobuf(&mut self, msg: &impl Message) -> Result<usize> {
-        let offset = self.tell();
+        let offset = self.tell().await;
 
         let len = msg.encoded_len();
 

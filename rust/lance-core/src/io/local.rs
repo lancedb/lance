@@ -15,7 +15,7 @@
 //! Optimized local I/Os
 
 use std::fs::File;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, SeekFrom};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -64,6 +64,19 @@ pub struct LocalObjectReader {
 }
 
 impl LocalObjectReader {
+    pub fn open_local_path(
+        path: impl AsRef<std::path::Path>,
+        block_size: usize,
+    ) -> Result<Box<dyn Reader>> {
+        let local_file = File::open(&path)?;
+        let object_store_path = Path::from_filesystem_path(path)?;
+        Ok(Box::new(Self {
+            file: Arc::new(local_file),
+            path: object_store_path,
+            block_size,
+        }))
+    }
+
     /// Open a local object reader, with default prefetch size.
     #[instrument(level = "debug")]
     pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn Reader>> {
@@ -146,5 +159,12 @@ fn read_exact_at(file: Arc<File>, mut buf: &mut [u8], mut offset: u64) -> std::i
         ))
     } else {
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Writer for tokio::fs::File {
+    async fn tell(&mut self) -> usize {
+        self.seek(SeekFrom::Current(0)).await.unwrap_or_default() as usize
     }
 }

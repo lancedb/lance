@@ -15,6 +15,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use async_trait::async_trait;
 use lance_core::io::{WriteExt, Writer as LanceWrite};
 use object_store::{path::Path, MultipartId};
 use pin_project::pin_project;
@@ -61,8 +62,9 @@ impl ObjectWriter {
     }
 }
 
+#[async_trait]
 impl LanceWrite for ObjectWriter {
-    fn tell(&self) -> usize {
+    async fn tell(&mut self) -> usize {
         self.cursor
     }
 }
