@@ -21,7 +21,6 @@ use std::{any::Any, collections::HashMap};
 use arrow_array::Float32Array;
 
 pub mod diskann;
-pub mod flat;
 #[allow(dead_code)]
 mod graph;
 pub mod ivf;
@@ -61,34 +60,7 @@ use crate::{
 };
 pub use traits::*;
 
-pub(crate) const DIST_COL: &str = "_distance";
 const INDEX_FILE_NAME: &str = "index.idx";
-
-/// Query parameters for the vector indices
-#[derive(Debug, Clone)]
-pub struct Query {
-    /// The column to be searched.
-    pub column: String,
-
-    /// The vector to be searched.
-    pub key: Arc<Float32Array>,
-
-    /// Top k results to return.
-    pub k: usize,
-
-    /// The number of probes to load and search.
-    pub nprobes: usize,
-
-    /// If presented, apply a refine step.
-    /// TODO: should we support fraction / float number here?
-    pub refine_factor: Option<u32>,
-
-    /// Distance metric type
-    pub metric_type: MetricType,
-
-    /// Whether to use an ANN index if available
-    pub use_index: bool,
-}
 
 impl From<super::pb::VectorMetricType> for MetricType {
     fn from(proto: super::pb::VectorMetricType) -> Self {

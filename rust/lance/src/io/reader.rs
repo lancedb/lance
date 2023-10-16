@@ -14,8 +14,8 @@
 
 //! Lance Data File Reader
 
-use std::borrow::Cow;
 // Standard
+use std::borrow::Cow;
 use std::ops::{Range, RangeTo};
 use std::sync::Arc;
 
@@ -37,6 +37,11 @@ use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
 use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
+use lance_arrow::*;
+use lance_core::{
+    io::{RecordBatchStream, RecordBatchStreamAdapter},
+    Error, Result,
+};
 use object_store::path::Path;
 use prost::Message;
 use snafu::{location, Location};
@@ -45,15 +50,12 @@ use tracing::instrument;
 use super::deletion::{read_deletion_file, DeletionVector};
 use super::object_reader::read_message;
 use super::{deletion_file_path, ReadBatchParams};
-use crate::arrow::*;
 use crate::dataset::ROW_ID;
 use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
-use crate::error::{Error, Result};
 use crate::format::{pb, Fragment, Index, Manifest, Metadata, PageTable};
 use crate::io::{
     object_reader::{read_fixed_stride_array, read_struct, ObjectReader},
     read_metadata_offset, read_struct_from_buf,
-    stream::{RecordBatchStream, RecordBatchStreamAdapter},
 };
 use crate::session::Session;
 use crate::{

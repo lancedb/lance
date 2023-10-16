@@ -22,6 +22,7 @@ use std::{
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
+use lance_index::vector::{Query, DIST_COL};
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
 use serde::Serialize;
@@ -32,21 +33,15 @@ use crate::{
     dataset::{Dataset, ROW_ID},
     index::{
         prefilter::PreFilter,
-        vector::{
-            graph::{GraphReadParams, PersistedGraph},
-            DIST_COL,
-        },
+        vector::graph::{GraphReadParams, PersistedGraph},
         Index,
     },
     Result,
 };
 use crate::{
     index::{
+        vector::graph::{Graph, VertexWithDistance},
         vector::VectorIndex,
-        vector::{
-            graph::{Graph, VertexWithDistance},
-            Query,
-        },
     },
     io::object_reader::ObjectReader,
     Error,

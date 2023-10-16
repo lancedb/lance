@@ -17,23 +17,24 @@
 
 use std::sync::Arc;
 
-use arrow::{array::as_primitive_array, datatypes::Float32Type};
 use arrow_array::{
-    cast::as_struct_array, Array, ArrayRef, FixedSizeListArray, RecordBatch, StructArray,
+    cast::AsArray, types::Float32Type, Array, ArrayRef, FixedSizeListArray, RecordBatch,
+    StructArray,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, SchemaRef};
 use arrow_select::{concat::concat, take::take};
-use futures::future;
-use futures::stream::{repeat_with, StreamExt, TryStreamExt};
+use futures::{
+    future,
+    stream::{repeat_with, StreamExt, TryStreamExt},
+};
+use lance_arrow::*;
+use lance_core::{io::RecordBatchStream, Error, Result};
 use lance_linalg::distance::DistanceType;
 use snafu::{location, Location};
 use tracing::instrument;
 
 use super::{Query, DIST_COL};
-use crate::arrow::*;
-use crate::io::RecordBatchStream;
-use crate::{Error, Result};
 
 fn distance_field() -> ArrowField {
     ArrowField::new(DIST_COL, DataType::Float32, false)
@@ -66,7 +67,7 @@ pub async fn flat_search(
 
     let struct_arr = StructArray::from(batch);
     let selected_arr = take(&struct_arr, &indices, None)?;
-    Ok(as_struct_array(&selected_arr).into())
+    Ok(selected_arr.as_struct().into())
 }
 
 #[instrument(level = "debug", skip(query, batch))]
@@ -92,7 +93,7 @@ async fn flat_search_batch(
     tokio::task::spawn_blocking(move || {
         let distances = mt.batch_func()(
             key.values(),
-            as_primitive_array::<Float32Type>(flatten_vectors.as_ref()).values(),
+            flatten_vectors.as_primitive::<Float32Type>().values(),
             key.len(),
         ) as ArrayRef;
 
@@ -100,7 +101,7 @@ async fn flat_search_batch(
         let batch_with_distance = batch.try_with_column(distance_field(), distances)?;
         let struct_arr = StructArray::from(batch_with_distance);
         let selected_arr = take(&struct_arr, &indices, None)?;
-        Ok::<RecordBatch, Error>(as_struct_array(&selected_arr).into())
+        Ok::<RecordBatch, Error>(selected_arr.as_struct().into())
     })
     .await
     .unwrap()

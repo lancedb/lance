@@ -26,16 +26,17 @@ use arrow_select::take::take;
 use async_trait::async_trait;
 // Re-export
 pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
+use lance_index::vector::{Query, DIST_COL};
 use lance_linalg::{
-    distance::{l2::l2_distance_batch, norm_l2::norm_l2, Dot, Normalize},
+    distance::{l2::l2_distance_batch, norm_l2::norm_l2, Dot, MetricType, Normalize},
     matrix::MatrixView,
 };
 use serde::Serialize;
 use tracing::instrument;
 
-use super::{MetricType, Query, VectorIndex};
+use super::VectorIndex;
 use crate::dataset::ROW_ID;
-use crate::index::{pb, prefilter::PreFilter, vector::DIST_COL, Index};
+use crate::index::{pb, prefilter::PreFilter, Index};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::{arrow::*, utils::tokio::spawn_cpu};
 use crate::{Error, Result};

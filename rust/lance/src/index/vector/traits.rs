@@ -17,13 +17,12 @@
 
 use std::collections::HashMap;
 
-use arrow_array::types::Float32Type;
-use arrow_array::RecordBatch;
+use arrow_array::{types::Float32Type, RecordBatch};
 use async_trait::async_trait;
 
+use lance_index::vector::Query;
 use lance_linalg::MatrixView;
 
-use super::Query;
 use crate::{
     index::{pb::Transform, prefilter::PreFilter, Index},
     io::{object_reader::ObjectReader, object_writer::ObjectWriter},
