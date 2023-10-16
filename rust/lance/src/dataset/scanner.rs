@@ -36,6 +36,7 @@ use datafusion::physical_plan::{
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use futures::stream::{Stream, StreamExt};
+use lance_index::vector::Query;
 use lance_linalg::distance::MetricType;
 use log::debug;
 use tracing::{info_span, instrument, Span};
@@ -44,7 +45,6 @@ use super::Dataset;
 use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index};
-use crate::index::vector::Query;
 use crate::io::{
     exec::{KNNFlatExec, KNNIndexExec, LanceScanExec, Planner, ProjectionExec, TakeExec},
     RecordBatchStream,

@@ -34,7 +34,7 @@ use lance_arrow::*;
 use lance_core::io::{WriteExt, Writer};
 use lance_index::vector::{
     pq::{PQBuildParams, ProductQuantizer},
-    RESIDUAL_COLUMN,
+    Query, RESIDUAL_COLUMN,
 };
 use lance_linalg::{distance::*, kernels::argmin, matrix::MatrixView};
 use log::info;
@@ -49,7 +49,7 @@ use super::opq::train_opq;
 use super::{
     pq::{train_pq, PQIndex},
     utils::maybe_sample_training_data,
-    MetricType, Query, VectorIndex, INDEX_FILE_NAME,
+    MetricType, VectorIndex, INDEX_FILE_NAME,
 };
 use crate::{
     dataset::Dataset,

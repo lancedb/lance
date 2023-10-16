@@ -32,16 +32,15 @@ pub mod object_reader;
 pub mod object_store;
 pub mod object_writer;
 pub(crate) mod reader;
-mod stream;
 mod writer;
 
 use crate::format::{ProtoStruct, INDEX_MAGIC, MAGIC};
 
 pub use self::object_store::ObjectStore;
 pub use deletion::deletion_file_path;
+pub use lance_core::io::RecordBatchStream;
 pub use reader::read_manifest;
 pub use reader::FileReader;
-pub use stream::RecordBatchStream;
 pub use writer::*;
 
 #[async_trait]

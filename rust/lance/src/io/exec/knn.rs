@@ -26,6 +26,7 @@ use datafusion::physical_plan::{
 };
 use futures::stream::Stream;
 use futures::FutureExt;
+use lance_index::vector::{flat::flat_search, Query, DIST_COL};
 use snafu::{location, Location};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
@@ -34,8 +35,7 @@ use tracing::{instrument, Instrument};
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::{Dataset, ROW_ID};
 use crate::index::prefilter::PreFilter;
-use crate::index::vector::flat::flat_search;
-use crate::index::vector::{open_index, Query, DIST_COL};
+use crate::index::vector::open_index;
 use crate::io::RecordBatchStream;
 use crate::{Error, Result};
 

@@ -15,5 +15,5 @@
 mod stream;
 mod traits;
 
-pub use stream::RecordBatchStream;
+pub use stream::{RecordBatchStream, RecordBatchStreamAdapter};
 pub use traits::*;
