@@ -216,12 +216,10 @@ impl<'a> AsyncIndex<ReadBatchParams> for DictionaryDecoder<'a> {
 mod tests {
     use super::*;
 
-    use crate::{
-        encodings::plain::PlainEncoder,
-        io::{object_writer::ObjectWriter, ObjectStore},
-    };
+    use crate::encodings::plain::PlainEncoder;
     use arrow_array::{Array, StringArray};
     use arrow_buffer::ArrowNativeType;
+    use lance::io::{object_writer::ObjectWriter, ObjectStore};
     use object_store::path::Path;
 
     async fn test_dict_decoder_for_type<T: ArrowDictionaryKeyType>() {

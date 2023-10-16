@@ -35,12 +35,13 @@ categories = [
 rust-version = "1.65"
 
 [workspace.dependencies]
+lance = { version = "=0.8.5", path = "./lance" }
 lance-arrow = { version = "=0.8.5", path = "./lance-arrow" }
 lance-core = { version = "=0.8.5", path = "./lance-core" }
 lance-index = { version = "=0.8.5", path = "./lance-index" }
 lance-linalg = { version = "=0.8.5", path = "./lance-linalg" }
-lance-testing = { version = "=0.8.5", path = "./lance-testing" }
 lance-test-macros = { version = "=0.8.5", path = "./lance-test-macros" }
+lance-testing = { version = "=0.8.5", path = "./lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "47.0.0", optional = false }
@@ -79,9 +80,10 @@ serde = { version = "^1" }
 serde_json = { version = "1" }
 snafu = "0.7.4"
 tempfile = "3"
-tokio = { version = "1.23", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.23", features = ["rt-multi-thread", "macros", "fs"] }
 tracing = "0.1"
 url = "2.3"
+uuid = { version = "1.2", features = ["v4", "serde"] }
 
 [profile.bench]
 opt-level = 3

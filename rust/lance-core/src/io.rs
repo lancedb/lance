@@ -25,7 +25,7 @@ pub use traits::*;
 
 /// Parameter to be used to read a batch.
 #[derive(Debug, Clone)]
-pub(crate) enum ReadBatchParams {
+pub enum ReadBatchParams {
     Range(Range<usize>),
 
     RangeFull,

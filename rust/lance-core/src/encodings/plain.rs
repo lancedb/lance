@@ -500,9 +500,10 @@ mod tests {
     use arrow_schema::{Field, Schema as ArrowSchema};
     use object_store::path::Path;
     use rand::prelude::*;
+    use tempfile;
 
-    use crate::io::object_writer::ObjectWriter;
-    use crate::io::{FileReader, FileWriter, ObjectStore};
+    // TODO: migrate them to lance-core.
+    use crate::io::{Reader, Writer};
 
     use super::*;
 
@@ -866,6 +867,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_take_boolean() {
+        let temp_dir = tempfile::tempdir().unwrap();
         let store = ObjectStore::memory();
         let path = Path::from("/take_bools");
 

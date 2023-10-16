@@ -44,7 +44,10 @@ use url::Url;
 
 use crate::io::object_reader::CloudObjectReader;
 use crate::io::object_writer::ObjectWriter;
-use lance_core::error::{Error, Result};
+use lance_core::{
+    error::{Error, Result},
+    io::Reader,
+};
 
 use self::tracing::ObjectStoreTracingExt;
 
@@ -592,7 +595,7 @@ impl ObjectStore {
     ///
     /// Parameters
     /// - ``path``: Absolute path to the file.
-    pub async fn open(&self, path: &Path) -> Result<Box<dyn ObjectReader>> {
+    pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
         match self.scheme.as_str() {
             "file" => LocalObjectReader::open(path, self.block_size),
             _ => Ok(Box::new(CloudObjectReader::new(
@@ -611,7 +614,7 @@ impl ObjectStore {
     }
 
     /// Open an [ObjectReader] from local [std::path::Path]
-    pub async fn open_local(path: &std::path::Path) -> Result<Box<dyn ObjectReader>> {
+    pub async fn open_local(path: &std::path::Path) -> Result<Box<dyn Reader>> {
         let object_store = Self::local();
         let os_path = Path::from(path.to_str().unwrap());
         object_store.open(&os_path).await

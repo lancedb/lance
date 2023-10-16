@@ -29,9 +29,10 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use object_store::path::Path;
 use snafu::{location, Location};
+use tokio::io::AsyncSeekExt;
 use tracing::instrument;
 
-use crate::io::Reader;
+use crate::io::{Reader, Writer};
 use crate::{Error, Result};
 
 /// Convert an [`object_store::path::Path`] to a [`std::path::Path`].

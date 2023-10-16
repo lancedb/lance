@@ -59,7 +59,7 @@ pub trait Encoder {
 
 /// Decoder - Read Arrow Data.
 #[async_trait]
-pub(crate) trait Decoder: Send + AsyncIndex<ReadBatchParams> {
+pub trait Decoder: Send + AsyncIndex<ReadBatchParams> {
     async fn decode(&self) -> Result<ArrayRef>;
 
     /// Take by indices.

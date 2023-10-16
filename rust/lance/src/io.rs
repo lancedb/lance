@@ -15,9 +15,7 @@
 //! I/O utilities.
 
 use std::io::{Error, ErrorKind, Result};
-use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
-use arrow_array::UInt32Array;
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use prost::bytes::Bytes;

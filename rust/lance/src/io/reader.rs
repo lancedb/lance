@@ -39,7 +39,8 @@ use bytes::{Bytes, BytesMut};
 use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{
-    io::{RecordBatchStream, RecordBatchStreamAdapter},
+    encodings::{dictionary::DictionaryDecoder, AsyncIndex},
+    io::{ReadBatchParams, RecordBatchStream, RecordBatchStreamAdapter},
     Error, Result,
 };
 use object_store::path::Path;
@@ -48,10 +49,9 @@ use snafu::{location, Location};
 use tracing::instrument;
 
 use super::deletion::{read_deletion_file, DeletionVector};
+use super::deletion_file_path;
 use super::object_reader::read_message;
-use super::{deletion_file_path, ReadBatchParams};
 use crate::dataset::ROW_ID;
-use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::format::{pb, Fragment, Index, Manifest, Metadata, PageTable};
 use crate::io::{
     object_reader::{read_fixed_stride_array, read_struct, ObjectReader},
@@ -209,7 +209,7 @@ impl FileReader {
     /// The session passed in is used to cache metadata about the file. If no session
     /// is passed in, there will be no caching.
     #[instrument(level = "debug", skip(object_store, manifest, session))]
-    pub(crate) async fn try_new_with_fragment(
+    pub async fn try_new_with_fragment(
         object_store: &ObjectStore,
         path: &Path,
         fragment_id: u64,
@@ -424,7 +424,8 @@ impl FileReader {
     }
 
     /// Open one Lance data file for read.
-    pub(crate) async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<Self> {
+    // TODO: make this crate(pub) once the migration to lance-core is done.
+    pub async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<Self> {
         Self::try_new_with_fragment(object_store, path, 0, None, None).await
     }
 
