@@ -28,15 +28,14 @@ use std::os::windows::fs::FileExt;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use object_store::path::Path;
-use snafu::location;
-use snafu::Location;
+use snafu::{location, Location};
 use tracing::instrument;
 
-use super::object_reader::ObjectReader;
+use crate::io::Reader;
 use crate::{Error, Result};
 
 /// Convert an [`object_store::path::Path`] to a [`std::path::Path`].
-pub(crate) fn to_local_path(path: &Path) -> String {
+pub fn to_local_path(path: &Path) -> String {
     if cfg!(windows) {
         path.to_string()
     } else {
@@ -45,7 +44,7 @@ pub(crate) fn to_local_path(path: &Path) -> String {
 }
 
 /// Recursively remove a directory, specified by [`object_store::path::Path`].
-pub(super) fn remove_dir_all(path: &Path) -> Result<()> {
+pub fn remove_dir_all(path: &Path) -> Result<()> {
     let local_path = to_local_path(path);
     std::fs::remove_dir_all(local_path)?;
     Ok(())
@@ -66,7 +65,7 @@ pub struct LocalObjectReader {
 impl LocalObjectReader {
     /// Open a local object reader, with default prefetch size.
     #[instrument(level = "debug")]
-    pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn ObjectReader>> {
+    pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn Reader>> {
         let local_path = to_local_path(path);
         let file = File::open(local_path).map_err(|e| match e.kind() {
             ErrorKind::NotFound => Error::NotFound {
@@ -87,7 +86,7 @@ impl LocalObjectReader {
 }
 
 #[async_trait]
-impl ObjectReader for LocalObjectReader {
+impl Reader for LocalObjectReader {
     fn path(&self) -> &Path {
         &self.path
     }

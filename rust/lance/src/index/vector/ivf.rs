@@ -31,7 +31,7 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
-use lance_core::io::{WriteExt, Writer};
+use lance_core::io::{local::to_local_path, Reader, WriteExt, Writer};
 use lance_index::vector::{
     pq::{PQBuildParams, ProductQuantizer},
     Query, RESIDUAL_COLUMN,
@@ -66,7 +66,7 @@ use crate::{
         Index,
     },
     io::RecordBatchStream,
-    io::{local::to_local_path, object_reader::ObjectReader, object_writer::ObjectWriter},
+    io::{object_reader::ObjectReader, object_writer::ObjectWriter},
     session::Session,
 };
 use crate::{Error, Result};
@@ -82,7 +82,7 @@ pub struct IVFIndex {
     /// Ivf model
     ivf: Ivf,
 
-    reader: Arc<dyn ObjectReader>,
+    reader: Arc<dyn Reader>,
 
     /// Index in each partition.
     sub_index: Arc<dyn VectorIndex>,
@@ -98,7 +98,7 @@ impl IVFIndex {
         session: Arc<Session>,
         uuid: &str,
         ivf: Ivf,
-        reader: Arc<dyn ObjectReader>,
+        reader: Arc<dyn Reader>,
         sub_index: Arc<dyn VectorIndex>,
         metric_type: MetricType,
     ) -> Result<Self> {
