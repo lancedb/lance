@@ -147,13 +147,10 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     /// ```rust
     /// use arrow_array::types::Utf8Type;
     /// use object_store::path::Path;
-    /// use lance::io::ObjectStore;
-    /// use lance::encodings::binary::BinaryDecoder;
+    /// use lance_core::{io::local::LocalObjectReader, encodings::binary::BinaryDecoder, io::Reader};
     ///
     /// async {
-    ///     let object_store = ObjectStore::memory();
-    ///     let path = Path::from("/data.lance");
-    ///     let reader = object_store.open(&path).await.unwrap();
+    ///     let reader = LocalObjectReader::open_local_path("/tmp/foo.lance", 2048).unwrap();
     ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), 100, 1024, true);
     /// };
     /// ```
@@ -520,7 +517,7 @@ mod tests {
 
     async fn test_round_trips<O: OffsetSizeTrait>(arrs: &[&GenericStringArray<O>]) {
         let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("/foo");
+        let path = temp_dir.path().join("foo");
 
         let pos = write_test_data(&path, arrs).await.unwrap();
 

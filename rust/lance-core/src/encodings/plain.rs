@@ -547,18 +547,20 @@ mod tests {
 
     async fn test_round_trip(expected: &[ArrayRef], data_type: DataType) {
         let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("/test_round_trip");
-        let mut writer = tokio::fs::File::create(&path).await.unwrap();
-        let mut encoder = PlainEncoder::new(&mut writer, &data_type);
+        let path = temp_dir.path().join("test_round_trip");
 
         let expected_as_array = expected
             .iter()
             .map(|e| e.as_ref())
             .collect::<Vec<&dyn Array>>();
-        assert_eq!(
-            encoder.encode(expected_as_array.as_slice()).await.unwrap(),
-            0
-        );
+        {
+            let mut writer = tokio::fs::File::create(&path).await.unwrap();
+            let mut encoder = PlainEncoder::new(&mut writer, &data_type);
+            assert_eq!(
+                encoder.encode(expected_as_array.as_slice()).await.unwrap(),
+                0
+            );
+        }
 
         let reader = LocalObjectReader::open_local_path(&path, 1024).unwrap();
         assert!(reader.size().await.unwrap() > 0);
@@ -672,12 +674,14 @@ mod tests {
     #[tokio::test]
     async fn test_decode_by_range() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("/decode_by_range");
+        let path = temp_dir.path().join("decode_by_range");
 
         let array = Int32Array::from_iter_values([0, 1, 2, 3, 4, 5]);
-        let mut writer = tokio::fs::File::create(&path).await.unwrap();
-        let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
-        assert_eq!(encoder.encode(&[&array]).await.unwrap(), 0);
+        {
+            let mut writer = tokio::fs::File::create(&path).await.unwrap();
+            let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
+            assert_eq!(encoder.encode(&[&array]).await.unwrap(), 0);
+        }
 
         let reader = LocalObjectReader::open_local_path(&path, 2048).unwrap();
         assert!(reader.size().await.unwrap() > 0);
