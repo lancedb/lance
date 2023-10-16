@@ -56,7 +56,7 @@ impl<'a> DictionaryEncoder<'a> {
     ) -> Result<usize> {
         assert!(!arrs.is_empty());
         let data_type = arrs[0].data_type();
-        let pos = self.writer.tell().await;
+        let pos = self.writer.tell().await?;
         let mut plain_encoder = PlainEncoder::new(self.writer, data_type);
 
         let keys = arrs

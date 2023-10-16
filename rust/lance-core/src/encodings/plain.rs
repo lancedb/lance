@@ -61,7 +61,7 @@ impl<'a> PlainEncoder<'a> {
 
     /// Write an continuous plain-encoded array to the writer.
     pub async fn write(writer: &'a mut dyn Writer, arrays: &[&'a dyn Array]) -> Result<usize> {
-        let pos = writer.tell().await;
+        let pos = writer.tell().await?;
         if !arrays.is_empty() {
             let mut encoder = Self::new(writer, arrays[0].data_type());
             encoder.encode(arrays).await?;
@@ -109,7 +109,7 @@ impl<'a> PlainEncoder<'a> {
     async fn encode_primitive(&mut self, arrays: &[&dyn Array]) -> Result<usize> {
         assert!(!arrays.is_empty());
         let data_type = arrays[0].data_type();
-        let offset = self.writer.tell().await;
+        let offset = self.writer.tell().await?;
 
         if matches!(data_type, DataType::Boolean) {
             let boolean_arr = arrays

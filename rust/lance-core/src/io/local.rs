@@ -164,7 +164,7 @@ fn read_exact_at(file: Arc<File>, mut buf: &mut [u8], mut offset: u64) -> std::i
 
 #[async_trait]
 impl Writer for tokio::fs::File {
-    async fn tell(&mut self) -> usize {
-        self.seek(SeekFrom::Current(0)).await.unwrap_or_default() as usize
+    async fn tell(&mut self) -> Result<usize> {
+        Ok(self.seek(SeekFrom::Current(0)).await? as usize)
     }
 }

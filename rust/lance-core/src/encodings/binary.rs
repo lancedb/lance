@@ -62,7 +62,7 @@ impl<'a> BinaryEncoder<'a> {
         let mut pos_builder: PrimitiveBuilder<Int64Type> =
             PrimitiveBuilder::with_capacity(capacity + 1);
 
-        let mut last_offset: usize = self.writer.tell().await;
+        let mut last_offset: usize = self.writer.tell().await?;
         pos_builder.append_value(last_offset as i64);
         for array in arrs.iter() {
             let arr = array
@@ -91,7 +91,7 @@ impl<'a> BinaryEncoder<'a> {
             last_offset = pos_builder.values_slice()[pos_builder.len() - 1] as usize;
         }
 
-        let positions_offset = self.writer.tell().await;
+        let positions_offset = self.writer.tell().await?;
         let pos_array = pos_builder.finish();
         self.writer
             .write_all(pos_array.to_data().buffers()[0].as_slice())
