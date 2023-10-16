@@ -55,7 +55,7 @@ arrow-row = "47.0"
 arrow-schema = "47.0"
 arrow-select = "47.0"
 async-recursion = "1.0"
-async-trait = "0.1.60"
+async-trait = "0.1"
 half = { "version" = "=2.2.1", default-features = false, features = [
     "num-traits",
 ] }
@@ -69,10 +69,11 @@ log = "0.4"
 num_cpus = "1.0"
 num-traits = "0.2"
 object_store = { version = "0.7.1", features = ["aws", "gcp", "azure"] }
+pin-project = "1.0"
 pprof = { version = "0.12", features = ["flamegraph", "criterion"] }
 prost = "0.10"
+prost-build = "0.11"
 prost-types = "0.10"
-pin-project = "1.0"
 rand = { version = "0.8.3", features = ["small_rng"] }
 serde = { version = "^1" }
 serde_json = { version = "1" }

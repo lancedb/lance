@@ -12,15 +12,23 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+lance-arrow.workspace = true
 arrow-array.workspace = true
+arrow-arith.workspace = true
+arrow-buffer.workspace = true
+arrow-cast.workspace = true
+arrow-data.workspace = true
 arrow-schema.workspace = true
+arrow-select.workspace = true
 async-trait.workspace = true
+async-recursion.workspace = true
 bytes.workspace = true
 datafusion-common.workspace = true
 datafusion-sql.workspace = true
 futures.workspace = true
-pin-project.workspace = true
 object_store.workspace = true
+pin-project.workspace = true
+prost-types.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,3 +36,10 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
+num_cpus.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true

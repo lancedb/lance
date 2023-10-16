@@ -21,10 +21,10 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use arrow_arith::numeric::sub;
-use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
-use arrow_array::cast::AsArray;
 use arrow_array::{
+    builder::{ArrayBuilder, PrimitiveBuilder},
     cast::as_primitive_array,
+    cast::AsArray,
     new_empty_array,
     types::{
         BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, UInt32Type, Utf8Type,
@@ -38,16 +38,14 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::io::Writer;
+use snafu::{location, Location};
 use tokio::io::AsyncWriteExt;
 
 use super::Encoder;
 use super::{plain::PlainDecoder, AsyncIndex};
 use crate::encodings::Decoder;
-use crate::error::Result;
-use crate::io::object_reader::ObjectReader;
-use crate::io::ReadBatchParams;
-use snafu::{location, Location};
+use crate::io::{ReadBatchParams, Reader, Writer};
+use crate::Result;
 
 /// Encoder for Var-binary encoding.
 pub struct BinaryEncoder<'a> {
@@ -124,7 +122,7 @@ impl<'a> Encoder for BinaryEncoder<'a> {
 
 /// Var-binary encoding decoder.
 pub struct BinaryDecoder<'a, T: ByteArrayType> {
-    reader: &'a dyn ObjectReader,
+    reader: &'a dyn Reader,
 
     position: usize,
 
@@ -159,12 +157,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), 100, 1024, true);
     /// };
     /// ```
-    pub fn new(
-        reader: &'a dyn ObjectReader,
-        position: usize,
-        length: usize,
-        nullable: bool,
-    ) -> Self {
+    pub fn new(reader: &'a dyn Reader, position: usize, length: usize, nullable: bool) -> Self {
         Self {
             reader,
             position,

@@ -22,33 +22,25 @@ use std::ptr::NonNull;
 use std::slice::from_raw_parts;
 use std::sync::Arc;
 
-use arrow::array::{as_boolean_array, BooleanBuilder};
 use arrow_arith::numeric::sub;
-use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    make_array, new_empty_array, Array, ArrayRef, BooleanArray, FixedSizeBinaryArray,
-    FixedSizeListArray, UInt32Array, UInt8Array,
+    builder::BooleanBuilder, cast::AsArray, make_array, new_empty_array, Array, ArrayRef,
+    BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, UInt32Array, UInt8Array,
 };
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
-use arrow_select::concat::concat;
-use arrow_select::take::take;
+use arrow_select::{concat::concat, take::take};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use lance_core::io::Writer;
+use lance_arrow::*;
 use snafu::{location, Location};
 use tokio::io::AsyncWriteExt;
 
-use crate::arrow::*;
-use crate::encodings::AsyncIndex;
-use crate::error::Result;
-use crate::io::object_reader::ObjectReader;
-use crate::io::ReadBatchParams;
-use crate::Error;
-
-use super::Decoder;
+use crate::encodings::{AsyncIndex, Decoder};
+use crate::io::{ReadBatchParams, Reader, Writer};
+use crate::{Error, Result};
 
 /// Parallelism factor decides how many run parallel I/O issued per CPU core.
 /// This is a heuristic value, with the assumption NVME and S3/GCS can
@@ -122,7 +114,7 @@ impl<'a> PlainEncoder<'a> {
         if matches!(data_type, DataType::Boolean) {
             let boolean_arr = arrays
                 .iter()
-                .map(|a| as_boolean_array(*a))
+                .map(|a| a.as_boolean())
                 .collect::<Vec<&BooleanArray>>();
             self.encode_boolean(boolean_arr.as_slice()).await?;
         } else {
@@ -178,7 +170,7 @@ impl<'a> PlainEncoder<'a> {
 
 /// Decoder for plain encoding.
 pub struct PlainDecoder<'a> {
-    reader: &'a dyn ObjectReader,
+    reader: &'a dyn Reader,
     data_type: &'a DataType,
     /// The start position of the batch in the file.
     position: usize,
@@ -197,7 +189,7 @@ fn get_byte_range(data_type: &DataType, row_range: Range<usize>) -> Range<usize>
 
 impl<'a> PlainDecoder<'a> {
     pub fn new(
-        reader: &'a dyn ObjectReader,
+        reader: &'a dyn Reader,
         data_type: &'a DataType,
         position: usize,
         length: usize,
@@ -342,9 +334,8 @@ impl<'a> PlainDecoder<'a> {
 
         let arrays = stream::iter(chunk_ranges)
             .map(|cr| async move {
-                let index_chunk = indices.slice(cr.start as usize, cr.len());
+                let request = indices.slice(cr.start as usize, cr.len());
                 // request contains the array indices we are retrieving in this chunk.
-                let request: &UInt32Array = as_primitive_array(&index_chunk);
 
                 // Get the starting index
                 let start = request.value(0);
@@ -352,7 +343,7 @@ impl<'a> PlainDecoder<'a> {
                 let end = request.value(request.len() - 1);
                 let array = self.get(start as usize..end as usize + 1).await?;
 
-                let shifted_indices = sub(request, &UInt32Array::new_scalar(start))?;
+                let shifted_indices = sub(&request, &UInt32Array::new_scalar(start))?;
                 Ok::<ArrayRef, Error>(take(&array, &shifted_indices, None)?)
             })
             .buffered(num_cpus::get())
@@ -409,13 +400,12 @@ impl<'a> Decoder for PlainDecoder<'a> {
 
         let arrays = stream::iter(chunked_ranges)
             .map(|cr| async move {
-                let index_chunk = indices.slice(cr.start, cr.len());
-                let request: &UInt32Array = as_primitive_array(&index_chunk);
+                let request = indices.slice(cr.start, cr.len());
 
                 let start = request.value(0);
                 let end = request.value(request.len() - 1);
                 let array = self.get(start as usize..end as usize + 1).await?;
-                let adjusted_offsets = sub(request, &UInt32Array::new_scalar(start))?;
+                let adjusted_offsets = sub(&request, &UInt32Array::new_scalar(start))?;
                 Ok::<ArrayRef, Error>(take(&array, &adjusted_offsets, None)?)
             })
             .buffered(num_cpus::get() * PARALLELISM_FACTOR)
@@ -511,7 +501,6 @@ mod tests {
     use object_store::path::Path;
     use rand::prelude::*;
 
-    use crate::datatypes::Schema;
     use crate::io::object_writer::ObjectWriter;
     use crate::io::{FileReader, FileWriter, ObjectStore};
 

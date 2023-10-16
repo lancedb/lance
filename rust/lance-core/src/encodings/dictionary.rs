@@ -29,7 +29,6 @@ use arrow_array::types::{
 use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray, UInt32Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use lance_core::io::Writer;
 use snafu::{location, Location};
 
 use super::plain::PlainEncoder;
@@ -37,7 +36,7 @@ use super::AsyncIndex;
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::{Decoder, Encoder};
 use crate::error::Result;
-use crate::io::{object_reader::ObjectReader, ReadBatchParams};
+use crate::io::{ReadBatchParams, Reader, Writer};
 use crate::Error;
 
 /// Encoder for Dictionary encoding.
@@ -100,7 +99,7 @@ impl<'a> Encoder for DictionaryEncoder<'a> {
 
 /// Decoder for Dictionary encoding.
 pub struct DictionaryDecoder<'a> {
-    reader: &'a dyn ObjectReader,
+    reader: &'a dyn Reader,
     /// The start position of the key array in the file.
     position: usize,
     /// Number of the rows in this batch.
@@ -124,7 +123,7 @@ impl fmt::Debug for DictionaryDecoder<'_> {
 
 impl<'a> DictionaryDecoder<'a> {
     pub fn new(
-        reader: &'a dyn ObjectReader,
+        reader: &'a dyn Reader,
         position: usize,
         length: usize,
         data_type: &'a DataType,

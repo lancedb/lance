@@ -30,8 +30,8 @@ arrow-ord = { workspace = true }
 arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
-async-recursion = "1.0"
-async-trait = "0.1.60"
+async-recursion.workspace = true
+async-trait.workspace = true
 byteorder = "1.4.3"
 bytes.workspace = true
 chrono = "0.4.23"
@@ -98,7 +98,7 @@ openblas-src = { version = "0.10.8", default-features = false, features = [
 ], optional = true }
 
 [build-dependencies]
-prost-build = "0.11"
+prost-build.workspace = true
 
 [dev-dependencies]
 lance-test-macros = { workspace = true }
