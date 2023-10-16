@@ -32,6 +32,7 @@ import numpy as np
 import pyarrow as pa
 import tensorflow as tf
 from lance import LanceDataset
+from lance.arrow import EncodedImageType, FixedShapeImageTensorType, ImageURIType
 from lance.fragment import FragmentMetadata, LanceFragment
 
 
@@ -100,6 +101,12 @@ def data_type_to_tensor_spec(dt: pa.DataType) -> tf.TensorSpec:
         )
     elif pa.types.is_struct(dt):
         return {field.name: data_type_to_tensor_spec(field.type) for field in dt}
+    elif isinstance(dt, (EncodedImageType, ImageURIType)):
+        return tf.TensorSpec(shape=(None,), dtype=tf.string)
+    elif isinstance(dt, FixedShapeImageTensorType):
+        return tf.TensorSpec(
+            shape=(None, *dt.shape), dtype=arrow_data_type_to_tf(dt.arrow_type)
+        )
 
     raise TypeError("Unsupported data type: ", dt)
 
