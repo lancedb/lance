@@ -26,15 +26,16 @@ use arrow_array::{
 use arrow_schema::{DataType, Field as ArrowField};
 use async_recursion::async_recursion;
 use lance_arrow::*;
-use lance_core::{
+use snafu::{location, Location};
+
+
+use crate::{
+    format::pb,
     encodings::Encoding,
     io::{read_binary_array, read_fixed_stride_array, Reader},
     Error, Result,
 };
-use snafu::{location, Location};
-
 use super::{Dictionary, LogicalType};
-use crate::format::pb;
 
 /// Lance Schema Field
 ///
@@ -85,7 +86,7 @@ impl Field {
 
     /// Attach the Dictionary's value array, so that we can later serialize
     /// the dictionary to the manifest.
-    pub(crate) fn set_dictionary_values(&mut self, arr: &ArrayRef) {
+    pub fn set_dictionary_values(&mut self, arr: &ArrayRef) {
         assert!(self.data_type().is_dictionary());
         // offset / length are set to 0 and recomputed when the dictionary is persisted to disk
         self.dictionary = Some(Dictionary {
@@ -95,7 +96,7 @@ impl Field {
         });
     }
 
-    pub(super) fn set_dictionary(&mut self, arr: &ArrayRef) {
+    pub fn set_dictionary(&mut self, arr: &ArrayRef) {
         let data_type = self.data_type();
         match data_type {
             DataType::Dictionary(key_type, _) => match key_type.as_ref() {
@@ -152,7 +153,7 @@ impl Field {
         }
     }
 
-    pub(super) fn sub_field(&self, path_components: &[&str]) -> Option<&Self> {
+    pub fn sub_field(&self, path_components: &[&str]) -> Option<&Self> {
         if path_components.is_empty() {
             Some(self)
         } else {
@@ -164,7 +165,7 @@ impl Field {
         }
     }
 
-    pub(crate) fn project(&self, path_components: &[&str]) -> Result<Self> {
+    pub fn project(&self, path_components: &[&str]) -> Result<Self> {
         let mut f = Self {
             name: self.name.clone(),
             id: self.id,
@@ -198,7 +199,7 @@ impl Field {
     /// it does not match the filter.
     ///
     /// Returns None if the field itself does not match the filter.
-    pub(crate) fn project_by_filter<F: Fn(&Self) -> bool>(&self, filter: &F) -> Option<Self> {
+    pub fn project_by_filter<F: Fn(&Self) -> bool>(&self, filter: &F) -> Option<Self> {
         let children = self
             .children
             .iter()
@@ -223,7 +224,7 @@ impl Field {
 
     /// Project by a field.
     ///
-    pub(super) fn project_by_field(&self, other: &Self) -> Result<Self> {
+    pub fn project_by_field(&self, other: &Self) -> Result<Self> {
         if self.name != other.name {
             return Err(Error::Schema {
                 message: format!(
@@ -303,7 +304,7 @@ impl Field {
 
     /// Intersection of two [`Field`]s.
     ///
-    pub(super) fn intersection(&self, other: &Self) -> Result<Self> {
+    pub fn intersection(&self, other: &Self) -> Result<Self> {
         if self.name != other.name {
             return Err(Error::Arrow {
                 message: format!(
@@ -353,7 +354,7 @@ impl Field {
         Ok(self.clone())
     }
 
-    pub(super) fn exclude(&self, other: &Self) -> Option<Self> {
+    pub fn exclude(&self, other: &Self) -> Option<Self> {
         if !self.data_type().is_nested() {
             return None;
         }
@@ -455,7 +456,7 @@ impl Field {
         self.children.iter_mut().for_each(Self::reset_id);
     }
 
-    pub(crate) fn field_by_id(&self, id: impl Into<i32>) -> Option<&Self> {
+    pub fn field_by_id(&self, id: impl Into<i32>) -> Option<&Self> {
         let id = id.into();
         for child in self.children.as_slice() {
             if child.id == id {
@@ -483,7 +484,7 @@ impl Field {
     }
 
     #[async_recursion]
-    pub(super) async fn load_dictionary<'a>(&mut self, reader: &dyn Reader) -> Result<()> {
+    pub async fn load_dictionary<'a>(&mut self, reader: &dyn Reader) -> Result<()> {
         if let DataType::Dictionary(_, value_type) = self.data_type() {
             assert!(self.dictionary.is_some());
             if let Some(dict_info) = self.dictionary.as_mut() {

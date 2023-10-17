@@ -14,8 +14,7 @@
 
 //! Lance data types, [Schema] and [Field]
 
-use std::fmt::{self};
-use std::fmt::{Debug, Formatter};
+use std::fmt::{Debug, Formatter, self};
 use std::sync::Arc;
 
 use arrow_array::ArrayRef;
@@ -335,7 +334,7 @@ impl From<&Dictionary> for pb::Dictionary {
 }
 
 /// Returns true if Lance supports writing this datatype with nulls.
-pub(crate) fn lance_supports_nulls(datatype: &DataType) -> bool {
+pub fn lance_supports_nulls(datatype: &DataType) -> bool {
     matches!(
         datatype,
         DataType::Utf8

@@ -22,10 +22,10 @@ use std::{
 use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use snafu::{location, Location};
+use lance_arrow::*;
 
 use super::field::Field;
-use crate::arrow::*;
-use crate::{format::pb, io::object_reader::ObjectReader, Error, Result};
+use crate::{format::pb, io::Reader, Error, Result};
 
 /// Lance Schema.
 #[derive(Default, Debug, Clone)]
@@ -42,6 +42,7 @@ struct SchemaFieldIterPreOrder<'a> {
 }
 
 impl<'a> SchemaFieldIterPreOrder<'a> {
+    #[allow(dead_code)]
     fn new(schema: &'a Schema) -> Self {
         let mut field_stack = Vec::new();
         field_stack.reserve(schema.fields.len() * 2);
@@ -258,7 +259,7 @@ impl Schema {
     }
 
     /// Load dictionary value array from manifest files.
-    pub(crate) async fn load_dictionary<'a>(&mut self, reader: &dyn ObjectReader) -> Result<()> {
+    pub(crate) async fn load_dictionary<'a>(&mut self, reader: &dyn Reader) -> Result<()> {
         for field in self.fields.as_mut_slice() {
             field.load_dictionary(reader).await?;
         }
