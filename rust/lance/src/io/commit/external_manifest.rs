@@ -30,8 +30,8 @@ use crate::io::ObjectStore;
 use crate::{Error, Result};
 
 use super::{
-    current_manifest_path, make_staging_manifest_path, manifest_path, write_latest_manifest,
-    MANIFEST_EXTENSION,
+    current_manifest_path, make_staging_manifest_path, manifest_path, parse_version_from_path,
+    write_latest_manifest, MANIFEST_EXTENSION,
 };
 
 /// External manifest store
@@ -121,6 +121,22 @@ impl CommitHandler for ExternalManifestCommitHandler {
             // Dataset not found in the external store, this could be because the dataset did not
             // use external store for commit before. In this case, we search for the latest manifest
             None => current_manifest_path(object_store, base_path).await,
+        }
+    }
+
+    async fn resolve_latest_version_id(
+        &self,
+        base_path: &Path,
+        object_store: &ObjectStore,
+    ) -> std::result::Result<u64, crate::Error> {
+        let version = self
+            .external_manifest_store
+            .get_latest_version(base_path.as_ref())
+            .await?;
+
+        match version {
+            Some((version, _)) => Ok(version),
+            None => parse_version_from_path(&current_manifest_path(object_store, base_path).await?),
         }
     }
 

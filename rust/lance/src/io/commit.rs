@@ -164,6 +164,16 @@ async fn write_latest_manifest(
     Ok(())
 }
 
+fn parse_version_from_path(path: &Path) -> Result<u64> {
+    path.filename()
+        .and_then(|name| name.split_once('.'))
+        .filter(|(_, extension)| *extension == "manifest")
+        .and_then(|(version, _)| version.parse::<u64>().ok())
+        .ok_or(crate::Error::Internal {
+            message: format!("Expected manifest file, but found {}", path),
+        })
+}
+
 /// Handle commits that prevent conflicting writes.
 ///
 /// Commit implementations ensure that if there are multiple concurrent writers
@@ -180,6 +190,17 @@ pub(crate) trait CommitHandler: Debug + Send + Sync {
     ) -> std::result::Result<Path, crate::Error> {
         // TODO: we need to pade 0's to the version number on the manifest file path
         Ok(current_manifest_path(object_store, base_path).await?)
+    }
+
+    // for default implementation, parse the version from the path
+    async fn resolve_latest_version_id(
+        &self,
+        base_path: &Path,
+        object_store: &ObjectStore,
+    ) -> std::result::Result<u64, crate::Error> {
+        let path = self.resolve_latest_version(base_path, object_store).await?;
+
+        parse_version_from_path(&path)
     }
 
     /// Get the path to a specific versioned manifest of a dataset at the base_path
