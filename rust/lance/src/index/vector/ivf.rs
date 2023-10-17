@@ -1404,7 +1404,7 @@ mod tests {
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
 
         let index_meta = crate::format::Index {
-            uuid: uuid.clone(),
+            uuid,
             dataset_version: 0,
             fields: Vec::new(),
             name: INDEX_NAME.to_string(),
