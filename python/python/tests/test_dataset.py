@@ -151,6 +151,25 @@ def test_versions(tmp_path: Path):
     assert isinstance(v2["metadata"], dict)
 
 
+def test_version_id(tmp_path: Path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+    base_dir = tmp_path / "test"
+    original_ds = lance.write_dataset(table1, base_dir)
+
+    assert original_ds.version == 1
+    assert original_ds.latest_version == 1
+
+    table2 = pa.Table.from_pylist([{"s": "one"}, {"s": "two"}])
+    time.sleep(1)
+    updated_ds = lance.write_dataset(table2, base_dir, mode="overwrite")
+
+    assert original_ds.version == 1
+    assert original_ds.latest_version == 2
+
+    assert updated_ds.version == 2
+    assert updated_ds.latest_version == 2
+
+
 def test_asof_checkout(tmp_path: Path):
     table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
     base_dir = tmp_path / "test"

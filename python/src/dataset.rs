@@ -497,6 +497,11 @@ impl Dataset {
         Ok(self.ds.version().version)
     }
 
+    fn latest_version(self_: PyRef<'_, Self>) -> PyResult<u64> {
+        RT.block_on(Some(self_.py()), self_.ds.latest_version_id())
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
     /// Restore the current version
     fn restore(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();

@@ -590,6 +590,13 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.version()
 
+    @property
+    def latest_version(self) -> int:
+        """
+        Returns the lastest version of the dataset
+        """
+        return self._ds.latest_version()
+
     def restore(self):
         """
         Restore the currently checked out version as the latest version of the dataset.

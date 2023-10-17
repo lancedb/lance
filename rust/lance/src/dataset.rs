@@ -1163,6 +1163,16 @@ impl Dataset {
         Ok(versions)
     }
 
+    /// Get the latest version of the dataset
+    /// This is meant to be a fast path for checking if a dataset has changed. This is why
+    /// we don't return the full version struct.
+    pub async fn latest_version_id(&self) -> Result<u64> {
+        self.object_store
+            .commit_handler
+            .resolve_latest_version_id(&self.base, &self.object_store)
+            .await
+    }
+
     pub fn schema(&self) -> &Schema {
         &self.manifest.schema
     }
