@@ -126,6 +126,8 @@ def column_to_tensor(array: pa.Array, tensor_spec: tf.TensorSpec) -> tf.Tensor:
         return tf.ragged.constant(array.to_pylist(), dtype=tensor_spec.dtype)
     elif isinstance(array.type, pa.FixedShapeTensorType):
         return tf.constant(array.to_numpy_ndarray(), dtype=tensor_spec.dtype)
+    elif isinstance(array.type, FixedShapeImageTensorType):
+        return tf.constant(array.to_numpy(), dtype=tensor_spec.dtype)
     elif isinstance(array.type, pa.StructType):
         return {
             field.name: column_to_tensor(array.field(i), tensor_spec[field.name])
