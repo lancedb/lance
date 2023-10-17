@@ -15,9 +15,7 @@
 //! I/O utilities.
 
 use std::io::{Error, ErrorKind, Result};
-use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
-use arrow_array::UInt32Array;
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use prost::bytes::Bytes;
@@ -27,7 +25,6 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 pub mod commit;
 pub(crate) mod deletion;
 pub(crate) mod exec;
-pub mod local;
 pub mod object_reader;
 pub mod object_store;
 pub mod object_writer;
@@ -38,9 +35,9 @@ use crate::format::{ProtoStruct, INDEX_MAGIC, MAGIC};
 
 pub use self::object_store::ObjectStore;
 pub use deletion::deletion_file_path;
+pub use lance_core::io::local;
 pub use lance_core::io::RecordBatchStream;
-pub use reader::read_manifest;
-pub use reader::FileReader;
+pub use reader::{read_manifest, FileReader};
 pub use writer::*;
 
 #[async_trait]
@@ -82,67 +79,4 @@ pub fn read_struct_from_buf<M: Message + Default, T: ProtoStruct<Proto = M> + Fr
 ) -> Result<T> {
     let msg: M = read_message_from_buf(buf)?;
     Ok(T::from(msg))
-}
-
-/// Parameter to be used to read a batch.
-#[derive(Debug, Clone)]
-pub(crate) enum ReadBatchParams {
-    Range(Range<usize>),
-
-    RangeFull,
-
-    RangeTo(RangeTo<usize>),
-
-    RangeFrom(RangeFrom<usize>),
-
-    Indices(UInt32Array),
-}
-
-/// Default of ReadBatchParams is reading the full batch.
-impl Default for ReadBatchParams {
-    fn default() -> Self {
-        Self::RangeFull
-    }
-}
-
-impl From<&[u32]> for ReadBatchParams {
-    fn from(value: &[u32]) -> Self {
-        Self::Indices(UInt32Array::from_iter_values(value.iter().copied()))
-    }
-}
-
-impl From<UInt32Array> for ReadBatchParams {
-    fn from(value: UInt32Array) -> Self {
-        Self::Indices(value)
-    }
-}
-
-impl From<RangeFull> for ReadBatchParams {
-    fn from(_: RangeFull) -> Self {
-        Self::RangeFull
-    }
-}
-
-impl From<Range<usize>> for ReadBatchParams {
-    fn from(r: Range<usize>) -> Self {
-        Self::Range(r)
-    }
-}
-
-impl From<RangeTo<usize>> for ReadBatchParams {
-    fn from(r: RangeTo<usize>) -> Self {
-        Self::RangeTo(r)
-    }
-}
-
-impl From<RangeFrom<usize>> for ReadBatchParams {
-    fn from(r: RangeFrom<usize>) -> Self {
-        Self::RangeFrom(r)
-    }
-}
-
-impl From<&Self> for ReadBatchParams {
-    fn from(params: &Self) -> Self {
-        params.clone()
-    }
 }

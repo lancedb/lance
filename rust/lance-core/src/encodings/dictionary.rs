@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Dictionary encoding.
 //!
@@ -29,7 +26,6 @@ use arrow_array::types::{
 use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray, UInt32Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use lance_core::io::Writer;
 use snafu::{location, Location};
 
 use super::plain::PlainEncoder;
@@ -37,7 +33,7 @@ use super::AsyncIndex;
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::{Decoder, Encoder};
 use crate::error::Result;
-use crate::io::{object_reader::ObjectReader, ReadBatchParams};
+use crate::io::{ReadBatchParams, Reader, Writer};
 use crate::Error;
 
 /// Encoder for Dictionary encoding.
@@ -57,7 +53,7 @@ impl<'a> DictionaryEncoder<'a> {
     ) -> Result<usize> {
         assert!(!arrs.is_empty());
         let data_type = arrs[0].data_type();
-        let pos = self.writer.tell();
+        let pos = self.writer.tell().await?;
         let mut plain_encoder = PlainEncoder::new(self.writer, data_type);
 
         let keys = arrs
@@ -100,7 +96,7 @@ impl<'a> Encoder for DictionaryEncoder<'a> {
 
 /// Decoder for Dictionary encoding.
 pub struct DictionaryDecoder<'a> {
-    reader: &'a dyn ObjectReader,
+    reader: &'a dyn Reader,
     /// The start position of the key array in the file.
     position: usize,
     /// Number of the rows in this batch.
@@ -124,7 +120,7 @@ impl fmt::Debug for DictionaryDecoder<'_> {
 
 impl<'a> DictionaryDecoder<'a> {
     pub fn new(
-        reader: &'a dyn ObjectReader,
+        reader: &'a dyn Reader,
         position: usize,
         length: usize,
         data_type: &'a DataType,
@@ -217,13 +213,10 @@ impl<'a> AsyncIndex<ReadBatchParams> for DictionaryDecoder<'a> {
 mod tests {
     use super::*;
 
-    use crate::{
-        encodings::plain::PlainEncoder,
-        io::{object_writer::ObjectWriter, ObjectStore},
-    };
+    use crate::encodings::plain::PlainEncoder;
+    use crate::io::local::LocalObjectReader;
     use arrow_array::{Array, StringArray};
     use arrow_buffer::ArrowNativeType;
-    use object_store::path::Path;
 
     async fn test_dict_decoder_for_type<T: ArrowDictionaryKeyType>() {
         let value_array: StringArray = vec![Some("a"), Some("b"), Some("c"), Some("d")]
@@ -247,18 +240,17 @@ mod tests {
         let keys2_ref = arr2.keys() as &dyn Array;
         let arrs: Vec<&dyn Array> = vec![keys1_ref, keys2_ref];
 
-        let store = ObjectStore::memory();
-        let path = Path::from("/foo");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("foo");
 
         let pos;
         {
-            let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
+            let mut object_writer = tokio::fs::File::create(&path).await.unwrap();
             let mut encoder = PlainEncoder::new(&mut object_writer, arr1.keys().data_type());
             pos = encoder.encode(arrs.as_slice()).await.unwrap();
-            object_writer.shutdown().await.unwrap();
         }
 
-        let reader = store.open(&path).await.unwrap();
+        let reader = LocalObjectReader::open_local_path(&path, 2048).unwrap();
         let decoder = DictionaryDecoder::new(
             reader.as_ref(),
             pos,

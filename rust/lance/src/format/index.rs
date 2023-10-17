@@ -21,8 +21,10 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::*;
+
 use crate::dataset::Dataset;
-use crate::Error;
+use crate::{Error, Result};
+use lance_core::format::pb;
 use snafu::{location, Location};
 
 /// Index metadata
@@ -132,11 +134,11 @@ impl From<&Index> for pb::IndexMetadata {
         }
     }
 }
-
-impl From<&Vec<Index>> for pb::IndexSection {
-    fn from(indices: &Vec<Index>) -> Self {
-        Self {
-            indices: indices.iter().map(pb::IndexMetadata::from).collect(),
-        }
-    }
-}
+//
+// impl From<&Vec<Index>> for pb::IndexSection {
+//     fn from(indices: &Vec<Index>) -> Self {
+//         Self {
+//             indices: indices.iter().map(pb::IndexMetadata::from).collect(),
+//         }
+//     }
+// }

@@ -27,12 +27,11 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
-use lance_core::io::Reader;
+use lance_core::io::{ReadBatchParams, Reader};
 use object_store::path::Path;
 use prost::Message;
 use snafu::{location, Location};
 
-use super::ReadBatchParams;
 use crate::arrow::*;
 use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, AsyncIndex, Decoder};
 use crate::error::{Error, Result};

@@ -21,10 +21,10 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use arrow_arith::numeric::sub;
-use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
-use arrow_array::cast::AsArray;
 use arrow_array::{
+    builder::{ArrayBuilder, PrimitiveBuilder},
     cast::as_primitive_array,
+    cast::AsArray,
     new_empty_array,
     types::{
         BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, UInt32Type, Utf8Type,
@@ -38,16 +38,12 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::io::Writer;
+use snafu::{location, Location};
 use tokio::io::AsyncWriteExt;
 
-use super::Encoder;
-use super::{plain::PlainDecoder, AsyncIndex};
-use crate::encodings::Decoder;
-use crate::error::Result;
-use crate::io::object_reader::ObjectReader;
-use crate::io::ReadBatchParams;
-use snafu::{location, Location};
+use super::{plain::PlainDecoder, AsyncIndex, Decoder, Encoder};
+use crate::io::{ReadBatchParams, Reader, Writer};
+use crate::Result;
 
 /// Encoder for Var-binary encoding.
 pub struct BinaryEncoder<'a> {
@@ -64,7 +60,7 @@ impl<'a> BinaryEncoder<'a> {
         let mut pos_builder: PrimitiveBuilder<Int64Type> =
             PrimitiveBuilder::with_capacity(capacity + 1);
 
-        let mut last_offset: usize = self.writer.tell();
+        let mut last_offset: usize = self.writer.tell().await?;
         pos_builder.append_value(last_offset as i64);
         for array in arrs.iter() {
             let arr = array
@@ -93,7 +89,7 @@ impl<'a> BinaryEncoder<'a> {
             last_offset = pos_builder.values_slice()[pos_builder.len() - 1] as usize;
         }
 
-        let positions_offset = self.writer.tell();
+        let positions_offset = self.writer.tell().await?;
         let pos_array = pos_builder.finish();
         self.writer
             .write_all(pos_array.to_data().buffers()[0].as_slice())
@@ -124,7 +120,7 @@ impl<'a> Encoder for BinaryEncoder<'a> {
 
 /// Var-binary encoding decoder.
 pub struct BinaryDecoder<'a, T: ByteArrayType> {
-    reader: &'a dyn ObjectReader,
+    reader: &'a dyn Reader,
 
     position: usize,
 
@@ -149,22 +145,14 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     /// ```rust
     /// use arrow_array::types::Utf8Type;
     /// use object_store::path::Path;
-    /// use lance::io::ObjectStore;
-    /// use lance::encodings::binary::BinaryDecoder;
+    /// use lance_core::{io::local::LocalObjectReader, encodings::binary::BinaryDecoder, io::Reader};
     ///
     /// async {
-    ///     let object_store = ObjectStore::memory();
-    ///     let path = Path::from("/data.lance");
-    ///     let reader = object_store.open(&path).await.unwrap();
+    ///     let reader = LocalObjectReader::open_local_path("/tmp/foo.lance", 2048).unwrap();
     ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), 100, 1024, true);
     /// };
     /// ```
-    pub fn new(
-        reader: &'a dyn ObjectReader,
-        position: usize,
-        length: usize,
-        nullable: bool,
-    ) -> Self {
+    pub fn new(reader: &'a dyn Reader, position: usize, length: usize, nullable: bool) -> Self {
         Self {
             reader,
             position,
@@ -500,38 +488,36 @@ impl<'a, T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_select::concat::concat;
 
     use arrow_array::{
         cast::AsArray, new_empty_array, types::GenericStringType, BinaryArray, GenericStringArray,
         LargeStringArray, OffsetSizeTrait, StringArray,
     };
-    use object_store::path::Path;
+    use arrow_select::concat::concat;
 
-    use crate::io::object_writer::ObjectWriter;
-    use crate::io::ObjectStore;
+    use crate::io::local::LocalObjectReader;
 
     async fn write_test_data<O: OffsetSizeTrait>(
-        store: &ObjectStore,
-        path: &Path,
+        path: impl AsRef<std::path::Path>,
         arr: &[&GenericStringArray<O>],
     ) -> Result<usize> {
-        let mut object_writer = ObjectWriter::new(store, path).await.unwrap();
+        let mut writer = tokio::fs::File::create(path).await?;
         // Write some garbage to reset "tell()".
-        object_writer.write_all(b"1234").await.unwrap();
-        let mut encoder = BinaryEncoder::new(&mut object_writer);
+        writer.write_all(b"1234").await.unwrap();
+        let mut encoder = BinaryEncoder::new(&mut writer);
 
         let arrs = arr.iter().map(|a| a as &dyn Array).collect::<Vec<_>>();
         let pos = encoder.encode(arrs.as_slice()).await.unwrap();
-        object_writer.shutdown().await.unwrap();
         Ok(pos)
     }
 
     async fn test_round_trips<O: OffsetSizeTrait>(arrs: &[&GenericStringArray<O>]) {
-        let store = ObjectStore::memory();
-        let path = Path::from("/foo");
-        let pos = write_test_data(&store, &path, arrs).await.unwrap();
-        let reader = store.open(&path).await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("foo");
+
+        let pos = write_test_data(&path, arrs).await.unwrap();
+
+        let reader = LocalObjectReader::open_local_path(&path, 1024).unwrap();
         let read_len = arrs.iter().map(|a| a.len()).sum();
         let decoder =
             BinaryDecoder::<GenericStringType<O>>::new(reader.as_ref(), pos, read_len, true);
@@ -587,16 +573,17 @@ mod tests {
     async fn test_range_query() {
         let data = StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"]);
 
-        let store = ObjectStore::memory();
-        let path = Path::from("/foo");
-        let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("foo");
+        let mut object_writer = tokio::fs::File::create(&path).await.unwrap();
+
         // Write some gabage to reset "tell()".
         object_writer.write_all(b"1234").await.unwrap();
         let mut encoder = BinaryEncoder::new(&mut object_writer);
         let pos = encoder.encode(&[&data]).await.unwrap();
         object_writer.shutdown().await.unwrap();
 
-        let reader = store.open(&path).await.unwrap();
+        let reader = LocalObjectReader::open_local_path(&path, 1024).unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
         assert_eq!(
             decoder.decode().await.unwrap().as_ref(),
@@ -633,11 +620,11 @@ mod tests {
     async fn test_take() {
         let data = StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"]);
 
-        let store = ObjectStore::memory();
-        let path = Path::from("/foo");
-        let pos = write_test_data(&store, &path, &[&data]).await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("foo");
 
-        let reader = store.open(&path).await.unwrap();
+        let pos = write_test_data(&path, &[&data]).await.unwrap();
+        let reader = LocalObjectReader::open_local_path(&path, 1024).unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
 
         let actual = decoder
@@ -654,11 +641,10 @@ mod tests {
     async fn test_take_sparse_indices() {
         let data = StringArray::from_iter_values((0..1000000).map(|v| format!("string-{v}")));
 
-        let store = ObjectStore::memory();
-        let path = Path::from("/foo");
-        let pos = write_test_data(&store, &path, &[&data]).await.unwrap();
-
-        let reader = store.open(&path).await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("foo");
+        let pos = write_test_data(&path, &[&data]).await.unwrap();
+        let reader = LocalObjectReader::open_local_path(&path, 1024).unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
 
         let positions = decoder.get_positions(1..999998).await.unwrap();
@@ -683,11 +669,11 @@ mod tests {
     async fn test_take_dense_indices() {
         let data = StringArray::from_iter_values((0..1000000).map(|v| format!("string-{v}")));
 
-        let store = ObjectStore::memory();
-        let path = Path::from("/bar");
-        let pos = write_test_data(&store, &path, &[&data]).await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("foo");
+        let pos = write_test_data(&path, &[&data]).await.unwrap();
 
-        let reader = store.open(&path).await.unwrap();
+        let reader = LocalObjectReader::open_local_path(&path, 1024).unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
 
         let positions = decoder.get_positions(1..999998).await.unwrap();
@@ -728,11 +714,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_slice() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("slices");
         let data = StringArray::from_iter_values((0..100).map(|v| format!("abcdef-{v:#03}")));
-        let store = ObjectStore::memory();
-        let path = Path::from("/slices");
 
-        let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
+        let mut object_writer = tokio::fs::File::create(&path).await.unwrap();
         let mut encoder = BinaryEncoder::new(&mut object_writer);
         for i in 0..10 {
             let pos = encoder.encode(&[&data.slice(i * 10, 10)]).await.unwrap();
@@ -749,19 +735,21 @@ mod tests {
                 None
             }
         }));
-        let store = ObjectStore::memory();
-        let path = Path::from("/slices");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("nulls");
 
-        let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
-        // Write some garbage to reset "tell()".
-        object_writer.write_all(b"1234").await.unwrap();
-        let mut encoder = BinaryEncoder::new(&mut object_writer);
+        let pos = {
+            let mut object_writer = tokio::fs::File::create(&path).await.unwrap();
 
-        // let arrs = arr.iter().map(|a| a as &dyn Array).collect::<Vec<_>>();
-        let pos = encoder.encode(&[&data]).await.unwrap();
-        object_writer.shutdown().await.unwrap();
+            // Write some garbage to reset "tell()".
+            object_writer.write_all(b"1234").await.unwrap();
+            let mut encoder = BinaryEncoder::new(&mut object_writer);
 
-        let reader = store.open(&path).await.unwrap();
+            // let arrs = arr.iter().map(|a| a as &dyn Array).collect::<Vec<_>>();
+            encoder.encode(&[&data]).await.unwrap()
+        };
+
+        let reader = LocalObjectReader::open_local_path(&path, 1024).unwrap();
         let decoder = BinaryDecoder::<BinaryType>::new(reader.as_ref(), pos, data.len(), true);
         let idx = UInt32Array::from(vec![0_u32, 5_u32, 59996_u32]);
         let actual = decoder.take(&idx).await.unwrap();

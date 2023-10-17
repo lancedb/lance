@@ -12,8 +12,76 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
+
+use arrow_array::UInt32Array;
+
+pub mod local;
 mod stream;
 mod traits;
 
 pub use stream::{RecordBatchStream, RecordBatchStreamAdapter};
 pub use traits::*;
+
+/// Parameter to be used to read a batch.
+#[derive(Debug, Clone)]
+pub enum ReadBatchParams {
+    Range(Range<usize>),
+
+    RangeFull,
+
+    RangeTo(RangeTo<usize>),
+
+    RangeFrom(RangeFrom<usize>),
+
+    Indices(UInt32Array),
+}
+
+/// Default of ReadBatchParams is reading the full batch.
+impl Default for ReadBatchParams {
+    fn default() -> Self {
+        Self::RangeFull
+    }
+}
+
+impl From<&[u32]> for ReadBatchParams {
+    fn from(value: &[u32]) -> Self {
+        Self::Indices(UInt32Array::from_iter_values(value.iter().copied()))
+    }
+}
+
+impl From<UInt32Array> for ReadBatchParams {
+    fn from(value: UInt32Array) -> Self {
+        Self::Indices(value)
+    }
+}
+
+impl From<RangeFull> for ReadBatchParams {
+    fn from(_: RangeFull) -> Self {
+        Self::RangeFull
+    }
+}
+
+impl From<Range<usize>> for ReadBatchParams {
+    fn from(r: Range<usize>) -> Self {
+        Self::Range(r)
+    }
+}
+
+impl From<RangeTo<usize>> for ReadBatchParams {
+    fn from(r: RangeTo<usize>) -> Self {
+        Self::RangeTo(r)
+    }
+}
+
+impl From<RangeFrom<usize>> for ReadBatchParams {
+    fn from(r: RangeFrom<usize>) -> Self {
+        Self::RangeFrom(r)
+    }
+}
+
+impl From<&Self> for ReadBatchParams {
+    fn from(params: &Self) -> Self {
+        params.clone()
+    }
+}

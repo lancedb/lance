@@ -23,6 +23,7 @@ use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::{io::ReadBatchParams, Error, Result};
 use object_store::path::Path;
 use snafu::{location, Location};
 use uuid::Uuid;
@@ -33,6 +34,7 @@ use super::progress::WriteFragmentProgress;
 use super::scanner::Scanner;
 use super::updater::Updater;
 use super::write::reader_to_stream;
+use super::WriteParams;
 use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
@@ -40,10 +42,7 @@ use crate::format::Fragment;
 use crate::io::deletion::{
     deletion_file_path, read_deletion_file, write_deletion_file, DeletionVector,
 };
-use crate::io::{FileReader, FileWriter, ObjectStore, ReadBatchParams};
-use crate::{Error, Result};
-
-use super::WriteParams;
+use crate::io::{FileReader, FileWriter, ObjectStore};
 
 /// A Fragment of a Lance [`Dataset`].
 ///

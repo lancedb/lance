@@ -89,7 +89,9 @@ pub async fn write_manifest(
 
     // Write indices if presented.
     if let Some(indices) = indices.as_ref() {
-        let section: pb::IndexSection = indices.into();
+        let section = pb::IndexSection {
+            indices: indices.iter().map(|i| i.into()).collect(),
+        };
         let pos = writer.write_protobuf(&section).await?;
         manifest.index_section = Some(pos);
     }
@@ -353,7 +355,7 @@ impl FileWriter {
         page_table: &mut PageTable,
     ) -> Result<()> {
         let arrs_length: i32 = arrs.iter().map(|a| a.len() as i32).sum();
-        let page_info = PageInfo::new(object_writer.tell(), arrs_length as usize);
+        let page_info = PageInfo::new(object_writer.tell().await?, arrs_length as usize);
         page_table.set(field.id, batch_id, page_info);
         Ok(())
     }
@@ -623,6 +625,7 @@ mod tests {
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema, TimeUnit,
     };
+    use arrow_select::concat::concat_batches;
     use object_store::path::Path;
 
     use crate::io::{FileReader, ObjectStore};
@@ -1094,5 +1097,52 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         // TODO: read and test statistics
+    }
+
+    async fn read_file_as_one_batch(object_store: &ObjectStore, path: &Path) -> RecordBatch {
+        let reader = FileReader::try_new(object_store, path).await.unwrap();
+        let mut batches = vec![];
+        for i in 0..reader.num_batches() {
+            batches.push(
+                reader
+                    .read_batch(i as i32, .., reader.schema())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let arrow_schema = Arc::new(reader.schema().into());
+        concat_batches(&arrow_schema, &batches).unwrap()
+    }
+
+    /// Test encoding arrays that share the same underneath buffer.
+    #[tokio::test]
+    async fn test_encode_slice() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/shared_slice");
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema, &Default::default())
+            .await
+            .unwrap();
+
+        let array = Int32Array::from_iter_values(0..1000);
+
+        for i in (0..1000).step_by(4) {
+            let data = array.slice(i, 4);
+            file_writer
+                .write(&[RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(data)]).unwrap()])
+                .await
+                .unwrap();
+        }
+        file_writer.finish().await.unwrap();
+        assert!(store.size(&path).await.unwrap() < 2 * 8 * 1000);
+
+        let batch = read_file_as_one_batch(&store, &path).await;
+        assert_eq!(batch.column_by_name("i").unwrap().as_ref(), &array);
     }
 }

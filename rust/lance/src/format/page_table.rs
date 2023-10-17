@@ -101,7 +101,7 @@ impl PageTable {
             });
         }
 
-        let pos = writer.tell();
+        let pos = writer.tell().await?;
         let num_columns = self.pages.keys().max().unwrap() + 1 - field_id_offset;
         let num_batches = self
             .pages
