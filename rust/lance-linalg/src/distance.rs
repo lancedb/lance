@@ -48,26 +48,25 @@ pub enum DistanceType {
 /// For backwards compatibility.
 pub type MetricType = DistanceType;
 
-pub type DistanceFunc = dyn Fn(&[f32], &[f32]) -> f32 + Send + Sync + 'static;
-pub type BatchDistanceFunc =
-    dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync + 'static;
+pub type DistanceFunc = fn(&[f32], &[f32]) -> f32;
+pub type BatchDistanceFunc = fn(&[f32], &[f32], usize) -> Arc<Float32Array>;
 
 impl DistanceType {
     /// Compute the distance from one vector to a batch of vectors.
-    pub fn batch_func(&self) -> Arc<BatchDistanceFunc> {
+    pub fn batch_func(&self) -> BatchDistanceFunc {
         match self {
-            Self::L2 => Arc::new(l2_distance_batch),
-            Self::Cosine => Arc::new(cosine_distance_batch),
-            Self::Dot => Arc::new(dot_distance_batch),
+            Self::L2 => l2_distance_batch,
+            Self::Cosine => cosine_distance_batch,
+            Self::Dot => dot_distance_batch,
         }
     }
 
     /// Returns the distance function between two vectors.
-    pub fn func(&self) -> Arc<DistanceFunc> {
+    pub fn func(&self) -> DistanceFunc {
         match self {
-            Self::L2 => Arc::new(l2_distance),
-            Self::Cosine => Arc::new(cosine_distance),
-            Self::Dot => Arc::new(dot_distance),
+            Self::L2 => l2_distance,
+            Self::Cosine => cosine_distance,
+            Self::Dot => dot_distance,
         }
     }
 }
