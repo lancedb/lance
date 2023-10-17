@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import os
 import warnings
 
 import ml_dtypes
@@ -19,7 +20,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pytest
-from lance.arrow import BFloat16Type, bfloat16_array
+from lance.arrow import BFloat16Type, ImageArray, bfloat16_array
 
 try:
     with warnings.catch_warnings():
@@ -236,6 +237,33 @@ def test_tensor(tmp_path):
         assert batch["x"].shape == (2, 2, 3)
         assert batch["x"].dtype == tf.float32
         assert batch["x"].numpy().tolist() == arr.tolist()
+
+
+def test_image_types(tmp_path):
+    path = [os.path.join(os.path.dirname(__file__), "images/1.png")]
+    uris = ImageArray.from_array(path * 3)
+    encoded_images = uris.read_uris()
+    tensors = encoded_images.to_tensor()
+    table = pa.table(
+        {"uris": uris, "encoded_images": encoded_images, "tensor_images": tensors}
+    )
+
+    uri = tmp_path / "dataset.lance"
+    dataset = lance.write_dataset(table, uri)
+    ds = tf.data.Dataset.from_lance(dataset)
+
+    for batch in ds:
+        assert batch["uris"].shape == (3,)
+        assert batch["uris"].dtype == tf.string
+        assert batch["uris"].numpy().astype("str").tolist() == uris.tolist()
+
+        assert batch["encoded_images"].shape == (3,)
+        assert batch["encoded_images"].dtype == tf.string
+        assert batch["encoded_images"].numpy().tolist() == encoded_images.tolist()
+
+        assert batch["tensor_images"].shape == (3, 1, 1, 4)
+        assert batch["tensor_images"].dtype == tf.uint8
+        assert batch["tensor_images"].numpy().tolist() == tensors.to_numpy().tolist()
 
 
 @pytest.fixture
