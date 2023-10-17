@@ -801,7 +801,7 @@ async fn read_binary_array(
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(page_table, field, batch_id)?;
 
-    use crate::io::object_reader::read_binary_array;
+    use lance_core::io::read_binary_array;
     read_binary_array(
         reader.object_reader.as_ref(),
         &field.data_type(),

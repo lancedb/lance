@@ -25,15 +25,14 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field as ArrowField};
 use async_recursion::async_recursion;
+use lance_arrow::*;
+use lance_core::{encodings::Encoding, io::read_binary_array, Error, Result};
 use snafu::{location, Location};
 
 use super::{Dictionary, LogicalType};
 use crate::{
-    arrow::*,
-    encodings::Encoding,
     format::pb,
-    io::object_reader::{read_binary_array, read_fixed_stride_array, ObjectReader},
-    Error, Result,
+    io::object_reader::{read_fixed_stride_array, ObjectReader},
 };
 
 /// Lance Schema Field

@@ -19,9 +19,11 @@ use arrow_array::UInt32Array;
 pub mod local;
 mod stream;
 mod traits;
+mod utils;
 
 pub use stream::{RecordBatchStream, RecordBatchStreamAdapter};
 pub use traits::*;
+pub use utils::*;
 
 /// Parameter to be used to read a batch.
 #[derive(Debug, Clone)]
