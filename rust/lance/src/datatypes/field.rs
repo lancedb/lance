@@ -26,14 +26,15 @@ use arrow_array::{
 use arrow_schema::{DataType, Field as ArrowField};
 use async_recursion::async_recursion;
 use lance_arrow::*;
-use lance_core::{encodings::Encoding, io::read_binary_array, Error, Result};
+use lance_core::{
+    encodings::Encoding,
+    io::{read_binary_array, read_fixed_stride_array, Reader},
+    Error, Result,
+};
 use snafu::{location, Location};
 
 use super::{Dictionary, LogicalType};
-use crate::{
-    format::pb,
-    io::object_reader::{read_fixed_stride_array, ObjectReader},
-};
+use crate::format::pb;
 
 /// Lance Schema Field
 ///
@@ -482,7 +483,7 @@ impl Field {
     }
 
     #[async_recursion]
-    pub(super) async fn load_dictionary<'a>(&mut self, reader: &dyn ObjectReader) -> Result<()> {
+    pub(super) async fn load_dictionary<'a>(&mut self, reader: &dyn Reader) -> Result<()> {
         if let DataType::Dictionary(_, value_type) = self.data_type() {
             assert!(self.dictionary.is_some());
             if let Some(dict_info) = self.dictionary.as_mut() {

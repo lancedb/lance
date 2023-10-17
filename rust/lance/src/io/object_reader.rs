@@ -19,18 +19,14 @@ use std::cmp::min;
 
 use std::ops::Range;
 
-use arrow_array::ArrayRef;
-use arrow_schema::DataType;
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
-use lance_core::io::{ReadBatchParams, Reader};
+use lance_core::io::Reader;
 use object_store::path::Path;
 use prost::Message;
 use snafu::{location, Location};
 
-use crate::arrow::*;
-use crate::encodings::{plain::PlainDecoder, AsyncIndex};
 use crate::error::{Error, Result};
 use crate::format::ProtoStruct;
 use crate::io::ObjectStore;
