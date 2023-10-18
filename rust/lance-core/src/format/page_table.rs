@@ -12,18 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
+
 use arrow_array::builder::Int64Builder;
 use arrow_array::{Array, Int64Array};
 use arrow_schema::DataType;
-use lance_core::io::{Reader, Writer};
-use std::collections::BTreeMap;
 use tokio::io::AsyncWriteExt;
 
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::Decoder;
-use crate::error::Result;
-use crate::io::object_writer::ObjectWriter;
-use crate::Error;
+use crate::io::{Reader, Writer};
+use crate::{Error, Result};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageInfo {
@@ -93,7 +92,7 @@ impl PageTable {
     ///
     /// Any (field_id, batch_id) combinations that are not present in the page table
     /// will be written as (0, 0) to indicate an empty page.
-    pub async fn write(&self, writer: &mut ObjectWriter, field_id_offset: i32) -> Result<usize> {
+    pub async fn write(&self, writer: &mut dyn Writer, field_id_offset: i32) -> Result<usize> {
         if self.pages.is_empty() {
             return Err(Error::InvalidInput {
                 source: "empty page table".into(),
@@ -147,11 +146,11 @@ impl PageTable {
 
 #[cfg(test)]
 mod tests {
-    use object_store::path::Path;
-
-    use crate::io::ObjectStore;
-
     use super::*;
+
+    use crate::io::local::LocalObjectReader;
+
+    use tempfile;
 
     #[test]
     fn test_set_page_info() {
@@ -176,22 +175,22 @@ mod tests {
         page_table.set(12, 2, page_info.clone());
         page_table.set(12, 3, page_info.clone());
 
-        let path = Path::from("test");
-        let object_store = ObjectStore::memory();
+        let test_dir = tempfile::tempdir().unwrap();
+        let path = test_dir.path().join("test");
 
         // The first field_id with entries is 10, but if it's inside of a struct
         // the struct itself needs to be included in the page table. We use 9
         // here to represent the struct.
         let starting_field_id = 9;
 
-        let mut writer = ObjectWriter::new(&object_store, &path).await.unwrap();
+        let mut writer = tokio::fs::File::create(&path).await.unwrap();
         let pos = page_table
             .write(&mut writer, starting_field_id)
             .await
             .unwrap();
         writer.shutdown().await.unwrap();
 
-        let reader = object_store.open(&path).await.unwrap();
+        let reader = LocalObjectReader::open_local_path(&path, 1024).unwrap();
         let actual = PageTable::load(
             reader.as_ref(),
             pos,
