@@ -23,7 +23,10 @@ use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
-use lance_core::{io::ReadBatchParams, Error, Result};
+use lance_core::{
+    io::{FileWriter, ReadBatchParams},
+    Error, Result,
+};
 use object_store::path::Path;
 use snafu::{location, Location};
 use uuid::Uuid;
@@ -42,7 +45,7 @@ use crate::format::Fragment;
 use crate::io::deletion::{
     deletion_file_path, read_deletion_file, write_deletion_file, DeletionVector,
 };
-use crate::io::{FileReader, FileWriter, ObjectStore};
+use crate::io::{FileReader, ObjectStore};
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -86,13 +89,9 @@ impl FileFragment {
         let filename = format!("{}.lance", Uuid::new_v4());
         let mut fragment = Fragment::with_file(id as u64, &filename, &schema, 0);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
-        let mut writer = FileWriter::try_new(
-            &object_store,
-            &full_path,
-            schema.clone(),
-            &Default::default(),
-        )
-        .await?;
+        let writer = object_store.create(&full_path).await?;
+        let mut writer =
+            FileWriter::with_object_writer(writer, schema.clone(), &Default::default())?;
 
         progress.begin(&fragment, writer.multipart_id()).await?;
 

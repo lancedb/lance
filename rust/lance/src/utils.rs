@@ -19,7 +19,7 @@
 
 pub(crate) mod future;
 pub mod sql;
-pub mod temporal;
+
 #[cfg(test)]
 pub mod testing;
 #[cfg(feature = "tfrecord")]
@@ -27,4 +27,5 @@ pub mod tfrecord;
 pub(crate) mod tokio;
 
 // Re-export
+pub use lance_core::utils::temporal;
 pub use lance_linalg::kmeans;

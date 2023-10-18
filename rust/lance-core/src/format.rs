@@ -17,12 +17,19 @@ use prost::Message;
 use snafu::{location, Location};
 use uuid::Uuid;
 
+mod fragment;
+mod index;
+mod manifest;
 mod metadata;
 mod page_table;
-use crate::{Error, Result};
 
+pub use fragment::*;
 pub use metadata::{Metadata, StatisticsMetadata};
 pub use page_table::{PageInfo, PageTable};
+pub use index::Index;
+pub use manifest::Manifest;
+
+use crate::{Error, Result};
 
 /// Protobuf definitions for Lance Format
 pub mod pb {

@@ -24,17 +24,15 @@ use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use lance_arrow::*;
-use lance_core::io::{WriteExt, Writer, object_writer::ObjectWriter};
-use lance_core::datatypes::{Field, Schema};
-use object_store::path::Path;
+
 use snafu::{location, Location};
 
+use crate::datatypes::{Field, Schema};
 use crate::encodings::dictionary::DictionaryEncoder;
 use crate::encodings::{binary::BinaryEncoder, plain::PlainEncoder, Encoder, Encoding};
 use crate::format::{pb, Index, Manifest, Metadata, PageInfo, PageTable, StatisticsMetadata};
+use crate::io::{object_writer::ObjectWriter, WriteExt, Writer};
 use crate::{Error, Result};
-
-use super::ObjectStore;
 
 /// Write manifest to an open file.
 pub async fn write_manifest(
@@ -130,16 +128,6 @@ pub struct FileWriterOptions {
 }
 
 impl FileWriter {
-    pub async fn try_new(
-        object_store: &ObjectStore,
-        path: &Path,
-        schema: Schema,
-        options: &FileWriterOptions,
-    ) -> Result<Self> {
-        let object_writer = object_store.create(path).await?;
-        Self::with_object_writer(object_writer, schema, options)
-    }
-
     pub fn with_object_writer(
         object_writer: ObjectWriter,
         schema: Schema,

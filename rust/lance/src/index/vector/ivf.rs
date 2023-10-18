@@ -31,8 +31,14 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
-use lance_core::{io::{local::to_local_path, Reader, RecordBatchStream, WriteExt, Writer, object_writer::ObjectWriter},
-encodings::plain::PlainEncoder, datatypes::Field};
+use lance_core::{
+    datatypes::Field,
+    encodings::plain::PlainEncoder,
+    io::{
+        local::to_local_path, object_writer::ObjectWriter, Reader, RecordBatchStream, WriteExt,
+        Writer,
+    },
+};
 use lance_index::vector::{
     pq::{PQBuildParams, ProductQuantizer},
     Query, RESIDUAL_COLUMN,

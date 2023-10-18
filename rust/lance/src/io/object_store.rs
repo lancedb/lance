@@ -32,10 +32,10 @@ use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_credential_types::provider::error::CredentialsError;
 use aws_credential_types::provider::ProvideCredentials;
 use chrono::{DateTime, Utc};
-use lance_core::io::object_reader::CloudObjectReader;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use http::header::{HeaderMap, CACHE_CONTROL};
+use lance_core::io::object_reader::CloudObjectReader;
 use object_store::aws::AwsCredential as ObjectStoreAwsCredential;
 use object_store::ObjectMeta;
 use shellexpand::tilde;
@@ -43,10 +43,9 @@ use snafu::{location, Location};
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 use url::Url;
 
-use crate::io::object_writer::ObjectWriter;
 use lance_core::{
     error::{Error, Result},
-    io::Reader,
+    io::{object_writer::ObjectWriter, Reader},
 };
 
 use self::tracing::ObjectStoreTracingExt;

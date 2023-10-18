@@ -41,6 +41,7 @@ use lance_linalg::distance::MetricType;
 use log::debug;
 use tracing::{info_span, instrument, Span};
 
+use super::index::unindexed_fragments;
 use super::Dataset;
 use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::datatypes::Schema;
@@ -644,7 +645,7 @@ impl Scanner {
         knn_node: Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Check if we've created new versions since the index
-        let unindexed_fragments = index.unindexed_fragments(self.dataset.as_ref()).await?;
+        let unindexed_fragments = unindexed_fragments(index, self.dataset.as_ref()).await?;
         if !unindexed_fragments.is_empty() {
             let vector_scan_projection =
                 Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());

@@ -118,14 +118,13 @@ impl Updater {
         self.fragment.metadata.add_file(&file_name, &schema);
 
         let full_path = self.fragment.dataset().data_dir().child(file_name.as_str());
-
-        FileWriter::try_new(
-            self.fragment.dataset().object_store.as_ref(),
-            &full_path,
-            schema,
-            &Default::default(),
-        )
-        .await
+        let writer = self
+            .fragment
+            .dataset()
+            .object_store
+            .create(&full_path)
+            .await?;
+        FileWriter::with_object_writer(writer, schema, &Default::default())
     }
 
     /// Update one batch.

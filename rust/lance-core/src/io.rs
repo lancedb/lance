@@ -22,10 +22,12 @@ pub mod object_writer;
 mod stream;
 mod traits;
 mod utils;
+pub mod writer;
 
 pub use stream::{RecordBatchStream, RecordBatchStreamAdapter};
 pub use traits::*;
 pub use utils::*;
+pub use writer::FileWriter;
 
 /// Parameter to be used to read a batch.
 #[derive(Debug, Clone)]

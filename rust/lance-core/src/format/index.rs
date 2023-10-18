@@ -1,31 +1,24 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Metadata for index
 
 use roaring::RoaringBitmap;
 use uuid::Uuid;
-
-use super::*;
-
-use crate::dataset::Dataset;
-use crate::{Error, Result};
-use lance_core::format::pb;
 use snafu::{location, Location};
+
+use crate::{format::pb, Error, Result};
 
 /// Index metadata
 #[derive(Debug, Clone)]
@@ -46,42 +39,6 @@ pub struct Index {
     ///
     /// If this is None, then this is unknown.
     pub fragment_bitmap: Option<RoaringBitmap>,
-}
-
-impl Index {
-    /// Returns the fragment ids that are not indexed by this index.
-    pub async fn unindexed_fragments(&self, dataset: &Dataset) -> Result<Vec<Fragment>> {
-        if self.dataset_version == dataset.version().version {
-            return Ok(vec![]);
-        }
-        if let Some(bitmap) = self.fragment_bitmap.as_ref() {
-            Ok(dataset
-                .fragments()
-                .iter()
-                .filter(|f| !bitmap.contains(f.id as u32))
-                .cloned()
-                .collect::<Vec<_>>())
-        } else {
-            let ds = dataset.checkout_version(self.dataset_version).await?;
-            let max_fragment_id_idx = ds.manifest.max_fragment_id().ok_or_else(|| Error::IO {
-                message: "No fragments in index version".to_string(),
-                location: location!(),
-            })?;
-            let max_fragment_id_ds =
-                dataset
-                    .manifest
-                    .max_fragment_id()
-                    .ok_or_else(|| Error::IO {
-                        message: "No fragments in dataset version".to_string(),
-                        location: location!(),
-                    })?;
-            if max_fragment_id_idx < max_fragment_id_ds {
-                dataset.manifest.fragments_since(&ds.manifest)
-            } else {
-                Ok(vec![])
-            }
-        }
-    }
 }
 
 impl TryFrom<&pb::IndexMetadata> for Index {

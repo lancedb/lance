@@ -32,7 +32,7 @@ use arrow_array::{
 
 use arrow_schema::DataType;
 use arrow_schema::{ArrowError, Field as ArrowField, Schema as ArrowSchema};
-use datafusion::common::ScalarValue;
+use datafusion_common::scalar::ScalarValue;
 use num_traits::bounds::Bounded;
 
 // /// Max number of bytes that are included in statistics for binary columns.
@@ -52,7 +52,7 @@ pub struct StatisticsRow {
 fn get_statistics<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> StatisticsRow
 where
     T::Native: Bounded + PartialOrd,
-    datafusion::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
+    datafusion_common::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
 {
     let arr = arrays
         .iter()

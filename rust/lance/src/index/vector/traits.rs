@@ -20,9 +20,9 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::{types::Float32Type, RecordBatch};
 use async_trait::async_trait;
 
+use lance_core::io::{object_writer::ObjectWriter, Reader};
 use lance_index::vector::Query;
 use lance_linalg::MatrixView;
-use lance_core::io::{Reader, object_writer::ObjectWriter};
 
 use crate::{
     index::{pb::Transform, prefilter::PreFilter, Index},
