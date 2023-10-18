@@ -185,28 +185,20 @@ impl PQIndex {
     }
 
     /// Filter the row id and PQ code arrays based on the pre-filter.
-    async fn filter_arrays(
-        &self,
+    fn filter_arrays(
         pre_filter: &PreFilter,
+        code: Arc<UInt8Array>,
+        row_ids: Arc<UInt64Array>,
+        num_sub_vectors: i32,
     ) -> Result<(Arc<UInt8Array>, Arc<UInt64Array>)> {
-        if self.code.is_none() || self.row_ids.is_none() {
-            return Err(Error::Index {
-                message: "PQIndex::filter_arrays: PQ is not initialized".to_string(),
-            });
-        }
-        let code = self.code.clone().unwrap();
-        let row_ids = self.row_ids.clone().unwrap();
-        let indices_to_keep = pre_filter.filter_row_ids(row_ids.values()).await?;
+        let indices_to_keep = pre_filter.filter_row_ids(row_ids.values());
         let indices_to_keep = UInt64Array::from(indices_to_keep);
 
         let row_ids = take(row_ids.as_ref(), &indices_to_keep, None)?;
         let row_ids = Arc::new(as_primitive_array(&row_ids).clone());
 
-        let code = FixedSizeListArray::try_new_from_values(
-            code.as_ref().clone(),
-            self.pq.num_sub_vectors as i32,
-        )
-        .unwrap();
+        let code = FixedSizeListArray::try_new_from_values(code.as_ref().clone(), num_sub_vectors)
+            .unwrap();
         let code = take(&code, &indices_to_keep, None)?;
         let code = as_fixed_size_list_array(&code).values().clone();
         let code = Arc::new(as_primitive_array(&code).clone());
@@ -245,25 +237,27 @@ impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
     #[instrument(level = "debug", skip_all, name = "PQIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
         if self.code.is_none() || self.row_ids.is_none() {
             return Err(Error::Index {
                 message: "PQIndex::search: PQ is not initialized".to_string(),
             });
         }
+        pre_filter.wait_for_ready().await?;
 
-        let (code, row_ids) = if pre_filter.is_empty() {
-            (
-                self.code.as_ref().unwrap().clone(),
-                self.row_ids.as_ref().unwrap().clone(),
-            )
-        } else {
-            self.filter_arrays(pre_filter).await?
-        };
+        let code = self.code.as_ref().unwrap().clone();
+        let row_ids = self.row_ids.as_ref().unwrap().clone();
 
         let this = self.clone();
         let query = query.clone();
+        let num_sub_vectors = self.pq.num_sub_vectors as i32;
         spawn_cpu(move || {
+            let (code, row_ids) = if pre_filter.is_empty() {
+                Ok((code, row_ids))
+            } else {
+                Self::filter_arrays(pre_filter.as_ref(), code, row_ids, num_sub_vectors)
+            }?;
+
             // Pre-compute distance table for each sub-vector.
             let distances = if this.metric_type == MetricType::L2 {
                 this.fast_l2_distances(&query.key, code.as_ref())?

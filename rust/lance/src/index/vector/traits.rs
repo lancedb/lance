@@ -15,7 +15,7 @@
 //! Traits for vector index.
 //!
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{types::Float32Type, RecordBatch};
 use async_trait::async_trait;
@@ -51,7 +51,7 @@ pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
-    async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch>;
+    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch>;
 
     /// If the index is loadable by IVF, so it can be a sub-index that
     /// is loaded on demand by IVF.

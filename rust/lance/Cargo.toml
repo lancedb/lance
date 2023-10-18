@@ -78,6 +78,7 @@ tempfile = { workspace = true }
 tracing = { workspace = true }
 lazy_static = "1"
 base64 = "0.21.4"
+async_cell = "0.2.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accelerate-src = { version = "0.3.2", optional = true }

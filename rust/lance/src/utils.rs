@@ -17,6 +17,7 @@
 
 //! Various utilities
 
+pub(crate) mod future;
 pub mod sql;
 pub mod temporal;
 #[cfg(test)]

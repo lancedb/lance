@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
@@ -229,6 +230,10 @@ impl RowAddress {
 
     pub fn first_row(fragment_id: u32) -> Self {
         Self::new_from_parts(fragment_id, 0)
+    }
+
+    pub fn fragment_range(fragment_id: u32) -> Range<u64> {
+        u64::from(Self::first_row(fragment_id))..u64::from(Self::first_row(fragment_id + 1))
     }
 
     pub fn fragment_id(&self) -> u32 {

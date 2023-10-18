@@ -122,6 +122,7 @@ impl IVFIndex {
     /// Parameters
     /// ----------
     ///  - partition_id: partition ID.
+    #[instrument(level = "debug", skip(self))]
     pub(crate) async fn load_partition(&self, partition_id: usize) -> Result<Arc<dyn VectorIndex>> {
         let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
         let part_index = if let Some(part_idx) = self.session.index_cache.get(&cache_key) {
@@ -144,7 +145,7 @@ impl IVFIndex {
         &self,
         partition_id: usize,
         query: &Query,
-        pre_filter: &PreFilter,
+        pre_filter: Arc<PreFilter>,
     ) -> Result<RecordBatch> {
         let part_index = self.load_partition(partition_id).await?;
 
@@ -274,17 +275,14 @@ impl Index for IVFIndex {
 #[async_trait]
 impl VectorIndex for IVFIndex {
     #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: &PreFilter) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
         let partition_ids =
             self.ivf
                 .find_partitions(&query.key, query.nprobes, self.metric_type)?;
         assert!(partition_ids.len() <= query.nprobes);
         let part_ids = partition_ids.values().to_vec();
         let batches = stream::iter(part_ids)
-            .map(|part_id| async move {
-                self.search_in_partition(part_id as usize, query, pre_filter)
-                    .await
-            })
+            .map(|part_id| self.search_in_partition(part_id as usize, query, pre_filter.clone()))
             .buffer_unordered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
@@ -1208,7 +1206,7 @@ mod tests {
         async fn check_index<F: Fn(u64) -> Option<u64>>(
             &mut self,
             index: &IVFIndex,
-            prefilter: &PreFilter,
+            prefilter: Arc<PreFilter>,
             ids_to_test: &Vec<u64>,
             row_id_map: F,
         ) {
@@ -1227,7 +1225,7 @@ mod tests {
                     metric_type: MetricType::L2,
                     use_index: true,
                 };
-                let search_result = index.search(&query, prefilter).await.unwrap();
+                let search_result = index.search(&query, prefilter.clone()).await.unwrap();
 
                 let found_ids = search_result.column(1);
                 let found_ids = found_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
@@ -1405,7 +1403,15 @@ mod tests {
             .unwrap();
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
 
-        let prefilter = PreFilter::new(dataset.clone());
+        let index_meta = crate::format::Index {
+            uuid,
+            dataset_version: 0,
+            fields: Vec::new(),
+            name: INDEX_NAME.to_string(),
+            fragment_bitmap: None,
+        };
+
+        let prefilter = Arc::new(PreFilter::new(dataset.clone(), index_meta));
 
         let is_not_remapped = Some;
         let is_remapped = |row_id| Some(row_id + BIG_OFFSET);
@@ -1417,7 +1423,7 @@ mod tests {
         // input row, when used as a query, should be found in the results list with
         // the same id
         test_data
-            .check_index(ivf_index, &prefilter, &row_ids, is_not_remapped)
+            .check_index(ivf_index, prefilter.clone(), &row_ids, is_not_remapped)
             .await;
 
         // When remapping we change the id of 1/3 of the rows, we remove another 1/3,
@@ -1457,15 +1463,30 @@ mod tests {
 
         // If the ids were remapped then make sure the new row id is in the results
         test_data
-            .check_index(ivf_remapped, &prefilter, row_ids_to_modify, is_remapped)
+            .check_index(
+                ivf_remapped,
+                prefilter.clone(),
+                row_ids_to_modify,
+                is_remapped,
+            )
             .await;
         // If the ids were removed then make sure the old row id isn't in the results
         test_data
-            .check_index(ivf_remapped, &prefilter, row_ids_to_remove, is_removed)
+            .check_index(
+                ivf_remapped,
+                prefilter.clone(),
+                row_ids_to_remove,
+                is_removed,
+            )
             .await;
         // If the ids were not remapped then make sure they still return the old id
         test_data
-            .check_index(ivf_remapped, &prefilter, row_ids_to_remain, is_not_remapped)
+            .check_index(
+                ivf_remapped,
+                prefilter.clone(),
+                row_ids_to_remain,
+                is_not_remapped,
+            )
             .await;
     }
 }

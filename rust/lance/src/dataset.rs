@@ -1209,6 +1209,15 @@ impl Dataset {
         read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest).await
     }
 
+    /// Loads a specific index with the given id
+    pub async fn load_index(&self, uuid: &str) -> Option<Index> {
+        self.load_indices()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|idx| idx.uuid.to_string() == uuid)
+    }
+
     /// Find index with a given index_name and return its serialized statistics.
     pub async fn index_statistics(&self, index_name: &str) -> Result<Option<String>> {
         let index_uuid = self
