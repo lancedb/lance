@@ -508,6 +508,7 @@ mod tests {
 
         let arrs = arr.iter().map(|a| a as &dyn Array).collect::<Vec<_>>();
         let pos = encoder.encode(arrs.as_slice()).await.unwrap();
+        writer.shutdown().await.unwrap();
         Ok(pos)
     }
 
@@ -746,7 +747,9 @@ mod tests {
             let mut encoder = BinaryEncoder::new(&mut object_writer);
 
             // let arrs = arr.iter().map(|a| a as &dyn Array).collect::<Vec<_>>();
-            encoder.encode(&[&data]).await.unwrap()
+            let pos = encoder.encode(&[&data]).await.unwrap();
+            object_writer.shutdown().await.unwrap();
+            pos
         };
 
         let reader = LocalObjectReader::open_local_path(&path, 1024).unwrap();

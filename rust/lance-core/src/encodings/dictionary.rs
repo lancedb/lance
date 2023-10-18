@@ -217,6 +217,7 @@ mod tests {
     use crate::io::local::LocalObjectReader;
     use arrow_array::{Array, StringArray};
     use arrow_buffer::ArrowNativeType;
+    use tokio::io::AsyncWriteExt;
 
     async fn test_dict_decoder_for_type<T: ArrowDictionaryKeyType>() {
         let value_array: StringArray = vec![Some("a"), Some("b"), Some("c"), Some("d")]
@@ -248,6 +249,7 @@ mod tests {
             let mut object_writer = tokio::fs::File::create(&path).await.unwrap();
             let mut encoder = PlainEncoder::new(&mut object_writer, arr1.keys().data_type());
             pos = encoder.encode(arrs.as_slice()).await.unwrap();
+            object_writer.shutdown().await.unwrap();
         }
 
         let reader = LocalObjectReader::open_local_path(&path, 2048).unwrap();
