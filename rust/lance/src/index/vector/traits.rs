@@ -22,11 +22,10 @@ use async_trait::async_trait;
 
 use lance_index::vector::Query;
 use lance_linalg::MatrixView;
-use lance_core::io::Reader;
+use lance_core::io::{Reader, object_writer::ObjectWriter};
 
 use crate::{
     index::{pb::Transform, prefilter::PreFilter, Index},
-    io::{object_writer::ObjectWriter},
     Result,
 };
 

@@ -31,7 +31,8 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
-use lance_core::io::{local::to_local_path, Reader, RecordBatchStream, WriteExt, Writer};
+use lance_core::{io::{local::to_local_path, Reader, RecordBatchStream, WriteExt, Writer, object_writer::ObjectWriter},
+encodings::plain::PlainEncoder, datatypes::Field};
 use lance_index::vector::{
     pq::{PQBuildParams, ProductQuantizer},
     Query, RESIDUAL_COLUMN,
@@ -53,8 +54,6 @@ use super::{
 };
 use crate::{
     dataset::Dataset,
-    datatypes::Field,
-    encodings::plain::PlainEncoder,
     format::Index as IndexMetadata,
     index::{
         pb,
@@ -65,7 +64,6 @@ use crate::{
         },
         Index,
     },
-    io::object_writer::ObjectWriter,
     session::Session,
 };
 use crate::{Error, Result};

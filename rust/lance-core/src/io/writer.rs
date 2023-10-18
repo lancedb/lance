@@ -23,16 +23,15 @@ use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
-use lance_core::io::{WriteExt, Writer};
+use lance_arrow::*;
+use lance_core::io::{WriteExt, Writer, object_writer::ObjectWriter};
+use lance_core::datatypes::{Field, Schema};
 use object_store::path::Path;
 use snafu::{location, Location};
 
-use crate::arrow::*;
-use crate::datatypes::{Field, Schema};
 use crate::encodings::dictionary::DictionaryEncoder;
 use crate::encodings::{binary::BinaryEncoder, plain::PlainEncoder, Encoder, Encoding};
 use crate::format::{pb, Index, Manifest, Metadata, PageInfo, PageTable, StatisticsMetadata};
-use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
 
 use super::ObjectStore;
