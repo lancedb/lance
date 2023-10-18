@@ -17,6 +17,7 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use arrow_array::UInt32Array;
 
 pub mod local;
+pub mod object_reader;
 mod stream;
 mod traits;
 mod utils;

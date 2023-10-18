@@ -23,6 +23,7 @@ arrow-select.workspace = true
 async-trait.workspace = true
 async-recursion.workspace = true
 bytes.workspace = true
+byteorder.workspace = true
 datafusion-common.workspace = true
 datafusion-sql.workspace = true
 futures.workspace = true

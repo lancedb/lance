@@ -15,14 +15,13 @@
 use arrow_array::builder::Int64Builder;
 use arrow_array::{Array, Int64Array};
 use arrow_schema::DataType;
-use lance_core::io::Writer;
+use lance_core::io::{Reader, Writer};
 use std::collections::BTreeMap;
 use tokio::io::AsyncWriteExt;
 
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::Decoder;
 use crate::error::Result;
-use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
 use crate::Error;
 
@@ -54,7 +53,7 @@ impl PageTable {
     /// be the total unique number of field ids, including struct fields despite the fact
     /// they have no data pages.
     pub async fn load<'a>(
-        reader: &dyn ObjectReader,
+        reader: &dyn Reader,
         position: usize,
         num_columns: i32,
         num_batches: i32,

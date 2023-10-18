@@ -22,10 +22,11 @@ use async_trait::async_trait;
 
 use lance_index::vector::Query;
 use lance_linalg::MatrixView;
+use lance_core::io::Reader;
 
 use crate::{
     index::{pb::Transform, prefilter::PreFilter, Index},
-    io::{object_reader::ObjectReader, object_writer::ObjectWriter},
+    io::{object_writer::ObjectWriter},
     Result,
 };
 
@@ -64,7 +65,7 @@ pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// Load the index from the reader on-demand.
     async fn load(
         &self,
-        reader: &dyn ObjectReader,
+        reader: &dyn Reader,
         offset: usize,
         length: usize,
     ) -> Result<Box<dyn VectorIndex>>;

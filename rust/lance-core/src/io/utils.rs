@@ -12,16 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::min;
+
 use arrow_array::{
     types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
     ArrayRef,
 };
 use arrow_schema::DataType;
+use byteorder::{ByteOrder, LittleEndian};
 use lance_arrow::*;
+use prost::Message;
 use snafu::{location, Location};
 
-use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, AsyncIndex, Decoder};
 use crate::io::{ReadBatchParams, Reader};
+use crate::{
+    encodings::{binary::BinaryDecoder, plain::PlainDecoder, AsyncIndex, Decoder},
+    format::ProtoStruct,
+};
 use crate::{Error, Result};
 
 /// Read a binary array from a [Reader].
@@ -77,4 +84,45 @@ pub async fn read_fixed_stride_array(
     // TODO: support more than plain encoding here.
     let decoder = PlainDecoder::new(reader, data_type, position, length)?;
     decoder.get(params.into()).await
+}
+
+/// Read a protobuf message at file position 'pos'.
+// TODO: pub(crate)
+pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize) -> Result<M> {
+    let file_size = reader.size().await?;
+    if pos > file_size {
+        return Err(Error::IO {
+            message: "file size is too small".to_string(),
+            location: location!(),
+        });
+    }
+
+    let range = pos..min(pos + 4096, file_size);
+    let buf = reader.get_range(range.clone()).await?;
+    let msg_len = LittleEndian::read_u32(&buf) as usize;
+
+    if msg_len + 4 > buf.len() {
+        let remaining_range = range.end..min(4 + pos + msg_len, file_size);
+        let remaining_bytes = reader.get_range(remaining_range).await?;
+        let buf = [buf, remaining_bytes].concat();
+        assert!(buf.len() >= msg_len + 4);
+        Ok(M::decode(&buf[4..4 + msg_len])?)
+    } else {
+        Ok(M::decode(&buf[4..4 + msg_len])?)
+    }
+}
+
+/// Read a Protobuf-backed struct at file position: `pos`.
+// TODO: pub(crate)
+pub async fn read_struct<
+    'm,
+    M: Message + Default + 'static,
+    T: ProtoStruct<Proto = M> + From<M>,
+>(
+    reader: &dyn Reader,
+    pos: usize,
+) -> Result<T> {
+    let msg = read_message::<M>(reader, pos).await?;
+    let obj = T::from(msg);
+    Ok(obj)
 }

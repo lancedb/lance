@@ -32,6 +32,7 @@ use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_credential_types::provider::error::CredentialsError;
 use aws_credential_types::provider::ProvideCredentials;
 use chrono::{DateTime, Utc};
+use lance_core::io::object_reader::CloudObjectReader;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use http::header::{HeaderMap, CACHE_CONTROL};
@@ -42,7 +43,6 @@ use snafu::{location, Location};
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 use url::Url;
 
-use crate::io::object_reader::CloudObjectReader;
 use crate::io::object_writer::ObjectWriter;
 use lance_core::{
     error::{Error, Result},
@@ -598,7 +598,7 @@ impl ObjectStore {
         match self.scheme.as_str() {
             "file" => LocalObjectReader::open(path, self.block_size),
             _ => Ok(Box::new(CloudObjectReader::new(
-                self,
+                self.inner.clone(),
                 path.clone(),
                 self.block_size,
             )?)),
