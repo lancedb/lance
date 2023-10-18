@@ -621,7 +621,7 @@ impl ObjectStore {
 
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<ObjectWriter> {
-        ObjectWriter::new(self, path).await
+        ObjectWriter::new(self.inner.as_ref(), path).await
     }
 
     /// A helper function to create a file and write content to it.

@@ -19,6 +19,7 @@ use crate::datatypes::Schema;
 use crate::format::{pb, ProtoStruct};
 use crate::{Error, Result};
 use snafu::{location, Location};
+
 /// Data File Metadata
 #[derive(Debug, Default, PartialEq)]
 pub struct Metadata {

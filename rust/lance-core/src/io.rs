@@ -18,6 +18,7 @@ use arrow_array::UInt32Array;
 
 pub mod local;
 pub mod object_reader;
+pub mod object_writer;
 mod stream;
 mod traits;
 mod utils;
