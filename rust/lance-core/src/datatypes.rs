@@ -14,7 +14,7 @@
 
 //! Lance data types, [Schema] and [Field]
 
-use std::fmt::{Debug, Formatter, self};
+use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
 use arrow_array::ArrayRef;
@@ -298,11 +298,11 @@ impl TryFrom<&LogicalType> for DataType {
 
 #[derive(Debug, Clone, Default)]
 pub struct Dictionary {
-    pub(crate) offset: usize,
+    pub offset: usize,
 
-    pub(crate) length: usize,
+    pub length: usize,
 
-    pub(crate) values: Option<ArrayRef>,
+    pub values: Option<ArrayRef>,
 }
 
 impl PartialEq for Dictionary {

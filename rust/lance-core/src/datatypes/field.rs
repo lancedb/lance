@@ -28,14 +28,13 @@ use async_recursion::async_recursion;
 use lance_arrow::*;
 use snafu::{location, Location};
 
-
+use super::{Dictionary, LogicalType};
 use crate::{
-    format::pb,
     encodings::Encoding,
+    format::pb,
     io::{read_binary_array, read_fixed_stride_array, Reader},
     Error, Result,
 };
-use super::{Dictionary, LogicalType};
 
 /// Lance Schema Field
 ///
@@ -46,7 +45,7 @@ pub struct Field {
     parent_id: i32,
     logical_type: LogicalType,
     metadata: HashMap<String, String>,
-    pub(crate) encoding: Option<Encoding>,
+    pub encoding: Option<Encoding>,
     pub nullable: bool,
 
     pub children: Vec<Field>,

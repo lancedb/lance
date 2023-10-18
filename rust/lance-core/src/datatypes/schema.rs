@@ -21,8 +21,8 @@ use std::{
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-use snafu::{location, Location};
 use lance_arrow::*;
+use snafu::{location, Location};
 
 use super::field::Field;
 use crate::{format::pb, io::Reader, Error, Result};
@@ -104,7 +104,8 @@ impl Schema {
 
     /// Check that the top level fields don't contain `.` in their names
     /// to distinguish from nested fields.
-    pub(crate) fn validate(&self) -> Result<bool> {
+    // TODO: pub(crate)
+    pub fn validate(&self) -> Result<bool> {
         for field in self.fields.iter() {
             if field.name.contains('.') {
                 return Err(Error::Schema{message:format!(
@@ -213,7 +214,8 @@ impl Schema {
             .and_then(|c| c.sub_field(&split[1..]))
     }
 
-    pub(crate) fn field_id(&self, column: &str) -> Result<i32> {
+    // TODO: This is not a public API, change to pub(crate) after refactor is done.
+    pub fn field_id(&self, column: &str) -> Result<i32> {
         self.field(column)
             .map(|f| f.id)
             .ok_or_else(|| Error::Schema {
@@ -222,13 +224,15 @@ impl Schema {
             })
     }
 
-    /// Recursively collect all the field IDs, in pre-order traversal order.
-    pub(crate) fn field_ids(&self) -> Vec<i32> {
+    // Recursively collect all the field IDs, in pre-order traversal order.
+    // TODO: pub(crate)
+    pub fn field_ids(&self) -> Vec<i32> {
         self.fields_pre_order().map(|f| f.id).collect()
     }
 
     /// Get field by its id.
-    pub(crate) fn field_by_id(&self, id: impl Into<i32>) -> Option<&Field> {
+    // TODO: pub(crate)
+    pub fn field_by_id(&self, id: impl Into<i32>) -> Option<&Field> {
         let id = id.into();
         for field in self.fields.iter() {
             if field.id == id {
@@ -241,7 +245,8 @@ impl Schema {
         None
     }
 
-    pub(crate) fn mut_field_by_id(&mut self, id: impl Into<i32>) -> Option<&mut Field> {
+    // TODO: pub(crate)
+    pub fn mut_field_by_id(&mut self, id: impl Into<i32>) -> Option<&mut Field> {
         let id = id.into();
         for field in self.fields.as_mut_slice() {
             if field.id == id {
@@ -254,12 +259,14 @@ impl Schema {
         None
     }
 
-    pub(crate) fn max_field_id(&self) -> Option<i32> {
+    // TODO: pub(crate)
+    pub fn max_field_id(&self) -> Option<i32> {
         self.fields.iter().map(|f| f.max_id()).max()
     }
 
     /// Load dictionary value array from manifest files.
-    pub(crate) async fn load_dictionary<'a>(&mut self, reader: &dyn Reader) -> Result<()> {
+    // TODO: pub(crate)
+    pub async fn load_dictionary<'a>(&mut self, reader: &dyn Reader) -> Result<()> {
         for field in self.fields.as_mut_slice() {
             field.load_dictionary(reader).await?;
         }
@@ -267,7 +274,8 @@ impl Schema {
     }
 
     /// Recursively attach set up dictionary values to the dictionary fields.
-    pub(crate) fn set_dictionary(&mut self, batch: &RecordBatch) -> Result<()> {
+    // TODO: pub(crate)
+    pub fn set_dictionary(&mut self, batch: &RecordBatch) -> Result<()> {
         for field in self.fields.as_mut_slice() {
             let column = batch
                 .column_by_name(&field.name)
