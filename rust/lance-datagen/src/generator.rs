@@ -686,6 +686,7 @@ pub mod array {
         UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
     };
     use arrow_array::{ArrowNativeTypeOp, Date32Array, Date64Array, PrimitiveArray};
+    use chrono::Utc;
     use rand::distributions::Uniform;
     use rand::prelude::Distribution;
     use rand::Rng;
@@ -824,11 +825,22 @@ pub mod array {
     /// Instead of sampling the entire range, all values will be drawn from the last year as this
     /// is a more common use pattern
     pub fn rand_date32() -> Box<dyn ArrayGenerator> {
+        let now = chrono::Utc::now();
+        let one_year_ago = now - chrono::Duration::days(365);
+        rand_date32_in_range(one_year_ago, now)
+    }
+
+    /// Create a generator of randomly sampled date32 values in the given range
+    pub fn rand_date32_in_range(
+        start: chrono::DateTime<Utc>,
+        end: chrono::DateTime<Utc>,
+    ) -> Box<dyn ArrayGenerator> {
         let data_type = DataType::Date32;
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let now_days = (now_ms / MS_PER_DAY) as i32;
-        let one_year_ago = now_days - 365;
-        let dist = Uniform::new(one_year_ago, now_days);
+        let end_ms = end.timestamp_millis();
+        let end_days = (end_ms / MS_PER_DAY) as i32;
+        let start_ms = start.timestamp_millis();
+        let start_days = (start_ms / MS_PER_DAY) as i32;
+        let dist = Uniform::new(start_days, end_days);
 
         Box::new(FnGen::<i32, Date32Array, _>::new_known_size(
             data_type.clone(),
@@ -846,11 +858,25 @@ pub mod array {
     /// Instead of sampling the entire range, all values will be drawn from the last year as this
     /// is a more common use pattern
     pub fn rand_date64() -> Box<dyn ArrayGenerator> {
+        let now = chrono::Utc::now();
+        let one_year_ago = now - chrono::Duration::days(365);
+        rand_date64_in_range(one_year_ago, now)
+    }
+
+    /// Create a generator of randomly sampled date64 values
+    ///
+    /// Instead of sampling the entire range, all values will be drawn from the last year as this
+    /// is a more common use pattern
+    pub fn rand_date64_in_range(
+        start: chrono::DateTime<Utc>,
+        end: chrono::DateTime<Utc>,
+    ) -> Box<dyn ArrayGenerator> {
         let data_type = DataType::Date64;
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let now_days = (now_ms / MS_PER_DAY) as i32;
-        let one_year_ago = now_days - 365;
-        let dist = Uniform::new(one_year_ago, now_days);
+        let end_ms = end.timestamp_millis();
+        let end_days = end_ms / MS_PER_DAY;
+        let start_ms = start.timestamp_millis();
+        let start_days = start_ms / MS_PER_DAY;
+        let dist = Uniform::new(start_days, end_days);
 
         Box::new(FnGen::<i64, Date64Array, _>::new_known_size(
             data_type.clone(),
@@ -956,8 +982,8 @@ pub fn rand(schema: &Schema) -> BatchGeneratorBuilder {
 mod tests {
 
     use arrow_array::{
-        types::{Float32Type, Int16Type, Int32Type, Int8Type},
-        Float32Array, Int16Array, Int32Array, Int8Array,
+        types::{Float32Type, Int16Type, Int32Type, Int8Type, UInt32Type},
+        Float32Array, Int16Array, Int32Array, Int8Array, UInt32Array,
     };
 
     use super::*;
@@ -1061,6 +1087,28 @@ mod tests {
         let mut gen = array::rand_date64();
         let days_64 = gen.generate(RowCount::from(3), &mut rng).unwrap();
         assert_eq!(days_64.data_type(), &DataType::Date64);
+    }
+
+    #[test]
+    fn test_rng_distribution() {
+        // Sanity test to make sure we our RNG is giving us well distributed values
+        // We generates some 4-byte integers, histogram them into 8 buckets, and make
+        // sure each bucket has a good # of values
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
+        let mut gen = array::rand::<UInt32Type>();
+        for _ in 0..10 {
+            let arr = gen.generate(RowCount::from(10000), &mut rng).unwrap();
+            let int_arr = arr.as_any().downcast_ref::<UInt32Array>().unwrap();
+            let mut buckets = vec![0_u32; 256];
+            for val in int_arr.values() {
+                buckets[(*val >> 24) as usize] += 1;
+            }
+            for bucket in buckets {
+                // Perfectly even distribution would have 10000 / 256 values (~40) per bucket
+                // We test for 15 which should be "good enough" and statistically unlikely to fail
+                assert!(bucket > 15);
+            }
+        }
     }
 
     #[test]
