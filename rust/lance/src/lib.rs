@@ -79,13 +79,12 @@
 //!
 //! ```
 
-pub use lance_core::{encodings, error};
+pub use lance_core::{datatypes, encodings, error};
 pub use lance_core::{Error, Result};
 
 pub mod arrow;
 pub mod datafusion;
 pub mod dataset;
-pub mod datatypes;
 pub mod format;
 pub mod index;
 pub mod io;

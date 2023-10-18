@@ -25,6 +25,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
 // Re-export
+use lance_core::io::{read_fixed_stride_array, Reader};
 pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
 use lance_index::vector::{Query, DIST_COL};
 use lance_linalg::{
@@ -37,7 +38,6 @@ use tracing::instrument;
 use super::VectorIndex;
 use crate::dataset::ROW_ID;
 use crate::index::{pb, prefilter::PreFilter, Index};
-use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::{arrow::*, utils::tokio::spawn_cpu};
 use crate::{Error, Result};
 
@@ -294,7 +294,7 @@ impl VectorIndex for PQIndex {
     /// Load a PQ index (page) from the disk.
     async fn load(
         &self,
-        reader: &dyn ObjectReader,
+        reader: &dyn Reader,
         offset: usize,
         length: usize,
     ) -> Result<Box<dyn VectorIndex>> {

@@ -40,7 +40,10 @@ use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{
     encodings::{dictionary::DictionaryDecoder, AsyncIndex},
-    io::{ReadBatchParams, RecordBatchStream, RecordBatchStreamAdapter},
+    io::{
+        read_fixed_stride_array, ReadBatchParams, Reader, RecordBatchStream,
+        RecordBatchStreamAdapter,
+    },
     Error, Result,
 };
 use object_store::path::Path;
@@ -53,10 +56,7 @@ use super::deletion_file_path;
 use super::object_reader::read_message;
 use crate::dataset::ROW_ID;
 use crate::format::{pb, Fragment, Index, Manifest, Metadata, PageTable};
-use crate::io::{
-    object_reader::{read_fixed_stride_array, read_struct, ObjectReader},
-    read_metadata_offset, read_struct_from_buf,
-};
+use crate::io::{object_reader::read_struct, read_metadata_offset, read_struct_from_buf};
 use crate::session::Session;
 use crate::{
     datatypes::{Field, Schema},
@@ -164,7 +164,7 @@ fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
 /// It reads arrow data from one data file.
 #[derive(Clone)]
 pub struct FileReader {
-    object_reader: Arc<dyn ObjectReader>,
+    object_reader: Arc<dyn Reader>,
     metadata: Arc<Metadata>,
     page_table: Arc<PageTable>,
     projection: Option<Schema>,
@@ -318,7 +318,7 @@ impl FileReader {
     }
 
     async fn read_metadata(
-        object_reader: &dyn ObjectReader,
+        object_reader: &dyn Reader,
         session: Option<&Session>,
     ) -> Result<Arc<Metadata>> {
         Self::load_from_cache(session, object_reader.path(), |_| async {
@@ -347,17 +347,17 @@ impl FileReader {
     ///
     /// The page table is cached.
     async fn read_stats_page_table(
-        object_reader: &dyn ObjectReader,
+        reader: &dyn Reader,
         session: Option<&Session>,
     ) -> Result<Arc<Option<PageTable>>> {
         // To prevent collisions, we cache this at a child path
-        Self::load_from_cache(session, &object_reader.path().child("stats"), |_| async {
-            let metadata = Self::read_metadata(object_reader, session).await?;
+        Self::load_from_cache(session, &reader.path().child("stats"), |_| async {
+            let metadata = Self::read_metadata(reader, session).await?;
 
             if let Some(stats_meta) = metadata.stats_metadata.as_ref() {
                 Ok(Some(
                     PageTable::load(
-                        object_reader,
+                        reader,
                         stats_meta.page_table_position,
                         stats_meta.leaf_field_ids.len() as i32,
                         metadata.num_batches() as i32,
@@ -801,7 +801,7 @@ async fn read_binary_array(
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(page_table, field, batch_id)?;
 
-    use crate::io::object_reader::read_binary_array;
+    use lance_core::io::read_binary_array;
     read_binary_array(
         reader.object_reader.as_ref(),
         &field.data_type(),

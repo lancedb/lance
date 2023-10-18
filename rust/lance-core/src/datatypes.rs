@@ -14,8 +14,7 @@
 
 //! Lance data types, [Schema] and [Field]
 
-use std::fmt::{self};
-use std::fmt::{Debug, Formatter};
+use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
 use arrow_array::ArrayRef;
@@ -299,11 +298,11 @@ impl TryFrom<&LogicalType> for DataType {
 
 #[derive(Debug, Clone, Default)]
 pub struct Dictionary {
-    pub(crate) offset: usize,
+    pub offset: usize,
 
-    pub(crate) length: usize,
+    pub length: usize,
 
-    pub(crate) values: Option<ArrayRef>,
+    pub values: Option<ArrayRef>,
 }
 
 impl PartialEq for Dictionary {
@@ -335,7 +334,7 @@ impl From<&Dictionary> for pb::Dictionary {
 }
 
 /// Returns true if Lance supports writing this datatype with nulls.
-pub(crate) fn lance_supports_nulls(datatype: &DataType) -> bool {
+pub fn lance_supports_nulls(datatype: &DataType) -> bool {
     matches!(
         datatype,
         DataType::Utf8

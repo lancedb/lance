@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod datatypes;
 pub mod encodings;
 pub mod error;
 pub mod format;

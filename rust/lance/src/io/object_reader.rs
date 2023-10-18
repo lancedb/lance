@@ -19,21 +19,14 @@ use std::cmp::min;
 
 use std::ops::Range;
 
-use arrow_array::{
-    types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
-    ArrayRef,
-};
-use arrow_schema::DataType;
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
-use lance_core::io::{ReadBatchParams, Reader};
+use lance_core::io::Reader;
 use object_store::path::Path;
 use prost::Message;
 use snafu::{location, Location};
 
-use crate::arrow::*;
-use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, AsyncIndex, Decoder};
 use crate::error::{Error, Result};
 use crate::format::ProtoStruct;
 use crate::io::ObjectStore;
@@ -126,59 +119,3 @@ pub(crate) async fn read_struct<
     let obj = T::from(msg);
     Ok(obj)
 }
-
-/// Read a fixed stride array from disk.
-///
-pub(crate) async fn read_fixed_stride_array(
-    reader: &dyn Reader,
-    data_type: &DataType,
-    position: usize,
-    length: usize,
-    params: impl Into<ReadBatchParams>,
-) -> Result<ArrayRef> {
-    if !data_type.is_fixed_stride() {
-        return Err(Error::Schema {
-            message: format!("{data_type} is not a fixed stride type"),
-            location: location!(),
-        });
-    }
-    // TODO: support more than plain encoding here.
-    let decoder = PlainDecoder::new(reader, data_type, position, length)?;
-    decoder.get(params.into()).await
-}
-
-pub(crate) async fn read_binary_array(
-    reader: &dyn Reader,
-    data_type: &DataType,
-    nullable: bool,
-    position: usize,
-    length: usize,
-    params: impl Into<ReadBatchParams>,
-) -> Result<ArrayRef> {
-    use arrow_schema::DataType::*;
-    let decoder: Box<dyn Decoder<Output = Result<ArrayRef>> + Send> = match data_type {
-        Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(
-            reader, position, length, nullable,
-        )),
-        Binary => Box::new(BinaryDecoder::<BinaryType>::new(
-            reader, position, length, nullable,
-        )),
-        LargeUtf8 => Box::new(BinaryDecoder::<LargeUtf8Type>::new(
-            reader, position, length, nullable,
-        )),
-        LargeBinary => Box::new(BinaryDecoder::<LargeBinaryType>::new(
-            reader, position, length, nullable,
-        )),
-        _ => {
-            return Err(Error::IO {
-                message: format!("Unsupported binary type: {data_type}",),
-                location: location!(),
-            })
-        }
-    };
-    let fut = decoder.as_ref().get(params.into());
-    fut.await
-}
-
-#[cfg(test)]
-mod tests {}
