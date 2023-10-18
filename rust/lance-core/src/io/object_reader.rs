@@ -39,7 +39,7 @@ pub struct CloudObjectReader {
     block_size: usize,
 }
 
-impl<'a> CloudObjectReader {
+impl CloudObjectReader {
     /// Create an ObjectReader from URI
     pub fn new(object_store: Arc<dyn ObjectStore>, path: Path, block_size: usize) -> Result<Self> {
         Ok(Self {

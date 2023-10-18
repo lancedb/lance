@@ -24,10 +24,10 @@ mod metadata;
 mod page_table;
 
 pub use fragment::*;
-pub use metadata::{Metadata, StatisticsMetadata};
-pub use page_table::{PageInfo, PageTable};
 pub use index::Index;
 pub use manifest::Manifest;
+pub use metadata::{Metadata, StatisticsMetadata};
+pub use page_table::{PageInfo, PageTable};
 
 use crate::{Error, Result};
 

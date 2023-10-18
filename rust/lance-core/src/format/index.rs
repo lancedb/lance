@@ -15,8 +15,8 @@
 //! Metadata for index
 
 use roaring::RoaringBitmap;
-use uuid::Uuid;
 use snafu::{location, Location};
+use uuid::Uuid;
 
 use crate::{format::pb, Error, Result};
 
