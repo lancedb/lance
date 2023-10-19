@@ -19,8 +19,6 @@
 
 pub(crate) mod future;
 pub mod sql;
-#[cfg(test)]
-pub mod testing;
 #[cfg(feature = "tfrecord")]
 pub mod tfrecord;
 pub(crate) mod tokio;

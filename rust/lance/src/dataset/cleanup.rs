@@ -454,6 +454,10 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow_array::{RecordBatchIterator, RecordBatchReader};
     use chrono::Duration;
+    use lance_core::{
+        utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy},
+        Error, Result,
+    };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
     use tokio::io::AsyncWriteExt;
@@ -468,8 +472,6 @@ mod tests {
             object_store::{ObjectStoreParams, WrappingObjectStore},
             ObjectStore,
         },
-        utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy},
-        Error, Result,
     };
     use all_asserts::{assert_gt, assert_lt};
     use tempfile::{tempdir, TempDir};

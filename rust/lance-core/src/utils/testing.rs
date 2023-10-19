@@ -63,7 +63,7 @@ type ObjectMetaPolicyFn = Arc<dyn ObjectMetaPolicyFnT>;
 /// Currently, for simplicity, we only proxy calls that involve some kind of path.  Calls
 /// to copy functions, which have a src and dst, will provide the source to the policy
 #[derive(Debug)]
-pub(crate) struct ProxyObjectStorePolicy {
+pub struct ProxyObjectStorePolicy {
     /// Policies which run before a method is invoked.  If the policy returns
     /// an error then the target method will not be invoked and the error will
     /// be returned instead.
@@ -103,16 +103,13 @@ impl ProxyObjectStorePolicy {
 /// made to the underlying store.  This can be used to simulate failures or, perhaps
 /// in the future, to mock out results or provide other fine-grained control.
 #[derive(Debug)]
-pub(crate) struct ProxyObjectStore {
+pub struct ProxyObjectStore {
     target: Arc<dyn ObjectStore>,
     policy: Arc<Mutex<ProxyObjectStorePolicy>>,
 }
 
 impl ProxyObjectStore {
-    pub(crate) fn new(
-        target: Arc<dyn ObjectStore>,
-        policy: Arc<Mutex<ProxyObjectStorePolicy>>,
-    ) -> Self {
+    pub fn new(target: Arc<dyn ObjectStore>, policy: Arc<Mutex<ProxyObjectStorePolicy>>) -> Self {
         Self { target, policy }
     }
 
