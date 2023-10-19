@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use arrow_schema::{DataType, Field as ArrowField};
+
 pub mod datatypes;
 pub mod encodings;
 pub mod error;
@@ -19,3 +21,12 @@ pub mod format;
 pub mod io;
 
 pub use error::{Error, Result};
+
+/// Column name for the meta row ID.
+pub const ROW_ID: &str = "_rowid";
+
+lazy_static::lazy_static! {
+    /// Row ID field. This is nullable because its validity bitmap is sometimes used
+    /// as a selection vector.
+    pub static ref ROW_ID_FIELD: ArrowField = ArrowField::new(ROW_ID, DataType::UInt64, true);
+}

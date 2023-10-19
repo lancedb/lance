@@ -36,7 +36,8 @@ use datafusion::physical_plan::{
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use futures::stream::{Stream, StreamExt};
-use lance_index::vector::Query;
+use lance_core::ROW_ID_FIELD;
+use lance_index::vector::{Query, DIST_COL};
 use lance_linalg::distance::MetricType;
 use log::debug;
 use tracing::{info_span, instrument, Span};
@@ -52,8 +53,7 @@ use crate::io::{
 use crate::utils::sql::parse_sql_filter;
 use crate::{Error, Result};
 use snafu::{location, Location};
-/// Column name for the meta row ID.
-pub const ROW_ID: &str = "_rowid";
+
 pub const DEFAULT_BATCH_SIZE: usize = 8192;
 
 // Same as pyarrow Dataset::scanner()
@@ -373,10 +373,10 @@ impl Scanner {
                 location: location!(),
             })?;
             extra_columns.push(vector_field);
-            extra_columns.push(ArrowField::new("_distance", DataType::Float32, false));
+            extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
         };
         if self.with_row_id {
-            extra_columns.push(ArrowField::new(ROW_ID, DataType::UInt64, false));
+            extra_columns.push(ROW_ID_FIELD.clone());
         }
 
         let schema = if !extra_columns.is_empty() {
@@ -515,10 +515,10 @@ impl Scanner {
         } else if let Some(expr) = filter_expr.as_ref() {
             let columns_in_filter = column_names_in_expr(expr.as_ref());
             let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
-            self.scan(true, filter_schema)
+            self.scan(true, false, filter_schema)
         } else {
             // Scan without filter or limits
-            self.scan(self.with_row_id, self.projections.clone().into())
+            self.scan(self.with_row_id, false, self.projections.clone().into())
         };
 
         // Stage 2: filter
@@ -628,7 +628,7 @@ impl Scanner {
             }
             // No index found. use flat search.
             let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
-            let mut plan = self.scan(true, vector_scan_projection);
+            let mut plan = self.scan(true, true, vector_scan_projection);
             if let Some(prefilter) = prefilter {
                 plan = Arc::new(FilterExec::try_new(prefilter.clone(), plan)?);
             }
@@ -649,6 +649,7 @@ impl Scanner {
             let vector_scan_projection =
                 Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
             let scan_node = self.scan_fragments(
+                true,
                 true,
                 vector_scan_projection,
                 Arc::new(unindexed_fragments),
@@ -685,18 +686,33 @@ impl Scanner {
     }
 
     /// Create an Execution plan with a scan node
-    fn scan(&self, with_row_id: bool, projection: Arc<Schema>) -> Arc<dyn ExecutionPlan> {
+    ///
+    /// Setting `with_make_deletions_null` will use the validity of the _rowid
+    /// column as a selection vector. Read more in [crate::io::FileReader].
+    fn scan(
+        &self,
+        with_row_id: bool,
+        with_make_deletions_null: bool,
+        projection: Arc<Schema>,
+    ) -> Arc<dyn ExecutionPlan> {
         let fragments = if let Some(fragment) = self.fragments.as_ref() {
             Arc::new(fragment.clone())
         } else {
             self.dataset.fragments().clone()
         };
-        self.scan_fragments(with_row_id, projection, fragments, self.ordered)
+        self.scan_fragments(
+            with_row_id,
+            with_make_deletions_null,
+            projection,
+            fragments,
+            self.ordered,
+        )
     }
 
     fn scan_fragments(
         &self,
         with_row_id: bool,
+        with_make_deletions_null: bool,
         projection: Arc<Schema>,
         fragments: Arc<Vec<Fragment>>,
         ordered: bool,
@@ -709,6 +725,7 @@ impl Scanner {
             self.batch_readahead,
             self.fragment_readahead,
             with_row_id,
+            with_make_deletions_null,
             ordered,
         ))
     }
@@ -824,6 +841,8 @@ mod test {
     use arrow_schema::DataType;
     use arrow_select::take;
     use futures::TryStreamExt;
+    use lance_core::ROW_ID;
+    use lance_index::vector::DIST_COL;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use tempfile::tempdir;
 
@@ -1095,7 +1114,7 @@ mod test {
                         ),
                         true,
                     ),
-                    ArrowField::new("_distance", DataType::Float32, false),
+                    ArrowField::new(DIST_COL, DataType::Float32, true),
                 ])
             );
 
@@ -1259,7 +1278,7 @@ mod test {
                     ),
                     true,
                 ),
-                ArrowField::new("_distance", DataType::Float32, false),
+                ArrowField::new(DIST_COL, DataType::Float32, true),
             ])
         );
 
@@ -1313,7 +1332,7 @@ mod test {
                     ),
                     true,
                 ),
-                ArrowField::new("_distance", DataType::Float32, false),
+                ArrowField::new(DIST_COL, DataType::Float32, true),
             ])
         );
 
@@ -1363,7 +1382,7 @@ mod test {
                     ),
                     true,
                 ),
-                ArrowField::new("_distance", DataType::Float32, false),
+                ArrowField::new(DIST_COL, DataType::Float32, true),
             ])
         );
 
@@ -1416,10 +1435,10 @@ mod test {
         let plan = scan.create_plan().await.unwrap();
 
         assert!(plan.as_any().is::<ProjectionExec>());
-        assert_eq!(plan.schema().field_names(), &["i", "_rowid"]);
+        assert_eq!(plan.schema().field_names(), &["i", ROW_ID]);
         let scan = &plan.children()[0];
         assert!(scan.as_any().is::<LanceScanExec>());
-        assert_eq!(scan.schema().field_names(), &["i", "_rowid"]);
+        assert_eq!(scan.schema().field_names(), &["i", ROW_ID]);
     }
 
     #[tokio::test]
@@ -1459,7 +1478,7 @@ mod test {
 
             // If they aren't equal, they should be equal if we sort by row id
             if ordered_batch != unordered_batch {
-                let sort_indices = sort_to_indices(&unordered_batch["_rowid"], None, None).unwrap();
+                let sort_indices = sort_to_indices(&unordered_batch[ROW_ID], None, None).unwrap();
 
                 let ordered_i = ordered_batch["i"].clone();
                 let sorted_i = take::take(&unordered_batch["i"], &sort_indices, None).unwrap();
@@ -1566,15 +1585,15 @@ mod test {
 
         let take = &plan.children()[0];
         assert!(take.as_any().is::<TakeExec>());
-        assert_eq!(take.schema().field_names(), ["i", "_rowid", "s"]);
+        assert_eq!(take.schema().field_names(), ["i", ROW_ID, "s"]);
 
         let filter = &take.children()[0];
         assert!(filter.as_any().is::<FilterExec>());
-        assert_eq!(filter.schema().field_names(), ["i", "_rowid"]);
+        assert_eq!(filter.schema().field_names(), ["i", ROW_ID]);
 
         let scan = &filter.children()[0];
         assert!(scan.as_any().is::<LanceScanExec>());
-        assert_eq!(filter.schema().field_names(), ["i", "_rowid"]);
+        assert_eq!(filter.schema().field_names(), ["i", ROW_ID]);
     }
 
     /// Test KNN with index
@@ -1604,14 +1623,14 @@ mod test {
                 .iter()
                 .map(|f| f.name())
                 .collect::<Vec<_>>(),
-            vec!["s", "vec", "_distance"]
+            vec!["s", "vec", DIST_COL]
         );
 
         let take = &plan.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
         assert_eq!(
             take.schema().field_names(),
-            ["_distance", "_rowid", "vec", "i", "s"]
+            [DIST_COL, ROW_ID, "vec", "i", "s"]
         );
         assert_eq!(
             take.extra_schema
@@ -1626,15 +1645,12 @@ mod test {
         assert!(filter.as_any().is::<FilterExec>());
         assert_eq!(
             filter.schema().field_names(),
-            ["_distance", "_rowid", "vec", "i"]
+            [DIST_COL, ROW_ID, "vec", "i"]
         );
 
         let take = &filter.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(
-            take.schema().field_names(),
-            ["_distance", "_rowid", "vec", "i"]
-        );
+        assert_eq!(take.schema().field_names(), [DIST_COL, ROW_ID, "vec", "i"]);
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1647,7 +1663,7 @@ mod test {
         // TODO: Two continuous take execs, we can merge them into one.
         let take = &take.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(take.schema().field_names(), ["_distance", "_rowid", "vec"]);
+        assert_eq!(take.schema().field_names(), [DIST_COL, ROW_ID, "vec"]);
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1659,7 +1675,7 @@ mod test {
 
         let knn = &take.children()[0];
         assert!(knn.as_any().is::<KNNIndexExec>());
-        assert_eq!(knn.schema().field_names(), ["_distance", "_rowid"]);
+        assert_eq!(knn.schema().field_names(), [DIST_COL, ROW_ID]);
     }
 
     /// Test KNN index with refine factor
@@ -1691,14 +1707,14 @@ mod test {
                 .iter()
                 .map(|f| f.name())
                 .collect::<Vec<_>>(),
-            vec!["s", "vec", "_distance"]
+            vec!["s", "vec", DIST_COL]
         );
 
         let take = &plan.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
         assert_eq!(
             take.schema().field_names(),
-            ["_distance", "_rowid", "vec", "i", "s"]
+            [DIST_COL, ROW_ID, "vec", "i", "s"]
         );
         assert_eq!(
             take.extra_schema
@@ -1713,15 +1729,12 @@ mod test {
         assert!(filter.as_any().is::<FilterExec>());
         assert_eq!(
             filter.schema().field_names(),
-            ["_distance", "_rowid", "vec", "i"]
+            [DIST_COL, ROW_ID, "vec", "i"]
         );
 
         let take = &filter.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(
-            take.schema().field_names(),
-            ["_distance", "_rowid", "vec", "i"]
-        );
+        assert_eq!(take.schema().field_names(), [DIST_COL, ROW_ID, "vec", "i"]);
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1737,7 +1750,7 @@ mod test {
 
         let take = &flat.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(take.schema().field_names(), ["_distance", "_rowid", "vec"]);
+        assert_eq!(take.schema().field_names(), [DIST_COL, ROW_ID, "vec"]);
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1749,7 +1762,7 @@ mod test {
 
         let knn = &take.children()[0];
         assert!(knn.as_any().is::<KNNIndexExec>());
-        assert_eq!(knn.schema().field_names(), ["_distance", "_rowid"]);
+        assert_eq!(knn.schema().field_names(), [DIST_COL, ROW_ID]);
     }
 
     #[tokio::test]

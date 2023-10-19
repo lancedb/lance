@@ -34,7 +34,7 @@ use lance_arrow::*;
 use lance_core::io::{local::to_local_path, Reader, WriteExt, Writer};
 use lance_index::vector::{
     pq::{PQBuildParams, ProductQuantizer},
-    Query, RESIDUAL_COLUMN,
+    Query, DIST_COL, RESIDUAL_COLUMN,
 };
 use lance_linalg::{distance::*, kernels::argmin, matrix::MatrixView};
 use log::info;
@@ -288,7 +288,7 @@ impl VectorIndex for IVFIndex {
             .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
 
-        let dist_col = batch.column_by_name("_distance").ok_or_else(|| Error::IO {
+        let dist_col = batch.column_by_name(DIST_COL).ok_or_else(|| Error::IO {
             message: format!(
                 "_distance column does not exist in batch: {}",
                 batch.schema()

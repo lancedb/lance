@@ -20,7 +20,7 @@ use arrow_array::{cast::AsArray, types::Float32Type, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
 use futures::{stream::repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
-use lance_core::io::Writer;
+use lance_core::{io::Writer, ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{
     pq::{transform::PQTransformer, ProductQuantizer},
     residual::ResidualTransform,
@@ -30,7 +30,6 @@ use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 use tracing::instrument;
 
-use crate::dataset::ROW_ID;
 use crate::index::vector::ivf::{
     io::write_index_partitions,
     shuffler::{Shuffler, ShufflerBuilder},
@@ -95,7 +94,7 @@ pub async fn shuffle_dataset(
 
     // TODO: dynamically detect schema from the transforms.
     let schema = Schema::new(vec![
-        Field::new(ROW_ID, DataType::UInt64, false),
+        ROW_ID_FIELD.clone(),
         Field::new(
             PQ_CODE_COLUMN,
             DataType::FixedSizeList(

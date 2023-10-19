@@ -21,7 +21,9 @@
 use std::iter::Sum;
 use std::sync::Arc;
 
-use arrow_array::Float32Array;
+use arrow_array::cast::AsArray;
+use arrow_array::types::Float32Type;
+use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
 use num_traits::real::Real;
 use num_traits::{AsPrimitive, FromPrimitive};
@@ -219,13 +221,37 @@ pub fn cosine_distance<T: Cosine + ?Sized>(from: &T, to: &T) -> T::Output {
 pub fn cosine_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Float32Array> {
     let x_norm = norm_l2(from);
 
-    let dists = unsafe {
-        Float32Array::from_trusted_len_iter(
-            to.chunks_exact(dimension)
-                .map(|y| Some(from.cosine_fast(x_norm, y))),
-        )
-    };
-    Arc::new(dists)
+    let dists = to
+        .chunks_exact(dimension)
+        .map(|y| from.cosine_fast(x_norm, y));
+    Arc::new(Float32Array::new(dists.collect(), None))
+}
+
+/// Compute Cosine distance between a vector and a batch of vectors.
+///
+/// Null buffer of `to` is propagated to the returned array.
+///
+/// Parameters
+///
+/// - `from`: the vector to compute distance from.
+/// - `to`: a list of vectors to compute distance to.
+///
+/// # Panics
+///
+/// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
+pub fn cosine_distance_arrow_batch(from: &[f32], to: &FixedSizeListArray) -> Arc<Float32Array> {
+    let dimension = to.value_length() as usize;
+    debug_assert_eq!(from.len(), dimension);
+
+    let x_norm = norm_l2(from);
+
+    // TODO: if we detect there is a run of nulls, should we skip those?
+    let to_values = to.values().as_primitive::<Float32Type>().values();
+    let dists = to_values
+        .chunks_exact(dimension)
+        .map(|v| from.cosine_fast(x_norm, v));
+
+    Arc::new(Float32Array::new(dists.collect(), to.nulls().cloned()))
 }
 
 #[cfg(target_arch = "x86_64")]

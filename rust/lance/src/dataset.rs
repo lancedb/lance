@@ -72,7 +72,7 @@ use crate::session::Session;
 use crate::utils::temporal::{utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
-pub use scanner::ROW_ID;
+pub use lance_core::ROW_ID;
 pub use write::{WriteMode, WriteParams};
 
 const INDICES_DIR: &str = "_indices";
@@ -1381,6 +1381,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
+    use lance_index::vector::DIST_COL;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
@@ -2718,8 +2719,8 @@ mod tests {
                 )
             );
             assert_eq!(
-                schema.field_with_name("_distance").unwrap(),
-                &Field::new("_distance", DataType::Float32, false)
+                schema.field_with_name(DIST_COL).unwrap(),
+                &Field::new(DIST_COL, DataType::Float32, true)
             );
         }
     }
@@ -2777,8 +2778,8 @@ mod tests {
                 )
             );
             assert_eq!(
-                schema.field_with_name("_distance").unwrap(),
-                &Field::new("_distance", DataType::Float32, false)
+                schema.field_with_name(DIST_COL).unwrap(),
+                &Field::new(DIST_COL, DataType::Float32, true)
             );
         }
     }

@@ -25,7 +25,10 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
 // Re-export
-use lance_core::io::{read_fixed_stride_array, Reader};
+use lance_core::{
+    io::{read_fixed_stride_array, Reader},
+    ROW_ID_FIELD,
+};
 pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
 use lance_index::vector::{Query, DIST_COL};
 use lance_linalg::{
@@ -36,7 +39,6 @@ use serde::Serialize;
 use tracing::instrument;
 
 use super::VectorIndex;
-use crate::dataset::ROW_ID;
 use crate::index::{pb, prefilter::PreFilter, Index};
 use crate::{arrow::*, utils::tokio::spawn_cpu};
 use crate::{Error, Result};
@@ -273,8 +275,8 @@ impl VectorIndex for PQIndex {
             let row_ids = take(row_ids.as_ref(), &indices, None)?;
 
             let schema = Arc::new(ArrowSchema::new(vec![
-                ArrowField::new(DIST_COL, DataType::Float32, false),
-                ArrowField::new(ROW_ID, DataType::UInt64, false),
+                ArrowField::new(DIST_COL, DataType::Float32, true),
+                ROW_ID_FIELD.clone(),
             ]));
             Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
         })

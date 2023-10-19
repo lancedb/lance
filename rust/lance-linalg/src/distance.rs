@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::Float32Array;
+use arrow_array::{FixedSizeListArray, Float32Array};
 
 pub mod cosine;
 pub mod dot;
@@ -50,6 +50,7 @@ pub type MetricType = DistanceType;
 
 pub type DistanceFunc = fn(&[f32], &[f32]) -> f32;
 pub type BatchDistanceFunc = fn(&[f32], &[f32], usize) -> Arc<Float32Array>;
+pub type ArrowBatchDistanceFunc = fn(&[f32], &FixedSizeListArray) -> Arc<Float32Array>;
 
 impl DistanceType {
     /// Compute the distance from one vector to a batch of vectors.
@@ -58,6 +59,17 @@ impl DistanceType {
             Self::L2 => l2_distance_batch,
             Self::Cosine => cosine_distance_batch,
             Self::Dot => dot_distance_batch,
+        }
+    }
+
+    /// Compute the distance from one vector to a batch of vectors.
+    ///
+    /// This propagates nulls to the output.
+    pub fn arrow_batch_func(&self) -> ArrowBatchDistanceFunc {
+        match self {
+            Self::L2 => l2_distance_arrow_batch,
+            Self::Cosine => cosine_distance_arrow_batch,
+            Self::Dot => dot_distance_arrow_batch,
         }
     }
 

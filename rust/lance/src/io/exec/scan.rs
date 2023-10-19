@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
@@ -28,10 +28,11 @@ use datafusion::physical_plan::{
 use futures::stream::Stream;
 use futures::{stream, Future};
 use futures::{StreamExt, TryStreamExt};
+use lance_core::ROW_ID_FIELD;
 use tracing::Instrument;
 
 use crate::dataset::fragment::{FileFragment, FragmentReader};
-use crate::dataset::{Dataset, ROW_ID};
+use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 use crate::format::Fragment;
 
@@ -39,10 +40,14 @@ async fn open_file(
     file_fragment: FileFragment,
     projection: Arc<Schema>,
     with_row_id: bool,
+    with_make_deletions_null: bool,
 ) -> Result<FragmentReader> {
     let mut reader = file_fragment.open(projection.as_ref()).await?;
     if with_row_id {
         reader.with_row_id();
+    };
+    if with_make_deletions_null {
+        reader.with_make_deletions_null();
     };
     Ok(reader)
 }
@@ -115,6 +120,7 @@ impl LanceStream {
         batch_readahead: usize,
         fragment_readahead: usize,
         with_row_id: bool,
+        with_make_deletions_null: bool,
         scan_in_order: bool,
     ) -> Result<Self> {
         let project_schema = projection.clone();
@@ -131,6 +137,7 @@ impl LanceStream {
                         file_fragment,
                         project_schema.clone(),
                         with_row_id,
+                        with_make_deletions_null,
                     ))
                 })
                 .try_buffered(fragment_readahead)
@@ -147,6 +154,7 @@ impl LanceStream {
                         file_fragment,
                         project_schema.clone(),
                         with_row_id,
+                        with_make_deletions_null,
                     ))
                 })
                 .try_buffered(fragment_readahead)
@@ -181,7 +189,7 @@ impl RecordBatchStream for LanceStream {
         let schema: ArrowSchema = self.projection.as_ref().into();
         if self.with_row_id {
             let mut fields: Vec<Arc<Field>> = schema.fields.to_vec();
-            fields.push(Arc::new(Field::new(ROW_ID, DataType::UInt64, false)));
+            fields.push(Arc::new(ROW_ID_FIELD.clone()));
             Arc::new(ArrowSchema::new(fields))
         } else {
             Arc::new(schema)
@@ -207,6 +215,7 @@ pub struct LanceScanExec {
     batch_readahead: usize,
     fragment_readahead: usize,
     with_row_id: bool,
+    with_make_deletions_null: bool,
     ordered_output: bool,
 }
 
@@ -244,6 +253,7 @@ impl LanceScanExec {
         batch_readahead: usize,
         fragment_readahead: usize,
         with_row_id: bool,
+        with_make_deletions_null: bool,
         ordered_ouput: bool,
     ) -> Self {
         Self {
@@ -254,6 +264,7 @@ impl LanceScanExec {
             batch_readahead,
             fragment_readahead,
             with_row_id,
+            with_make_deletions_null,
             ordered_output: ordered_ouput,
         }
     }
@@ -268,7 +279,7 @@ impl ExecutionPlan for LanceScanExec {
         let schema: ArrowSchema = self.projection.as_ref().into();
         if self.with_row_id {
             let mut fields: Vec<Arc<Field>> = schema.fields.to_vec();
-            fields.push(Arc::new(Field::new(ROW_ID, DataType::UInt64, false)));
+            fields.push(Arc::new(ROW_ID_FIELD.clone()));
             Arc::new(ArrowSchema::new(fields))
         } else {
             Arc::new(schema)
@@ -308,6 +319,7 @@ impl ExecutionPlan for LanceScanExec {
             self.batch_readahead,
             self.fragment_readahead,
             self.with_row_id,
+            self.with_make_deletions_null,
             self.ordered_output,
         )?))
     }

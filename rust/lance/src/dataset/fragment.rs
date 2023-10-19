@@ -23,6 +23,7 @@ use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::ROW_ID;
 use lance_core::{io::ReadBatchParams, Error, Result};
 use object_store::path::Path;
 use snafu::{location, Location};
@@ -485,7 +486,7 @@ impl FileFragment {
             .try_into_stream()
             .await?
             .try_for_each(|batch| {
-                let array = batch["_rowid"].clone();
+                let array = batch[ROW_ID].clone();
                 let int_array: &UInt64Array = as_primitive_array(array.as_ref());
 
                 // _row_id is global, not within fragment level. The high bits
@@ -605,6 +606,13 @@ impl FragmentReader {
 
     pub(crate) fn with_row_id(&mut self) -> &mut Self {
         self.readers[0].0.with_row_id(true);
+        self
+    }
+
+    pub(crate) fn with_make_deletions_null(&mut self) -> &mut Self {
+        for (reader, _) in self.readers.iter_mut() {
+            reader.with_make_deletions_null(true);
+        }
         self
     }
 
@@ -736,6 +744,38 @@ mod tests {
         assert_eq!(
             batches[2].column_by_name("i").unwrap().as_ref(),
             &Int32Array::from_iter_values(100..105)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fragment_scan_deletions() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = create_dataset(test_uri).await;
+        dataset.delete("i >= 0 and i < 15").await.unwrap();
+
+        let fragment = &dataset.get_fragments()[0];
+        let mut reader = fragment.open(dataset.schema()).await.unwrap();
+        reader.with_make_deletions_null();
+        reader.with_row_id();
+
+        // Since the first batch is all deleted, it will return an empty batch.
+        let batch1 = reader.read_batch(0, ..).await.unwrap();
+        assert_eq!(batch1.num_rows(), 0);
+
+        // The second batch is partially deleted, so the deleted rows will be
+        // marked null with null row ids.
+        let batch2 = reader.read_batch(1, ..).await.unwrap();
+        assert_eq!(
+            batch2.column_by_name(ROW_ID).unwrap().as_ref(),
+            &UInt64Array::from_iter((10..20).map(|v| if v < 15 { None } else { Some(v) }))
+        );
+
+        // The final batch is not deleted, so it will be returned as-is.
+        let batch3 = reader.read_batch(2, ..).await.unwrap();
+        assert_eq!(
+            batch3.column_by_name(ROW_ID).unwrap().as_ref(),
+            &UInt64Array::from_iter_values(20..30)
         );
     }
 

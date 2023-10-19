@@ -361,13 +361,14 @@ mod tests {
             10,
             4,
             true,
+            false,
             true,
         ));
         let take_exec = TakeExec::try_new(dataset, input, extra_schema, 10).unwrap();
         let schema = take_exec.schema();
         assert_eq!(
             schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
-            vec!["i", "_rowid", "s"]
+            vec!["i", ROW_ID, "s"]
         );
     }
 
@@ -393,13 +394,14 @@ mod tests {
             10,
             4,
             true,
+            false,
             true,
         ));
         let take_exec = TakeExec::try_new(dataset, input, extra_schema, 10).unwrap();
         let schema = take_exec.schema();
         assert_eq!(
             schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
-            vec!["i", "s", "_rowid"]
+            vec!["i", "s", ROW_ID]
         );
     }
 
@@ -424,6 +426,7 @@ mod tests {
             10,
             10,
             4,
+            false,
             false,
             true,
         ));

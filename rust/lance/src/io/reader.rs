@@ -27,8 +27,9 @@ use arrow_array::{
     ArrayRef, ArrowNativeTypeOp, ArrowNumericType, NullArray, OffsetSizeTrait, PrimitiveArray,
     RecordBatch, StructArray, UInt32Array, UInt64Array,
 };
-use arrow_buffer::ArrowNativeType;
-use arrow_schema::{DataType, Field as ArrowField, FieldRef, Schema as ArrowSchema};
+use arrow_array::{make_array, BooleanArray};
+use arrow_buffer::{ArrowNativeType, NullBuffer};
+use arrow_schema::{DataType, FieldRef, Schema as ArrowSchema};
 use arrow_select::{
     concat::{concat, concat_batches},
     filter::filter_record_batch,
@@ -44,7 +45,7 @@ use lance_core::{
         read_fixed_stride_array, ReadBatchParams, Reader, RecordBatchStream,
         RecordBatchStreamAdapter,
     },
-    Error, Result,
+    Error, Result, ROW_ID, ROW_ID_FIELD,
 };
 use object_store::path::Path;
 use prost::Message;
@@ -54,7 +55,6 @@ use tracing::instrument;
 use super::deletion::{read_deletion_file, DeletionVector};
 use super::deletion_file_path;
 use super::object_reader::read_message;
-use crate::dataset::ROW_ID;
 use crate::format::{pb, Fragment, Index, Manifest, Metadata, PageTable};
 use crate::io::{object_reader::read_struct, read_metadata_offset, read_struct_from_buf};
 use crate::session::Session;
@@ -176,6 +176,11 @@ pub struct FileReader {
     /// If set true, returns the row ID from the dataset alongside with the
     /// actual data.
     with_row_id: bool,
+
+    /// If true, instead of removing deleted rows, the _rowid column value may be
+    /// marked as null. This is used as a performance optimization to
+    /// avoid copying data.
+    make_deletions_null: bool,
 
     // deletion vector indicating which rows are deleting in the fragment
     deletion_vector: Option<Arc<DeletionVector>>,
@@ -312,6 +317,7 @@ impl FileReader {
             page_table,
             fragment_id,
             with_row_id: false,
+            make_deletions_null: false,
             deletion_vector,
             stats_page_table,
         })
@@ -435,6 +441,16 @@ impl FileReader {
         self
     }
 
+    /// Instruct the FileReader that instead of removing deleted rows, it may
+    /// simply mark the _rowid value as null. Some rows may still be removed,
+    /// for example if the entire batch is deleted. This is a performance
+    /// optimization where the null bitmap of the _rowid column serves as a
+    /// selection vector.
+    pub(crate) fn with_make_deletions_null(&mut self, val: bool) -> &mut Self {
+        self.make_deletions_null = val;
+        self
+    }
+
     /// Schema of the returning RecordBatch.
     pub fn schema(&self) -> &Schema {
         self.projection.as_ref().unwrap()
@@ -522,7 +538,7 @@ impl FileReader {
 
         let mut schema = ArrowSchema::from(projection);
         if self.with_row_id {
-            schema = schema.try_with_column(ArrowField::new(ROW_ID, DataType::UInt64, false))?;
+            schema = schema.try_with_column(ROW_ID_FIELD.clone())?;
         }
         let schema = Arc::new(schema);
 
@@ -659,16 +675,57 @@ async fn read_batch(
 
     if with_row_id {
         let row_id_arr = Arc::new(UInt64Array::from(row_ids.unwrap()));
-        batch = batch.try_with_column(
-            ArrowField::new("_rowid", DataType::UInt64, false),
-            row_id_arr,
-        )?;
+        batch = batch.try_with_column(ROW_ID_FIELD.clone(), row_id_arr)?;
     }
 
-    match deletion_mask {
-        None => Ok(batch),
-        Some(mask) => Ok(filter_record_batch(&batch, &mask)?),
+    match (deletion_mask, reader.make_deletions_null) {
+        (None, _) => Ok(batch),
+        (Some(mask), false) => Ok(filter_record_batch(&batch, &mask)?),
+        (Some(mask), true) => Ok(apply_deletions_as_nulls(batch, &mask)?),
     }
+}
+
+/// Apply a mask to the batch, where rows are "deleted" by the _rowid column null.
+/// This is used as a performance optimization to avoid copying data.
+fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<RecordBatch> {
+    // Transform mask into null buffer. Null means deleted, though note that
+    // null buffers are actually validity buffers, so True means not null
+    // and thus not deleted.
+    let mask_buffer = NullBuffer::new(mask.values().clone());
+
+    match mask_buffer.null_count() {
+        // All rows are deleted
+        n if n == mask_buffer.len() => return Ok(RecordBatch::new_empty(batch.schema())),
+        // No rows are deleted
+        0 => return Ok(batch),
+        _ => {}
+    }
+
+    // For each column convert to data
+    let new_columns = batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(field, col)| {
+            if field.name() == ROW_ID {
+                let col_data = col.to_data();
+                // If it already has a validity bitmap, then AND it with the mask.
+                // Otherwise, use the boolean buffer as the mask.
+                let null_buffer = NullBuffer::union(col_data.nulls(), Some(&mask_buffer));
+
+                Ok(col_data
+                    .into_builder()
+                    .null_bit_buffer(null_buffer.map(|b| b.buffer().clone()))
+                    .build()
+                    .map(make_array)?)
+            } else {
+                Ok(col.clone())
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(RecordBatch::try_new(batch.schema(), new_columns)?)
 }
 
 #[async_recursion]
@@ -1038,7 +1095,7 @@ mod tests {
 
         for b in 0..10 {
             let batch = reader.read_batch(b, .., reader.schema()).await.unwrap();
-            let row_ids_col = &batch["_rowid"];
+            let row_ids_col = &batch[ROW_ID];
             // Do the same computation as `compute_row_id`.
             let start_pos = (fragment << 32) + 10 * b as u64;
 
@@ -1170,7 +1227,7 @@ mod tests {
 
         for b in 0..10 {
             let batch = reader.read_batch(b, .., reader.schema()).await.unwrap();
-            let row_ids_col = &batch["_rowid"];
+            let row_ids_col = &batch[ROW_ID];
             // Do the same computation as `compute_row_id`.
             let start_pos = (fragment << 32) + 10 * b as u64;
 
@@ -1235,7 +1292,7 @@ mod tests {
                 .fields()
                 .iter()
                 .map(|f| f.name().as_str())
-                .any(|name| name == "_rowid"))
+                .any(|name| name == ROW_ID))
         }
     }
 
