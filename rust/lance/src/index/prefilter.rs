@@ -39,9 +39,14 @@ pub trait AllowListLoader: Send + 'static {
     async fn load(self: Box<Self>) -> Result<Arc<RoaringTreemap>>;
 }
 
-/// Filter out row ids that we know are not relevant to the query. This currently
-/// is just deleted rows.
+/// Filter out row ids that we know are not relevant to the query.
+///
+/// This could be both rows that are deleted (block_list) or a prefilter
+/// that should be applied to the search (allow_list)
 pub struct PreFilter {
+    // Expressing these as tasks allows us to start calculating the block list
+    // and allow list at the same time we start searching the query.  We will await
+    // these tasks only when we've done as much work as we can without them.
     block_list: Option<Arc<SharedPrerequisite<Arc<RoaringTreemap>>>>,
     allow_list: Option<Arc<SharedPrerequisite<Arc<RoaringTreemap>>>>,
 }
