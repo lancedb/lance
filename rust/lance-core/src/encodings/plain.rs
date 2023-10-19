@@ -18,7 +18,6 @@
 //! it stores the array directly in the file. It offers O(1) read access.
 
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
-use std::ptr::NonNull;
 use std::slice::from_raw_parts;
 use std::sync::Arc;
 
@@ -27,7 +26,7 @@ use arrow_array::{
     builder::BooleanBuilder, cast::AsArray, make_array, new_empty_array, Array, ArrayRef,
     BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, UInt32Array, UInt8Array,
 };
-use arrow_buffer::{bit_util, Buffer};
+use arrow_buffer::bit_util;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 use arrow_select::{concat::concat, take::take};
@@ -221,27 +220,7 @@ impl<'a> PlainDecoder<'a> {
         };
 
         let data = self.reader.get_range(range).await?;
-        let is_aligned = matches!(self.data_type, DataType::Boolean)
-            || data.as_ptr().align_offset(self.data_type.byte_width()) == 0;
-        // TODO: replace this with safe method once arrow-rs 47.0.0 comes out.
-        // https://github.com/lancedb/lance/issues/1237
-        // Zero-copy conversion from bytes
-        // Safety: the bytes are owned by the `data` value, so the pointer
-        // will be valid for the lifetime of the Arc we are passing in.
-        let buf = if is_aligned {
-            unsafe {
-                Buffer::from_custom_allocation(
-                    NonNull::new(data.as_ptr() as _).unwrap(),
-                    data.len(),
-                    Arc::new(data),
-                )
-            }
-        } else {
-            // If data isn't aligned appropriately for the data type, we need to copy
-            // the buffer.
-            Buffer::from(data)
-        };
-
+        let buf = data.into();
         // booleans are bitpacked, so we need an offset to provide the exact
         // requested range.
         let offset = if self.data_type == &DataType::Boolean {
