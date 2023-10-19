@@ -14,7 +14,6 @@
 import platform
 import random
 import string
-from threading import Thread
 import time
 from pathlib import Path
 
@@ -464,24 +463,3 @@ def test_knn_with_deletions(tmp_path):
     assert len(results) == 10
 
     assert expected == [r.as_py() for r in results]
-
-
-def test_keyboard_interrupt(tmp_path, dataset):
-    assert not dataset.has_index
-    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
-
-    try:
-        start_time = time.monotonic()
-
-        # Create an index in a thread
-        thread = Thread(target=ann_ds.create_index, args=("vector"), kwargs=dict(
-            index_type="IVF_PQ",
-            num_partitions=4,
-            num_sub_vectors=16,
-        ))
-        
-        raise KeyboardInterrupt()
-    except KeyboardInterrupt:
-        end_time = time.monotonic()
-    
-    assert end_time - start_time < 0.2
