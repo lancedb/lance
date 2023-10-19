@@ -44,9 +44,10 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+arrow = "47.0"
+mock_instant.workspace = true
 rand.workspace = true
 tempfile.workspace = true
-arrow = "47.0"
 
 [build-dependencies]
 prost-build.workspace = true

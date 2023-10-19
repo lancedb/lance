@@ -146,11 +146,11 @@ impl PageTable {
 
 #[cfg(test)]
 mod tests {
-    use object_store::path::Path;
-
-    use crate::io::ObjectStore;
 
     use super::*;
+
+    use crate::io::local::LocalObjectReader;
+    use tempfile;
 
     #[test]
     fn test_set_page_info() {
@@ -175,22 +175,22 @@ mod tests {
         page_table.set(12, 2, page_info.clone());
         page_table.set(12, 3, page_info.clone());
 
-        let path = Path::from("test");
-        let object_store = ObjectStore::memory();
+        let test_dir = tempfile::tempdir().unwrap();
+        let path = test_dir.path().join("test");
 
         // The first field_id with entries is 10, but if it's inside of a struct
         // the struct itself needs to be included in the page table. We use 9
         // here to represent the struct.
         let starting_field_id = 9;
 
-        let mut writer = ObjectWriter::new(&object_store, &path).await.unwrap();
+        let mut writer = tokio::fs::File::create(&path).await.unwrap();
         let pos = page_table
             .write(&mut writer, starting_field_id)
             .await
             .unwrap();
         writer.shutdown().await.unwrap();
 
-        let reader = object_store.open(&path).await.unwrap();
+        let reader = LocalObjectReader::open_local_path(&path, 1024).unwrap();
         let actual = PageTable::load(
             reader.as_ref(),
             pos,
