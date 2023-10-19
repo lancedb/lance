@@ -26,17 +26,18 @@ use datafusion::logical_expr::AggregateFunction;
 use datafusion::physical_plan::{
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     display::DisplayableExecutionPlan,
-    expressions::{create_aggregate_expr, Literal},
+    expressions::{create_aggregate_expr, Column, Literal, PhysicalSortExpr},
     filter::FilterExec,
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
+    sorts::sort::SortExec,
     union::UnionExec,
     ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
 };
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use futures::stream::{Stream, StreamExt};
-use lance_core::ROW_ID_FIELD;
+use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{Query, DIST_COL};
 use lance_linalg::distance::MetricType;
 use log::debug;
@@ -504,7 +505,9 @@ impl Scanner {
         };
 
         // Stage 1: source
+        let mut order_by_distance = false;
         let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() {
+            order_by_distance = true;
             if self.prefilter {
                 let prefilter = filter_expr;
                 filter_expr = None;
@@ -542,7 +545,13 @@ impl Scanner {
         let output_schema = self.output_schema()?;
         let remaining_schema = output_schema.exclude(plan.schema().as_ref())?;
         if !remaining_schema.fields.is_empty() {
+            if order_by_distance {
+                plan = self.order_by(ROW_ID, plan)?;
+            }
             plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
+            if order_by_distance {
+                plan = self.order_by(DIST_COL, plan)?;
+            }
         }
         plan = Arc::new(ProjectionExec::try_new(plan, output_schema)?);
 
@@ -766,6 +775,18 @@ impl Scanner {
             *self.offset.as_ref().unwrap_or(&0) as usize,
             self.limit.map(|l| l as usize),
         ))
+    }
+
+    fn order_by(
+        &self,
+        column: &str,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let sort_expr = PhysicalSortExpr {
+            expr: Arc::new(Column::new_with_schema(column, input.schema().as_ref())?),
+            options: Default::default(),
+        };
+        Ok(Arc::new(SortExec::new(vec![sort_expr], input)))
     }
 
     pub async fn explain_plan(&self, verbose: bool) -> Result<String> {
@@ -1626,7 +1647,11 @@ mod test {
             vec!["s", "vec", DIST_COL]
         );
 
-        let take = &plan.children()[0];
+        // Order by row_id
+        let order_by = &plan.children()[0];
+        let order_by = order_by.as_any().downcast_ref::<SortExec>().unwrap();
+
+        let take = &order_by.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
         assert_eq!(
             take.schema().field_names(),
@@ -1641,7 +1666,11 @@ mod test {
             vec!["s"]
         );
 
-        let filter = &take.children()[0];
+        // Order by distance
+        let order_by = &take.children()[0];
+        let order_by = order_by.as_any().downcast_ref::<SortExec>().unwrap();
+
+        let filter = &order_by.children()[0];
         assert!(filter.as_any().is::<FilterExec>());
         assert_eq!(
             filter.schema().field_names(),
@@ -1710,7 +1739,11 @@ mod test {
             vec!["s", "vec", DIST_COL]
         );
 
-        let take = &plan.children()[0];
+        // Order by row_id
+        let order_by = &plan.children()[0];
+        let order_by = order_by.as_any().downcast_ref::<SortExec>().unwrap();
+
+        let take = &order_by.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
         assert_eq!(
             take.schema().field_names(),
@@ -1725,7 +1758,11 @@ mod test {
             vec!["s"]
         );
 
-        let filter = &take.children()[0];
+        // Order by distance
+        let order_by = &take.children()[0];
+        let order_by = order_by.as_any().downcast_ref::<SortExec>().unwrap();
+
+        let filter = &order_by.children()[0];
         assert!(filter.as_any().is::<FilterExec>());
         assert_eq!(
             filter.schema().field_names(),
