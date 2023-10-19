@@ -475,6 +475,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::*;
+    use arrow_buffer::Buffer;
     use arrow_schema::Field;
     use rand::prelude::*;
     use tempfile;
