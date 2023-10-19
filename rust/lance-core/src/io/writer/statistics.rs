@@ -55,6 +55,16 @@ pub struct StatisticsRow {
     pub(crate) max_value: ScalarValue,
 }
 
+impl Default for StatisticsRow {
+    fn default() -> Self {
+        Self {
+            null_count: ScalarValue::Int64(Some(0)),
+            min_value: ScalarValue::Null,
+            max_value: ScalarValue::Null,
+        }
+    }
+}
+
 fn get_primitive_statistics<T: ArrowNumericType>(
     arrays: &[&ArrayRef],
 ) -> (T::Native, T::Native, i64)
@@ -683,6 +693,9 @@ fn get_temporal_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 }
 
 pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
+    if arrays.is_empty() {
+        return StatisticsRow::default();
+    }
     match arrays[0].data_type() {
         DataType::Boolean => get_boolean_statistics(arrays),
         DataType::Int8 => get_statistics::<Int8Type>(arrays),
@@ -991,76 +1004,93 @@ mod tests {
     use super::*;
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
     use proptest::prelude::*;
-    // use proptest::collection::hash_set;
-    // use std::collections::HashSet;
+    use proptest::collection::hash_set;
+    use std::collections::HashSet;
 
-    // fn vec_of_vec() -> impl Strategy<Value = Vec<Vec<u16>>> {
-    //     const N: u16 = 10;
-    //
-    //     let length = 0..N;
-    //     length.prop_flat_map(vec_from_length).prop_map(convert)
-    // }
-    //
-    // fn vec_from_length(length: u16) -> impl Strategy<Value = Vec<HashSet<u16>>> {
-    //     const K: usize = 5;
-    //     let mut result = vec![];
-    //     for index in 1..length {
-    //         // Using a hash_set instead of vec because the elements should be unique.
-    //         let inner = hash_set(0..index, 0..K);
-    //
-    //         result.push(inner);
-    //     }
-    //     result
-    // }
-    //
-    // /// Convert Vec<HashSet<T>> to Vec<Vec<T>>
-    // fn convert(input: Vec<HashSet<u16>>) -> Vec<Vec<u16>> {
-    //     let mut output = vec![];
-    //     for inner in input {
-    //         output.push(inner.into_iter().collect())
-    //     }
-    //     output
-    // }
+    fn vec_of_vec() -> impl Strategy<Value = Vec<Vec<u16>>> {
+        const N: u16 = 10;
+
+        let length = 0..N;
+        length.prop_flat_map(vec_from_length).prop_map(convert)
+    }
+
+    fn vec_from_length(length: u16) -> impl Strategy<Value = Vec<HashSet<u16>>> {
+        const K: usize = 5;
+        let mut result = vec![];
+        for index in 1..length {
+            // Using a hash_set instead of vec because the elements should be unique.
+            let inner = hash_set(0..index, 0..K);
+
+            result.push(inner);
+        }
+        result
+    }
+
+    /// Convert Vec<HashSet<T>> to Vec<Vec<T>>
+    fn convert(input: Vec<HashSet<u16>>) -> Vec<Vec<u16>> {
+        let mut output = vec![];
+        for inner in input {
+            output.push(inner.into_iter().collect())
+        }
+        output
+    }
 
     proptest! {
-        // #[test]
-        // fn test_something2(vecs in vec_of_vec()) {
-        //     let mut arrays: Vec<ArrayRef> = vec![];
-        //
-        //     for v in vecs.iter() {
-        //         let array = Arc::new(UInt16Array::from_iter_values(v.to_vec()));
-        //         arrays.push(array);
-        //     }
-        //
-        //     let array_refs = arrays.iter().collect::<Vec<_>>();
-        //     let stats = collect_statistics(array_refs.as_slice());
-        //
-        //     prop_assert_eq!(stats.null_count, ScalarValue::from(0_i64));
-        //     prop_assert!(stats.min_value >= ScalarValue::from(1_u16));
-        //     prop_assert!(stats.max_value <= ScalarValue::from(100_u16));
-        // }
-
         #[test]
-        fn test_something(a in prop::array::uniform32(1u32..100), split in prop::array::uniform5(0usize..6usize)) {
+        fn test_something(vecs in vec_of_vec()) {
             let mut arrays: Vec<ArrayRef> = vec![];
-            let mut split = split.to_vec();
-            for i in 1..split.len() {
-                split[i] = split[i-1] + split[i];
-            }
 
-            for i in 1..split.len() {
-                let array_slice = &a[split[i-1]..split[i]];
-                let array = Arc::new(UInt32Array::from_iter_values(array_slice.to_vec()));
+            for v in vecs.iter() {
+                let array = Arc::new(UInt16Array::from_iter_values(v.to_vec()));
                 arrays.push(array);
             }
 
             let array_refs = arrays.iter().collect::<Vec<_>>();
             let stats = collect_statistics(array_refs.as_slice());
 
-            prop_assert_eq!(stats.null_count, ScalarValue::from(0_i64));
-            prop_assert!(stats.min_value >= ScalarValue::from(1_u32));
-            prop_assert!(stats.max_value <= ScalarValue::from(100_u32));
+            let some_values : bool = array_refs.iter().map(|x| x.len() > 0).any(|x| x);
+
+            if some_values {
+                prop_assert_eq!(stats.null_count, ScalarValue::from(0_i64));
+                prop_assert!(stats.min_value >= ScalarValue::from(0_u16));
+                prop_assert!(stats.max_value <= ScalarValue::from(100_u16));
+            } else if arrays.len() == 0 {
+                prop_assert_eq!(stats, StatisticsRow{
+                    null_count: ScalarValue::Int64(Some(0)),
+                    min_value: ScalarValue::Null,
+                    max_value: ScalarValue::Null,
+                });
+            } else {
+                prop_assert_eq!(stats, StatisticsRow{
+                    null_count: ScalarValue::Int64(Some(0)),
+                    min_value: ScalarValue::from(0_u16),
+                    max_value: ScalarValue::from(u16::MAX),
+                });
+            }
         }
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        // No arrays, datatype can't be inferred
+        let arrays: Vec<ArrayRef> = vec![];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        assert_eq!(collect_statistics(array_refs.as_slice()),
+        StatisticsRow{
+            null_count: ScalarValue::Int64(Some(0)),
+            min_value: ScalarValue::Null,
+            max_value: ScalarValue::Null,
+        });
+
+        // Empty arrays, default min/max values
+        let arrays: Vec<ArrayRef> = vec![Arc::new(UInt32Array::from_iter_values(vec![]))];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        assert_eq!(collect_statistics(array_refs.as_slice()),
+        StatisticsRow{
+            null_count: ScalarValue::Int64(Some(0)),
+            min_value: ScalarValue::from(u32::MIN),
+            max_value: ScalarValue::from(u32::MAX),
+        });
     }
 
     #[test]
