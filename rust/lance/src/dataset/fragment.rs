@@ -23,6 +23,7 @@ use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::ROW_ID;
 use lance_core::{io::ReadBatchParams, Error, Result};
 use object_store::path::Path;
 use snafu::{location, Location};
@@ -485,7 +486,7 @@ impl FileFragment {
             .try_into_stream()
             .await?
             .try_for_each(|batch| {
-                let array = batch["_rowid"].clone();
+                let array = batch[ROW_ID].clone();
                 let int_array: &UInt64Array = as_primitive_array(array.as_ref());
 
                 // _row_id is global, not within fragment level. The high bits

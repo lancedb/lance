@@ -1095,7 +1095,7 @@ mod tests {
 
         for b in 0..10 {
             let batch = reader.read_batch(b, .., reader.schema()).await.unwrap();
-            let row_ids_col = &batch["_rowid"];
+            let row_ids_col = &batch[ROW_ID];
             // Do the same computation as `compute_row_id`.
             let start_pos = (fragment << 32) + 10 * b as u64;
 
@@ -1227,7 +1227,7 @@ mod tests {
 
         for b in 0..10 {
             let batch = reader.read_batch(b, .., reader.schema()).await.unwrap();
-            let row_ids_col = &batch["_rowid"];
+            let row_ids_col = &batch[ROW_ID];
             // Do the same computation as `compute_row_id`.
             let start_pos = (fragment << 32) + 10 * b as u64;
 
@@ -1292,7 +1292,7 @@ mod tests {
                 .fields()
                 .iter()
                 .map(|f| f.name().as_str())
-                .any(|name| name == "_rowid"))
+                .any(|name| name == ROW_ID))
         }
     }
 

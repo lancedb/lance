@@ -515,7 +515,7 @@ mod tests {
             .unwrap();
         let results = stream.try_collect::<Vec<_>>().await.unwrap();
 
-        assert!(results[0].schema().column_with_name("_distance").is_some());
+        assert!(results[0].schema().column_with_name(DIST_COL).is_some());
 
         assert_eq!(results.len(), 1);
 

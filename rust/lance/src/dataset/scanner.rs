@@ -841,6 +841,7 @@ mod test {
     use arrow_schema::DataType;
     use arrow_select::take;
     use futures::TryStreamExt;
+    use lance_core::ROW_ID;
     use lance_index::vector::DIST_COL;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use tempfile::tempdir;
@@ -1277,7 +1278,7 @@ mod test {
                     ),
                     true,
                 ),
-                ArrowField::new("_distance", DataType::Float32, true),
+                ArrowField::new(DIST_COL, DataType::Float32, true),
             ])
         );
 
@@ -1381,7 +1382,7 @@ mod test {
                     ),
                     true,
                 ),
-                ArrowField::new("_distance", DataType::Float32, true),
+                ArrowField::new(DIST_COL, DataType::Float32, true),
             ])
         );
 
@@ -1434,10 +1435,10 @@ mod test {
         let plan = scan.create_plan().await.unwrap();
 
         assert!(plan.as_any().is::<ProjectionExec>());
-        assert_eq!(plan.schema().field_names(), &["i", "_rowid"]);
+        assert_eq!(plan.schema().field_names(), &["i", ROW_ID]);
         let scan = &plan.children()[0];
         assert!(scan.as_any().is::<LanceScanExec>());
-        assert_eq!(scan.schema().field_names(), &["i", "_rowid"]);
+        assert_eq!(scan.schema().field_names(), &["i", ROW_ID]);
     }
 
     #[tokio::test]
@@ -1477,7 +1478,7 @@ mod test {
 
             // If they aren't equal, they should be equal if we sort by row id
             if ordered_batch != unordered_batch {
-                let sort_indices = sort_to_indices(&unordered_batch["_rowid"], None, None).unwrap();
+                let sort_indices = sort_to_indices(&unordered_batch[ROW_ID], None, None).unwrap();
 
                 let ordered_i = ordered_batch["i"].clone();
                 let sorted_i = take::take(&unordered_batch["i"], &sort_indices, None).unwrap();
@@ -1584,15 +1585,15 @@ mod test {
 
         let take = &plan.children()[0];
         assert!(take.as_any().is::<TakeExec>());
-        assert_eq!(take.schema().field_names(), ["i", "_rowid", "s"]);
+        assert_eq!(take.schema().field_names(), ["i", ROW_ID, "s"]);
 
         let filter = &take.children()[0];
         assert!(filter.as_any().is::<FilterExec>());
-        assert_eq!(filter.schema().field_names(), ["i", "_rowid"]);
+        assert_eq!(filter.schema().field_names(), ["i", ROW_ID]);
 
         let scan = &filter.children()[0];
         assert!(scan.as_any().is::<LanceScanExec>());
-        assert_eq!(filter.schema().field_names(), ["i", "_rowid"]);
+        assert_eq!(filter.schema().field_names(), ["i", ROW_ID]);
     }
 
     /// Test KNN with index
@@ -1622,14 +1623,14 @@ mod test {
                 .iter()
                 .map(|f| f.name())
                 .collect::<Vec<_>>(),
-            vec!["s", "vec", "_distance"]
+            vec!["s", "vec", DIST_COL]
         );
 
         let take = &plan.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
         assert_eq!(
             take.schema().field_names(),
-            ["_distance", "_rowid", "vec", "i", "s"]
+            [DIST_COL, ROW_ID, "vec", "i", "s"]
         );
         assert_eq!(
             take.extra_schema
@@ -1644,15 +1645,12 @@ mod test {
         assert!(filter.as_any().is::<FilterExec>());
         assert_eq!(
             filter.schema().field_names(),
-            ["_distance", "_rowid", "vec", "i"]
+            [DIST_COL, ROW_ID, "vec", "i"]
         );
 
         let take = &filter.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(
-            take.schema().field_names(),
-            ["_distance", "_rowid", "vec", "i"]
-        );
+        assert_eq!(take.schema().field_names(), [DIST_COL, ROW_ID, "vec", "i"]);
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1665,7 +1663,7 @@ mod test {
         // TODO: Two continuous take execs, we can merge them into one.
         let take = &take.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(take.schema().field_names(), ["_distance", "_rowid", "vec"]);
+        assert_eq!(take.schema().field_names(), [DIST_COL, ROW_ID, "vec"]);
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1677,7 +1675,7 @@ mod test {
 
         let knn = &take.children()[0];
         assert!(knn.as_any().is::<KNNIndexExec>());
-        assert_eq!(knn.schema().field_names(), ["_distance", "_rowid"]);
+        assert_eq!(knn.schema().field_names(), [DIST_COL, ROW_ID]);
     }
 
     /// Test KNN index with refine factor
@@ -1709,14 +1707,14 @@ mod test {
                 .iter()
                 .map(|f| f.name())
                 .collect::<Vec<_>>(),
-            vec!["s", "vec", "_distance"]
+            vec!["s", "vec", DIST_COL]
         );
 
         let take = &plan.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
         assert_eq!(
             take.schema().field_names(),
-            ["_distance", "_rowid", "vec", "i", "s"]
+            [DIST_COL, ROW_ID, "vec", "i", "s"]
         );
         assert_eq!(
             take.extra_schema
@@ -1731,15 +1729,12 @@ mod test {
         assert!(filter.as_any().is::<FilterExec>());
         assert_eq!(
             filter.schema().field_names(),
-            ["_distance", "_rowid", "vec", "i"]
+            [DIST_COL, ROW_ID, "vec", "i"]
         );
 
         let take = &filter.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(
-            take.schema().field_names(),
-            ["_distance", "_rowid", "vec", "i"]
-        );
+        assert_eq!(take.schema().field_names(), [DIST_COL, ROW_ID, "vec", "i"]);
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1755,7 +1750,7 @@ mod test {
 
         let take = &flat.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(take.schema().field_names(), ["_distance", "_rowid", "vec"]);
+        assert_eq!(take.schema().field_names(), [DIST_COL, ROW_ID, "vec"]);
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1767,7 +1762,7 @@ mod test {
 
         let knn = &take.children()[0];
         assert!(knn.as_any().is::<KNNIndexExec>());
-        assert_eq!(knn.schema().field_names(), ["_distance", "_rowid"]);
+        assert_eq!(knn.schema().field_names(), [DIST_COL, ROW_ID]);
     }
 
     #[tokio::test]

@@ -368,7 +368,7 @@ mod tests {
         let schema = take_exec.schema();
         assert_eq!(
             schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
-            vec!["i", "_rowid", "s"]
+            vec!["i", ROW_ID, "s"]
         );
     }
 
@@ -401,7 +401,7 @@ mod tests {
         let schema = take_exec.schema();
         assert_eq!(
             schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
-            vec!["i", "s", "_rowid"]
+            vec!["i", "s", ROW_ID]
         );
     }
 
