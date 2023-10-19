@@ -42,7 +42,6 @@ pub trait AllowListLoader: Send + 'static {
 /// Filter out row ids that we know are not relevant to the query. This currently
 /// is just deleted rows.
 pub struct PreFilter {
-    dataset: Arc<Dataset>,
     block_list: Option<Arc<SharedPrerequisite<Arc<RoaringTreemap>>>>,
     allow_list: Option<Arc<SharedPrerequisite<Arc<RoaringTreemap>>>>,
 }
@@ -80,7 +79,6 @@ impl PreFilter {
         let allow_list = allow_list
             .map(|allow_list| SharedPrerequisite::spawn(allow_list.load().in_current_span()));
         Self {
-            dataset,
             block_list,
             allow_list,
         }
@@ -91,18 +89,25 @@ impl PreFilter {
     }
 
     /// Check whether a single row id should be included in the query.
-    pub async fn check_one(&self, row_id: u64) -> Result<bool> {
-        let fragment_id = (row_id >> 32) as u32;
-        // If the fragment isn't found, then it must have been deleted.
-        let Some(fragment) = self.dataset.get_fragment(fragment_id as usize) else {
-            return Ok(false);
-        };
-        // If the fragment has no deletion vector, then the row must be there.
-        let Some(deletion_vector) = fragment.get_deletion_vector().await? else {
-            return Ok(true);
-        };
-        let local_row_id = row_id as u32;
-        Ok(!deletion_vector.contains(local_row_id))
+    pub fn check_one(&self, row_id: u64) -> bool {
+        match (&self.block_list, &self.allow_list) {
+            (Some(block_list), Some(allow_list)) => {
+                let block_list = block_list.get_ready();
+                let allow_list = allow_list.get_ready();
+                !block_list.contains(row_id) && allow_list.contains(row_id)
+            }
+            (Some(block_list), None) => {
+                let block_list = block_list.get_ready();
+                !block_list.contains(row_id)
+            }
+            (None, Some(allow_list)) => {
+                let allow_list = allow_list.get_ready();
+                allow_list.contains(row_id)
+            }
+            (None, None) => {
+                panic!("PreFilter::check_one called but prefilter has nothing to filter with")
+            }
+        }
     }
 
     #[instrument(level = "debug", skip_all)]

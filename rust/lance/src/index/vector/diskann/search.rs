@@ -222,12 +222,14 @@ impl VectorIndex for DiskANNIndex {
             Field::new(DIST_COL, DataType::Float32, true),
         ]));
 
+        pre_filter.wait_for_ready().await?;
+
         let mut candidates = Vec::with_capacity(query.k);
         for (distance, row) in state.candidates {
             if candidates.len() == query.k {
                 break;
             }
-            if pre_filter.check_one(row as u64).await? {
+            if pre_filter.check_one(row as u64) {
                 candidates.push((distance, row));
             }
         }
