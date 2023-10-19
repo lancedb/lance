@@ -988,11 +988,80 @@ mod tests {
         UInt32Array, UInt64Array, UInt8Array,
     };
 
-    use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
-
     use super::*;
+    use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
+    use proptest::prelude::*;
+    // use proptest::collection::hash_set;
+    // use std::collections::HashSet;
 
-    // fn test_collecting_integer_stats() {}
+    // fn vec_of_vec() -> impl Strategy<Value = Vec<Vec<u16>>> {
+    //     const N: u16 = 10;
+    //
+    //     let length = 0..N;
+    //     length.prop_flat_map(vec_from_length).prop_map(convert)
+    // }
+    //
+    // fn vec_from_length(length: u16) -> impl Strategy<Value = Vec<HashSet<u16>>> {
+    //     const K: usize = 5;
+    //     let mut result = vec![];
+    //     for index in 1..length {
+    //         // Using a hash_set instead of vec because the elements should be unique.
+    //         let inner = hash_set(0..index, 0..K);
+    //
+    //         result.push(inner);
+    //     }
+    //     result
+    // }
+    //
+    // /// Convert Vec<HashSet<T>> to Vec<Vec<T>>
+    // fn convert(input: Vec<HashSet<u16>>) -> Vec<Vec<u16>> {
+    //     let mut output = vec![];
+    //     for inner in input {
+    //         output.push(inner.into_iter().collect())
+    //     }
+    //     output
+    // }
+
+    proptest! {
+        // #[test]
+        // fn test_something2(vecs in vec_of_vec()) {
+        //     let mut arrays: Vec<ArrayRef> = vec![];
+        //
+        //     for v in vecs.iter() {
+        //         let array = Arc::new(UInt16Array::from_iter_values(v.to_vec()));
+        //         arrays.push(array);
+        //     }
+        //
+        //     let array_refs = arrays.iter().collect::<Vec<_>>();
+        //     let stats = collect_statistics(array_refs.as_slice());
+        //
+        //     prop_assert_eq!(stats.null_count, ScalarValue::from(0_i64));
+        //     prop_assert!(stats.min_value >= ScalarValue::from(1_u16));
+        //     prop_assert!(stats.max_value <= ScalarValue::from(100_u16));
+        // }
+
+        #[test]
+        fn test_something(a in prop::array::uniform32(1u32..100), split in prop::array::uniform5(0usize..6usize)) {
+            let mut arrays: Vec<ArrayRef> = vec![];
+            let mut split = split.to_vec();
+            for i in 1..split.len() {
+                split[i] = split[i-1] + split[i];
+            }
+
+            for i in 1..split.len() {
+                let array_slice = &a[split[i-1]..split[i]];
+                let array = Arc::new(UInt32Array::from_iter_values(array_slice.to_vec()));
+                arrays.push(array);
+            }
+
+            let array_refs = arrays.iter().collect::<Vec<_>>();
+            let stats = collect_statistics(array_refs.as_slice());
+
+            prop_assert_eq!(stats.null_count, ScalarValue::from(0_i64));
+            prop_assert!(stats.min_value >= ScalarValue::from(1_u32));
+            prop_assert!(stats.max_value <= ScalarValue::from(100_u32));
+        }
+    }
 
     #[test]
     fn test_collect_primitive_stats() {
