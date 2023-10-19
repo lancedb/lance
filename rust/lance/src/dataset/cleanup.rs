@@ -52,13 +52,16 @@ use std::{
 
 use chrono::{DateTime, Duration, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
+use lance_core::{
+    format::{Index, Manifest},
+    utils::temporal::utc_now,
+    Error, Result,
+};
 use object_store::path::Path;
 
 use crate::{
-    format::{Index, Manifest},
     io::{deletion_file_path, read_manifest, reader::read_manifest_indexes, ObjectStore},
-    utils::temporal::utc_now,
-    Dataset, Error, Result,
+    Dataset,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -465,10 +468,7 @@ mod tests {
             object_store::{ObjectStoreParams, WrappingObjectStore},
             ObjectStore,
         },
-        utils::{
-            temporal::utc_now,
-            testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy},
-        },
+        utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy},
         Error, Result,
     };
     use all_asserts::{assert_gt, assert_lt};

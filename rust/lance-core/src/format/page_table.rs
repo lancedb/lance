@@ -15,15 +15,13 @@
 use arrow_array::builder::Int64Builder;
 use arrow_array::{Array, Int64Array};
 use arrow_schema::DataType;
-use lance_core::io::Writer;
 use std::collections::BTreeMap;
 use tokio::io::AsyncWriteExt;
 
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::Decoder;
 use crate::error::Result;
-use crate::io::object_reader::ObjectReader;
-use crate::io::object_writer::ObjectWriter;
+use crate::io::{Reader, Writer};
 use crate::Error;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -54,7 +52,7 @@ impl PageTable {
     /// be the total unique number of field ids, including struct fields despite the fact
     /// they have no data pages.
     pub async fn load<'a>(
-        reader: &dyn ObjectReader,
+        reader: &dyn Reader,
         position: usize,
         num_columns: i32,
         num_batches: i32,
@@ -94,7 +92,7 @@ impl PageTable {
     ///
     /// Any (field_id, batch_id) combinations that are not present in the page table
     /// will be written as (0, 0) to indicate an empty page.
-    pub async fn write(&self, writer: &mut ObjectWriter, field_id_offset: i32) -> Result<usize> {
+    pub async fn write(&self, writer: &mut dyn Writer, field_id_offset: i32) -> Result<usize> {
         if self.pages.is_empty() {
             return Err(Error::InvalidInput {
                 source: "empty page table".into(),

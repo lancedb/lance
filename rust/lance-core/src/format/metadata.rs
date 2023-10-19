@@ -128,7 +128,8 @@ impl Metadata {
     /// Group row indices into each batch.
     ///
     /// The indices must be sorted.
-    pub(crate) fn group_indices_to_batches(&self, indices: &[u32]) -> Vec<BatchOffsets> {
+    // TODO: pub(crate)
+    pub fn group_indices_to_batches(&self, indices: &[u32]) -> Vec<BatchOffsets> {
         let mut batch_id: i32 = 0;
         let num_batches = self.num_batches() as i32;
         let mut indices_per_batch: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
@@ -167,7 +168,8 @@ impl Metadata {
     /// Map the range of row indices to the corresponding batches.
     ///
     /// It returns a list of (batch_id, in_batch_range) tuples.
-    pub(crate) fn range_to_batches(&self, range: Range<usize>) -> Result<Vec<(i32, Range<usize>)>> {
+    // TODO: pub(crate)
+    pub fn range_to_batches(&self, range: Range<usize>) -> Result<Vec<(i32, Range<usize>)>> {
         if range.end > *(self.batch_offsets.last().unwrap()) as usize {
             return Err(Error::IO {
                 message: format!(

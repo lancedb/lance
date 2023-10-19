@@ -14,20 +14,20 @@
 
 use std::sync::Arc;
 
-use lance_core::{Error, Result};
+use lance_core::{format::Index as IndexMetadata, Error, Result};
 use log::info;
 use uuid::Uuid;
 
+use crate::dataset::index::unindexed_fragments;
 use crate::dataset::Dataset;
-use crate::format::Index as IndexMetadata;
 use crate::index::vector::{ivf::IVFIndex, open_index};
 
 /// Append new data to the index, without re-train.
-pub async fn append_index(
+pub(crate) async fn append_index(
     dataset: Arc<Dataset>,
     old_index: &IndexMetadata,
 ) -> Result<Option<Uuid>> {
-    let unindexed = old_index.unindexed_fragments(dataset.as_ref()).await?;
+    let unindexed = unindexed_fragments(old_index, dataset.as_ref()).await?;
     if unindexed.is_empty() {
         return Ok(None);
     };
@@ -126,8 +126,7 @@ mod tests {
         dataset.append(batches, None).await.unwrap();
 
         let index = &dataset.load_indices().await.unwrap()[0];
-        assert!(!index
-            .unindexed_fragments(&dataset)
+        assert!(!unindexed_fragments(index, &dataset)
             .await
             .unwrap()
             .is_empty());
@@ -146,8 +145,7 @@ mod tests {
 
         dataset.optimize_indices().await.unwrap();
         let index = &dataset.load_indices().await.unwrap()[0];
-        assert!(index
-            .unindexed_fragments(&dataset)
+        assert!(unindexed_fragments(index, &dataset)
             .await
             .unwrap()
             .is_empty());

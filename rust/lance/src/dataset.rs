@@ -33,7 +33,10 @@ use chrono::{prelude::*, Duration};
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt};
-use lance_core::io::WriteExt;
+use lance_core::{
+    io::WriteExt,
+    utils::temporal::{utc_now, SystemTime},
+};
 use log::warn;
 use object_store::path::Path;
 use tracing::instrument;
@@ -69,7 +72,7 @@ use crate::io::{
     read_manifest, read_metadata_offset, write_manifest, ObjectStore,
 };
 use crate::session::Session;
-use crate::utils::temporal::{utc_now, SystemTime};
+
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;

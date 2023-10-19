@@ -40,7 +40,7 @@ impl DataFile {
         }
     }
 
-    pub(crate) fn schema(&self, full_schema: &Schema) -> Schema {
+    pub fn schema(&self, full_schema: &Schema) -> Schema {
         full_schema.project_by_ids(&self.fields)
     }
 }
@@ -71,7 +71,8 @@ pub enum DeletionFileType {
 }
 
 impl DeletionFileType {
-    pub(crate) fn suffix(&self) -> &str {
+    // TODO: pub(crate)
+    pub fn suffix(&self) -> &str {
         match self {
             Self::Array => "arrow",
             Self::Bitmap => "bin",
