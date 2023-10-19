@@ -241,7 +241,7 @@ impl PyCompactionTask {
             .block_on(
                 None,
                 async move { self.0.execute(dataset.ds.as_ref()).await },
-            )
+            )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         Ok(PyRewriteResult(result))
@@ -465,7 +465,7 @@ impl PyCompaction {
         let fut = compact_files(&mut new_ds, opts, None);
         let metrics = RT.block_on(None, async move {
             fut.await.map_err(|err| PyIOError::new_err(err.to_string()))
-        })?;
+        })??;
         Python::with_gil(|py| {
             dataset_ref.borrow_mut(py).ds = Arc::new(new_ds);
         });
@@ -501,7 +501,7 @@ impl PyCompaction {
         let plan = RT
             .block_on(None, async move {
                 plan_compaction(dataset.ds.as_ref(), &opts).await
-            })
+            })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(PyCompactionPlan(plan))
     }
@@ -539,7 +539,7 @@ impl PyCompaction {
             Arc::new(DatasetIndexRemapperOptions::default()),
         );
         let metrics = RT
-            .block_on(None, fut)
+            .block_on(None, fut)?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Python::with_gil(|py| {
             dataset_ref.borrow_mut(py).ds = Arc::new(new_ds);

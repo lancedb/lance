@@ -209,7 +209,7 @@ impl Dataset {
     /// Load index metadata
     fn load_indices(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
         let index_metadata = RT
-            .block_on(Some(self_.py()), self_.ds.load_indices())
+            .block_on(Some(self_.py()), self_.ds.load_indices())?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
         let py = self_.py();
         Ok(index_metadata
@@ -412,7 +412,7 @@ impl Dataset {
         }
         .map_err(|err| PyIOError::new_err(err.to_string()))?;
         let batch = RT
-            .block_on(Some(self_.py()), self_.ds.take(&row_indices, &projection))
+            .block_on(Some(self_.py()), self_.ds.take(&row_indices, &projection))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         crate::arrow::record_batch_to_pyarrow(self_.py(), &batch)
@@ -439,7 +439,7 @@ impl Dataset {
             .block_on(
                 Some(self_.py()),
                 self_.ds.take_rows(&row_indices, &projection),
-            )
+            )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         crate::arrow::record_batch_to_pyarrow(self_.py(), &batch)
@@ -452,7 +452,7 @@ impl Dataset {
         right_on: &str,
     ) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.merge(reader.0, left_on, right_on))
+        RT.block_on(None, new_self.merge(reader.0, left_on, right_on))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -460,7 +460,7 @@ impl Dataset {
 
     fn delete(&mut self, predicate: String) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.delete(&predicate))
+        RT.block_on(None, new_self.delete(&predicate))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -498,14 +498,14 @@ impl Dataset {
     }
 
     fn latest_version(self_: PyRef<'_, Self>) -> PyResult<u64> {
-        RT.block_on(Some(self_.py()), self_.ds.latest_version_id())
+        RT.block_on(Some(self_.py()), self_.ds.latest_version_id())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
     /// Restore the current version
     fn restore(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.restore(None))
+        RT.block_on(None, new_self.restore(None))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -522,7 +522,7 @@ impl Dataset {
             .block_on(
                 None,
                 self.ds.cleanup_old_versions(older_than, delete_unverified),
-            )
+            )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(CleanupStats {
             bytes_removed: cleanup_stats.bytes_removed,
@@ -532,7 +532,7 @@ impl Dataset {
 
     fn optimize_indices(&mut self, _kwargs: Option<&PyDict>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.optimize_indices())
+        RT.block_on(None, new_self.optimize_indices())?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -640,7 +640,7 @@ impl Dataset {
         RT.block_on(
             None,
             new_self.create_index(&columns, idx_type, name, &params, replace),
-        )
+        )?
         .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
 
@@ -686,7 +686,7 @@ impl Dataset {
             .block_on(
                 commit_lock.map(|cl| cl.py()),
                 LanceDataset::commit(dataset_uri, operation.0, read_version, store_params),
-            )
+            )?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
             ds: Arc::new(ds),
@@ -708,15 +708,15 @@ pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<
     if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
         let batches = RT
-            .block_on(Some(py), scanner.to_reader())
+            .block_on(Some(py), scanner.to_reader())?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))
+        RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(true)
     } else {
         let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
-        RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))
+        RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(true)
     }

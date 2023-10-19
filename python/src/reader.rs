@@ -54,7 +54,12 @@ impl Iterator for LanceReader {
             let mut stream = stream.lock().await;
             stream.next().await
         })
-        .map(|rs| rs.map_err(ArrowError::from))
+        .transpose()
+        .map(|rs| match rs {
+            Ok(Ok(batch)) => Ok(batch),
+            Ok(Err(err)) => Err(ArrowError::from(err)),
+            Err(err) => Err(ArrowError::ExternalError(Box::new(err))),
+        })
     }
 }
 

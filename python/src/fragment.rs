@@ -335,13 +335,13 @@ impl FileFragment {
 
     #[getter]
     fn num_deletions(&self) -> PyResult<usize> {
-        RT.block_on(None, self.fragment.count_deletions())
+        RT.block_on(None, self.fragment.count_deletions())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
     #[getter]
     fn physical_rows(&self) -> PyResult<usize> {
-        RT.block_on(None, self.fragment.physical_rows())
+        RT.block_on(None, self.fragment.physical_rows())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 }
