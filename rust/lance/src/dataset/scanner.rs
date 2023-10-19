@@ -746,7 +746,7 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let columns_in_filter = column_names_in_expr(prefilter.as_ref());
         let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
-        let filter_input = self.scan(true, filter_schema);
+        let filter_input = self.scan(true, true, filter_schema);
         let filtered = Arc::new(FilterExec::try_new(prefilter, filter_input)?);
         Ok(Arc::new(KNNIndexExec::try_new(
             self.dataset.clone(),

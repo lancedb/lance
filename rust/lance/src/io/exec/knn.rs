@@ -266,7 +266,7 @@ impl AllowListLoader for PreFilterBuilder {
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .expect("row id column in input batch had incorrect type");
-            allow_list.extend(row_ids.values())
+            allow_list.extend(row_ids.iter().filter_map(|row_id| row_id))
         }
         Ok(Arc::new(allow_list))
     }
