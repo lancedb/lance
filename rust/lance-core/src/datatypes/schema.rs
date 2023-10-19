@@ -245,7 +245,7 @@ impl Schema {
     }
 
     /// Get the sequence of fields from the root to the field with the given id.
-    pub(crate) fn field_ancestry_by_id(&self, id: i32) -> Option<Vec<&Field>> {
+    pub fn field_ancestry_by_id(&self, id: i32) -> Option<Vec<&Field>> {
         let mut to_visit = self.fields.iter().map(|f| vec![f]).collect::<Vec<_>>();
         while let Some(path) = to_visit.pop() {
             let field = path.last().unwrap();
@@ -261,7 +261,7 @@ impl Schema {
         None
     }
 
-    pub(crate) fn mut_field_by_id(&mut self, id: impl Into<i32>) -> Option<&mut Field> {
+    pub fn mut_field_by_id(&mut self, id: impl Into<i32>) -> Option<&mut Field> {
         let id = id.into();
         for field in self.fields.as_mut_slice() {
             if field.id == id {

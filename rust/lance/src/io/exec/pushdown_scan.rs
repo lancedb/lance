@@ -19,12 +19,13 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{Array, Int64Array, PrimitiveArray, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
+use arrow_select::filter::filter_record_batch;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::logical_expr::col;
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::physical_expr::intervals::{Interval, IntervalBound, NullableInterval};
 use datafusion::physical_plan::ColumnarValue;
-use datafusion::prelude::Column;
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     physical_plan::{
@@ -35,10 +36,11 @@ use datafusion::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
+use lance_core::io::ReadBatchParams;
+use lance_core::ROW_ID_FIELD;
 use snafu::{location, Location};
 
 use crate::dataset::scanner::{DEFAULT_BATCH_READAHEAD, DEFAULT_FRAGMENT_READAHEAD};
-use crate::io::ReadBatchParams;
 use crate::Error;
 use crate::{
     dataset::{
@@ -50,22 +52,30 @@ use crate::{
     Dataset,
 };
 
-// TODO:
-// [ ] Test with row_id
-// [ ] Handle scanning out-of-order
-// [ ] Test interval creation
-// [ ] Test predicate simplification
-// [ ] Hook up into planner
-// [ ] Benchmark various scenarios
-
 use super::Planner;
 
 #[derive(Debug, Clone)]
 pub struct ScanConfig {
-    batch_readahead: usize,
-    fragment_readahead: usize,
-    with_row_id: bool,
-    ordered_output: bool,
+    /// Number of batches to read ahead, potentially concurrently. This determines
+    /// the amount of concurrent IO a scan may perform as well as the amount of
+    /// data that may be buffered.
+    pub batch_readahead: usize,
+    /// Number of fragments to read ahead, potentially concurrently.
+    pub fragment_readahead: usize,
+    /// If true, a row id column will be added to the output. This will be the
+    /// first column.
+    pub with_row_id: bool,
+    /// If true, the scan will emit batches that contain deleted rows but have
+    /// a null _rowid. This option is only valid if with_row_id is true.
+    pub make_deletions_null: bool,
+    /// If true (default), the scan will emit batches in the same order as the
+    /// fragments. If false, the scan may emit batches in an arbitrary order.
+    pub ordered_output: bool,
+    /// Whether to use statistics to optimize the scan. This is primarily used
+    /// for testing purposes.
+    pub use_stats: bool,
+    /// The number of rows to read per batch.
+    pub batch_size: usize, // TODO: respect batch size.
 }
 
 impl Default for ScanConfig {
@@ -74,7 +84,10 @@ impl Default for ScanConfig {
             batch_readahead: DEFAULT_BATCH_READAHEAD,
             fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
             with_row_id: false,
+            make_deletions_null: false,
             ordered_output: true,
+            use_stats: true,
+            batch_size: 1024,
         }
     }
 }
@@ -107,6 +120,12 @@ impl LancePushdownScanExec {
         let dataset_schema = dataset.schema();
         let predicate_projection = Arc::new(dataset_schema.project(&columns)
             .map_err(|err| Error::invalid_input(format!("Filter predicate '{:?}' references columns {:?}, but some of them were not found in the dataset schema: {}\nInner error: {:?}", predicate, columns, dataset_schema, err), location!()))?);
+
+        if config.make_deletions_null && !config.with_row_id {
+            return Err(DataFusionError::Configuration(
+                "make_deletions_null is only valid if with_row_id is true".into(),
+            ));
+        }
 
         Ok(Self {
             dataset,
@@ -185,9 +204,7 @@ impl ExecutionPlan for LancePushdownScanExec {
                 exec.projection,
                 exec.predicate_projection,
                 exec.predicate,
-                exec.config.batch_readahead,
-                exec.config.with_row_id,
-                exec.config.ordered_output,
+                exec.config.clone(),
             )
             .await?;
 
@@ -236,20 +253,8 @@ struct FragmentScanner {
     projection: Arc<Schema>,
     predicate_projection: Arc<Schema>,
     predicate: Expr,
-    batch_readahead: usize,
-    ordered_output: bool,
-    /// Cache of readers for each projection. For each batch, we scan the
-    /// minimum number of columns needed to evaluate the predicate, so which
-    /// columns are relevant change from batch to batch. To reduce the cost
-    /// of opening readers, we cache them here.
-    ///
-    /// It's worth noting that the [FileFragment::open()] method caches it's IO
-    /// calls, so there shouldn't be a meaningful cost to each additional reader
-    /// we open beyond the CPU time required to instantiate them.
-    ///
-    /// We don't intend to hold this across await points, so we just use the std
-    /// Mutex instead of the tokio one.
-    reader_cache: Arc<std::sync::Mutex<HashMap<Vec<i32>, Arc<FragmentReader>>>>,
+    config: ScanConfig,
+    reader: FragmentReader,
     stats: Option<RecordBatch>,
 }
 
@@ -260,82 +265,99 @@ impl FragmentScanner {
         projection: Arc<Schema>,
         predicate_projection: Arc<Schema>,
         predicate: Expr,
-        batch_readahead: usize,
-        with_row_id: bool,
-        ordered_output: bool,
+        config: ScanConfig,
     ) -> Result<Self> {
         let fragment = FileFragment::new(dataset.clone(), fragment);
-        let mut filter_reader = fragment.open(&predicate_projection).await?;
-        if with_row_id {
-            filter_reader.with_row_id();
+
+        // We will call the reader with projections. In order for this to work
+        // we must ensure that we open the fragment with the maximal schema.
+        let mut reader = fragment.open(dataset.schema()).await?;
+        if config.make_deletions_null {
+            reader.with_make_deletions_null();
         }
-        // We read the stats off of the filter column reader, since that contains
-        // the statistics we need to simplify the predicate.
-        let stats = filter_reader.read_page_stats().await?;
 
-        let mut reader_cache = HashMap::new();
-        reader_cache.insert(predicate_projection.field_ids(), Arc::new(filter_reader));
-
-        let projection_reader = fragment.open(&projection).await?;
-        reader_cache.insert(projection.field_ids(), Arc::new(projection_reader));
+        // We only need the statistics for the predicate projection.
+        let stats = reader.read_page_stats(Some(&predicate_projection)).await?;
 
         Ok(Self {
             fragment,
             projection,
             predicate_projection,
             predicate,
-            batch_readahead,
-            ordered_output,
-            reader_cache: Arc::new(std::sync::Mutex::new(reader_cache)),
+            config,
+            reader,
             stats,
         })
     }
 
     pub async fn scan(self) -> Result<impl Stream<Item = Result<RecordBatch>> + 'static + Send> {
-        // This reader was inserted on initialization, so it's guaranteed to be there.
-        let num_batches = self
-            .reader_cache
-            .lock()
-            .unwrap()
-            .get(&self.predicate_projection.field_ids())
-            .unwrap()
-            .num_batches();
-        let batch_readahead = self.batch_readahead;
+        let batch_readahead = self.config.batch_readahead;
         let simplified_predicates = self.simplified_predicates()?;
+        let ordered_output = self.config.ordered_output;
 
         let scanner = Arc::new(self);
 
-        Ok(
-            futures::stream::iter((0..num_batches).zip(simplified_predicates.into_iter()))
-                .map(move |(batch_id, predicate)| {
-                    let scanner_ref = scanner.clone();
-                    async move { scanner_ref.read_batch(batch_id, predicate).await }
-                })
+        let stream = futures::stream::iter(simplified_predicates.into_iter().enumerate()).map(
+            move |(batch_id, predicate)| {
+                let scanner_ref = scanner.clone();
+                async move { scanner_ref.read_batch(batch_id, predicate).await }
+            },
+        );
+
+        let stream = if ordered_output {
+            stream
                 .buffered(batch_readahead)
                 .try_filter_map(|res| futures::future::ready(Ok(res)))
-                .boxed(),
-        )
+                .boxed()
+        } else {
+            stream
+                .buffer_unordered(batch_readahead)
+                .try_filter_map(|res| futures::future::ready(Ok(res)))
+                .boxed()
+        };
+
+        Ok(stream)
     }
 
     async fn read_batch(&self, batch_id: usize, predicate: Expr) -> Result<Option<RecordBatch>> {
         match predicate {
             Expr::Literal(ScalarValue::Boolean(Some(true))) => {
                 // Predicate is always true, we just need to load the projection.
-
-                // TODO: what about the row id column?
-                let projection_reader = self
-                    .reader_cache
-                    .lock()
-                    .unwrap()
-                    .get(&self.projection.field_ids())
-                    .unwrap()
-                    .clone();
-                let batch = projection_reader.read_batch(batch_id, ..).await?;
+                let mut projection_reader = self.reader.clone();
+                if self.config.with_row_id {
+                    projection_reader.with_row_id();
+                }
+                let batch = projection_reader
+                    .read_batch_projected(batch_id, .., &self.projection)
+                    .await?;
+                let batch = self.final_projection(batch)?;
                 Ok(Some(batch))
             }
             Expr::Literal(ScalarValue::Boolean(Some(false))) => {
                 // Predicate is always false, we can skip this batch.
                 Ok(None)
+            }
+            _ if !self.config.use_stats => {
+                // 1. Load the full projection
+                let mut reader = self.reader.clone();
+                if self.config.with_row_id {
+                    reader.with_row_id();
+                }
+                let batch = reader.read_batch(batch_id, ..).await?;
+
+                // 2. Evaluate the predicate
+                let planner = Planner::new(batch.schema());
+                let physical_expr = planner.create_physical_expr(&predicate)?;
+                let result = physical_expr.evaluate(&batch)?.into_array(batch.num_rows());
+
+                // 3. Apply the final projection
+                let batch = self.final_projection(batch)?;
+
+                // 4. Apply the filter
+                let mask = result.as_boolean();
+                let batch = filter_record_batch(&batch, mask)?;
+
+                Ok(Some(batch))
             }
             _ => {
                 // Predicate is not always true or always false, we need to load
@@ -351,22 +373,13 @@ impl FragmentScanner {
                     .collect();
                 let predicate_projection =
                     Arc::new(self.fragment.dataset().schema().project(&columns).unwrap());
-                let field_ids = predicate_projection.field_ids();
-                let maybe_reader = self.reader_cache.lock().unwrap().get(&field_ids).cloned();
-                let filter_reader = match maybe_reader {
-                    Some(reader) => reader,
-                    None => {
-                        let filter_reader =
-                            Arc::new(self.fragment.open(&predicate_projection).await?);
-                        self.reader_cache
-                            .lock()
-                            .unwrap()
-                            .insert(field_ids.clone(), filter_reader.clone());
-                        filter_reader
-                    }
-                };
-
-                let batch = filter_reader.read_batch(batch_id, ..).await?;
+                let mut reader = self.reader.clone();
+                if self.config.with_row_id {
+                    reader.with_row_id();
+                }
+                let batch = reader
+                    .read_batch_projected(batch_id, .., &predicate_projection)
+                    .await?;
 
                 // 2. Evaluate predicate
                 let planner = Planner::new(batch.schema());
@@ -415,37 +428,23 @@ impl FragmentScanner {
                 // 3. Take the subset of rows that pass the predicate. Some of the
                 //    columns in the projection may have already been loaded as a
                 //    filter column, so we just load the remaining columns.
+                let predicate_field_ids = predicate_projection.field_ids();
                 let projection_field_ids = self.projection.field_ids();
                 let remaining_fields: Vec<i32> = projection_field_ids
                     .iter()
                     .cloned()
-                    .filter(|i| !field_ids.contains(i))
+                    .filter(|i| !predicate_field_ids.contains(i))
                     .collect();
+
                 let remainder_batch = if !remaining_fields.is_empty() {
-                    let maybe_reader = self
-                        .reader_cache
-                        .lock()
-                        .unwrap()
-                        .get(&remaining_fields)
-                        .cloned();
-                    let remainder_reader = match maybe_reader {
-                        Some(reader) => reader,
-                        None => {
-                            let remainder_reader = Arc::new(
-                                self.fragment
-                                    .open(&self.projection.project_by_ids(&remaining_fields))
-                                    .await?,
-                            );
-                            self.reader_cache
-                                .lock()
-                                .unwrap()
-                                .insert(field_ids.clone(), remainder_reader.clone());
-                            remainder_reader
-                        }
-                    };
+                    let remaining_projection = self.projection.project_by_ids(&remaining_fields);
                     Some(
-                        remainder_reader
-                            .read_batch(batch_id, selection.clone())
+                        self.reader
+                            .read_batch_projected(
+                                batch_id,
+                                selection.clone(),
+                                &remaining_projection,
+                            )
                             .await?,
                     )
                 } else {
@@ -460,19 +459,48 @@ impl FragmentScanner {
                     batch
                 };
                 let batch = if let Some(remainder_batch) = remainder_batch {
+                    debug_assert_eq!(batch.num_rows(), remainder_batch.num_rows());
                     batch.merge(&remainder_batch)?
                 } else {
                     batch
                 };
-                let batch = batch.project_by_schema(&self.projection.as_ref().into())
-                    .map_err(|err| Error::Internal {
-                        message: format!("Failed to to select schema {} from batch with schema {}\nInner error: {}", self.projection, batch.schema(), err),
-                        location: location!()
-                    })?;
+
+                let batch = self.final_projection(batch)?;
 
                 Ok(Some(batch))
             }
         }
+    }
+
+    fn final_projection(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        let row_id_column = batch.column_by_name(ROW_ID).cloned();
+
+        if self.projection.fields.is_empty() && row_id_column.is_some() {
+            return Ok(RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()])),
+                vec![row_id_column.unwrap()],
+            )?);
+        }
+
+        let mut batch = batch
+            .project_by_schema(&self.projection.as_ref().into())
+            .map_err(|err| Error::Internal {
+                message: format!(
+                    "Failed to to select schema {} from batch with schema {}\nInner error: {}",
+                    self.projection,
+                    batch.schema(),
+                    err
+                ),
+                location: location!(),
+            })?;
+
+        // Row id wasn't part of the projection, so we need to add it back if it
+        // was requested. We always put it at the front.
+        if self.config.with_row_id {
+            batch = batch.try_with_column_at(0, ROW_ID_FIELD.clone(), row_id_column.unwrap())?;
+        }
+
+        Ok(batch)
     }
 
     /// Parse the statistics into a set of guarantees for each batch.
@@ -567,12 +595,12 @@ impl FragmentScanner {
                         (null_count, batch_size) if null_count == batch_size as i64 => NullableInterval::Null { datatype: field.data_type() },
                         _ => NullableInterval::MaybeNull { values }
                     };
-                    let fully_qualified_name = predicate_projection.field_ancestry_by_id(field.id).unwrap()
-                        .into_iter()
-                        .map(|field| field.name.as_str())
-                        .collect::<Vec<&str>>()
-                        .join(".");
-                    let expr = Expr::Column(Column::from_name(fully_qualified_name));
+                    let column_path = predicate_projection.field_ancestry_by_id(field.id).unwrap();
+                    let mut parts_iter = column_path.into_iter().map(|part| part.name.as_str());
+                    let mut expr = col(parts_iter.next().unwrap());
+                    for part in parts_iter {
+                        expr = expr.field(part);
+                    }
                     guarantees.push((expr, interval));
                 }
                 guarantees
@@ -580,18 +608,11 @@ impl FragmentScanner {
     }
 
     fn simplified_predicates(&self) -> Result<Vec<Expr>> {
-        let reader = {
-            let cache = self.reader_cache.lock().unwrap();
-            cache
-                .get(&self.predicate_projection.field_ids())
-                .unwrap()
-                .clone()
-        };
-        let num_batches = reader.num_batches();
+        let num_batches = self.reader.num_batches();
 
         if let Some(stats) = &self.stats {
             let batch_sizes: Vec<usize> = (0..num_batches)
-                .map(|batch_id| reader.num_rows_in_batch(batch_id))
+                .map(|batch_id| self.reader.num_rows_in_batch(batch_id))
                 .collect();
             let schema =
                 Arc::new(ArrowSchema::from(self.predicate_projection.as_ref()).try_into()?);
@@ -601,11 +622,20 @@ impl FragmentScanner {
 
             let mut predicates = Vec::with_capacity(num_batches);
             for guarantees in
-                Self::extract_guarantees(&self.predicate_projection, &batch_sizes, &stats)
+                Self::extract_guarantees(&self.predicate_projection, &batch_sizes, stats)
             {
-                dbg!(&guarantees);
                 simplifier = simplifier.with_guarantees(guarantees);
-                predicates.push(simplifier.simplify(self.predicate.clone())?);
+                let simplified_expr = match simplifier.simplify(self.predicate.clone()) {
+                    Ok(expr) => expr,
+                    Err(err) => {
+                        // TODO: this logs on each iteration, but maybe should should
+                        // only log once per call of this func?
+                        log::debug!("Failed to simplify predicate: {}", err);
+                        self.predicate.clone()
+                    }
+                };
+
+                predicates.push(simplified_expr);
             }
             Ok(predicates)
         } else {
@@ -616,13 +646,24 @@ impl FragmentScanner {
 
 #[cfg(test)]
 mod test {
-    use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StructArray, UInt64Array};
+    use arrow_array::{
+        types::{Int32Type, UInt64Type},
+        ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array,
+        RecordBatchIterator, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array,
+    };
+    use arrow_ord::sort::sort_to_indices;
+    use arrow_schema::TimeUnit;
+    use arrow_select::concat::concat_batches;
     use datafusion::prelude::{col, lit, Column, SessionContext};
+    use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
     use tempfile::tempdir;
 
     use crate::dataset::WriteParams;
 
     use super::*;
+
+    // TODO: test pushdown with nested column once https://github.com/apache/arrow-datafusion/pull/8256
+    // is released.
 
     #[tokio::test]
     async fn test_empty_result() {
@@ -713,9 +754,10 @@ mod test {
         // [x.b, y.a]
         let projection = Arc::new(dataset.schema().clone().project_by_ids(&[2, 4]));
 
-        let predicate = col(Column::from_name("x.a"))
+        let predicate = col("x")
+            .field("a")
             .lt(lit(8))
-            .and(col(Column::from_name("y.b")).gt(lit(3)));
+            .and(col("y").field("b").gt(lit(3)));
 
         let exec = LancePushdownScanExec::try_new(
             dataset.clone(),
@@ -763,7 +805,8 @@ mod test {
 
     #[tokio::test]
     async fn test_with_row_id() {
-        // Want to hit all three code paths:
+        // Want to hit all three code paths: all filtered out, partially filtered
+        // out, and none filtered out.
         // Batches: [0..100], [100..200], [200..300]
         // Predicate: s.x >= 150
         // Expected simplification: false, s.x > 150, true
@@ -772,18 +815,14 @@ mod test {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let field = Arc::new(Field::new("x", DataType::Int32, false));
-        let field_outer = Field::new("s", DataType::Struct(vec![field.clone()].into()), false);
+        let field = Arc::new(Field::new("int", DataType::Int32, false));
 
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![field_outer]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![field.clone()]));
 
         let batches = [0..100, 100..200, 200..300].map(|range| {
             RecordBatch::try_new(
                 arrow_schema.clone(),
-                vec![Arc::new(StructArray::from(vec![(
-                    field.clone(),
-                    Arc::new(Int32Array::from_iter_values(range)) as ArrayRef,
-                )]))],
+                vec![Arc::new(Int32Array::from_iter_values(range)) as ArrayRef],
             )
         });
 
@@ -803,7 +842,7 @@ mod test {
         assert_eq!(fragments.len(), 1);
         let fragment = fragments[0].clone();
 
-        let predicate = col(Column::from_name("s.x")).gt_eq(lit(150));
+        let predicate = col("int").gt_eq(lit(150));
 
         let schema = Arc::new(dataset.schema().clone());
 
@@ -813,14 +852,13 @@ mod test {
             schema.clone(),
             schema.clone(),
             predicate.clone(),
-            1,
-            true,
-            true,
+            ScanConfig {
+                with_row_id: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
-
-        dbg!(&fragment_scanner);
 
         let predicates = fragment_scanner.simplified_predicates().unwrap();
         assert_eq!(predicates.len(), 3);
@@ -841,17 +879,14 @@ mod test {
         assert!(batch1.is_some());
         let batch1 = batch1.unwrap();
         let expected_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("s", DataType::Struct(vec![field.clone()].into()), false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            ROW_ID_FIELD.clone(),
+            field.as_ref().clone(),
         ]));
         let expected = RecordBatch::try_new(
             expected_schema.clone(),
             vec![
-                Arc::new(StructArray::from(vec![(
-                    field.clone(),
-                    Arc::new(Int32Array::from_iter_values(150..200)) as ArrayRef,
-                )])),
                 Arc::new(UInt64Array::from_iter_values(150..200)),
+                Arc::new(Int32Array::from_iter_values(150..200)),
             ],
         )
         .unwrap();
@@ -866,20 +901,445 @@ mod test {
         let expected = RecordBatch::try_new(
             expected_schema.clone(),
             vec![
-                Arc::new(StructArray::from(vec![(
-                    field.clone(),
-                    Arc::new(Int32Array::from_iter_values(200..300)) as ArrayRef,
-                )])),
                 Arc::new(UInt64Array::from_iter_values(200..300)),
+                Arc::new(Int32Array::from_iter_values(200..300)),
             ],
         )
         .unwrap();
         assert_eq!(batch2, expected);
     }
 
-    // property based testing
-    // All column types
-    // choose random subset to project
-    // random range to filter for
-    // random over with or without rowid
+    fn test_data() -> RecordBatch {
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 3),
+                false,
+            ),
+            Field::new(
+                "struct",
+                DataType::Struct(vec![Field::new("int", DataType::Int32, false)].into()),
+                false,
+            ),
+            Field::new("str", DataType::Utf8, true),
+        ]);
+
+        let num_rows = 9;
+        let values: Float32Array = (0..num_rows).flat_map(|i| vec![i as f32; 3]).collect();
+        let vector = FixedSizeListArray::try_new_from_values(values, 3).unwrap();
+
+        let struct_int = Int32Array::from_iter_values(0..num_rows);
+        let struct_array = StructArray::new(
+            vec![Field::new("int", DataType::Int32, false)].into(),
+            vec![Arc::new(struct_int) as ArrayRef],
+            None,
+        );
+
+        let strings = StringArray::from(vec![
+            Some("a"),
+            None,
+            Some("b"),
+            Some("c"),
+            None,
+            Some("d"),
+            Some("e"),
+            None,
+            Some("g"),
+        ]);
+
+        RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![
+                Arc::new(vector) as ArrayRef,
+                Arc::new(struct_array) as ArrayRef,
+                Arc::new(strings) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn test_dataset() -> Dataset {
+        let data = test_data();
+        let schema = data.schema().clone();
+        let reader = RecordBatchIterator::new(vec![Ok(data)], schema);
+        let params = WriteParams {
+            max_rows_per_group: 3,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://test", Some(params))
+            .await
+            .unwrap();
+
+        dataset.delete("struct.int = 6").await.unwrap();
+
+        dataset
+    }
+
+    #[tokio::test]
+    async fn test_codepath_options() {
+        struct TestCase {
+            with_row_id: bool,
+            make_deletions_null: bool,
+            ordered_output: bool,
+            use_stats: bool,
+        }
+
+        // This is a little galaxy-brained, but at least it's concise.
+        let cases = (0..16).map(|i| TestCase {
+            with_row_id: i & 1 != 0 || i & 2 != 0, // If make_deletions_null is true, with_row_id is required
+            make_deletions_null: i & 2 != 0,
+            ordered_output: i & 4 != 0,
+            use_stats: i & 8 != 0,
+        });
+
+        let dataset = Arc::new(test_dataset().await);
+
+        // TODO: it seems like nested column references work by accident. We
+        // can move the string to a flat column.
+        let predicate = col("struct")
+            .field("int")
+            .gt(lit(4))
+            .and(col(Column::from_name("str")).is_not_null());
+
+        for case in cases {
+            let config = ScanConfig {
+                with_row_id: case.with_row_id,
+                make_deletions_null: case.make_deletions_null,
+                ordered_output: case.ordered_output,
+                use_stats: case.use_stats,
+                ..Default::default()
+            };
+            let scan = LancePushdownScanExec::try_new(
+                dataset.clone(),
+                dataset.fragments().clone(),
+                Arc::new(dataset.schema().clone()),
+                predicate.clone(),
+                config,
+            )
+            .unwrap();
+
+            let ctx = SessionContext::new();
+            let batches = scan
+                .execute(0, ctx.task_ctx())
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut result = concat_batches(&batches[0].schema(), &batches).unwrap();
+
+            let mut expected_schema = ArrowSchema::from(dataset.schema());
+            if case.with_row_id {
+                expected_schema = expected_schema
+                    .try_with_column_at(0, ROW_ID_FIELD.clone())
+                    .unwrap();
+            }
+            assert_eq!(result.schema().as_ref(), &expected_schema);
+
+            if !case.ordered_output {
+                let indices = sort_to_indices(
+                    result.column_by_qualified_name("struct.int").unwrap(),
+                    Default::default(),
+                    None,
+                )
+                .unwrap();
+                result = result.take(&indices).unwrap();
+            }
+
+            if case.make_deletions_null {
+                let predicate = col(ROW_ID).is_not_null();
+                let planner = Planner::new(result.schema());
+                let physical_expr = planner.create_physical_expr(&predicate).unwrap();
+                let mask = physical_expr
+                    .evaluate(&result)
+                    .unwrap()
+                    .into_array(result.num_rows());
+                result = filter_record_batch(&result, mask.as_boolean()).unwrap();
+            }
+
+            assert_eq!(
+                result
+                    .column_by_qualified_name("struct.int")
+                    .unwrap()
+                    .as_primitive::<Int32Type>(),
+                &Int32Array::from(vec![5, 8])
+            );
+        }
+    }
+
+    async fn pushdown_scan(
+        ctx: &SessionContext,
+        dataset: Arc<Dataset>,
+        projection_indices: Vec<i32>,
+        predicate: Expr,
+        scan_config: ScanConfig,
+    ) -> Result<RecordBatch> {
+        let scan = LancePushdownScanExec::try_new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            Arc::new(dataset.schema().clone().project_by_ids(&projection_indices)),
+            predicate,
+            scan_config,
+        )
+        .unwrap();
+        let result: Vec<RecordBatch> = scan.execute(0, ctx.task_ctx())?.try_collect().await?;
+        Ok(concat_batches(&result[0].schema(), &result)?)
+    }
+
+    #[derive(Debug)]
+    struct PredicateCombinationsTest {
+        projection_indices: Vec<i32>,
+        predicate: Expr,
+        data: RecordBatch,
+    }
+
+    impl PredicateCombinationsTest {
+        fn new(projection_indices: Vec<i32>, predicate: Expr) -> Self {
+            Self {
+                projection_indices,
+                predicate,
+                data: Self::data(),
+            }
+        }
+
+        /// Generate the test data
+        fn data() -> RecordBatch {
+            // Properties for test data:
+            // * Want a good mix of data types
+            // * Want multiple batches (will do 3 rows per batch when writing dataset)
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("int", DataType::Int32, false),
+                Field::new("float", DataType::Float32, false),
+                Field::new("str", DataType::Utf8, true),
+                Field::new(
+                    "timestamp",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    false,
+                ),
+                Field::new(
+                    "str_dict",
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                    true,
+                ),
+            ]));
+
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 1, 3, 6])),
+                    Arc::new(Float32Array::from(vec![
+                        1.0,
+                        2.0,
+                        3.0,
+                        4.0,
+                        5.0,
+                        6.0,
+                        std::f32::NAN,
+                        3.0,
+                        6.0,
+                    ])),
+                    Arc::new(StringArray::from(vec![
+                        Some("a"),
+                        None,
+                        Some("b"),
+                        Some("c"),
+                        None,
+                        Some("d"),
+                        Some("e"),
+                        Some("f"),
+                        Some("g"),
+                    ])),
+                    Arc::new(TimestampMicrosecondArray::from(vec![
+                        1, 2, 3, 4, 5, 6, 1, 3, 6,
+                    ])),
+                    Arc::new(DictionaryArray::new(
+                        // "a", null, "b", "a", "a", "a", null, null, "b"
+                        Int32Array::from(vec![0, 1, 2, 0, 0, 0, 1, 1, 2]),
+                        Arc::new(StringArray::from(vec![Some("a"), None, Some("b")])),
+                    )),
+                ],
+            )
+            .unwrap()
+        }
+
+        async fn dataset(uri: &str, data: RecordBatch) -> Dataset {
+            let schema = data.schema();
+            let reader = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
+
+            let write_params = WriteParams {
+                max_rows_per_group: 3,
+                ..Default::default()
+            };
+            Dataset::write(reader, uri, Some(write_params))
+                .await
+                .unwrap()
+        }
+
+        /// Generate the expected result using DataFusion executed on the test data.
+        async fn expected_result(&self) -> RecordBatch {
+            let ctx = SessionContext::new();
+            let schema = self.data.schema();
+            let schema_names = schema.field_names();
+            let columns = self
+                .projection_indices
+                .iter()
+                .map(|i| schema_names[*i as usize].as_str())
+                .collect::<Vec<&str>>();
+            let res = ctx
+                .read_batch(self.data.clone())
+                .unwrap()
+                .filter(self.predicate.clone())
+                .unwrap()
+                .select_columns(&columns)
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            concat_batches(&res[0].schema(), &res).unwrap()
+        }
+
+        async fn run_test(&self) {
+            let test_dir = tempdir().unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+
+            let dataset = Arc::new(Self::dataset(test_uri, self.data.clone()).await);
+            let expected = self.expected_result().await;
+
+            let ctx = SessionContext::new();
+
+            let result = pushdown_scan(
+                &ctx,
+                dataset.clone(),
+                self.projection_indices.clone(),
+                self.predicate.clone(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                &expected, &result,
+                "Failed with use_stats = true: {:#?}",
+                self
+            );
+
+            // Also validate with use_stats = false
+            let result = pushdown_scan(
+                &ctx,
+                dataset.clone(),
+                self.projection_indices.clone(),
+                self.predicate.clone(),
+                ScanConfig {
+                    use_stats: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                &expected, &result,
+                "Failed with use_stats = false: {:#?}",
+                self
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_predicate_combinations() {
+        struct TestCase {
+            projection_indices: Vec<i32>,
+            predicate: Expr,
+        }
+
+        let cases = [
+            TestCase {
+                projection_indices: vec![0, 1, 2, 3, 4],
+                predicate: col("int").eq(lit(1)),
+            },
+            TestCase {
+                projection_indices: vec![1, 4],
+                predicate: col("int").lt_eq(lit(3)),
+            },
+            TestCase {
+                projection_indices: vec![1],
+                predicate: col("float").gt(lit(2.0_f32)),
+            },
+            TestCase {
+                projection_indices: vec![0, 1, 2, 3, 4],
+                predicate: col("str").in_list(vec![lit("a"), lit("g")], false),
+            },
+            TestCase {
+                projection_indices: vec![0, 1, 4],
+                predicate: col("str").in_list(vec![lit("a"), lit("g")], true),
+            },
+            TestCase {
+                projection_indices: vec![0, 1, 4],
+                predicate: col("str").is_null().or(col("int").eq(lit(1))),
+            },
+            TestCase {
+                projection_indices: vec![0, 1, 3],
+                predicate: col("timestamp")
+                    .lt(lit(ScalarValue::TimestampMicrosecond(Some(3), None))),
+            },
+            // TODO: I think there's something wrong with how we handle nulls with dictionaries.
+            // TestCase {
+            //     projection_indices: vec![0, 1, 4],
+            //     predicate: col("str_dict").eq(lit("b")).or(col("str_dict").is_null()),
+            // },
+        ];
+
+        for case in cases {
+            let test = PredicateCombinationsTest::new(case.projection_indices, case.predicate);
+            test.run_test().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retrieve_just_row_id() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "int",
+            DataType::Int32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..50))],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let write_params = WriteParams {
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        dataset.delete("int >= 10 AND int < 25").await.unwrap();
+
+        let dataset = Arc::new(dataset.clone());
+        let ctx = SessionContext::new();
+
+        let result = pushdown_scan(
+            &ctx,
+            dataset.clone(),
+            vec![0],
+            col("int").lt(lit(40)),
+            ScanConfig {
+                with_row_id: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let row_ids = result[ROW_ID].as_primitive::<UInt64Type>();
+        assert_eq!(
+            row_ids,
+            &UInt64Array::from_iter_values((0..10).chain(25..40))
+        );
+    }
 }

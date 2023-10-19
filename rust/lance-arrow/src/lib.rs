@@ -321,6 +321,9 @@ pub trait RecordBatchExt {
     /// ```
     fn try_with_column(&self, field: Field, arr: ArrayRef) -> Result<RecordBatch>;
 
+    /// Created a new RecordBatch with column at index.
+    fn try_with_column_at(&self, index: usize, field: Field, arr: ArrayRef) -> Result<RecordBatch>;
+
     /// Creates a new [`RecordBatch`] from the provided  [`StructArray`].
     ///
     /// The fields on the [`StructArray`] need to match this [`RecordBatch`] schema
@@ -381,14 +384,16 @@ pub trait RecordBatchExt {
 
 impl RecordBatchExt for RecordBatch {
     fn try_with_column(&self, field: Field, arr: ArrayRef) -> Result<Self> {
-        let mut new_fields: Vec<FieldRef> = self.schema().fields.iter().cloned().collect();
-        new_fields.push(FieldRef::new(field));
-        let new_schema = Arc::new(Schema::new_with_metadata(
-            Fields::from(new_fields.as_slice()),
-            self.schema().metadata.clone(),
-        ));
+        let new_schema = Arc::new(self.schema().as_ref().try_with_column(field)?);
         let mut new_columns = self.columns().to_vec();
         new_columns.push(arr);
+        Self::try_new(new_schema, new_columns)
+    }
+
+    fn try_with_column_at(&self, index: usize, field: Field, arr: ArrayRef) -> Result<Self> {
+        let new_schema = Arc::new(self.schema().as_ref().try_with_column_at(index, field)?);
+        let mut new_columns = self.columns().to_vec();
+        new_columns.insert(index, arr);
         Self::try_new(new_schema, new_columns)
     }
 

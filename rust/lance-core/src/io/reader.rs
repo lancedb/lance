@@ -559,6 +559,10 @@ impl FileReader {
     pub async fn read_page_stats(&self, field_ids: &[i32]) -> Result<Option<RecordBatch>> {
         if let Some(stats_page_table) = self.stats_page_table.as_ref() {
             let projection = self.page_stats_schema(field_ids).unwrap();
+            // It's possible none of the requested fields have stats.
+            if projection.fields.is_empty() {
+                return Ok(None);
+            }
             let arrays = futures::stream::iter(projection.fields.iter().cloned())
                 .map(|field| async move {
                     read_array(
@@ -621,6 +625,9 @@ pub fn batches_stream(
 }
 
 /// Read a batch.
+///
+/// `schema` may only be empty if `with_row_id` is also true. This function
+/// panics otherwise.
 async fn read_batch(
     reader: &FileReader,
     params: &ReadBatchParams,
@@ -629,13 +636,20 @@ async fn read_batch(
     with_row_id: bool,
     deletion_vector: Option<Arc<DeletionVector>>,
 ) -> Result<RecordBatch> {
-    // We box this because otherwise we get a higher-order lifetime error.
-    let arrs = stream::iter(&schema.fields)
-        .map(|f| async { read_array(reader, f, batch_id, &reader.page_table, params).await })
-        .buffered(num_cpus::get() * 4)
-        .try_collect::<Vec<_>>()
-        .boxed();
-    let arrs = arrs.await?;
+    let batch = if !schema.fields.is_empty() {
+        // We box this because otherwise we get a higher-order lifetime error.
+        let arrs = stream::iter(&schema.fields)
+            .map(|f| async { read_array(reader, f, batch_id, &reader.page_table, params).await })
+            .buffered(num_cpus::get() * 4)
+            .try_collect::<Vec<_>>()
+            .boxed();
+        let arrs = arrs.await?;
+        Some(RecordBatch::try_new(Arc::new(schema.into()), arrs)?)
+    } else {
+        // If the schema is empty, we are just fetching row ids.
+        assert!(with_row_id);
+        None
+    };
 
     let should_fetch_row_id = with_row_id
         || !matches!(
@@ -643,7 +657,18 @@ async fn read_batch(
             None | Some(DeletionVector::NoDeletions)
         );
 
-    let mut batch = RecordBatch::try_new(Arc::new(schema.into()), arrs)?;
+    let num_rows = if let Some(batch) = &batch {
+        batch.num_rows()
+    } else {
+        let total_rows = reader.num_rows_in_batch(batch_id);
+        match params {
+            ReadBatchParams::Indices(indices) => indices.len(),
+            ReadBatchParams::Range(r) => r.len(),
+            ReadBatchParams::RangeFull => total_rows,
+            ReadBatchParams::RangeTo(r) => r.end,
+            ReadBatchParams::RangeFrom(r) => total_rows - r.start,
+        }
+    };
 
     let row_ids = if should_fetch_row_id {
         let ids_in_batch: Vec<i32> = match params {
@@ -651,11 +676,11 @@ async fn read_batch(
                 indices.values().iter().map(|v| *v as i32).collect()
             }
             ReadBatchParams::Range(r) => r.clone().map(|v| v as i32).collect(),
-            ReadBatchParams::RangeFull => (0..batch.num_rows() as i32).collect(),
+            ReadBatchParams::RangeFull => (0..num_rows as i32).collect(),
             ReadBatchParams::RangeTo(r) => (0..r.end).map(|v| v as i32).collect(),
-            ReadBatchParams::RangeFrom(r) => (r.start..r.start + batch.num_rows())
-                .map(|v| v as i32)
-                .collect(),
+            ReadBatchParams::RangeFrom(r) => {
+                (r.start..r.start + num_rows).map(|v| v as i32).collect()
+            }
         };
         let batch_offset = reader
             .metadata
@@ -685,10 +710,24 @@ async fn read_batch(
     let deletion_mask =
         deletion_vector.and_then(|v| v.build_predicate(row_ids.as_ref().unwrap().iter()));
 
-    if with_row_id {
-        let row_id_arr = Arc::new(UInt64Array::from(row_ids.unwrap()));
-        batch = batch.try_with_column(ROW_ID_FIELD.clone(), row_id_arr)?;
-    }
+    let batch = match batch {
+        Some(batch) => {
+            if with_row_id {
+                let row_id_arr = Arc::new(UInt64Array::from(row_ids.unwrap()));
+                batch.try_with_column(ROW_ID_FIELD.clone(), row_id_arr)?
+            } else {
+                batch
+            }
+        }
+        None if with_row_id => {
+            let row_id_arr = Arc::new(UInt64Array::from(row_ids.unwrap()));
+            RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()])),
+                vec![row_id_arr as ArrayRef],
+            )?
+        }
+        _ => unreachable!(),
+    };
 
     match (deletion_mask, reader.make_deletions_null) {
         (None, _) => Ok(batch),

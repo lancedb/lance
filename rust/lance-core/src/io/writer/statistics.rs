@@ -37,7 +37,7 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use datafusion_common::ScalarValue;
-use lance_arrow::as_fixed_size_binary_array;
+use lance_arrow::{as_fixed_size_binary_array, DataTypeExt};
 use num_traits::{bounds::Bounded, Float, Zero};
 use std::str;
 
@@ -604,22 +604,28 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 }
 
 pub fn supports_stats_collection(datatype: &DataType) -> bool {
-    match datatype {
+    matches!(
+        datatype,
         DataType::Boolean
-        | DataType::Int8
-        | DataType::UInt8
-        | DataType::Int16
-        | DataType::UInt16
-        | DataType::Int32
-        | DataType::UInt32
-        | DataType::Int64
-        | DataType::UInt64
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::Date32
-        | DataType::Date64 => true,
-        _ => false,
-    }
+            | DataType::Int8
+            | DataType::UInt8
+            | DataType::Int16
+            | DataType::UInt16
+            | DataType::Int32
+            | DataType::UInt32
+            | DataType::Int64
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Utf8
+            | DataType::Binary
+            | DataType::LargeUtf8
+            | DataType::LargeBinary
+            // | DataType::FixedSizeBinary(_)
+            | DataType::Decimal128(_, _)
+    )
 }
 
 #[derive(Debug)]
@@ -628,13 +634,18 @@ pub struct StatisticsCollector {
 }
 
 impl StatisticsCollector {
-    pub fn new(schema: &Schema) -> Self {
-        let builders = schema
-            .fields_pre_order()
+    /// Try to create a new statistics collection. If no fields in the schema
+    /// support statistics, will just return None.
+    pub fn try_new(schema: &Schema) -> Option<Self> {
+        let builders: BTreeMap<i32, (Field, StatisticsBuilder)> = visit_fields(schema)
             .filter(|f| supports_stats_collection(&f.data_type()))
             .map(|f| (f.id, (f.clone(), StatisticsBuilder::new(&f.data_type()))))
             .collect();
-        Self { builders }
+        if builders.is_empty() {
+            None
+        } else {
+            Some(Self { builders })
+        }
     }
 
     pub fn get_builder(&mut self, field_id: i32) -> Option<&mut StatisticsBuilder> {
@@ -664,6 +675,7 @@ impl StatisticsCollector {
             fields.push(field);
             arrays.push(Arc::new(stats));
         });
+
         let schema = Arc::new(ArrowSchema::new(fields));
         let batch = RecordBatch::try_new(schema.clone(), arrays);
         match batch {
@@ -674,6 +686,21 @@ impl StatisticsCollector {
             .into()),
         }
     }
+}
+
+/// Visit all fields, only visiting children of structs.
+fn visit_fields(schema: &Schema) -> impl Iterator<Item = &Field> {
+    let mut fields: Vec<&Field> = schema.fields.iter().rev().collect();
+    std::iter::from_fn(move || {
+        if let Some(field) = fields.pop() {
+            if field.data_type().is_struct() {
+                fields.extend(field.children.iter().rev());
+            }
+            Some(field)
+        } else {
+            None
+        }
+    })
 }
 
 pub struct StatisticsBuilder {
@@ -1654,7 +1681,7 @@ mod tests {
             ArrowField::new("b", DataType::Utf8, true),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut collector = StatisticsCollector::new(&schema);
+        let mut collector = StatisticsCollector::try_new(&schema).unwrap();
 
         // Collect stats for a
         let id = schema.field("a").unwrap().id;
@@ -1675,7 +1702,7 @@ mod tests {
         assert!(collector.finish().is_err());
 
         // We cannot reuse old collector as it's builders were finished.
-        let mut collector = StatisticsCollector::new(&schema);
+        let mut collector = StatisticsCollector::try_new(&schema).unwrap();
 
         let id = schema.field("a").unwrap().id;
         let builder = collector.get_builder(id).unwrap();
@@ -1777,7 +1804,7 @@ mod tests {
             ArrowField::new("large_string", DataType::LargeUtf8, true),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut collector = StatisticsCollector::new(&schema);
+        let mut collector = StatisticsCollector::try_new(&schema).unwrap();
 
         // Collect stats
         let id = schema.field("boolean").unwrap().id;

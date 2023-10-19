@@ -97,8 +97,7 @@ impl FileWriter {
 
         let stats_collector = if !collect_stats_for_fields.is_empty() {
             let stats_schema = schema.project_by_ids(&collect_stats_for_fields);
-            let stats_collector = statistics::StatisticsCollector::new(&stats_schema);
-            Some(stats_collector)
+            statistics::StatisticsCollector::try_new(&stats_schema)
         } else {
             None
         };
@@ -889,139 +888,6 @@ mod tests {
         assert_eq!(actual, batch);
     }
 
-    async fn roundtrip_stats_batch(
-        stats_batch: RecordBatch,
-        projection: &Schema,
-    ) -> Option<RecordBatch> {
-        // Irrelevant sample data
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "i",
-            DataType::Int32,
-            false,
-        )]));
-        let data_batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..10))],
-        )
-        .unwrap();
-        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-
-        let store = ObjectStore::memory();
-        let path = Path::from("/foo");
-        let mut file_writer =
-            FileWriter::try_new(&store, &path, schema.clone(), &FileWriterOptions::default())
-                .await
-                .unwrap();
-        file_writer.write(&[data_batch.clone()]).await.unwrap();
-        file_writer.finish().await.unwrap();
-
-        let reader = FileReader::try_new(&store, &path).await.unwrap();
-        reader
-            .read_page_stats(&projection.field_ids())
-            .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn test_write_statistics() {
-        // Schema
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new(
-                "0",
-                DataType::Struct(
-                    vec![
-                        ArrowField::new("null_count", DataType::Int64, true),
-                        ArrowField::new("min_value", DataType::Float32, true),
-                        ArrowField::new("max_value", DataType::Float32, true),
-                    ]
-                    .into(),
-                ),
-                true,
-            ),
-            ArrowField::new(
-                "1",
-                DataType::Struct(
-                    vec![
-                        ArrowField::new("null_count", DataType::Int64, true),
-                        ArrowField::new("min_value", DataType::Utf8, true),
-                        ArrowField::new("max_value", DataType::Utf8, true),
-                    ]
-                    .into(),
-                ),
-                true,
-            ),
-        ]));
-        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-
-        // Empty record batch just isn't saved.
-        let batch = RecordBatch::new_empty(arrow_schema.clone());
-        assert!(roundtrip_stats_batch(batch, &schema).await.is_none());
-
-        // Can get back the full schema
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![
-                Arc::new(StructArray::from(vec![
-                    (
-                        Arc::new(ArrowField::new("null_count", DataType::Int64, true)),
-                        Arc::new(Int64Array::from(vec![3, 0])) as ArrayRef,
-                    ),
-                    (
-                        Arc::new(ArrowField::new("min_value", DataType::Float32, true)),
-                        Arc::new(Float32Array::from(vec![0.0, -20.0])) as ArrayRef,
-                    ),
-                    (
-                        Arc::new(ArrowField::new("max_value", DataType::Float32, true)),
-                        Arc::new(Float32Array::from(vec![10.0, 20.0])) as ArrayRef,
-                    ),
-                ])),
-                Arc::new(StructArray::from(vec![
-                    (
-                        Arc::new(ArrowField::new("null_count", DataType::Int64, true)),
-                        Arc::new(Int64Array::from(vec![0, 2])) as ArrayRef,
-                    ),
-                    (
-                        Arc::new(ArrowField::new("min_value", DataType::Utf8, true)),
-                        Arc::new(StringArray::from(vec!["abcdef", "abbb"])) as ArrayRef,
-                    ),
-                    (
-                        Arc::new(ArrowField::new("max_value", DataType::Utf8, true)),
-                        Arc::new(StringArray::from(vec!["yz", "zz"])) as ArrayRef,
-                    ),
-                ])),
-            ],
-        )
-        .unwrap();
-        let actual = roundtrip_stats_batch(batch.clone(), &schema).await.unwrap();
-        assert_eq!(actual, batch);
-
-        // Can project a subset of columns
-        let arrow_projection = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new(
-                "0",
-                DataType::Struct(
-                    vec![ArrowField::new("min_value", DataType::Float32, true)].into(),
-                ),
-                true,
-            ),
-            ArrowField::new(
-                "1",
-                DataType::Struct(
-                    vec![
-                        ArrowField::new("null_count", DataType::Int64, true),
-                        ArrowField::new("max_value", DataType::Utf8, true),
-                    ]
-                    .into(),
-                ),
-                true,
-            ),
-        ]));
-        let projection = schema.project_by_schema(arrow_projection.as_ref()).unwrap();
-        let expected = batch.project_by_schema(arrow_projection.as_ref()).unwrap();
-        let actual = roundtrip_stats_batch(batch, &projection).await.unwrap();
-        assert_eq!(actual, expected);
-    }
-
     #[tokio::test]
     async fn test_collect_stats() {
         // Validate:
@@ -1052,9 +918,8 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
 
-        // TODO: add 6 once strings are supported
         let options = FileWriterOptions {
-            collect_stats_for_fields: Some(vec![0, 1, 5]),
+            collect_stats_for_fields: Some(vec![0, 1, 5, 6]),
         };
         let mut file_writer = FileWriter::try_new(&store, &path, schema, &options)
             .await
@@ -1121,7 +986,7 @@ mod tests {
             (0, DataType::Int64),
             (1, DataType::Int64),
             (5, DataType::Int64),
-            // (6, DataType::Utf8),
+            (6, DataType::Utf8),
         ]);
 
         assert_eq!(read_stats.schema().as_ref(), &expected_stats_schema);
@@ -1144,6 +1009,14 @@ mod tests {
                 null_counts: vec![0, 0],
                 min_values: Arc::new(Int64Array::from(vec![1, 4])),
                 max_values: Arc::new(Int64Array::from(vec![3, 5])),
+            },
+            // FIXME: these max values shouldn't be incremented
+            // https://github.com/lancedb/lance/issues/1517
+            Stats {
+                field_id: 6,
+                null_counts: vec![0, 0],
+                min_values: Arc::new(StringArray::from(vec!["a", "d"])),
+                max_values: Arc::new(StringArray::from(vec!["c", "e"])),
             },
         ]);
 
