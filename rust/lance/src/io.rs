@@ -25,9 +25,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 pub mod commit;
 pub(crate) mod deletion;
 pub(crate) mod exec;
-pub mod object_reader;
 pub mod object_store;
-pub mod object_writer;
 pub(crate) mod reader;
 mod writer;
 
@@ -47,7 +45,7 @@ pub trait AsyncWriteProtoExt {
 }
 
 #[async_trait]
-impl<T: AsyncWrite + Unpin + std::marker::Send> AsyncWriteProtoExt for T {
+impl<T: AsyncWrite + Unpin + Send> AsyncWriteProtoExt for T {
     async fn write_footer(&mut self, offset: u64) -> Result<()> {
         self.write_u64_le(offset).await?;
         self.write_all(INDEX_MAGIC).await?;

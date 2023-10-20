@@ -18,7 +18,6 @@
 //! it stores the array directly in the file. It offers O(1) read access.
 
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
-use std::ptr::NonNull;
 use std::slice::from_raw_parts;
 use std::sync::Arc;
 
@@ -33,6 +32,7 @@ use arrow_schema::{DataType, Field};
 use arrow_select::{concat::concat, take::take};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use snafu::{location, Location};
@@ -187,6 +187,23 @@ fn get_byte_range(data_type: &DataType, row_range: Range<usize>) -> Range<usize>
     }
 }
 
+pub fn bytes_to_array(
+    data_type: &DataType,
+    bytes: Bytes,
+    len: usize,
+    offset: usize,
+) -> Result<ArrayRef> {
+    let buf: Buffer = bytes.into();
+
+    let array_data = ArrayDataBuilder::new(data_type.clone())
+        .len(len)
+        .offset(offset)
+        .null_count(0)
+        .add_buffer(buf)
+        .build()?;
+    Ok(make_array(array_data))
+}
+
 impl<'a> PlainDecoder<'a> {
     pub fn new(
         reader: &'a dyn Reader,
@@ -221,27 +238,6 @@ impl<'a> PlainDecoder<'a> {
         };
 
         let data = self.reader.get_range(range).await?;
-        let is_aligned = matches!(self.data_type, DataType::Boolean)
-            || data.as_ptr().align_offset(self.data_type.byte_width()) == 0;
-        // TODO: replace this with safe method once arrow-rs 47.0.0 comes out.
-        // https://github.com/lancedb/lance/issues/1237
-        // Zero-copy conversion from bytes
-        // Safety: the bytes are owned by the `data` value, so the pointer
-        // will be valid for the lifetime of the Arc we are passing in.
-        let buf = if is_aligned {
-            unsafe {
-                Buffer::from_custom_allocation(
-                    NonNull::new(data.as_ptr() as _).unwrap(),
-                    data.len(),
-                    Arc::new(data),
-                )
-            }
-        } else {
-            // If data isn't aligned appropriately for the data type, we need to copy
-            // the buffer.
-            Buffer::from(data)
-        };
-
         // booleans are bitpacked, so we need an offset to provide the exact
         // requested range.
         let offset = if self.data_type == &DataType::Boolean {
@@ -249,14 +245,7 @@ impl<'a> PlainDecoder<'a> {
         } else {
             0
         };
-
-        let array_data = ArrayDataBuilder::new(self.data_type.clone())
-            .len(end - start)
-            .offset(offset)
-            .null_count(0)
-            .add_buffer(buf)
-            .build()?;
-        Ok(make_array(array_data))
+        bytes_to_array(self.data_type, data, end - start, offset)
     }
 
     async fn decode_fixed_size_list(
@@ -496,6 +485,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::*;
+    use arrow_buffer::Buffer;
     use arrow_schema::Field;
     use rand::prelude::*;
     use tempfile;

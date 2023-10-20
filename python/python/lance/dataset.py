@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -376,6 +377,32 @@ class LanceDataset(pa.dataset.Dataset):
             prefilter=prefilter,
             with_row_id=with_row_id,
         ).to_batches()
+
+    def sample(
+        self,
+        num_rows: int,
+        columns: Optional[List[str]] = None,
+        **kwargs,
+    ) -> pa.Table:
+        """Select a random sample of data
+
+        Parameters
+        ----------
+        num_rows: int
+            number of rows to retrieve
+        columns: list of strings, optional
+            list of column names to be fetched.  All columns are fetched
+            if not specified.
+        **kwargs : dict, optional
+            see scanner() method for full parameter description.
+
+        Returns
+        -------
+        table : Table
+        """
+        total_num_rows = self.count_rows()
+        indices = random.sample(range(total_num_rows), num_rows)
+        return self.take(indices, columns, **kwargs)
 
     def take(
         self,

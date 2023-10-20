@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.5"
+version = "0.8.6"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -35,12 +35,12 @@ categories = [
 rust-version = "1.70"
 
 [workspace.dependencies]
-lance-arrow = { version = "=0.8.5", path = "./lance-arrow" }
-lance-core = { version = "=0.8.5", path = "./lance-core" }
-lance-index = { version = "=0.8.5", path = "./lance-index" }
-lance-linalg = { version = "=0.8.5", path = "./lance-linalg" }
-lance-test-macros = { version = "=0.8.5", path = "./lance-test-macros" }
-lance-testing = { version = "=0.8.5", path = "./lance-testing" }
+lance-arrow = { version = "=0.8.6", path = "./lance-arrow" }
+lance-core = { version = "=0.8.6", path = "./lance-core" }
+lance-index = { version = "=0.8.6", path = "./lance-index" }
+lance-linalg = { version = "=0.8.6", path = "./lance-linalg" }
+lance-test-macros = { version = "=0.8.6", path = "./lance-test-macros" }
+lance-testing = { version = "=0.8.6", path = "./lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "47.0.0", optional = false }
@@ -59,7 +59,9 @@ async-trait = "0.1"
 half = { "version" = "=2.2.1", default-features = false, features = [
     "num-traits",
 ] }
-bytes = "1.3"
+bytes = "1.4"
+byteorder = "1.5"
+chrono = "0.4.23"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
 datafusion-common = "32.0"
 datafusion-sql = "32.0"
@@ -67,8 +69,9 @@ either = "1.0"
 futures = "0.3"
 lazy_static = "1"
 log = "0.4"
-num_cpus = "1.0"
+mock_instant = { version = "0.3.1", features = ["sync"] }
 num-traits = "0.2"
+num_cpus = "1.0"
 object_store = { version = "0.7.1", features = ["aws", "gcp", "azure"] }
 pin-project = "1.0"
 pprof = { version = "0.12", features = ["flamegraph", "criterion"] }
@@ -76,6 +79,7 @@ prost = "0.10"
 prost-build = "0.11"
 prost-types = "0.10"
 rand = { version = "0.8.3", features = ["small_rng"] }
+roaring = "0.10.1"
 serde = { version = "^1" }
 serde_json = { version = "1" }
 snafu = "0.7.4"

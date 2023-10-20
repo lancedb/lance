@@ -22,7 +22,7 @@ use std::{
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use lance_core::ROW_ID_FIELD;
+use lance_core::{io::Reader, Error, Result, ROW_ID_FIELD};
 use lance_index::vector::{Query, DIST_COL};
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
@@ -30,6 +30,10 @@ use serde::Serialize;
 use tracing::instrument;
 
 use super::row_vertex::{RowVertex, RowVertexSerDe};
+use crate::index::{
+    vector::graph::{Graph, VertexWithDistance},
+    vector::VectorIndex,
+};
 use crate::{
     dataset::Dataset,
     index::{
@@ -37,15 +41,6 @@ use crate::{
         vector::graph::{GraphReadParams, PersistedGraph},
         Index,
     },
-    Result,
-};
-use crate::{
-    index::{
-        vector::graph::{Graph, VertexWithDistance},
-        vector::VectorIndex,
-    },
-    io::object_reader::ObjectReader,
-    Error,
 };
 
 /// DiskANN search state.
@@ -260,7 +255,7 @@ impl VectorIndex for DiskANNIndex {
 
     async fn load(
         &self,
-        _reader: &dyn ObjectReader,
+        _reader: &dyn Reader,
         _offset: usize,
         _length: usize,
     ) -> Result<Box<dyn VectorIndex>> {

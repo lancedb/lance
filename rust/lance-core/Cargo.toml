@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-description.workspace = true
+description = "Lance Columnar Format -- Core Library"
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
@@ -20,18 +20,22 @@ arrow-cast.workspace = true
 arrow-data.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
-async-trait.workspace = true
 async-recursion.workspace = true
+async-trait.workspace = true
+byteorder.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 datafusion-common.workspace = true
 datafusion-sql.workspace = true
 futures.workspace = true
 lazy_static.workspace = true
+log.workspace = true
 num_cpus.workspace = true
 object_store.workspace = true
 pin-project.workspace = true
 prost-types.workspace = true
 prost.workspace = true
+roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
@@ -39,11 +43,12 @@ tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+mock_instant.workspace = true
 
 [dev-dependencies]
+arrow = "47.0"
 rand.workspace = true
 tempfile.workspace = true
-arrow = "47.0"
 
 [build-dependencies]
 prost-build.workspace = true

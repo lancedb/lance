@@ -42,14 +42,11 @@ use snafu::{location, Location};
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 use url::Url;
 
-use crate::io::object_reader::CloudObjectReader;
-use crate::io::object_writer::ObjectWriter;
+use self::tracing::ObjectStoreTracingExt;
 use lance_core::{
     error::{Error, Result},
-    io::Reader,
+    io::{CloudObjectReader, ObjectWriter, Reader},
 };
-
-use self::tracing::ObjectStoreTracingExt;
 
 #[cfg(feature = "dynamodb")]
 use super::commit::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore};
@@ -598,7 +595,7 @@ impl ObjectStore {
         match self.scheme.as_str() {
             "file" => LocalObjectReader::open(path, self.block_size),
             _ => Ok(Box::new(CloudObjectReader::new(
-                self,
+                self.inner.clone(),
                 path.clone(),
                 self.block_size,
             )?)),
@@ -621,7 +618,7 @@ impl ObjectStore {
 
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<ObjectWriter> {
-        ObjectWriter::new(self, path).await
+        ObjectWriter::new(self.inner.as_ref(), path).await
     }
 
     /// A helper function to create a file and write content to it.

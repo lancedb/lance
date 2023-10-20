@@ -60,6 +60,7 @@ use crate::{
         Fragment, Manifest,
     },
     io::{read_manifest, reader::read_manifest_indexes, ObjectStore},
+    utils::temporal::timestamp_to_nanos,
 };
 
 use super::{feature_flags::apply_feature_flags, ManifestWriteConfig};
@@ -319,7 +320,7 @@ impl Transaction {
             .resolve_version(base_path, version, object_store)
             .await?;
         let mut manifest = read_manifest(object_store, &path).await?;
-        manifest.set_timestamp(config.timestamp);
+        manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &path, &manifest).await?;
         Ok((manifest, indices))
@@ -453,7 +454,7 @@ impl Transaction {
         if config.auto_set_feature_flags {
             apply_feature_flags(&mut manifest);
         }
-        manifest.set_timestamp(config.timestamp);
+        manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
         manifest.update_max_fragment_id();
 

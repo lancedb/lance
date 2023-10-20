@@ -17,7 +17,6 @@
 
 use std::marker::PhantomData;
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
-use std::ptr::NonNull;
 use std::sync::Arc;
 
 use arrow_arith::numeric::sub;
@@ -235,19 +234,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
                 .null_bit_buffer(null_buf);
         }
 
-        // TODO: replace this with safe method once arrow-rs 47.0.0 comes out.
-        // https://github.com/lancedb/lance/issues/1237
-        // Zero-copy conversion from bytes
-        // Safety: the bytes are owned by the `data` value, so the pointer
-        // will be valid for the lifetime of the Arc we are passing in.
-        let buf = unsafe {
-            Buffer::from_custom_allocation(
-                NonNull::new(bytes.as_ptr() as _).unwrap(),
-                bytes.len(),
-                Arc::new(bytes),
-            )
-        };
-
+        let buf = bytes.into();
         let array_data = data_builder
             .add_buffer(offset_data.buffers()[0].clone())
             .add_buffer(buf)

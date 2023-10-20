@@ -20,6 +20,7 @@ use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
+use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use lance::datatypes::Schema;
@@ -34,7 +35,6 @@ use pyo3::{
     types::{PyBytes, PyDict},
 };
 use snafu::{location, Location};
-use tokio::runtime::Runtime;
 
 use crate::dataset::get_write_params;
 use crate::updater::Updater;
@@ -138,7 +138,6 @@ impl FileFragment {
         schema: PyArrowType<ArrowSchema>,
         fragment_id: usize,
     ) -> PyResult<FragmentMetadata> {
-        let rt = Runtime::new()?;
         let arrow_schema = schema.0;
         let schema = Schema::try_from(&arrow_schema).map_err(|e| {
             PyValueError::new_err(format!(
@@ -146,11 +145,11 @@ impl FileFragment {
                 e
             ))
         })?;
-        let metadata = rt.block_on(async {
+        let metadata = RT.block_on(None, async {
             LanceFragment::create_from_file(filename, &schema, fragment_id, None)
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))
-        })?;
+        })??;
         Ok(FragmentMetadata::new(metadata, schema))
     }
 
@@ -163,42 +162,36 @@ impl FileFragment {
         progress: Option<&PyAny>,
         kwargs: Option<&PyDict>,
     ) -> PyResult<FragmentMetadata> {
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(async {
-            let params = if let Some(kw_params) = kwargs {
-                get_write_params(kw_params)?
-            } else {
-                None
-            };
+        let params = if let Some(kw_params) = kwargs {
+            get_write_params(kw_params)?
+        } else {
+            None
+        };
 
-            let mut progress_wrapper = if let Some(progress) = progress {
-                let progress = PyWriteProgress::new(progress.to_object(reader.py()));
-                Box::new(progress) as Box<dyn WriteFragmentProgress>
-            } else {
-                Box::new(NoopFragmentWriteProgress {}) as Box<dyn WriteFragmentProgress>
-            };
+        let mut progress_wrapper = if let Some(progress) = progress {
+            let progress = PyWriteProgress::new(progress.to_object(reader.py()));
+            Box::new(progress) as Box<dyn WriteFragmentProgress>
+        } else {
+            Box::new(NoopFragmentWriteProgress {}) as Box<dyn WriteFragmentProgress>
+        };
 
-            let (metadata, schema) = if reader.is_instance_of::<Scanner>() {
+        let batches: Box<dyn RecordBatchReader + Send + 'static> =
+            if reader.is_instance_of::<Scanner>() {
                 let scanner: Scanner = reader.extract()?;
-                let batches = scanner
-                    .to_reader()
-                    .await
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
-                let schema = batches.schema().clone();
-                let metadata = LanceFragment::create(
-                    dataset_uri,
-                    fragment_id.unwrap_or(0),
-                    batches,
-                    params,
-                    progress_wrapper.as_mut(),
-                )
-                .await
-                .map_err(|err| PyIOError::new_err(err.to_string()))?;
-                (metadata, schema)
+                let reader = RT.block_on(
+                    Some(reader.py()),
+                    scanner
+                        .to_reader()
+                        .map_err(|err| PyValueError::new_err(err.to_string())),
+                )??;
+                Box::new(reader)
             } else {
-                let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
-                let schema = batches.schema().clone();
+                Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
+            };
 
+        reader.py().allow_threads(|| {
+            RT.runtime.block_on(async move {
+                let schema = batches.schema().clone();
                 let metadata = LanceFragment::create(
                     dataset_uri,
                     fragment_id.unwrap_or(0),
@@ -208,12 +201,11 @@ impl FileFragment {
                 )
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))?;
-                (metadata, schema)
-            };
-            let schema = Schema::try_from(schema.as_ref())
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                let schema = Schema::try_from(schema.as_ref())
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-            Ok(FragmentMetadata::new(metadata, schema))
+                Ok(FragmentMetadata::new(metadata, schema))
+            })
         })
     }
 
@@ -229,8 +221,7 @@ impl FileFragment {
     }
 
     fn count_rows(&self, _filter: Option<String>) -> PyResult<usize> {
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(async {
+        RT.runtime.block_on(async {
             self.fragment
                 .count_rows()
                 .await
@@ -243,7 +234,6 @@ impl FileFragment {
         row_indices: Vec<usize>,
         columns: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
-        let rt = Arc::new(tokio::runtime::Runtime::new()?);
         let dataset_schema = self_.fragment.dataset().schema();
         let projection = if let Some(columns) = columns {
             dataset_schema
@@ -254,8 +244,11 @@ impl FileFragment {
         };
 
         let indices = row_indices.iter().map(|v| *v as u32).collect::<Vec<_>>();
-        let batch = rt
-            .block_on(async { self_.fragment.take(&indices, &projection).await })
+        let fragment = self_.fragment.clone();
+        let batch = RT
+            .spawn(Some(self_.py()), async move {
+                fragment.take(&indices, &projection).await
+            })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         batch.to_pyarrow(self_.py())
     }
@@ -287,20 +280,18 @@ impl FileFragment {
         Ok(Scanner::new(scn))
     }
 
-    fn updater(self_: PyRef<'_, Self>, columns: Option<Vec<String>>) -> PyResult<Updater> {
-        let rt = tokio::runtime::Runtime::new()?;
+    fn updater(&self, columns: Option<Vec<String>>) -> PyResult<Updater> {
         let cols = columns.as_deref();
-        let inner = rt
-            .block_on(async { self_.fragment.updater(cols).await })
+        let inner = RT
+            .block_on(None, async { self.fragment.updater(cols).await })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(Updater::new(inner))
     }
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
         let old_fragment = self.fragment.clone();
-        let rt = tokio::runtime::Runtime::new()?;
-        let updated_fragment = rt
-            .block_on(async { old_fragment.delete(predicate).await })
+        let updated_fragment = RT
+            .block_on(None, async { old_fragment.delete(predicate).await })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         match updated_fragment {

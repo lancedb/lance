@@ -33,7 +33,7 @@ use chrono::{prelude::*, Duration};
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt};
-use lance_core::io::WriteExt;
+use lance_core::io::{read_struct, WriteExt};
 use log::warn;
 use object_store::path::Path;
 use tracing::instrument;
@@ -64,12 +64,12 @@ use crate::index::vector::open_index;
 use crate::io::reader::read_manifest_indexes;
 use crate::io::{
     commit::{commit_new_dataset, commit_transaction, CommitError},
-    object_reader::read_struct,
     object_store::ObjectStoreParams,
     read_manifest, read_metadata_offset, write_manifest, ObjectStore,
 };
 use crate::session::Session;
-use crate::utils::temporal::{utc_now, SystemTime};
+
+use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
@@ -1299,7 +1299,7 @@ pub(crate) async fn write_manifest_file(
     if config.auto_set_feature_flags {
         apply_feature_flags(manifest);
     }
-    manifest.set_timestamp(config.timestamp);
+    manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
     manifest.update_max_fragment_id();
 

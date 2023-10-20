@@ -42,8 +42,8 @@ use lance_arrow::*;
 use lance_core::{
     encodings::{dictionary::DictionaryDecoder, AsyncIndex},
     io::{
-        read_fixed_stride_array, ReadBatchParams, Reader, RecordBatchStream,
-        RecordBatchStreamAdapter,
+        read_fixed_stride_array, read_message, read_struct, ReadBatchParams, Reader,
+        RecordBatchStream, RecordBatchStreamAdapter,
     },
     Error, Result, ROW_ID, ROW_ID_FIELD,
 };
@@ -54,9 +54,8 @@ use tracing::instrument;
 
 use super::deletion::{read_deletion_file, DeletionVector};
 use super::deletion_file_path;
-use super::object_reader::read_message;
 use crate::format::{pb, Fragment, Index, Manifest, Metadata, PageTable};
-use crate::io::{object_reader::read_struct, read_metadata_offset, read_struct_from_buf};
+use crate::io::{read_metadata_offset, read_struct_from_buf};
 use crate::session::Session;
 use crate::{
     datatypes::{Field, Schema},

@@ -52,13 +52,16 @@ use std::{
 
 use chrono::{DateTime, Duration, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
+use lance_core::{
+    format::{Index, Manifest},
+    Error, Result,
+};
 use object_store::path::Path;
 
 use crate::{
-    format::{Index, Manifest},
     io::{deletion_file_path, read_manifest, reader::read_manifest_indexes, ObjectStore},
     utils::temporal::utc_now,
-    Dataset, Error, Result,
+    Dataset,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -451,6 +454,10 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow_array::{RecordBatchIterator, RecordBatchReader};
     use chrono::Duration;
+    use lance_core::{
+        utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy},
+        Error, Result,
+    };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
     use tokio::io::AsyncWriteExt;
@@ -465,11 +472,6 @@ mod tests {
             object_store::{ObjectStoreParams, WrappingObjectStore},
             ObjectStore,
         },
-        utils::{
-            temporal::utc_now,
-            testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy},
-        },
-        Error, Result,
     };
     use all_asserts::{assert_gt, assert_lt};
     use tempfile::{tempdir, TempDir};
