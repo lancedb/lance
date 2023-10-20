@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use arrow_array::{Array, FixedSizeListArray};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use lance_arrow::{ArrowFloatType, FloatType};
-use lance_core::{Error, Result};
+use lance_core::{encodings::plain::bytes_to_array, Error, Result};
 use lance_linalg::MatrixView;
+use prost::bytes;
 use rand::distributions::Standard;
 use rand::prelude::*;
 
 use super::pb;
+use crate::pb::Tensor;
 
 fn to_pb_data_type<T: ArrowFloatType>() -> pb::tensor::DataType {
     match T::FLOAT_TYPE {
@@ -31,18 +35,45 @@ fn to_pb_data_type<T: ArrowFloatType>() -> pb::tensor::DataType {
     }
 }
 
-fn arrow_to_pb_data_type(dt: &DataType) -> Result<pb::tensor::DataType> {
-    match dt {
-        DataType::UInt8 => Ok(pb::tensor::DataType::Uint8),
-        DataType::UInt16 => Ok(pb::tensor::DataType::Uint16),
-        DataType::UInt32 => Ok(pb::tensor::DataType::Uint32),
-        DataType::UInt64 => Ok(pb::tensor::DataType::Uint64),
-        DataType::Float16 => Ok(pb::tensor::DataType::Float16),
-        DataType::Float32 => Ok(pb::tensor::DataType::Float32),
-        DataType::Float64 => Ok(pb::tensor::DataType::Float64),
-        _ => Err(Error::Index {
-            message: format!("pb tensor type not supported: {:?}", dt),
-        }),
+impl From<pb::tensor::DataType> for DataType {
+    fn from(dt: pb::tensor::DataType) -> Self {
+        match dt {
+            pb::tensor::DataType::Uint8 => DataType::UInt8,
+            pb::tensor::DataType::Uint16 => DataType::UInt16,
+            pb::tensor::DataType::Uint32 => DataType::UInt32,
+            pb::tensor::DataType::Uint64 => DataType::UInt64,
+            pb::tensor::DataType::Float16 => DataType::Float16,
+            pb::tensor::DataType::Float32 => DataType::Float32,
+            pb::tensor::DataType::Float64 => DataType::Float64,
+            pb::tensor::DataType::Bfloat16 => unimplemented!(),
+        }
+    }
+}
+
+impl TryFrom<&DataType> for pb::tensor::DataType {
+    type Error = Error;
+
+    fn try_from(dt: &DataType) -> Result<Self> {
+        match dt {
+            DataType::UInt8 => Ok(pb::tensor::DataType::Uint8),
+            DataType::UInt16 => Ok(pb::tensor::DataType::Uint16),
+            DataType::UInt32 => Ok(pb::tensor::DataType::Uint32),
+            DataType::UInt64 => Ok(pb::tensor::DataType::Uint64),
+            DataType::Float16 => Ok(pb::tensor::DataType::Float16),
+            DataType::Float32 => Ok(pb::tensor::DataType::Float32),
+            DataType::Float64 => Ok(pb::tensor::DataType::Float64),
+            _ => Err(Error::Index {
+                message: format!("pb tensor type not supported: {:?}", dt),
+            }),
+        }
+    }
+}
+
+impl TryFrom<DataType> for pb::tensor::DataType {
+    type Error = Error;
+
+    fn try_from(dt: DataType) -> Result<Self> {
+        (&dt).try_into()
     }
 }
 
@@ -65,7 +96,7 @@ impl TryFrom<&FixedSizeListArray> for pb::Tensor {
 
     fn try_from(array: &FixedSizeListArray) -> Result<Self> {
         let mut tensor = pb::Tensor::default();
-        tensor.data_type = arrow_to_pb_data_type(&array.value_type())? as i32;
+        tensor.data_type = pb::tensor::DataType::try_from(array.value_type())? as i32;
         tensor.shape = vec![array.len() as u32, array.value_length() as u32];
         let flat_array = array.values();
         tensor.data = flat_array.into_data().buffers()[0].to_vec();
@@ -73,11 +104,48 @@ impl TryFrom<&FixedSizeListArray> for pb::Tensor {
     }
 }
 
+impl TryFrom<&pb::Tensor> for FixedSizeListArray {
+    type Error = Error;
+
+    fn try_from(tensor: &Tensor) -> Result<Self> {
+        if tensor.shape.len() != 2 {
+            return Err(Error::Index {
+                message: format!("only accept 2-D tensor shape, got: {:?}", tensor.shape),
+            });
+        }
+        let dim = tensor.shape[1] as usize;
+        let num_rows = tensor.shape[0] as usize;
+
+        let data = bytes::Bytes::from(tensor.data.clone());
+        let flat_array = bytes_to_array(
+            &DataType::from(pb::tensor::DataType::from_i32(tensor.data_type).unwrap()),
+            data,
+            dim * num_rows,
+            0,
+        )?;
+
+        if flat_array.len() != dim * num_rows {
+            return Err(Error::Index {
+                message: format!(
+                    "Tensor shape {:?} does not match to data len: {}",
+                    tensor.shape,
+                    flat_array.len()
+                ),
+            });
+        }
+
+        let field = Field::new("item", flat_array.data_type().clone(), false);
+        Ok(FixedSizeListArray::try_new(
+            Arc::new(field),
+            dim as i32,
+            flat_array,
+            None,
+        )?)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::sync::Arc;
 
     use arrow_array::{types::*, Float16Array, Float32Array, Float64Array};
     use half::f16;

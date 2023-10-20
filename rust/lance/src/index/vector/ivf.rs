@@ -553,13 +553,11 @@ impl TryFrom<&Ivf> for pb::Ivf {
                 location: location!(),
             });
         }
-        let centroids_arr = ivf.centroids.values();
-        let f32_centroids: &Float32Array = as_primitive_array(&centroids_arr);
         Ok(Self {
-            centroids: f32_centroids.values().iter().clone().collect(),
+            centroids: vec![],
             offsets: ivf.offsets.iter().map(|o| *o as u64).collect(),
             lengths: ivf.lengths.clone(),
-            centroids_tensor: None,
+            centroids_tensor: Some(ivf.centroids.as_ref().try_into()?),
         })
     }
 }
@@ -569,12 +567,18 @@ impl TryFrom<&pb::Ivf> for Ivf {
     type Error = Error;
 
     fn try_from(proto: &pb::Ivf) -> Result<Self> {
-        let f32_centroids = Float32Array::from(proto.centroids.clone());
-        let dimension = f32_centroids.len() / proto.offsets.len();
-        let centroids = Arc::new(FixedSizeListArray::try_new_from_values(
-            f32_centroids,
-            dimension as i32,
-        )?);
+        let centroids = if let Some(tensor) = proto.centroids_tensor.as_ref() {
+            Arc::new(FixedSizeListArray::try_from(tensor)?)
+        } else {
+            // For backward-compatibility
+            let f32_centroids = Float32Array::from(proto.centroids.clone());
+            let dimension = f32_centroids.len() / proto.offsets.len();
+            Arc::new(FixedSizeListArray::try_new_from_values(
+                f32_centroids,
+                dimension as i32,
+            )?)
+        };
+
         Ok(Self {
             centroids,
             offsets: proto.offsets.iter().map(|o| *o as usize).collect(),

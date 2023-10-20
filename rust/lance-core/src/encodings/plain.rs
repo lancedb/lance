@@ -26,12 +26,13 @@ use arrow_array::{
     builder::BooleanBuilder, cast::AsArray, make_array, new_empty_array, Array, ArrayRef,
     BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, UInt32Array, UInt8Array,
 };
-use arrow_buffer::bit_util;
+use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 use arrow_select::{concat::concat, take::take};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use snafu::{location, Location};
@@ -186,6 +187,23 @@ fn get_byte_range(data_type: &DataType, row_range: Range<usize>) -> Range<usize>
     }
 }
 
+pub fn bytes_to_array(
+    data_type: &DataType,
+    bytes: Bytes,
+    len: usize,
+    offset: usize,
+) -> Result<ArrayRef> {
+    let buf: Buffer = bytes.into();
+
+    let array_data = ArrayDataBuilder::new(data_type.clone())
+        .len(len)
+        .offset(offset)
+        .null_count(0)
+        .add_buffer(buf)
+        .build()?;
+    Ok(make_array(array_data))
+}
+
 impl<'a> PlainDecoder<'a> {
     pub fn new(
         reader: &'a dyn Reader,
@@ -220,7 +238,6 @@ impl<'a> PlainDecoder<'a> {
         };
 
         let data = self.reader.get_range(range).await?;
-        let buf = data.into();
         // booleans are bitpacked, so we need an offset to provide the exact
         // requested range.
         let offset = if self.data_type == &DataType::Boolean {
@@ -228,14 +245,7 @@ impl<'a> PlainDecoder<'a> {
         } else {
             0
         };
-
-        let array_data = ArrayDataBuilder::new(self.data_type.clone())
-            .len(end - start)
-            .offset(offset)
-            .null_count(0)
-            .add_buffer(buf)
-            .build()?;
-        Ok(make_array(array_data))
+        bytes_to_array(self.data_type, data, end - start, offset)
     }
 
     async fn decode_fixed_size_list(
