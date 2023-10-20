@@ -1009,7 +1009,7 @@ mod tests {
         const N: u16 = 10;
 
         let length = 0..N;
-        length.prop_flat_map(vec_from_length).prop_map(convert)
+        length.prop_flat_map(vec_from_length)
     }
     fn vec_from_length(length: u16) -> impl Strategy<Value = Vec<Vec<u16>>> {
         const K: usize = 5;
@@ -1019,14 +1019,6 @@ mod tests {
             result.push(inner);
         }
         result
-    }
-    /// Convert Vec<VecStrategy<T>> to Vec<Vec<T>>
-    fn convert(input: Vec<Vec<u16>>) -> Vec<Vec<u16>> {
-        let mut output = vec![];
-        for inner in input {
-            output.push(inner.into_iter().collect())
-        }
-        output
     }
 
     fn vec_of_vec_to_array(vecs: Vec<Vec<u16>>) -> Vec<ArrayRef> {
