@@ -42,7 +42,7 @@ use lance_index::vector::{
     Query, DIST_COL, RESIDUAL_COLUMN,
 };
 use lance_linalg::{distance::*, kernels::argmin, matrix::MatrixView};
-use log::info;
+use log::{debug, info, warn};
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
 use snafu::{location, Location};
@@ -568,8 +568,10 @@ impl TryFrom<&pb::Ivf> for Ivf {
 
     fn try_from(proto: &pb::Ivf) -> Result<Self> {
         let centroids = if let Some(tensor) = proto.centroids_tensor.as_ref() {
+            debug!("Ivf: loading IVF centroids from index format v2");
             Arc::new(FixedSizeListArray::try_from(tensor)?)
         } else {
+            warn!("Ivf: loading IVF centroids from index format v1");
             // For backward-compatibility
             let f32_centroids = Float32Array::from(proto.centroids.clone());
             let dimension = f32_centroids.len() / proto.offsets.len();
