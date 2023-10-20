@@ -556,9 +556,10 @@ impl TryFrom<&Ivf> for pb::Ivf {
         let centroids_arr = ivf.centroids.values();
         let f32_centroids: &Float32Array = as_primitive_array(&centroids_arr);
         Ok(Self {
-            centroids: f32_centroids.iter().map(|v| v.unwrap()).collect(),
+            centroids: f32_centroids.values().iter().clone().collect(),
             offsets: ivf.offsets.iter().map(|o| *o as u64).collect(),
             lengths: ivf.lengths.clone(),
+            centroids_tensor: None,
         })
     }
 }
