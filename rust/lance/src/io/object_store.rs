@@ -598,7 +598,7 @@ impl ObjectStore {
         match self.scheme.as_str() {
             "file" => LocalObjectReader::open(path, self.block_size),
             _ => Ok(Box::new(CloudObjectReader::new(
-                self,
+                self.inner.clone(),
                 path.clone(),
                 self.block_size,
             )?)),

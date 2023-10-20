@@ -16,20 +16,19 @@
 // under the License.
 
 use std::cmp::min;
-
 use std::ops::Range;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use lance_core::io::Reader;
-use object_store::path::Path;
+use object_store::{path::Path, ObjectStore};
 use prost::Message;
 use snafu::{location, Location};
 
 use crate::error::{Error, Result};
 use crate::format::ProtoStruct;
-use crate::io::ObjectStore;
 
 pub use lance_core::io::Reader as ObjectReader;
 
@@ -39,8 +38,7 @@ pub use lance_core::io::Reader as ObjectReader;
 #[derive(Debug)]
 pub struct CloudObjectReader {
     // Object Store.
-    // TODO: can we use reference instead?
-    pub object_store: ObjectStore,
+    pub object_store: Arc<dyn ObjectStore>,
     // File path
     pub path: Path,
 
@@ -49,9 +47,9 @@ pub struct CloudObjectReader {
 
 impl<'a> CloudObjectReader {
     /// Create an ObjectReader from URI
-    pub fn new(object_store: &'a ObjectStore, path: Path, block_size: usize) -> Result<Self> {
+    pub fn new(object_store: Arc<dyn ObjectStore>, path: Path, block_size: usize) -> Result<Self> {
         Ok(Self {
-            object_store: object_store.clone(),
+            object_store,
             path,
             block_size,
         })
@@ -59,7 +57,7 @@ impl<'a> CloudObjectReader {
 }
 
 #[async_trait]
-impl ObjectReader for CloudObjectReader {
+impl Reader for CloudObjectReader {
     fn path(&self) -> &Path {
         &self.path
     }
@@ -70,11 +68,11 @@ impl ObjectReader for CloudObjectReader {
 
     /// Object/File Size.
     async fn size(&self) -> Result<usize> {
-        Ok(self.object_store.inner.head(&self.path).await?.size)
+        Ok(self.object_store.head(&self.path).await?.size)
     }
 
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
-        Ok(self.object_store.inner.get_range(&self.path, range).await?)
+        Ok(self.object_store.get_range(&self.path, range).await?)
     }
 }
 
