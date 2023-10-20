@@ -60,26 +60,6 @@ pub use traits::*;
 
 const INDEX_FILE_NAME: &str = "index.idx";
 
-impl From<super::pb::VectorMetricType> for MetricType {
-    fn from(proto: super::pb::VectorMetricType) -> Self {
-        match proto {
-            super::pb::VectorMetricType::L2 => Self::L2,
-            super::pb::VectorMetricType::Cosine => Self::Cosine,
-            super::pb::VectorMetricType::Dot => Self::Dot,
-        }
-    }
-}
-
-impl From<MetricType> for super::pb::VectorMetricType {
-    fn from(mt: MetricType) -> Self {
-        match mt {
-            MetricType::L2 => Self::L2,
-            MetricType::Cosine => Self::Cosine,
-            MetricType::Dot => Self::Dot,
-        }
-    }
-}
-
 /// Parameters of each index stage.
 #[derive(Debug, Clone)]
 pub enum StageParams {

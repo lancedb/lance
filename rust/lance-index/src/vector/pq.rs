@@ -25,10 +25,10 @@ use lance_core::{Error, Result};
 use lance_linalg::kernels::argmin_opt;
 use lance_linalg::{distance::MetricType, MatrixView};
 use rand::SeedableRng;
-
 pub mod transform;
 
 use super::kmeans::train_kmeans;
+use super::pb;
 
 /// Parameters for building product quantization.
 #[derive(Debug, Clone)]
@@ -443,6 +443,17 @@ impl ProductQuantizer {
     }
 }
 
+#[allow(clippy::fallible_impl_from)]
+impl From<&ProductQuantizer> for pb::Pq {
+    fn from(pq: &ProductQuantizer) -> Self {
+        Self {
+            num_bits: pq.num_bits,
+            num_sub_vectors: pq.num_sub_vectors as u32,
+            dimension: pq.dimension as u32,
+            codebook: pq.codebook.values().to_vec(),
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

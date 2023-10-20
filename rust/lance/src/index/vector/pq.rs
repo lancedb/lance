@@ -39,7 +39,7 @@ use serde::Serialize;
 use tracing::instrument;
 
 use super::VectorIndex;
-use crate::index::{pb, prefilter::PreFilter, Index};
+use crate::index::{prefilter::PreFilter, Index};
 use crate::{arrow::*, utils::tokio::spawn_cpu};
 use crate::{Error, Result};
 
@@ -342,18 +342,6 @@ impl VectorIndex for PQIndex {
             remapped.into_iter().flat_map(|(_, code)| code).copied(),
         )));
         Ok(())
-    }
-}
-
-#[allow(clippy::fallible_impl_from)]
-impl From<&ProductQuantizer> for pb::Pq {
-    fn from(pq: &ProductQuantizer) -> Self {
-        Self {
-            num_bits: pq.num_bits,
-            num_sub_vectors: pq.num_sub_vectors as u32,
-            dimension: pq.dimension as u32,
-            codebook: pq.codebook.values().to_vec(),
-        }
     }
 }
 

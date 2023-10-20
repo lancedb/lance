@@ -22,12 +22,16 @@ futures.workspace = true
 lance-arrow.workspace = true
 lance-core.workspace = true
 lance-linalg.workspace = true
+log.workspace = true
 num_cpus.workspace = true
+prost.workspace = true
 rand.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-log.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true

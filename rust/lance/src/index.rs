@@ -23,12 +23,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-/// Protobuf definitions for the index on-disk format.
-pub mod pb {
-    #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
-}
-
 pub(crate) mod append;
 pub(crate) mod cache;
 pub(crate) mod prefilter;
@@ -40,6 +34,7 @@ use crate::index::append::append_index;
 use crate::index::vector::remap_vector_index;
 use crate::io::commit::commit_transaction;
 use crate::{dataset::Dataset, Error, Result};
+pub use lance_index::pb;
 
 use self::vector::{build_vector_index, VectorIndexParams};
 
