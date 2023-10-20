@@ -31,7 +31,12 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
-use lance_core::io::{local::to_local_path, Reader, WriteExt, Writer};
+use lance_core::io::{
+    local::to_local_path, ObjectWriter, Reader, RecordBatchStream, WriteExt, Writer,
+};
+use lance_core::{
+    datatypes::Field, encodings::plain::PlainEncoder, format::Index as IndexMetadata, Error, Result,
+};
 use lance_index::vector::{
     pq::{PQBuildParams, ProductQuantizer},
     Query, DIST_COL, RESIDUAL_COLUMN,
@@ -53,9 +58,6 @@ use super::{
 };
 use crate::{
     dataset::Dataset,
-    datatypes::Field,
-    encodings::plain::PlainEncoder,
-    format::Index as IndexMetadata,
     index::{
         pb,
         prefilter::PreFilter,
@@ -65,11 +67,8 @@ use crate::{
         },
         Index,
     },
-    io::RecordBatchStream,
-    io::{object_reader::ObjectReader, object_writer::ObjectWriter},
     session::Session,
 };
-use crate::{Error, Result};
 
 mod builder;
 mod io;
@@ -310,7 +309,7 @@ impl VectorIndex for IVFIndex {
 
     async fn load(
         &self,
-        _reader: &dyn ObjectReader,
+        _reader: &dyn Reader,
         _offset: usize,
         _length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
@@ -828,7 +827,7 @@ impl RemapPageTask {
 impl RemapPageTask {
     async fn load_and_remap(
         mut self,
-        reader: &dyn ObjectReader,
+        reader: &dyn Reader,
         index: &IVFIndex,
         mapping: &HashMap<u64, Option<u64>>,
     ) -> Result<Self> {

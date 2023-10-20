@@ -12,15 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! IO utilities for Lance Columnar Format.
+//!
+
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
 use arrow_array::UInt32Array;
 
 pub mod local;
+pub mod object_reader;
+pub mod object_writer;
 mod stream;
 mod traits;
 mod utils;
 
+pub use object_reader::CloudObjectReader;
+pub use object_writer::ObjectWriter;
 pub use stream::{RecordBatchStream, RecordBatchStreamAdapter};
 pub use traits::*;
 pub use utils::*;

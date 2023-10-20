@@ -32,7 +32,7 @@ arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 async-recursion.workspace = true
 async-trait.workspace = true
-byteorder = "1.4.3"
+byteorder.workspace = true
 bytes.workspace = true
 chrono = "0.4.23"
 clap = { version = "4.1.1", features = ["derive"], optional = true }
