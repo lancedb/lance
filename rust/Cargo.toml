@@ -60,6 +60,7 @@ half = { "version" = "=2.2.1", default-features = false, features = [
     "num-traits",
 ] }
 bytes = "1.4"
+chrono = "0.4.23"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
 datafusion-common = "32.0"
 datafusion-sql = "32.0"
@@ -67,8 +68,9 @@ either = "1.0"
 futures = "0.3"
 lazy_static = "1"
 log = "0.4"
-num_cpus = "1.0"
+mock_instant = { version = "0.3.1", features = ["sync"] }
 num-traits = "0.2"
+num_cpus = "1.0"
 object_store = { version = "0.7.1", features = ["aws", "gcp", "azure"] }
 pin-project = "1.0"
 pprof = { version = "0.12", features = ["flamegraph", "criterion"] }
@@ -76,6 +78,7 @@ prost = "0.10"
 prost-build = "0.11"
 prost-types = "0.10"
 rand = { version = "0.8.3", features = ["small_rng"] }
+roaring = "0.10.1"
 serde = { version = "^1" }
 serde_json = { version = "1" }
 snafu = "0.7.4"

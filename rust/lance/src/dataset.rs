@@ -69,7 +69,8 @@ use crate::io::{
     read_manifest, read_metadata_offset, write_manifest, ObjectStore,
 };
 use crate::session::Session;
-use crate::utils::temporal::{utc_now, SystemTime};
+
+use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
@@ -1299,7 +1300,7 @@ pub(crate) async fn write_manifest_file(
     if config.auto_set_feature_flags {
         apply_feature_flags(manifest);
     }
-    manifest.set_timestamp(config.timestamp);
+    manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
     manifest.update_max_fragment_id();
 

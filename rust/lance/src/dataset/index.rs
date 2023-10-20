@@ -1,13 +1,30 @@
+// Copyright 2023 Lance Developers.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use lance_core::{
+    format::{Fragment, Index},
+    Error, Result,
+};
 use serde::{Deserialize, Serialize};
+use snafu::{location, Location};
 
-use crate::format::Index;
 use crate::index::remap_index;
 use crate::Dataset;
-use crate::Result;
 
 use super::optimize::{IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
@@ -62,5 +79,38 @@ impl IndexRemapper for DatasetIndexRemapper {
             }
         }
         Ok(remapped)
+    }
+}
+
+/// Returns the fragment ids that are not indexed by this index.
+pub async fn unindexed_fragments(index: &Index, dataset: &Dataset) -> Result<Vec<Fragment>> {
+    if index.dataset_version == dataset.version().version {
+        return Ok(vec![]);
+    }
+    if let Some(bitmap) = index.fragment_bitmap.as_ref() {
+        Ok(dataset
+            .fragments()
+            .iter()
+            .filter(|f| !bitmap.contains(f.id as u32))
+            .cloned()
+            .collect::<Vec<_>>())
+    } else {
+        let ds = dataset.checkout_version(index.dataset_version).await?;
+        let max_fragment_id_idx = ds.manifest.max_fragment_id().ok_or_else(|| Error::IO {
+            message: "No fragments in index version".to_string(),
+            location: location!(),
+        })?;
+        let max_fragment_id_ds = dataset
+            .manifest
+            .max_fragment_id()
+            .ok_or_else(|| Error::IO {
+                message: "No fragments in dataset version".to_string(),
+                location: location!(),
+            })?;
+        if max_fragment_id_idx < max_fragment_id_ds {
+            dataset.manifest.fragments_since(&ds.manifest)
+        } else {
+            Ok(vec![])
+        }
     }
 }
