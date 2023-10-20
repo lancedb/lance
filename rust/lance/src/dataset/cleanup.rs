@@ -54,13 +54,13 @@ use chrono::{DateTime, Duration, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_core::{
     format::{Index, Manifest},
-    utils::temporal::utc_now,
     Error, Result,
 };
 use object_store::path::Path;
 
 use crate::{
     io::{deletion_file_path, read_manifest, reader::read_manifest_indexes, ObjectStore},
+    utils::temporal::utc_now,
     Dataset,
 };
 
