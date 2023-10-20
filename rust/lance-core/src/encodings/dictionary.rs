@@ -53,7 +53,7 @@ impl<'a> DictionaryEncoder<'a> {
     ) -> Result<usize> {
         assert!(!arrs.is_empty());
         let data_type = arrs[0].data_type();
-        let pos = self.writer.tell().await?;
+        let pos = self.writer.tell();
         let mut plain_encoder = PlainEncoder::new(self.writer, data_type);
 
         let keys = arrs
@@ -213,8 +213,8 @@ impl<'a> AsyncIndex<ReadBatchParams> for DictionaryDecoder<'a> {
 mod tests {
     use super::*;
 
-    use crate::encodings::plain::PlainEncoder;
     use crate::io::local::LocalObjectReader;
+    use crate::{encodings::plain::PlainEncoder, io::local::LocalObjectWriter};
     use arrow_array::{Array, StringArray};
     use arrow_buffer::ArrowNativeType;
     use tokio::io::AsyncWriteExt;
@@ -246,8 +246,8 @@ mod tests {
 
         let pos;
         {
-            let mut object_writer = tokio::fs::File::create(&path).await.unwrap();
-            let mut encoder = PlainEncoder::new(&mut object_writer, arr1.keys().data_type());
+            let mut object_writer = LocalObjectWriter::open_local_path(&path).await.unwrap();
+            let mut encoder = PlainEncoder::new(object_writer.as_mut(), arr1.keys().data_type());
             pos = encoder.encode(arrs.as_slice()).await.unwrap();
             object_writer.shutdown().await.unwrap();
         }

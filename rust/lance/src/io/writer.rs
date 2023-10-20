@@ -358,7 +358,7 @@ impl FileWriter {
         page_table: &mut PageTable,
     ) -> Result<()> {
         let arrs_length: i32 = arrs.iter().map(|a| a.len() as i32).sum();
-        let page_info = PageInfo::new(object_writer.tell().await?, arrs_length as usize);
+        let page_info = PageInfo::new(object_writer.tell(), arrs_length as usize);
         page_table.set(field.id, batch_id, page_info);
         Ok(())
     }

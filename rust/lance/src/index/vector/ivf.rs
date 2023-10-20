@@ -846,7 +846,7 @@ impl RemapPageTask {
             .as_any()
             .downcast_ref()
             .expect("Generic index writing not supported yet");
-        ivf.offsets.push(writer.tell().await?);
+        ivf.offsets.push(writer.tell());
         ivf.lengths
             .push(page.row_ids.as_ref().unwrap().len() as u32);
         PlainEncoder::write(writer, &[page.code.as_ref().unwrap().as_ref()]).await?;

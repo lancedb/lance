@@ -99,7 +99,7 @@ impl PageTable {
             });
         }
 
-        let pos = writer.tell().await?;
+        let pos = writer.tell();
         let num_columns = self.pages.keys().max().unwrap() + 1 - field_id_offset;
         let num_batches = self
             .pages
@@ -149,7 +149,7 @@ mod tests {
 
     use super::*;
 
-    use crate::io::local::LocalObjectReader;
+    use crate::io::local::{LocalObjectReader, LocalObjectWriter};
     use tempfile;
 
     #[test]
@@ -183,9 +183,9 @@ mod tests {
         // here to represent the struct.
         let starting_field_id = 9;
 
-        let mut writer = tokio::fs::File::create(&path).await.unwrap();
+        let mut writer = LocalObjectWriter::open_local_path(&path).await.unwrap();
         let pos = page_table
-            .write(&mut writer, starting_field_id)
+            .write(writer.as_mut(), starting_field_id)
             .await
             .unwrap();
         writer.shutdown().await.unwrap();

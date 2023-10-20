@@ -15,7 +15,7 @@
 //! Optimized local I/Os
 
 use std::fs::File;
-use std::io::{ErrorKind, SeekFrom};
+use std::io::ErrorKind;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use object_store::path::Path;
 use snafu::{location, Location};
-use tokio::io::AsyncSeekExt;
+use tokio::io::AsyncWrite;
 use tracing::instrument;
 
 use crate::io::{Reader, Writer};
@@ -162,9 +162,64 @@ fn read_exact_at(file: Arc<File>, mut buf: &mut [u8], mut offset: u64) -> std::i
     }
 }
 
+/// [ObjectWriter] for local file system.
+#[pin_project::pin_project]
+pub struct LocalObjectWriter {
+    /// File handler.
+    #[pin]
+    file: tokio::fs::File,
+    /// Current offset.
+    cursor: usize,
+}
+
+impl LocalObjectWriter {
+    /// Open a local object writer.
+    #[instrument(level = "debug")]
+    pub async fn open(path: &Path) -> Result<Box<dyn Writer>> {
+        let local_path = to_local_path(path);
+        let file = tokio::fs::File::create(local_path).await?;
+        Ok(Box::new(Self { file, cursor: 0 }))
+    }
+
+    pub async fn open_local_path(
+        local_path: impl AsRef<std::path::Path>,
+    ) -> Result<Box<dyn Writer>> {
+        let file = tokio::fs::File::create(&local_path).await?;
+        Ok(Box::new(Self { file, cursor: 0 }))
+    }
+}
+
+impl AsyncWrite for LocalObjectWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
+        let this = self.project();
+        this.file.poll_write(cx, buf).map_ok(|n| {
+            *this.cursor += n;
+            n
+        })
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        self.project().file.poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        self.project().file.poll_shutdown(cx)
+    }
+}
+
 #[async_trait]
-impl Writer for tokio::fs::File {
-    async fn tell(&mut self) -> Result<usize> {
-        Ok(self.seek(SeekFrom::Current(0)).await? as usize)
+impl Writer for LocalObjectWriter {
+    fn tell(&self) -> usize {
+        self.cursor
     }
 }

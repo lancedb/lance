@@ -64,7 +64,7 @@ pub(super) async fn write_index_partitions(
         }
 
         let total_records = row_id_array.iter().map(|a| a.len()).sum::<usize>();
-        ivf.add_partition(writer.tell().await?, total_records as u32);
+        ivf.add_partition(writer.tell(), total_records as u32);
         if total_records > 0 {
             let pq_refs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
             PlainEncoder::write(writer, &pq_refs).await?;

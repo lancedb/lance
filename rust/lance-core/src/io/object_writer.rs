@@ -65,8 +65,8 @@ impl ObjectWriter {
 
 #[async_trait]
 impl Writer for ObjectWriter {
-    async fn tell(&mut self) -> Result<usize> {
-        Ok(self.cursor)
+    fn tell(&self) -> usize {
+        self.cursor
     }
 }
 
@@ -115,17 +115,17 @@ mod tests {
         let mut object_writer = ObjectWriter::new(&store, &Path::from("/foo"))
             .await
             .unwrap();
-        assert_eq!(object_writer.tell().await.unwrap(), 0);
+        assert_eq!(object_writer.tell(), 0);
 
         let buf = vec![0; 256];
         assert_eq!(object_writer.write(buf.as_slice()).await.unwrap(), 256);
-        assert_eq!(object_writer.tell().await.unwrap(), 256);
+        assert_eq!(object_writer.tell(), 256);
 
         assert_eq!(object_writer.write(buf.as_slice()).await.unwrap(), 256);
-        assert_eq!(object_writer.tell().await.unwrap(), 512);
+        assert_eq!(object_writer.tell(), 512);
 
         assert_eq!(object_writer.write(buf.as_slice()).await.unwrap(), 256);
-        assert_eq!(object_writer.tell().await.unwrap(), 256 * 3);
+        assert_eq!(object_writer.tell(), 256 * 3);
 
         object_writer.shutdown().await.unwrap();
     }
@@ -136,7 +136,7 @@ mod tests {
         let path = Path::from("/foo");
 
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
-        assert_eq!(object_writer.tell().await.unwrap(), 0);
+        assert_eq!(object_writer.tell(), 0);
 
         let mut metadata = Metadata {
             manifest_position: Some(100),

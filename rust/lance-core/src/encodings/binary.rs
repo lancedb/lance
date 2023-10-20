@@ -59,7 +59,7 @@ impl<'a> BinaryEncoder<'a> {
         let mut pos_builder: PrimitiveBuilder<Int64Type> =
             PrimitiveBuilder::with_capacity(capacity + 1);
 
-        let mut last_offset: usize = self.writer.tell().await?;
+        let mut last_offset: usize = self.writer.tell();
         pos_builder.append_value(last_offset as i64);
         for array in arrs.iter() {
             let arr = array
@@ -88,7 +88,7 @@ impl<'a> BinaryEncoder<'a> {
             last_offset = pos_builder.values_slice()[pos_builder.len() - 1] as usize;
         }
 
-        let positions_offset = self.writer.tell().await?;
+        let positions_offset = self.writer.tell();
         let pos_array = pos_builder.finish();
         self.writer
             .write_all(pos_array.to_data().buffers()[0].as_slice())
@@ -482,16 +482,16 @@ mod tests {
     };
     use arrow_select::concat::concat;
 
-    use crate::io::local::LocalObjectReader;
+    use crate::io::local::{LocalObjectReader, LocalObjectWriter};
 
     async fn write_test_data<O: OffsetSizeTrait>(
         path: impl AsRef<std::path::Path>,
         arr: &[&GenericStringArray<O>],
     ) -> Result<usize> {
-        let mut writer = tokio::fs::File::create(path).await?;
+        let mut writer = LocalObjectWriter::open_local_path(path).await?;
         // Write some garbage to reset "tell()".
         writer.write_all(b"1234").await.unwrap();
-        let mut encoder = BinaryEncoder::new(&mut writer);
+        let mut encoder = BinaryEncoder::new(writer.as_mut());
 
         let arrs = arr.iter().map(|a| a as &dyn Array).collect::<Vec<_>>();
         let pos = encoder.encode(arrs.as_slice()).await.unwrap();
@@ -563,11 +563,11 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("foo");
-        let mut object_writer = tokio::fs::File::create(&path).await.unwrap();
+        let mut object_writer = LocalObjectWriter::open_local_path(&path).await.unwrap();
 
         // Write some gabage to reset "tell()".
         object_writer.write_all(b"1234").await.unwrap();
-        let mut encoder = BinaryEncoder::new(&mut object_writer);
+        let mut encoder = BinaryEncoder::new(object_writer.as_mut());
         let pos = encoder.encode(&[&data]).await.unwrap();
         object_writer.shutdown().await.unwrap();
 
@@ -706,8 +706,8 @@ mod tests {
         let path = temp_dir.path().join("slices");
         let data = StringArray::from_iter_values((0..100).map(|v| format!("abcdef-{v:#03}")));
 
-        let mut object_writer = tokio::fs::File::create(&path).await.unwrap();
-        let mut encoder = BinaryEncoder::new(&mut object_writer);
+        let mut object_writer = LocalObjectWriter::open_local_path(path).await.unwrap();
+        let mut encoder = BinaryEncoder::new(object_writer.as_mut());
         for i in 0..10 {
             let pos = encoder.encode(&[&data.slice(i * 10, 10)]).await.unwrap();
             assert_eq!(pos, (i * (8 * 11) /* offset array */ + (i + 1) * (10 * 10)));
@@ -727,11 +727,11 @@ mod tests {
         let path = temp_dir.path().join("nulls");
 
         let pos = {
-            let mut object_writer = tokio::fs::File::create(&path).await.unwrap();
+            let mut object_writer = LocalObjectWriter::open_local_path(&path).await.unwrap();
 
             // Write some garbage to reset "tell()".
             object_writer.write_all(b"1234").await.unwrap();
-            let mut encoder = BinaryEncoder::new(&mut object_writer);
+            let mut encoder = BinaryEncoder::new(object_writer.as_mut());
 
             // let arrs = arr.iter().map(|a| a as &dyn Array).collect::<Vec<_>>();
             let pos = encoder.encode(&[&data]).await.unwrap();

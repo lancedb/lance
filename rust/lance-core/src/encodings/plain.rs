@@ -60,7 +60,7 @@ impl<'a> PlainEncoder<'a> {
 
     /// Write an continuous plain-encoded array to the writer.
     pub async fn write(writer: &'a mut dyn Writer, arrays: &[&'a dyn Array]) -> Result<usize> {
-        let pos = writer.tell().await?;
+        let pos = writer.tell();
         if !arrays.is_empty() {
             let mut encoder = Self::new(writer, arrays[0].data_type());
             encoder.encode(arrays).await?;
@@ -108,7 +108,7 @@ impl<'a> PlainEncoder<'a> {
     async fn encode_primitive(&mut self, arrays: &[&dyn Array]) -> Result<usize> {
         assert!(!arrays.is_empty());
         let data_type = arrays[0].data_type();
-        let offset = self.writer.tell().await?;
+        let offset = self.writer.tell();
 
         if matches!(data_type, DataType::Boolean) {
             let boolean_arr = arrays
@@ -481,7 +481,7 @@ mod tests {
     use tempfile;
 
     use super::*;
-    use crate::io::local::LocalObjectReader;
+    use crate::io::local::{LocalObjectReader, LocalObjectWriter};
 
     #[tokio::test]
     async fn test_encode_decode_primitive_array() {
@@ -528,8 +528,8 @@ mod tests {
             .map(|e| e.as_ref())
             .collect::<Vec<&dyn Array>>();
         {
-            let mut writer = tokio::fs::File::create(&path).await.unwrap();
-            let mut encoder = PlainEncoder::new(&mut writer, &data_type);
+            let mut writer = LocalObjectWriter::open_local_path(&path).await.unwrap();
+            let mut encoder = PlainEncoder::new(writer.as_mut(), &data_type);
             assert_eq!(
                 encoder.encode(expected_as_array.as_slice()).await.unwrap(),
                 0
@@ -653,8 +653,8 @@ mod tests {
 
         let array = Int32Array::from_iter_values([0, 1, 2, 3, 4, 5]);
         {
-            let mut writer = tokio::fs::File::create(&path).await.unwrap();
-            let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
+            let mut writer = LocalObjectWriter::open_local_path(&path).await.unwrap();
+            let mut encoder = PlainEncoder::new(writer.as_mut(), array.data_type());
             assert_eq!(encoder.encode(&[&array]).await.unwrap(), 0);
             writer.flush().await.unwrap();
         }
@@ -699,8 +699,8 @@ mod tests {
         let array = Int32Array::from_iter_values(0..100);
 
         {
-            let mut writer = tokio::fs::File::create(&path).await.unwrap();
-            let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
+            let mut writer = LocalObjectWriter::open_local_path(&path).await.unwrap();
+            let mut encoder = PlainEncoder::new(writer.as_mut(), array.data_type());
             assert_eq!(encoder.encode(&[&array]).await.unwrap(), 0);
             writer.shutdown().await.unwrap();
         }
