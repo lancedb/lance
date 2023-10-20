@@ -30,6 +30,7 @@ pub mod pq;
 mod traits;
 mod utils;
 
+use lance_core::io::{read_message, Reader};
 use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
 use lance_linalg::distance::*;
 use tracing::instrument;
@@ -52,10 +53,7 @@ use crate::{
             ivf::Ivf,
         },
     },
-    io::{
-        object_reader::{read_message, ObjectReader},
-        read_message_from_buf, read_metadata_offset,
-    },
+    io::{read_message_from_buf, read_metadata_offset},
     Error, Result,
 };
 pub use traits::*;
@@ -294,7 +292,7 @@ pub(crate) async fn open_index(
     let index_file = index_dir.child(INDEX_FILE_NAME);
 
     let object_store = dataset.object_store();
-    let reader: Arc<dyn ObjectReader> = object_store.open(&index_file).await?.into();
+    let reader: Arc<dyn Reader> = object_store.open(&index_file).await?.into();
 
     let file_size = reader.size().await?;
     let block_size = object_store.block_size();

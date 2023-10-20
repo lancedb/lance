@@ -60,6 +60,7 @@ half = { "version" = "=2.2.1", default-features = false, features = [
     "num-traits",
 ] }
 bytes = "1.4"
+byteorder = "1.5"
 chrono = "0.4.23"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
 datafusion-common = "32.0"

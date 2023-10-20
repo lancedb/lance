@@ -20,12 +20,13 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::{types::Float32Type, RecordBatch};
 use async_trait::async_trait;
 
+use lance_core::io::Reader;
 use lance_index::vector::Query;
 use lance_linalg::MatrixView;
 
 use crate::{
     index::{pb::Transform, prefilter::PreFilter, Index},
-    io::{object_reader::ObjectReader, object_writer::ObjectWriter},
+    io::object_writer::ObjectWriter,
     Result,
 };
 
@@ -64,7 +65,7 @@ pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// Load the index from the reader on-demand.
     async fn load(
         &self,
-        reader: &dyn ObjectReader,
+        reader: &dyn Reader,
         offset: usize,
         length: usize,
     ) -> Result<Box<dyn VectorIndex>>;

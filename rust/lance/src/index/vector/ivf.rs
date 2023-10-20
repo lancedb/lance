@@ -65,8 +65,8 @@ use crate::{
         },
         Index,
     },
+    io::object_writer::ObjectWriter,
     io::RecordBatchStream,
-    io::{object_reader::ObjectReader, object_writer::ObjectWriter},
     session::Session,
 };
 use crate::{Error, Result};
@@ -310,7 +310,7 @@ impl VectorIndex for IVFIndex {
 
     async fn load(
         &self,
-        _reader: &dyn ObjectReader,
+        _reader: &dyn Reader,
         _offset: usize,
         _length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
@@ -828,7 +828,7 @@ impl RemapPageTask {
 impl RemapPageTask {
     async fn load_and_remap(
         mut self,
-        reader: &dyn ObjectReader,
+        reader: &dyn Reader,
         index: &IVFIndex,
         mapping: &HashMap<u64, Option<u64>>,
     ) -> Result<Self> {

@@ -42,14 +42,12 @@ use snafu::{location, Location};
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 use url::Url;
 
-use crate::io::object_reader::CloudObjectReader;
+use self::tracing::ObjectStoreTracingExt;
 use crate::io::object_writer::ObjectWriter;
 use lance_core::{
     error::{Error, Result},
-    io::Reader,
+    io::{CloudObjectReader, Reader},
 };
-
-use self::tracing::ObjectStoreTracingExt;
 
 #[cfg(feature = "dynamodb")]
 use super::commit::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore};
