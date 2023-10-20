@@ -141,9 +141,9 @@ def train_ivf_centroids(
         )
 
     total_size = dataset.count_rows()
-    sample_size = min(k * sample_rate, total_size)
+    sample_size = k * sample_rate
 
-    if total_size < sample_size:
+    if total_size <= sample_size:
         samples = dataset.to_table(columns=[column])[column].combine_chunks()
     else:
         samples = dataset.sample(sample_size, columns=[column])[column].combine_chunks()
