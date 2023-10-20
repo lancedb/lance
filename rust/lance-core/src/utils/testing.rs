@@ -62,7 +62,7 @@ type ObjectMetaPolicyFn = Arc<dyn ObjectMetaPolicyFnT>;
 ///
 /// Currently, for simplicity, we only proxy calls that involve some kind of path.  Calls
 /// to copy functions, which have a src and dst, will provide the source to the policy
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ProxyObjectStorePolicy {
     /// Policies which run before a method is invoked.  If the policy returns
     /// an error then the target method will not be invoked and the error will
@@ -75,10 +75,7 @@ pub struct ProxyObjectStorePolicy {
 
 impl ProxyObjectStorePolicy {
     pub fn new() -> Self {
-        Self {
-            before_policies: HashMap::new(),
-            object_meta_policies: HashMap::new(),
-        }
+        Default::default()
     }
 
     /// Set a new policy with the given name
