@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! IO utilities for Lance Columnar Format.
+//!
+
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
 use arrow_array::UInt32Array;

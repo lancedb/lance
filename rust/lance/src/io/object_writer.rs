@@ -144,7 +144,7 @@ mod tests {
         assert_eq!(pos, 0);
         object_writer.shutdown().await.unwrap();
 
-        let object_reader = CloudObjectReader::new(&store, path, 1024).unwrap();
+        let object_reader = CloudObjectReader::new(store.inner.clone(), path, 1024).unwrap();
         let actual: Metadata = read_struct(&object_reader, pos).await.unwrap();
         assert_eq!(metadata, actual);
     }
