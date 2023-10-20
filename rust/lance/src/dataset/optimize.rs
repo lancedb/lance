@@ -115,7 +115,7 @@ use crate::{format::Fragment, Dataset};
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
 use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
-use super::{write_fragments, WriteMode, WriteParams};
+use super::{write_fragments_internal, WriteMode, WriteParams};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemappedIndex {
@@ -825,7 +825,7 @@ async fn rewrite_files(
         mode: WriteMode::Append,
         ..Default::default()
     };
-    let mut new_fragments = write_fragments(
+    let mut new_fragments = write_fragments_internal(
         dataset.object_store.clone(),
         &dataset.base,
         dataset.schema(),

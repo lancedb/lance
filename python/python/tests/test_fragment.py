@@ -21,6 +21,7 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 from lance import FragmentMetadata, LanceDataset, LanceFragment, LanceOperation
+from lance.fragment import write_fragments
 from lance.progress import FileSystemFragmentWriteProgress, FragmentWriteProgress
 
 
@@ -58,6 +59,20 @@ def test_write_fragment_two_phases(tmp_path: Path):
     pd.testing.assert_frame_equal(
         df, pd.DataFrame({"a": [i * 10 for i in range(num_files)]})
     )
+
+
+def test_write_fragments(tmp_path: Path):
+    # This will be split across two files if we set the max_bytes_per_file to 1024
+    tab = pa.table(
+        {
+            "a": pa.array(range(1024)),
+        }
+    )
+    fragments = write_fragments(
+        tab, tmp_path, max_rows_per_group=512, max_bytes_per_file=1024
+    )
+    assert len(fragments) == 2
+    assert all(isinstance(f, FragmentMetadata) for f in fragments)
 
 
 class ProgressForTest(FragmentWriteProgress):

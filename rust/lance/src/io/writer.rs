@@ -235,8 +235,8 @@ impl FileWriter {
     }
 
     /// Total bytes written so far
-    pub fn tell(&self) -> usize {
-        self.object_writer.tell()
+    pub async fn tell(&mut self) -> Result<usize> {
+        self.object_writer.tell().await
     }
 
     /// Returns the in-flight multipart ID.

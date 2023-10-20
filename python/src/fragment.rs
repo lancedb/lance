@@ -175,23 +175,12 @@ impl FileFragment {
             Box::new(NoopFragmentWriteProgress {}) as Box<dyn WriteFragmentProgress>
         };
 
-        let batches: Box<dyn RecordBatchReader + Send + 'static> =
-            if reader.is_instance_of::<Scanner>() {
-                let scanner: Scanner = reader.extract()?;
-                let reader = RT.block_on(
-                    Some(reader.py()),
-                    scanner
-                        .to_reader()
-                        .map_err(|err| PyValueError::new_err(err.to_string())),
-                )??;
-                Box::new(reader)
-            } else {
-                Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
-            };
+        let batches = convert_reader(reader)?;
 
         reader.py().allow_threads(|| {
             RT.runtime.block_on(async move {
                 let schema = batches.schema().clone();
+
                 let metadata = LanceFragment::create(
                     dataset_uri,
                     fragment_id.unwrap_or(0),
@@ -509,4 +498,57 @@ pub fn cleanup_partial_writes(base_uri: &str, files: Vec<(String, String)>) -> P
     RT.runtime
         .block_on(inner(store, files))
         .map_err(|err| PyIOError::new_err(format!("Failed to cleanup files: {}", err)))
+}
+
+#[pyfunction(name = "_write_fragments")]
+#[pyo3(signature = (dataset_uri, reader, progress, **kwargs))]
+pub fn write_fragments(
+    dataset_uri: &str,
+    reader: &PyAny,
+    progress: Option<&PyAny>,
+    kwargs: Option<&PyDict>,
+) -> PyResult<Vec<FragmentMetadata>> {
+    let batches = convert_reader(reader)?;
+
+    let schema = batches.schema().clone();
+    let schema =
+        Schema::try_from(schema.as_ref()).map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+    let mut params = kwargs
+        .and_then(|params| get_write_params(params).ok().flatten())
+        .unwrap_or_default();
+
+    let progress_wrapper = if let Some(progress) = progress {
+        let progress = PyWriteProgress::new(progress.to_object(reader.py()));
+        Arc::new(progress) as Arc<dyn WriteFragmentProgress>
+    } else {
+        Arc::new(NoopFragmentWriteProgress {}) as Arc<dyn WriteFragmentProgress>
+    };
+    params.progress = Some(progress_wrapper);
+
+    let fragments = RT
+        .block_on(Some(reader.py()), async {
+            lance::dataset::write_fragments(dataset_uri, batches, params).await
+        })?
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+    fragments
+        .into_iter()
+        .map(|f| Ok(FragmentMetadata::new(f, schema.clone())))
+        .collect()
+}
+
+fn convert_reader(reader: &PyAny) -> PyResult<Box<dyn RecordBatchReader + Send + 'static>> {
+    if reader.is_instance_of::<Scanner>() {
+        let scanner: Scanner = reader.extract()?;
+        let reader = RT.block_on(
+            Some(reader.py()),
+            scanner
+                .to_reader()
+                .map_err(|err| PyValueError::new_err(err.to_string())),
+        )??;
+        Ok(Box::new(reader))
+    } else {
+        Ok(Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?))
+    }
 }

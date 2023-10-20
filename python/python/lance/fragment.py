@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, Optional, Union
+from typing import TYPE_CHECKING, Callable, Iterator, List, Optional, Union
 
 try:
     import pandas as pd
@@ -28,10 +28,11 @@ import pyarrow as pa
 
 from .lance import _Fragment
 from .lance import _FragmentMetadata as _FragmentMetadata
+from .lance import _write_fragments
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 
 if TYPE_CHECKING:
-    from .dataset import LanceDataset, LanceScanner
+    from .dataset import LanceDataset, LanceScanner, ReaderLike
 
 
 class FragmentMetadata:
@@ -384,3 +385,40 @@ class LanceFragment(pa.dataset.Fragment):
         FragmentMetadata
         """
         return FragmentMetadata(self._fragment.metadata().json())
+
+
+def write_fragments(
+    data: ReaderLike,
+    dataset_uri: Union[str, Path],
+    schema: Optional[pa.Schema] = None,
+    *,
+    max_rows_per_file: int = 1024 * 1024,
+    max_rows_per_group: int = 1024,
+    max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
+    progress: Optional[FragmentWriteProgress] = None,
+) -> List[FragmentMetadata]:
+    if pd and isinstance(data, pd.DataFrame):
+        reader = pa.Table.from_pandas(data, schema=schema).to_reader()
+    elif isinstance(data, pa.Table):
+        reader = data.to_reader()
+    elif isinstance(data, pa.dataset.Scanner):
+        reader = data.to_reader()
+    elif isinstance(data, pa.RecordBatchReader):
+        reader = data
+    else:
+        raise TypeError(f"Unknown data_obj type {type(data)}")
+
+    if isinstance(dataset_uri, Path):
+        dataset_uri = str(dataset_uri)
+    if progress is None:
+        progress = NoopFragmentWriteProgress()
+
+    fragments = _write_fragments(
+        dataset_uri,
+        reader,
+        progress,
+        max_rows_per_file=max_rows_per_file,
+        max_rows_per_group=max_rows_per_group,
+        max_bytes_per_file=max_bytes_per_file,
+    )
+    return [FragmentMetadata(frag.json()) for frag in fragments]

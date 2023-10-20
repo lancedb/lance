@@ -122,8 +122,31 @@ pub fn reader_to_stream(
 /// NOTE: the fragments have not yet been assigned an ID. That must be done
 /// by the caller. This is so this function can be called in parallel, and the
 /// IDs can be assigned after writing is complete.
-#[instrument(skip_all)]
 pub async fn write_fragments(
+    dataset_uri: &str,
+    data: impl RecordBatchReader + Send + 'static,
+    params: WriteParams,
+) -> Result<Vec<Fragment>> {
+    let (object_store, base) = ObjectStore::from_uri_and_params(
+        dataset_uri,
+        &params.store_params.clone().unwrap_or_default(),
+    )
+    .await?;
+    let (stream, schema) = reader_to_stream(Box::new(data))?;
+    write_fragments_internal(Arc::new(object_store), &base, &schema, stream, params).await
+}
+
+/// Writes the given data to the dataset and returns fragments.
+///
+/// NOTE: the fragments have not yet been assigned an ID. That must be done
+/// by the caller. This is so this function can be called in parallel, and the
+/// IDs can be assigned after writing is complete.
+///
+/// This is a private veriant that takes a `SendableRecordBatchStream` instead
+/// of a reader. We don't expose the stream at our interface because it is a
+/// DataFusion type.
+#[instrument(skip_all)]
+pub async fn write_fragments_internal(
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
     schema: &Schema,
@@ -153,7 +176,7 @@ pub async fn write_fragments(
         }
 
         if num_rows_in_current_file >= params.max_rows_per_file
-            || writer.as_ref().unwrap().tell() >= params.max_bytes_per_file
+            || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file
         {
             let num_rows = writer.take().unwrap().finish().await?;
             debug_assert_eq!(num_rows, num_rows_in_current_file);
@@ -327,7 +350,7 @@ mod tests {
         let schema = Schema::try_from(schema.as_ref()).unwrap();
 
         let object_store = Arc::new(ObjectStore::memory());
-        let fragments = write_fragments(
+        let fragments = write_fragments_internal(
             object_store,
             &Path::from("test"),
             &schema,

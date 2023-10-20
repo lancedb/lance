@@ -28,7 +28,7 @@ mod utils;
 
 pub use object_reader::CloudObjectReader;
 pub use object_writer::ObjectWriter;
-pub use stream::{RecordBatchStream, RecordBatchStreamAdapter};
+pub use stream::{LanceRecordBatchStream, RecordBatchStream, RecordBatchStreamAdapter};
 pub use traits::*;
 pub use utils::*;
 
