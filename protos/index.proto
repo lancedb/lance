@@ -71,7 +71,7 @@ message IVF {
   // Centroids of partitions. `dimension * num_partitions` of float32s.
   //
   // Deprecated, use centroids_tensor instead.
-  repeated float centroids = 1 [deprecated=true];
+  repeated float centroids = 1;  // [deprecated = true];
 
   // File offset of each partition.
   repeated uint64 offsets = 2;
