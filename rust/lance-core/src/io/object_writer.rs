@@ -16,14 +16,15 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use lance_core::io::{WriteExt, Writer as LanceWrite};
-use object_store::{path::Path, MultipartId};
+use object_store::{path::Path, MultipartId, ObjectStore};
 use pin_project::pin_project;
 use snafu::{location, Location};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::io::ObjectStore;
-use crate::{Error, Result};
+use crate::{
+    io::{WriteExt, Writer},
+    Error, Result,
+};
 
 /// AsyncWrite with the capability to tell the position the data is written.
 ///
@@ -33,16 +34,16 @@ pub struct ObjectWriter {
     #[pin]
     writer: Box<dyn AsyncWrite + Send + Unpin>,
 
-    pub(crate) multipart_id: MultipartId,
+    // TODO: pub(crate)
+    pub multipart_id: MultipartId,
 
     cursor: usize,
 }
 
 impl ObjectWriter {
-    pub async fn new(object_store: &ObjectStore, path: &Path) -> Result<Self> {
+    pub async fn new(object_store: &dyn ObjectStore, path: &Path) -> Result<Self> {
         let (multipart_id, writer) =
             object_store
-                .inner
                 .put_multipart(path)
                 .await
                 .map_err(|e| Error::IO {
@@ -63,7 +64,7 @@ impl ObjectWriter {
 }
 
 #[async_trait]
-impl LanceWrite for ObjectWriter {
+impl Writer for ObjectWriter {
     async fn tell(&mut self) -> Result<usize> {
         Ok(self.cursor)
     }
@@ -95,18 +96,21 @@ impl AsyncWrite for ObjectWriter {
 
 #[cfg(test)]
 mod tests {
-    use object_store::path::Path;
+    use std::sync::Arc;
+
+    use object_store::{memory::InMemory, path::Path};
     use tokio::io::AsyncWriteExt;
 
-    use crate::format::Metadata;
-    use crate::io::ObjectStore;
-    use lance_core::io::{read_struct, CloudObjectReader};
+    use crate::{
+        format::Metadata,
+        io::{read_struct, CloudObjectReader},
+    };
 
     use super::*;
 
     #[tokio::test]
     async fn test_write() {
-        let store = ObjectStore::memory();
+        let store = InMemory::new();
 
         let mut object_writer = ObjectWriter::new(&store, &Path::from("/foo"))
             .await
@@ -128,7 +132,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_proto_structs() {
-        let store = ObjectStore::memory();
+        let store = InMemory::new();
         let path = Path::from("/foo");
 
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
@@ -144,7 +148,7 @@ mod tests {
         assert_eq!(pos, 0);
         object_writer.shutdown().await.unwrap();
 
-        let object_reader = CloudObjectReader::new(store.inner.clone(), path, 1024).unwrap();
+        let object_reader = CloudObjectReader::new(Arc::new(store), path, 1024).unwrap();
         let actual: Metadata = read_struct(&object_reader, pos).await.unwrap();
         assert_eq!(metadata, actual);
     }

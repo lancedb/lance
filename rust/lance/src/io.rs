@@ -26,7 +26,6 @@ pub mod commit;
 pub(crate) mod deletion;
 pub(crate) mod exec;
 pub mod object_store;
-pub mod object_writer;
 pub(crate) mod reader;
 mod writer;
 

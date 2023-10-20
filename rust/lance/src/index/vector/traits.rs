@@ -20,15 +20,14 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::{types::Float32Type, RecordBatch};
 use async_trait::async_trait;
 
-use lance_core::io::Reader;
+use lance_core::{
+    io::{object_writer::ObjectWriter, Reader},
+    Result,
+};
 use lance_index::vector::Query;
 use lance_linalg::MatrixView;
 
-use crate::{
-    index::{pb::Transform, prefilter::PreFilter, Index},
-    io::object_writer::ObjectWriter,
-    Result,
-};
+use crate::index::{pb::Transform, prefilter::PreFilter, Index};
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
 #[async_trait]
