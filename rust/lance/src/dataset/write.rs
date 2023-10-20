@@ -56,6 +56,13 @@ pub struct WriteParams {
     /// Max number of rows per row group.
     pub max_rows_per_group: usize,
 
+    /// Max file size in bytes.
+    ///
+    /// This is a soft limit. The actual file size may be larger than this value
+    /// by a few megabytes, since once we detect we hit this limit, we still
+    /// need to flush the footer.
+    pub max_bytes_per_file: usize,
+
     /// Write mode
     pub mode: WriteMode,
 
@@ -69,6 +76,9 @@ impl Default for WriteParams {
         Self {
             max_rows_per_file: 1024 * 1024, // 1 million
             max_rows_per_group: 1024,
+            // object-store has a 100GB limit, so we should at least make sure
+            // we are under that.
+            max_bytes_per_file: 90 * 1024 * 1024 * 1024, // 90 GB
             mode: WriteMode::Create,
             store_params: None,
             progress: None,
@@ -142,7 +152,9 @@ pub async fn write_fragments(
             num_rows_in_current_file += batch.num_rows();
         }
 
-        if num_rows_in_current_file >= params.max_rows_per_file {
+        if num_rows_in_current_file >= params.max_rows_per_file
+            || writer.as_ref().unwrap().tell() >= params.max_bytes_per_file
+        {
             let num_rows = writer.take().unwrap().finish().await?;
             debug_assert_eq!(num_rows, num_rows_in_current_file);
             fragments.last_mut().unwrap().physical_rows = num_rows;
@@ -281,5 +293,49 @@ mod tests {
             let num_rows = chunk.iter().map(|batch| batch.num_rows()).sum::<usize>();
             assert_eq!(num_rows, 10);
         }
+    }
+
+    #[tokio::test]
+    async fn test_file_size() {
+        let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+
+        // Write 1024 rows and show they are split into two files
+        // 512 * 4 bytes = 2KB
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter(0..1024))],
+        )
+        .unwrap();
+
+        let write_params = WriteParams {
+            max_rows_per_file: 1024 * 10, // Won't be limited by this
+            max_rows_per_group: 512,
+            max_bytes_per_file: 2 * 1024,
+            mode: WriteMode::Create,
+            ..Default::default()
+        };
+
+        let data_stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(std::iter::once(Ok(batch))),
+        ));
+
+        let schema = Schema::try_from(schema.as_ref()).unwrap();
+
+        let object_store = Arc::new(ObjectStore::memory());
+        let fragments = write_fragments(
+            object_store,
+            &Path::from("test"),
+            &schema,
+            data_stream,
+            write_params,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fragments.len(), 2);
     }
 }

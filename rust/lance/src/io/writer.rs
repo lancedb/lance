@@ -234,6 +234,11 @@ impl FileWriter {
         self.metadata.len()
     }
 
+    /// Total bytes written so far
+    pub fn tell(&self) -> usize {
+        self.object_writer.tell()
+    }
+
     /// Returns the in-flight multipart ID.
     pub fn multipart_id(&self) -> &str {
         &self.object_writer.multipart_id
