@@ -42,7 +42,7 @@ use lance_index::vector::{
     Query, DIST_COL, RESIDUAL_COLUMN,
 };
 use lance_linalg::{distance::*, kernels::argmin, matrix::MatrixView};
-use log::info;
+use log::{debug, info, warn};
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
 use snafu::{location, Location};
@@ -553,12 +553,11 @@ impl TryFrom<&Ivf> for pb::Ivf {
                 location: location!(),
             });
         }
-        let centroids_arr = ivf.centroids.values();
-        let f32_centroids: &Float32Array = as_primitive_array(&centroids_arr);
         Ok(Self {
-            centroids: f32_centroids.iter().map(|v| v.unwrap()).collect(),
+            centroids: vec![],
             offsets: ivf.offsets.iter().map(|o| *o as u64).collect(),
             lengths: ivf.lengths.clone(),
+            centroids_tensor: Some(ivf.centroids.as_ref().try_into()?),
         })
     }
 }
@@ -568,12 +567,20 @@ impl TryFrom<&pb::Ivf> for Ivf {
     type Error = Error;
 
     fn try_from(proto: &pb::Ivf) -> Result<Self> {
-        let f32_centroids = Float32Array::from(proto.centroids.clone());
-        let dimension = f32_centroids.len() / proto.offsets.len();
-        let centroids = Arc::new(FixedSizeListArray::try_new_from_values(
-            f32_centroids,
-            dimension as i32,
-        )?);
+        let centroids = if let Some(tensor) = proto.centroids_tensor.as_ref() {
+            debug!("Ivf: loading IVF centroids from index format v2");
+            Arc::new(FixedSizeListArray::try_from(tensor)?)
+        } else {
+            warn!("Ivf: loading IVF centroids from index format v1");
+            // For backward-compatibility
+            let f32_centroids = Float32Array::from(proto.centroids.clone());
+            let dimension = f32_centroids.len() / proto.offsets.len();
+            Arc::new(FixedSizeListArray::try_new_from_values(
+                f32_centroids,
+                dimension as i32,
+            )?)
+        };
+
         Ok(Self {
             centroids,
             offsets: proto.offsets.iter().map(|o| *o as usize).collect(),

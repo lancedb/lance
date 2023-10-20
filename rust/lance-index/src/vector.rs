@@ -26,12 +26,14 @@ pub mod kmeans;
 pub mod pq;
 pub mod residual;
 pub mod transform;
+pub mod utils;
 
 // TODO: Make these crate private once the migration from lance to lance-index is done.
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
 pub const PART_ID_COLUMN: &str = "__ivf_part_id";
 pub const DIST_COL: &str = "_distance";
 
+use super::pb;
 pub use residual::RESIDUAL_COLUMN;
 
 /// Query parameters for the vector indices
@@ -58,4 +60,24 @@ pub struct Query {
 
     /// Whether to use an ANN index if available
     pub use_index: bool,
+}
+
+impl From<pb::VectorMetricType> for MetricType {
+    fn from(proto: pb::VectorMetricType) -> Self {
+        match proto {
+            pb::VectorMetricType::L2 => Self::L2,
+            pb::VectorMetricType::Cosine => Self::Cosine,
+            pb::VectorMetricType::Dot => Self::Dot,
+        }
+    }
+}
+
+impl From<MetricType> for pb::VectorMetricType {
+    fn from(mt: MetricType) -> Self {
+        match mt {
+            MetricType::L2 => Self::L2,
+            MetricType::Cosine => Self::Cosine,
+            MetricType::Dot => Self::Dot,
+        }
+    }
 }
