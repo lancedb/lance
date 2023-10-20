@@ -467,65 +467,36 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         max_value: ScalarValue::Boolean(Some(true_present || !false_present)),
     }
 }
-
-fn get_list_statistics<T: ArrowNumericType, N>(arrays: &[&ArrayRef]) -> StatisticsRow
-where
-    T::Native: Bounded + PartialOrd,
-    datafusion::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
-    <T as ArrowPrimitiveType>::Native: OffsetSizeTrait,
-    N: arrow_array::OffsetSizeTrait,
-{
-    let max_comparison_length: usize = 16; // TODO: is 16 a reasonable lenght?
-    let first_length = arrays[0].as_list::<N>().value(0).len();
-    let mut max_length = first_length;
-    let mut min_length = first_length;
+fn get_list_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     let mut null_count: i64 = 0;
-    let mut max_value = vec![T::Native::min_value(); max_comparison_length].to_vec();
-    let mut min_value = vec![T::Native::max_value(); max_comparison_length].to_vec();
-
-    let arrs = arrays.iter().map(|x| x.as_list::<N>()).collect::<Vec<_>>();
-    arrs.iter().for_each(|array| {
-        null_count += array.null_count() as i64;
-        for row in array.iter() {
-            if let Some(row) = row {
-                max_length = std::cmp::max(max_length, row.len());
-                min_length = std::cmp::min(min_length, row.len());
-                let values = as_primitive_array::<T>(&row);
-                for (i, val) in values.iter().enumerate() {
-                    if let Some(val) = val {
-                        if let Some(Ordering::Greater) = val.partial_cmp(&max_value[i]) {
-                            max_value[i] = val;
-                        }
-                        if let Some(Ordering::Less) = val.partial_cmp(&min_value[i]) {
-                            min_value[i] = val;
-                        }
-                    }
-                    if i == max_length {
-                        break;
-                    }
-                }
-            } else {
-                continue;
-            }
+    let mut stats: StatisticsRow;
+    match arrays[0].data_type() {
+        DataType::List(_) => {
+            let arrays = arrays
+                .iter()
+                .map(|x| {
+                    null_count += x.null_count() as i64;
+                    x.as_list::<i32>().values()
+                })
+                .collect::<Vec<_>>();
+            stats = collect_statistics(&arrays);
         }
-    });
-
-    let DataType::List(f) = arrays[0].data_type() else {
-        todo!()
-    };
-    let min_value = min_value[0..min_length]
-        .iter()
-        .map(|&x| ScalarValue::from(x))
-        .collect::<Vec<_>>();
-    let max_value = max_value[0..max_length]
-        .iter()
-        .map(|&x| ScalarValue::from(x))
-        .collect::<Vec<_>>();
-    StatisticsRow {
-        null_count: ScalarValue::Int64(Some(null_count)),
-        min_value: ScalarValue::List(Some(min_value), f.clone()),
-        max_value: ScalarValue::List(Some(max_value), f.clone()),
+        DataType::LargeList(_) => {
+            let arrays = arrays
+                .iter()
+                .map(|x| {
+                    null_count += x.null_count() as i64;
+                    x.as_list::<i64>().values()
+                })
+                .collect::<Vec<_>>();
+            stats = collect_statistics(&arrays);
+        }
+        _ => {
+            todo!()
+        }
     }
+    stats.null_count = ScalarValue::Int64(Some(null_count));
+    stats
 }
 
 fn cast_dictionary_arrays<'a, T: ArrowDictionaryKeyType + 'static>(
@@ -721,8 +692,8 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::Utf8 => get_string_statistics::<i32>(arrays),
         DataType::LargeUtf8 => get_string_statistics::<i64>(arrays),
         DataType::Dictionary(_, _) => get_dictionary_statistics(arrays),
-        DataType::List(_) => get_list_statistics::<Int64Type, i32>(arrays),
-        DataType::LargeList(_) => get_list_statistics::<Int64Type, i64>(arrays),
+        DataType::List(_) => get_list_statistics(arrays),
+        DataType::LargeList(_) => get_list_statistics(arrays),
         _ => {
             println!(
                 "Stats collection for {} is not supported yet",
@@ -995,10 +966,10 @@ mod tests {
         Decimal128Array, DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
         DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, Float32Array,
         Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
-        LargeStringArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
-        UInt32Array, UInt64Array, UInt8Array,
+        LargeListArray, LargeStringArray, ListArray, StringArray, StructArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
 
     use super::*;
@@ -1415,63 +1386,72 @@ mod tests {
         );
     }
 
-    // #[test]
-    // fn test_collect_list_stats() {
-    //     let data1 = vec![
-    //         Some(vec![Some(0)]),
-    //         Some(vec![Some(9)]),
-    //         Some(vec![Some(9), Some(2), Some(2)]),
-    //     ];
-    //     let data2 = vec![
-    //         Some(vec![Some(0), Some(1), Some(2)]),
-    //         None,
-    //         Some(vec![Some(3), None]),
-    //         Some(vec![Some(6), Some(7), Some(8)]),
-    //     ];
-    //
-    //     let expected_min_value = [0]
-    //         .iter()
-    //         .map(|x: &i64| ScalarValue::Int64(Some(*x)))
-    //         .collect::<Vec<_>>();
-    //     let expected_max_value = [9, 7, 8]
-    //         .iter()
-    //         .map(|x: &i64| ScalarValue::Int64(Some(*x)))
-    //         .collect::<Vec<_>>();
-    //     let field = Arc::new(ArrowField::new("", DataType::Int64, false));
-    //     let expected_stats = StatisticsRow {
-    //         null_count: ScalarValue::from(1_i64),
-    //         min_value: ScalarValue::List(Some(expected_min_value), field.clone()),
-    //         max_value: ScalarValue::List(Some(expected_max_value), field.clone()),
-    //     };
-    //
-    //     let arrays = vec![
-    //         Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
-    //             data1.clone(),
-    //         )) as ArrayRef,
-    //         Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
-    //             data2.clone(),
-    //         )) as ArrayRef,
-    //     ];
-    //     let binding = arrays.iter().collect::<Vec<_>>();
-    //     let array_refs = binding.as_slice();
-    //     let stats = collect_statistics(array_refs);
-    //     // TODO
-    //     // assert_eq!(stats, expected_stats);
-    //
-    //     let arrays = vec![
-    //         Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(
-    //             data1.clone(),
-    //         )) as ArrayRef,
-    //         Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(
-    //             data2.clone(),
-    //         )) as ArrayRef,
-    //     ];
-    //     let binding = arrays.iter().collect::<Vec<_>>();
-    //     let array_refs = binding.as_slice();
-    //     let stats = collect_statistics(array_refs);
-    //     // TODO
-    //     // assert_eq!(stats, expected_stats);
-    // }
+    #[test]
+    fn test_collect_list_stats() {
+        let data1 = vec![
+            Some(vec![Some(0)]),
+            Some(vec![Some(9)]),
+            Some(vec![Some(9), Some(2), Some(2)]),
+        ];
+        let data2 = vec![
+            Some(vec![Some(0), Some(1), Some(2)]),
+            None,
+            Some(vec![Some(3), None]),
+            Some(vec![Some(6), Some(7), Some(8)]),
+        ];
+
+        let expected_stats = StatisticsRow {
+            null_count: ScalarValue::from(1_i64),
+            min_value: ScalarValue::from(0_i16),
+            max_value: ScalarValue::from(9_i16),
+        };
+        let arrays = vec![
+            Arc::new(ListArray::from_iter_primitive::<Int16Type, _, _>(
+                data1.clone(),
+            )) as ArrayRef,
+            Arc::new(ListArray::from_iter_primitive::<Int16Type, _, _>(
+                data2.clone(),
+            )) as ArrayRef,
+        ];
+
+        let binding = arrays.iter().collect::<Vec<_>>();
+        let array_refs = binding.as_slice();
+        let stats = collect_statistics(array_refs);
+        assert_eq!(stats, expected_stats);
+    }
+
+    #[test]
+    fn test_collect_large_list_stats() {
+        let data1 = vec![
+            Some(vec![Some(0)]),
+            Some(vec![Some(9)]),
+            Some(vec![Some(9), Some(2), Some(2)]),
+        ];
+        let data2 = vec![
+            Some(vec![Some(0), Some(1), Some(2)]),
+            None,
+            Some(vec![Some(3), None]),
+            Some(vec![Some(6), Some(7), Some(8)]),
+        ];
+        let expected_stats = StatisticsRow {
+            null_count: ScalarValue::from(1_i64),
+            min_value: ScalarValue::from(0_i64),
+            max_value: ScalarValue::from(9_i64),
+        };
+        let arrays = vec![
+            Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(
+                data1.clone(),
+            )) as ArrayRef,
+            Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(
+                data2.clone(),
+            )) as ArrayRef,
+        ];
+
+        let binding = arrays.iter().collect::<Vec<_>>();
+        let array_refs = binding.as_slice();
+        let stats = collect_statistics(array_refs);
+        assert_eq!(stats, expected_stats);
+    }
 
     #[test]
     fn test_collect_binary_stats() {
