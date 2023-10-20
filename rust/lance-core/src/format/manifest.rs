@@ -25,7 +25,6 @@ use super::Fragment;
 use crate::datatypes::Schema;
 use crate::error::{Error, Result};
 use crate::format::{pb, ProtoStruct};
-use crate::utils::temporal::SystemTime;
 use snafu::{location, Location};
 /// Manifest of a dataset
 ///
@@ -116,12 +115,7 @@ impl Manifest {
     }
 
     /// Set the `timestamp_nanos` value from a Utc DateTime
-    pub fn set_timestamp(&mut self, timestamp: Option<SystemTime>) {
-        let timestamp = timestamp.unwrap_or_else(SystemTime::now);
-        let nanos = timestamp
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+    pub fn set_timestamp(&mut self, nanos: u128) {
         self.timestamp_nanos = nanos;
     }
 
