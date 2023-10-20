@@ -1003,9 +1003,7 @@ mod tests {
 
     use super::*;
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
-    use proptest::collection::hash_set;
     use proptest::prelude::*;
-    use std::collections::HashSet;
 
     fn vec_of_vec() -> impl Strategy<Value = Vec<Vec<u16>>> {
         const N: u16 = 10;
@@ -1013,21 +1011,17 @@ mod tests {
         let length = 0..N;
         length.prop_flat_map(vec_from_length).prop_map(convert)
     }
-
-    fn vec_from_length(length: u16) -> impl Strategy<Value = Vec<HashSet<u16>>> {
+    fn vec_from_length(length: u16) -> impl Strategy<Value = Vec<Vec<u16>>> {
         const K: usize = 5;
         let mut result = vec![];
         for index in 1..length {
-            // Using a hash_set instead of vec because the elements should be unique.
-            let inner = hash_set(0..index, 0..K);
-
+            let inner = proptest::collection::vec(0..index, 0..K);
             result.push(inner);
         }
         result
     }
-
-    /// Convert Vec<HashSet<T>> to Vec<Vec<T>>
-    fn convert(input: Vec<HashSet<u16>>) -> Vec<Vec<u16>> {
+    /// Convert Vec<VecStrategy<T>> to Vec<Vec<T>>
+    fn convert(input: Vec<Vec<u16>>) -> Vec<Vec<u16>> {
         let mut output = vec![];
         for inner in input {
             output.push(inner.into_iter().collect())
