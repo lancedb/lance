@@ -38,13 +38,13 @@ fn to_pb_data_type<T: ArrowFloatType>() -> pb::tensor::DataType {
 impl From<pb::tensor::DataType> for DataType {
     fn from(dt: pb::tensor::DataType) -> Self {
         match dt {
-            pb::tensor::DataType::Uint8 => DataType::UInt8,
-            pb::tensor::DataType::Uint16 => DataType::UInt16,
-            pb::tensor::DataType::Uint32 => DataType::UInt32,
-            pb::tensor::DataType::Uint64 => DataType::UInt64,
-            pb::tensor::DataType::Float16 => DataType::Float16,
-            pb::tensor::DataType::Float32 => DataType::Float32,
-            pb::tensor::DataType::Float64 => DataType::Float64,
+            pb::tensor::DataType::Uint8 => Self::UInt8,
+            pb::tensor::DataType::Uint16 => Self::UInt16,
+            pb::tensor::DataType::Uint32 => Self::UInt32,
+            pb::tensor::DataType::Uint64 => Self::UInt64,
+            pb::tensor::DataType::Float16 => Self::Float16,
+            pb::tensor::DataType::Float32 => Self::Float32,
+            pb::tensor::DataType::Float64 => Self::Float64,
             pb::tensor::DataType::Bfloat16 => unimplemented!(),
         }
     }
@@ -55,13 +55,13 @@ impl TryFrom<&DataType> for pb::tensor::DataType {
 
     fn try_from(dt: &DataType) -> Result<Self> {
         match dt {
-            DataType::UInt8 => Ok(pb::tensor::DataType::Uint8),
-            DataType::UInt16 => Ok(pb::tensor::DataType::Uint16),
-            DataType::UInt32 => Ok(pb::tensor::DataType::Uint32),
-            DataType::UInt64 => Ok(pb::tensor::DataType::Uint64),
-            DataType::Float16 => Ok(pb::tensor::DataType::Float16),
-            DataType::Float32 => Ok(pb::tensor::DataType::Float32),
-            DataType::Float64 => Ok(pb::tensor::DataType::Float64),
+            DataType::UInt8 => Ok(Self::Uint8),
+            DataType::UInt16 => Ok(Self::Uint16),
+            DataType::UInt32 => Ok(Self::Uint32),
+            DataType::UInt64 => Ok(Self::Uint64),
+            DataType::Float16 => Ok(Self::Float16),
+            DataType::Float32 => Ok(Self::Float32),
+            DataType::Float64 => Ok(Self::Float64),
             _ => Err(Error::Index {
                 message: format!("pb tensor type not supported: {:?}", dt),
             }),
@@ -82,12 +82,13 @@ where
     Standard: Distribution<<T as ArrowFloatType>::Native>,
 {
     fn from(mat: &MatrixView<T>) -> Self {
-        let mut tensor = pb::Tensor::default();
-        tensor.data_type = to_pb_data_type::<T>() as i32;
-        tensor.shape = vec![mat.num_rows() as u32, mat.num_columns() as u32];
         let flat_array = mat.data().as_ref().clone();
-        tensor.data = flat_array.into_data().buffers()[0].to_vec();
-        tensor
+
+        Self {
+            data_type: to_pb_data_type::<T>() as i32,
+            shape: vec![mat.num_rows() as u32, mat.num_columns() as u32],
+            data: flat_array.into_data().buffers()[0].to_vec(),
+        }
     }
 }
 
@@ -95,7 +96,7 @@ impl TryFrom<&FixedSizeListArray> for pb::Tensor {
     type Error = Error;
 
     fn try_from(array: &FixedSizeListArray) -> Result<Self> {
-        let mut tensor = pb::Tensor::default();
+        let mut tensor = Self::default();
         tensor.data_type = pb::tensor::DataType::try_from(array.value_type())? as i32;
         tensor.shape = vec![array.len() as u32, array.value_length() as u32];
         let flat_array = array.values();
@@ -135,7 +136,7 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
         }
 
         let field = Field::new("item", flat_array.data_type().clone(), false);
-        Ok(FixedSizeListArray::try_new(
+        Ok(Self::try_new(
             Arc::new(field),
             dim as i32,
             flat_array,
