@@ -207,6 +207,26 @@ def test_asof_checkout(tmp_path: Path):
     assert len(ds.to_table()) == 9
 
 
+def test_sample(tmp_path: Path):
+    table1 = pa.Table.from_pydict({"x": [0, 10, 20, 30, 40, 50], "y": range(6)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table1, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    sampled = dataset.sample(3)
+
+    assert sampled.num_rows == 3
+    assert sampled.num_columns == 2
+
+    sampled = dataset.sample(4, columns=["x"])
+
+    assert sampled.num_rows == 4
+    assert sampled.num_columns == 1
+
+    for row in sampled.column(0).chunk(0):
+        assert row.as_py() % 10 == 0
+
+
 def test_take(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
