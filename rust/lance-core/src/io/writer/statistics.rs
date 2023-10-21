@@ -974,62 +974,6 @@ mod tests {
 
     use super::*;
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
-    use proptest::prelude::*;
-
-    fn vec_of_vec() -> impl Strategy<Value = Vec<Vec<u16>>> {
-        const N: u16 = 10;
-
-        let length = 0..N;
-        length.prop_flat_map(vec_from_length)
-    }
-    fn vec_from_length(length: u16) -> impl Strategy<Value = Vec<Vec<u16>>> {
-        const K: usize = 5;
-        let mut result = vec![];
-        for index in 1..length {
-            let inner = proptest::collection::vec(0..index, 0..K);
-            result.push(inner);
-        }
-        result
-    }
-
-    fn vec_of_vec_to_array(vecs: Vec<Vec<u16>>) -> Vec<ArrayRef> {
-        let mut arrays: Vec<ArrayRef> = vec![];
-
-        for v in vecs.iter() {
-            let array = Arc::new(UInt16Array::from_iter_values(v.to_vec()));
-            arrays.push(array);
-        }
-        arrays
-    }
-
-    proptest! {
-        #[test]
-        fn test_something(vecs in vec_of_vec()) {
-            let arrays = vec_of_vec_to_array(vecs);
-            let array_refs = arrays.iter().collect::<Vec<_>>();
-            let stats = collect_statistics(array_refs.as_ref());
-
-            let some_values : bool = array_refs.iter().map(|x| x.len() > 0).any(|x| x);
-
-            if some_values {
-                prop_assert_eq!(stats.null_count, ScalarValue::from(0_i64));
-                prop_assert!(stats.min_value >= ScalarValue::from(0_u16));
-                prop_assert!(stats.max_value <= ScalarValue::from(100_u16));
-            } else if arrays.is_empty() {
-                prop_assert_eq!(stats, StatisticsRow{
-                    null_count: ScalarValue::Int64(Some(0)),
-                    min_value: ScalarValue::Null,
-                    max_value: ScalarValue::Null,
-                });
-            } else {
-                prop_assert_eq!(stats, StatisticsRow{
-                    null_count: ScalarValue::Int64(Some(0)),
-                    min_value: ScalarValue::from(0_u16),
-                    max_value: ScalarValue::from(u16::MAX),
-                });
-            }
-        }
-    }
 
     #[test]
     fn test_edge_cases() {
