@@ -397,6 +397,42 @@ def write_fragments(
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
     progress: Optional[FragmentWriteProgress] = None,
 ) -> List[FragmentMetadata]:
+    """
+    Write data into one or more fragments.
+
+    .. warning::
+
+        This is a low-level API intended for manually implementing distributed
+        writes. For most users, :func:`lance.write_dataset` is the recommended API.
+
+    Parameters
+    ----------
+    data : pa.Table or pa.RecordBatchReader
+        The data to be written to the fragment.
+    dataset_uri : str
+        The URI of the dataset.
+    schema : pa.Schema, optional
+        The schema of the data. If not specified, the schema will be inferred
+        from the data.
+    max_rows_per_file : int, default 1024 * 1024
+        The maximum number of rows per data file.
+    max_rows_per_group : int, default 1024
+        The maximum number of rows per group in the data file.
+    max_bytes_per_file : int, default 90 * 1024 * 1024 * 1024
+        The maximum number of bytes per data file. Defaults to 90 GB. This is a
+        soft limit; the actual size of the file might be larger. This limit is
+        checked at the group level, so if your group size is large then this
+        can overshoot the limit.
+    progress : FragmentWriteProgress, optional
+        *Experimental API*. Progress tracking for writing the fragment.
+
+    Returns
+    -------
+    List[FragmentMetadata]
+        A list of :class:`FragmentMetadata` for the fragments written. The
+        fragment ids are left as zero meaning they are not yet specified. They
+        will be assigned when the fragments are committed to a dataset.
+    """
     if pd and isinstance(data, pd.DataFrame):
         reader = pa.Table.from_pandas(data, schema=schema).to_reader()
     elif isinstance(data, pa.Table):

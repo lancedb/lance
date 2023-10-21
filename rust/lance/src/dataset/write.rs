@@ -142,7 +142,7 @@ pub async fn write_fragments(
 /// by the caller. This is so this function can be called in parallel, and the
 /// IDs can be assigned after writing is complete.
 ///
-/// This is a private veriant that takes a `SendableRecordBatchStream` instead
+/// This is a private variant that takes a `SendableRecordBatchStream` instead
 /// of a reader. We don't expose the stream at our interface because it is a
 /// DataFusion type.
 #[instrument(skip_all)]
