@@ -306,11 +306,7 @@ pub(crate) async fn open_index(
 
     let pb::index::Implementation::VectorIndex(vec_idx) = idx_impl;
 
-    let metric_type = pb::VectorMetricType::from_i32(vec_idx.metric_type)
-        .ok_or(Error::Index {
-            message: format!("Unsupported metric type value: {}", vec_idx.metric_type),
-        })?
-        .into();
+    let metric_type = pb::VectorMetricType::try_from(vec_idx.metric_type)?.into();
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
 

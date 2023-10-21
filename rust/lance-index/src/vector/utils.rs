@@ -119,7 +119,7 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
 
         let data = bytes::Bytes::from(tensor.data.clone());
         let flat_array = bytes_to_array(
-            &DataType::from(pb::tensor::DataType::from_i32(tensor.data_type).unwrap()),
+            &DataType::from(pb::tensor::DataType::try_from(tensor.data_type).unwrap()),
             data,
             dim * num_rows,
             0,
