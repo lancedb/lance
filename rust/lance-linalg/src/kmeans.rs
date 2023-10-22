@@ -563,7 +563,7 @@ fn compute_partitions_l2(centroids: &[f32], data: &[f32], dim: usize) -> Vec<u32
 
         // Loop over each strip.
         // s is the index of value in each vector.
-        let mut min_dists = vec![f32::MAX; TILE_SIZE];
+        let mut min_dists = [f32::MAX; TILE_SIZE];
         for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
             // 4B * 16 * 16 = 1 KB
             let mut dists = vec![0_f32; TILE_SIZE * TILE_SIZE];
