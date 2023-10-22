@@ -27,11 +27,7 @@ use arrow_schema::Field;
 use arrow_select::take::take;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
-use lance_linalg::{
-    distance::{Cosine, Dot, MetricType, Normalize, L2},
-    kernels::argmin,
-    MatrixView,
-};
+use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -197,26 +193,14 @@ impl Ivf {
     ///
     #[instrument(level = "debug", skip(data))]
     fn compute_partitions(&self, data: &MatrixView<Float32Type>) -> UInt32Array {
-        let ndim = data.ndim();
-        let centroids_arr = self.centroids.data();
-        let centroid_norms = centroids_arr
-            .values()
-            .chunks(ndim)
-            .map(|centroid| centroid.norm_l2())
-            .collect::<Vec<_>>();
-        UInt32Array::from_iter_values(data.iter().map(|row| {
-            argmin(
-                centroids_arr
-                    .values()
-                    .chunks(ndim)
-                    .zip(centroid_norms.iter())
-                    .map(|(centroid, &norm)| match self.metric_type {
-                        MetricType::L2 => row.l2(centroid),
-                        MetricType::Cosine => centroid.cosine_fast(norm, row),
-                        MetricType::Dot => row.dot(centroid),
-                    }),
-            )
-            .expect("argmin should always return a value")
-        }))
+        use lance_linalg::kmeans::compute_partitions;
+
+        compute_partitions(
+            self.centroids.data().values(),
+            data.data().values(),
+            self.centroids.ndim(),
+            self.metric_type,
+        )
+        .into()
     }
 }
