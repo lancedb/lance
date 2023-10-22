@@ -155,7 +155,7 @@ pub fn l2_distance_arrow_batch(from: &[f32], to: &FixedSizeListArray) -> Arc<Flo
 }
 
 #[cfg(target_arch = "x86_64")]
-mod x86_64 {
+pub mod x86_64 {
     pub mod avx {
         use super::super::l2_scalar;
 
@@ -166,14 +166,27 @@ mod x86_64 {
                 debug_assert_eq!(from.len(), to.len());
 
                 // Get the potion of the vector that is aligned to 32 bytes.
-                let len = from.len() / 8 * 8;
+                let len = from.len() / 32 * 32;
                 let mut sums = _mm256_setzero_ps();
-                for i in (0..len).step_by(8) {
+                for i in (0..len).step_by(32) {
                     let left = _mm256_loadu_ps(from.as_ptr().add(i));
+                    let l2 = _mm256_loadu_ps(from.as_ptr().add(i + 8));
+                    let l3 = _mm256_loadu_ps(from.as_ptr().add(i + 16));
+                    let l4 = _mm256_loadu_ps(from.as_ptr().add(i + 24));
+
                     let right = _mm256_loadu_ps(to.as_ptr().add(i));
+                    let r2 = _mm256_loadu_ps(to.as_ptr().add(i + 8));
+                    let r3 = _mm256_loadu_ps(to.as_ptr().add(i + 16));
+                    let r4 = _mm256_loadu_ps(to.as_ptr().add(i + 24));
                     let sub = _mm256_sub_ps(left, right);
                     // sum = sub * sub + sum
                     sums = _mm256_fmadd_ps(sub, sub, sums);
+                    let s2 = _mm256_sub_ps(l2, r2);
+                    let s3 = _mm256_sub_ps(l3, r3);
+                    let s4 = _mm256_sub_ps(l4, r4);
+                    sums = _mm256_fmadd_ps(s2, s2, sums);
+                    sums = _mm256_fmadd_ps(s3, s3, sums);
+                    sums = _mm256_fmadd_ps(s4, s4, sums);
                 }
                 // Shift and add vector, until only 1 value left.
                 // sums = [x0-x7], shift = [x4-x7]

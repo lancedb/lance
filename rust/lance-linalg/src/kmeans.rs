@@ -540,6 +540,57 @@ impl KMeans {
     }
 }
 
+/// Return a slice of `data[x,y..y+strip]`.
+#[inline]
+fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f32] {
+    &data[x * dim + y..x * dim + y + strip]
+}
+
+fn compute_l2_tiling(centroids: &[f32], data: &[f32], dim: usize, partition_ids: &mut [u32]) {
+    use super::distance::l2::x86_64::avx::l2_f32;
+    const STRIPE_SIZE: usize = 128;
+    const TILE_SIZE: usize = 16;
+    // 128 * 4bytes * 16 = 8KB for centroid and data in L1 cache, respectively.
+    let num_rows = data.len() / dim;
+    let num_centroids = centroids.len() / dim;
+
+    // For a TILE of data rows.
+    for idx in (0..num_rows).step_by(TILE_SIZE) {
+        // Loop over each strip.
+        // s is the index of value in each vector.
+        let mut partitions = vec![0; TILE_SIZE];
+        let mut min_dists = vec![f32::MAX; TILE_SIZE];
+        for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
+            // 4B * 16 * 16 = 1B
+            let mut dists = vec![0_f32; TILE_SIZE * TILE_SIZE];
+            for s in (0..dim).step_by(STRIPE_SIZE) {
+                // Calculate L2 within each TILE * STRIP
+                for di in idx..idx + TILE_SIZE {
+                    let data_slice = get_slice(data, di, s, dim, STRIPE_SIZE);
+                    for ci in centroid_start..centroid_start + TILE_SIZE {
+                        // Get a slice of `[s..s+STRIP_SIZE]` from `data[di]`
+                        let cent_slice = get_slice(centroids, ci, s, dim, STRIPE_SIZE);
+                        let dist = l2_f32(data_slice, cent_slice);
+                        dists[(di - idx) * TILE_SIZE + (ci - centroid_start)] += dist;
+                    }
+                }
+            }
+            for i in 0..TILE_SIZE {
+                for j in 0..TILE_SIZE {
+                    let dist = dists[i * TILE_SIZE + j];
+                    if dist < min_dists[i] {
+                        min_dists[i] = dist;
+                        partitions[i] = (centroid_start + j) as u32;
+                    }
+                }
+            }
+        }
+        for i in 0..TILE_SIZE {
+            partition_ids[idx + i] = partitions[i];
+        }
+    }
+}
+
 /// Tiling L2 distance computation.
 fn compute_partitions_l2(
     centroids: &MatrixView<Float32Type>,
@@ -553,31 +604,13 @@ fn compute_partitions_l2(
     let dist_buffer_size = tile_size * num_centroids;
     // A tiling size * (# of centroids) buffer to store distances.
     let mut dists = vec![0.0; dist_buffer_size];
-    let mut partitions = Vec::<u32>::with_capacity(data.num_rows());
+    let mut partitions = vec![0; data.num_rows()];
     let centroid_arr = centroids.data();
     let data_arr = data.data();
     let data_values = data_arr.values();
     let cent_values = centroid_arr.values();
 
-    for i in (0..data.num_rows()).step_by(tile_size) {
-        for j in (0..num_centroids).step_by(tile_size) {
-            for data_offset in 0..min(tile_size, data.num_rows() - i) {
-                let data_idx = i + data_offset;
-                let row = &data_values[data_idx * dim..(data_idx + 1) * dim];
-                for k in 0..min(tile_size, num_centroids - j) {
-                    let centroid_idx = j + k;
-                    let cent = &cent_values[centroid_idx * dim..(centroid_idx + 1) * dim];
-                    let dist = cent.l2(row);
-
-                    dists[data_offset * tile_size + k] = dist;
-                 }
-            }
-        }
-        for data_offset in 0..min(tile_size, data.num_rows() - i) {
-            let partition_id = argmin(dists[data_offset * tile_size..(data_offset + 1) * tile_size].iter().copied()).unwrap();
-            partitions.push(partition_id);
-        }
-    }
+    compute_l2_tiling(&cent_values, &data_values, dim, &mut partitions);
     partitions.into()
 }
 
@@ -609,8 +642,7 @@ pub fn compute_partitions(
                 //     MetricType::Cosine => centroid.cosine_fast(norm, row),
                 //     MetricType::Dot => row.dot(centroid),
                 // }
-                row.l2(&centroid),
-            ),
+                row.l2(&centroid)),
         )
         .unwrap()
     }))
