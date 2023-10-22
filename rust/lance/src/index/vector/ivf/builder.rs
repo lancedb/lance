@@ -88,7 +88,8 @@ pub async fn shuffle_dataset(
                         Ok((part_id, batch))
                     })
                     .collect::<Result<Vec<_>>>()
-            }).await
+            })
+            .await
         })
         .buffer_unordered(num_cpus::get())
         .boxed();
