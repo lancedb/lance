@@ -204,6 +204,6 @@ impl Ivf {
             compute_partitions(centroids.values(), data.values(), dimension, metric_type).into()
         })
         .await
-        .unwrap()
+        .expect("compute_partitions: schedule CPU task")
     }
 }
