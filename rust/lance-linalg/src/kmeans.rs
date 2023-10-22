@@ -545,36 +545,43 @@ fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f3
     &data[x * dim + y..x * dim + y + strip]
 }
 
+/// Fast partition computation for L2 distance.
 fn compute_partitions_l2(centroids: &[f32], data: &[f32], dim: usize) -> Vec<u32> {
     const STRIPE_SIZE: usize = 128;
     const TILE_SIZE: usize = 16;
-    // 128 * 4bytes * 16 = 8KB for centroid and data in L1 cache, respectively.
+
+    // 128 * 4bytes * 16 = 8KB for centroid and data respectively, so both of them can
+    // stay in L1 cache.
     let num_rows = data.len() / dim;
     let num_centroids = centroids.len() / dim;
 
     let mut partition_ids = vec![0_u32; num_rows];
-    // For a TILE of data rows.
+
+    // Read a tile of data, `data[idx..idx+TILE_SIZE]`
     for idx in (0..num_rows).step_by(TILE_SIZE) {
+        let num_rows_in_tile = min(TILE_SIZE, num_rows - idx);
+
         // Loop over each strip.
         // s is the index of value in each vector.
         let mut min_dists = vec![f32::MAX; TILE_SIZE];
         for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
-            // 4B * 16 * 16 = 1B
+            // 4B * 16 * 16 = 1 KB
             let mut dists = vec![0_f32; TILE_SIZE * TILE_SIZE];
+            let num_centroids_in_tile = min(TILE_SIZE, num_centroids - centroid_start);
             for s in (0..dim).step_by(STRIPE_SIZE) {
                 // Calculate L2 within each TILE * STRIP
-                for di in idx..idx + TILE_SIZE {
-                    let data_slice = get_slice(data, di, s, dim, STRIPE_SIZE);
-                    for ci in centroid_start..centroid_start + TILE_SIZE {
-                        // Get a slice of `[s..s+STRIP_SIZE]` from `data[di]`
+                for di in 0..num_rows_in_tile {
+                    let data_slice = get_slice(data, idx + di, s, dim, STRIPE_SIZE);
+                    for ci in centroid_start..centroid_start + num_centroids_in_tile {
+                        // Get a slice of `data[di][s..s+STRIP_SIZE]`.
                         let cent_slice = get_slice(centroids, ci, s, dim, STRIPE_SIZE);
                         let dist = data_slice.l2(cent_slice);
-                        dists[(di - idx) * TILE_SIZE + (ci - centroid_start)] += dist;
+                        dists[di * TILE_SIZE + (ci - centroid_start)] += dist;
                     }
                 }
             }
-            for i in 0..TILE_SIZE {
-                for j in 0..TILE_SIZE {
+            for i in 0..num_rows_in_tile {
+                for j in 0..num_centroids_in_tile {
                     let dist = dists[i * TILE_SIZE + j];
                     if dist < min_dists[i] {
                         min_dists[i] = dist;
@@ -638,6 +645,7 @@ mod tests {
 
     use arrow_array::Float32Array;
     use lance_arrow::*;
+    use lance_testing::datagen::generate_random_array;
 
     #[tokio::test]
     async fn test_train_with_small_dataset() {
@@ -649,5 +657,28 @@ mod tests {
                 assert!(e.to_string().contains("smaller than"));
             }
         }
+    }
+
+    #[test]
+    fn test_compute_partitions() {
+        const DIM: usize = 256;
+        let centroids = generate_random_array(DIM * 18);
+        let data = generate_random_array(DIM * 20);
+
+        let expected = data
+            .values()
+            .chunks(DIM)
+            .map(|row| {
+                argmin(
+                    centroids
+                        .values()
+                        .chunks(DIM)
+                        .map(|centroid| row.l2(centroid)),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let actual = compute_partitions(centroids.values(), data.values(), DIM, MetricType::L2);
+        assert_eq!(expected, actual);
     }
 }
