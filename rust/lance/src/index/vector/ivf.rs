@@ -41,12 +41,12 @@ use lance_index::vector::{
     pq::{PQBuildParams, ProductQuantizer},
     Query, DIST_COL, RESIDUAL_COLUMN,
 };
-use lance_linalg::{matrix::MatrixView};
+use lance_linalg::matrix::MatrixView;
 use log::{debug, info, warn};
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
 use snafu::{location, Location};
-use tracing::{instrument, span, Level, Instrument};
+use tracing::{instrument, span, Instrument, Level};
 use uuid::Uuid;
 
 #[cfg(feature = "opq")]
@@ -757,10 +757,10 @@ pub async fn build_ivf_pq_index(
             vec![],
         );
         // Compute the residual vector to train Product Quantizer.
-        let part_ids = ivf2.compute_partitions(training_data.clone()).instrument(span!(
-            Level::INFO,
-            "compute partition for PQ training"
-        )).await;
+        let part_ids = ivf2
+            .compute_partitions(training_data.clone())
+            .instrument(span!(Level::INFO, "compute partition for PQ training"))
+            .await;
 
         let residuals = span!(Level::INFO, "compute residual for PQ training")
             .in_scope(|| ivf_model.compute_residual(&training_data, &part_ids));
