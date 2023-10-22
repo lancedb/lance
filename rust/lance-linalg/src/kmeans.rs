@@ -17,8 +17,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::vec;
 
-use arrow_array::types::Float32Type;
-use arrow_array::{cast::AsArray, new_empty_array, Array, FixedSizeListArray, Float32Array};
+use arrow_array::{
+    cast::AsArray, new_empty_array, types::Float32Type, Array, FixedSizeListArray, Float32Array,
+    UInt32Array,
+};
 use arrow_schema::{ArrowError, DataType};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use log::{info, warn};
@@ -26,9 +28,9 @@ use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 use tracing::instrument;
 
-use crate::kernels::argmin_value;
 use crate::{
     distance::{Cosine, Dot, MetricType, Normalize, L2},
+    kernels::{argmin, argmin_value},
     matrix::MatrixView,
 };
 use crate::{Error, Result};
@@ -536,6 +538,36 @@ impl KMeans {
             metric_type: self.metric_type,
         }
     }
+}
+
+pub fn compute_partitions(
+    centroids: &MatrixView<Float32Type>,
+    data: &MatrixView<Float32Type>,
+    metric_type: MetricType,
+) -> UInt32Array {
+    let ndim = data.ndim();
+    let centroids_arr = centroids.data();
+    let centroid_norms = centroids_arr
+        .values()
+        .chunks(ndim)
+        .map(|centroid| centroid.norm_l2())
+        .collect::<Vec<_>>();
+    let part_ids = UInt32Array::from_iter_values(data.iter().map(|row| {
+        argmin(
+            centroids_arr
+                .values()
+                .chunks(ndim)
+                .zip(centroid_norms.iter())
+                .map(|(centroid, &norm)| match metric_type {
+                    MetricType::L2 => row.l2(centroid),
+                    MetricType::Cosine => centroid.cosine_fast(norm, row),
+                    MetricType::Dot => row.dot(centroid),
+                }),
+        )
+        .unwrap()
+    }))
+    .into();
+    part_ids
 }
 
 #[cfg(test)]
