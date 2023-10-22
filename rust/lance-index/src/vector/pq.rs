@@ -332,7 +332,15 @@ impl ProductQuantizer {
 
     /// Train [`ProductQuantizer`] using vectors.
     pub async fn train(data: &MatrixView<Float32Type>, params: &PQBuildParams) -> Result<Self> {
-        assert_eq!(data.num_columns() % params.num_sub_vectors, 0);
+        if data.num_columns() % params.num_sub_vectors != 0 {
+            return Err(Error::Index {
+                message: format!(
+                    "Dimension {} cannot be divided by {}",
+                    data.num_columns(),
+                    params.num_sub_vectors
+                ),
+            });
+        }
         assert_eq!(data.data().null_count(), 0);
 
         let sub_vectors = divide_to_subvectors(data, params.num_sub_vectors);

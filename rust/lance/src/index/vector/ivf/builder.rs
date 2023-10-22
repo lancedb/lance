@@ -27,6 +27,8 @@ use lance_index::vector::{
     PART_ID_COLUMN, PQ_CODE_COLUMN,
 };
 use lance_linalg::{distance::MetricType, MatrixView};
+use log::info;
+use rand;
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -65,12 +67,18 @@ pub async fn shuffle_dataset(
         .map(|(b, ivf)| async move {
             let batch = b?;
             // TODO: Make CPU bound to a future.
-            ivf.partition_transform(&batch, column).await
+            let start = std::time::Instant::now();
+            let batch = ivf.partition_transform(&batch, column).await;
+            println!("Partition transform: {:?}", start.elapsed());
+            batch
         })
-        .buffer_unordered(num_cpus::get())
-        .and_then(|batch| async move {
+        .buffer_unordered(num_cpus::get() * 2)
+        .then(|batch| async move {
+            let n = rand::random::<i32>();
+            info!("Start for batch {}", n);
+            let batch = batch.unwrap();
             // Collecting partition ID and row ID.
-            tokio::task::spawn_blocking(move || {
+            let task = tokio::task::spawn_blocking(move || {
                 let part_id = batch
                     .column_by_name(PART_ID_COLUMN)
                     .expect("The caller already checked column exist");
@@ -79,17 +87,21 @@ pub async fn shuffle_dataset(
                 for (idx, part_id) in part_id_arr.values().iter().enumerate() {
                     cnt_map.entry(*part_id).or_default().push(idx as u32);
                 }
-                cnt_map
+                let m = cnt_map
                     .into_iter()
                     .map(|(part_id, row_ids)| {
                         let indices = UInt32Array::from(row_ids);
                         let batch = batch.take(&indices)?;
                         Ok((part_id, batch))
                     })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .await?
+                    .collect::<Result<Vec<_>>>();
+                info!("Finish cont map: {}", n);
+                m
+            });
+            info!("Finish for batch in iter {}", n);
+            task
         })
+        .buffer_unordered(num_cpus::get())
         .boxed();
 
     // TODO: dynamically detect schema from the transforms.
@@ -108,7 +120,7 @@ pub async fn shuffle_dataset(
 
     let mut shuffler_builder = ShufflerBuilder::try_new(&schema, FLUSH_THRESHOLD).await?;
     while let Some(result) = stream.next().await {
-        let batches = result?;
+        let batches = result??;
         if batches.is_empty() {
             continue;
         }

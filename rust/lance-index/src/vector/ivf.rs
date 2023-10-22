@@ -159,7 +159,7 @@ impl Ivf {
             ),
         })?;
         let matrix = MatrixView::<Float32Type>::try_from(data)?;
-        let part_ids = self.compute_partitions(&matrix);
+        let part_ids = self.compute_partitions(&matrix).await;
 
         let (part_ids, batch) = if let Some(part_range) = self.partition_range.as_ref() {
             let idx_in_range: UInt32Array = part_ids
@@ -192,15 +192,18 @@ impl Ivf {
     /// Compute the partition for each row in the input Matrix.
     ///
     #[instrument(level = "debug", skip(data))]
-    fn compute_partitions(&self, data: &MatrixView<Float32Type>) -> UInt32Array {
+    async fn compute_partitions(&self, data: &MatrixView<Float32Type>) -> UInt32Array {
         use lance_linalg::kmeans::compute_partitions;
 
-        compute_partitions(
-            self.centroids.data().values(),
-            data.data().values(),
-            self.centroids.ndim(),
-            self.metric_type,
-        )
-        .into()
+        let dimension = data.ndim();
+        let centroids = self.centroids.data();
+        let data = data.data();
+        let metric_type = self.metric_type;
+
+        tokio::task::spawn_blocking(move || {
+            compute_partitions(centroids.values(), data.values(), dimension, metric_type).into()
+        })
+        .await
+        .unwrap()
     }
 }

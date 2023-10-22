@@ -780,11 +780,12 @@ pub async fn build_ivf_pq_index(
             training_data
         };
         // Compute the residual vector to train Product Quantizer.
-        let part_ids = span!(Level::INFO, "compute partition")
+        let part_ids = span!(Level::INFO, "compute partition for PQ training")
             .in_scope(|| ivf_model.compute_partitions(&training_data, metric_type));
 
-        let residuals = span!(Level::INFO, "compute residual")
+        let residuals = span!(Level::INFO, "compute residual for PQ training")
             .in_scope(|| ivf_model.compute_residual(&training_data, &part_ids));
+        info!("Start train PQ: params={:#?}", pq_params);
         train_pq(&residuals, pq_params).await?
     };
     info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
