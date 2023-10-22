@@ -618,15 +618,13 @@ fn compute_partitions_dot(centroids: &[f32], data: &[f32], dimension: usize) -> 
         .collect()
 }
 
+#[inline]
 pub fn compute_partitions(
     centroids: &[f32],
     data: &[f32],
     dimension: usize,
     metric_type: MetricType,
 ) -> Vec<u32> {
-    if metric_type == MetricType::L2 {
-        return compute_partitions_l2(centroids, data, dimension).into();
-    };
     match metric_type {
         MetricType::L2 => compute_partitions_l2(centroids, data, dimension),
         MetricType::Cosine => compute_partitions_cosine(centroids, data, dimension),

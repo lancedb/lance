@@ -29,7 +29,14 @@ fn bench_compute_partitions(c: &mut Criterion) {
     let input = generate_random_array_with_seed::<Float32Type>(INPUT_SIZE * DIMENSION, SEED);
 
     c.bench_function("compute_centroids(L2)", |b| {
-        b.iter(|| compute_partitions(centroids.values(), input.values(), DIMENSION, MetricType::L2))
+        b.iter(|| {
+            compute_partitions(
+                centroids.values(),
+                input.values(),
+                DIMENSION,
+                MetricType::L2,
+            )
+        })
     });
 }
 
