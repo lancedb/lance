@@ -38,6 +38,17 @@ fn bench_compute_partitions(c: &mut Criterion) {
             )
         })
     });
+
+    c.bench_function("compute_centroids(Cosine)", |b| {
+        b.iter(|| {
+            compute_partitions(
+                centroids.values(),
+                input.values(),
+                DIMENSION,
+                MetricType::Cosine,
+            )
+        })
+    });
 }
 
 #[cfg(target_os = "linux")]
