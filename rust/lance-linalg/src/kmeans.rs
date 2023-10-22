@@ -570,11 +570,12 @@ fn compute_partitions_l2(centroids: &[f32], data: &[f32], dim: usize) -> Vec<u32
             let num_centroids_in_tile = min(TILE_SIZE, num_centroids - centroid_start);
             for s in (0..dim).step_by(STRIPE_SIZE) {
                 // Calculate L2 within each TILE * STRIP
+                let slice_len = min(STRIPE_SIZE, dim - s);
                 for di in 0..num_rows_in_tile {
-                    let data_slice = get_slice(data, idx + di, s, dim, STRIPE_SIZE);
+                    let data_slice = get_slice(data, idx + di, s, dim, slice_len);
                     for ci in centroid_start..centroid_start + num_centroids_in_tile {
                         // Get a slice of `data[di][s..s+STRIP_SIZE]`.
-                        let cent_slice = get_slice(centroids, ci, s, dim, STRIPE_SIZE);
+                        let cent_slice = get_slice(centroids, ci, s, dim, slice_len);
                         let dist = data_slice.l2(cent_slice);
                         dists[di * TILE_SIZE + (ci - centroid_start)] += dist;
                     }
