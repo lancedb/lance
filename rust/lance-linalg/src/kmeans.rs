@@ -546,7 +546,7 @@ fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f3
 }
 
 /// Fast partition computation for L2 distance.
-fn compute_partitions_l2(centroids: &[f32], data: &[f32], dim: usize) -> Vec<u32> {
+fn compute_partitions_l2_f32(centroids: &[f32], data: &[f32], dim: usize) -> Vec<u32> {
     const STRIPE_SIZE: usize = 128;
     const TILE_SIZE: usize = 16;
 
@@ -634,7 +634,7 @@ pub fn compute_partitions(
     metric_type: MetricType,
 ) -> Vec<u32> {
     match metric_type {
-        MetricType::L2 => compute_partitions_l2(centroids, data, dimension),
+        MetricType::L2 => compute_partitions_l2_f32(centroids, data, dimension),
         MetricType::Cosine => compute_partitions_cosine(centroids, data, dimension),
         MetricType::Dot => compute_partitions_dot(centroids, data, dimension),
     }
