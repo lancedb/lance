@@ -19,7 +19,6 @@ use std::vec;
 
 use arrow_array::{
     cast::AsArray, new_empty_array, types::Float32Type, Array, FixedSizeListArray, Float32Array,
-    UInt32Array,
 };
 use arrow_schema::{ArrowError, DataType};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
@@ -546,19 +545,18 @@ fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f3
     &data[x * dim + y..x * dim + y + strip]
 }
 
-fn compute_l2_tiling(centroids: &[f32], data: &[f32], dim: usize, partition_ids: &mut [u32]) {
-    use super::distance::l2::x86_64::avx::l2_f32;
+fn compute_partitions_l2(centroids: &[f32], data: &[f32], dim: usize) -> Vec<u32> {
     const STRIPE_SIZE: usize = 128;
     const TILE_SIZE: usize = 16;
     // 128 * 4bytes * 16 = 8KB for centroid and data in L1 cache, respectively.
     let num_rows = data.len() / dim;
     let num_centroids = centroids.len() / dim;
 
+    let mut partition_ids = vec![0_u32; num_rows];
     // For a TILE of data rows.
     for idx in (0..num_rows).step_by(TILE_SIZE) {
         // Loop over each strip.
         // s is the index of value in each vector.
-        let mut partitions = vec![0; TILE_SIZE];
         let mut min_dists = vec![f32::MAX; TILE_SIZE];
         for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
             // 4B * 16 * 16 = 1B
@@ -570,7 +568,7 @@ fn compute_l2_tiling(centroids: &[f32], data: &[f32], dim: usize, partition_ids:
                     for ci in centroid_start..centroid_start + TILE_SIZE {
                         // Get a slice of `[s..s+STRIP_SIZE]` from `data[di]`
                         let cent_slice = get_slice(centroids, ci, s, dim, STRIPE_SIZE);
-                        let dist = l2_f32(data_slice, cent_slice);
+                        let dist = data_slice.l2(cent_slice);
                         dists[(di - idx) * TILE_SIZE + (ci - centroid_start)] += dist;
                     }
                 }
@@ -580,74 +578,60 @@ fn compute_l2_tiling(centroids: &[f32], data: &[f32], dim: usize, partition_ids:
                     let dist = dists[i * TILE_SIZE + j];
                     if dist < min_dists[i] {
                         min_dists[i] = dist;
-                        partitions[i] = (centroid_start + j) as u32;
+                        partition_ids[idx + i] = (centroid_start + j) as u32;
                     }
                 }
             }
         }
-        for i in 0..TILE_SIZE {
-            partition_ids[idx + i] = partitions[i];
-        }
     }
+    partition_ids
 }
 
-/// Tiling L2 distance computation.
-fn compute_partitions_l2(
-    centroids: &MatrixView<Float32Type>,
-    data: &MatrixView<Float32Type>,
-    tile_size: Option<usize>,
-) -> UInt32Array {
-    let dim = centroids.ndim();
-    let num_centroids = centroids.num_rows();
+fn compute_partitions_cosine(centroids: &[f32], data: &[f32], dimension: usize) -> Vec<u32> {
+    let centroid_norms = centroids
+        .chunks(dimension)
+        .map(|centroid| centroid.norm_l2())
+        .collect::<Vec<_>>();
+    data.chunks(dimension)
+        .map(|row| {
+            argmin(
+                centroids
+                    .chunks(dimension)
+                    .zip(centroid_norms.iter())
+                    .map(|(centroid, &norm)| centroid.cosine_fast(norm, row)),
+            )
+            .unwrap()
+        })
+        .collect()
+}
 
-    let tile_size = tile_size.unwrap_or(8);
-    let dist_buffer_size = tile_size * num_centroids;
-    // A tiling size * (# of centroids) buffer to store distances.
-    let mut dists = vec![0.0; dist_buffer_size];
-    let mut partitions = vec![0; data.num_rows()];
-    let centroid_arr = centroids.data();
-    let data_arr = data.data();
-    let data_values = data_arr.values();
-    let cent_values = centroid_arr.values();
-
-    compute_l2_tiling(&cent_values, &data_values, dim, &mut partitions);
-    partitions.into()
+fn compute_partitions_dot(centroids: &[f32], data: &[f32], dimension: usize) -> Vec<u32> {
+    data.chunks(dimension)
+        .map(|row| {
+            argmin(
+                centroids
+                    .chunks(dimension)
+                    .map(|centroid| centroid.dot(row)),
+            )
+            .unwrap()
+        })
+        .collect()
 }
 
 pub fn compute_partitions(
-    centroids: &MatrixView<Float32Type>,
-    data: &MatrixView<Float32Type>,
+    centroids: &[f32],
+    data: &[f32],
+    dimension: usize,
     metric_type: MetricType,
-) -> UInt32Array {
-    let ndim = data.ndim();
-    let centroids_arr = centroids.data();
+) -> Vec<u32> {
+    if metric_type == MetricType::L2 {
+        return compute_partitions_l2(centroids, data, dimension).into();
+    };
     match metric_type {
-        MetricType::L2 => return compute_partitions_l2(centroids, data, None),
-        _ => {}
+        MetricType::L2 => compute_partitions_l2(centroids, data, dimension),
+        MetricType::Cosine => compute_partitions_cosine(centroids, data, dimension),
+        MetricType::Dot => compute_partitions_dot(centroids, data, dimension),
     }
-    // let centroid_norms = centroids_arr
-    //     .values()
-    //     .chunks(ndim)
-    //     .map(|centroid| centroid.norm_l2())
-    //     .collect::<Vec<_>>();
-    let part_ids = UInt32Array::from_iter_values(data.iter().map(|row| {
-        argmin(
-            centroids_arr
-                .values()
-                .chunks(ndim)
-                // .zip(centroid_norms.iter())
-                .map(|centroid|
-                //     match metric_type {
-                //     MetricType::L2 => row.l2(centroid),
-                //     MetricType::Cosine => centroid.cosine_fast(norm, row),
-                //     MetricType::Dot => row.dot(centroid),
-                // }
-                row.l2(&centroid)),
-        )
-        .unwrap()
-    }))
-    .into();
-    part_ids
 }
 
 #[cfg(test)]

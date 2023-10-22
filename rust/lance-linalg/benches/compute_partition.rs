@@ -14,7 +14,7 @@
 
 use arrow_array::types::Float32Type;
 use criterion::{criterion_group, criterion_main, Criterion};
-use lance_linalg::{distance::MetricType, kmeans::compute_partitions, MatrixView};
+use lance_linalg::{distance::MetricType, kmeans::compute_partitions};
 use lance_testing::datagen::generate_random_array_with_seed;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -25,13 +25,11 @@ fn bench_compute_partitions(c: &mut Criterion) {
     const INPUT_SIZE: usize = 10240;
     const SEED: [u8; 32] = [42; 32];
 
-    let centroids_arr = generate_random_array_with_seed::<Float32Type>(K * DIMENSION, SEED);
-    let centroids = MatrixView::new(centroids_arr.into(), DIMENSION);
-    let input = generate_random_array_with_seed(INPUT_SIZE * DIMENSION, SEED);
-    let input = MatrixView::new(input.into(), DIMENSION);
+    let centroids = generate_random_array_with_seed::<Float32Type>(K * DIMENSION, SEED);
+    let input = generate_random_array_with_seed::<Float32Type>(INPUT_SIZE * DIMENSION, SEED);
 
     c.bench_function("compute_centroids(L2)", |b| {
-        b.iter(|| compute_partitions(&centroids, &input, MetricType::L2))
+        b.iter(|| compute_partitions(centroids.values(), input.values(), DIMENSION, MetricType::L2))
     });
 }
 

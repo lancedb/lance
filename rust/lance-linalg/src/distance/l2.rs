@@ -155,7 +155,7 @@ pub fn l2_distance_arrow_batch(from: &[f32], to: &FixedSizeListArray) -> Arc<Flo
 }
 
 #[cfg(target_arch = "x86_64")]
-pub mod x86_64 {
+mod x86_64 {
     pub mod avx {
         use super::super::l2_scalar;
 
@@ -180,10 +180,10 @@ pub mod x86_64 {
                     let r4 = _mm256_loadu_ps(to.as_ptr().add(i + 24));
                     let sub = _mm256_sub_ps(left, right);
                     // sum = sub * sub + sum
-                    sums = _mm256_fmadd_ps(sub, sub, sums);
                     let s2 = _mm256_sub_ps(l2, r2);
                     let s3 = _mm256_sub_ps(l3, r3);
                     let s4 = _mm256_sub_ps(l4, r4);
+                    sums = _mm256_fmadd_ps(sub, sub, sums);
                     sums = _mm256_fmadd_ps(s2, s2, sums);
                     sums = _mm256_fmadd_ps(s3, s3, sums);
                     sums = _mm256_fmadd_ps(s4, s4, sums);
