@@ -1005,10 +1005,10 @@ mod tests {
 
     use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
+    use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
         generate_random_array, generate_scaled_random_array, sample_without_replacement,
     };
-    use lance_linalg::distance::l2_distance_batch;
     use rand::{seq::SliceRandom, thread_rng};
     use tempfile::tempdir;
     use uuid::Uuid;
