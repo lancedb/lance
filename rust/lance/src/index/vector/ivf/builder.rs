@@ -18,7 +18,7 @@ use std::{collections::BTreeMap, ops::Range};
 use arrow_array::types::UInt32Type;
 use arrow_array::{cast::AsArray, types::Float32Type, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
-use futures::{stream::repeat_with, StreamExt, TryStreamExt};
+use futures::{stream::repeat_with, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::{io::Writer, ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{

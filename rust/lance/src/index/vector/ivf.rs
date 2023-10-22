@@ -41,12 +41,12 @@ use lance_index::vector::{
     pq::{PQBuildParams, ProductQuantizer},
     Query, DIST_COL, RESIDUAL_COLUMN,
 };
-use lance_linalg::{distance::*, kernels::argmin, matrix::MatrixView};
+use lance_linalg::{matrix::MatrixView};
 use log::{debug, info, warn};
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
 use snafu::{location, Location};
-use tracing::{instrument, span, Level};
+use tracing::{instrument, span, Level, Instrument};
 use uuid::Uuid;
 
 #[cfg(feature = "opq")]
@@ -479,37 +479,6 @@ impl Ivf {
         self.lengths.push(len);
     }
 
-    /// Compute the partition for each row in the input Matrix.
-    ///
-    #[instrument(level = "debug", skip(data))]
-    pub fn compute_partitions(
-        &self,
-        data: &MatrixView<Float32Type>,
-        metric_type: MetricType,
-    ) -> UInt32Array {
-        let ndim = data.ndim();
-        let centroids_arr: &Float32Array = self.centroids.values().as_primitive();
-        let centroid_norms = centroids_arr
-            .values()
-            .chunks(ndim)
-            .map(|centroid| centroid.norm_l2())
-            .collect::<Vec<_>>();
-        UInt32Array::from_iter_values(data.iter().map(|row| {
-            argmin(
-                centroids_arr
-                    .values()
-                    .chunks(ndim)
-                    .zip(centroid_norms.iter())
-                    .map(|(centroid, &norm)| match metric_type {
-                        MetricType::L2 => row.l2(centroid),
-                        MetricType::Cosine => centroid.cosine_fast(norm, row),
-                        MetricType::Dot => row.dot(centroid),
-                    }),
-            )
-            .expect("argmin should always return a value")
-        }))
-    }
-
     /// Compute residual vector.
     ///
     /// A residual vector is `original vector - centroids`.
@@ -779,9 +748,19 @@ pub async fn build_ivf_pq_index(
         } else {
             training_data
         };
+        let training_data = Arc::new(training_data);
+
+        // TODO: consolidate IVF models to `lance_index`.
+        let ivf2 = lance_index::vector::ivf::Ivf::new(
+            ivf_model.centroids.as_ref().try_into()?,
+            metric_type,
+            vec![],
+        );
         // Compute the residual vector to train Product Quantizer.
-        let part_ids = span!(Level::INFO, "compute partition for PQ training")
-            .in_scope(|| ivf_model.compute_partitions(&training_data, metric_type));
+        let part_ids = ivf2.compute_partitions(training_data.clone()).instrument(span!(
+            Level::INFO,
+            "compute partition for PQ training"
+        )).await;
 
         let residuals = span!(Level::INFO, "compute residual for PQ training")
             .in_scope(|| ivf_model.compute_residual(&training_data, &part_ids));
