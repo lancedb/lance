@@ -540,6 +540,47 @@ impl KMeans {
     }
 }
 
+/// Tiling L2 distance computation.
+fn compute_partitions_l2(
+    centroids: &MatrixView<Float32Type>,
+    data: &MatrixView<Float32Type>,
+    tile_size: Option<usize>,
+) -> UInt32Array {
+    let dim = centroids.ndim();
+    let num_centroids = centroids.num_rows();
+
+    let tile_size = tile_size.unwrap_or(8);
+    let dist_buffer_size = tile_size * num_centroids;
+    // A tiling size * (# of centroids) buffer to store distances.
+    let mut dists = vec![0.0; dist_buffer_size];
+    let mut partitions = Vec::<u32>::with_capacity(data.num_rows());
+    let centroid_arr = centroids.data();
+    let data_arr = data.data();
+    let data_values = data_arr.values();
+    let cent_values = centroid_arr.values();
+
+    for i in (0..data.num_rows()).step_by(tile_size) {
+        for j in (0..num_centroids).step_by(tile_size) {
+            for data_offset in 0..min(tile_size, data.num_rows() - i) {
+                let data_idx = i + data_offset;
+                let row = &data_values[data_idx * dim..(data_idx + 1) * dim];
+                for k in 0..min(tile_size, num_centroids - j) {
+                    let centroid_idx = j + k;
+                    let cent = &cent_values[centroid_idx * dim..(centroid_idx + 1) * dim];
+                    let dist = cent.l2(row);
+
+                    dists[data_offset * tile_size + k] = dist;
+                 }
+            }
+        }
+        for data_offset in 0..min(tile_size, data.num_rows() - i) {
+            let partition_id = argmin(dists[data_offset * tile_size..(data_offset + 1) * tile_size].iter().copied()).unwrap();
+            partitions.push(partition_id);
+        }
+    }
+    partitions.into()
+}
+
 pub fn compute_partitions(
     centroids: &MatrixView<Float32Type>,
     data: &MatrixView<Float32Type>,
@@ -547,22 +588,29 @@ pub fn compute_partitions(
 ) -> UInt32Array {
     let ndim = data.ndim();
     let centroids_arr = centroids.data();
-    let centroid_norms = centroids_arr
-        .values()
-        .chunks(ndim)
-        .map(|centroid| centroid.norm_l2())
-        .collect::<Vec<_>>();
+    match metric_type {
+        MetricType::L2 => return compute_partitions_l2(centroids, data, None),
+        _ => {}
+    }
+    // let centroid_norms = centroids_arr
+    //     .values()
+    //     .chunks(ndim)
+    //     .map(|centroid| centroid.norm_l2())
+    //     .collect::<Vec<_>>();
     let part_ids = UInt32Array::from_iter_values(data.iter().map(|row| {
         argmin(
             centroids_arr
                 .values()
                 .chunks(ndim)
-                .zip(centroid_norms.iter())
-                .map(|(centroid, &norm)| match metric_type {
-                    MetricType::L2 => row.l2(centroid),
-                    MetricType::Cosine => centroid.cosine_fast(norm, row),
-                    MetricType::Dot => row.dot(centroid),
-                }),
+                // .zip(centroid_norms.iter())
+                .map(|centroid|
+                //     match metric_type {
+                //     MetricType::L2 => row.l2(centroid),
+                //     MetricType::Cosine => centroid.cosine_fast(norm, row),
+                //     MetricType::Dot => row.dot(centroid),
+                // }
+                row.l2(&centroid),
+            ),
         )
         .unwrap()
     }))
