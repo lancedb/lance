@@ -22,8 +22,6 @@ use pin_project::pin_project;
 
 use crate::Result;
 
-pub type LanceRecordBatchStream = Pin<Box<dyn RecordBatchStream + Send + 'static>>;
-
 /// RecordBatch Stream trait.
 pub trait RecordBatchStream: Stream<Item = Result<RecordBatch>> + Send {
     /// Returns the schema of the stream.

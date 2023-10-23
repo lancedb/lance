@@ -61,6 +61,12 @@ pub struct WriteParams {
     /// This is a soft limit. The actual file size may be larger than this value
     /// by a few megabytes, since once we detect we hit this limit, we still
     /// need to flush the footer.
+    ///
+    /// This limit is checked after writing each group, so if max_rows_per_group
+    /// is set to a large value, this limit may be exceeded by a large amount.
+    ///
+    /// The default is 90 GB. If you are using an object store such as S3, we
+    /// currently have a hard 100 GB limit.
     pub max_bytes_per_file: usize,
 
     /// Write mode

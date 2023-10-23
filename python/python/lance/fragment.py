@@ -419,10 +419,11 @@ def write_fragments(
     max_rows_per_group : int, default 1024
         The maximum number of rows per group in the data file.
     max_bytes_per_file : int, default 90 * 1024 * 1024 * 1024
-        The maximum number of bytes per data file. Defaults to 90 GB. This is a
-        soft limit; the actual size of the file might be larger. This limit is
-        checked at the group level, so if your group size is large then this
-        can overshoot the limit.
+        The max number of bytes to write before starting a new file. This is a
+        soft limit. This limit is checked after each group is written, which
+        means larger groups may cause this to be overshot meaningfully. This
+        defaults to 90 GB, since we have a hard limit of 100 GB per file on
+        object stores.
     progress : FragmentWriteProgress, optional
         *Experimental API*. Progress tracking for writing the fragment.
 

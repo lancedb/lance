@@ -1631,7 +1631,11 @@ def write_dataset(
     max_rows_per_group: int, default 1024
         The max number of rows before starting a new group (in the same file)
     max_bytes_per_file: int, default 90 * 1024 * 1024 * 1024
-        The max number of bytes to write before starting a new file.
+        The max number of bytes to write before starting a new file. This is a
+        soft limit. This limit is checked after each group is written, which
+        means larger groups may cause this to be overshot meaningfully. This
+        defaults to 90 GB, since we have a hard limit of 100 GB per file on
+        object stores.
     commit_lock : CommitLock, optional
         A custom commit lock.  Only needed if your object store does not support
         atomic commits.  See the user guide for more details.
