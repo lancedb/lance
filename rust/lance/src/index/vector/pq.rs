@@ -36,7 +36,7 @@ use lance_linalg::{
     matrix::MatrixView,
 };
 use serde::Serialize;
-use tracing::instrument;
+use tracing::{instrument, Instrument};
 
 use super::VectorIndex;
 use crate::index::{prefilter::PreFilter, Index};
@@ -280,6 +280,7 @@ impl VectorIndex for PQIndex {
             ]));
             Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
         })
+        .in_current_span()
         .await
     }
 

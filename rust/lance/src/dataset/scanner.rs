@@ -596,9 +596,6 @@ impl Scanner {
         };
         let knn_idx = indices.iter().find(|i| i.fields.contains(&column_id));
         if let Some(index) = knn_idx {
-            if prefilter.is_some() {
-                return Err(Error::NotSupported { source: "A prefilter cannot currently be used with a vector index.  Set use_index to false or remove the prefilter.".into() });
-            }
             // There is an index built for the column.
             // We will use the index.
             if let Some(rf) = q.refine_factor {
@@ -610,9 +607,14 @@ impl Scanner {
                 }
             }
 
-            let knn_node = self.ann(q, index)?; // _distance, _rowid
+            let ann_node = if let Some(prefilter) = prefilter {
+                self.prefilter_ann(q, index, prefilter)?
+            } else {
+                self.ann(q, index)?
+            }; // _distance, _rowid
+
             let with_vector = self.dataset.schema().project(&[&q.column])?;
-            let knn_node_with_vector = self.take(knn_node, &with_vector, self.batch_readahead)?;
+            let knn_node_with_vector = self.take(ann_node, &with_vector, self.batch_readahead)?;
             let mut knn_node = if q.refine_factor.is_some() {
                 self.flat_knn(knn_node_with_vector, q)?
             } else {
@@ -736,12 +738,31 @@ impl Scanner {
         Ok(Arc::new(KNNFlatExec::try_new(input, q.clone())?))
     }
 
+    fn prefilter_ann(
+        &self,
+        q: &Query,
+        index: &Index,
+        prefilter: Arc<dyn PhysicalExpr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let columns_in_filter = column_names_in_expr(prefilter.as_ref());
+        let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
+        let filter_input = self.scan(true, true, filter_schema);
+        let filtered = Arc::new(FilterExec::try_new(prefilter, filter_input)?);
+        Ok(Arc::new(KNNIndexExec::try_new(
+            self.dataset.clone(),
+            index.clone(),
+            q,
+            Some(filtered),
+        )?))
+    }
+
     /// Create an Execution plan to do indexed ANN search
     fn ann(&self, q: &Query, index: &Index) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(KNNIndexExec::try_new(
             self.dataset.clone(),
             index.clone(),
             q,
+            None,
         )?))
     }
 
@@ -834,6 +855,8 @@ mod test {
     use arrow::array::as_primitive_array;
     use arrow::compute::concat_batches;
     use arrow::datatypes::Int32Type;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::UInt64Type;
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray,
         RecordBatchIterator, StringArray, StructArray,
@@ -1249,10 +1272,6 @@ mod test {
         scan.prefilter(true);
         scan.project(&["i"]).unwrap();
         scan.nearest("vec", &key, 5).unwrap();
-
-        // Prefilter with index not supported yet
-        assert!(scan.try_into_stream().await.is_err());
-
         scan.use_index(false);
 
         let results = scan
@@ -1764,6 +1783,74 @@ mod test {
         let knn = &take.children()[0];
         assert!(knn.as_any().is::<KNNIndexExec>());
         assert_eq!(knn.schema().field_names(), [DIST_COL, ROW_ID]);
+    }
+
+    #[tokio::test]
+    async fn test_ann_prefilter() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("filterable", DataType::Int32, true),
+            ArrowField::new("vector", fixed_size_list_type(2, DataType::Float32), true),
+        ]));
+
+        let vector_values = Float32Array::from_iter_values((0..600).map(|x| x as f32));
+
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..300)),
+                Arc::new(FixedSizeListArray::try_new_from_values(vector_values, 2).unwrap()),
+            ],
+        )
+        .unwrap()];
+
+        let write_params = WriteParams::default();
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let query_key = Arc::new(Float32Array::from_iter_values((0..2).map(|x| x as f32)));
+        let mut scan = dataset.scan();
+        scan.filter("filterable > 5").unwrap();
+        scan.nearest("vector", &query_key, 1).unwrap();
+        scan.with_row_id();
+
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 0);
+
+        scan.prefilter(true);
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+
+        let first_match = batches[0][ROW_ID].as_primitive::<UInt64Type>().values()[0];
+
+        assert_eq!(6, first_match);
     }
 
     #[tokio::test]

@@ -17,17 +17,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
     RecordBatchStream as DFRecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 use futures::stream::Stream;
-use futures::FutureExt;
-use lance_core::ROW_ID_FIELD;
+use futures::{FutureExt, StreamExt};
+use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{flat::flat_search, Query, DIST_COL};
+use roaring::RoaringTreemap;
 use snafu::{location, Location};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
@@ -36,7 +38,7 @@ use tracing::{instrument, Instrument};
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
 use crate::format::Index;
-use crate::index::prefilter::PreFilter;
+use crate::index::prefilter::{AllowListLoader, PreFilter};
 use crate::index::vector::open_index;
 use crate::io::RecordBatchStream;
 use crate::{Error, Result};
@@ -247,6 +249,29 @@ impl ExecutionPlan for KNNFlatExec {
     }
 }
 
+// Utilities to convert an input (containing row ids) into an allow
+// list to be used for prefiltering
+pub struct PreFilterBuilder(SendableRecordBatchStream);
+
+#[async_trait]
+impl AllowListLoader for PreFilterBuilder {
+    async fn load(mut self: Box<Self>) -> Result<Arc<RoaringTreemap>> {
+        let mut allow_list = RoaringTreemap::new();
+        while let Some(batch) = self.0.next().await {
+            let batch = batch?;
+            let row_ids = batch.column_by_name(ROW_ID).expect(
+                "input batch missing row id column even though it is in the schema for the stream",
+            );
+            let row_ids = row_ids
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("row id column in input batch had incorrect type");
+            allow_list.extend(row_ids.iter().flatten())
+        }
+        Ok(Arc::new(allow_list))
+    }
+}
+
 /// KNN Node from reading a vector index.
 pub struct KNNIndexStream {
     rx: Receiver<datafusion::error::Result<RecordBatch>>,
@@ -258,21 +283,31 @@ impl KNNIndexStream {
         query: Query,
         dataset: Arc<Dataset>,
         index_meta: Index,
+        // An optional input containing a list of row ids to use as a prefilter
+        allow_list_input: Option<datafusion::physical_plan::SendableRecordBatchStream>,
     ) -> Result<RecordBatch> {
         let index =
             open_index(dataset.clone(), &query.column, &index_meta.uuid.to_string()).await?;
-        let pre_filter = Arc::new(PreFilter::new(dataset, index_meta));
+        let allow_list_loader = allow_list_input.map(|allow_list_input| {
+            Box::new(PreFilterBuilder(allow_list_input)) as Box<dyn AllowListLoader>
+        });
+        let pre_filter = Arc::new(PreFilter::new(dataset, index_meta, allow_list_loader));
         index.search(&query, pre_filter).await
     }
 
     #[instrument(level = "debug", skip_all, name = "KNNIndexStream::new")]
-    pub fn new(dataset: Arc<Dataset>, index: &Index, query: &Query) -> Self {
+    pub fn new(
+        dataset: Arc<Dataset>,
+        index: &Index,
+        query: &Query,
+        allow_list: Option<datafusion::physical_plan::SendableRecordBatchStream>,
+    ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         let q = query.clone();
         let index = index.clone();
         let bg_thread = tokio::spawn(
             async move {
-                let result = match Self::knn_stream(q, dataset, index).await {
+                let result = match Self::knn_stream(q, dataset, index, allow_list).await {
                     Ok(b) => b,
                     Err(e) => {
                         tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
@@ -344,6 +379,8 @@ impl Stream for KNNIndexStream {
 pub struct KNNIndexExec {
     /// Dataset to read from.
     dataset: Arc<Dataset>,
+    /// Optional input of valid row ids, used for prefiltering
+    allow_list: Option<Arc<dyn ExecutionPlan>>,
     /// The index metadata
     index: Index,
     /// The vector query to execute.
@@ -362,7 +399,12 @@ impl DisplayAs for KNNIndexExec {
 
 impl KNNIndexExec {
     /// Create a new [KNNIndexExec].
-    pub fn try_new(dataset: Arc<Dataset>, index: Index, query: &Query) -> Result<Self> {
+    pub fn try_new(
+        dataset: Arc<Dataset>,
+        index: Index,
+        query: &Query,
+        allow_list: Option<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Self> {
         let schema = dataset.schema();
         if schema.field(query.column.as_str()).is_none() {
             return Err(Error::IO {
@@ -378,6 +420,7 @@ impl KNNIndexExec {
             dataset,
             index,
             query: query.clone(),
+            allow_list,
         })
     }
 }
@@ -416,13 +459,20 @@ impl ExecutionPlan for KNNIndexExec {
 
     fn execute(
         &self,
-        _partition: usize,
-        _context: Arc<datafusion::execution::context::TaskContext>,
+        partition: usize,
+        context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
+        let allow_list = self
+            .allow_list
+            .as_ref()
+            .map(|allow_list| allow_list.execute(partition, context))
+            .transpose()?;
+
         Ok(Box::pin(KNNIndexStream::new(
             self.dataset.clone(),
             &self.index,
             &self.query,
+            allow_list,
         )))
     }
 
