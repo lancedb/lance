@@ -69,7 +69,7 @@ pub async fn shuffle_dataset(
         })
         .buffer_unordered(num_cpus::get() * 2)
         .map(|batch| async move {
-            let batch = batch.unwrap();
+            let batch = batch?;
             // Collecting partition ID and row ID.
             tokio::task::spawn_blocking(move || {
                 let part_id = batch
@@ -89,7 +89,7 @@ pub async fn shuffle_dataset(
                     })
                     .collect::<Result<Vec<_>>>()
             })
-            .await
+            .await.map_err(|e| Error::Index { message: e.to_string() })
         })
         .buffer_unordered(num_cpus::get())
         .boxed();

@@ -158,8 +158,8 @@ impl Ivf {
                 vector_arr.data_type()
             ),
         })?;
-        let matrix = Arc::new(MatrixView::<Float32Type>::try_from(data)?);
-        let part_ids = self.compute_partitions(matrix).await;
+        let matrix = MatrixView::<Float32Type>::try_from(data)?;
+        let part_ids = self.compute_partitions(&matrix).await;
 
         let (part_ids, batch) = if let Some(part_range) = self.partition_range.as_ref() {
             let idx_in_range: UInt32Array = part_ids
@@ -192,7 +192,7 @@ impl Ivf {
     /// Compute the partition for each row in the input Matrix.
     ///
     #[instrument(level = "debug", skip(data))]
-    async fn compute_partitions(&self, data: &MatrixView<Float32Type>) -> UInt32Array {
+    pub async fn compute_partitions(&self, data: &MatrixView<Float32Type>) -> UInt32Array {
         use lance_linalg::kmeans::compute_partitions;
 
         let dimension = data.ndim();

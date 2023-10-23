@@ -748,7 +748,6 @@ pub async fn build_ivf_pq_index(
         } else {
             training_data
         };
-        let training_data = Arc::new(training_data);
 
         // TODO: consolidate IVF models to `lance_index`.
         let ivf2 = lance_index::vector::ivf::Ivf::new(
@@ -758,7 +757,7 @@ pub async fn build_ivf_pq_index(
         );
         // Compute the residual vector to train Product Quantizer.
         let part_ids = ivf2
-            .compute_partitions(training_data.clone())
+            .compute_partitions(&training_data)
             .instrument(span!(Level::INFO, "compute partition for PQ training"))
             .await;
 
