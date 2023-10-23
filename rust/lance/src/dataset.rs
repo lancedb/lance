@@ -34,7 +34,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt};
 use lance_core::io::WriteExt;
-use log::warn;
+use log::{warn, info};
 use object_store::path::Path;
 use tracing::instrument;
 
@@ -178,10 +178,13 @@ impl Dataset {
 
     /// Open a dataset with read params.
     pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
+        let start = std::time::Instant::now();
         let (mut object_store, base_path) = match params.store_options.as_ref() {
             Some(store_options) => ObjectStore::from_uri_and_params(uri, store_options).await?,
             None => ObjectStore::from_uri(uri).await?,
         };
+        info!("open_with_params({}) construct store took {:?}", uri, start.elapsed());
+        let start = std::time::Instant::now();
 
         if let Some(block_size) = params.block_size {
             object_store.set_block_size(block_size);
@@ -196,6 +199,9 @@ impl Dataset {
                 source: Box::new(e),
             })?;
 
+        info!("open_with_params({}) resolve version took {:?}", uri, start.elapsed());
+        let start = std::time::Instant::now();
+
         let session = if let Some(session) = params.session.as_ref() {
             session.clone()
         } else {
@@ -205,13 +211,17 @@ impl Dataset {
             ))
         };
 
-        Self::checkout_manifest(
+        let res = Self::checkout_manifest(
             Arc::new(object_store),
             base_path.clone(),
             &latest_manifest,
             session,
         )
-        .await
+        .await;
+
+        info!("open_with_params({}) checkout took {:?}", uri, start.elapsed());
+
+        res
     }
 
     /// Check out a version of the dataset.
