@@ -89,7 +89,10 @@ pub async fn shuffle_dataset(
                     })
                     .collect::<Result<Vec<_>>>()
             })
-            .await.map_err(|e| Error::Index { message: e.to_string() })
+            .await
+            .map_err(|e| Error::Index {
+                message: e.to_string(),
+            })
         })
         .buffer_unordered(num_cpus::get())
         .boxed();
