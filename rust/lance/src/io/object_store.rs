@@ -21,6 +21,7 @@ use std::path::Path as StdPath;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use log::info;
 pub use ::object_store::path::Path;
 use ::object_store::{
     aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
@@ -462,13 +463,16 @@ impl ObjectStore {
                     }
                 };
 
+                let start = std::time::Instant::now();
                 let (aws_creds, region) = build_aws_credential(
                     params.s3_credentials_refresh_offset,
                     params.aws_credentials.clone(),
                     params.aws_region.clone(),
                 )
                 .await?;
+                info!("build_aws_credential took {:?}", start.elapsed());
 
+                let start = std::time::Instant::now();
                 let commit_handler = match ddb_table_name {
                     #[cfg(feature = "dynamodb")]
                     Some(table_name) => Arc::new(ExternalManifestCommitHandler {
@@ -492,6 +496,7 @@ impl ObjectStore {
                         .clone()
                         .unwrap_or_else(|| Arc::new(UnsafeCommitHandler)),
                 };
+                info!("commit_handler took {:?}", start.elapsed());
 
                 // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
                 url.set_scheme("s3").map_err(|()| Error::Internal {
@@ -499,7 +504,8 @@ impl ObjectStore {
                 })?;
                 url.set_query(None);
 
-                Ok(Self {
+                let start = std::time::Instant::now();
+                let res = Ok(Self {
                     inner: build_s3_object_store(url.to_string().as_str(), aws_creds, &region)
                         .await?
                         .traced(),
@@ -507,7 +513,10 @@ impl ObjectStore {
                     base_path: Path::from(url.path()),
                     block_size: 64 * 1024,
                     commit_handler,
-                })
+                });
+                info!("build_s3_object_store took {:?}", start.elapsed());
+
+                res
             }
             "gs" => Ok(Self {
                 inner: build_gcs_object_store(url.to_string().as_str())

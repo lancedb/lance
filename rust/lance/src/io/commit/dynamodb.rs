@@ -25,6 +25,7 @@ use aws_sdk_dynamodb::operation::{
 };
 use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
 use aws_sdk_dynamodb::Client;
+use log::info;
 use snafu::OptionExt;
 use tokio::sync::RwLock;
 
@@ -118,6 +119,7 @@ impl DynamoDBExternalManifestStore {
         // this is to avoid checking the table schema every time
         // because it's expensive to call DescribeTable
         if SANITY_CHECK_CACHE.read().await.contains(table_name) {
+            info!("dynamodb table: {} already checked", table_name);
             return Ok(store);
         }
 

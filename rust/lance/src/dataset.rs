@@ -280,6 +280,7 @@ impl Dataset {
         manifest_path: &Path,
         session: Arc<Session>,
     ) -> Result<Self> {
+        let start = std::time::Instant::now();
         let object_reader = object_store
             .open(manifest_path)
             .await
@@ -290,7 +291,9 @@ impl Dataset {
                 },
                 _ => e,
             })?;
+        info!("checkout_manifest({}) open manifest took {:?}", manifest_path, start.elapsed());
         // TODO: remove reference to inner.
+        let start = std::time::Instant::now();
         let get_result = object_store
             .inner
             .get(manifest_path)
@@ -303,6 +306,9 @@ impl Dataset {
                 _ => e.into(),
             })?;
         let bytes = get_result.bytes().await?;
+        info!("checkout_manifest({}) get manifest took {:?}", manifest_path, start.elapsed());
+
+        let start = std::time::Instant::now();
         let offset = read_metadata_offset(&bytes)?;
         let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
 
@@ -321,6 +327,8 @@ impl Dataset {
             .schema
             .load_dictionary(object_reader.as_ref())
             .await?;
+
+        info!("checkout_manifest({}) read manifest took {:?}", manifest_path, start.elapsed());
         Ok(Self {
             object_store,
             base: base_path,
