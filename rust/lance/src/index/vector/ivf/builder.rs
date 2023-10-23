@@ -18,7 +18,7 @@ use std::{collections::BTreeMap, ops::Range};
 use arrow_array::types::UInt32Type;
 use arrow_array::{cast::AsArray, types::Float32Type, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
-use futures::{stream::repeat_with, StreamExt, TryStreamExt};
+use futures::{stream::repeat_with, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::{io::Writer, ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{
@@ -67,8 +67,9 @@ pub async fn shuffle_dataset(
             // TODO: Make CPU bound to a future.
             ivf.partition_transform(&batch, column).await
         })
-        .buffer_unordered(num_cpus::get())
-        .and_then(|batch| async move {
+        .buffer_unordered(num_cpus::get() * 2)
+        .map(|batch| async move {
+            let batch = batch?;
             // Collecting partition ID and row ID.
             tokio::task::spawn_blocking(move || {
                 let part_id = batch
@@ -88,8 +89,12 @@ pub async fn shuffle_dataset(
                     })
                     .collect::<Result<Vec<_>>>()
             })
-            .await?
+            .await
+            .map_err(|e| Error::Index {
+                message: e.to_string(),
+            })
         })
+        .buffer_unordered(num_cpus::get())
         .boxed();
 
     // TODO: dynamically detect schema from the transforms.
@@ -108,7 +113,7 @@ pub async fn shuffle_dataset(
 
     let mut shuffler_builder = ShufflerBuilder::try_new(&schema, FLUSH_THRESHOLD).await?;
     while let Some(result) = stream.next().await {
-        let batches = result?;
+        let batches = result??;
         if batches.is_empty() {
             continue;
         }

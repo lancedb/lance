@@ -41,7 +41,7 @@ use lance_index::vector::{
     pq::{PQBuildParams, ProductQuantizer},
     Query, DIST_COL, RESIDUAL_COLUMN,
 };
-use lance_linalg::{distance::*, kernels::argmin, matrix::MatrixView};
+use lance_linalg::matrix::MatrixView;
 use log::{debug, info, warn};
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
@@ -479,37 +479,6 @@ impl Ivf {
         self.lengths.push(len);
     }
 
-    /// Compute the partition for each row in the input Matrix.
-    ///
-    #[instrument(level = "debug", skip(data))]
-    pub fn compute_partitions(
-        &self,
-        data: &MatrixView<Float32Type>,
-        metric_type: MetricType,
-    ) -> UInt32Array {
-        let ndim = data.ndim();
-        let centroids_arr: &Float32Array = self.centroids.values().as_primitive();
-        let centroid_norms = centroids_arr
-            .values()
-            .chunks(ndim)
-            .map(|centroid| centroid.norm_l2())
-            .collect::<Vec<_>>();
-        UInt32Array::from_iter_values(data.iter().map(|row| {
-            argmin(
-                centroids_arr
-                    .values()
-                    .chunks(ndim)
-                    .zip(centroid_norms.iter())
-                    .map(|(centroid, &norm)| match metric_type {
-                        MetricType::L2 => row.l2(centroid),
-                        MetricType::Cosine => centroid.cosine_fast(norm, row),
-                        MetricType::Dot => row.dot(centroid),
-                    }),
-            )
-            .expect("argmin should always return a value")
-        }))
-    }
-
     /// Compute residual vector.
     ///
     /// A residual vector is `original vector - centroids`.
@@ -779,12 +748,19 @@ pub async fn build_ivf_pq_index(
         } else {
             training_data
         };
-        // Compute the residual vector to train Product Quantizer.
-        let part_ids = span!(Level::INFO, "compute partition")
-            .in_scope(|| ivf_model.compute_partitions(&training_data, metric_type));
 
-        let residuals = span!(Level::INFO, "compute residual")
+        // TODO: consolidate IVF models to `lance_index`.
+        let ivf2 = lance_index::vector::ivf::Ivf::new(
+            ivf_model.centroids.as_ref().try_into()?,
+            metric_type,
+            vec![],
+        );
+        // Compute the residual vector to train Product Quantizer.
+        let part_ids = ivf2.compute_partitions(&training_data).await;
+
+        let residuals = span!(Level::INFO, "compute residual for PQ training")
             .in_scope(|| ivf_model.compute_residual(&training_data, &part_ids));
+        info!("Start train PQ: params={:#?}", pq_params);
         train_pq(&residuals, pq_params).await?
     };
     info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
@@ -1021,16 +997,17 @@ async fn train_ivf_model(
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
+
     use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
+    use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
         generate_random_array, generate_scaled_random_array, sample_without_replacement,
     };
     use rand::{seq::SliceRandom, thread_rng};
     use tempfile::tempdir;
     use uuid::Uuid;
-
-    use std::collections::HashMap;
 
     use crate::{
         format::RowAddress,
