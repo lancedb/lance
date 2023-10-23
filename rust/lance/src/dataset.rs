@@ -56,7 +56,7 @@ use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_datas
 use self::fragment::FileFragment;
 use self::scanner::Scanner;
 use self::transaction::{Operation, Transaction};
-use self::write::{reader_to_stream, write_fragments};
+use self::write::{reader_to_stream, write_fragments_internal};
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{Fragment, Index, Manifest};
@@ -73,7 +73,7 @@ use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
-pub use write::{WriteMode, WriteParams};
+pub use write::{write_fragments, WriteMode, WriteParams};
 
 const INDICES_DIR: &str = "_indices";
 pub(crate) const DELETION_DIRS: &str = "_deletions";
@@ -409,7 +409,8 @@ impl Dataset {
 
         let object_store = Arc::new(object_store);
         let fragments =
-            write_fragments(object_store.clone(), &base, &schema, stream, params.clone()).await?;
+            write_fragments_internal(object_store.clone(), &base, &schema, stream, params.clone())
+                .await?;
 
         let operation = match params.mode {
             WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite { schema, fragments },
@@ -486,7 +487,7 @@ impl Dataset {
             });
         }
 
-        let fragments = write_fragments(
+        let fragments = write_fragments_internal(
             object_store.clone(),
             &self.base,
             &schema,

@@ -1603,8 +1603,10 @@ def write_dataset(
     uri: Union[str, Path],
     schema: Optional[pa.Schema] = None,
     mode: str = "create",
+    *,
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
+    max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
     commit_lock: Optional[CommitLock] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
@@ -1628,6 +1630,12 @@ def write_dataset(
         The max number of rows to write before starting a new file
     max_rows_per_group: int, default 1024
         The max number of rows before starting a new group (in the same file)
+    max_bytes_per_file: int, default 90 * 1024 * 1024 * 1024
+        The max number of bytes to write before starting a new file. This is a
+        soft limit. This limit is checked after each group is written, which
+        means larger groups may cause this to be overshot meaningfully. This
+        defaults to 90 GB, since we have a hard limit of 100 GB per file on
+        object stores.
     commit_lock : CommitLock, optional
         A custom commit lock.  Only needed if your object store does not support
         atomic commits.  See the user guide for more details.
@@ -1641,6 +1649,7 @@ def write_dataset(
         "mode": mode,
         "max_rows_per_file": max_rows_per_file,
         "max_rows_per_group": max_rows_per_group,
+        "max_bytes_per_file": max_bytes_per_file,
     }
 
     if commit_lock:

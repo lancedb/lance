@@ -758,6 +758,9 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         if let Some(maybe_nrows) = options.get_item("max_rows_per_group") {
             p.max_rows_per_group = usize::extract(maybe_nrows)?;
         }
+        if let Some(maybe_nbytes) = options.get_item("max_bytes_per_file") {
+            p.max_bytes_per_file = usize::extract(maybe_nbytes)?;
+        }
         p.store_params = get_object_store_params(options);
 
         Some(p)

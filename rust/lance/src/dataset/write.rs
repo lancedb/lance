@@ -56,6 +56,19 @@ pub struct WriteParams {
     /// Max number of rows per row group.
     pub max_rows_per_group: usize,
 
+    /// Max file size in bytes.
+    ///
+    /// This is a soft limit. The actual file size may be larger than this value
+    /// by a few megabytes, since once we detect we hit this limit, we still
+    /// need to flush the footer.
+    ///
+    /// This limit is checked after writing each group, so if max_rows_per_group
+    /// is set to a large value, this limit may be exceeded by a large amount.
+    ///
+    /// The default is 90 GB. If you are using an object store such as S3, we
+    /// currently have a hard 100 GB limit.
+    pub max_bytes_per_file: usize,
+
     /// Write mode
     pub mode: WriteMode,
 
@@ -69,6 +82,9 @@ impl Default for WriteParams {
         Self {
             max_rows_per_file: 1024 * 1024, // 1 million
             max_rows_per_group: 1024,
+            // object-store has a 100GB limit, so we should at least make sure
+            // we are under that.
+            max_bytes_per_file: 90 * 1024 * 1024 * 1024, // 90 GB
             mode: WriteMode::Create,
             store_params: None,
             progress: None,
@@ -112,8 +128,31 @@ pub fn reader_to_stream(
 /// NOTE: the fragments have not yet been assigned an ID. That must be done
 /// by the caller. This is so this function can be called in parallel, and the
 /// IDs can be assigned after writing is complete.
-#[instrument(skip_all)]
 pub async fn write_fragments(
+    dataset_uri: &str,
+    data: impl RecordBatchReader + Send + 'static,
+    params: WriteParams,
+) -> Result<Vec<Fragment>> {
+    let (object_store, base) = ObjectStore::from_uri_and_params(
+        dataset_uri,
+        &params.store_params.clone().unwrap_or_default(),
+    )
+    .await?;
+    let (stream, schema) = reader_to_stream(Box::new(data))?;
+    write_fragments_internal(Arc::new(object_store), &base, &schema, stream, params).await
+}
+
+/// Writes the given data to the dataset and returns fragments.
+///
+/// NOTE: the fragments have not yet been assigned an ID. That must be done
+/// by the caller. This is so this function can be called in parallel, and the
+/// IDs can be assigned after writing is complete.
+///
+/// This is a private variant that takes a `SendableRecordBatchStream` instead
+/// of a reader. We don't expose the stream at our interface because it is a
+/// DataFusion type.
+#[instrument(skip_all)]
+pub async fn write_fragments_internal(
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
     schema: &Schema,
@@ -142,7 +181,9 @@ pub async fn write_fragments(
             num_rows_in_current_file += batch.num_rows();
         }
 
-        if num_rows_in_current_file >= params.max_rows_per_file {
+        if num_rows_in_current_file >= params.max_rows_per_file
+            || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file
+        {
             let num_rows = writer.take().unwrap().finish().await?;
             debug_assert_eq!(num_rows, num_rows_in_current_file);
             fragments.last_mut().unwrap().physical_rows = num_rows;
@@ -281,5 +322,49 @@ mod tests {
             let num_rows = chunk.iter().map(|batch| batch.num_rows()).sum::<usize>();
             assert_eq!(num_rows, 10);
         }
+    }
+
+    #[tokio::test]
+    async fn test_file_size() {
+        let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+
+        // Write 1024 rows and show they are split into two files
+        // 512 * 4 bytes = 2KB
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter(0..1024))],
+        )
+        .unwrap();
+
+        let write_params = WriteParams {
+            max_rows_per_file: 1024 * 10, // Won't be limited by this
+            max_rows_per_group: 512,
+            max_bytes_per_file: 2 * 1024,
+            mode: WriteMode::Create,
+            ..Default::default()
+        };
+
+        let data_stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(std::iter::once(Ok(batch))),
+        ));
+
+        let schema = Schema::try_from(schema.as_ref()).unwrap();
+
+        let object_store = Arc::new(ObjectStore::memory());
+        let fragments = write_fragments_internal(
+            object_store,
+            &Path::from("test"),
+            &schema,
+            data_stream,
+            write_params,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fragments.len(), 2);
     }
 }

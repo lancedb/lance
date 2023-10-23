@@ -51,7 +51,7 @@ pub(crate) mod updater;
 pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
-use crate::fragment::cleanup_partial_writes;
+use crate::fragment::{cleanup_partial_writes, write_fragments};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::KMeans;
 pub use dataset::write_dataset;
@@ -92,6 +92,7 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<TraceGuard>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
+    m.add_wrapped(wrap_pyfunction!(write_fragments))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
     m.add_wrapped(wrap_pyfunction!(json_to_schema))?;
     m.add_wrapped(wrap_pyfunction!(infer_tfrecord_schema))?;
