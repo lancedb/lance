@@ -166,25 +166,46 @@ mod x86_64 {
                 debug_assert_eq!(from.len(), to.len());
 
                 // Get the potion of the vector that is aligned to 32 bytes.
-                let len = from.len() / 8 * 8;
-                let mut sums = _mm256_setzero_ps();
-                for i in (0..len).step_by(8) {
+                let len = from.len() / 32 * 32;
+                let mut sums1 = _mm256_setzero_ps();
+                let mut sums2 = _mm256_setzero_ps();
+                let mut sums3 = _mm256_setzero_ps();
+                let mut sums4 = _mm256_setzero_ps();
+
+                // Manually unroll the loop by 4.
+                for i in (0..len).step_by(32) {
                     let left = _mm256_loadu_ps(from.as_ptr().add(i));
+                    let l2 = _mm256_loadu_ps(from.as_ptr().add(i + 8));
+                    let l3 = _mm256_loadu_ps(from.as_ptr().add(i + 16));
+                    let l4 = _mm256_loadu_ps(from.as_ptr().add(i + 24));
+
                     let right = _mm256_loadu_ps(to.as_ptr().add(i));
+                    let r2 = _mm256_loadu_ps(to.as_ptr().add(i + 8));
+                    let r3 = _mm256_loadu_ps(to.as_ptr().add(i + 16));
+                    let r4 = _mm256_loadu_ps(to.as_ptr().add(i + 24));
                     let sub = _mm256_sub_ps(left, right);
                     // sum = sub * sub + sum
-                    sums = _mm256_fmadd_ps(sub, sub, sums);
+                    let s2 = _mm256_sub_ps(l2, r2);
+                    let s3 = _mm256_sub_ps(l3, r3);
+                    let s4 = _mm256_sub_ps(l4, r4);
+                    sums1 = _mm256_fmadd_ps(sub, sub, sums1);
+                    sums2 = _mm256_fmadd_ps(s2, s2, sums2);
+                    sums3 = _mm256_fmadd_ps(s3, s3, sums3);
+                    sums4 = _mm256_fmadd_ps(s4, s4, sums4);
                 }
+                sums1 = _mm256_add_ps(sums1, sums2);
+                sums3 = _mm256_add_ps(sums3, sums4);
+                sums1 = _mm256_add_ps(sums1, sums3);
                 // Shift and add vector, until only 1 value left.
                 // sums = [x0-x7], shift = [x4-x7]
-                let mut shift = _mm256_permute2f128_ps(sums, sums, 1);
+                let mut shift = _mm256_permute2f128_ps(sums1, sums1, 1);
                 // [x0+x4, x1+x5, ..]
-                sums = _mm256_add_ps(sums, shift);
-                shift = _mm256_permute_ps(sums, 14);
-                sums = _mm256_add_ps(sums, shift);
-                sums = _mm256_hadd_ps(sums, sums);
+                sums1 = _mm256_add_ps(sums1, shift);
+                shift = _mm256_permute_ps(sums1, 14);
+                sums1 = _mm256_add_ps(sums1, shift);
+                sums1 = _mm256_hadd_ps(sums1, sums1);
                 let mut results: [f32; 8] = [0f32; 8];
-                _mm256_storeu_ps(results.as_mut_ptr(), sums);
+                _mm256_storeu_ps(results.as_mut_ptr(), sums1);
 
                 // Remaining
                 results[0] += l2_scalar(&from[len..], &to[len..]);

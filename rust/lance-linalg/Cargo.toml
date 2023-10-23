@@ -51,3 +51,8 @@ harness = false
 [[bench]]
 name = "kmeans"
 harness = false
+
+[[bench]]
+name = "compute_partition"
+harness = false
+

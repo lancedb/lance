@@ -17,8 +17,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::vec;
 
-use arrow_array::types::Float32Type;
-use arrow_array::{cast::AsArray, new_empty_array, Array, FixedSizeListArray, Float32Array};
+use arrow_array::{
+    cast::AsArray, new_empty_array, types::Float32Type, Array, FixedSizeListArray, Float32Array,
+};
 use arrow_schema::{ArrowError, DataType};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use log::{info, warn};
@@ -26,9 +27,9 @@ use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 use tracing::instrument;
 
-use crate::kernels::argmin_value;
 use crate::{
     distance::{Cosine, Dot, MetricType, Normalize, L2},
+    kernels::{argmin, argmin_value},
     matrix::MatrixView,
 };
 use crate::{Error, Result};
@@ -538,12 +539,114 @@ impl KMeans {
     }
 }
 
+/// Return a slice of `data[x,y..y+strip]`.
+#[inline]
+fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f32] {
+    &data[x * dim + y..x * dim + y + strip]
+}
+
+/// Fast partition computation for L2 distance.
+fn compute_partitions_l2_f32(centroids: &[f32], data: &[f32], dim: usize) -> Vec<u32> {
+    const STRIPE_SIZE: usize = 128;
+    const TILE_SIZE: usize = 16;
+
+    // 128 * 4bytes * 16 = 8KB for centroid and data respectively, so both of them can
+    // stay in L1 cache.
+    let num_rows = data.len() / dim;
+    let num_centroids = centroids.len() / dim;
+
+    let mut partition_ids = vec![0_u32; num_rows];
+
+    // Read a tile of data, `data[idx..idx+TILE_SIZE]`
+    for idx in (0..num_rows).step_by(TILE_SIZE) {
+        let num_rows_in_tile = min(TILE_SIZE, num_rows - idx);
+
+        // Loop over each strip.
+        // s is the index of value in each vector.
+        let mut min_dists = [f32::MAX; TILE_SIZE];
+        for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
+            // 4B * 16 * 16 = 1 KB
+            let mut dists = vec![0_f32; TILE_SIZE * TILE_SIZE];
+            let num_centroids_in_tile = min(TILE_SIZE, num_centroids - centroid_start);
+            for s in (0..dim).step_by(STRIPE_SIZE) {
+                // Calculate L2 within each TILE * STRIP
+                let slice_len = min(STRIPE_SIZE, dim - s);
+                for di in 0..num_rows_in_tile {
+                    let data_slice = get_slice(data, idx + di, s, dim, slice_len);
+                    for ci in centroid_start..centroid_start + num_centroids_in_tile {
+                        // Get a slice of `data[di][s..s+STRIP_SIZE]`.
+                        let cent_slice = get_slice(centroids, ci, s, dim, slice_len);
+                        let dist = data_slice.l2(cent_slice);
+                        dists[di * TILE_SIZE + (ci - centroid_start)] += dist;
+                    }
+                }
+            }
+            for i in 0..num_rows_in_tile {
+                for j in 0..num_centroids_in_tile {
+                    let dist = dists[i * TILE_SIZE + j];
+                    if dist < min_dists[i] {
+                        min_dists[i] = dist;
+                        partition_ids[idx + i] = (centroid_start + j) as u32;
+                    }
+                }
+            }
+        }
+    }
+    partition_ids
+}
+
+fn compute_partitions_cosine(centroids: &[f32], data: &[f32], dimension: usize) -> Vec<u32> {
+    let centroid_norms = centroids
+        .chunks(dimension)
+        .map(|centroid| centroid.norm_l2())
+        .collect::<Vec<_>>();
+    data.chunks(dimension)
+        .map(|row| {
+            argmin(
+                centroids
+                    .chunks(dimension)
+                    .zip(centroid_norms.iter())
+                    .map(|(centroid, &norm)| centroid.cosine_fast(norm, row)),
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+fn compute_partitions_dot(centroids: &[f32], data: &[f32], dimension: usize) -> Vec<u32> {
+    data.chunks(dimension)
+        .map(|row| {
+            argmin(
+                centroids
+                    .chunks(dimension)
+                    .map(|centroid| centroid.dot(row)),
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+#[inline]
+pub fn compute_partitions(
+    centroids: &[f32],
+    data: &[f32],
+    dimension: usize,
+    metric_type: MetricType,
+) -> Vec<u32> {
+    match metric_type {
+        MetricType::L2 => compute_partitions_l2_f32(centroids, data, dimension),
+        MetricType::Cosine => compute_partitions_cosine(centroids, data, dimension),
+        MetricType::Dot => compute_partitions_dot(centroids, data, dimension),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use arrow_array::Float32Array;
     use lance_arrow::*;
+    use lance_testing::datagen::generate_random_array;
 
     #[tokio::test]
     async fn test_train_with_small_dataset() {
@@ -555,5 +658,28 @@ mod tests {
                 assert!(e.to_string().contains("smaller than"));
             }
         }
+    }
+
+    #[test]
+    fn test_compute_partitions() {
+        const DIM: usize = 256;
+        let centroids = generate_random_array(DIM * 18);
+        let data = generate_random_array(DIM * 20);
+
+        let expected = data
+            .values()
+            .chunks(DIM)
+            .map(|row| {
+                argmin(
+                    centroids
+                        .values()
+                        .chunks(DIM)
+                        .map(|centroid| row.l2(centroid)),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let actual = compute_partitions(centroids.values(), data.values(), DIM, MetricType::L2);
+        assert_eq!(expected, actual);
     }
 }
