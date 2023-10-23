@@ -276,16 +276,19 @@ fn get_string_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
         }
     }
 
+    let min_value = min_value.map(|x| x.to_string());
+    let max_value = max_value.map(|x| x.to_string());
+
     match arrays[0].data_type() {
         DataType::Utf8 => StatisticsRow {
             null_count: ScalarValue::Int64(Some(null_count)),
-            min_value: ScalarValue::Utf8(Some(min_value.unwrap().to_string())),
-            max_value: ScalarValue::Utf8(Some(max_value.unwrap().to_string())),
+            min_value: ScalarValue::Utf8(min_value),
+            max_value: ScalarValue::Utf8(max_value),
         },
         DataType::LargeUtf8 => StatisticsRow {
             null_count: ScalarValue::Int64(Some(null_count)),
-            min_value: ScalarValue::LargeUtf8(Some(min_value.unwrap().to_string())),
-            max_value: ScalarValue::LargeUtf8(Some(max_value.unwrap().to_string())),
+            min_value: ScalarValue::LargeUtf8(min_value),
+            max_value: ScalarValue::LargeUtf8(max_value),
         },
         _ => {
             todo!()
@@ -349,16 +352,19 @@ fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
         }
     }
 
+    let min_value = min_value.map(|x| x.to_vec());
+    let max_value = max_value.map(|x| x.to_vec());
+
     match arrays[0].data_type() {
         DataType::Binary => StatisticsRow {
             null_count: ScalarValue::Int64(Some(null_count)),
-            min_value: ScalarValue::Binary(min_value.map(|x| x.to_vec())),
-            max_value: ScalarValue::Binary(max_value.map(|x| x.to_vec())),
+            min_value: ScalarValue::Binary(min_value),
+            max_value: ScalarValue::Binary(max_value),
         },
         DataType::LargeBinary => StatisticsRow {
             null_count: ScalarValue::Int64(Some(null_count)),
-            min_value: ScalarValue::LargeBinary(min_value.map(|x| x.to_vec())),
-            max_value: ScalarValue::LargeBinary(max_value.map(|x| x.to_vec())),
+            min_value: ScalarValue::LargeBinary(min_value),
+            max_value: ScalarValue::LargeBinary(max_value),
         },
         _ => {
             todo!()
@@ -424,11 +430,13 @@ fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
             }
         }
     }
+    let min_value = min_value.map(|x| x.to_vec());
+    let max_value = max_value.map(|x| x.to_vec());
 
     StatisticsRow {
         null_count: ScalarValue::Int64(Some(null_count)),
-        min_value: ScalarValue::FixedSizeBinary(length as i32, min_value.map(|x| x.to_vec())),
-        max_value: ScalarValue::FixedSizeBinary(length as i32, max_value.map(|x| x.to_vec())),
+        min_value: ScalarValue::FixedSizeBinary(length as i32, min_value),
+        max_value: ScalarValue::FixedSizeBinary(length as i32, max_value),
     }
 }
 
@@ -996,6 +1004,52 @@ mod tests {
                 null_count: ScalarValue::Int64(Some(0)),
                 min_value: ScalarValue::from(u32::MIN),
                 max_value: ScalarValue::from(u32::MAX),
+            }
+        );
+
+        let empty_string_vec: Vec<Option<&str>> = vec![];
+        let arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(empty_string_vec))];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        assert_eq!(
+            collect_statistics(array_refs.as_slice()),
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(0)),
+                min_value: ScalarValue::Utf8(None),
+                max_value: ScalarValue::Utf8(None),
+            }
+        );
+        let empty_string_vec: Vec<Option<&str>> = vec![];
+        let arrays: Vec<ArrayRef> = vec![Arc::new(LargeStringArray::from(empty_string_vec))];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        assert_eq!(
+            collect_statistics(array_refs.as_slice()),
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(0)),
+                min_value: ScalarValue::LargeUtf8(None),
+                max_value: ScalarValue::LargeUtf8(None),
+            }
+        );
+
+        let empty_binary_vec: Vec<Option<&[u8]>> = vec![];
+        let arrays: Vec<ArrayRef> = vec![Arc::new(BinaryArray::from(empty_binary_vec))];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        assert_eq!(
+            collect_statistics(array_refs.as_slice()),
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(0)),
+                min_value: ScalarValue::Binary(None),
+                max_value: ScalarValue::Binary(None),
+            }
+        );
+        let empty_binary_vec: Vec<Option<&[u8]>> = vec![];
+        let arrays: Vec<ArrayRef> = vec![Arc::new(LargeBinaryArray::from(empty_binary_vec))];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        assert_eq!(
+            collect_statistics(array_refs.as_slice()),
+            StatisticsRow {
+                null_count: ScalarValue::Int64(Some(0)),
+                min_value: ScalarValue::LargeBinary(None),
+                max_value: ScalarValue::LargeBinary(None),
             }
         );
     }
