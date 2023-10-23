@@ -37,7 +37,7 @@ impl Updater {
     #[pyo3(signature=())]
     fn next(&mut self, py: Python<'_>) -> PyResult<Option<PyArrowType<RecordBatch>>> {
         let batch = {
-            RT.block_on(Some(py), async { self.inner.next().await })
+            RT.block_on(Some(py), async { self.inner.next().await })?
                 .map_err(|err| PyIOError::new_err(err.to_string()))?
         };
         Ok(batch.map(|b| PyArrowType(b.clone())))
@@ -51,7 +51,7 @@ impl Updater {
                 .update(batch)
                 .await
                 .map_err(|e| PyIOError::new_err(e.to_string()))
-        })
+        })?
     }
 
     fn finish(&mut self) -> PyResult<FragmentMetadata> {
@@ -60,7 +60,7 @@ impl Updater {
                 .finish()
                 .await
                 .map_err(|e| PyIOError::new_err(e.to_string()))
-        })?;
+        })??;
 
         Ok(FragmentMetadata::new(
             fragment,

@@ -149,7 +149,7 @@ impl FileFragment {
             LanceFragment::create_from_file(filename, &schema, fragment_id, None)
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))
-        })?;
+        })??;
         Ok(FragmentMetadata::new(metadata, schema))
     }
 
@@ -183,7 +183,7 @@ impl FileFragment {
                     scanner
                         .to_reader()
                         .map_err(|err| PyValueError::new_err(err.to_string())),
-                )?;
+                )??;
                 Box::new(reader)
             } else {
                 Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
@@ -248,7 +248,7 @@ impl FileFragment {
         let batch = RT
             .spawn(Some(self_.py()), async move {
                 fragment.take(&indices, &projection).await
-            })
+            })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         batch.to_pyarrow(self_.py())
     }
@@ -283,7 +283,7 @@ impl FileFragment {
     fn updater(&self, columns: Option<Vec<String>>) -> PyResult<Updater> {
         let cols = columns.as_deref();
         let inner = RT
-            .block_on(None, async { self.fragment.updater(cols).await })
+            .block_on(None, async { self.fragment.updater(cols).await })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(Updater::new(inner))
     }
@@ -291,7 +291,7 @@ impl FileFragment {
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
         let old_fragment = self.fragment.clone();
         let updated_fragment = RT
-            .block_on(None, async { old_fragment.delete(predicate).await })
+            .block_on(None, async { old_fragment.delete(predicate).await })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         match updated_fragment {
@@ -326,13 +326,13 @@ impl FileFragment {
 
     #[getter]
     fn num_deletions(&self) -> PyResult<usize> {
-        RT.block_on(None, self.fragment.count_deletions())
+        RT.block_on(None, self.fragment.count_deletions())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
     #[getter]
     fn physical_rows(&self) -> PyResult<usize> {
-        RT.block_on(None, self.fragment.physical_rows())
+        RT.block_on(None, self.fragment.physical_rows())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 }

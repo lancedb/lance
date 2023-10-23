@@ -64,7 +64,7 @@ impl Scanner {
         let res = RT
             .spawn(Some(self_.py()), async move {
                 scanner.explain_plan(verbose).await
-            })
+            })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         Ok(res)
@@ -72,7 +72,7 @@ impl Scanner {
 
     fn count_rows(self_: PyRef<'_, Self>) -> PyResult<u64> {
         let scanner = self_.scanner.clone();
-        RT.spawn(Some(self_.py()), async move { scanner.count_rows().await })
+        RT.spawn(Some(self_.py()), async move { scanner.count_rows().await })?
             .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 
@@ -81,7 +81,7 @@ impl Scanner {
         let reader = RT
             .spawn(Some(self_.py()), async move {
                 LanceReader::try_new(scanner).await
-            })
+            })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         // Export a `RecordBatchReader` through `FFI_ArrowArrayStream`

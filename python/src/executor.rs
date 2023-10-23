@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::mpsc::RecvTimeoutError;
+
 use futures::Future;
-use pyo3::Python;
+use pyo3::{exceptions::PyRuntimeError, PyResult, Python};
+
+pub const SIGNAL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// A wrapper around tokio runtime.
 ///
@@ -40,7 +44,7 @@ impl BackgroundExecutor {
     }
 
     /// Spawn a task and wait for it to complete.
-    pub fn spawn<T>(&self, py: Option<Python<'_>>, task: T) -> T::Output
+    pub fn spawn<T>(&self, py: Option<Python<'_>>, task: T) -> PyResult<T::Output>
     where
         T: Future + Send + 'static,
         T::Output: Send + 'static,
@@ -53,7 +57,7 @@ impl BackgroundExecutor {
         }
     }
 
-    fn spawn_impl<T>(&self, task: T) -> T::Output
+    fn spawn_impl<T>(&self, task: T) -> PyResult<T::Output>
     where
         T: Future + Send + 'static,
         T::Output: Send + 'static,
@@ -69,10 +73,27 @@ impl BackgroundExecutor {
             .unwrap();
         });
 
-        // We throw away the handle, but it should continue on.
-        self.runtime.spawn(fut);
+        let handle = self.runtime.spawn(fut);
 
-        rx.recv().unwrap()
+        loop {
+            // Check for keyboard interrupts
+            match Python::with_gil(|py| py.check_signals()) {
+                Ok(_) => {}
+                Err(err) => {
+                    handle.abort();
+                    return Err(err);
+                }
+            }
+            // Wait for 100ms before checking signals again
+            match rx.recv_timeout(SIGNAL_CHECK_INTERVAL) {
+                Ok(output) => return Ok(output),
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    handle.abort();
+                    return Err(PyRuntimeError::new_err("Task was aborted"));
+                }
+            }
+        }
     }
 
     /// Spawn a task in the background
@@ -98,15 +119,44 @@ impl BackgroundExecutor {
     /// Block on a future and wait for it to complete.
     ///
     /// This helper method also frees the GIL before blocking.
-    pub fn block_on<F: Future + Send>(&self, py: Option<Python<'_>>, future: F) -> F::Output
+    pub fn block_on<F: Future + Send>(
+        &self,
+        py: Option<Python<'_>>,
+        future: F,
+    ) -> PyResult<F::Output>
     where
         F::Output: Send,
     {
+        let future = Self::result_or_interrupt(future);
         if let Some(py) = py {
             py.allow_threads(move || self.runtime.block_on(future))
         } else {
             // Python::with_gil is a no-op if the GIL is already held by the thread.
             Python::with_gil(|py| py.allow_threads(|| self.runtime.block_on(future)))
+        }
+    }
+
+    async fn result_or_interrupt<F>(future: F) -> PyResult<F::Output>
+    where
+        F: Future + Send,
+        F::Output: Send,
+    {
+        let interrupt_future = async {
+            loop {
+                // Check for keyboard interrupts
+                match Python::with_gil(|py| py.check_signals()) {
+                    Ok(_) => {
+                        // Wait for 100ms before checking signals again
+                        tokio::time::sleep(SIGNAL_CHECK_INTERVAL).await;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        };
+
+        tokio::select! {
+            result = future => Ok(result),
+            err = interrupt_future => err,
         }
     }
 }
