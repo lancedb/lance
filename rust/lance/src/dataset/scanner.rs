@@ -855,9 +855,11 @@ mod test {
     use arrow::array::as_primitive_array;
     use arrow::compute::concat_batches;
     use arrow::datatypes::Int32Type;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::UInt64Type;
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray,
-        RecordBatchIterator, StringArray, StructArray, UInt64Array,
+        RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::DataType;
