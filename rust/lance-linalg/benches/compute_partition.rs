@@ -64,6 +64,6 @@ criterion_group!(
 criterion_group!(
     name=benches;
     config = Criterion::default().sample_size(10);
-    targets = bench_argmin);
+    targets = bench_compute_partitions);
 
 criterion_main!(benches);
