@@ -99,7 +99,7 @@ impl PreFilter {
             (Some(block_list), Some(allow_list)) => {
                 let block_list = block_list.get_ready();
                 let allow_list = allow_list.get_ready();
-                !block_list.contains(row_id) && allow_list.contains(row_id)
+                allow_list.contains(row_id) && !block_list.contains(row_id)
             }
             (Some(block_list), None) => {
                 let block_list = block_list.get_ready();

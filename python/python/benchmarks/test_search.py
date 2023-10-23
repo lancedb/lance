@@ -11,7 +11,6 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-import itertools
 import shutil
 from pathlib import Path
 from typing import NamedTuple, Union
@@ -172,10 +171,9 @@ def test_ivf_pq_index_search(test_dataset, benchmark):
 
 
 @pytest.mark.benchmark(group="query_ann")
-@pytest.mark.parametrize(
-    "selectivity, prefilter, use_index",
-    list(itertools.product((0.25, 0.75), (False, True), (False, True))),
-)
+@pytest.mark.parametrize("selectivity", (0.25, 0.75))
+@pytest.mark.parametrize("prefilter", (False, True))
+@pytest.mark.parametrize("use_index", (False, True))
 def test_filtered_search(test_dataset, benchmark, selectivity, prefilter, use_index):
     q = pc.random(N_DIMS).cast(pa.float32())
     threshold = int(round(selectivity * NUM_ROWS))

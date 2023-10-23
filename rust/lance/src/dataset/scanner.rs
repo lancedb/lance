@@ -1846,13 +1846,7 @@ mod test {
             .unwrap();
         assert_eq!(batches.len(), 1);
 
-        let first_match = batches[0]
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap()
-            .values()[0];
+        let first_match = batches[0][ROW_ID].as_primitive::<UInt64Type>().values()[0];
 
         assert_eq!(6, first_match);
     }
