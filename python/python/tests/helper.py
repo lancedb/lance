@@ -12,12 +12,31 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from typing import Optional
+
 import pyarrow as pa
 import pytest
 import semver
+from lance.fragment import FragmentMetadata
+from lance.progress import FragmentWriteProgress
 
 PYARROW_VERSION = semver.VersionInfo.parse(pa.__version__)
 
 requires_pyarrow_12 = pytest.mark.skipif(
     PYARROW_VERSION.major < 12, reason="requires arrow 12+"
 )
+
+
+class ProgressForTest(FragmentWriteProgress):
+    def __init__(self):
+        super().__init__()
+        self.begin_called = 0
+        self.complete_called = 0
+
+    def begin(
+        self, fragment: FragmentMetadata, multipart_id: Optional[str] = None, **kwargs
+    ):
+        self.begin_called += 1
+
+    def complete(self, fragment: FragmentMetadata):
+        self.complete_called += 1

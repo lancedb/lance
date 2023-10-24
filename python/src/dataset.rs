@@ -20,8 +20,11 @@ use arrow::pyarrow::{ToPyArrow, *};
 use arrow_array::{Float32Array, RecordBatch};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
+use async_trait::async_trait;
 use chrono::Duration;
+
 use lance::arrow::as_fixed_size_list_array;
+use lance::dataset::progress::WriteFragmentProgress;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, scanner::Scanner as LanceScanner,
     transaction::Operation as LanceOperation, Dataset as LanceDataset, ReadParams, Version,
@@ -44,6 +47,7 @@ use pyo3::{
     types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong},
     PyObject, PyResult,
 };
+use snafu::{location, Location};
 
 use crate::fragment::{FileFragment, FragmentMetadata};
 use crate::Scanner;
@@ -806,9 +810,63 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         if let Some(maybe_nbytes) = options.get_item("max_bytes_per_file") {
             p.max_bytes_per_file = usize::extract(maybe_nbytes)?;
         }
+        if let Some(progress) = options.get_item("progress") {
+            if !progress.is_none() {
+                p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));
+            }
+        }
+
         p.store_params = get_object_store_params(options);
 
         Some(p)
     };
     Ok(params)
+}
+
+#[pyclass(name = "_FragmentWriteProgress", module = "_lib")]
+#[derive(Debug)]
+pub struct PyWriteProgress {
+    /// A Python object that implements the `WriteFragmentProgress` trait.
+    py_obj: PyObject,
+}
+
+impl PyWriteProgress {
+    fn new(obj: PyObject) -> Self {
+        Self { py_obj: obj }
+    }
+}
+
+#[async_trait]
+impl WriteFragmentProgress for PyWriteProgress {
+    async fn begin(&self, fragment: &Fragment, multipart_id: &str) -> lance::Result<()> {
+        let json_str = serde_json::to_string(fragment)?;
+
+        Python::with_gil(|py| -> PyResult<()> {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("multipart_id", multipart_id)?;
+            self.py_obj
+                .call_method(py, "_do_begin", (json_str,), Some(kwargs))?;
+            Ok(())
+        })
+        .map_err(|e| lance::Error::IO {
+            message: format!("Failed to call begin() on WriteFragmentProgress: {}", e),
+            location: location!(),
+        })?;
+        Ok(())
+    }
+
+    async fn complete(&self, fragment: &Fragment) -> lance::Result<()> {
+        let json_str = serde_json::to_string(fragment)?;
+
+        Python::with_gil(|py| -> PyResult<()> {
+            self.py_obj
+                .call_method(py, "_do_complete", (json_str,), None)?;
+            Ok(())
+        })
+        .map_err(|e| lance::Error::IO {
+            message: format!("Failed to call complete() on WriteFragmentProgress: {}", e),
+            location: location!(),
+        })?;
+        Ok(())
+    }
 }
