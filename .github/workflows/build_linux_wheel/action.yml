@@ -44,10 +44,10 @@ runs:
         target: aarch64-unknown-linux-gnu
         manylinux: "2_17"
         args: ${{ inputs.args }}
-        env:
-          # We can remove this once we upgrade to 2_28.
-          # https://github.com/briansmith/ring/issues/1728
-          CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"
+        # We can remove this once we upgrade to 2_28.
+        # https://github.com/briansmith/ring/issues/1728
+        docker-options: |
+          --env CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
         before-script-linux: |
           set -e
           apt install -y unzip
