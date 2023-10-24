@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, TypedDict, Union
 
 import numpy as np
 import pyarrow as pa
@@ -109,6 +109,10 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.load_indices()
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
+        warnings.warn(
+            "LanceDataset.index_statistics() is deprecated, use LanceDataset.stats.index_stats() instead",
+            DeprecationWarning,
+        )
         return json.loads(self._ds.index_statistics(index_name))
 
     @property
@@ -961,6 +965,13 @@ class LanceDataset(pa.dataset.Dataset):
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
 
+    @property
+    def stats(self) -> "LanceStats":
+        """
+        **Experimental API**
+        """
+        return LanceStats(self._ds)
+
 
 # LanceOperation is a namespace for operations that can be applied to a dataset.
 class LanceOperation:
@@ -1599,6 +1610,45 @@ class DatasetOptimizer:
         if the new data exhibits new patterns, concepts, or trends)
         """
         self._dataset._ds.optimize_indices(**kwargs)
+
+
+class DatasetStats(TypedDict):
+    num_deleted_rows: int
+    num_fragments: int
+    num_small_files: int
+
+
+class LanceStats:
+    """
+    Statistics about a LanceDataset.
+    """
+
+    def __init__(self, dataset: _Dataset):
+        self._ds = dataset
+
+    def dataset_stats(self, max_rows_per_group: int = 1024) -> DatasetStats:
+        """
+        Statistics about the dataset.
+        """
+        return {
+            "num_deleted_rows": self._ds.count_deleted_rows(),
+            "num_fragments": self._ds.count_fragments(),
+            "num_small_files": self._ds.num_small_files(max_rows_per_group),
+        }
+
+    def index_stats(self, index_name: str) -> Dict[str, Any]:
+        """
+        Statistics about an index.
+
+        Parameters
+        ----------
+        index_name: str
+            The name of the index to get statistics for.
+        """
+        index_stats = json.loads(self._ds.index_statistics(index_name))
+        index_stats["num_indexed_rows"] = self._ds.count_indexed_rows(index_name)
+        index_stats["num_unindexed_rows"] = self._ds.count_unindexed_rows(index_name)
+        return index_stats
 
 
 def write_dataset(

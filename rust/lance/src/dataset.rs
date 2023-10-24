@@ -57,6 +57,7 @@ use self::fragment::FileFragment;
 use self::scanner::Scanner;
 use self::transaction::{Operation, Transaction};
 use self::write::{reader_to_stream, write_fragments_internal};
+use crate::dataset::index::unindexed_fragments;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{Fragment, Index, Manifest};
@@ -527,7 +528,7 @@ impl Dataset {
         self.append_impl(batches, params).await
     }
 
-    async fn latest_manifest(&self) -> Result<Manifest> {
+    pub async fn latest_manifest(&self) -> Result<Manifest> {
         read_manifest(
             &self.object_store,
             &self
@@ -1119,6 +1120,17 @@ impl Dataset {
         Ok(())
     }
 
+    pub fn count_deleted_rows(&self) -> usize {
+        self.manifest
+            .fragments
+            .iter()
+            .map(|f| match f.deletion_file.as_ref() {
+                Some(d) => d.num_deleted_rows,
+                None => 0,
+            })
+            .sum()
+    }
+
     pub(crate) fn object_store(&self) -> &ObjectStore {
         &self.object_store
     }
@@ -1174,6 +1186,10 @@ impl Dataset {
             .await
     }
 
+    pub fn count_fragments(&self) -> usize {
+        self.manifest.fragments.len()
+    }
+
     pub fn schema(&self) -> &Schema {
         &self.manifest.schema
     }
@@ -1219,14 +1235,19 @@ impl Dataset {
             .find(|idx| idx.uuid.to_string() == uuid)
     }
 
+    pub async fn load_index_by_name(&self, name: &str) -> Option<Index> {
+        self.load_indices()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|idx| idx.name == name)
+    }
+
     /// Find index with a given index_name and return its serialized statistics.
     pub async fn index_statistics(&self, index_name: &str) -> Result<Option<String>> {
         let index_uuid = self
-            .load_indices()
+            .load_index_by_name(index_name)
             .await
-            .unwrap()
-            .iter()
-            .find(|idx| idx.name.eq(index_name))
             .map(|idx| idx.uuid.to_string());
 
         if let Some(index_uuid) = index_uuid {
@@ -1238,6 +1259,43 @@ impl Dataset {
         } else {
             Ok(None)
         }
+    }
+
+    pub async fn count_unindexed_rows(&self, index_uuid: &str) -> Result<Option<usize>> {
+        let index = self.load_index(index_uuid).await;
+
+        if let Some(index) = index {
+            let unindexed_frags = unindexed_fragments(&index, self).await?;
+            let unindexed_rows = unindexed_frags
+                .iter()
+                .map(Fragment::num_rows)
+                // sum the number of rows in each fragment if no fragment returned None from row_count
+                .try_fold(0, |a, b| b.map(|b| a + b).ok_or(()));
+
+            Ok(unindexed_rows.ok())
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn count_indexed_rows(&self, index_uuid: &str) -> Result<Option<usize>> {
+        let count_rows = self.count_rows();
+        let count_unindexed_rows = self.count_unindexed_rows(index_uuid);
+
+        let (count_rows, count_unindexed_rows) =
+            futures::try_join!(count_rows, count_unindexed_rows)?;
+
+        match count_unindexed_rows {
+            Some(count_unindexed_rows) => Ok(Some(count_rows - count_unindexed_rows)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn num_small_files(&self, max_rows_per_group: usize) -> usize {
+        self.fragments()
+            .iter()
+            .filter(|f| f.physical_rows < max_rows_per_group)
+            .count()
     }
 
     pub async fn validate(&self) -> Result<()> {
@@ -1592,6 +1650,7 @@ mod tests {
 
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 10);
+        assert_eq!(dataset.count_fragments(), 10);
         for fragment in &fragments {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
             let reader = fragment.open(dataset.schema()).await.unwrap();
@@ -2528,6 +2587,8 @@ mod tests {
         // We should not have any deletion file still
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
+        assert_eq!(dataset.count_fragments(), 2);
+        assert_eq!(dataset.count_deleted_rows(), 0);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
         assert!(fragments[0].metadata.deletion_file.is_none());
         assert!(fragments[1].metadata.deletion_file.is_none());
@@ -2540,10 +2601,12 @@ mod tests {
         // There should be a deletion file in the metadata
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
+        assert_eq!(dataset.count_fragments(), 2);
         assert!(fragments[0].metadata.deletion_file.is_some());
         assert!(fragments[1].metadata.deletion_file.is_some());
 
         // The deletion file should contain 20 rows
+        assert_eq!(dataset.count_deleted_rows(), 20);
         let store = dataset.object_store().clone();
         let path = Path::from_filesystem_path(test_uri).unwrap();
         // First fragment has 0..10 deleted
@@ -2574,6 +2637,7 @@ mod tests {
         dataset.validate().await.unwrap();
 
         // Verify result
+        assert_eq!(dataset.count_deleted_rows(), 30);
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
         assert!(fragments[0].metadata.deletion_file.is_some());
@@ -2599,7 +2663,12 @@ mod tests {
         // Verify second fragment is fully gone
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
+        assert_eq!(dataset.count_fragments(), 1);
         assert_eq!(fragments[0].id(), 0);
+
+        // Verify the count_deleted_rows only contains the rows from the first fragment
+        // i.e. - deleted_rows from the fragment that has been deleted are not counted
+        assert_eq!(dataset.count_deleted_rows(), 20);
 
         // Append after delete
         let data = sequence_data(0..100);
@@ -2616,6 +2685,7 @@ mod tests {
 
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
+        assert_eq!(dataset.count_fragments(), 2);
         // Fragment id picks up where we left off
         assert_eq!(fragments[0].id(), 0);
         assert_eq!(fragments[1].id(), 2);
@@ -2652,6 +2722,7 @@ mod tests {
         assert_eq!(dataset.manifest.version, 1);
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
+        assert_eq!(dataset.count_fragments(), 1);
         assert_eq!(fragments[0].metadata.deletion_file, None);
         assert_eq!(dataset.manifest, original_manifest);
 
@@ -2666,6 +2737,7 @@ mod tests {
         assert_eq!(dataset.manifest.version, 4);
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
+        assert_eq!(dataset.count_fragments(), 1);
         assert!(fragments[0].metadata.deletion_file.is_some());
     }
 
@@ -2783,5 +2855,119 @@ mod tests {
                 &Field::new(DIST_COL, DataType::Float32, true)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_count_index_rows() {
+        let test_dir = tempdir().unwrap();
+        let dimensions = 16;
+        let column_name = "vec";
+        let field = Field::new(
+            column_name,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimensions,
+            ),
+            false,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+
+        let float_arr = generate_random_array(512 * dimensions as usize);
+
+        let vectors =
+            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+
+        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+
+        let reader =
+            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Make sure it returns None if there's no index with the passed identifier
+        assert_eq!(dataset.count_unindexed_rows("bad_id").await.unwrap(), None);
+        assert_eq!(dataset.count_indexed_rows("bad_id").await.unwrap(), None);
+
+        // Create an index
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 10);
+        dataset
+            .create_index(
+                &[column_name],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let index = dataset.load_index_by_name("vec_idx").await.unwrap();
+        let index_uuid = &index.uuid.to_string();
+
+        // Make sure there are no unindexed rows
+        assert_eq!(
+            dataset.count_unindexed_rows(index_uuid).await.unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            dataset.count_indexed_rows(index_uuid).await.unwrap(),
+            Some(512)
+        );
+
+        // Now we'll append some rows which shouldn't be indexed and see the
+        // count change
+        let float_arr = generate_random_array(512 * dimensions as usize);
+        let vectors =
+            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+
+        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+
+        let reader = RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema);
+        dataset.append(reader, None).await.unwrap();
+
+        // Make sure the new rows are not indexed
+        assert_eq!(
+            dataset.count_unindexed_rows(index_uuid).await.unwrap(),
+            Some(512)
+        );
+        assert_eq!(
+            dataset.count_indexed_rows(index_uuid).await.unwrap(),
+            Some(512)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_num_small_files() {
+        let test_dir = tempdir().unwrap();
+        let dimensions = 16;
+        let column_name = "vec";
+        let field = Field::new(
+            column_name,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimensions,
+            ),
+            false,
+        );
+
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+
+        let float_arr = generate_random_array(512 * dimensions as usize);
+        let vectors =
+            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+
+        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+
+        let reader =
+            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        assert!(dataset.num_small_files(1024) > 0);
+        assert!(dataset.num_small_files(512) == 0);
     }
 }
