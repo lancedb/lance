@@ -12,10 +12,16 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from pathlib import Path
+
+import lance
 import numpy as np
+import pyarrow as pa
 import pytest
 
 torch = pytest.importorskip("pytorch")
+
+from lance.vector import train_ivf_centroids  # noqa: E402
 
 
 def test_kmeans():
@@ -29,3 +35,13 @@ def test_kmeans():
     _, cnts = torch.unique(cluster_ids, return_counts=True)
     assert (cnts >= 1).all() and (cnts <= 8).all()
     assert len(cnts) == 4  # all cluster has data
+
+
+def test_torch_kmean_accept_torch_device(tmp_path: Path):
+    from lance.torch import preferred_device
+
+    arr = np.array(range(128)).reshape(-1, 8).astype(np.float32)
+    tbl = pa.Table.from_arrays([arr], ["vector"])
+    ds = lance.write(tbl, tmp_path)
+    # Not raising exception if pass a `torch.device()` directly
+    train_ivf_centroids(ds, "vector", "L2", accelerator=preferred_device())
