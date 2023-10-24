@@ -34,7 +34,7 @@ jobs:
         repo: "pypi"
   mac:
     timeout-minutes: 60
-    runs-on: "macos-13"
+    runs-on: "macos-13-xlarge"
     strategy:
       matrix:
         python-minor-version: ["8"]

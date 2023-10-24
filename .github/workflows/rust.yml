@@ -96,7 +96,7 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-features --tests -- -D warnings
   mac-build:
-    runs-on: macos-13
+    runs-on: macos-13-xlarge
     timeout-minutes: 45
     defaults:
       run:

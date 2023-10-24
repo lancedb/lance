@@ -34,7 +34,7 @@ jobs:
       #     path: integration/duckdb/build/lance.duckdb_extension
       #     retention-days: 1
   MacOS:
-    runs-on: macos-13
+    runs-on: macos-13-xlarge
     timeout-minutes: 40
     defaults:
       run:
@@ -56,4 +56,3 @@ jobs:
       #     name: duckdb-intel-mac-extension
       #     path: integration/duckdb/build/lance.duckdb_extension
       #     retention-days: 1
-
