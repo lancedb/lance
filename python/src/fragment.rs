@@ -56,7 +56,7 @@ impl PyWriteProgress {
 #[async_trait]
 impl WriteFragmentProgress for PyWriteProgress {
     async fn begin(
-        &mut self,
+        &self,
         fragment: &LanceFragmentMetadata,
         multipart_id: &str,
     ) -> lance::Result<()> {
@@ -76,7 +76,7 @@ impl WriteFragmentProgress for PyWriteProgress {
         Ok(())
     }
 
-    async fn complete(&mut self, fragment: &LanceFragmentMetadata) -> lance::Result<()> {
+    async fn complete(&self, fragment: &LanceFragmentMetadata) -> lance::Result<()> {
         let json_str = serde_json::to_string(fragment)?;
 
         Python::with_gil(|py| -> PyResult<()> {
