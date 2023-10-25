@@ -44,4 +44,6 @@ def test_torch_kmean_accept_torch_device(tmp_path: Path):
     tbl = pa.Table.from_arrays([arr], ["vector"])
     ds = lance.write(tbl, tmp_path)
     # Not raising exception if pass a `torch.device()` directly
-    train_ivf_centroids_on_accelerator(ds, "vector", "L2", accelerator=preferred_device())
+    train_ivf_centroids_on_accelerator(
+        ds, "vector", "L2", accelerator=preferred_device()
+    )
