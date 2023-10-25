@@ -132,7 +132,7 @@ def train_ivf_centroids_on_accelerator(
     column: str,
     k: int,
     metric_type: str,
-    accelerator: Union[str, torch.Device],
+    accelerator: Union[str, "torch.Device"],
     *,
     sample_rate: int = 256,
 ) -> np.ndarray:
