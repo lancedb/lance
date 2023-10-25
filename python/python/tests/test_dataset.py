@@ -686,7 +686,6 @@ def test_add_columns(tmp_path):
     assert times_called == 5
 
     expected = tab.append_column("double_a", pa.array([2 * x for x in range(100)]))
-
     assert expected == dataset.to_table()
 
     # Check: errors if produces inconsistent schema

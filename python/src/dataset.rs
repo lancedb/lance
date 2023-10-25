@@ -184,6 +184,15 @@ impl Dataset {
         }
     }
 
+    fn checkout_latest(&mut self) -> PyResult<()> {
+        let dataset = RT
+            .runtime
+            .block_on(self.ds.checkout_latest())
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(dataset);
+        Ok(())
+    }
+
     #[getter(schema)]
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let arrow_schema = ArrowSchema::from(self_.ds.schema());

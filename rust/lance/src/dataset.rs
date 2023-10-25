@@ -264,6 +264,23 @@ impl Dataset {
         .await
     }
 
+    /// Check out the latest version of the dataset
+    pub async fn checkout_latest(&self) -> Result<Self> {
+        let base_path = self.base.clone();
+        let manifest_file = self
+            .object_store
+            .commit_handler
+            .resolve_latest_version(&base_path, &self.object_store)
+            .await?;
+        Self::checkout_manifest(
+            self.object_store.clone(),
+            base_path,
+            &manifest_file,
+            self.session.clone(),
+        )
+        .await
+    }
+
     async fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,

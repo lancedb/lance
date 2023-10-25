@@ -630,11 +630,17 @@ class LanceDataset(pa.dataset.Dataset):
 
         # Infer the schema based on the first batch
         sample_batch = func(next(iter(self.to_batches(limit=1, columns=columns))))
-        new_schema = sample_batch.schema
+        output_schema = sample_batch.schema
+        del sample_batch
+
+        # Append new fields at the end
+        new_schema = self.schema
+        for field in output_schema:
+            new_schema = new_schema.append(field)
 
         def wrapped(batch):
             result = func(batch)
-            assert result.schema == new_schema
+            assert result.schema == output_schema
             return result
 
         fragments = self.get_fragments()
@@ -651,6 +657,7 @@ class LanceDataset(pa.dataset.Dataset):
         self.commit(
             self.uri, operation, read_version=self.version, commit_lock=commit_lock
         )
+        self._ds.checkout_latest()
 
     def delete(self, predicate: Union[str, pa.compute.Expression]):
         """
