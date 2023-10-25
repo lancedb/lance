@@ -32,18 +32,10 @@ pub trait Writer: AsyncWrite + Unpin + Send {
 
 /// Lance Write Extension.
 #[async_trait]
-pub trait WriteExt: Writer {
-    /// Write a protobuf message to the object, and returns the file position of the protobuf.
-    async fn write_protobuf(&mut self, msg: &impl Message) -> Result<usize> {
-        let offset = self.tell().await?;
-
-        let len = msg.encoded_len();
-
-        self.write_u32_le(len as u32).await?;
-        self.write_all(&msg.encode_to_vec()).await?;
-
-        Ok(offset)
-    }
+pub trait WriteExt {
+    /// Write a Protobuf message to the [Writer], and returns the file position
+    /// where the protobuf is written.
+    async fn write_protobuf(&mut self, msg: &impl Message) -> Result<usize>;
 
     async fn write_struct<
         'b,
@@ -56,8 +48,23 @@ pub trait WriteExt: Writer {
         let msg: M = M::from(obj);
         self.write_protobuf(&msg).await
     }
-
     /// Write magics to the tail of a file before closing the file.
+    async fn write_magics(&mut self, pos: usize) -> Result<()>;
+}
+
+#[async_trait]
+impl<W: Writer + ?Sized> WriteExt for W {
+    async fn write_protobuf(&mut self, msg: &impl Message) -> Result<usize> {
+        let offset = self.tell().await?;
+
+        let len = msg.encoded_len();
+
+        self.write_u32_le(len as u32).await?;
+        self.write_all(&msg.encode_to_vec()).await?;
+
+        Ok(offset)
+    }
+
     async fn write_magics(&mut self, pos: usize) -> Result<()> {
         self.write_i64_le(pos as i64).await?;
         self.write_i16_le(MAJOR_VERSION).await?;

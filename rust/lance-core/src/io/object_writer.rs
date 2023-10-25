@@ -21,10 +21,7 @@ use pin_project::pin_project;
 use snafu::{location, Location};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::{
-    io::{WriteExt, Writer},
-    Error, Result,
-};
+use crate::{io::Writer, Error, Result};
 
 /// AsyncWrite with the capability to tell the position the data is written.
 ///
@@ -69,9 +66,6 @@ impl Writer for ObjectWriter {
         Ok(self.cursor)
     }
 }
-
-impl WriteExt for ObjectWriter {}
-
 impl AsyncWrite for ObjectWriter {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -103,7 +97,7 @@ mod tests {
 
     use crate::{
         format::Metadata,
-        io::{read_struct, CloudObjectReader},
+        io::{read_struct, CloudObjectReader, WriteExt},
     };
 
     use super::*;
