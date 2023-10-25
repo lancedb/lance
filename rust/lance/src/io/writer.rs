@@ -42,7 +42,7 @@ use super::ObjectStore;
 
 /// Write manifest to an open file.
 pub async fn write_manifest(
-    writer: &mut ObjectWriter,
+    writer: &mut dyn Writer,
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
 ) -> Result<usize> {
