@@ -537,7 +537,6 @@ impl FileFragment {
         with_row_id: bool,
     ) -> Result<RecordBatch> {
         let reader = self.open(projection, with_row_id).await?;
-
         if row_ids.len() > 1 && Self::row_ids_contiguous(row_ids) {
             let range = (row_ids[0] as usize)..(row_ids[row_ids.len() - 1] as usize + 1);
             reader.read_range(range).await
@@ -576,7 +575,9 @@ impl FileFragment {
         if let Some(columns) = columns {
             schema = schema.project(columns)?;
         }
-        let reader = self.open(&schema, false);
+        // If there is no projection, we are least need to read the row id
+        let with_row_id = schema.fields.is_empty();
+        let reader = self.open(&schema, with_row_id);
         let deletion_vector = read_deletion_file(
             &self.dataset.base,
             &self.metadata,

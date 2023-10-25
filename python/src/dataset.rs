@@ -1016,6 +1016,10 @@ impl Dataset {
         self.ds = Arc::new(new_self);
         Ok(())
     }
+
+    fn add_columns(&mut self, transforms: &PyAny) -> PyResult<()> {
+        todo!()
+    }
 }
 
 impl Dataset {

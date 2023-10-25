@@ -32,6 +32,7 @@ from typing import (
     Iterator,
     List,
     Literal,
+    NamedTuple,
     Optional,
     TypedDict,
     Union,
@@ -552,7 +553,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return pa.Table.from_batches([self._ds.take_rows(row_ids, columns)])
 
-    def head(self, num_rows, **kwargs):
+    def head(self, num_rows, **kwargs) -> pa.Table:
         """
         Load the first N rows of the dataset.
 
@@ -653,6 +654,11 @@ class LanceDataset(pa.dataset.Dataset):
         0  1  a  d
         1  2  b  e
         2  3  c  f
+
+        See Also
+        --------
+        LanceDataset.add_columns :
+            Add new columns by computing batch-by-batch.
         """
         if right_on is None:
             right_on = left_on
@@ -660,6 +666,75 @@ class LanceDataset(pa.dataset.Dataset):
         reader = _coerce_reader(data_obj, schema)
 
         self._ds.merge(reader, left_on, right_on)
+
+    def add_columns(self, transforms: Dict[str, str] | AddColumnsUDF):
+        """
+        Add new columns by computing them based on input data.
+
+        This function will infer the final schema by apply the function against
+        the first row of your dataset.
+
+        Parameters
+        ----------
+        value_func: Callable.
+            A function that takes a RecordBatch as input and returns a RecordBatch
+            or Pandas DataFrame. This should return only the new columns you wish
+            to add.
+        read_columns: Optional[list[str]].
+            If specified, only the columns in this list will be passed to the
+            value_func. Otherwise, all columns will be passed to the value_func.
+        commit_lock : CommitLock, optional
+            A custom commit lock.  Only needed if your object store does not support
+            atomic commits.  See the user guide for more details.
+        pool_executor: ThreadPoolExecutor, optional
+            A thread pool to run the function concurrently. This will
+            write out the data in parallel across fragments.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "my_dataset")
+        >>> def double_a(batch):
+        ...     df = batch.to_pandas()
+        ...     return pd.DataFrame({'double_a': 2 * df['a']})
+        >>> dataset.add_columns(double_a, ['a'])
+        >>> dataset.to_table().to_pandas()
+           a  b  double_a
+        0  1  a         2
+        1  2  b         4
+        2  3  c         6
+
+        See Also
+        --------
+        LanceDataset.merge :
+            Merge a pre-computed set of columns into the dataset.
+        """
+        if isinstance(transforms, AddColumnsUDF):
+            if transforms.output_schema is None:
+                # Infer the schema based on the first batch
+                sample_batch = transforms(
+                    next(
+                        iter(self.to_batches(limit=1, columns=transforms.read_columns))
+                    )
+                )
+                if isinstance(sample_batch, pd.DataFrame):
+                    sample_batch = pa.RecordBatch.from_pandas(sample_batch)
+                transforms.output_schema = sample_batch.schema
+                del sample_batch
+        elif isinstance(transforms, dict):
+            for k, v in transforms.items():
+                if not isinstance(k, str):
+                    raise TypeError(f"Column names must be a string. Got {type(k)}")
+                if not isinstance(v, str):
+                    raise TypeError(
+                        f"Column expressions must be a string. Got {type(k)}"
+                    )
+        else:
+            raise TypeError("transforms must be a dict or AddColumnsUDF")
+
+        self._ds.add_columns(transforms)
 
     def drop_columns(self, columns: List[str]):
         """Drop one or more columns from the dataset
@@ -2338,3 +2413,73 @@ def _casting_recordbatch_iter(
                     f"Got:\n{batch.schema}"
                 )
         yield batch
+
+
+# this is used in LanceDataset.add_columns, but must be defined here so that
+# it can be pickled.
+def _validated_batch_func(func, output_schema, batch):
+    result = func(batch)
+    if isinstance(result, pd.DataFrame):
+        result = pa.RecordBatch.from_pandas(result)
+    assert result.schema == output_schema
+    return result
+
+
+class AddColumnsUDF:
+    def __init__(self, func, read_columns, output_schema=None):
+        self.func = func
+        self.read_columns = read_columns
+        self.output_schema = output_schema
+
+    def __call__(self, batch: pa.RecordBatch, info: BatchInfo):
+        # Directly call inner function. This is to allow the user to test the
+        # function and have it behave exactly as it was written.
+        return self.func(batch, info)
+
+    def _call(self, batch: pa.RecordBatch, info: BatchInfo):
+        if self.output_schema is None:
+            raise ValueError(
+                "output_schema must be provided when using a function that "
+                "returns a RecordBatch"
+            )
+        result = self.func(batch, info)
+        if isinstance(result, pd.DataFrame):
+            result = pa.RecordBatch.from_pandas(result)
+        assert result.schema == self.output_schema
+        return result
+
+
+def add_columns_udf(func, read_columns, output_schema=None):
+    """
+    Create a user defined function (UDF) that adds columns to a dataset.
+
+    This function is used to add columns to a dataset. It takes a function that
+    takes a single argument, a RecordBatch, and returns a RecordBatch. The
+    function is called once for each batch in the dataset. The function should
+    not modify the input batch, but instead create a new batch with the new
+    columns added.
+
+    Parameters
+    ----------
+    func : callable
+        The function that adds the columns. The function should take a single
+        argument, a RecordBatch, and return a RecordBatch.
+    read_columns : list[str]
+        The columns that the function reads from the input RecordBatch. This is
+        used to optimize the function so that only the necessary columns are
+        read from disk.
+    output_schema : Schema, optional
+        The schema of the output RecordBatch. This is used to validate the
+        output of the function. If not provided, the schema of the first output
+        RecordBatch will be used.
+
+    Returns
+    -------
+    AddColumnsUDF
+    """
+    return AddColumnsUDF(func, read_columns, output_schema)
+
+
+class BatchInfo(NamedTuple):
+    fragment_id: int
+    batch_index: int

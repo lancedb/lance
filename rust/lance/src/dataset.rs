@@ -30,6 +30,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt, Stream};
+use lance_arrow::SchemaExt;
 use lance_core::datatypes::SchemaCompareOptions;
 use lance_datafusion::utils::reader_to_stream;
 use lance_file::datatypes::populate_schema_dictionary;
@@ -43,7 +44,7 @@ use lance_table::io::manifest::{read_manifest, write_manifest};
 use log::warn;
 use object_store::path::Path;
 use snafu::{location, Location};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::default::Default;
 use std::ops::Range;
 use std::pin::Pin;
@@ -74,6 +75,7 @@ use self::write::write_fragments_internal;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{commit_new_dataset, commit_transaction};
+use crate::io::exec::Planner;
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
@@ -1436,7 +1438,214 @@ impl Dataset {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchInfo {
+    pub fragment_id: u32,
+    pub batch_index: usize,
+}
+
+pub trait UDFCache {
+    fn get_batch(&self, info: &BatchInfo) -> Result<Option<RecordBatch>>;
+    fn insert_batch(&self, info: BatchInfo, batch: RecordBatch) -> Result<()>;
+    fn get_fragment(&self, fragment_id: u32) -> Result<Option<Fragment>>;
+    fn insert_fragment(&self, fragment: Fragment) -> Result<()>;
+}
+
+pub struct BatchUDF {
+    pub mapper: Box<dyn Fn(&RecordBatch) -> Result<RecordBatch>>,
+    /// The schema of the returned RecordBatch
+    pub append_schema: Arc<ArrowSchema>,
+    /// The names of the columns that are required to be present in the input
+    /// RecordBatch. If None, then all columns will be read and passed in.
+    pub read_columns: Option<Vec<String>>,
+    /// A cache for UDF results.
+    pub result_cache: Option<Arc<dyn UDFCache>>,
+}
+
+/// A way to define one or more new columns in a dataset
+pub enum NewColumnTransform {
+    /// A UDF that takes a RecordBatch of existing data and returns a
+    /// RecordBatch with the new columns for those corresponding rows. The returned
+    /// batch must return the same number of rows as the input batch.
+    BatchUDF(BatchUDF),
+    /// A set of SQL expressions that define new columns.
+    SqlExpressions(Vec<(String, String)>),
+}
+
 impl Dataset {
+    /// Append new columns to the dataset.
+    pub async fn add_columns(&mut self, transforms: NewColumnTransform) -> Result<()> {
+        // We just transform the SQL expression into a UDF backed by DataFusion
+        // physical expressions.
+        let BatchUDF {
+            mapper,
+            append_schema,
+            read_columns,
+            result_cache,
+        } = match transforms {
+            NewColumnTransform::BatchUDF(udf) => udf,
+            NewColumnTransform::SqlExpressions(expressions) => {
+                let arrow_schema = Arc::new(ArrowSchema::from(self.schema()));
+                let planner = Planner::new(arrow_schema);
+                let exprs = expressions
+                    .into_iter()
+                    .map(|(name, expr)| {
+                        let expr = planner.parse_expr(&expr)?;
+                        let expr = planner.optimize_expr(expr)?;
+                        Ok((name, expr))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let needed_columns = exprs
+                    .iter()
+                    .flat_map(|(_, expr)| Planner::column_names_in_expr(expr))
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let read_schema = self.schema().project(&needed_columns)?;
+                let read_schema = Arc::new(ArrowSchema::from(&read_schema));
+                // Need to re-create the planner with the read schema because physical
+                // expressions use positional column references.
+                let planner = Planner::new(read_schema.clone());
+                let exprs = exprs
+                    .into_iter()
+                    .map(|(name, expr)| {
+                        let expr = planner.create_physical_expr(&expr)?;
+                        Ok((name, expr))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let append_schema = Arc::new(ArrowSchema::new(
+                    exprs
+                        .iter()
+                        .map(|(name, expr)| {
+                            Ok(ArrowField::new(
+                                name,
+                                expr.data_type(read_schema.as_ref())?,
+                                expr.nullable(read_schema.as_ref())?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ));
+
+                let schema_ref = append_schema.clone();
+                let mapper = move |batch: &RecordBatch| {
+                    let num_rows = batch.num_rows();
+                    let columns = exprs
+                        .iter()
+                        .map(|(_, expr)| Ok(expr.evaluate(batch)?.into_array(num_rows)?))
+                        .collect::<Result<Vec<_>>>()?;
+
+                    let batch = RecordBatch::try_new(schema_ref.clone(), columns)?;
+                    Ok(batch)
+                };
+                let mapper = Box::new(mapper);
+
+                let read_columns = Some(read_schema.field_names().into_iter().cloned().collect());
+                BatchUDF {
+                    mapper,
+                    append_schema,
+                    read_columns,
+                    result_cache: None,
+                }
+            }
+        };
+
+        {
+            let new_names = append_schema.field_names();
+            for field in &self.schema().fields {
+                if new_names.contains(&&field.name) {
+                    return Err(Error::invalid_input(
+                        format!("Column {} already exists in the dataset", field.name),
+                        location!(),
+                    ));
+                }
+            }
+        }
+
+        let schema = self.schema().merge(append_schema.as_ref())?;
+
+        let fragments = self
+            .add_columns_impl(read_columns, mapper, result_cache)
+            .await?;
+        let operation = Operation::Merge { fragments, schema };
+        let transaction = Transaction::new(self.manifest.version, operation, None);
+        let new_manifest = commit_transaction(
+            self,
+            &self.object_store,
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+        )
+        .await?;
+
+        self.manifest = Arc::new(new_manifest);
+
+        Ok(())
+    }
+
+    async fn add_columns_impl(
+        &self,
+        read_columns: Option<Vec<String>>,
+        mapper: Box<dyn Fn(&RecordBatch) -> Result<RecordBatch>>,
+        result_cache: Option<Arc<dyn UDFCache>>,
+    ) -> Result<Vec<Fragment>> {
+        let read_columns_ref = read_columns.as_deref();
+        let mapper_ref = mapper.as_ref();
+        let fragments = futures::stream::iter(self.get_fragments())
+            .then(|fragment| {
+                let cache_ref = result_cache.clone();
+                async move {
+                    if let Some(cache) = &cache_ref {
+                        let fragment_id = fragment.id() as u32;
+                        let fragment = cache.get_fragment(fragment_id)?;
+                        if let Some(fragment) = fragment {
+                            return Ok(fragment);
+                        }
+                    }
+
+                    let mut updater = fragment.updater(read_columns_ref).await?;
+
+                    let mut batch_index = 0;
+                    // TODO: the structure of the updater prevents batch-level parallelism here,
+                    //       but there is no reason why we couldn't do this in parallel.
+                    while let Some(batch) = updater.next().await? {
+                        let batch_info = BatchInfo {
+                            fragment_id: fragment.id() as u32,
+                            batch_index,
+                        };
+
+                        let new_batch = if let Some(cache) = &cache_ref {
+                            if let Some(batch) = cache.get_batch(&batch_info)? {
+                                batch
+                            } else {
+                                let new_batch = mapper_ref(batch)?;
+                                cache.insert_batch(batch_info, new_batch.clone())?;
+                                new_batch
+                            }
+                        } else {
+                            mapper_ref(batch)?
+                        };
+
+                        updater.update(new_batch).await?;
+                        batch_index += 1;
+                    }
+
+                    let fragment = updater.finish().await?;
+
+                    if let Some(cache) = &cache_ref {
+                        cache.insert_fragment(fragment.clone())?;
+                    }
+
+                    Ok::<_, Error>(fragment)
+                }
+            })
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(fragments)
+    }
+
     /// Remove columns from the dataset.
     ///
     /// This is a metadata-only operation and does not remove the data from the
@@ -1479,7 +1688,6 @@ impl Dataset {
             &Default::default(),
         )
         .await?;
-
         self.manifest = Arc::new(manifest);
 
         Ok(())
@@ -1578,6 +1786,7 @@ fn check_row_ids(row_ids: &[u64]) -> RowIdMeta {
 mod tests {
     use std::collections::HashSet;
     use std::ops::Range;
+    use std::sync::Mutex;
     use std::vec;
 
     use super::*;
@@ -1588,7 +1797,6 @@ mod tests {
     use crate::index::scalar::ScalarIndexParams;
     use crate::index::vector::VectorIndexParams;
 
-    use arrow_array::FixedSizeListArray;
     use arrow_array::{
         builder::StringDictionaryBuilder,
         cast::{as_string_array, as_struct_array},
@@ -1597,6 +1805,7 @@ mod tests {
         Int8DictionaryArray, RecordBatch, RecordBatchIterator, StringArray, UInt16Array,
         UInt32Array,
     };
+    use arrow_array::{FixedSizeListArray, Float64Array, ListArray};
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
     use arrow_select::take::take;
@@ -3653,6 +3862,322 @@ mod tests {
 
         let data = dataset.scan().try_into_batch().await?;
         assert_eq!(batch, data);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_columns_exprs() -> Result<()> {
+        let num_rows = 5;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, None).await?;
+        dataset.validate().await?;
+
+        // Adding a duplicate column name will break
+        let res = dataset
+            .add_columns(NewColumnTransform::SqlExpressions(vec![(
+                "id".into(),
+                "id + 1".into(),
+            )]))
+            .await;
+        assert!(matches!(res, Err(Error::InvalidInput { .. })));
+
+        // Can add a column that is independent of any existing ones
+        dataset
+            .add_columns(NewColumnTransform::SqlExpressions(vec![(
+                "value".into(),
+                "2 * random()".into(),
+            )]))
+            .await?;
+
+        // Can add a column derived from an existing one.
+        dataset
+            .add_columns(NewColumnTransform::SqlExpressions(vec![(
+                "double_id".into(),
+                "2 * id".into(),
+            )]))
+            .await?;
+
+        // Can derive a column from existing ones across multiple data files.
+        dataset
+            .add_columns(NewColumnTransform::SqlExpressions(vec![(
+                "triple_id".into(),
+                "id + double_id".into(),
+            )]))
+            .await?;
+
+        // These can be read back, the dataset is valid
+        dataset.validate().await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        let expected_schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Float64, true),
+            Field::new("double_id", DataType::Int32, false),
+            Field::new("triple_id", DataType::Int32, false),
+        ]);
+        assert_eq!(data.schema().as_ref(), &expected_schema);
+        assert_eq!(data.num_rows(), num_rows);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_columns_udf() -> Result<()> {
+        let num_rows = 5;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, None).await?;
+        dataset.validate().await?;
+
+        // Adding a duplicate column name will break
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(|_| unimplemented!()),
+            append_schema: Arc::new(ArrowSchema::new(vec![Field::new(
+                "id",
+                DataType::Int32,
+                false,
+            )])),
+            read_columns: None,
+            result_cache: None,
+        });
+        let res = dataset.add_columns(transforms).await;
+        assert!(matches!(res, Err(Error::InvalidInput { .. })));
+
+        // Can add a column that independent (empty read_schema)
+        let append_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            true,
+        )]));
+        let append_schema_ref = append_schema.clone();
+        let mapper = move |batch: &RecordBatch| {
+            Ok(RecordBatch::try_new(
+                append_schema_ref.clone(),
+                vec![Arc::new(Float64Array::from_iter_values(
+                    (0..batch.num_rows()).map(|i| i as f64),
+                ))],
+            )?)
+        };
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(mapper),
+            append_schema,
+            read_columns: None,
+            result_cache: None,
+        });
+        dataset.add_columns(transforms).await?;
+
+        // Can add a column that depends on another column (double id)
+        let append_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "double_id",
+            DataType::Int32,
+            false,
+        )]));
+        let append_schema_ref = append_schema.clone();
+        let mapper = move |batch: &RecordBatch| {
+            let id = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            Ok(RecordBatch::try_new(
+                append_schema_ref.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(
+                    id.values().iter().map(|i| i * 2),
+                ))],
+            )?)
+        };
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(mapper),
+            append_schema,
+            read_columns: None,
+            result_cache: None,
+        });
+        dataset.add_columns(transforms).await?;
+        // These can be read back, the dataset is valid
+        dataset.validate().await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        let expected_schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Float64, true),
+            Field::new("double_id", DataType::Int32, false),
+        ]);
+        assert_eq!(data.schema().as_ref(), &expected_schema);
+        assert_eq!(data.num_rows(), num_rows);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_columns_udf_cache() -> Result<()> {
+        #[derive(Default)]
+        struct RequestCounter {
+            pub get_batch_requests: Mutex<Vec<BatchInfo>>,
+            pub insert_batch_requests: Mutex<Vec<BatchInfo>>,
+            pub get_fragment_requests: Mutex<Vec<u32>>,
+            pub insert_fragment_requests: Mutex<Vec<u32>>,
+        }
+
+        impl UDFCache for RequestCounter {
+            fn get_batch(&self, key: &BatchInfo) -> Result<Option<RecordBatch>> {
+                self.get_batch_requests.lock().unwrap().push(key.clone());
+                // TODO: Add a pre-computed batch
+                Ok(None)
+            }
+
+            fn insert_batch(&self, key: BatchInfo, _value: RecordBatch) -> Result<()> {
+                self.insert_batch_requests.lock().unwrap().push(key);
+                Ok(())
+            }
+
+            fn get_fragment(&self, _key: u32) -> Result<Option<Fragment>> {
+                self.get_fragment_requests.lock().unwrap().push(_key);
+                // TODO: Add a pre-computed fragment
+                Ok(None)
+            }
+
+            fn insert_fragment(&self, fragment: Fragment) -> Result<()> {
+                self.insert_fragment_requests
+                    .lock()
+                    .unwrap()
+                    .push(fragment.id as u32);
+                Ok(())
+            }
+        }
+
+        let num_rows = 100;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                max_rows_per_group: 25,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset.validate().await?;
+
+        let request_counter = Arc::new(RequestCounter::default());
+
+        let append_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "double_id",
+            DataType::Int32,
+            false,
+        )]));
+        let append_schema_ref = append_schema.clone();
+        let mapper = move |batch: &RecordBatch| {
+            let id = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            Ok(RecordBatch::try_new(
+                append_schema_ref.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(
+                    id.values().iter().map(|i| i * 2),
+                ))],
+            )?)
+        };
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(mapper),
+            append_schema,
+            read_columns: None,
+            result_cache: Some(request_counter.clone()),
+        });
+        dataset.add_columns(transforms).await?;
+
+        let expected_batch_req = vec![
+            BatchInfo {
+                fragment_id: 0,
+                batch_index: 0,
+            },
+            BatchInfo {
+                fragment_id: 0,
+                batch_index: 1,
+            },
+            BatchInfo {
+                fragment_id: 1,
+                batch_index: 0,
+            },
+            BatchInfo {
+                fragment_id: 1,
+                batch_index: 1,
+            },
+        ];
+        assert_eq!(
+            request_counter
+                .get_batch_requests
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &expected_batch_req
+        );
+        assert_eq!(
+            request_counter
+                .insert_batch_requests
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &expected_batch_req
+        );
+
+        let expected_fragment_req = vec![0, 1];
+        assert_eq!(
+            request_counter
+                .get_fragment_requests
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &expected_fragment_req
+        );
+        assert_eq!(
+            request_counter
+                .insert_fragment_requests
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &expected_fragment_req
+        );
 
         Ok(())
     }
