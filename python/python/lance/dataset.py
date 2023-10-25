@@ -24,7 +24,17 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Union,
+)
 
 import numpy as np
 import pyarrow as pa
@@ -457,7 +467,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return pa.Table.from_batches([self._ds.take_rows(row_ids, columns)])
 
-    def head(self, num_rows, **kwargs):
+    def head(self, num_rows, **kwargs) -> pa.Table:
         """
         Load the first N rows of the dataset.
 
@@ -558,6 +568,11 @@ class LanceDataset(pa.dataset.Dataset):
         0  1  a  d
         1  2  b  e
         2  3  c  f
+
+        See Also
+        --------
+        LanceDataset.add_columns :
+            Add new columns by computing batch-by-batch.
         """
         if right_on is None:
             right_on = left_on
@@ -565,6 +580,77 @@ class LanceDataset(pa.dataset.Dataset):
         reader = _coerce_reader(data_obj, schema)
 
         self._ds.merge(reader, left_on, right_on)
+
+    def add_columns(
+        self,
+        func: Callable[[pa.RecordBatch], pa.RecordBatch],
+        columns: Optional[List[str]] = None,
+        *,
+        commit_lock: Optional[CommitLock] = None,
+    ):
+        """
+        Add new columns by computing them based on input data.
+
+        Parameters
+        ----------
+        value_func: Callable.
+            A function that takes a RecordBatch as input and returns a RecordBatch.
+        columns: Optional[list[str]].
+            If specified, only the columns in this list will be passed to the
+            value_func. Otherwise, all columns will be passed to the value_func.
+        commit_lock : CommitLock, optional
+            A custom commit lock.  Only needed if your object store does not support
+            atomic commits.  See the user guide for more details.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "my_dataset")
+        >>> def double_a(batch):
+        ...     return pa.record_batch([[2 * x for x in batch['a']]], ['double_a'])
+        >>> dataset.add_columns(double_a, ['a'])
+        >>> dataset.to_table().to_pandas()
+           a  b double_a
+        0  1  a        2
+        1  2  b        4
+        2  3  c        6
+        3  4  d        8
+
+        See Also
+        --------
+        LanceDataset.Merge :
+            Merge a pre-computed set of columns into the dataset.
+        """
+        # TODO: support multi-processing or multi-threading
+        # TODO: support returning something other than record batch
+        # TODO: support specifying positions of new columns (or else maybe just
+        # call this append_columns?)
+
+        # Infer the schema based on the first batch
+        sample_batch = func(next(iter(self.to_batches(limit=1, columns=columns))))
+        new_schema = sample_batch.schema
+
+        def wrapped(batch):
+            result = func(batch)
+            assert result.schema == new_schema
+            return result
+
+        fragments = self.get_fragments()
+        new_fragments = []
+        for fragment in fragments:
+            new_frag = fragment.add_columns(wrapped, columns)
+            new_fragments.append(new_frag)
+
+        operation = LanceOperation.Merge(
+            new_fragments,
+            new_schema,
+        )
+
+        self.commit(
+            self.uri, operation, read_version=self.version, commit_lock=commit_lock
+        )
 
     def delete(self, predicate: Union[str, pa.compute.Expression]):
         """
