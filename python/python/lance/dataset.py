@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Union, TYPE_CHECKING
 
 import numpy as np
 import pyarrow as pa
@@ -61,6 +61,9 @@ except ImportError:
         Iterable[RecordBatch],
         pa.RecordBatchReader,
     ]
+
+if TYPE_CHECKING:
+    import torch
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -682,7 +685,7 @@ class LanceDataset(pa.dataset.Dataset):
         num_partitions: Optional[int] = None,
         ivf_centroids: Optional[Union[np.ndarray, pa.FixedSizeListArray]] = None,
         num_sub_vectors: Optional[int] = None,
-        accelerator: Optional[str] = None,
+        accelerator: Optional[Union[str, "torch.Device"]] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -710,7 +713,7 @@ class LanceDataset(pa.dataset.Dataset):
             clustering. If not provided, a new Kmean model will be trained.
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
-        accelerator : str, optional
+        accelerator : str or ``torch.Device``, optional
             If set, use an accelerator to speed up the training process.
             Accepted accelerator: "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU).
             If not set, use the CPU.
@@ -825,9 +828,9 @@ class LanceDataset(pa.dataset.Dataset):
 
             if accelerator is not None and ivf_centroids is None:
                 # Use accelerator to train ivf centroids
-                from .vector import train_ivf_centroids
+                from .vector import train_ivf_centroids_on_accelerator
 
-                ivf_centroids = train_ivf_centroids(
+                ivf_centroids = train_ivf_centroids_on_accelerator(
                     self, column[0], num_partitions, metric, accelerator
                 )
 

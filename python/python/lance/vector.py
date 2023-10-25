@@ -15,12 +15,15 @@
 
 import logging
 import re
-from typing import Optional, Union
+from typing import Optional, Union, TYPE_CHECKING
 
 import numpy as np
 import pyarrow as pa
 
 from . import LanceDataset
+
+if TYPE_CHECKING:
+    import torch
 
 
 def _normalize_vectors(vectors, ndim):
@@ -124,12 +127,12 @@ def vec_to_table(
 CUDA_REGEX = re.compile(r"^cuda(:\d+)?$")
 
 
-def train_ivf_centroids(
+def train_ivf_centroids_on_accelerator(
     dataset: LanceDataset,
     column: str,
     k: int,
     metric_type: str,
-    accelerator: str,
+    accelerator: Union[str, torch.Device],
     *,
     sample_rate: int = 256,
 ) -> np.ndarray:
