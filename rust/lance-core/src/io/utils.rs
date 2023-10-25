@@ -24,9 +24,13 @@ use lance_arrow::*;
 use prost::Message;
 use snafu::{location, Location};
 
-use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, AsyncIndex, Decoder};
-use crate::format::ProtoStruct;
-use crate::io::{ReadBatchParams, Reader};
+use crate::encodings::{
+    binary::{BinaryDecoder, BinaryEncoder},
+    plain::{PlainDecoder, PlainEncoder},
+    AsyncIndex, Decoder, Encoder,
+};
+use crate::format::{pb, Index, Manifest, ProtoStruct};
+use crate::io::{ReadBatchParams, Reader, WriteExt, Writer};
 use crate::{Error, Result};
 
 /// Read a binary array from a [Reader].
@@ -123,4 +127,66 @@ pub async fn read_struct<
     let msg = read_message::<M>(reader, pos).await?;
     let obj = T::from(msg);
     Ok(obj)
+}
+
+/// Write manifest to an open file.
+pub async fn write_manifest(
+    writer: &mut dyn Writer,
+    manifest: &mut Manifest,
+    indices: Option<Vec<Index>>,
+) -> Result<usize> {
+    // Write dictionary values.
+    let max_field_id = manifest.schema.max_field_id().unwrap_or(-1);
+    for field_id in 0..max_field_id + 1 {
+        if let Some(field) = manifest.schema.mut_field_by_id(field_id) {
+            if field.data_type().is_dictionary() {
+                let dict_info = field.dictionary.as_mut().ok_or_else(|| Error::IO {
+                    message: format!("Lance field {} misses dictionary info", field.name),
+                    location: location!(),
+                })?;
+
+                let value_arr = dict_info.values.as_ref().ok_or_else(|| Error::IO {
+                    message: format!(
+                        "Lance field {} is dictionary type, but misses the dictionary value array",
+                        field.name
+                    ),
+                    location: location!(),
+                })?;
+
+                let data_type = value_arr.data_type();
+                let pos = match data_type {
+                    dt if dt.is_numeric() => {
+                        let mut encoder = PlainEncoder::new(writer, dt);
+                        encoder.encode(&[value_arr]).await?
+                    }
+                    dt if dt.is_binary_like() => {
+                        let mut encoder = BinaryEncoder::new(writer);
+                        encoder.encode(&[value_arr]).await?
+                    }
+                    _ => {
+                        return Err(Error::IO {
+                            message: format!(
+                                "Does not support {} as dictionary value type",
+                                value_arr.data_type()
+                            ),
+                            location: location!(),
+                        });
+                    }
+                };
+                dict_info.offset = pos;
+                dict_info.length = value_arr.len();
+            }
+        }
+    }
+
+    // Write indices if presented.
+    if let Some(indices) = indices.as_ref() {
+        let section = pb::IndexSection {
+            indices: indices.iter().map(|i| i.into()).collect(),
+        };
+        let pos = writer.write_protobuf(&section).await?;
+        manifest.index_section = Some(pos);
+    }
+
+    writer.write_struct(manifest).await
 }
