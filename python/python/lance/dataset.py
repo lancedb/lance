@@ -591,10 +591,15 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Add new columns by computing them based on input data.
 
+        This function will infer the final schema by apply the function against
+        the first row of your dataset.
+
         Parameters
         ----------
         value_func: Callable.
-            A function that takes a RecordBatch as input and returns a RecordBatch.
+            A function that takes a RecordBatch as input and returns a RecordBatch
+            or Pandas DataFrame. This should return only the new columns you wish
+            to add.
         columns: Optional[list[str]].
             If specified, only the columns in this list will be passed to the
             value_func. Otherwise, all columns will be passed to the value_func.
@@ -609,14 +614,14 @@ class LanceDataset(pa.dataset.Dataset):
         >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
         >>> dataset = lance.write_dataset(table, "my_dataset")
         >>> def double_a(batch):
-        ...     return pa.record_batch([[2 * x for x in batch['a']]], ['double_a'])
+        ...     df = batch.to_pandas()
+        ...     return pd.DataFrame({'double_a': 2 * df['a']})
         >>> dataset.add_columns(double_a, ['a'])
         >>> dataset.to_table().to_pandas()
-           a  b double_a
-        0  1  a        2
-        1  2  b        4
-        2  3  c        6
-        3  4  d        8
+           a  b  double_a
+        0  1  a         2
+        1  2  b         4
+        2  3  c         6
 
         See Also
         --------
@@ -624,12 +629,13 @@ class LanceDataset(pa.dataset.Dataset):
             Merge a pre-computed set of columns into the dataset.
         """
         # TODO: support multi-processing or multi-threading
-        # TODO: support returning something other than record batch
         # TODO: support specifying positions of new columns (or else maybe just
         # call this append_columns?)
 
         # Infer the schema based on the first batch
         sample_batch = func(next(iter(self.to_batches(limit=1, columns=columns))))
+        if isinstance(sample_batch, pd.DataFrame):
+            sample_batch = pa.RecordBatch.from_pandas(sample_batch)
         output_schema = sample_batch.schema
         del sample_batch
 
@@ -640,6 +646,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         def wrapped(batch):
             result = func(batch)
+            if isinstance(result, pd.DataFrame):
+                result = pa.RecordBatch.from_pandas(result)
             assert result.schema == output_schema
             return result
 
