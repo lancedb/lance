@@ -15,12 +15,15 @@
 
 import logging
 import re
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
 import pyarrow as pa
 
 from . import LanceDataset
+
+if TYPE_CHECKING:
+    import torch
 
 
 def _normalize_vectors(vectors, ndim):
@@ -124,17 +127,19 @@ def vec_to_table(
 CUDA_REGEX = re.compile(r"^cuda(:\d+)?$")
 
 
-def train_ivf_centroids(
+def train_ivf_centroids_on_accelerator(
     dataset: LanceDataset,
     column: str,
     k: int,
     metric_type: str,
-    accelerator: str,
+    accelerator: Union[str, "torch.Device"],
     *,
     sample_rate: int = 256,
 ) -> np.ndarray:
     """Use accelerator (GPU or MPS) to train kmeans."""
-    if not (CUDA_REGEX.match(accelerator) or accelerator == "mps"):
+    if isinstance(accelerator, str) and (
+        not (CUDA_REGEX.match(accelerator) or accelerator == "mps")
+    ):
         raise ValueError(
             "Train ivf centroids on accelerator: "
             + f"only support 'cuda' as accelerator, got '{accelerator}'."
@@ -148,11 +153,17 @@ def train_ivf_centroids(
     else:
         samples = dataset.sample(sample_size, columns=[column])[column].combine_chunks()
 
-    if CUDA_REGEX.match(accelerator) or accelerator == "mps":
-        logging.info(f"Training IVF partitions using GPU({accelerator})")
-        # Pytorch installation warning will be raised here.
-        from .torch.kmeans import KMeans
+    import torch
 
+    # Pytorch installation warning will be raised here.
+    from .torch.kmeans import KMeans
+
+    if (
+        isinstance(accelerator, torch.device)
+        or CUDA_REGEX.match(accelerator)
+        or accelerator == "mps"
+    ):
+        logging.info(f"Training IVF partitions using GPU({accelerator})")
         kmeans = KMeans(k, metric=metric_type, device=accelerator)
         kmeans.fit(samples)
         return kmeans.centroids.cpu().numpy()

@@ -63,7 +63,11 @@ def pytest_collection_modifyitems(config, items):
         # torch.cuda.is_available will return True on some CI machines even though any
         # attempt to use CUDA will then fail.  torch.cuda.device_count seems to be more
         # reliable
-        if not torch.cuda.is_available or torch.cuda.device_count() <= 0:
+        if (
+            torch.backends.cuda.is_built()
+            and not torch.cuda.is_available
+            or torch.cuda.device_count() <= 0
+        ):
             disable_items_with_mark(
                 items, "cuda", "torch is installed but cuda is not available"
             )
