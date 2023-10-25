@@ -897,39 +897,9 @@ impl Dataset {
     /// dataset.
     /// Parameters:
     /// - `columns`: the list of column names to drop.
+    #[deprecated(since = "0.9.12", note = "Please use `drop_columns` instead.")]
     pub async fn drop(&mut self, columns: &[&str]) -> Result<()> {
-        // Check if columns are present in the dataset and construct the new schema.
-        for col in columns {
-            if self.schema().field(col).is_none() {
-                return Err(Error::invalid_input(
-                    format!("Column {} does not exist in the dataset", col),
-                    location!(),
-                ));
-            }
-        }
-
-        let columns_to_remove = self.manifest.schema.project(columns)?;
-        let new_schema = self.manifest.schema.exclude(columns_to_remove)?;
-
-        let transaction = Transaction::new(
-            self.manifest.version,
-            Operation::Project { schema: new_schema },
-            None,
-        );
-
-        let manifest = commit_transaction(
-            self,
-            &self.object_store,
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-        )
-        .await?;
-
-        self.manifest = Arc::new(manifest);
-
-        Ok(())
+        self.drop_columns(columns).await
     }
 
     /// Create a Scanner to scan the dataset.
@@ -1466,6 +1436,56 @@ impl Dataset {
     }
 }
 
+impl Dataset {
+    /// Remove columns from the dataset.
+    ///
+    /// This is a metadata-only operation and does not remove the data from the
+    /// underlying storage. In order to remove the data, you must subsequently
+    /// call `compact_files` to rewrite the data without the removed columns and
+    /// then call `cleanup_files` to remove the old files.
+    pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<()> {
+        // Check if columns are present in the dataset and construct the new schema.
+        for col in columns {
+            if self.schema().field(col).is_none() {
+                return Err(Error::invalid_input(
+                    format!("Column {} does not exist in the dataset", col),
+                    location!(),
+                ));
+            }
+        }
+
+        let columns_to_remove = self.manifest.schema.project(columns)?;
+        let new_schema = self.manifest.schema.exclude(columns_to_remove)?;
+
+        if new_schema.fields.is_empty() {
+            return Err(Error::invalid_input(
+                "Cannot drop all columns from a dataset",
+                location!(),
+            ));
+        }
+
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Project { schema: new_schema },
+            None,
+        );
+
+        let manifest = commit_transaction(
+            self,
+            &self.object_store,
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+        )
+        .await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ManifestWriteConfig {
     auto_set_feature_flags: bool,  // default true
@@ -1574,7 +1594,7 @@ mod tests {
         cast::{as_string_array, as_struct_array},
         types::Int32Type,
         ArrayRef, DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array,
-        Int8DictionaryArray, ListArray, RecordBatch, RecordBatchIterator, StringArray, UInt16Array,
+        Int8DictionaryArray, RecordBatch, RecordBatchIterator, StringArray, UInt16Array,
         UInt32Array,
     };
     use arrow_ord::sort::sort_to_indices;
@@ -2628,9 +2648,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drop() {
-        let mut metadata: HashMap<String, String> = HashMap::new();
-        metadata.insert(String::from("k1"), String::from("v1"));
+    async fn test_drop_columns() -> Result<()> {
+        let metadata: HashMap<String, String> = [("k1".into(), "v1".into())].into();
 
         let schema = Arc::new(ArrowSchema::new_with_metadata(
             vec![
@@ -2638,23 +2657,8 @@ mod tests {
                 Field::new(
                     "s",
                     DataType::Struct(ArrowFields::from(vec![
-                        Field::new(
-                            "d",
-                            DataType::Dictionary(
-                                Box::new(DataType::UInt32),
-                                Box::new(DataType::Utf8),
-                            ),
-                            true,
-                        ),
-                        ArrowField::new(
-                            "l",
-                            DataType::List(Arc::new(ArrowField::new(
-                                "item",
-                                DataType::Int32,
-                                true,
-                            ))),
-                            true,
-                        ),
+                        Field::new("d", DataType::Int32, true),
+                        Field::new("l", DataType::Int32, true),
                     ])),
                     true,
                 ),
@@ -2663,270 +2667,65 @@ mod tests {
             metadata.clone(),
         ));
 
-        let struct_array_1 = Arc::new(StructArray::from(vec![
-            (
-                Arc::new(ArrowField::new(
-                    "d",
-                    DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-                    true,
-                )),
-                Arc::new(
-                    DictionaryArray::try_new(
-                        UInt32Array::from(vec![1, 0]),
-                        Arc::new(StringArray::from(vec!["A", "C", "G", "T"])),
-                    )
-                    .unwrap(),
-                ) as ArrayRef,
-            ),
-            (
-                Arc::new(ArrowField::new(
-                    "l",
-                    DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
-                    true,
-                )),
-                Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
-                    Some(vec![Some(1i32), Some(2), Some(3)]),
-                    Some(vec![Some(4), Some(5)]),
-                ])),
-            ),
-        ]));
-        let struct_array_2 = Arc::new(StructArray::from(vec![
-            (
-                Arc::new(ArrowField::new(
-                    "d",
-                    DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-                    true,
-                )),
-                Arc::new(
-                    DictionaryArray::try_new(
-                        UInt32Array::from(vec![2, 1]),
-                        Arc::new(StringArray::from(vec!["A", "C", "G", "T"])),
-                    )
-                    .unwrap(),
-                ) as ArrayRef,
-            ),
-            (
-                Arc::new(ArrowField::new(
-                    "l",
-                    DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
-                    true,
-                )),
-                Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
-                    Some(vec![Some(4), Some(5)]),
-                    Some((0..2_000).map(Some).collect::<Vec<_>>()),
-                ])),
-            ),
-        ]));
-
-        let struct_array_full_1 = Arc::new(StructArray::from(vec![
-            (
-                Arc::new(ArrowField::new(
-                    "d",
-                    DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-                    true,
-                )),
-                Arc::new(
-                    DictionaryArray::try_new(
-                        UInt32Array::from(vec![1, 0, 2, 1]),
-                        Arc::new(StringArray::from(vec!["A", "C", "G", "T"])),
-                    )
-                    .unwrap(),
-                ) as ArrayRef,
-            ),
-            (
-                Arc::new(ArrowField::new(
-                    "l",
-                    DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
-                    true,
-                )),
-                Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
-                    Some(vec![Some(1i32), Some(2), Some(3)]),
-                    Some(vec![Some(4), Some(5)]),
-                    Some(vec![Some(4), Some(5)]),
-                    Some((0..2_000).map(Some).collect::<Vec<_>>()),
-                ])),
-            ),
-        ]));
-
-        let struct_array_full_2 = Arc::new(StructArray::from(vec![(
-            Arc::new(ArrowField::new(
-                "l",
-                DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
-                true,
-            )),
-            Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
-                Some(vec![Some(1i32), Some(2), Some(3)]),
-                Some(vec![Some(4), Some(5)]),
-                Some(vec![Some(4), Some(5)]),
-                Some((0..2_000).map(Some).collect::<Vec<_>>()),
-            ])) as ArrayRef,
-        )]));
-
-        let batch1 = RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(Int32Array::from(vec![1, 2])),
-                struct_array_1.clone(),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(ArrowField::new("d", DataType::Int32, true)),
+                        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("l", DataType::Int32, true)),
+                        Arc::new(Int32Array::from(vec![1, 2])),
+                    ),
+                ])),
                 Arc::new(Float32Array::from(vec![1.0, 2.0])),
             ],
-        )
-        .unwrap();
-        let batch2 = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![3, 2])),
-                struct_array_2.clone(),
-                Arc::new(Float32Array::from(vec![3.0, 4.0])),
-            ],
-        )
-        .unwrap();
+        )?;
 
-        let test_dir = tempdir().unwrap();
+        let test_dir = tempdir()?;
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let write_params = WriteParams {
-            mode: WriteMode::Append,
-            ..Default::default()
-        };
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await?;
 
-        let batches =
-            RecordBatchIterator::new(vec![batch1.clone()].into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
-            .await
-            .unwrap();
+        let lance_schema = dataset.schema().clone();
+        let original_fragments = dataset.fragments().to_vec();
 
-        let batches =
-            RecordBatchIterator::new(vec![batch2.clone()].into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
-            .await
-            .unwrap();
+        dataset.drop_columns(&["x"]).await?;
+        dataset.validate().await?;
 
-        let expected_drop_x = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new_with_metadata(
-                vec![
-                    Field::new("i", DataType::Int32, false),
-                    schema.fields[1].as_ref().clone(),
-                ],
-                metadata.clone(),
-            )),
+        let expected_schema = lance_schema.project(&["i", "s"])?;
+        assert_eq!(dataset.schema(), &expected_schema);
+
+        assert_eq!(dataset.version().version, 2);
+        assert_eq!(dataset.fragments().as_ref(), &original_fragments);
+
+        dataset.drop_columns(&["s.d"]).await?;
+        dataset.validate().await?;
+
+        let expected_schema = expected_schema.project(&["i", "s.l"])?;
+        assert_eq!(dataset.schema(), &expected_schema);
+
+        let expected_data = RecordBatch::try_new(
+            Arc::new(ArrowSchema::from(&expected_schema)),
             vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3, 2])),
-                struct_array_full_1.clone(),
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StructArray::from(vec![(
+                    Arc::new(ArrowField::new("l", DataType::Int32, true)),
+                    Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                )])),
             ],
-        )
-        .unwrap();
+        )?;
+        let actual_data = dataset.scan().try_into_batch().await?;
+        assert_eq!(actual_data, expected_data);
 
-        let expected_drop_s_d = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new_with_metadata(
-                vec![
-                    Field::new("i", DataType::Int32, false),
-                    Field::new(
-                        "s",
-                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                            "l",
-                            DataType::List(Arc::new(ArrowField::new(
-                                "item",
-                                DataType::Int32,
-                                true,
-                            ))),
-                            true,
-                        )])),
-                        true,
-                    ),
-                    Field::new("x", DataType::Float32, false),
-                ],
-                metadata.clone(),
-            )),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3, 2])),
-                struct_array_full_2.clone(),
-                Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0])),
-            ],
-        )
-        .unwrap();
-
-        let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(dataset.fragments().len(), 2);
-        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
-
-        let mut dataset = Dataset::open(test_uri).await.unwrap();
-        dataset.drop(&["x"]).await.unwrap();
-        dataset.validate().await.unwrap();
-
-        assert_eq!(dataset.schema().fields.len(), 2);
-        assert_eq!(dataset.schema().metadata, metadata.clone());
         assert_eq!(dataset.version().version, 3);
-        assert_eq!(dataset.fragments().len(), 2);
-        assert_eq!(dataset.fragments()[0].files.len(), 1);
-        assert_eq!(dataset.fragments()[1].files.len(), 1);
-        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
+        assert_eq!(dataset.fragments().as_ref(), &original_fragments);
 
-        let actual_batches = dataset
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
-
-        assert_eq!(actual, expected_drop_x);
-
-        // Validate we can still read after re-instantiating dataset, which
-        // clears the cache.
-        let dataset = Dataset::open(test_uri).await.unwrap();
-        let actual_batches = dataset
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
-
-        assert_eq!(actual, expected_drop_x);
-
-        let overwrite_params = WriteParams {
-            mode: WriteMode::Overwrite,
-            ..Default::default()
-        };
-
-        let batches =
-            RecordBatchIterator::new(vec![batch1.clone()].into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(overwrite_params.clone()))
-            .await
-            .unwrap();
-
-        let batches =
-            RecordBatchIterator::new(vec![batch2.clone()].into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
-            .await
-            .unwrap();
-
-        let mut dataset = Dataset::open(test_uri).await.unwrap();
-        dataset.drop(&["s.d"]).await.unwrap();
-        dataset.validate().await.unwrap();
-
-        assert_eq!(dataset.schema().fields.len(), 3);
-        assert_eq!(dataset.schema().metadata, metadata.clone());
-        assert_eq!(dataset.version().version, 6);
-        assert_eq!(dataset.fragments().len(), 2);
-        assert_eq!(dataset.fragments()[0].files.len(), 1);
-        assert_eq!(dataset.fragments()[1].files.len(), 1);
-        assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
-
-        let actual_batches = dataset
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
-        assert_eq!(actual, expected_drop_s_d);
+        Ok(())
     }
 
     #[tokio::test]

@@ -661,6 +661,12 @@ class LanceDataset(pa.dataset.Dataset):
 
         self._ds.merge(reader, left_on, right_on)
 
+    def drop_columns(self, columns: List[str]):
+        """Drop one or more columns from the dataset"""
+        self._ds.drop_columns(columns)
+        # Indices might have changed
+        self._list_indices_res = None
+
     def delete(self, predicate: Union[str, pa.compute.Expression]):
         """
         Delete rows from the dataset.
