@@ -18,6 +18,7 @@ no-default-features = true
 [dependencies]
 lance-arrow = { workspace = true }
 lance-core = { workspace = true }
+lance-datagen = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
 arrow-arith = { workspace = true }

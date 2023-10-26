@@ -17,12 +17,15 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use datafusion::execution::{
     context::SessionState,
     runtime_env::{RuntimeConfig, RuntimeEnv},
 };
 use datafusion::logical_expr::AggregateFunction;
+use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_plan::expressions;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     display::DisplayableExecutionPlan,
@@ -63,6 +66,46 @@ const DEFAULT_BATCH_READAHEAD: usize = 16;
 // Same as pyarrow Dataset::scanner()
 const DEFAULT_FRAGMENT_READAHEAD: usize = 4;
 
+pub struct Ordering {
+    pub ascending: bool,
+    pub nulls_first: bool,
+    pub column: String,
+}
+
+impl Ordering {
+    pub fn asc_nulls_first(column: String) -> Self {
+        Self {
+            ascending: true,
+            nulls_first: true,
+            column,
+        }
+    }
+
+    pub fn asc_nulls_last(column: String) -> Self {
+        Self {
+            ascending: true,
+            nulls_first: false,
+            column,
+        }
+    }
+
+    pub fn desc_nulls_first(column: String) -> Self {
+        Self {
+            ascending: false,
+            nulls_first: true,
+            column,
+        }
+    }
+
+    pub fn desc_nulls_last(column: String) -> Self {
+        Self {
+            ascending: false,
+            nulls_first: false,
+            column,
+        }
+    }
+}
+
 /// Dataset Scanner
 ///
 /// ```rust,ignore
@@ -99,6 +142,13 @@ pub struct Scanner {
     limit: Option<i64>,
     offset: Option<i64>,
 
+    /// If Some then results will be ordered by ordering
+    ///
+    /// If this is Some then the value of `ordered` is ignored
+    /// since the scan must be determinsitic for this ordering to
+    /// have any value
+    ordering: Option<Ordering>,
+
     nearest: Option<Query>,
 
     /// Scan the dataset with a meta column: "_rowid"
@@ -131,6 +181,7 @@ impl Scanner {
             fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
             limit: None,
             offset: None,
+            ordering: None,
             nearest: None,
             with_row_id: false,
             ordered: true,
@@ -151,6 +202,7 @@ impl Scanner {
             fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
             limit: None,
             offset: None,
+            ordering: None,
             nearest: None,
             with_row_id: false,
             ordered: true,
@@ -338,6 +390,21 @@ impl Scanner {
         self
     }
 
+    pub fn order_by(&mut self, ordering: Option<Ordering>) -> Result<&mut Self> {
+        if let Some(ordering) = &ordering {
+            // Verify early that the field exists
+            self.dataset
+                .schema()
+                .field(&ordering.column)
+                .ok_or(Error::IO {
+                    message: format!("Column {} not found", &ordering.column),
+                    location: location!(),
+                })?;
+        }
+        self.ordering = ordering;
+        Ok(self)
+    }
+
     /// Set whether to use the index if available
     pub fn use_index(&mut self, use_index: bool) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
@@ -491,8 +558,9 @@ impl Scanner {
     ///
     /// 1. Source (from dataset Scan or from index, may include prefilter)
     /// 2. Filter
-    /// 3. Limit / Offset
-    /// 4. Take remaining columns / Projection
+    /// 3. Sort
+    /// 4. Limit / Offset
+    /// 5. Take remaining columns / Projection
     async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         // NOTE: we only support node that have one partition. So any nodes that
         // produce multiple need to be repartitioned to 1.
@@ -524,7 +592,14 @@ impl Scanner {
 
         // Stage 2: filter
         if let Some(predicates) = filter_expr.as_ref() {
-            let columns_in_filter = column_names_in_expr(predicates.as_ref());
+            let mut columns_in_filter = column_names_in_expr(predicates.as_ref());
+            // If we are going to sort then grab the ordering column at the same time we grab
+            // the columns we need for filtering
+            if let Some(ordering) = &self.ordering {
+                if !columns_in_filter.contains(&ordering.column) {
+                    columns_in_filter.push(ordering.column.clone())
+                }
+            }
             let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
             let remaining_schema = filter_schema.exclude(plan.schema().as_ref())?;
             if !remaining_schema.fields.is_empty() {
@@ -534,12 +609,32 @@ impl Scanner {
             plan = Arc::new(FilterExec::try_new(predicates.clone(), plan)?);
         }
 
-        // Stage 3: limit / offset
+        // Stage 3: sort
+        if let Some(ordering) = &self.ordering {
+            let order_by_schema = Arc::new(self.dataset.schema().project(&[&ordering.column])?);
+            let remaining_schema = order_by_schema.exclude(plan.schema().as_ref())?;
+            if !remaining_schema.fields.is_empty() {
+                // We haven't loaded the sort column yet so take it now
+                plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
+            }
+            plan = Arc::new(SortExec::new(
+                vec![PhysicalSortExpr {
+                    expr: expressions::col(ordering.column.as_str(), plan.schema().as_ref())?,
+                    options: SortOptions {
+                        descending: !ordering.ascending,
+                        nulls_first: ordering.nulls_first,
+                    },
+                }],
+                plan,
+            ));
+        }
+
+        // Stage 4: limit / offset
         if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
             plan = self.limit_node(plan);
         }
 
-        // Stage 4: take remaining columns / projection
+        // Stage 5: take remaining columns / projection
         let output_schema = self.output_schema()?;
         let remaining_schema = output_schema.exclude(plan.schema().as_ref())?;
         if !remaining_schema.fields.is_empty() {
@@ -866,6 +961,7 @@ mod test {
     use arrow_select::take;
     use futures::TryStreamExt;
     use lance_core::ROW_ID;
+    use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::vector::DIST_COL;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use tempfile::tempdir;
@@ -1577,6 +1673,82 @@ mod test {
         assert_eq!(output.len(), 2);
         assert_eq!(output[0], batch2);
         assert_eq!(output[1], batch1);
+    }
+
+    #[tokio::test]
+    async fn test_scan_sort() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = gen()
+            .col(
+                Some("int".to_string()),
+                array::cycle::<Int32Type>(vec![5, 4, 1, 2, 3]),
+            )
+            .col(
+                Some("str".to_string()),
+                array::cycle_utf8_literals(&["a", "b", "c", "e", "d"]),
+            );
+
+        let sorted_by_int = gen()
+            .col(
+                Some("int".to_string()),
+                array::cycle::<Int32Type>(vec![1, 2, 3, 4, 5]),
+            )
+            .col(
+                Some("str".to_string()),
+                array::cycle_utf8_literals(&["c", "e", "d", "b", "a"]),
+            )
+            .into_batch_rows(RowCount::from(5))
+            .unwrap();
+
+        let sorted_by_str = gen()
+            .col(
+                Some("int".to_string()),
+                array::cycle::<Int32Type>(vec![5, 4, 1, 3, 2]),
+            )
+            .col(
+                Some("str".to_string()),
+                array::cycle_utf8_literals(&["a", "b", "c", "d", "e"]),
+            )
+            .into_batch_rows(RowCount::from(5))
+            .unwrap();
+
+        Dataset::write(
+            data.into_reader_rows(RowCount::from(5), BatchCount::from(1)),
+            test_uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let dataset = Arc::new(Dataset::open(test_uri).await.unwrap());
+
+        let batches_by_int = dataset
+            .scan()
+            .order_by(Some(Ordering::asc_nulls_first("int".to_string())))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches_by_int[0], sorted_by_int);
+
+        let batches_by_str = dataset
+            .scan()
+            .order_by(Some(Ordering::asc_nulls_first("str".to_string())))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches_by_str[0], sorted_by_str);
     }
 
     /// Test scan with filter.
