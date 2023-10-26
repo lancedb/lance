@@ -27,6 +27,7 @@ use uuid::Uuid;
 pub(crate) mod append;
 pub(crate) mod cache;
 pub(crate) mod prefilter;
+pub mod scalar;
 pub mod vector;
 
 use crate::dataset::transaction::{Operation, Transaction};
@@ -39,7 +40,7 @@ pub use lance_index::pb;
 
 use self::vector::{build_vector_index, VectorIndexParams};
 
-/// Trait of a secondary index.
+/// Common trait for both scalar & vector indices
 pub(crate) trait Index: Send + Sync {
     /// Cast to [Any].
     fn as_any(&self) -> &dyn Any;
@@ -52,7 +53,6 @@ pub(crate) trait Index: Send + Sync {
 /// Index Type
 pub enum IndexType {
     // Preserve 0-100 for simple indices.
-
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100,

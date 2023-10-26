@@ -73,18 +73,21 @@ lance.write_dataset(parquet, "/tmp/test.lance")
 ```
 
 **Reading Lance data**
+
 ```python
 dataset = lance.dataset("/tmp/test.lance")
 assert isinstance(dataset, pa.dataset.Dataset)
 ```
 
 **Pandas**
+
 ```python
 df = dataset.to_table().to_pandas()
 df
 ```
 
 **DuckDB**
+
 ```python
 import duckdb
 
@@ -170,8 +173,9 @@ Support both CPUs (``x86_64`` and ``arm``) and GPU (``Nvidia (cuda)`` and ``Appl
 
 **Fast updates** (ROADMAP): Updates will be supported via write-ahead logs.
 
-**Rich secondary indices** (ROADMAP):
-  - Inverted index for fuzzy search over many label / annotation fields.
+**Rich scalar indices** (ROADMAP):
+
+* Inverted index for fuzzy search over many label / annotation fields.
 
 ## Benchmarks
 
@@ -193,7 +197,7 @@ We create a Lance dataset using the Oxford Pet dataset to do some preliminary pe
 
 ![](docs/lance_perf.png)
 
-## Why are you building yet another data format?!
+## Why are you building yet another data format?
 
 The machine learning development cycle involves the steps:
 
@@ -236,6 +240,7 @@ A comparison of different data formats in each stage of ML development cycle.
 ## Community Highlights
 
 Lance is currently used in production by:
+
 * [LanceDB](https://github.com/lancedb/lancedb), a serverless, low-latency vector database for ML applications
 * Self-driving car company for large-scale storage, retrieval and processing of multi-modal data.
 * E-commerce company for billion-scale+ vector personalized search.

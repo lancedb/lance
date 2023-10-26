@@ -14,6 +14,7 @@
 
 //! Lance secondary index library
 
+pub mod scalar;
 pub mod vector;
 
 pub mod pb {
