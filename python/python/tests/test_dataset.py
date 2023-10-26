@@ -19,6 +19,7 @@ import platform
 import re
 import time
 import uuid
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -664,37 +665,38 @@ def test_merge_data(tmp_path: Path):
     assert dataset.to_table() == expected
 
 
-def test_add_columns(tmp_path):
+# Test function for test_add_columns.
+def double_a(batch):
+    assert batch.schema.names == ["a"]
+    return pa.record_batch(
+        [pa.array([2 * x.as_py() for x in batch["a"]])], ["double_a"]
+    )
+
+
+@pytest.mark.parametrize(
+    "pool_executor",
+    [
+        None,
+        ProcessPoolExecutor(2),
+        ThreadPoolExecutor(2),
+    ],
+    ids=["no_pool", "process_pool", "thread_pool"],
+)
+def test_add_columns(tmp_path, pool_executor):
     tab = pa.table({"a": range(100), "b": range(100)})
     dataset = lance.write_dataset(
         tab, tmp_path / "dataset", mode="append", max_rows_per_file=25
     )
 
-    times_called = 0
-
-    def double_a(batch):
-        nonlocal times_called
-        assert batch.schema.names == ["a"]
-        times_called += 1
-        return pa.record_batch(
-            [pa.array([2 * x.as_py() for x in batch["a"]])], ["double_a"]
-        )
-
-    dataset.add_columns(double_a, ["a"])
-
-    # one for each batch (4) plus once for schema inference.
-    assert times_called == 5
+    dataset.add_columns(double_a, ["a"], pool_executor=pool_executor)
 
     expected = tab.append_column("double_a", pa.array([2 * x for x in range(100)]))
     assert expected == dataset.to_table()
 
     # Check: errors if produces inconsistent schema
-    times_called = 0
-
     def make_new_col(batch):
-        nonlocal times_called
-        times_called += 1
-        return pa.record_batch([batch["a"]], [f"{times_called}"])
+        col_name = str(uuid.uuid4())
+        return pa.record_batch([batch["a"]], [col_name])
 
     with pytest.raises(AssertionError):
         dataset.add_columns(make_new_col, ["a"])

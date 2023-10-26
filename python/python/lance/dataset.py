@@ -20,9 +20,10 @@ import os
 import random
 import warnings
 from abc import ABC, abstractmethod
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -587,6 +588,7 @@ class LanceDataset(pa.dataset.Dataset):
         columns: Optional[List[str]] = None,
         *,
         commit_lock: Optional[CommitLock] = None,
+        pool_executor: Optional[Union[ProcessPoolExecutor, ThreadPoolExecutor]] = None,
     ):
         """
         Add new columns by computing them based on input data.
@@ -606,6 +608,9 @@ class LanceDataset(pa.dataset.Dataset):
         commit_lock : CommitLock, optional
             A custom commit lock.  Only needed if your object store does not support
             atomic commits.  See the user guide for more details.
+        pool_executor: ProcessPoolExecutor or ThreadPoolExecutor, optional
+            A process or thread pool to run the function concurrently. This will
+            write out the data in parallel across fragments.
 
         Examples
         --------
@@ -628,7 +633,6 @@ class LanceDataset(pa.dataset.Dataset):
         LanceDataset.Merge :
             Merge a pre-computed set of columns into the dataset.
         """
-        # TODO: support multi-processing or multi-threading
         # TODO: support specifying positions of new columns (or else maybe just
         # call this append_columns?)
 
@@ -644,18 +648,18 @@ class LanceDataset(pa.dataset.Dataset):
         for field in output_schema:
             new_schema = new_schema.append(field)
 
-        def wrapped(batch):
-            result = func(batch)
-            if isinstance(result, pd.DataFrame):
-                result = pa.RecordBatch.from_pandas(result)
-            assert result.schema == output_schema
-            return result
+        wrapped = partial(_validated_batch_func, func, output_schema)
 
-        fragments = self.get_fragments()
-        new_fragments = []
-        for fragment in fragments:
-            new_frag = fragment.add_columns(wrapped, columns)
-            new_fragments.append(new_frag)
+        if pool_executor:
+            task = partial(
+                LanceFragment.add_columns, value_func=wrapped, columns=columns
+            )
+            new_fragments = list(pool_executor.map(task, self.get_fragments()))
+        else:
+            new_fragments = [
+                fragment.add_columns(wrapped, columns)
+                for fragment in self.get_fragments()
+            ]
 
         operation = LanceOperation.Merge(
             new_fragments,
@@ -1859,3 +1863,13 @@ def _casting_recordbatch_iter(
                     f"Got:\n{batch.schema}"
                 )
         yield batch
+
+
+# this is used in LanceDataset.add_columns, but must be defined here so that
+# it can be pickled.
+def _validated_batch_func(func, output_schema, batch):
+    result = func(batch)
+    if isinstance(result, pd.DataFrame):
+        result = pa.RecordBatch.from_pandas(result)
+    assert result.schema == output_schema
+    return result
