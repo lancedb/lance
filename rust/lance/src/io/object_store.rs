@@ -654,10 +654,10 @@ impl ObjectStore {
     /// unmodified_since can be specified to only return files that have not been modified since the given time.
     pub async fn read_dir_all(
         &self,
-        dir_path: impl Into<&Path>,
+        dir_path: impl Into<&Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
     ) -> Result<BoxStream<Result<ObjectMeta>>> {
-        self.inner.read_dir_all(dir_path, unmodified_since)
+        self.inner.read_dir_all(dir_path, unmodified_since).await
     }
 
     /// Remove a directory recursively.

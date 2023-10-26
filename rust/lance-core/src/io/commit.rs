@@ -47,7 +47,7 @@ use snafu::{location, Location};
 
 #[cfg(feature = "dynamodb")]
 mod dynamodb;
-mod external_manifest;
+pub mod external_manifest;
 
 use crate::format::{Index, Manifest};
 use crate::io::object_store::ObjectStoreExt;
@@ -71,7 +71,7 @@ fn manifest_path(base: &Path, version: u64) -> Path {
         .child(format!("{version}.{MANIFEST_EXTENSION}"))
 }
 
-fn latest_manifest_path(base: &Path) -> Path {
+pub fn latest_manifest_path(base: &Path) -> Path {
     base.child(LATEST_MANIFEST_NAME)
 }
 
@@ -448,5 +448,17 @@ impl CommitHandler for RenameCommitHandler {
 impl Debug for RenameCommitHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RenameCommitHandler").finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitConfig {
+    pub num_retries: u32,
+    // TODO: add isolation_level
+}
+
+impl Default for CommitConfig {
+    fn default() -> Self {
+        Self { num_retries: 5 }
     }
 }

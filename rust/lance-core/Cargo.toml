@@ -49,6 +49,7 @@ mock_instant.workspace = true
 arrow = "47.0"
 rand.workspace = true
 tempfile.workspace = true
+lance-testing.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

@@ -33,25 +33,17 @@
 //! terms of a lock. The trait [CommitLock] can be implemented as a simpler
 //! alternative to [CommitHandler].
 
-use std::fmt::Debug;
-use std::future;
 use std::sync::Arc;
 
-#[cfg(feature = "dynamodb")]
-pub(crate) mod dynamodb;
-pub(crate) mod external_manifest;
-
 use futures::future::Either;
-use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{
     format::{pb, Index, Manifest},
-    io::commit::{CommitError, CommitHandler, ManifestWriter},
+    io::commit::{CommitConfig, CommitError},
     Error, Result,
 };
 use object_store::path::Path;
 use prost::Message;
-use snafu::{location, Location};
 
 use super::deletion::read_deletion_file;
 use super::ObjectStore;
@@ -61,115 +53,7 @@ use crate::dataset::{write_manifest_file, ManifestWriteConfig};
 use crate::format::{DeletionFile, Fragment};
 use crate::Dataset;
 
-const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
-const VERSIONS_DIR: &str = "_versions";
-const MANIFEST_EXTENSION: &str = "manifest";
-
-/// Get the manifest file path for a version.
-fn manifest_path(base: &Path, version: u64) -> Path {
-    base.child(VERSIONS_DIR)
-        .child(format!("{version}.{MANIFEST_EXTENSION}"))
-}
-
-fn latest_manifest_path(base: &Path) -> Path {
-    base.child(LATEST_MANIFEST_NAME)
-}
-
-/// Get the latest manifest path
-async fn current_manifest_path(object_store: &ObjectStore, base: &Path) -> Result<Path> {
-    // TODO: list gives us the size, so we could also return the size of the manifest.
-    // That avoids a HEAD request later.
-
-    // We use `list_with_delimiter` to avoid listing the contents of child directories.
-    let manifest_files = object_store
-        .inner
-        .list_with_delimiter(Some(&base.child(VERSIONS_DIR)))
-        .await?;
-
-    let current = manifest_files
-        .objects
-        .into_iter()
-        .map(|meta| meta.location)
-        .filter(|path| {
-            path.filename().is_some() && path.filename().unwrap().ends_with(MANIFEST_EXTENSION)
-        })
-        .filter_map(|path| {
-            let version = path
-                .filename()
-                .unwrap()
-                .split_once('.')
-                .and_then(|(version_str, _)| version_str.parse::<u64>().ok())?;
-            Some((version, path))
-        })
-        .max_by_key(|(version, _)| *version)
-        .map(|(_, path)| path);
-
-    if let Some(path) = current {
-        Ok(path)
-    } else {
-        Err(Error::NotFound {
-            uri: manifest_path(base, 1).to_string(),
-            location: location!(),
-        })
-    }
-}
-
-fn make_staging_manifest_path(base: &Path) -> Result<Path> {
-    let id = uuid::Uuid::new_v4().to_string();
-    Path::parse(format!("{base}-{id}")).map_err(|e| crate::Error::IO {
-        message: format!("failed to parse path: {}", e),
-        location: location!(),
-    })
-}
-
-async fn list_manifests<'a>(
-    base_path: &Path,
-    object_store: &'a ObjectStore,
-) -> Result<BoxStream<'a, Result<Path>>> {
-    let base_path = base_path.clone();
-    Ok(object_store
-        .read_dir_all(&base_path.child(VERSIONS_DIR), None)
-        .await?
-        .try_filter_map(|obj_meta| {
-            if obj_meta.location.extension() == Some("manifest") {
-                future::ready(Ok(Some(obj_meta.location)))
-            } else {
-                future::ready(Ok(None))
-            }
-        })
-        .boxed())
-}
-
-async fn write_latest_manifest(
-    from_path: &Path,
-    base_path: &Path,
-    object_store: &ObjectStore,
-) -> Result<()> {
-    let latest_path = latest_manifest_path(base_path);
-    let staging_path = make_staging_manifest_path(from_path)?;
-    object_store
-        .inner
-        .copy(from_path, &staging_path)
-        .await
-        .map_err(|err| CommitError::OtherError(err.into()))?;
-    object_store
-        .inner
-        .rename(&staging_path, &latest_path)
-        .await?;
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-pub struct CommitConfig {
-    pub num_retries: u32,
-    // TODO: add isolation_level
-}
-
-impl Default for CommitConfig {
-    fn default() -> Self {
-        Self { num_retries: 5 }
-    }
-}
+pub use lance_core::io::commit::latest_manifest_path;
 
 /// Read the transaction data from a transaction file.
 async fn read_transaction_file(
@@ -487,6 +371,10 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::future::join_all;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::io::commit::{
+        CommitError, CommitHandler, CommitLease, CommitLock, RenameCommitHandler,
+        UnsafeCommitHandler,
+    };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
 
