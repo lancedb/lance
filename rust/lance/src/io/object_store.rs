@@ -16,7 +16,6 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::future;
 use std::path::Path as StdPath;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -43,14 +42,17 @@ use tokio::{io::AsyncWriteExt, sync::RwLock};
 use url::Url;
 
 use self::tracing::ObjectStoreTracingExt;
+use lance_core::io::object_store::ObjectStoreExt;
 use lance_core::{
     error::{Error, Result},
-    io::{CloudObjectReader, ObjectWriter, Reader},
+    io::{
+        commit::{CommitHandler, CommitLock, RenameCommitHandler, UnsafeCommitHandler},
+        CloudObjectReader, ObjectWriter, Reader,
+    },
 };
 
 #[cfg(feature = "dynamodb")]
 use super::commit::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore};
-use super::commit::{CommitHandler, CommitLock, RenameCommitHandler, UnsafeCommitHandler};
 use super::local::LocalObjectReader;
 
 mod tracing;
@@ -655,13 +657,7 @@ impl ObjectStore {
         dir_path: impl Into<&Path>,
         unmodified_since: Option<DateTime<Utc>>,
     ) -> Result<BoxStream<Result<ObjectMeta>>> {
-        let mut output = self.inner.list(Some(dir_path.into())).await?;
-        if let Some(unmodified_since_val) = unmodified_since {
-            output = output
-                .try_filter(move |file| future::ready(file.last_modified < unmodified_since_val))
-                .boxed();
-        }
-        Ok(output.map_err(|e| e.into()).boxed())
+        self.inner.read_dir_all(dir_path, unmodified_since)
     }
 
     /// Remove a directory recursively.

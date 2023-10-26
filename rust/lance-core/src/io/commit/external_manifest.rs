@@ -20,19 +20,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use log::warn;
-use object_store::path::Path;
+use object_store::{path::Path, ObjectStore};
 use snafu::{location, Location};
 
-use crate::format::{Index, Manifest};
-use crate::io::commit::{CommitError, CommitHandler, ManifestWriter};
-use crate::io::ObjectStore;
-
-use crate::{Error, Result};
-
 use super::{
-    current_manifest_path, make_staging_manifest_path, manifest_path, parse_version_from_path,
-    write_latest_manifest, MANIFEST_EXTENSION,
+    current_manifest_path, make_staging_manifest_path, manifest_path, write_latest_manifest,
+    MANIFEST_EXTENSION,
 };
+use crate::format::{Index, Manifest};
+use crate::io::{
+    commit::{parse_version_from_path, CommitError, CommitHandler, ManifestWriter},
+    object_store::ObjectStoreExt,
+};
+use crate::{Error, Result};
 
 /// External manifest store
 ///
@@ -77,8 +77,8 @@ impl CommitHandler for ExternalManifestCommitHandler {
     async fn resolve_latest_version(
         &self,
         base_path: &Path,
-        object_store: &ObjectStore,
-    ) -> std::result::Result<Path, crate::Error> {
+        object_store: &dyn ObjectStore,
+    ) -> std::result::Result<Path, Error> {
         let version = self
             .external_manifest_store
             .get_latest_version(base_path.as_ref())
@@ -98,9 +98,8 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 let manifest_path = Path::parse(path)?;
                 let staging = make_staging_manifest_path(&manifest_path)?;
                 // TODO: remove copy-rename once we upgrade object_store crate
-                object_store.inner.copy(&manifest_path, &staging).await?;
+                object_store.copy(&manifest_path, &staging).await?;
                 object_store
-                    .inner
                     .rename(&staging, &object_store_manifest_path)
                     .await?;
 
@@ -127,7 +126,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
     async fn resolve_latest_version_id(
         &self,
         base_path: &Path,
-        object_store: &ObjectStore,
+        object_store: &dyn ObjectStore,
     ) -> std::result::Result<u64, crate::Error> {
         let version = self
             .external_manifest_store
@@ -144,7 +143,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         &self,
         base_path: &Path,
         version: u64,
-        object_store: &ObjectStore,
+        object_store: &dyn object_store::ObjectStore,
     ) -> std::result::Result<Path, crate::Error> {
         let path_res = self
             .external_manifest_store
@@ -193,13 +192,9 @@ impl CommitHandler for ExternalManifestCommitHandler {
         // as the content is immutable and copy is atomic
         // We can't use `copy_if_not_exists` here because not all store supports it
         object_store
-            .inner
             .copy(&Path::parse(path)?, &staging_path)
             .await?;
-        object_store
-            .inner
-            .rename(&staging_path, &manifest_path)
-            .await?;
+        object_store.rename(&staging_path, &manifest_path).await?;
 
         // finalize the external store
         self.external_manifest_store
@@ -214,7 +209,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
         base_path: &Path,
-        object_store: &ObjectStore,
+        object_store: &dyn object_store::ObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError> {
         // path we get here is the path to the manifest we want to write
@@ -234,7 +229,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
             .map_err(|_| CommitError::CommitConflict {})?;
 
         // step 4: copy the manifest to the final location
-        object_store.inner.copy(
+        object_store.copy(
             &staging_path,
             &path,
         ).await.map_err(|e| CommitError::OtherError(
