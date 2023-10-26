@@ -466,8 +466,8 @@ impl Dataset {
         Ok(())
     }
 
-    fn count_deleted_rows(self_: PyRef<'_, Self>) -> usize {
-        self_.ds.count_deleted_rows()
+    fn count_deleted_rows(&self) -> usize {
+        self.ds.count_deleted_rows()
     }
 
     fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
@@ -651,12 +651,12 @@ impl Dataset {
         Ok(())
     }
 
-    fn count_fragments(self_: PyRef<'_, Self>) -> usize {
-        self_.ds.count_fragments()
+    fn count_fragments(&self) -> usize {
+        self.ds.count_fragments()
     }
 
-    fn num_small_files(self_: PyRef<'_, Self>, max_rows_per_group: usize) -> usize {
-        self_.ds.num_small_files(max_rows_per_group)
+    fn num_small_files(&self, max_rows_per_group: usize) -> usize {
+        self.ds.num_small_files(max_rows_per_group)
     }
 
     fn get_fragments(self_: PyRef<'_, Self>) -> PyResult<Vec<FileFragment>> {
@@ -679,16 +679,14 @@ impl Dataset {
         }
     }
 
-    fn count_unindexed_rows(self_: PyRef<'_, Self>, index_name: String) -> PyResult<Option<usize>> {
-        let idx = RT.block_on(None, self_.ds.load_index_by_name(index_name.as_str()))?;
+    fn count_unindexed_rows(&self, index_name: String) -> PyResult<Option<usize>> {
+        let idx = RT.block_on(None, self.ds.load_index_by_name(index_name.as_str()))?;
         if let Some(index) = idx {
             RT.block_on(
                 None,
-                self_
-                    .ds
+                self.ds
                     .count_unindexed_rows(index.uuid.to_string().as_str()),
-            )
-            .map_err(|err| PyIOError::new_err(err.to_string()))?
+            )?
             .map_err(|err| PyIOError::new_err(err.to_string()))
         } else {
             Err(PyIOError::new_err(format!(
@@ -698,14 +696,13 @@ impl Dataset {
         }
     }
 
-    fn count_indexed_rows(self_: PyRef<'_, Self>, index_name: String) -> PyResult<Option<usize>> {
-        let idx = RT.block_on(None, self_.ds.load_index_by_name(index_name.as_str()))?;
+    fn count_indexed_rows(&self, index_name: String) -> PyResult<Option<usize>> {
+        let idx = RT.block_on(None, self.ds.load_index_by_name(index_name.as_str()))?;
         if let Some(index) = idx {
             RT.block_on(
                 None,
-                self_.ds.count_indexed_rows(index.uuid.to_string().as_str()),
-            )
-            .map_err(|err| PyIOError::new_err(err.to_string()))?
+                self.ds.count_indexed_rows(index.uuid.to_string().as_str()),
+            )?
             .map_err(|err| PyIOError::new_err(err.to_string()))
         } else {
             Err(PyIOError::new_err(format!(
