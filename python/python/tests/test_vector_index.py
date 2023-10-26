@@ -309,16 +309,18 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
             "nbits": 8,
             "num_sub_vectors": 8,
         },
+        "num_indexed_rows": 1000,
+        "num_unindexed_rows": 0,
     }
 
     with pytest.raises(KeyError, match='Index "non-existent_idx" not found'):
-        assert dataset_with_index.index_statistics("non-existent_idx")
+        assert dataset_with_index.stats.index_stats("non-existent_idx")
     with pytest.raises(KeyError, match='Index "" not found'):
-        assert dataset_with_index.index_statistics("")
+        assert dataset_with_index.stats.index_stats("")
     with pytest.raises(TypeError):
-        dataset_with_index.index_statistics()
+        dataset_with_index.stats.index_stats()
 
-    actual_statistics = dataset_with_index.index_statistics("vector_idx")
+    actual_statistics = dataset_with_index.stats.index_stats("vector_idx")
     partitions = actual_statistics.pop("partitions")
     assert actual_statistics == expected_statistics
 

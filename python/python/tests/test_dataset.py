@@ -364,6 +364,16 @@ def test_polar_scan(tmp_path: Path):
     tm.assert_frame_equal(polars_df.collect().to_pandas(), df)
 
 
+def test_count_fragments(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    count_fragments = dataset.stats.dataset_stats()["num_fragments"]
+    assert count_fragments == 1
+
+
 def test_get_fragments(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -514,6 +524,16 @@ def test_delete_with_commit(tmp_path: Path):
 
     tbl = dataset.to_table()
     assert tbl == half_table
+
+
+def test_count_deleted_rows(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+    dataset.delete("a >= 50")
+
+    assert dataset.stats.dataset_stats()["num_deleted_rows"] == 50
 
 
 def test_restore_with_commit(tmp_path: Path):
@@ -882,3 +902,38 @@ def test_scan_with_row_ids(tmp_path: Path):
 
     tbl2 = ds._take_rows(row_ids)
     assert tbl2["a"] == tbl["a"]
+
+
+def test_count_index_rows(tmp_path: Path):
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), 32), False)])
+    table = pa.Table.from_pydict(
+        {"a": [[float(i) for i in range(32)] for _ in range(512)]}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    # assert we return None for index name that doesn't exist
+    index_name = "a_idx"
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_unindexed_rows"]
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_indexed_rows"]
+
+    # create index and assert no rows are uncounted
+    dataset.create_index(
+        "a", "IVF_PQ", name=index_name, num_partitions=2, num_sub_vectors=1
+    )
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 0
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+
+    # append some data
+    new_table = pa.Table.from_pydict(
+        {"a": [[float(i) for i in range(32)] for _ in range(512)]}, schema=schema
+    )
+    dataset = lance.write_dataset(new_table, base_dir, mode="append")
+
+    # assert rows added since index was created are uncounted
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 512
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
