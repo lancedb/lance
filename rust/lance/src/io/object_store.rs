@@ -46,14 +46,17 @@ use lance_core::io::object_store::ObjectStoreExt;
 use lance_core::{
     error::{Error, Result},
     io::{
-        commit::{CommitHandler, CommitLock, RenameCommitHandler, UnsafeCommitHandler},
+        commit::{
+            external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
+            CommitHandler, CommitLock, RenameCommitHandler, UnsafeCommitHandler,
+        },
         CloudObjectReader, ObjectWriter, Reader,
     },
 };
 
-#[cfg(feature = "dynamodb")]
-use super::commit::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore};
 use super::local::LocalObjectReader;
+#[cfg(feature = "dynamodb")]
+pub use lance_core::io::commit::dynamodb;
 
 mod tracing;
 
@@ -249,8 +252,7 @@ async fn build_dynamodb_external_store(
     use std::env;
 
     use aws_sdk_dynamodb::{config::Region, Client};
-
-    use super::commit::dynamodb::DynamoDBExternalManifestStore;
+    use lance_core::io::commit::dynamodb::DynamoDBExternalManifestStore;
 
     let dynamodb_config = aws_sdk_dynamodb::config::Builder::new()
         .region(Some(Region::new(region.to_string())))

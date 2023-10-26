@@ -26,12 +26,12 @@ use aws_sdk_dynamodb::operation::{
 use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
 use aws_sdk_dynamodb::Client;
 use snafu::OptionExt;
+use snafu::{location, Location};
 use tokio::sync::RwLock;
 
 use crate::error::{IOSnafu, NotFoundSnafu};
 use crate::io::commit::external_manifest::ExternalManifestStore;
 use crate::{Error, Result};
-use snafu::{location, Location};
 
 // TODO: re-enable after migration is done.
 //

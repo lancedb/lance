@@ -44,6 +44,7 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 mock_instant.workspace = true
+aws-sdk-dynamodb = { workspace = true, optional = true }
 
 [dev-dependencies]
 arrow = "47.0"
@@ -53,3 +54,7 @@ lance-testing.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
+
+[features]
+dynamodb = ["aws-sdk-dynamodb"]
+dynamodb_tests = ["dynamodb"]

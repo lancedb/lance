@@ -46,7 +46,7 @@ use object_store::{path::Path, Error as ObjectStoreError, ObjectStore};
 use snafu::{location, Location};
 
 #[cfg(feature = "dynamodb")]
-mod dynamodb;
+pub mod dynamodb;
 pub mod external_manifest;
 
 use crate::format::{Index, Manifest};
