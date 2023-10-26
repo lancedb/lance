@@ -120,7 +120,7 @@ tracing-chrome = "0.7.1"
 cli = ["clap"]
 # opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
 tensorflow = ["tfrecord"]
-dynamodb = ["lance-core/dynamodb"]
+dynamodb = ["lance-core/dynamodb", "aws-sdk-dynamodb"]
 
 [[bin]]
 name = "lq"

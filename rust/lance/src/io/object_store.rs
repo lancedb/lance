@@ -54,6 +54,10 @@ use lance_core::{
 use super::local::LocalObjectReader;
 #[cfg(feature = "dynamodb")]
 pub use lance_core::io::commit::dynamodb;
+#[cfg(feature = "dynamodb")]
+use lance_core::io::commit::external_manifest::{
+    ExternalManifestCommitHandler, ExternalManifestStore,
+};
 
 mod tracing;
 
