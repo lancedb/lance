@@ -66,7 +66,7 @@ pub type ManifestWriter = for<'a> fn(
 ) -> BoxFuture<'a, Result<()>>;
 
 /// Get the manifest file path for a version.
-fn manifest_path(base: &Path, version: u64) -> Path {
+pub fn manifest_path(base: &Path, version: u64) -> Path {
     base.child(VERSIONS_DIR)
         .child(format!("{version}.{MANIFEST_EXTENSION}"))
 }

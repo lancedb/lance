@@ -46,10 +46,7 @@ use lance_core::io::object_store::ObjectStoreExt;
 use lance_core::{
     error::{Error, Result},
     io::{
-        commit::{
-            external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
-            CommitHandler, CommitLock, RenameCommitHandler, UnsafeCommitHandler,
-        },
+        commit::{CommitHandler, CommitLock, RenameCommitHandler, UnsafeCommitHandler},
         CloudObjectReader, ObjectWriter, Reader,
     },
 };

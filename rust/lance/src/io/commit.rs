@@ -53,6 +53,7 @@ use crate::dataset::{write_manifest_file, ManifestWriteConfig};
 use crate::format::{DeletionFile, Fragment};
 use crate::Dataset;
 
+mod external_manifest;
 pub use lance_core::io::commit::latest_manifest_path;
 
 /// Read the transaction data from a transaction file.

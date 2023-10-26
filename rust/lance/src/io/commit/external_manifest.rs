@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// Keep the tests in `lance` crate because it has dependency on [Dataset].
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
@@ -20,18 +21,17 @@ mod test {
     use async_trait::async_trait;
     use futures::{future::join_all, StreamExt, TryStreamExt};
     use lance_core::{
-        io::commit::{external_manifest::*, CommitHandler},
-        Error,
+        io::commit::{external_manifest::*, latest_manifest_path, manifest_path, CommitHandler},
+        Error, Result,
     };
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
     use snafu::{location, Location};
     use tokio::sync::Mutex;
 
-    use crate::io::commit::manifest_path;
     use crate::{
         dataset::{ReadParams, WriteMode, WriteParams},
-        io::{commit::latest_manifest_path, object_store::ObjectStoreParams},
+        io::object_store::ObjectStoreParams,
         Dataset,
     };
 
