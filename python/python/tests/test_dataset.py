@@ -400,7 +400,7 @@ def test_pickle_fragment(tmp_path: Path):
     assert fragment.to_table() == unpickled.to_table()
 
 
-def test_add_columns(tmp_path: Path):
+def test_fragment_add_columns(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
     lance.write_dataset(table, base_dir)
