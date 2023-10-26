@@ -391,13 +391,18 @@ impl ArrayGenerator for RandomBinaryGenerator {
             iter::repeat(self.bytes_per_element.0 as usize).take(length.0 as usize),
         );
         if self.scale_to_utf8 {
-            Ok(Arc::new(arrow_array::StringArray::new_unchecked(
-                offsets, bytes, None,
-            )))
+            // This is safe because we are only using printable characters
+            unsafe {
+                Ok(Arc::new(arrow_array::StringArray::new_unchecked(
+                    offsets, bytes, None,
+                )))
+            }
         } else {
-            Ok(Arc::new(arrow_array::BinaryArray::new(
-                offsets, bytes, None,
-            )))
+            unsafe {
+                Ok(Arc::new(arrow_array::BinaryArray::new_unchecked(
+                    offsets, bytes, None,
+                )))
+            }
         }
     }
 
