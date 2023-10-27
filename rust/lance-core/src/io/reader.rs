@@ -1031,20 +1031,17 @@ mod tests {
     use crate::io::deletion::DeletionVector;
     use crate::io::object_store::ObjectStore;
     use crate::io::{write_manifest, WriteExt};
+    use arrow_array::Int32Array;
     use arrow_array::{
-        builder::{
-            Int32Builder, LargeListBuilder, ListBuilder, StringBuilder, StringDictionaryBuilder,
-        },
+        builder::{Int32Builder, LargeListBuilder, ListBuilder, StringBuilder},
         cast::{as_string_array, as_struct_array},
         types::{Int32Type, UInt8Type},
         Array, BooleanArray, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray,
         NullArray, StringArray, StructArray, UInt32Array, UInt8Array,
     };
-    use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
     use rand::{distributions::Alphanumeric, Rng};
     use roaring::RoaringBitmap;
-    use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
 
     use crate::io::FileWriter;
@@ -1479,66 +1476,6 @@ mod tests {
             ),
         ]))
     }
-
-    #[tokio::test]
-    async fn test_read_struct_of_dictionary_arrays() {
-        let test_dir = tempdir().unwrap();
-
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "s",
-            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                "d",
-                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-                true,
-            )])),
-            true,
-        )]));
-
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        for _ in 1..2 {
-            let mut dict_builder = StringDictionaryBuilder::<Int32Type>::new();
-            dict_builder.append("a").unwrap();
-            dict_builder.append("b").unwrap();
-            dict_builder.append("c").unwrap();
-            dict_builder.append("d").unwrap();
-
-            let struct_array = Arc::new(StructArray::from(vec![(
-                Arc::new(ArrowField::new(
-                    "d",
-                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-                    true,
-                )),
-                Arc::new(dict_builder.finish()) as ArrayRef,
-            )]));
-
-            let batch =
-                RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
-            batches.push(batch);
-        }
-
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let batch_reader =
-            RecordBatchIterator::new(batches.clone().into_iter().map(Ok), arrow_schema.clone());
-        // Dataset::write(batch_reader, test_uri, Some(WriteParams::default()))
-        //     .await
-        //     .unwrap();
-
-        // let _result = scan_dataset(test_uri).await.unwrap();
-
-        // assert_eq!(batches, _result);
-    }
-
-    // async fn scan_dataset(uri: &str) -> Result<Vec<RecordBatch>> {
-    //     let results = Dataset::open(uri)
-    //         .await?
-    //         .scan()
-    //         .try_into_stream()
-    //         .await?
-    //         .try_collect::<Vec<_>>()
-    //         .await?;
-    //     Ok(results)
-    // }
 
     #[tokio::test]
     async fn test_read_nullable_arrays() {

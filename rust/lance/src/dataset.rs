@@ -1433,12 +1433,15 @@ mod tests {
     use crate::io::deletion::read_deletion_file;
 
     use arrow_array::{
+        builder::StringDictionaryBuilder,
         cast::{as_string_array, as_struct_array},
-        DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array, Int8DictionaryArray,
-        RecordBatch, RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
+        types::Int32Type,
+        ArrayRef, DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array,
+        Int8DictionaryArray, RecordBatch, RecordBatchIterator, StringArray, UInt16Array,
+        UInt32Array,
     };
     use arrow_ord::sort::sort_to_indices;
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
     use lance_index::vector::DIST_COL;
@@ -2970,5 +2973,65 @@ mod tests {
 
         assert!(dataset.num_small_files(1024) > 0);
         assert!(dataset.num_small_files(512) == 0);
+    }
+
+    #[tokio::test]
+    async fn test_read_struct_of_dictionary_arrays() {
+        let test_dir = tempdir().unwrap();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            )])),
+            true,
+        )]));
+
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        for _ in 1..2 {
+            let mut dict_builder = StringDictionaryBuilder::<Int32Type>::new();
+            dict_builder.append("a").unwrap();
+            dict_builder.append("b").unwrap();
+            dict_builder.append("c").unwrap();
+            dict_builder.append("d").unwrap();
+
+            let struct_array = Arc::new(StructArray::from(vec![(
+                Arc::new(ArrowField::new(
+                    "d",
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                    true,
+                )),
+                Arc::new(dict_builder.finish()) as ArrayRef,
+            )]));
+
+            let batch =
+                RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
+            batches.push(batch);
+        }
+
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let batch_reader =
+            RecordBatchIterator::new(batches.clone().into_iter().map(Ok), arrow_schema.clone());
+        Dataset::write(batch_reader, test_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        let result = scan_dataset(test_uri).await.unwrap();
+
+        assert_eq!(batches, result);
+    }
+
+    async fn scan_dataset(uri: &str) -> Result<Vec<RecordBatch>> {
+        let results = Dataset::open(uri)
+            .await?
+            .scan()
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(results)
     }
 }
