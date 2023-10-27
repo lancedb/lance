@@ -121,6 +121,7 @@ cli = ["clap"]
 # opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
 tensorflow = ["tfrecord"]
 dynamodb = ["lance-core/dynamodb", "aws-sdk-dynamodb"]
+dynamodb_tests = ["dynamodb"]
 
 [[bin]]
 name = "lq"
