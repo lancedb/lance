@@ -54,15 +54,16 @@ use chrono::{DateTime, Duration, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_core::{
     format::{Index, Manifest},
+    io::{
+        deletion::deletion_file_path,
+        object_store::ObjectStore,
+        reader::{read_manifest, read_manifest_indexes},
+    },
     Error, Result,
 };
 use object_store::path::Path;
 
-use crate::{
-    io::{deletion_file_path, read_manifest, reader::read_manifest_indexes, ObjectStore},
-    utils::temporal::utc_now,
-    Dataset,
-};
+use crate::{utils::temporal::utc_now, Dataset};
 
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {

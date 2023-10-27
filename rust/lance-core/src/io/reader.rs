@@ -39,30 +39,25 @@ use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
 use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::*;
-use lance_core::{
-    encodings::{dictionary::DictionaryDecoder, AsyncIndex},
-    io::{
-        read_fixed_stride_array, read_message, read_struct, ReadBatchParams, Reader,
-        RecordBatchStream, RecordBatchStreamAdapter,
-    },
-    Error, Result, ROW_ID, ROW_ID_FIELD,
-};
+
 use object_store::path::Path;
 use prost::Message;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use super::deletion::{read_deletion_file, DeletionVector};
-use super::deletion_file_path;
-use crate::format::{pb, Fragment, Index, Manifest, Metadata, PageTable};
-use crate::io::{read_metadata_offset, read_struct_from_buf};
-use crate::session::Session;
+use super::deletion::{deletion_file_path, read_deletion_file, DeletionVector};
+use crate::io::utils::{read_metadata_offset, read_struct_from_buf};
 use crate::{
+    cache::FileMetadataCache,
     datatypes::{Field, Schema},
-    format::PageInfo,
+    encodings::{dictionary::DictionaryDecoder, AsyncIndex},
+    format::{pb, Fragment, Index, Manifest, Metadata, PageInfo, PageTable, MAGIC},
+    io::{
+        object_store::ObjectStore, read_fixed_stride_array, read_message, read_struct,
+        ReadBatchParams, Reader, RecordBatchStream, RecordBatchStreamAdapter,
+    },
+    Error, Result, ROW_ID, ROW_ID_FIELD,
 };
-
-use super::object_store::ObjectStore;
 
 /// Read Manifest on URI.
 ///
@@ -83,7 +78,7 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
             location: location!(),
         });
     }
-    if !buf.ends_with(super::MAGIC) {
+    if !buf.ends_with(MAGIC) {
         return Err(Error::IO {
             message: "Invalid format: magic number does not match".to_string(),
             location: location!(),
@@ -218,7 +213,7 @@ impl FileReader {
         path: &Path,
         fragment_id: u64,
         manifest: Option<&Manifest>,
-        session: Option<&Session>,
+        session: Option<&FileMetadataCache>,
     ) -> Result<Self> {
         let object_reader = object_store.open(path).await?;
         let is_dataset = manifest.is_some();
@@ -324,9 +319,9 @@ impl FileReader {
 
     async fn read_metadata(
         object_reader: &dyn Reader,
-        session: Option<&Session>,
+        cache: Option<&FileMetadataCache>,
     ) -> Result<Arc<Metadata>> {
-        Self::load_from_cache(session, object_reader.path(), |_| async {
+        Self::load_from_cache(cache, object_reader.path(), |_| async {
             let file_size = object_reader.size().await?;
             let begin = if file_size < object_reader.block_size() {
                 0
@@ -353,11 +348,11 @@ impl FileReader {
     /// The page table is cached.
     async fn read_stats_page_table(
         reader: &dyn Reader,
-        session: Option<&Session>,
+        cache: Option<&FileMetadataCache>,
     ) -> Result<Arc<Option<PageTable>>> {
         // To prevent collisions, we cache this at a child path
-        Self::load_from_cache(session, &reader.path().child("stats"), |_| async {
-            let metadata = Self::read_metadata(reader, session).await?;
+        Self::load_from_cache(cache, &reader.path().child("stats"), |_| async {
+            let metadata = Self::read_metadata(reader, cache).await?;
 
             if let Some(stats_meta) = metadata.stats_metadata.as_ref() {
                 Ok(Some(
@@ -379,7 +374,7 @@ impl FileReader {
 
     /// Load some metadata about the fragment from the cache, if there is one.
     async fn load_from_cache<T: Send + Sync + 'static, F, Fut>(
-        session: Option<&Session>,
+        cache: Option<&FileMetadataCache>,
         path: &Path,
         loader: F,
     ) -> Result<Arc<T>>
@@ -387,17 +382,15 @@ impl FileReader {
         F: Fn(&Path) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        if let Some(session) = session {
-            if let Some(metadata) = session.file_metadata_cache.get::<T>(path) {
+        if let Some(cache) = cache {
+            if let Some(metadata) = cache.get::<T>(path) {
                 return Ok(metadata);
             }
         }
 
         let metadata = Arc::new(loader(path).await?);
-        if let Some(session) = session {
-            session
-                .file_metadata_cache
-                .insert(path.to_owned(), metadata.clone());
+        if let Some(cache) = cache {
+            cache.insert(path.to_owned(), metadata.clone());
         }
         Ok(metadata)
     }
@@ -405,12 +398,12 @@ impl FileReader {
     async fn load_deletion_vector(
         object_store: &ObjectStore,
         fragment: &Fragment,
-        session: Option<&Session>,
+        cache: Option<&FileMetadataCache>,
     ) -> Result<Option<Arc<DeletionVector>>> {
         if let Some(deletion_file) = &fragment.deletion_file {
             let path = deletion_file_path(object_store.base_path(), fragment.id, deletion_file);
 
-            let deletion_vector = Self::load_from_cache(session, &path, |_| async {
+            let deletion_vector = Self::load_from_cache(cache, &path, |_| async {
                 read_deletion_file(object_store.base_path(), fragment, object_store)
                     .await?
                     .ok_or(Error::IO {
@@ -435,7 +428,7 @@ impl FileReader {
     }
 
     /// Instruct the FileReader to return meta row id column.
-    pub(crate) fn with_row_id(&mut self, v: bool) -> &mut Self {
+    pub fn with_row_id(&mut self, v: bool) -> &mut Self {
         self.with_row_id = v;
         self
     }
@@ -445,7 +438,7 @@ impl FileReader {
     /// for example if the entire batch is deleted. This is a performance
     /// optimization where the null bitmap of the _rowid column serves as a
     /// selection vector.
-    pub(crate) fn with_make_deletions_null(&mut self, val: bool) -> &mut Self {
+    pub fn with_make_deletions_null(&mut self, val: bool) -> &mut Self {
         self.make_deletions_null = val;
         self
     }
@@ -477,7 +470,7 @@ impl FileReader {
     ///
     /// The schema of the returned [RecordBatch] is set by [`FileReader::schema()`].
     #[instrument(level = "debug", skip(self, params, projection))]
-    pub(crate) async fn read_batch(
+    pub async fn read_batch(
         &self,
         batch_id: i32,
         params: impl Into<ReadBatchParams>,
@@ -499,7 +492,7 @@ impl FileReader {
     /// Note that it might call concat if the range is crossing multiple batches, which
     /// makes it less efficient than [`FileReader::read_batch()`].
     #[instrument(level = "debug", skip(self, projection))]
-    pub(crate) async fn read_range(
+    pub async fn read_range(
         &self,
         range: Range<usize>,
         projection: &Schema,
@@ -857,7 +850,8 @@ async fn read_binary_array(
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(page_table, field, batch_id)?;
 
-    use lance_core::io::read_binary_array;
+    use crate::io::utils::read_binary_array;
+
     read_binary_array(
         reader.object_reader.as_ref(),
         &field.data_type(),
@@ -1032,26 +1026,22 @@ where
 mod tests {
     use super::*;
 
-    use crate::dataset::{Dataset, WriteParams};
     use crate::format::Fragment;
     use crate::io::deletion::write_deletion_file;
     use crate::io::deletion::DeletionVector;
-    use crate::io::ObjectStore;
+    use crate::io::object_store::ObjectStore;
+    use crate::io::{write_manifest, WriteExt};
+    use arrow_array::Int32Array;
     use arrow_array::{
-        builder::{
-            Int32Builder, LargeListBuilder, ListBuilder, StringBuilder, StringDictionaryBuilder,
-        },
+        builder::{Int32Builder, LargeListBuilder, ListBuilder, StringBuilder},
         cast::{as_string_array, as_struct_array},
         types::{Int32Type, UInt8Type},
         Array, BooleanArray, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray,
         NullArray, StringArray, StructArray, UInt32Array, UInt8Array,
     };
-    use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
-    use lance_core::io::{write_manifest, WriteExt};
     use rand::{distributions::Alphanumeric, Rng};
     use roaring::RoaringBitmap;
-    use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
 
     use crate::io::FileWriter;
@@ -1485,66 +1475,6 @@ mod tests {
                 Arc::new(large_list_builder.finish()) as ArrayRef,
             ),
         ]))
-    }
-
-    #[tokio::test]
-    async fn test_read_struct_of_dictionary_arrays() {
-        let test_dir = tempdir().unwrap();
-
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "s",
-            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                "d",
-                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-                true,
-            )])),
-            true,
-        )]));
-
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        for _ in 1..2 {
-            let mut dict_builder = StringDictionaryBuilder::<Int32Type>::new();
-            dict_builder.append("a").unwrap();
-            dict_builder.append("b").unwrap();
-            dict_builder.append("c").unwrap();
-            dict_builder.append("d").unwrap();
-
-            let struct_array = Arc::new(StructArray::from(vec![(
-                Arc::new(ArrowField::new(
-                    "d",
-                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-                    true,
-                )),
-                Arc::new(dict_builder.finish()) as ArrayRef,
-            )]));
-
-            let batch =
-                RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
-            batches.push(batch);
-        }
-
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let batch_reader =
-            RecordBatchIterator::new(batches.clone().into_iter().map(Ok), arrow_schema.clone());
-        Dataset::write(batch_reader, test_uri, Some(WriteParams::default()))
-            .await
-            .unwrap();
-
-        let _result = scan_dataset(test_uri).await.unwrap();
-
-        assert_eq!(batches, _result);
-    }
-
-    async fn scan_dataset(uri: &str) -> Result<Vec<RecordBatch>> {
-        let results = Dataset::open(uri)
-            .await?
-            .scan()
-            .try_into_stream()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(results)
     }
 
     #[tokio::test]

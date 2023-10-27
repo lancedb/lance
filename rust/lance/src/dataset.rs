@@ -33,7 +33,13 @@ use chrono::{prelude::*, Duration};
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt};
-use lance_core::io::{commit::CommitError, read_struct, write_manifest, ObjectWriter, WriteExt};
+use lance_core::io::{
+    commit::CommitError,
+    object_store::{ObjectStore, ObjectStoreParams},
+    read_metadata_offset, read_struct,
+    reader::{read_manifest, read_manifest_indexes},
+    write_manifest, ObjectWriter, WriteExt,
+};
 use log::warn;
 use object_store::path::Path;
 use tracing::instrument;
@@ -62,12 +68,7 @@ use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{Fragment, Index, Manifest};
 use crate::index::vector::open_index;
-use crate::io::reader::read_manifest_indexes;
-use crate::io::{
-    commit::{commit_new_dataset, commit_transaction},
-    object_store::ObjectStoreParams,
-    read_manifest, read_metadata_offset, ObjectStore,
-};
+use crate::io::commit::{commit_new_dataset, commit_transaction};
 use crate::session::Session;
 
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
@@ -77,7 +78,7 @@ pub use lance_core::ROW_ID;
 pub use write::{write_fragments, WriteMode, WriteParams};
 
 const INDICES_DIR: &str = "_indices";
-pub(crate) const DELETION_DIRS: &str = "_deletions";
+
 const DATA_DIR: &str = "data";
 pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
@@ -1432,12 +1433,15 @@ mod tests {
     use crate::io::deletion::read_deletion_file;
 
     use arrow_array::{
+        builder::StringDictionaryBuilder,
         cast::{as_string_array, as_struct_array},
-        DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array, Int8DictionaryArray,
-        RecordBatch, RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
+        types::Int32Type,
+        ArrayRef, DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array,
+        Int8DictionaryArray, RecordBatch, RecordBatchIterator, StringArray, UInt16Array,
+        UInt32Array,
     };
     use arrow_ord::sort::sort_to_indices;
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
     use lance_index::vector::DIST_COL;
@@ -2969,5 +2973,65 @@ mod tests {
 
         assert!(dataset.num_small_files(1024) > 0);
         assert!(dataset.num_small_files(512) == 0);
+    }
+
+    #[tokio::test]
+    async fn test_read_struct_of_dictionary_arrays() {
+        let test_dir = tempdir().unwrap();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            )])),
+            true,
+        )]));
+
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        for _ in 1..2 {
+            let mut dict_builder = StringDictionaryBuilder::<Int32Type>::new();
+            dict_builder.append("a").unwrap();
+            dict_builder.append("b").unwrap();
+            dict_builder.append("c").unwrap();
+            dict_builder.append("d").unwrap();
+
+            let struct_array = Arc::new(StructArray::from(vec![(
+                Arc::new(ArrowField::new(
+                    "d",
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                    true,
+                )),
+                Arc::new(dict_builder.finish()) as ArrayRef,
+            )]));
+
+            let batch =
+                RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
+            batches.push(batch);
+        }
+
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let batch_reader =
+            RecordBatchIterator::new(batches.clone().into_iter().map(Ok), arrow_schema.clone());
+        Dataset::write(batch_reader, test_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        let result = scan_dataset(test_uri).await.unwrap();
+
+        assert_eq!(batches, result);
+    }
+
+    async fn scan_dataset(uri: &str) -> Result<Vec<RecordBatch>> {
+        let results = Dataset::open(uri)
+            .await?
+            .scan()
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(results)
     }
 }

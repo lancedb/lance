@@ -12,47 +12,54 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-lance-arrow.workspace = true
-arrow-array.workspace = true
 arrow-arith.workspace = true
+arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-cast.workspace = true
 arrow-data.workspace = true
+arrow-ipc.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
 async-recursion.workspace = true
 async-trait.workspace = true
+lance-arrow.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
+aws-sdk-dynamodb = { workspace = true, optional = true }
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 datafusion-common.workspace = true
 datafusion-sql.workspace = true
 futures.workspace = true
+http.workspace = true
 lazy_static.workspace = true
 log.workspace = true
+mock_instant.workspace = true
+moka.workspace = true
 num_cpus.workspace = true
+num-traits.workspace = true
 object_store.workspace = true
 pin-project.workspace = true
 prost-types.workspace = true
 prost.workspace = true
+rand.workspace = true
 roaring.workspace = true
-serde.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+shellexpand.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
-mock_instant.workspace = true
-aws-sdk-dynamodb = { workspace = true, optional = true }
 
 [dev-dependencies]
 arrow = "47.0"
 rand.workspace = true
 tempfile.workspace = true
 lance-testing.workspace = true
+parquet.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

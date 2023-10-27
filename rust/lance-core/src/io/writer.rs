@@ -24,20 +24,20 @@ use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use lance_arrow::*;
-use lance_core::{
+
+use object_store::path::Path;
+use snafu::{location, Location};
+
+use crate::{
     datatypes::{Field, Schema},
     encodings::{
         binary::BinaryEncoder, dictionary::DictionaryEncoder, plain::PlainEncoder, Encoder,
         Encoding,
     },
     format::{Manifest, Metadata, PageInfo, PageTable, StatisticsMetadata},
-    io::{write_manifest, ObjectWriter, WriteExt, Writer},
+    io::{object_store::ObjectStore, write_manifest, ObjectWriter, WriteExt, Writer},
     Error, Result,
 };
-use object_store::path::Path;
-use snafu::{location, Location};
-
-use super::ObjectStore;
 
 /// [FileWriter] writes Arrow [RecordBatch] to one Lance file.
 ///
@@ -573,7 +573,7 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use object_store::path::Path;
 
-    use crate::io::{FileReader, ObjectStore};
+    use crate::io::{object_store::ObjectStore, FileReader};
 
     #[tokio::test]
     async fn test_write_file() {

@@ -23,8 +23,15 @@ use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
-use lance_core::ROW_ID;
-use lance_core::{io::ReadBatchParams, Error, Result};
+use lance_core::{
+    datatypes::Schema,
+    io::{
+        deletion::{deletion_file_path, read_deletion_file, write_deletion_file, DeletionVector},
+        object_store::ObjectStore,
+        FileReader, FileWriter, ReadBatchParams,
+    },
+    Error, Result, ROW_ID,
+};
 use object_store::path::Path;
 use snafu::{location, Location};
 use uuid::Uuid;
@@ -38,12 +45,7 @@ use super::write::reader_to_stream;
 use super::WriteParams;
 use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
-use crate::datatypes::Schema;
 use crate::format::Fragment;
-use crate::io::deletion::{
-    deletion_file_path, read_deletion_file, write_deletion_file, DeletionVector,
-};
-use crate::io::{FileReader, FileWriter, ObjectStore};
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -161,7 +163,7 @@ impl FileFragment {
                     &path,
                     self.id() as u64,
                     Some(self.dataset.manifest.as_ref()),
-                    Some(self.dataset.session.as_ref()),
+                    Some(&self.dataset.session.file_metadata_cache),
                 )
                 .await?;
                 let initialized_schema = reader.schema().project_by_schema(&schema_per_file)?;
@@ -237,7 +239,7 @@ impl FileFragment {
             &path,
             self.id() as u64,
             None,
-            Some(self.dataset.session.as_ref()),
+            Some(&self.dataset.session.file_metadata_cache),
         )
         .await?;
 
@@ -262,7 +264,7 @@ impl FileFragment {
                 path,
                 self.id() as u64,
                 Some(self.dataset.manifest.as_ref()),
-                Some(self.dataset.session.as_ref()),
+                Some(&self.dataset.session.file_metadata_cache),
             );
             reader.map_ok(|r| r.len())
         });

@@ -14,6 +14,7 @@
 
 use arrow_schema::{DataType, Field as ArrowField};
 
+pub mod cache;
 pub mod datatypes;
 pub mod encodings;
 pub mod error;
@@ -31,3 +32,5 @@ lazy_static::lazy_static! {
     /// as a selection vector.
     pub static ref ROW_ID_FIELD: ArrowField = ArrowField::new(ROW_ID, DataType::UInt64, true);
 }
+
+pub(crate) const DELETION_DIRS: &str = "_deletions";

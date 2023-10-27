@@ -1,11 +1,25 @@
+// Copyright 2023 Lance Developers.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::ops::Range;
 use std::slice::Iter;
 use std::{collections::HashSet, sync::Arc};
 
-use arrow::ipc::reader::FileReader as ArrowFileReader;
-use arrow::ipc::writer::{FileWriter as ArrowFileWriter, IpcWriteOptions};
-use arrow::ipc::CompressionType;
 use arrow_array::{BooleanArray, RecordBatch, UInt32Array};
+use arrow_ipc::reader::FileReader as ArrowFileReader;
+use arrow_ipc::writer::{FileWriter as ArrowFileWriter, IpcWriteOptions};
+use arrow_ipc::CompressionType;
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use bytes::Buf;
 use object_store::path::Path;
@@ -13,10 +27,10 @@ use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
 use snafu::ResultExt;
 
-use super::ObjectStore;
-use crate::dataset::DELETION_DIRS;
+use super::object_store::ObjectStore;
 use crate::error::{box_error, CorruptFileSnafu};
 use crate::format::{DeletionFile, DeletionFileType, Fragment};
+use crate::DELETION_DIRS;
 use crate::{Error, Result};
 
 /// Threshold for when a DeletionVector::Set should be promoted to a DeletionVector::Bitmap.
@@ -39,6 +53,10 @@ impl DeletionVector {
             Self::Set(set) => set.len(),
             Self::Bitmap(bitmap) => bitmap.len() as usize,
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn contains(&self, i: u32) -> bool {

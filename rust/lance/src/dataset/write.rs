@@ -22,19 +22,21 @@ use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::{
+    datatypes::Schema,
+    format::Fragment,
+    io::{
+        object_store::{ObjectStore, ObjectStoreParams},
+        FileWriter,
+    },
+    Error, Result,
+};
 use object_store::path::Path;
 use tracing::instrument;
 use uuid::Uuid;
 
 use super::progress::WriteFragmentProgress;
 use super::{chunker::chunk_stream, DATA_DIR};
-use crate::error::Result;
-use crate::Error;
-use crate::{
-    datatypes::Schema,
-    format::Fragment,
-    io::{object_store::ObjectStoreParams, FileWriter, ObjectStore},
-};
 
 /// The mode to write dataset.
 #[derive(Debug, Clone, Copy)]

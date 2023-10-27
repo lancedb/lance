@@ -47,24 +47,22 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use lance_core::{
+    datatypes::Schema,
+    format::{
+        pb::{self, IndexMetadata},
+        Fragment, Index, Manifest,
+    },
+    io::{object_store::ObjectStore, reader::read_manifest, reader::read_manifest_indexes},
+    Error, Result,
+};
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
-use crate::{
-    datatypes::Schema,
-    format::Index,
-    format::{
-        pb::{self, IndexMetadata},
-        Fragment, Manifest,
-    },
-    io::{read_manifest, reader::read_manifest_indexes, ObjectStore},
-    utils::temporal::timestamp_to_nanos,
-};
-
 use super::{feature_flags::apply_feature_flags, ManifestWriteConfig};
-use crate::{Error, Result};
+use crate::utils::temporal::timestamp_to_nanos;
 
 /// A change to a dataset that can be retried
 ///

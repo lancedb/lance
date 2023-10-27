@@ -15,16 +15,18 @@
 use std::ops::Range;
 
 use arrow_array::{RecordBatch, UInt32Array};
+use lance_core::{
+    datatypes::Schema,
+    io::{deletion::DeletionVector, FileWriter},
+    Error, Result,
+};
+use snafu::{location, Location};
 use uuid::Uuid;
 
 use super::fragment::FragmentReader;
 use super::Dataset;
 use crate::dataset::FileFragment;
-use crate::datatypes::Schema;
 use crate::format::Fragment;
-use crate::io::deletion::DeletionVector;
-use crate::{io::FileWriter, Error, Result};
-use snafu::{location, Location};
 /// Update or insert a new column.
 ///
 /// To use, call [`Updater::next`] to get the next [`RecordBatch`] as input,

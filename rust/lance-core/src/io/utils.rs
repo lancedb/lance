@@ -20,6 +20,7 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
+use bytes::Bytes;
 use lance_arrow::*;
 use prost::Message;
 use snafu::{location, Location};
@@ -189,4 +190,33 @@ pub async fn write_manifest(
     }
 
     writer.write_struct(manifest).await
+}
+
+pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
+    let len = bytes.len();
+    if len < 16 {
+        return Err(Error::IO {
+            message: format!(
+                "does not have sufficient data, len: {}, bytes: {:?}",
+                len, bytes
+            ),
+            location: location!(),
+        });
+    }
+    let offset_bytes = bytes.slice(len - 16..len - 8);
+    Ok(LittleEndian::read_u64(offset_bytes.as_ref()) as usize)
+}
+
+/// Read protobuf from a buffer.
+pub fn read_message_from_buf<M: Message + Default>(buf: &Bytes) -> Result<M> {
+    let msg_len = LittleEndian::read_u32(buf) as usize;
+    Ok(M::decode(&buf[4..4 + msg_len])?)
+}
+
+/// Read a Protobuf-backed struct from a buffer.
+pub fn read_struct_from_buf<M: Message + Default, T: ProtoStruct<Proto = M> + From<M>>(
+    buf: &Bytes,
+) -> Result<T> {
+    let msg: M = read_message_from_buf(buf)?;
+    Ok(T::from(msg))
 }
