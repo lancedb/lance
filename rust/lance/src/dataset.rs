@@ -15,11 +15,6 @@
 //! Lance Dataset
 //!
 
-use std::collections::{BTreeMap, HashMap};
-use std::default::Default;
-use std::ops::Range;
-use std::sync::Arc;
-
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::Array;
@@ -42,6 +37,11 @@ use lance_core::io::{
 };
 use log::warn;
 use object_store::path::Path;
+use snafu::{location, Location};
+use std::collections::{BTreeMap, HashMap};
+use std::default::Default;
+use std::ops::Range;
+use std::sync::Arc;
 use tracing::instrument;
 
 mod chunker;
@@ -841,6 +841,7 @@ impl Dataset {
         let mut fragments_iter = fragments.iter();
         let mut current_fragment = fragments_iter.next().ok_or_else(|| Error::InvalidInput {
             source: "Called take on an empty dataset.".to_string().into(),
+            location: location!(),
         })?;
         let mut current_fragment_len = current_fragment.count_rows().await?;
         let mut curr_fragment_offset: u64 = 0;
@@ -869,6 +870,7 @@ impl Dataset {
                         row_index
                     )
                     .into(),
+                    location: location!(),
                 })?;
                 curr_fragment_offset += current_fragment_len as u64;
                 current_fragment_len = current_fragment.count_rows().await?;

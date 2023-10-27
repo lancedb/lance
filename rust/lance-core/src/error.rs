@@ -27,8 +27,11 @@ pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedErro
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("Invalid user input: {source}"))]
-    InvalidInput { source: BoxedError },
+    #[snafu(display("Invalid user input: {source}, {location}"))]
+    InvalidInput {
+        source: BoxedError,
+        location: Location,
+    },
     #[snafu(display("Dataset already exists: {uri}"))]
     DatasetAlreadyExists { uri: String },
     // #[snafu(display("Append with different schema: original={original} new={new}"))]
@@ -77,6 +80,7 @@ impl Error {
         let message: String = message.into();
         Self::InvalidInput {
             source: message.into(),
+            location: location!(),
         }
     }
 }
