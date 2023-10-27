@@ -38,11 +38,16 @@ pub enum Error {
     #[snafu(display("Append with different schema:"))]
     SchemaMismatch {},
     #[snafu(display("Dataset at path {path} was not found: {source}, {location}"))]
-    DatasetNotFound { path: String, source: BoxedError, location: Location },
-    #[snafu(display("Encountered corrupt file {path}: {source}"))]
+    DatasetNotFound {
+        path: String,
+        source: BoxedError,
+        location: Location,
+    },
+    #[snafu(display("Encountered corrupt file {path}: {source}, {location}"))]
     CorruptFile {
         path: object_store::path::Path,
         source: BoxedError,
+        location: Location,
         // TODO: add backtrace?
     },
     #[snafu(display("Not supported: {source}"))]
@@ -73,6 +78,7 @@ impl Error {
         Self::CorruptFile {
             path,
             source: message.into(),
+            location: location!(),
         }
     }
 
