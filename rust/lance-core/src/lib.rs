@@ -14,6 +14,7 @@
 
 use arrow_schema::{DataType, Field as ArrowField};
 
+pub mod cache;
 pub mod datatypes;
 pub mod encodings;
 pub mod error;

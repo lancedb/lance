@@ -40,6 +40,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{
+    cache::FileMetadataCache,
     datatypes::{Field, Schema},
     encodings::{dictionary::DictionaryDecoder, AsyncIndex},
     format::{pb, Fragment, Index, Manifest, Metadata, PageInfo, PageTable},
@@ -57,7 +58,6 @@ use tracing::instrument;
 use super::deletion::{read_deletion_file, DeletionVector};
 use super::deletion_file_path;
 use crate::io::{read_metadata_offset, read_struct_from_buf};
-use crate::session::Session;
 
 /// Read Manifest on URI.
 ///
@@ -213,7 +213,7 @@ impl FileReader {
         path: &Path,
         fragment_id: u64,
         manifest: Option<&Manifest>,
-        session: Option<&Session>,
+        session: Option<&FileMetadataCache>,
     ) -> Result<Self> {
         let object_reader = object_store.open(path).await?;
         let is_dataset = manifest.is_some();
@@ -319,9 +319,9 @@ impl FileReader {
 
     async fn read_metadata(
         object_reader: &dyn Reader,
-        session: Option<&Session>,
+        cache: Option<&FileMetadataCache>,
     ) -> Result<Arc<Metadata>> {
-        Self::load_from_cache(session, object_reader.path(), |_| async {
+        Self::load_from_cache(cache, object_reader.path(), |_| async {
             let file_size = object_reader.size().await?;
             let begin = if file_size < object_reader.block_size() {
                 0
@@ -348,11 +348,11 @@ impl FileReader {
     /// The page table is cached.
     async fn read_stats_page_table(
         reader: &dyn Reader,
-        session: Option<&Session>,
+        cache: Option<&FileMetadataCache>,
     ) -> Result<Arc<Option<PageTable>>> {
         // To prevent collisions, we cache this at a child path
-        Self::load_from_cache(session, &reader.path().child("stats"), |_| async {
-            let metadata = Self::read_metadata(reader, session).await?;
+        Self::load_from_cache(cache, &reader.path().child("stats"), |_| async {
+            let metadata = Self::read_metadata(reader, cache).await?;
 
             if let Some(stats_meta) = metadata.stats_metadata.as_ref() {
                 Ok(Some(
@@ -374,7 +374,7 @@ impl FileReader {
 
     /// Load some metadata about the fragment from the cache, if there is one.
     async fn load_from_cache<T: Send + Sync + 'static, F, Fut>(
-        session: Option<&Session>,
+        cache: Option<&FileMetadataCache>,
         path: &Path,
         loader: F,
     ) -> Result<Arc<T>>
@@ -382,16 +382,15 @@ impl FileReader {
         F: Fn(&Path) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        if let Some(session) = session {
-            if let Some(metadata) = session.file_metadata_cache.get::<T>(path) {
+        if let Some(cache) = cache {
+            if let Some(metadata) = cache.get::<T>(path) {
                 return Ok(metadata);
             }
         }
 
         let metadata = Arc::new(loader(path).await?);
-        if let Some(session) = session {
-            session
-                .file_metadata_cache
+        if let Some(cache) = cache {
+            cache
                 .insert(path.to_owned(), metadata.clone());
         }
         Ok(metadata)
@@ -400,12 +399,12 @@ impl FileReader {
     async fn load_deletion_vector(
         object_store: &ObjectStore,
         fragment: &Fragment,
-        session: Option<&Session>,
+        cache: Option<&FileMetadataCache>,
     ) -> Result<Option<Arc<DeletionVector>>> {
         if let Some(deletion_file) = &fragment.deletion_file {
             let path = deletion_file_path(object_store.base_path(), fragment.id, deletion_file);
 
-            let deletion_vector = Self::load_from_cache(session, &path, |_| async {
+            let deletion_vector = Self::load_from_cache(cache, &path, |_| async {
                 read_deletion_file(object_store.base_path(), fragment, object_store)
                     .await?
                     .ok_or(Error::IO {

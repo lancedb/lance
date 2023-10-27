@@ -12,11 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::{Any, TypeId};
-use std::sync::Arc;
-
-use moka::sync::Cache;
-use object_store::path::Path;
+use lance_core::cache::FileMetadataCache;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::index::cache::IndexCache;
@@ -57,34 +53,6 @@ impl Default for Session {
             index_cache: IndexCache::new(DEFAULT_INDEX_CACHE_SIZE),
             file_metadata_cache: FileMetadataCache::new(DEFAULT_METADATA_CACHE_SIZE),
         }
-    }
-}
-
-type ArcAny = Arc<dyn Any + Send + Sync>;
-
-/// Cache for various metadata about files.
-///
-/// The cache is keyed by the file path and the type of metadata.
-#[derive(Clone)]
-pub struct FileMetadataCache {
-    cache: Arc<Cache<(Path, TypeId), ArcAny>>,
-}
-
-impl FileMetadataCache {
-    pub(crate) fn new(capacity: usize) -> Self {
-        Self {
-            cache: Arc::new(Cache::new(capacity as u64)),
-        }
-    }
-
-    pub(crate) fn get<T: Send + Sync + 'static>(&self, path: &Path) -> Option<Arc<T>> {
-        self.cache
-            .get(&(path.to_owned(), TypeId::of::<T>()))
-            .map(|metadata| metadata.clone().downcast::<T>().unwrap())
-    }
-
-    pub(crate) fn insert<T: Send + Sync + 'static>(&self, path: Path, metadata: Arc<T>) {
-        self.cache.insert((path, TypeId::of::<T>()), metadata);
     }
 }
 
