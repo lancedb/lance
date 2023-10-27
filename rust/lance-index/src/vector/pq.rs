@@ -67,7 +67,7 @@ impl Default for PQBuildParams {
             max_iters: 50,
             max_opq_iters: 50,
             codebook: None,
-            sample_rate: 1024,
+            sample_rate: 256,
         }
     }
 }
