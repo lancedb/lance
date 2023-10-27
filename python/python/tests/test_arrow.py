@@ -14,6 +14,7 @@
 
 import re
 from pathlib import Path
+from uuid import uuid4
 
 import lance
 import numpy as np
@@ -27,6 +28,7 @@ from lance.arrow import (
     ImageArray,
     ImageURIArray,
     PandasBFloat16Array,
+    UuidType,
     bfloat16_array,
 )
 
@@ -252,3 +254,49 @@ def test_roundtrip_image_tensor(tmp_path: Path):
     tensor_image_array_2 = tbl2.take(indices).column(2)
 
     assert tensor_image_array_2.type == tensor_image_array.type
+
+
+def test_uuid_type():
+    ty = UuidType()
+    assert ty.storage_type == pa.binary(16)
+    assert ty.__class__ is UuidType
+
+    ty = UuidType()
+    expected = uuid4()
+    scalar = pa.ExtensionScalar.from_storage(ty, expected.bytes)
+    assert scalar.as_py() == expected
+
+    # test array
+    uuids = [uuid4() for _ in range(3)]
+    storage = pa.array([uuid.bytes for uuid in uuids], type=pa.binary(16))
+    arr = pa.ExtensionArray.from_storage(ty, storage)
+
+    # Works for __get_item__
+    for i, expected in enumerate(uuids):
+        assert arr[i].as_py() == expected
+
+    # Works for __iter__
+    for result, expected in zip(arr, uuids):
+        assert result.as_py() == expected
+
+    # test chunked array
+    data = [
+        pa.ExtensionArray.from_storage(ty, storage),
+        pa.ExtensionArray.from_storage(ty, storage),
+    ]
+    carr = pa.chunked_array(data)
+    for i, expected in enumerate(uuids + uuids):
+        assert carr[i].as_py() == expected
+
+    for result, expected in zip(carr, uuids + uuids):
+        assert result.as_py() == expected
+
+    storage1 = pa.array([b"0123456789abcdef"], type=pa.binary(16))
+    storage2 = pa.array([b"0123456789abcdef"], type=pa.binary(16))
+    storage3 = pa.array([], type=pa.binary(16))
+
+    a = pa.ExtensionArray.from_storage(ty, storage1)
+    b = pa.ExtensionArray.from_storage(ty, storage2)
+    assert a.equals(b)
+    c = pa.ExtensionArray.from_storage(ty, storage3)
+    assert not a.equals(c)

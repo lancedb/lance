@@ -14,6 +14,7 @@
 import json
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Union
+from uuid import UUID
 
 import pyarrow as pa
 
@@ -615,3 +616,37 @@ else:
         def from_numpy(cls, array):
             inner = BFloat16Array.from_numpy(array)
             return cls(inner)
+
+
+class UuidArray(pa.ExtensionArray):
+    def __repr__(self):
+        return "<lance.arrow.UuidArray object at 0x%016x>\n%s" % (
+            id(self),
+            repr(self.to_pylist()),
+        )
+
+
+class UuidType(pa.ExtensionType):
+    def __init__(self):
+        pa.ExtensionType.__init__(self, pa.binary(16), "lance.uuid")
+
+    def __arrow_ext_serialize__(self):
+        return b""
+
+    @classmethod
+    def __arrow_ext_deserialize__(self, storage_type, serialized):
+        return UuidType()
+
+    def __arrow_ext_class__(self):
+        return UuidArray
+
+    def __arrow_ext_scalar_class__(self):
+        return UuidScalarType
+
+
+class UuidScalarType(pa.ExtensionScalar):
+    def as_py(self):
+        return None if self.value is None else UUID(bytes=self.value.as_py())
+
+
+pa.register_extension_type(UuidType())
