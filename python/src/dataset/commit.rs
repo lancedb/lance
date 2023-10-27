@@ -14,8 +14,8 @@
 
 use std::fmt::Debug;
 
-use lance::io::commit::{CommitError, CommitLease, CommitLock};
-use lance::Error;
+use lance_core::io::commit::{CommitError, CommitLease, CommitLock};
+use lance_core::Error;
 
 use pyo3::{exceptions::PyIOError, prelude::*};
 

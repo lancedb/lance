@@ -33,7 +33,7 @@ use chrono::{prelude::*, Duration};
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt};
-use lance_core::io::{read_struct, write_manifest, WriteExt};
+use lance_core::io::{commit::CommitError, read_struct, write_manifest, ObjectWriter, WriteExt};
 use log::warn;
 use object_store::path::Path;
 use tracing::instrument;
@@ -64,7 +64,7 @@ use crate::format::{Fragment, Index, Manifest};
 use crate::index::vector::open_index;
 use crate::io::reader::read_manifest_indexes;
 use crate::io::{
-    commit::{commit_new_dataset, commit_transaction, CommitError},
+    commit::{commit_new_dataset, commit_transaction},
     object_store::ObjectStoreParams,
     read_manifest, read_metadata_offset, ObjectStore,
 };
@@ -190,7 +190,7 @@ impl Dataset {
 
         let latest_manifest = object_store
             .commit_handler
-            .resolve_latest_version(&base_path, &object_store)
+            .resolve_latest_version(&base_path, &object_store.inner)
             .await
             .map_err(|e| Error::DatasetNotFound {
                 path: base_path.to_string(),
@@ -234,7 +234,7 @@ impl Dataset {
 
         let manifest_file = object_store
             .commit_handler
-            .resolve_version(&base_path, version, &object_store)
+            .resolve_version(&base_path, version, &object_store.inner)
             .await?;
 
         let session = if let Some(session) = params.session.as_ref() {
@@ -254,7 +254,7 @@ impl Dataset {
         let manifest_file = self
             .object_store
             .commit_handler
-            .resolve_version(&base_path, version, &self.object_store)
+            .resolve_version(&base_path, version, &self.object_store.inner)
             .await?;
         Self::checkout_manifest(
             self.object_store.clone(),
@@ -335,7 +335,7 @@ impl Dataset {
         // Read expected manifest path for the dataset
         let dataset_exists = match object_store
             .commit_handler
-            .resolve_latest_version(&base, &object_store)
+            .resolve_latest_version(&base, &object_store.inner)
             .await
         {
             Ok(_) => true,
@@ -534,7 +534,7 @@ impl Dataset {
             &self
                 .object_store
                 .commit_handler
-                .resolve_latest_version(&self.base, &self.object_store)
+                .resolve_latest_version(&self.base, &self.object_store.inner)
                 .await?,
         )
         .await
@@ -655,7 +655,7 @@ impl Dataset {
         // Test if the dataset exists
         let dataset_exists = match object_store
             .commit_handler
-            .resolve_latest_version(&base, &object_store)
+            .resolve_latest_version(&base, &object_store.inner)
             .await
         {
             Ok(_) => true,
@@ -1138,7 +1138,7 @@ impl Dataset {
     async fn manifest_file(&self, version: u64) -> Result<Path> {
         self.object_store
             .commit_handler
-            .resolve_version(&self.base, version, &self.object_store)
+            .resolve_version(&self.base, version, &self.object_store.inner)
             .await
     }
 
@@ -1159,7 +1159,7 @@ impl Dataset {
         let mut versions: Vec<Version> = self
             .object_store
             .commit_handler
-            .list_manifests(&self.base, &self.object_store)
+            .list_manifests(&self.base, &self.object_store.inner)
             .await?
             .try_filter_map(|path| async move {
                 match read_manifest(&self.object_store, &path).await {
@@ -1182,7 +1182,7 @@ impl Dataset {
     pub async fn latest_version_id(&self) -> Result<u64> {
         self.object_store
             .commit_handler
-            .resolve_latest_version_id(&self.base, &self.object_store)
+            .resolve_latest_version_id(&self.base, &self.object_store.inner)
             .await
     }
 
@@ -1368,7 +1368,7 @@ pub(crate) async fn write_manifest_file(
             manifest,
             indices,
             base_path,
-            object_store,
+            &object_store.inner,
             write_manifest_file_to_path,
         )
         .await?;
@@ -1377,13 +1377,13 @@ pub(crate) async fn write_manifest_file(
 }
 
 fn write_manifest_file_to_path<'a>(
-    object_store: &'a ObjectStore,
+    object_store: &'a dyn object_store::ObjectStore,
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,
 ) -> BoxFuture<'a, Result<()>> {
     Box::pin(async {
-        let mut object_writer = object_store.create(path).await?;
+        let mut object_writer = ObjectWriter::new(object_store, path).await?;
         let pos = write_manifest(&mut object_writer, manifest, indices).await?;
         object_writer.write_magics(pos).await?;
         object_writer.shutdown().await?;
@@ -1688,7 +1688,7 @@ mod tests {
             &dataset
                 .object_store()
                 .commit_handler
-                .resolve_latest_version(&dataset.base, dataset.object_store())
+                .resolve_latest_version(&dataset.base, &dataset.object_store().inner)
                 .await
                 .unwrap(),
         )
@@ -1707,7 +1707,7 @@ mod tests {
             &dataset
                 .object_store()
                 .commit_handler
-                .resolve_latest_version(&dataset.base, dataset.object_store())
+                .resolve_latest_version(&dataset.base, &dataset.object_store().inner)
                 .await
                 .unwrap(),
         )
