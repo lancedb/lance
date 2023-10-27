@@ -42,7 +42,7 @@ dashmap = "5"
 half = { version = "2.2.1", default-features = false, features = [
     "num-traits",
 ] }
-http = "0.2.9"
+http.workspace = true
 object_store = { workspace = true }
 aws-config = "0.56"
 aws-credential-types = "0.56"
@@ -55,7 +55,7 @@ url = "2.3"
 rand = { version = "0.8.3", features = ["small_rng"] }
 futures = { workspace = true }
 uuid = { version = "1.2", features = ["v4", "serde"] }
-shellexpand = "3.0.0"
+shellexpand.workspace = true
 arrow = { version = "47.0.0", features = ["prettyprint"] }
 num_cpus = "1.0"
 # TODO: use datafusion sub-modules to reduce build size?
