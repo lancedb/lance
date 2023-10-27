@@ -535,6 +535,7 @@ impl ObjectStore {
                 // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
                 url.set_scheme("s3").map_err(|()| Error::Internal {
                     message: "could not set scheme".into(),
+                    location: location!(),
                 })?;
                 url.set_query(None);
 

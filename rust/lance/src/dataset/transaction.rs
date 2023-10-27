@@ -344,6 +344,7 @@ impl Transaction {
                 } else {
                     return Err(Error::Internal {
                         message: "Cannot create a new dataset without a schema".to_string(),
+                        location: location!(),
                     });
                 }
             }
@@ -368,6 +369,7 @@ impl Transaction {
                         "No current manifest was provided while building manifest for operation {}",
                         self.operation.name()
                     ),
+                    location: location!(),
                 });
 
         match &self.operation {
@@ -661,6 +663,7 @@ impl TryFrom<&pb::Transaction> for Transaction {
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),
+                    location: location!(),
                 });
             }
         };

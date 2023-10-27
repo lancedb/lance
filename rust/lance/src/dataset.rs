@@ -1049,6 +1049,7 @@ impl Dataset {
                 .column_by_name(ROW_ID)
                 .ok_or_else(|| Error::Internal {
                     message: "ROW_ID column not found".into(),
+                    location: location!(),
                 })?
                 .as_primitive::<UInt64Type>()
                 .values();

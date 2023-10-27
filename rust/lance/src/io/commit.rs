@@ -102,6 +102,7 @@ fn check_transaction(
                 and it was missing transaction metadata.",
                 other_version
             ),
+            location: location!(),
         });
     }
 

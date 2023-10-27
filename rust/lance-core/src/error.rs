@@ -61,8 +61,8 @@ pub enum Error {
         source: BoxedError,
         location: Location,
     },
-    #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lancedb/lance/issues. {message}"))]
-    Internal { message: String },
+    #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lancedb/lance/issues. {message}, {location}"))]
+    Internal { message: String, location: Location },
     #[snafu(display("A prerequisite task failed: {message}"))]
     PrerequisiteFailed { message: String },
     #[snafu(display("LanceError(Arrow): {message}"))]

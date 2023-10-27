@@ -526,6 +526,7 @@ impl FileFragment {
                 Examples: {:?}",
                     physical_rows, dv_len, examples
                 ),
+                location: location!(),
             });
         }
 

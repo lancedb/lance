@@ -178,6 +178,7 @@ impl Updater {
                     batch.num_rows(),
                     row_id_stride
                 ),
+                location: location!(),
             });
         }
 
