@@ -196,6 +196,7 @@ impl Dataset {
             .map_err(|e| Error::DatasetNotFound {
                 path: base_path.to_string(),
                 source: Box::new(e),
+                location: location!(),
             })?;
 
         let session = if let Some(session) = params.session.as_ref() {
@@ -279,6 +280,7 @@ impl Dataset {
                 Error::NotFound { uri, .. } => Error::DatasetNotFound {
                     path: uri.clone(),
                     source: box_error(e),
+                    location: location!(),
                 },
                 _ => e,
             })?;
@@ -291,6 +293,7 @@ impl Dataset {
                 object_store::Error::NotFound { path: _, source } => Error::DatasetNotFound {
                     path: base_path.to_string(),
                     source,
+                    location: location!(),
                 },
                 _ => e.into(),
             })?;
@@ -669,6 +672,7 @@ impl Dataset {
             return Err(Error::DatasetNotFound {
                 path: base.to_string(),
                 source: "The dataset must already exist unless the operation is Overwrite".into(),
+                location: location!(),
             });
         }
 

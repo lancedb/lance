@@ -37,8 +37,8 @@ pub enum Error {
     // #[snafu(display("Append with different schema: original={original} new={new}"))]
     #[snafu(display("Append with different schema:"))]
     SchemaMismatch {},
-    #[snafu(display("Dataset at path {path} was not found: {source}"))]
-    DatasetNotFound { path: String, source: BoxedError },
+    #[snafu(display("Dataset at path {path} was not found: {source}, {location}"))]
+    DatasetNotFound { path: String, source: BoxedError, location: Location },
     #[snafu(display("Encountered corrupt file {path}: {source}"))]
     CorruptFile {
         path: object_store::path::Path,
