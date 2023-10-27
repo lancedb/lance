@@ -21,6 +21,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use snafu::{location, Location};
 use uuid::Uuid;
 
 pub(crate) mod append;
@@ -89,11 +90,13 @@ pub(crate) async fn remap_index(
         .find(|i| i.uuid == *index_id)
         .ok_or_else(|| Error::Index {
             message: format!("Index with id {} does not exist", index_id),
+            location: location!(),
         })?;
 
     if matched.fields.len() > 1 {
         return Err(Error::Index {
             message: "Remapping indices with multiple fields is not supported".to_string(),
+            location: location!(),
         });
     }
     let field = matched
@@ -159,12 +162,14 @@ impl DatasetIndexExt for Dataset {
         if columns.len() != 1 {
             return Err(Error::Index {
                 message: "Only support building index on 1 column at the moment".to_string(),
+                location: location!(),
             });
         }
         let column = columns[0];
         let Some(field) = self.schema().field(column) else {
             return Err(Error::Index {
                 message: format!("CreateIndex: column '{column}' does not exist"),
+                location: location!(),
             });
         };
 
@@ -178,6 +183,7 @@ impl DatasetIndexExt for Dataset {
                         "Index name '{index_name} already exists, \
                         please specify a different name or use replace=True"
                     ),
+                    location: location!(),
                 });
             };
             if idx.fields != [field.id] {
@@ -186,6 +192,7 @@ impl DatasetIndexExt for Dataset {
                         "Index name '{index_name} already exists with different fields, \
                         please specify a different name"
                     ),
+                    location: location!(),
                 });
             }
         }
@@ -199,6 +206,7 @@ impl DatasetIndexExt for Dataset {
                     .downcast_ref::<VectorIndexParams>()
                     .ok_or_else(|| Error::Index {
                         message: "Vector index type must take a VectorIndexParams".to_string(),
+                        location: location!(),
                     })?;
 
                 build_vector_index(self, column, &index_name, &index_id.to_string(), vec_params)

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_schema::{DataType, Field};
 use lance_arrow::{ArrowFloatType, FloatType};
@@ -22,6 +20,8 @@ use lance_linalg::MatrixView;
 use prost::bytes;
 use rand::distributions::Standard;
 use rand::prelude::*;
+use snafu::{location, Location};
+use std::sync::Arc;
 
 use super::pb;
 use crate::pb::Tensor;
@@ -64,6 +64,7 @@ impl TryFrom<&DataType> for pb::tensor::DataType {
             DataType::Float64 => Ok(Self::Float64),
             _ => Err(Error::Index {
                 message: format!("pb tensor type not supported: {:?}", dt),
+                location: location!(),
             }),
         }
     }
@@ -112,6 +113,7 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
         if tensor.shape.len() != 2 {
             return Err(Error::Index {
                 message: format!("only accept 2-D tensor shape, got: {:?}", tensor.shape),
+                location: location!(),
             });
         }
         let dim = tensor.shape[1] as usize;
@@ -132,6 +134,7 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
                     tensor.shape,
                     flat_array.len()
                 ),
+                location: location!(),
             });
         }
 

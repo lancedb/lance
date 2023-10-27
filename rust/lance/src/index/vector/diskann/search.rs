@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use snafu::{location, Location};
 use std::{
     any::Any,
     cmp::Reverse,
@@ -28,6 +27,7 @@ use lance_index::vector::{Query, DIST_COL};
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
 use serde::Serialize;
+use snafu::{location, Location};
 use tracing::instrument;
 
 use super::row_vertex::{RowVertex, RowVertexSerDe};
@@ -264,6 +264,7 @@ impl VectorIndex for DiskANNIndex {
     ) -> Result<Box<dyn VectorIndex>> {
         Err(Error::Index {
             message: "DiskANNIndex is not loadable".to_string(),
+            location: location!(),
         })
     }
 

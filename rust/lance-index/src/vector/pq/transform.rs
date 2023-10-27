@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
 use lance_linalg::MatrixView;
+use snafu::{location, Location};
 
 use super::ProductQuantizer;
 use crate::vector::transform::Transformer;
@@ -64,6 +65,7 @@ impl Transformer for PQTransformer {
                     "PQ Transform: column {} not found in batch",
                     self.input_column
                 ),
+                location: location!(),
             })?;
         let data: MatrixView<Float32Type> = input_arr
             .as_fixed_size_list_opt()
@@ -73,6 +75,7 @@ impl Transformer for PQTransformer {
                     self.input_column,
                     input_arr.data_type(),
                 ),
+                location: location!(),
             })?
             .try_into()?;
         let pq_code = self.quantizer.transform(&data).await?;

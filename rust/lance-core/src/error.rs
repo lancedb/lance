@@ -73,8 +73,8 @@ pub enum Error {
     NotFound { uri: String, location: Location },
     #[snafu(display("LanceError(IO): {message}, {location}"))]
     IO { message: String, location: Location },
-    #[snafu(display("LanceError(Index): {message}"))]
-    Index { message: String },
+    #[snafu(display("LanceError(Index): {message}, {location}"))]
+    Index { message: String, location: Location },
     /// Stream early stop
     Stop,
 }
@@ -194,7 +194,7 @@ impl From<Error> for ArrowError {
             Error::Arrow { message, .. } => arrow_io_error_from_msg(message), // we lose the error type converting to LanceError
             Error::IO { message, .. } => arrow_io_error_from_msg(message),
             Error::Schema { message, .. } => Self::SchemaError(message),
-            Error::Index { message } => arrow_io_error_from_msg(message),
+            Error::Index { message, .. } => arrow_io_error_from_msg(message),
             Error::Stop => arrow_io_error_from_msg("early stop".to_string()),
             e => arrow_io_error_from_msg(e.to_string()), // Find a more scalable way of doing this
         }

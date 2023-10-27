@@ -92,6 +92,7 @@ pub async fn shuffle_dataset(
             .await
             .map_err(|e| Error::Index {
                 message: e.to_string(),
+                location: location!(),
             })
         })
         .buffer_unordered(num_cpus::get())

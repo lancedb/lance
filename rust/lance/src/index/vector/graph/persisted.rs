@@ -31,6 +31,7 @@ use lance_core::{
 use lance_linalg::distance::l2::L2;
 use lru_time_cache::LruCache;
 use object_store::path::Path;
+use snafu::{location, Location};
 
 use super::{builder::GraphBuilder, Graph};
 use super::{Vertex, VertexSerDe};
@@ -114,12 +115,14 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
                             "Vertex column must be of fixed size binary, got: {}",
                             field.data_type()
                         ),
+                        location: location!(),
                     })
                 }
             }
         } else {
             return Err(Error::Index {
                 message: "Vertex column does not exist in the graph".to_string(),
+                location: location!(),
             });
         };
         let neighbors_projection = schema.project(&[NEIGHBORS_COL])?;
@@ -210,6 +213,7 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
             if array.len() < 1 {
                 return Err(Error::Index {
                     message: "Invalid graph".to_string(),
+                    location: location!(),
                 });
             }
             let value = array.value(0);
@@ -252,6 +256,7 @@ impl<V: Vertex + Send + Sync + Debug> Graph for PersistedGraph<V> {
             if array.len() < 1 {
                 return Err(Error::Index {
                     message: "Invalid graph".to_string(),
+                    location: location!(),
                 });
             }
             let value = array.value(0);
@@ -285,6 +290,7 @@ pub async fn write_graph<V: Vertex + Clone + Sync + Send>(
     if graph.is_empty() {
         return Err(Error::Index {
             message: "Invalid graph".to_string(),
+            location: location!(),
         });
     }
     let binary_size = serde.size();

@@ -36,6 +36,7 @@ use lance_linalg::{
     matrix::MatrixView,
 };
 use serde::Serialize;
+use snafu::{location, Location};
 use tracing::{instrument, Instrument};
 
 use super::VectorIndex;
@@ -243,6 +244,7 @@ impl VectorIndex for PQIndex {
         if self.code.is_none() || self.row_ids.is_none() {
             return Err(Error::Index {
                 message: "PQIndex::search: PQ is not initialized".to_string(),
+                location: location!(),
             });
         }
         pre_filter.wait_for_ready().await?;

@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
 use arrow_array::{builder::Float32Builder, FixedSizeListArray, Float32Array};
 use lance_arrow::FixedSizeListArrayExt;
 use log::info;
 use rand::{seq::IteratorRandom, Rng};
+use snafu::{location, Location};
+use std::sync::Arc;
 
 use lance_core::{Error, Result};
 use lance_linalg::{
@@ -42,7 +42,7 @@ pub async fn train_kmeans(
     if num_rows < k {
         return Err(Error::Index{message: format!(
             "KMeans: can not train {k} centroids with {num_rows} vectors, choose a smaller K (< {num_rows}) instead"
-        )});
+        ),location: location!()});
     }
     // Ony sample sample_rate * num_clusters. See Faiss
     let data = if num_rows > sample_rate * k {

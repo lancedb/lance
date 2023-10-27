@@ -104,6 +104,7 @@ impl IVFIndex {
         if !sub_index.is_loadable() {
             return Err(Error::Index {
                 message: format!("IVF sub index must be loadable, got: {:?}", sub_index),
+                location: location!(),
             });
         }
         Ok(Self {
@@ -178,6 +179,7 @@ impl IVFIndex {
             .downcast_ref::<PQIndex>()
             .ok_or(Error::Index {
                 message: "Only support append to IVF_PQ".to_string(),
+                location: location!(),
             })?;
 
         // TODO: merge two IVF implementations.
@@ -315,6 +317,7 @@ impl VectorIndex for IVFIndex {
     ) -> Result<Box<dyn VectorIndex>> {
         Err(Error::Index {
             message: "Flat index does not support load".to_string(),
+            location: location!(),
         })
     }
 
@@ -331,6 +334,7 @@ impl VectorIndex for IVFIndex {
         // mirrors some of the other IVF routines like build_ivf_pq_index
         Err(Error::Index {
             message: "Remapping IVF in this way not supported".to_string(),
+            location: location!(),
         })
     }
 }
@@ -560,7 +564,7 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
             return Err(
         Error::Index{message:
             format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
-            elem_type.data_type())});
+            elem_type.data_type()),            location: location!()        });
         }
     } else {
         return Err(Error::Index {
@@ -568,6 +572,7 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
             "VectorIndex requires the column data type to be fixed size list of float32s, got {}",
             field.data_type()
         ),
+            location: location!(),
         });
     }
     Ok(field)
@@ -621,6 +626,7 @@ impl IvfBuildParams {
                     num_partitions,
                     centroids.len()
                 ),
+                location: location!(),
             });
         }
         Ok(Self {
@@ -658,6 +664,7 @@ pub async fn build_ivf_pq_index(
                 "VectorIndex requires the column data type to be fixed size list of floats, got {}",
                 field.data_type()
             ),
+            location: location!(),
         });
     };
 
@@ -683,6 +690,7 @@ pub async fn build_ivf_pq_index(
                     centroids.len(),
                     ivf_params.num_partitions * dim,
                 ),
+                location: location!(),
             });
         }
         Ivf::new(centroids.clone())
@@ -692,6 +700,7 @@ pub async fn build_ivf_pq_index(
             #[cfg(not(feature = "opq"))]
             return Err(Error::Index {
                 message: "Feature 'opq' is not installed.".to_string(),
+                location: location!(),
             });
             #[cfg(feature = "opq")]
             {

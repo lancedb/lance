@@ -16,7 +16,6 @@
 //!
 
 use arrow_array::Float32Array;
-use snafu::{location, Location};
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
@@ -33,6 +32,7 @@ mod utils;
 use lance_core::io::{read_message, Reader};
 use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
 use lance_linalg::distance::*;
+use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -175,6 +175,7 @@ pub(crate) async fn build_vector_index(
     if stages.is_empty() {
         return Err(Error::Index {
             message: "Build Vector Index: must have at least 1 stage".to_string(),
+            location: location!(),
         });
     };
 
@@ -184,11 +185,13 @@ pub(crate) async fn build_vector_index(
         let StageParams::Ivf(ivf_params) = &stages[len - 2] else {
             return Err(Error::Index {
                 message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                location: location!(),
             });
         };
         let StageParams::PQ(pq_params) = &stages[len - 1] else {
             return Err(Error::Index {
                 message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                location: location!(),
             });
         };
         build_ivf_pq_index(
@@ -207,12 +210,14 @@ pub(crate) async fn build_vector_index(
         let StageParams::DiskANN(params) = stages.last().unwrap() else {
             return Err(Error::Index {
                 message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                location: location!(),
             });
         };
         build_diskann_index(dataset, column, name, uuid, params.clone()).await?;
     } else {
         return Err(Error::Index {
             message: format!("Build Vector Index: invalid stages: {:?}", stages),
+            location: location!(),
         });
     }
 
@@ -294,6 +299,7 @@ pub(crate) async fn open_index(
     if proto.columns.len() != 1 {
         return Err(Error::Index {
             message: "VectorIndex only supports 1 column".to_string(),
+            location: location!(),
         });
     }
     assert_eq!(proto.index_type, pb::IndexType::Vector as i32);
@@ -301,6 +307,7 @@ pub(crate) async fn open_index(
     let Some(idx_impl) = proto.implementation.as_ref() else {
         return Err(Error::Index {
             message: "Invalid protobuf for VectorIndex metadata".to_string(),
+            location: location!(),
         });
     };
 
@@ -317,6 +324,7 @@ pub(crate) async fn open_index(
                 if last_stage.is_none() {
                     return Err(Error::Index {
                         message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
+                        location: location!(),
                     });
                 }
                 #[cfg(feature = "opq")]
@@ -343,6 +351,7 @@ pub(crate) async fn open_index(
                 if last_stage.is_none() {
                     return Err(Error::Index {
                         message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
+                        location: location!(),
                     });
                 }
                 let ivf = Ivf::try_from(ivf_pb)?;
@@ -359,6 +368,7 @@ pub(crate) async fn open_index(
                 if last_stage.is_some() {
                     return Err(Error::Index {
                         message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
+                        location: location!(),
                     });
                 };
                 let pq = Arc::new(ProductQuantizer::new(
@@ -379,6 +389,7 @@ pub(crate) async fn open_index(
                             "DiskANN should be the only stage, but we got stages: {:?}",
                             vec_idx.stages
                         ),
+                        location: location!(),
                     });
                 };
                 let graph_path = index_dir.child(diskann_proto.filename.as_str());
@@ -393,6 +404,7 @@ pub(crate) async fn open_index(
     if last_stage.is_none() {
         return Err(Error::Index {
             message: format!("Invalid index stages: {:?}", vec_idx.stages),
+            location: location!(),
         });
     }
     let idx = last_stage.unwrap();
