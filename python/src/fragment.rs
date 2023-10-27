@@ -25,8 +25,8 @@ use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use lance::datatypes::Schema;
 use lance::format::{pb, DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
-use lance::io::object_store::Path;
-use lance::io::{deletion_file_path, ObjectStore};
+use lance_core::io::{deletion::deletion_file_path, object_store::ObjectStore};
+use object_store::path::Path;
 use prost::Message;
 use pyo3::prelude::*;
 use pyo3::{

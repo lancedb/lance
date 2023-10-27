@@ -39,6 +39,11 @@ use snafu::{location, Location};
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 use url::Url;
 
+use super::local::LocalObjectReader;
+#[cfg(feature = "dynamodb")]
+use crate::io::commit::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore};
+
+mod tracing;
 use self::tracing::ObjectStoreTracingExt;
 use crate::{
     error::{Error, Result},
@@ -87,14 +92,6 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
         }
     }
 }
-
-#[cfg(feature = "dynamodb")]
-use super::commit::dynamodb;
-use super::local::LocalObjectReader;
-#[cfg(feature = "dynamodb")]
-use crate::io::commit::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore};
-
-mod tracing;
 
 /// Wraps [ObjectStore](object_store::ObjectStore)
 #[derive(Debug, Clone)]

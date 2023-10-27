@@ -23,8 +23,12 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
 use lance_arrow::{as_fixed_size_binary_array, as_fixed_size_list_array};
+use lance_core::{
+    datatypes::Schema,
+    io::{object_store::ObjectStore, FileReader, FileWriter},
+    Error, Result,
+};
 use lance_linalg::distance::l2::L2;
-use lance_core::{io::{FileReader, FileWriter, object_store::ObjectStore}, Error, Result, datatypes::Schema};
 use lru_time_cache::LruCache;
 use object_store::path::Path;
 
@@ -32,7 +36,6 @@ use super::{builder::GraphBuilder, Graph};
 use super::{Vertex, VertexSerDe};
 use crate::dataset::Dataset;
 use crate::index::vector::diskann::RowVertex;
-
 
 const NEIGHBORS_COL: &str = "neighbors";
 const VERTEX_COL: &str = "vertex";

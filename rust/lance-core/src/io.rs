@@ -33,10 +33,10 @@ pub mod writer;
 
 pub use object_reader::CloudObjectReader;
 pub use object_writer::ObjectWriter;
+pub use reader::FileReader;
 pub use stream::{RecordBatchStream, RecordBatchStreamAdapter};
 pub use traits::*;
 pub use utils::*;
-pub use reader::FileReader;
 pub use writer::FileWriter;
 
 /// Parameter to be used to read a batch.

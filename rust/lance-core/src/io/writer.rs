@@ -573,7 +573,7 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use object_store::path::Path;
 
-    use crate::io::{FileReader, object_store::ObjectStore};
+    use crate::io::{object_store::ObjectStore, FileReader};
 
     #[tokio::test]
     async fn test_write_file() {

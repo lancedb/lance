@@ -1030,6 +1030,7 @@ mod tests {
     use crate::io::deletion::write_deletion_file;
     use crate::io::deletion::DeletionVector;
     use crate::io::object_store::ObjectStore;
+    use crate::io::{write_manifest, WriteExt};
     use arrow_array::{
         builder::{
             Int32Builder, LargeListBuilder, ListBuilder, StringBuilder, StringDictionaryBuilder,
@@ -1041,7 +1042,6 @@ mod tests {
     };
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
-    use crate::io::{write_manifest, WriteExt};
     use rand::{distributions::Alphanumeric, Rng};
     use roaring::RoaringBitmap;
     use tempfile::tempdir;
