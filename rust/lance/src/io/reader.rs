@@ -40,10 +40,12 @@ use bytes::{Bytes, BytesMut};
 use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{
+    datatypes::{Field, Schema},
     encodings::{dictionary::DictionaryDecoder, AsyncIndex},
+    format::{pb, Fragment, Index, Manifest, Metadata, PageInfo, PageTable},
     io::{
-        read_fixed_stride_array, read_message, read_struct, ReadBatchParams, Reader,
-        RecordBatchStream, RecordBatchStreamAdapter,
+        object_store::ObjectStore, read_fixed_stride_array, read_message, read_struct,
+        ReadBatchParams, Reader, RecordBatchStream, RecordBatchStreamAdapter,
     },
     Error, Result, ROW_ID, ROW_ID_FIELD,
 };
@@ -54,15 +56,8 @@ use tracing::instrument;
 
 use super::deletion::{read_deletion_file, DeletionVector};
 use super::deletion_file_path;
-use crate::format::{pb, Fragment, Index, Manifest, Metadata, PageTable};
 use crate::io::{read_metadata_offset, read_struct_from_buf};
 use crate::session::Session;
-use crate::{
-    datatypes::{Field, Schema},
-    format::PageInfo,
-};
-
-use super::object_store::ObjectStore;
 
 /// Read Manifest on URI.
 ///

@@ -287,8 +287,8 @@ async fn build_dynamodb_external_store(
 ) -> Result<Arc<dyn ExternalManifestStore>> {
     use std::env;
 
-    use aws_sdk_dynamodb::{config::Region, Client};
     use super::commit::dynamodb::DynamoDBExternalManifestStore;
+    use aws_sdk_dynamodb::{config::Region, Client};
 
     let dynamodb_config = aws_sdk_dynamodb::config::Builder::new()
         .region(Some(Region::new(region.to_string())))
