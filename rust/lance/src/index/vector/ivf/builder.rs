@@ -109,7 +109,7 @@ pub async fn shuffle_dataset(
             false,
         ),
     ]);
-    const FLUSH_THRESHOLD: usize = 2 * 1024;
+    const FLUSH_THRESHOLD: usize = 40 * 1024;
 
     let mut shuffler_builder = ShufflerBuilder::try_new(&schema, FLUSH_THRESHOLD).await?;
     while let Some(result) = stream.next().await {
