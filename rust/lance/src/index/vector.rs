@@ -15,10 +15,10 @@
 //! Vector Index for Fast Approximate Nearest Neighbor (ANN) Search
 //!
 
+use arrow_array::Float32Array;
+use snafu::{location, Location};
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
-
-use arrow_array::Float32Array;
 
 pub mod diskann;
 #[allow(dead_code)]
@@ -236,6 +236,7 @@ pub(crate) async fn remap_vector_index(
             .downcast_ref()
             .ok_or_else(|| Error::NotSupported {
                 source: "Only IVF indexes can be remapped currently".into(),
+                location: location!(),
             })?;
 
     remap_index_file(

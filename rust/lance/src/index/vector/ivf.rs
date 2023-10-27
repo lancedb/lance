@@ -873,6 +873,7 @@ pub(crate) async fn remap_index_file(
         .downcast_ref::<PQIndex>()
         .ok_or_else(|| Error::NotSupported {
             source: "Remapping a non-pq sub-index".into(),
+            location: location!(),
         })?;
 
     let metadata = IvfPQIndexMetadata {

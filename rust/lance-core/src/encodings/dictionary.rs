@@ -196,6 +196,7 @@ impl<'a> AsyncIndex<usize> for DictionaryDecoder<'a> {
             source: "DictionaryDecoder does not support get()"
                 .to_string()
                 .into(),
+            location: location!(),
         })
     }
 }

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use snafu::{location, Location};
 use std::{
     any::Any,
     cmp::Reverse,
@@ -269,12 +270,14 @@ impl VectorIndex for DiskANNIndex {
     fn check_can_remap(&self) -> Result<()> {
         Err(Error::NotSupported {
             source: "DiskANNIndex does not yet support remap".into(),
+            location: location!(),
         })
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         Err(Error::NotSupported {
             source: "DiskANNIndex does not yet support remap".into(),
+            location: location!(),
         })
     }
 }

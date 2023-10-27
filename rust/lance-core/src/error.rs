@@ -50,8 +50,11 @@ pub enum Error {
         location: Location,
         // TODO: add backtrace?
     },
-    #[snafu(display("Not supported: {source}"))]
-    NotSupported { source: BoxedError },
+    #[snafu(display("Not supported: {source}, {location}"))]
+    NotSupported {
+        source: BoxedError,
+        location: Location,
+    },
     #[snafu(display("Commit conflict for version {version}: {source}"))]
     CommitConflict { version: u64, source: BoxedError },
     #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lancedb/lance/issues. {message}"))]

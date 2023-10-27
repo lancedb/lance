@@ -309,6 +309,7 @@ impl Dataset {
             );
             return Err(Error::NotSupported {
                 source: message.into(),
+                location: location!(),
             });
         }
 
@@ -409,6 +410,7 @@ impl Dataset {
                 );
                 return Err(Error::NotSupported {
                     source: message.into(),
+                    location: location!(),
                 });
             }
         }

@@ -221,6 +221,7 @@ pub(crate) fn add_blanks(
         // This is difficult because we need to create a batch for arbitrary schemas.
         return Err(Error::NotSupported {
             source: "Missing many rows in merge".into(),
+            location: location!(),
         });
     }
 
