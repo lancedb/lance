@@ -14,6 +14,8 @@
 
 use std::fmt::Debug;
 
+use snafu::{location, Location};
+
 use lance_core::io::commit::{CommitError, CommitLease, CommitLock};
 use lance_core::Error;
 
@@ -36,6 +38,7 @@ fn handle_error(py_err: PyErr, py: Python) -> CommitError {
         Err(import_error) => {
             return CommitError::OtherError(Error::Internal {
                 message: format!("Error importing from pylance {}", import_error),
+                location: location!(),
             })
         }
     };
@@ -45,6 +48,7 @@ fn handle_error(py_err: PyErr, py: Python) -> CommitError {
     } else {
         CommitError::OtherError(Error::Internal {
             message: format!("Error from commit handler: {}", py_err),
+            location: location!(),
         })
     }
 }
