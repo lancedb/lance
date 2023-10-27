@@ -132,7 +132,7 @@ impl<'a> CleanupTask<'a> {
         self.dataset
             .object_store
             .commit_handler
-            .list_manifests(&self.dataset.base, &self.dataset.object_store)
+            .list_manifests(&self.dataset.base, &self.dataset.object_store.inner)
             .await?
             .try_for_each_concurrent(num_cpus::get(), |path| {
                 self.process_manifest_file(path, &inspection)

@@ -317,7 +317,7 @@ impl Transaction {
     ) -> Result<(Manifest, Vec<Index>)> {
         let path = object_store
             .commit_handler
-            .resolve_version(base_path, version, object_store)
+            .resolve_version(base_path, version, &object_store.inner)
             .await?;
         let mut manifest = read_manifest(object_store, &path).await?;
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
