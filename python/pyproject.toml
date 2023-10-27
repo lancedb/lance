@@ -64,4 +64,4 @@ benchmarks = [
 ]
 
 [tool.ruff]
-select = ["F", "I", "G", "TCH", "PERF"]
+select = ["F", "E", "W", "I", "G", "TCH", "PERF"]

@@ -123,7 +123,8 @@ class LanceDataset(pa.dataset.Dataset):
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
-            "LanceDataset.index_statistics() is deprecated, use LanceDataset.stats.index_stats() instead",
+            "LanceDataset.index_statistics() is deprecated, "
+            + "use LanceDataset.stats.index_stats() instead",
             DeprecationWarning,
         )
         return json.loads(self._ds.index_statistics(index_name))
