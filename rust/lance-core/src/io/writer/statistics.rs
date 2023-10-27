@@ -36,7 +36,7 @@ use arrow_array::{
     RecordBatch, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
-use datafusion::common::ScalarValue;
+use datafusion_common::ScalarValue;
 use lance_arrow::as_fixed_size_binary_array;
 use num_traits::bounds::Bounded;
 use std::str;
@@ -105,7 +105,7 @@ where
 fn get_statistics<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> StatisticsRow
 where
     T::Native: Bounded,
-    datafusion::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
+    datafusion_common::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
 {
     let (min_value, max_value, null_count) = get_primitive_statistics::<T>(arrays);
 
