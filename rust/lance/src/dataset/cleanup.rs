@@ -56,7 +56,6 @@ use lance_core::{
     Error, Result,
 };
 use object_store::path::Path;
-use snafu::{location, Location};
 use std::{
     collections::HashSet,
     future,
@@ -461,7 +460,7 @@ mod tests {
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
-    use snafu::location;
+    use snafu::{location, Location};
     use tokio::io::AsyncWriteExt;
 
     use crate::{
