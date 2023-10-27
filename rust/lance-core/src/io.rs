@@ -20,19 +20,24 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use arrow_array::UInt32Array;
 
 pub mod commit;
+mod deletion;
 pub mod local;
 pub mod object_reader;
 pub mod object_store;
 pub mod object_writer;
+pub mod reader;
 mod stream;
 mod traits;
 mod utils;
+pub mod writer;
 
 pub use object_reader::CloudObjectReader;
 pub use object_writer::ObjectWriter;
 pub use stream::{RecordBatchStream, RecordBatchStreamAdapter};
 pub use traits::*;
 pub use utils::*;
+pub use reader::FileReader;
+pub use writer::FileWriter;
 
 /// Parameter to be used to read a batch.
 #[derive(Debug, Clone)]

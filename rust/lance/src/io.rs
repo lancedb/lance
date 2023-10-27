@@ -23,20 +23,13 @@ use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 pub mod commit;
-pub(crate) mod deletion;
 pub(crate) mod exec;
 pub mod object_store;
-pub(crate) mod reader;
-mod writer;
-
 use crate::format::{ProtoStruct, INDEX_MAGIC, MAGIC};
 
 pub use self::object_store::ObjectStore;
-pub use deletion::deletion_file_path;
 pub use lance_core::io::local;
-pub use lance_core::io::RecordBatchStream;
-pub use reader::{read_manifest, FileReader};
-pub use writer::*;
+pub use lance_core::io::{RecordBatchStream, utils::*};
 
 #[async_trait]
 pub trait AsyncWriteProtoExt {
