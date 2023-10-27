@@ -39,22 +39,20 @@ clap = { version = "4.1.1", features = ["derive"], optional = true }
 # This is already used by datafusion
 dashmap = "5"
 # matches arrow-rs use
-half = { version = "2.2.1", default-features = false, features = [
-    "num-traits",
-] }
+half.workspace = true
 http.workspace = true
-object_store = { workspace = true }
-aws-config = "0.56"
-aws-credential-types = "0.56"
+object_store.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
 pin-project.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 roaring.workspace = true
-tokio = { workspace = true }
-url = "2.3"
-rand = { version = "0.8.3", features = ["small_rng"] }
-futures = { workspace = true }
-uuid = { version = "1.2", features = ["v4", "serde"] }
+tokio.workspace = true
+url.workspace = true
+rand.workspace = true
+futures.workspace = true
+uuid.workspace = true
 shellexpand.workspace = true
 arrow = { version = "47.0.0", features = ["prettyprint"] }
 num_cpus.workspace = true
@@ -71,11 +69,11 @@ snafu = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
-moka = "0.11.3"
+moka.workspace = true
 tfrecord = { version = "0.15.0", optional = true, features = ["async"] }
 aws-sdk-dynamodb = { workspace = true, optional = true }
-tempfile = { workspace = true }
-tracing = { workspace = true }
+tempfile.workspace = true
+tracing.workspace = true
 lazy_static = { workspace = true }
 base64 = "0.21.4"
 async_cell = "0.2.2"
@@ -91,7 +89,7 @@ openblas-src = { version = "0.10.8", default-features = false, features = [
 ], optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-pprof = { version = "0.12", features = ["flamegraph", "criterion"] }
+pprof.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 openblas-src = { version = "0.10.8", default-features = false, features = [
@@ -110,7 +108,7 @@ criterion = { workspace = true }
 approx.workspace = true
 dirs = "5.0.0"
 all_asserts = "2.3.1"
-mock_instant = { version = "0.3.1", features = ["sync"] }
+mock_instant.workspace = true
 lance-testing = { workspace = true }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 env_logger = "0.10.0"
