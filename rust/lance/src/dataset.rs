@@ -351,6 +351,7 @@ impl Dataset {
         if dataset_exists && matches!(params.mode, WriteMode::Create) {
             return Err(Error::DatasetAlreadyExists {
                 uri: uri.to_owned(),
+                location: location!(),
             });
         }
 

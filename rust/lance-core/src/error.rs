@@ -32,8 +32,8 @@ pub enum Error {
         source: BoxedError,
         location: Location,
     },
-    #[snafu(display("Dataset already exists: {uri}"))]
-    DatasetAlreadyExists { uri: String },
+    #[snafu(display("Dataset already exists: {uri}, {location}"))]
+    DatasetAlreadyExists { uri: String, location: Location },
     // #[snafu(display("Append with different schema: original={original} new={new}"))]
     #[snafu(display("Append with different schema:"))]
     SchemaMismatch {},
