@@ -12,22 +12,24 @@ integtest:
 	pytest --run-integration $(PYTEST_ARGS) python/tests
 .PHONY: integtest
 
-format:
-	make format-python && cargo fmt
+format: format-python
+	cargo fmt
 .PHONY: format
 
 format-python:
-	black python && isort python
+	ruff format python
+	ruff --fix python
 .PHONY: format-python
 
-lint:
-	make lint-python && make lint-rust
+lint: lint-python lint-rust
 .PHONY: lint
 
 lint-python:
-	black --check python && isort --check-only python && ruff python
+	ruff format --check python
+	ruff python
 .PHONY: lint-python
 
 lint-rust:
-	cargo fmt -- --check && cargo clippy -- -D warnings
+	cargo fmt -- --check
+	cargo clippy -- -D warnings
 .PHONY: lint-rust
