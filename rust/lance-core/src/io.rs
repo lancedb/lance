@@ -20,7 +20,7 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use arrow_array::UInt32Array;
 
 pub mod commit;
-mod deletion;
+pub mod deletion;
 pub mod local;
 pub mod object_reader;
 pub mod object_store;

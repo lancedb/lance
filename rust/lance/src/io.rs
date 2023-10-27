@@ -25,11 +25,11 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 pub mod commit;
 pub(crate) mod exec;
 pub mod object_store;
-use crate::format::{ProtoStruct, INDEX_MAGIC, MAGIC};
+use crate::format::{ProtoStruct, INDEX_MAGIC};
 
 pub use self::object_store::ObjectStore;
 pub use lance_core::io::local;
-pub use lance_core::io::{RecordBatchStream, utils::*};
+pub use lance_core::io::*;
 
 #[async_trait]
 pub trait AsyncWriteProtoExt {

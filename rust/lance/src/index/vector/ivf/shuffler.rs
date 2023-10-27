@@ -17,17 +17,17 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use lance_core::{
+    datatypes::Schema,
+    io::{
+        object_store::ObjectStore, reader::batches_stream, FileReader, FileWriter,
+        RecordBatchStream,
+    },
+    Error, Result,
+};
 use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::TempDir;
-
-use crate::datatypes::Schema;
-use crate::io::reader::batches_stream;
-use crate::io::FileReader;
-use crate::{
-    error::{Error, Result},
-    io::{FileWriter, ObjectStore, RecordBatchStream},
-};
 
 const BUFFER_FILE_NAME: &str = "buffer.lance";
 

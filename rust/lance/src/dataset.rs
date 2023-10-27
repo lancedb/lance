@@ -33,7 +33,13 @@ use chrono::{prelude::*, Duration};
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt};
-use lance_core::io::{commit::CommitError, read_struct, write_manifest, ObjectWriter, WriteExt};
+use lance_core::io::{
+    commit::CommitError,
+    object_store::{ObjectStore, ObjectStoreParams},
+    read_metadata_offset, read_struct,
+    reader::{read_manifest, read_manifest_indexes},
+    write_manifest, ObjectWriter, WriteExt,
+};
 use log::warn;
 use object_store::path::Path;
 use tracing::instrument;
@@ -62,12 +68,7 @@ use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{Fragment, Index, Manifest};
 use crate::index::vector::open_index;
-use crate::io::reader::read_manifest_indexes;
-use crate::io::{
-    commit::{commit_new_dataset, commit_transaction},
-    object_store::ObjectStoreParams,
-    read_manifest, read_metadata_offset, ObjectStore,
-};
+use crate::io::commit::{commit_new_dataset, commit_transaction};
 use crate::session::Session;
 
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};

@@ -428,7 +428,7 @@ impl FileReader {
     }
 
     /// Instruct the FileReader to return meta row id column.
-    pub(crate) fn with_row_id(&mut self, v: bool) -> &mut Self {
+    pub fn with_row_id(&mut self, v: bool) -> &mut Self {
         self.with_row_id = v;
         self
     }
@@ -438,7 +438,7 @@ impl FileReader {
     /// for example if the entire batch is deleted. This is a performance
     /// optimization where the null bitmap of the _rowid column serves as a
     /// selection vector.
-    pub(crate) fn with_make_deletions_null(&mut self, val: bool) -> &mut Self {
+    pub fn with_make_deletions_null(&mut self, val: bool) -> &mut Self {
         self.make_deletions_null = val;
         self
     }
@@ -470,7 +470,7 @@ impl FileReader {
     ///
     /// The schema of the returned [RecordBatch] is set by [`FileReader::schema()`].
     #[instrument(level = "debug", skip(self, params, projection))]
-    pub(crate) async fn read_batch(
+    pub async fn read_batch(
         &self,
         batch_id: i32,
         params: impl Into<ReadBatchParams>,
@@ -492,7 +492,7 @@ impl FileReader {
     /// Note that it might call concat if the range is crossing multiple batches, which
     /// makes it less efficient than [`FileReader::read_batch()`].
     #[instrument(level = "debug", skip(self, projection))]
-    pub(crate) async fn read_range(
+    pub async fn read_range(
         &self,
         range: Range<usize>,
         projection: &Schema,
