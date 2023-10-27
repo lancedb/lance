@@ -91,7 +91,7 @@ def test_s3_ddb_concurrent_commit_more_than_five(s3_bucket: str, ddb_table: str)
         for result in futures.as_completed(futs):
             try:
                 result.result()
-            except:  # noqa: E722
+            except:  # noqa: E722,PERF203
                 failures += 1
 
     assert failures > 0

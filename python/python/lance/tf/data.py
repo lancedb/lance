@@ -24,16 +24,19 @@ implementation for Lance.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Union
 
-import lance
 import numpy as np
 import pyarrow as pa
 import tensorflow as tf
+
+import lance
 from lance import LanceDataset
 from lance.arrow import EncodedImageType, FixedShapeImageTensorType, ImageURIType
 from lance.fragment import FragmentMetadata, LanceFragment
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def arrow_data_type_to_tf(dt: pa.DataType) -> tf.DType:

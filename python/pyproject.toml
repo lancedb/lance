@@ -63,6 +63,5 @@ benchmarks = [
     "pytest-benchmark",
 ]
 
-[tool.isort]
-profile = "black"
-
+[tool.ruff]
+select = ["F", "E", "W", "I", "G", "TCH", "PERF"]

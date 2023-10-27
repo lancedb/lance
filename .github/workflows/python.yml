@@ -42,12 +42,11 @@ jobs:
         workspaces: python
     - name: Install linting tools
       run: |
-        pip install black isort ruff maturin tensorflow tqdm
+        pip install ruff maturin tensorflow tqdm
         pip install torch --index-url https://download.pytorch.org/whl/cpu
     - name: Lint Python
       run: |
-        black --check python
-        isort --check-only python
+        ruff format --check python
         ruff check python
     - name: Install dependencies
       run: |

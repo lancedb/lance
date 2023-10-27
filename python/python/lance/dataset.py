@@ -39,16 +39,14 @@ from typing import (
 import numpy as np
 import pyarrow as pa
 import pyarrow.dataset
-from lance.optimize import Compaction
 from pyarrow import RecordBatch, Schema
-from pyarrow._compute import Expression
 
-from .commit import CommitLock
+from lance.optimize import Compaction
+
 from .fragment import FragmentMetadata, LanceFragment
-from .lance import CleanupStats
+from .lance import CleanupStats, _Dataset, _Operation, _Scanner, _write_dataset
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
-from .lance import _Dataset, _Operation, _Scanner, _write_dataset
 from .util import td_to_micros
 
 try:
@@ -74,6 +72,9 @@ except ImportError:
 
 if TYPE_CHECKING:
     import torch
+    from pyarrow._compute import Expression
+
+    from .commit import CommitLock
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -120,7 +121,8 @@ class LanceDataset(pa.dataset.Dataset):
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
-            "LanceDataset.index_statistics() is deprecated, use LanceDataset.stats.index_stats() instead",
+            "LanceDataset.index_statistics() is deprecated, "
+            + "use LanceDataset.stats.index_stats() instead",
             DeprecationWarning,
         )
         return json.loads(self._ds.index_statistics(index_name))

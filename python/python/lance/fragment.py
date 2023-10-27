@@ -26,9 +26,8 @@ except ImportError:
     pd = None
 import pyarrow as pa
 
-from .lance import _Fragment
+from .lance import _Fragment, _write_fragments
 from .lance import _FragmentMetadata as _FragmentMetadata
-from .lance import _write_fragments
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 
 if TYPE_CHECKING:
