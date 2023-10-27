@@ -55,6 +55,10 @@ impl DeletionVector {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn contains(&self, i: u32) -> bool {
         match self {
             Self::NoDeletions => false,
