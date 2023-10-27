@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use dashmap::DashMap;
 use lance_core::{
     datatypes::Schema,
     io::{
@@ -28,6 +29,7 @@ use lance_core::{
 use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::TempDir;
+use tokio::sync::Mutex;
 
 const BUFFER_FILE_NAME: &str = "buffer.lance";
 
@@ -47,7 +49,7 @@ const BUFFER_FILE_NAME: &str = "buffer.lance";
 ///     and later aggregated to create the final index file.
 #[allow(dead_code)]
 pub struct ShufflerBuilder {
-    buffer: BTreeMap<u32, Vec<RecordBatch>>,
+    buffer: DashMap<u32, Vec<RecordBatch>>,
 
     /// The size, as number of rows, of each partition in memory before flushing to disk.
     flush_size: usize,
@@ -55,13 +57,13 @@ pub struct ShufflerBuilder {
     /// Partition ID to file-group ID mapping, in memory.
     /// No external dependency is required, because we don't need to guarantee the
     /// persistence of this mapping, as well as the temp files.
-    parted_groups: BTreeMap<u32, Vec<u32>>,
+    parted_groups: DashMap<u32, Vec<u32>>,
 
     /// We need to keep the temp_dir with Shuffler because ObjectStore crate does not
     /// work with a NamedTempFile.
     temp_dir: Arc<TempDir>,
 
-    writer: FileWriter,
+    writer: Arc<Mutex<FileWriter>>,
 }
 
 fn lance_buffer_path(dir: &TempDir) -> Result<Path> {
@@ -73,7 +75,6 @@ fn lance_buffer_path(dir: &TempDir) -> Result<Path> {
 }
 
 impl ShufflerBuilder {
-    #[allow(dead_code)]
     pub async fn try_new(schema: &ArrowSchema, flush_threshold: usize) -> Result<Self> {
         let temp_dir = Arc::new(tempfile::tempdir()?);
 
@@ -82,46 +83,56 @@ impl ShufflerBuilder {
         let writer = object_store.create(&path).await?;
         let lance_schema = Schema::try_from(schema)?;
         Ok(Self {
-            buffer: BTreeMap::new(),
+            buffer: DashMap::new(),
             flush_size: flush_threshold, // TODO: change to parameterized value later.
             temp_dir,
-            parted_groups: BTreeMap::new(),
-            writer: FileWriter::with_object_writer(writer, lance_schema, &Default::default())?,
+            parted_groups: DashMap::new(),
+            writer: Arc::new(Mutex::new(FileWriter::with_object_writer(
+                writer,
+                lance_schema,
+                &Default::default(),
+            )?)),
         })
     }
 
     /// Insert a [RecordBatch] with the same key (Partition ID).
-    #[allow(dead_code)]
-    pub async fn insert(&mut self, key: u32, batch: RecordBatch) -> Result<()> {
-        let batches = self.buffer.entry(key).or_default();
+    pub async fn insert(&self, key: u32, batch: RecordBatch) -> Result<()> {
+        let mut batches = self.buffer.entry(key).or_default();
         batches.push(batch);
         let total = batches.iter().map(|b| b.num_rows()).sum::<usize>();
         // If there are more than `flush_size` rows in the buffer, flush them to disk
         // as one group.
         if total >= self.flush_size {
+            let mut writer = self.writer.lock().await;
             self.parted_groups
                 .entry(key)
                 .or_default()
-                .push(self.writer.next_batch_id() as u32);
-            self.writer.write(batches).await?;
+                .push(writer.next_batch_id() as u32);
+            writer.write(batches.as_slice()).await?;
             batches.clear();
         };
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn finish(&mut self) -> Result<Shuffler> {
-        for (key, batches) in self.buffer.iter() {
+        let mut writer = self.writer.lock().await;
+        for batches in self.buffer.iter() {
             if !batches.is_empty() {
                 self.parted_groups
-                    .entry(*key)
+                    .entry(*batches.key())
                     .or_default()
-                    .push(self.writer.next_batch_id() as u32);
-                self.writer.write(batches.as_slice()).await?;
+                    .push(writer.next_batch_id() as u32);
+                writer.write(batches.as_slice()).await?;
             }
         }
-        self.writer.finish().await?;
-        Ok(Shuffler::new(&self.parted_groups, self.temp_dir.clone()))
+        writer.finish().await?;
+        Ok(Shuffler::new(
+            self.parted_groups
+                .iter()
+                .map(|r| (*r.key(), r.to_vec()))
+                .collect(),
+            self.temp_dir.clone(),
+        ))
     }
 }
 
@@ -137,9 +148,9 @@ pub struct Shuffler {
 }
 
 impl Shuffler {
-    fn new(parted_groups: &BTreeMap<u32, Vec<u32>>, temp_dir: Arc<TempDir>) -> Self {
+    fn new(parted_groups: BTreeMap<u32, Vec<u32>>, temp_dir: Arc<TempDir>) -> Self {
         Self {
-            parted_groups: parted_groups.clone(),
+            parted_groups,
             temp_dir,
         }
     }
