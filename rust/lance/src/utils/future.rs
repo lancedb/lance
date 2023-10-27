@@ -1,7 +1,7 @@
-use std::sync::Arc;
-
 use async_cell::sync::AsyncCell;
 use futures::Future;
+use snafu::{location, Location};
+use std::sync::Arc;
 
 /// An async background task whose output can be shared across threads (via cloning)
 ///
@@ -22,7 +22,10 @@ impl<T: Clone> SharedPrerequisite<T> {
             .get()
             .await
             .clone()
-            .map_err(|err| crate::Error::PrerequisiteFailed { message: err })
+            .map_err(|err| crate::Error::PrerequisiteFailed {
+                message: err,
+                location: location!(),
+            })
     }
 
     /// Synchronously get a cloned copy of the cached output
@@ -45,7 +48,10 @@ impl<T: Clone> SharedPrerequisite<T> {
             .get()
             .await
             .map(|_| ())
-            .map_err(|err| crate::Error::PrerequisiteFailed { message: err })
+            .map_err(|err| crate::Error::PrerequisiteFailed {
+                message: err,
+                location: location!(),
+            })
     }
 
     /// Launch a background task (using tokio::spawn) and get a shareable handle to the eventual result
