@@ -55,8 +55,12 @@ pub enum Error {
         source: BoxedError,
         location: Location,
     },
-    #[snafu(display("Commit conflict for version {version}: {source}"))]
-    CommitConflict { version: u64, source: BoxedError },
+    #[snafu(display("Commit conflict for version {version}: {source}, {location}"))]
+    CommitConflict {
+        version: u64,
+        source: BoxedError,
+        location: Location,
+    },
     #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lancedb/lance/issues. {message}"))]
     Internal { message: String },
     #[snafu(display("A prerequisite task failed: {message}"))]

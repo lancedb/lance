@@ -544,7 +544,7 @@ impl Transaction {
             let replace_range = {
                 let start = final_fragments.iter().enumerate().find(|(_, f)| f.id == group.old_fragments[0].id)
                     .ok_or_else(|| Error::CommitConflict { version, source:
-                        format!("dataset does not contain a fragment a rewrite operation wants to replace: id={}", group.old_fragments[0].id).into() })?.0;
+                        format!("dataset does not contain a fragment a rewrite operation wants to replace: id={}", group.old_fragments[0].id).into() , location:location!()})?.0;
 
                 // Verify old_fragments matches contiguous range
                 let mut i = 1;
