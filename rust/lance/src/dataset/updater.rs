@@ -248,6 +248,7 @@ pub(crate) fn add_blanks(
             arrow::compute::take(array.as_ref(), &selection_vector, None).map_err(|e| {
                 Error::Arrow {
                     message: format!("Failed to add blanks: {}", e),
+                    location: location!(),
                 }
             })
         })

@@ -143,6 +143,7 @@ impl<'a> DictionaryDecoder<'a> {
         } else {
             return Err(Error::Arrow {
                 message: format!("Not a dictionary type: {}", self.data_type),
+                location: location!(),
             });
         };
 
@@ -160,6 +161,7 @@ impl<'a> DictionaryDecoder<'a> {
             DataType::UInt64 => self.make_dict_array::<UInt64Type>(keys).await,
             _ => Err(Error::Arrow {
                 message: format!("Dictionary encoding does not support index type: {index_type}",),
+                location: location!(),
             }),
         }
     }

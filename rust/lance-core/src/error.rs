@@ -65,8 +65,8 @@ pub enum Error {
     Internal { message: String, location: Location },
     #[snafu(display("A prerequisite task failed: {message}, {location}"))]
     PrerequisiteFailed { message: String, location: Location },
-    #[snafu(display("LanceError(Arrow): {message}"))]
-    Arrow { message: String },
+    #[snafu(display("LanceError(Arrow): {message}, {location}"))]
+    Arrow { message: String, location: Location },
     #[snafu(display("LanceError(Schema): {message}, {location}"))]
     Schema { message: String, location: Location },
     #[snafu(display("Not found: {uri}, {location}"))]
@@ -104,6 +104,7 @@ impl From<ArrowError> for Error {
     fn from(e: ArrowError) -> Self {
         Self::Arrow {
             message: e.to_string(),
+            location: location!(),
         }
     }
 }
@@ -112,6 +113,7 @@ impl From<&ArrowError> for Error {
     fn from(e: &ArrowError) -> Self {
         Self::Arrow {
             message: e.to_string(),
+            location: location!(),
         }
     }
 }
@@ -174,6 +176,7 @@ impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Self::Arrow {
             message: e.to_string(),
+            location: location!(),
         }
     }
 }
@@ -188,7 +191,7 @@ fn arrow_io_error_from_msg(message: String) -> ArrowError {
 impl From<Error> for ArrowError {
     fn from(value: Error) -> Self {
         match value {
-            Error::Arrow { message } => arrow_io_error_from_msg(message), // we lose the error type converting to LanceError
+            Error::Arrow { message, .. } => arrow_io_error_from_msg(message), // we lose the error type converting to LanceError
             Error::IO { message, .. } => arrow_io_error_from_msg(message),
             Error::Schema { message, .. } => Self::SchemaError(message),
             Error::Index { message } => arrow_io_error_from_msg(message),
