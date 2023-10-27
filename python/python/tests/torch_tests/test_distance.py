@@ -28,12 +28,11 @@ def test_cosine_distance():
     assert dist.shape == (20, 100)
 
     # Brute-force / the simplest proof.
-    expect = []
-    for x_row in x:
-        for y_row in y:
-            expect.append(
-                1 - np.dot(x_row, y_row) / np.linalg.norm(x_row) / np.linalg.norm(y_row)
-            )
+    expect = [
+        1 - np.dot(x_row, y_row) / np.linalg.norm(x_row) / np.linalg.norm(y_row)
+        for x_row in x
+        for y_row in y
+    ]
     expect_arr = np.array(expect).astype(np.float32).reshape(20, 100)
     assert np.allclose(dist.cpu(), expect_arr)
 
@@ -46,9 +45,10 @@ def test_l2_distance():
 
     dist = l2_distance(torch.from_numpy(x), torch.from_numpy(y))
     assert dist.shape == (20, 100)
-    expect = []
-    for x_row in x:
-        for y_row in y:
-            expect.append(np.linalg.norm(x_row - y_row))
-    expect_arr = np.array(expect).astype(np.float32).reshape(20, 100)
+
+    expect_arr = (
+        np.array([[np.linalg.norm(x_row - y_row) for y_row in y] for x_row in x])
+        .astype(np.float32)
+        .reshape(20, 100)
+    )
     assert np.allclose(dist.cpu(), expect_arr)

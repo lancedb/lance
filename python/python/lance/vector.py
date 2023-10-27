@@ -163,7 +163,7 @@ def train_ivf_centroids_on_accelerator(
         or CUDA_REGEX.match(accelerator)
         or accelerator == "mps"
     ):
-        logging.info(f"Training IVF partitions using GPU({accelerator})")
+        logging.info("Training IVF partitions using GPU(%s)", accelerator)
         kmeans = KMeans(k, metric=metric_type, device=accelerator)
         kmeans.fit(samples)
         return kmeans.centroids.cpu().numpy()
