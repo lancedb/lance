@@ -53,7 +53,7 @@ use crate::dataset::{write_manifest_file, ManifestWriteConfig};
 use crate::format::{DeletionFile, Fragment};
 use crate::Dataset;
 
-#[cfg(all(target_feature="dynamodb", tests))]
+#[cfg(all(target_feature = "dynamodb", tests))]
 mod dynamodb;
 #[cfg(tests)]
 mod external_manifest;
