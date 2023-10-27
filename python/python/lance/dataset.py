@@ -71,8 +71,6 @@ except ImportError:
     ]
 
 if TYPE_CHECKING:
-
-
     import torch
     from pyarrow._compute import Expression
 
