@@ -18,8 +18,8 @@ use std::fmt::Formatter;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::{
-    float32x4x2_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32_x2, vst1q_f32_x2,
-    vsubq_f32,
+    float32x4x2_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32_x2, vmulq_f32,
+    vst1q_f32_x2, vsubq_f32,
 };
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::__mm256;
@@ -174,6 +174,21 @@ impl SubAssign for f32x8 {
         unsafe {
             self.0 .0 = vsubq_f32(self.0 .0, rhs.0 .0);
             self.0 .1 = vsubq_f32(self.0 .1, rhs.0 .1);
+        }
+    }
+}
+
+impl Mul for f32x8 {
+    type Output = Self;
+
+    #[inline]
+    fn mul(self, rhs: Self) -> Self::Output {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            Self(float32x4x2_t(
+                vmulq_f32(self.0 .0, rhs.0 .0),
+                vmulq_f32(self.0 .1, rhs.0 .1),
+            ))
         }
     }
 }

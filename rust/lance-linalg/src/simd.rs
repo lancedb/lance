@@ -23,7 +23,7 @@
 //!
 //! The API are close to [std::simd] to make migration easier in the future.
 
-pub mod f32x8;
+pub mod f32;
 
 use num_traits::Float;
 

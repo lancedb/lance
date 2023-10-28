@@ -22,12 +22,13 @@ use arrow_array::{
     types::Float32Type,
     Float32Array,
 };
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance_linalg::distance::l2_distance_batch;
+use lance_linalg::simd::{f32::f32x8, SIMD};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 #[inline]
@@ -41,6 +42,29 @@ fn l2_arrow(x: &Float32Array, y: &Float32Array) -> f32 {
 fn l2_arrow_arity(x: &Float32Array, y: &Float32Array) -> f32 {
     let m: Float32Array = binary(x, y, |a, b| (a - b).powi(2)).unwrap();
     sum(&m).unwrap()
+}
+
+#[inline]
+fn l2_simd_lib(x: &[f32], y: &[f32], dim: usize) -> Vec<f32> {
+    y.chunks(dim)
+        .map(|y_row| {
+            let mut sum1 = f32x8::splat(0.0);
+            let mut sum2 = f32x8::splat(0.0);
+            for i in (0..x.len()).step_by(16) {
+                unsafe {
+                    let mut x1 = f32x8::load(x.as_ptr().add(i));
+                    let mut x2 = f32x8::load(y_row.as_ptr().add(i + 8));
+                    let y1 = f32x8::load(x.as_ptr().add(i));
+                    let y2 = f32x8::load(y_row.as_ptr().add(i + 8));
+                    x1 -= y1;
+                    x2 -= y2;
+                    sum1.multiply_add(x1, x1);
+                    sum2.multiply_add(x2, x2);
+                }
+            }
+            (sum1 + sum2).reduce_sum()
+        })
+        .collect::<Vec<_>>()
 }
 
 #[inline]
@@ -62,6 +86,12 @@ fn bench_distance(c: &mut Criterion) {
     c.bench_function("L2(simd)", |b| {
         b.iter(|| {
             l2_distance_batch(key.values(), target.values(), DIMENSION);
+        })
+    });
+
+    c.bench_function("L2(simd-lib)", |b| {
+        b.iter(|| {
+            black_box(l2_simd_lib(key.values(), target.values(), DIMENSION));
         })
     });
 
