@@ -23,7 +23,6 @@ use arrow_array::{
 use arrow_schema::{ArrowError, DataType};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use log::{info, warn};
-use num_traits::Float;
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 use tracing::instrument;
@@ -559,7 +558,8 @@ fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f3
 
 /// Assume half of the L1 cache is used for storing centroids.
 /// AMD64 or Apple M1/M2 usually have at least 32KB - 64KB L1 cache,
-/// so we use 16KB as the threshold. Also 16KB is enough for running PQ centroids.
+/// so we use 16KB as the threshold.
+/// Also 16KB is enough for running PQ centroids.
 const SMALL_CACHE_THRESHOLD: usize = 16 * 1024;
 
 #[inline]
@@ -569,7 +569,7 @@ fn compute_partitions_l2_small(
     dim: usize,
 ) -> (Vec<u32>, Vec<f32>) {
     // Centroids is already all in L1 cache.
-    debug_assert!(centroids.len() * 4 < SMALL_CACHE_THRESHOLD);
+    debug_assert!(centroids.len() * std::mem::size_of::<f32>() < SMALL_CACHE_THRESHOLD);
     let num_rows = data.len() / dim;
     let mut partition_ids = vec![0_u32; num_rows];
     let mut distances = vec![f32::MAX; num_rows];
@@ -589,6 +589,7 @@ fn compute_partitions_l2_f32(centroids: &[f32], data: &[f32], dim: usize) -> (Ve
         return compute_partitions_l2_small(centroids, data, dim);
     }
 
+    // If iterate over centroids will result to L1 cache miss, we use tiling to reduce cache miss.
     const STRIPE_SIZE: usize = 128;
     // Aligned with L2 unrolling
     const TILE_SIZE: usize = 32;
