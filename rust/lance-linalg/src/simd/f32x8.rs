@@ -14,9 +14,12 @@
 
 //! `f32x8`, 8 of f32 values.s
 
+use std::fmt::Formatter;
+
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::{
-    float32x4x2_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vld1q_f32_x2, vsubq_f32,
+    float32x4x2_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32_x2, vst1q_f32_x2,
+    vsubq_f32,
 };
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::__mm256;
@@ -27,11 +30,20 @@ use super::SIMD;
 /// 8 of 32-bit `f32` values. Use 256-bit SIMD if possible.
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::__mm256;
+
 /// 8 of 32-bit `f32` values. Use 256-bit SIMD if possible.
 #[allow(non_camel_case_types)]
 #[cfg(target_arch = "aarch64")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct f32x8(float32x4x2_t);
+
+impl std::fmt::Debug for f32x8 {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut arr = [0.0_f32; 8];
+        self.store(arr.as_mut_ptr());
+        write!(f, "f32x8({:?})", arr)
+    }
+}
 
 impl SIMD<f32> for f32x8 {
     fn splat(val: f32) -> Self {
@@ -62,6 +74,13 @@ impl SIMD<f32> for f32x8 {
         }
     }
 
+    fn store(&self, ptr: *mut f32) {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            vst1q_f32_x2(ptr, self.0);
+        }
+    }
+
     fn argmin(&self) -> u32 {
         todo!()
     }
@@ -70,6 +89,17 @@ impl SIMD<f32> for f32x8 {
         todo!()
     }
 
+    fn multiply_add(&mut self, a: Self, b: Self) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            self.0 = __mm256_fmadd_ps(a.0, b.0, self.0);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            self.0 .0 = vfmaq_f32(self.0 .0, a.0 .0, b.0 .0);
+            self.0 .1 = vfmaq_f32(self.0 .1, a.0 .1, b.0 .1);
+        }
+    }
     #[inline]
     fn reduce_sum(&self) -> f32 {
         #[cfg(target_arch = "aarch64")]
@@ -162,5 +192,14 @@ mod tests {
         let simd_b = f32x8::load(b.as_ptr());
         simd_a -= simd_b;
         assert_eq!(simd_a.reduce_sum(), -80.0);
+
+        let mut simd_power = f32x8::splat(0.0);
+        simd_power.multiply_add(simd_a, simd_a);
+        println!("{:?}", simd_power);
+
+        assert_eq!(
+            "f32x8([100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0])",
+            format!("{:?}", simd_power)
+        );
     }
 }
