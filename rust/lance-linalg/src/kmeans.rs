@@ -23,6 +23,7 @@ use arrow_array::{
 use arrow_schema::{ArrowError, DataType};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use log::{info, warn};
+use num_traits::Float;
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 use tracing::instrument;
@@ -556,16 +557,46 @@ fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f3
     &data[x * dim + y..x * dim + y + strip]
 }
 
+/// Assume half of the L1 cache is used for storing centroids.
+/// AMD64 or Apple M1/M2 usually have at least 32KB - 64KB L1 cache,
+/// so we use 16KB as the threshold. Also 16KB is enough for running PQ centroids.
+const SMALL_CACHE_THRESHOLD: usize = 16 * 1024;
+
+#[inline]
+fn compute_partitions_l2_small(
+    centroids: &[f32],
+    data: &[f32],
+    dim: usize,
+) -> (Vec<u32>, Vec<f32>) {
+    // Centroids is already all in L1 cache.
+    debug_assert!(centroids.len() * 4 < SMALL_CACHE_THRESHOLD);
+    let num_rows = data.len() / dim;
+    let mut partition_ids = vec![0_u32; num_rows];
+    let mut distances = vec![f32::MAX; num_rows];
+    data.chunks(dim).enumerate().for_each(|(i, row)| {
+        let (idx, dist) =
+            argmin_value(centroids.chunks(dim).map(|centroid| row.l2(centroid))).unwrap();
+        partition_ids[i] = idx;
+        distances[i] = dist;
+    });
+    (partition_ids, distances)
+}
+
+
 /// Fast partition computation for L2 distance.
 fn compute_partitions_l2_f32(centroids: &[f32], data: &[f32], dim: usize) -> (Vec<u32>, Vec<f32>) {
+    if centroids.len() * 4 < SMALL_CACHE_THRESHOLD {
+        return compute_partitions_l2_small(centroids, data, dim);
+    }
+
     const STRIPE_SIZE: usize = 128;
     // Aligned with L2 unrolling
     const TILE_SIZE: usize = 32;
 
     // 128 * 4bytes * 16 = 8KB for centroid and data respectively, so both of them can
     // stay in L1 cache.
-    let num_rows = data.len() / dim;
     let num_centroids = centroids.len() / dim;
+    let num_rows = data.len() / dim;
 
     let mut partition_ids = vec![0_u32; num_rows];
     let mut distances = vec![f32::MAX; num_rows];
