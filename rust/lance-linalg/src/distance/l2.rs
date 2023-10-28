@@ -22,6 +22,8 @@ use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, 
 use half::{bf16, f16};
 use num_traits::real::Real;
 
+use crate::simd::{f32::f32x8, SIMD};
+
 /// Calculate the L2 distance between two vectors.
 ///
 pub trait L2 {
@@ -67,27 +69,47 @@ impl L2 for [f32] {
 
     #[inline]
     fn l2(&self, other: &[f32]) -> f32 {
-        #[cfg(target_arch = "x86_64")]
-        {
-            // TODO: Only known platform that does not support FMA is Github Action Mac(Intel) Runner.
-            // However, it introduces one more branch, which may affect performance.
-            if is_x86_feature_detected!("avx2") {
-                // AVX2 / FMA is the lowest x86_64 CPU requirement (released from 2011) for Lance.
-                use x86_64::avx::l2_f32;
-                return l2_f32(self, other);
+        let mut sum1 = f32x8::splat(0.0);
+        let mut sum2 = f32x8::splat(0.0);
+
+        let remain = if self.len() >= 16 {
+            let unrolling_len = self.len() / 16 * 16;
+            for i in (0..unrolling_len).step_by(16) {
+                unsafe {
+                    let mut x1 = f32x8::load(self.as_ptr().add(i));
+                    let mut x2 = f32x8::load(self.as_ptr().add(i + 8));
+                    let y1 = f32x8::load(other.as_ptr().add(i));
+                    let y2 = f32x8::load(other.as_ptr().add(i + 8));
+                    x1 -= y1;
+                    x2 -= y2;
+                    sum1.multiply_add(x1, x1);
+                    sum2.multiply_add(x2, x2);
+                }
+            }
+            unrolling_len
+        } else {
+            0
+        };
+
+        if remain < self.len() {
+            for i in (remain..self.len()).step_by(8) {
+                unsafe {
+                    let mut x = f32x8::load(self.as_ptr().add(i));
+                    let y = f32x8::load(other.as_ptr().add(i));
+                    x -= y;
+                    sum1.multiply_add(x, x);
+                }
             }
         }
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            // Neon is the lowest aarch64 CPU requirement (available in all Apple Silicon / Arm V7+).
-            use aarch64::neon::l2_f32;
-            l2_f32(self, other)
+        sum1 += sum2;
+        let mut l2_sum = sum1.reduce_sum();
+        let unaligned_remain = self.len() / 8 * 8;
+        if unaligned_remain < self.len() {
+            l2_sum += l2_scalar(&self[unaligned_remain..], &other[unaligned_remain..]);
         }
 
-        // Fallback on x86_64 without AVX2 / FMA, or other platforms.
-        #[cfg(not(target_arch = "aarch64"))]
-        l2_scalar(self, other)
+        l2_sum
     }
 }
 
@@ -210,76 +232,6 @@ mod x86_64 {
                 // Remaining
                 results[0] += l2_scalar(&from[len..], &to[len..]);
                 results[0]
-            }
-        }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-mod aarch64 {
-
-    pub(super) mod neon {
-        use super::super::l2_scalar;
-        use std::arch::aarch64::*;
-
-        // TODO: learn rust macro and refactor to macro instead of manually unroll
-        const UNROLL_FACTOR: usize = 4;
-        const INSTRUCTION_WIDTH: usize = 4;
-
-        const STEP_SIZE: usize = UNROLL_FACTOR * INSTRUCTION_WIDTH;
-
-        #[inline]
-        pub fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
-            unsafe {
-                let len_aligned_to_unroll = from.len() / STEP_SIZE * STEP_SIZE;
-                let buf = [0.0_f32; 4];
-                let mut sum1 = vld1q_f32(buf.as_ptr());
-                let mut sum2 = vld1q_f32(buf.as_ptr());
-                let mut sum3 = vld1q_f32(buf.as_ptr());
-                let mut sum4 = vld1q_f32(buf.as_ptr());
-                for i in (0..len_aligned_to_unroll).step_by(STEP_SIZE) {
-                    let left = vld1q_f32(from.as_ptr().add(i));
-                    let right = vld1q_f32(to.as_ptr().add(i));
-                    let sub1 = vsubq_f32(left, right);
-                    sum1 = vfmaq_f32(sum1, sub1, sub1);
-
-                    let left = vld1q_f32(from.as_ptr().add(i + 4));
-                    let right = vld1q_f32(to.as_ptr().add(i + 4));
-                    let sub2 = vsubq_f32(left, right);
-                    sum2 = vfmaq_f32(sum2, sub2, sub2);
-
-                    let left = vld1q_f32(from.as_ptr().add(i + 8));
-                    let right = vld1q_f32(to.as_ptr().add(i + 8));
-                    let sub3 = vsubq_f32(left, right);
-                    sum3 = vfmaq_f32(sum3, sub3, sub3);
-
-                    let left = vld1q_f32(from.as_ptr().add(i + 12));
-                    let right = vld1q_f32(to.as_ptr().add(i + 12));
-                    let sub4 = vsubq_f32(left, right);
-                    sum4 = vfmaq_f32(sum4, sub4, sub4);
-                }
-
-                let mut sum = vaddq_f32(vaddq_f32(sum1, sum2), vaddq_f32(sum3, sum4));
-
-                let len_aligned_to_instruction = from.len() / INSTRUCTION_WIDTH * INSTRUCTION_WIDTH;
-
-                // non-unrolled tail
-                for i in
-                    (len_aligned_to_unroll..len_aligned_to_instruction).step_by(INSTRUCTION_WIDTH)
-                {
-                    let left = vld1q_f32(from.as_ptr().add(i));
-                    let right = vld1q_f32(to.as_ptr().add(i));
-                    let sub = vsubq_f32(left, right);
-                    sum = vfmaq_f32(sum, sub, sub);
-                }
-
-                // non vectorized tail
-                let mut sum = vaddvq_f32(sum);
-                sum += l2_scalar(
-                    &from[len_aligned_to_instruction..],
-                    &to[len_aligned_to_instruction..],
-                );
-                sum
             }
         }
     }
