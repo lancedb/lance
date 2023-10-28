@@ -22,7 +22,7 @@ use arrow_array::{
 use futures::{stream, stream::repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use lance_linalg::kernels::argmin_opt;
+use lance_linalg::kernels::{argmin_opt, argmin_value_f32};
 use lance_linalg::{distance::MetricType, MatrixView};
 use rand::SeedableRng;
 pub mod transform;
@@ -316,7 +316,7 @@ impl ProductQuantizer {
                     let centroids = all_centroids[sub_idx];
                     // TODO(lei): use kmeans.compute_membership()
                     let code =
-                        argmin_opt(dist_func(sub_vector, centroids, sub_dim).iter()).unwrap();
+                        argmin_value_f32(dist_func(sub_vector, centroids, sub_dim).values().iter()).0;
                     builder[i * num_sub_vectors + sub_idx] = code as u8;
                 }
             }

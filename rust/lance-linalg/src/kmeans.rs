@@ -27,6 +27,7 @@ use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 use tracing::instrument;
 
+use crate::kernels::argmin_value_f32;
 use crate::{
     distance::{Cosine, Dot, MetricType, Normalize, L2},
     kernels::{argmin, argmin_value},
@@ -575,7 +576,7 @@ fn compute_partitions_l2_small_f32(
     let mut distances = vec![f32::MAX; num_rows];
     data.chunks(dim).enumerate().for_each(|(i, row)| {
         let (idx, dist) =
-            argmin_value(centroids.chunks(dim).map(|centroid| row.l2(centroid))).unwrap();
+            argmin_value_f32(centroids.chunks(dim).map(|centroid| row.l2(centroid)));
         partition_ids[i] = idx;
         distances[i] = dist;
     });
