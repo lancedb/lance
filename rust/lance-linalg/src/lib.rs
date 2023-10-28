@@ -18,6 +18,7 @@ pub mod distance;
 pub mod kernels;
 pub mod kmeans;
 pub mod matrix;
+pub mod simd;
 
 pub use matrix::MatrixView;
 
