@@ -193,6 +193,16 @@ mod x86_64 {
                     sums3 = _mm256_fmadd_ps(s3, s3, sums3);
                     sums4 = _mm256_fmadd_ps(s4, s4, sums4);
                 }
+
+                // Remaining elements
+                let remained_len = from.len() / 8 * 8;
+                for i in (len..remained_len).step_by(8) {
+                    let left = _mm256_loadu_ps(from.as_ptr().add(i));
+                    let right = _mm256_loadu_ps(to.as_ptr().add(i));
+                    let sub = _mm256_sub_ps(left, right);
+                    sums1 = _mm256_fmadd_ps(sub, sub, sums1);
+                }
+
                 sums1 = _mm256_add_ps(sums1, sums2);
                 sums3 = _mm256_add_ps(sums3, sums4);
                 sums1 = _mm256_add_ps(sums1, sums3);
@@ -207,8 +217,10 @@ mod x86_64 {
                 let mut results: [f32; 8] = [0f32; 8];
                 _mm256_storeu_ps(results.as_mut_ptr(), sums1);
 
-                // Remaining
-                results[0] += l2_scalar(&from[len..], &to[len..]);
+                // Remaining elements
+                if remained_len < from.len() {
+                    results[0] += l2_scalar(&from[remained_len..], &to[remained_len..]);
+                }
                 results[0]
             }
         }

@@ -464,17 +464,28 @@ impl KMeans {
                     let data = tokio::task::spawn_blocking(move || {
                         let array = data.values();
                         let centroids_array = centroids.values();
-
                         let last_idx = min(start_idx + CHUNK_SIZE, n);
+
+                        if metric_type == MetricType::L2 {
+                            let (part_id, dist) = compute_partitions_l2_f32(
+                                centroids_array,
+                                &array[start_idx * dimension..last_idx * dimension],
+                                dimension,
+                            );
+                            return part_id
+                                .iter()
+                                .zip(dist.iter())
+                                .map(|(&pid, &d)| (pid, d))
+                                .collect::<Vec<_>>();
+                        }
+
                         array[start_idx * dimension..last_idx * dimension]
                             .chunks_exact(dimension)
                             .enumerate()
                             .map(|(idx, vector)| {
                                 let centroid_stream = centroids_array.chunks_exact(dimension);
                                 match metric_type {
-                                    MetricType::L2 => {
-                                        argmin_value(centroid_stream.map(|cent| vector.l2(cent)))
-                                    }
+                                    MetricType::L2 => panic!("should already handled"),
                                     MetricType::Cosine => {
                                         let centroid_norms = norms.as_ref().as_ref().unwrap();
                                         if let Some(norm_vectors) = norm_data.as_ref() {
@@ -546,9 +557,10 @@ fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f3
 }
 
 /// Fast partition computation for L2 distance.
-fn compute_partitions_l2_f32(centroids: &[f32], data: &[f32], dim: usize) -> Vec<u32> {
+fn compute_partitions_l2_f32(centroids: &[f32], data: &[f32], dim: usize) -> (Vec<u32>, Vec<f32>) {
     const STRIPE_SIZE: usize = 128;
-    const TILE_SIZE: usize = 16;
+    // Aligned with L2 unrolling
+    const TILE_SIZE: usize = 32;
 
     // 128 * 4bytes * 16 = 8KB for centroid and data respectively, so both of them can
     // stay in L1 cache.
@@ -556,6 +568,7 @@ fn compute_partitions_l2_f32(centroids: &[f32], data: &[f32], dim: usize) -> Vec
     let num_centroids = centroids.len() / dim;
 
     let mut partition_ids = vec![0_u32; num_rows];
+    let mut distances = vec![f32::MAX; num_rows];
 
     // Read a tile of data, `data[idx..idx+TILE_SIZE]`
     for idx in (0..num_rows).step_by(TILE_SIZE) {
@@ -563,7 +576,6 @@ fn compute_partitions_l2_f32(centroids: &[f32], data: &[f32], dim: usize) -> Vec
 
         // Loop over each strip.
         // s is the index of value in each vector.
-        let mut min_dists = [f32::MAX; TILE_SIZE];
         for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
             // 4B * 16 * 16 = 1 KB
             let mut dists = vec![0_f32; TILE_SIZE * TILE_SIZE];
@@ -583,16 +595,17 @@ fn compute_partitions_l2_f32(centroids: &[f32], data: &[f32], dim: usize) -> Vec
             }
             for i in 0..num_rows_in_tile {
                 for j in 0..num_centroids_in_tile {
+                    let row_id = idx + i;
                     let dist = dists[i * TILE_SIZE + j];
-                    if dist < min_dists[i] {
-                        min_dists[i] = dist;
-                        partition_ids[idx + i] = (centroid_start + j) as u32;
+                    if dist < distances[row_id] {
+                        distances[row_id] = dist;
+                        partition_ids[row_id] = (centroid_start + j) as u32;
                     }
                 }
             }
         }
     }
-    partition_ids
+    (partition_ids, distances)
 }
 
 fn compute_partitions_cosine(centroids: &[f32], data: &[f32], dimension: usize) -> Vec<u32> {
@@ -634,7 +647,7 @@ pub fn compute_partitions(
     metric_type: MetricType,
 ) -> Vec<u32> {
     match metric_type {
-        MetricType::L2 => compute_partitions_l2_f32(centroids, data, dimension),
+        MetricType::L2 => compute_partitions_l2_f32(centroids, data, dimension).0,
         MetricType::Cosine => compute_partitions_cosine(centroids, data, dimension),
         MetricType::Dot => compute_partitions_dot(centroids, data, dimension),
     }
