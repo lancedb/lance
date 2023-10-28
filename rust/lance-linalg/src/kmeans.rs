@@ -563,7 +563,7 @@ fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f3
 const SMALL_CACHE_THRESHOLD: usize = 16 * 1024;
 
 #[inline]
-fn compute_partitions_l2_small(
+fn compute_partitions_l2_small_f32(
     centroids: &[f32],
     data: &[f32],
     dim: usize,
@@ -582,11 +582,10 @@ fn compute_partitions_l2_small(
     (partition_ids, distances)
 }
 
-
 /// Fast partition computation for L2 distance.
 fn compute_partitions_l2_f32(centroids: &[f32], data: &[f32], dim: usize) -> (Vec<u32>, Vec<f32>) {
     if centroids.len() * 4 < SMALL_CACHE_THRESHOLD {
-        return compute_partitions_l2_small(centroids, data, dim);
+        return compute_partitions_l2_small_f32(centroids, data, dim);
     }
 
     // If iterate over centroids will result to L1 cache miss, we use tiling to reduce cache miss.
