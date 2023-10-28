@@ -885,7 +885,7 @@ pub mod array {
 
         Box::new(FnGen::<i64, Date64Array, _>::new_known_size(
             data_type.clone(),
-            move |rng| (dist.sample(rng) as i64) * MS_PER_DAY,
+            move |rng| (dist.sample(rng)) * MS_PER_DAY,
             1,
             DataType::Date64
                 .primitive_width()
