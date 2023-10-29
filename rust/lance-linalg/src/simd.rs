@@ -34,7 +34,7 @@ pub trait SIMD<T: Float>: std::fmt::Debug {
     fn load(ptr: *const T) -> Self;
 
     /// Load unaligned data from memory.
-    fn loadu(ptr: *const T) -> Self;
+    fn load_unaligned(ptr: *const T) -> Self;
 
     fn store(&self, ptr: *mut T);
 

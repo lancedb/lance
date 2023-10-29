@@ -76,10 +76,10 @@ impl L2 for [f32] {
 
             for i in (0..len).step_by(16) {
                 unsafe {
-                    let mut x1 = f32x8::load(self.as_ptr().add(i));
-                    let mut x2 = f32x8::load(self.as_ptr().add(i + 8));
-                    let y1 = f32x8::load(other.as_ptr().add(i));
-                    let y2 = f32x8::load(other.as_ptr().add(i + 8));
+                    let mut x1 = f32x8::load_unaligned(self.as_ptr().add(i));
+                    let mut x2 = f32x8::load_unaligned(self.as_ptr().add(i + 8));
+                    let y1 = f32x8::load_unaligned(other.as_ptr().add(i));
+                    let y2 = f32x8::load_unaligned(other.as_ptr().add(i + 8));
                     x1 -= y1;
                     x2 -= y2;
                     sum1.multiply_add(x1, x1);
@@ -92,17 +92,17 @@ impl L2 for [f32] {
             let mut sum1 = f32x8::splat(0.0);
             for i in (0..len).step_by(8) {
                 unsafe {
-                    let mut x = f32x8::load(self.as_ptr().add(i));
-                    let y = f32x8::load(other.as_ptr().add(i));
+                    let mut x = f32x8::load_unaligned(self.as_ptr().add(i));
+                    let y = f32x8::load_unaligned(other.as_ptr().add(i));
                     x -= y;
                     sum1.multiply_add(x, x);
                 }
             }
             return sum1.reduce_sum();
+        } else {
+            // Fallback to scalar
+            l2_scalar(self, other)
         }
-
-        // Fallback to scalar
-        l2_scalar(self, other)
     }
 }
 
