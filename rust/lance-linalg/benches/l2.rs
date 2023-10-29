@@ -28,7 +28,6 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance_linalg::distance::l2_distance_batch;
-use lance_linalg::simd::{f32::f32x8, SIMD};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 #[inline]
