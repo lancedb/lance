@@ -22,14 +22,16 @@ use std::arch::aarch64::{
     vst1q_f32_x2, vsubq_f32,
 };
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::__mm256;
+use std::arch::x86_64::*;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
 use super::SIMD;
 
 /// 8 of 32-bit `f32` values. Use 256-bit SIMD if possible.
+#[allow(non_camel_case_types)]
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::__mm256;
+#[derive(Clone, Copy)]
+pub struct f32x8(std::arch::x86_64::__m256);
 
 /// 8 of 32-bit `f32` values. Use 256-bit SIMD if possible.
 #[allow(non_camel_case_types)]
@@ -40,7 +42,7 @@ pub struct f32x8(float32x4x2_t);
 impl std::fmt::Debug for f32x8 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut arr = [0.0_f32; 8];
-        self.store(arr.as_mut_ptr());
+        self.store_unaligned(arr.as_mut_ptr());
         write!(f, "f32x8({:?})", arr)
     }
 }
@@ -49,7 +51,7 @@ impl SIMD<f32> for f32x8 {
     fn splat(val: f32) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(__mm256::set1_ps(val))
+            Self(_mm256_set1_ps(val))
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -59,6 +61,11 @@ impl SIMD<f32> for f32x8 {
 
     #[inline]
     fn load(ptr: *const f32) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_load_ps(ptr))
+        }
+        #[cfg(target_arch = "aarch64")]
         Self::loadu(ptr)
     }
 
@@ -66,7 +73,7 @@ impl SIMD<f32> for f32x8 {
     fn loadu(ptr: *const f32) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(__mm256_loadu_ps(ptr))
+            Self(_mm256_loadu_ps(ptr))
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -75,6 +82,21 @@ impl SIMD<f32> for f32x8 {
     }
 
     fn store(&self, ptr: *mut f32) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            _mm256_store_ps(ptr, self.0);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            vst1q_f32_x2(ptr, self.0);
+        }
+    }
+
+    fn store_unaligned(&self, ptr: *mut f32) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            _mm256_storeu_ps(ptr, self.0);
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             vst1q_f32_x2(ptr, self.0);
@@ -92,7 +114,7 @@ impl SIMD<f32> for f32x8 {
     fn multiply_add(&mut self, a: Self, b: Self) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            self.0 = __mm256_fmadd_ps(a.0, b.0, self.0);
+            self.0 = _mm256_fmadd_ps(a.0, b.0, self.0);
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -102,6 +124,21 @@ impl SIMD<f32> for f32x8 {
     }
     #[inline]
     fn reduce_sum(&self) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let mut sum = self.0;
+            // Shift and add vector, until only 1 value left.
+            // sums = [x0-x7], shift = [x4-x7]
+            let mut shift = _mm256_permute2f128_ps(sum, sum, 1);
+            // [x0+x4, x1+x5, ..]
+            sum = _mm256_add_ps(sum, shift);
+            shift = _mm256_permute_ps(sum, 14);
+            sum = _mm256_add_ps(sum, shift);
+            sum = _mm256_hadd_ps(sum, sum);
+            let mut results: [f32; 8] = [0f32; 8];
+            _mm256_storeu_ps(results.as_mut_ptr(), sum);
+            results[0]
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             let sum = vaddq_f32(self.0 .0, self.0 .1);
@@ -117,7 +154,7 @@ impl Add for f32x8 {
     fn add(self, rhs: Self) -> Self::Output {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(__mm256_add_ps(self.0, rhs.0))
+            Self(_mm256_add_ps(self.0, rhs.0))
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -134,7 +171,7 @@ impl AddAssign for f32x8 {
     fn add_assign(&mut self, rhs: Self) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(__mm256_add_ps(self.0, rhs.0))
+            self.0 = _mm256_add_ps(self.0, rhs.0)
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -151,7 +188,7 @@ impl Sub for f32x8 {
     fn sub(self, rhs: Self) -> Self::Output {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(__mm256_sub_ps(self.0, rhs.0))
+            Self(_mm256_sub_ps(self.0, rhs.0))
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -168,7 +205,7 @@ impl SubAssign for f32x8 {
     fn sub_assign(&mut self, rhs: Self) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(__mm256_sub_ps(self.0, rhs.0))
+            self.0 = _mm256_sub_ps(self.0, rhs.0)
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -183,6 +220,10 @@ impl Mul for f32x8 {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_mul_ps(self.0, rhs.0))
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(float32x4x2_t(
@@ -203,14 +244,13 @@ mod tests {
         let a = (0..8).map(|f| f as f32).collect::<Vec<_>>();
         let b = (10..18).map(|f| f as f32).collect::<Vec<_>>();
 
-        let mut simd_a = f32x8::load(a.as_ptr());
-        let simd_b = f32x8::load(b.as_ptr());
+        let mut simd_a = f32x8::loadu(a.as_ptr());
+        let simd_b = f32x8::loadu(b.as_ptr());
         simd_a -= simd_b;
         assert_eq!(simd_a.reduce_sum(), -80.0);
 
         let mut simd_power = f32x8::splat(0.0);
         simd_power.multiply_add(simd_a, simd_a);
-        println!("{:?}", simd_power);
 
         assert_eq!(
             "f32x8([100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0])",

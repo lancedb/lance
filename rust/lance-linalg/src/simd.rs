@@ -38,6 +38,8 @@ pub trait SIMD<T: Float>: std::fmt::Debug {
 
     fn store(&self, ptr: *mut T);
 
+    fn store_unaligned(&self, ptr: *mut T);
+
     /// fused multiply-add
     ///
     /// c = a * b + c
