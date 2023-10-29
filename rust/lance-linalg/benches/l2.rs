@@ -86,7 +86,7 @@ fn bench_distance(c: &mut Criterion) {
     c.bench_function("L2(simd)", |b| {
         b.iter(|| {
             black_box(
-                l2_distance_batch(key.values(), target.values(), DIMENSION).collect::<Vec<_>>(),
+                l2_distance_batch(key.values(), target.values(), DIMENSION).count(),
             );
         })
     });
@@ -131,7 +131,7 @@ fn bench_distance(c: &mut Criterion) {
 
     c.bench_function("L2(simd) second rng seed", |b| {
         b.iter(|| {
-            black_box(l2_distance_batch(key.values(), target.values(), DIMENSION));
+            black_box(l2_distance_batch(key.values(), target.values(), DIMENSION).count());
         })
     });
 

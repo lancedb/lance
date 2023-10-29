@@ -64,6 +64,28 @@ impl L2 for [f16] {
     }
 }
 
+#[inline]
+fn l2_unrolling_f32(from: &[f32], to: &[f32]) -> f32 {
+    let dim = from.len();
+    let mut sum1 = f32x8::splat(0.0);
+    let mut sum2 = f32x8::splat(0.0);
+
+    for i in (0..dim).step_by(16) {
+        unsafe {
+            let mut x1 = f32x8::load_unaligned(from.as_ptr().add(i));
+            let mut x2 = f32x8::load_unaligned(from.as_ptr().add(i + 8));
+            let y1 = f32x8::load_unaligned(to.as_ptr().add(i));
+            let y2 = f32x8::load_unaligned(to.as_ptr().add(i + 8));
+            x1 -= y1;
+            x2 -= y2;
+            sum1.multiply_add(x1, x1);
+            sum2.multiply_add(x2, x2);
+        }
+    }
+    sum1 += sum2;
+    sum1.reduce_sum()
+}
+
 impl L2 for [f32] {
     type Output = f32;
 
@@ -72,23 +94,7 @@ impl L2 for [f32] {
         let len = self.len();
         if len % 16 == 0 {
             // Likely
-            let mut sum1 = f32x8::splat(0.0);
-            let mut sum2 = f32x8::splat(0.0);
-
-            for i in (0..len).step_by(16) {
-                unsafe {
-                    let mut x1 = f32x8::load_unaligned(self.as_ptr().add(i));
-                    let mut x2 = f32x8::load_unaligned(self.as_ptr().add(i + 8));
-                    let y1 = f32x8::load_unaligned(other.as_ptr().add(i));
-                    let y2 = f32x8::load_unaligned(other.as_ptr().add(i + 8));
-                    x1 -= y1;
-                    x2 -= y2;
-                    sum1.multiply_add(x1, x1);
-                    sum2.multiply_add(x2, x2);
-                }
-            }
-            sum1 += sum2;
-            sum1.reduce_sum()
+            l2_unrolling_f32(self, other)
         } else if len % 8 == 0 {
             let mut sum1 = f32x8::splat(0.0);
             for i in (0..len).step_by(8) {
@@ -147,6 +153,10 @@ pub fn l2_distance_batch<'a>(
     debug_assert_eq!(from.len(), dimension);
     debug_assert_eq!(to.len() % dimension, 0);
 
+    if dimension % 16 == 0 {
+        // Likely
+        return Box::new(to.chunks_exact(dimension).map(|v| l2_unrolling_f32(from, v)));
+    };
     Box::new(to.chunks_exact(dimension).map(|v| from.l2(v)))
 }
 
