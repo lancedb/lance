@@ -1070,15 +1070,10 @@ mod tests {
                     }
                     let distances = l2_distance_batch(
                         centroid,
-                        &centroids.values().slice(offset, length),
+                        &centroids.values()[offset..offset + length],
                         self.dim as usize,
                     );
-                    let min_distance = distances
-                        .values()
-                        .iter()
-                        .copied()
-                        .min_by(|a, b| a.total_cmp(b))
-                        .unwrap();
+                    let min_distance = distances.min_by(|a, b| a.total_cmp(b)).unwrap();
                     // In theory we could just replace this one vector but, out of laziness, we just retry all of them
                     if min_distance < distance_needed {
                         broken = true;

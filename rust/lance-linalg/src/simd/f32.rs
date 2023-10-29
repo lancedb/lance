@@ -236,8 +236,8 @@ mod tests {
         let a = (0..8).map(|f| f as f32).collect::<Vec<_>>();
         let b = (10..18).map(|f| f as f32).collect::<Vec<_>>();
 
-        let mut simd_a = f32x8::load_unaligned(a.as_ptr());
-        let simd_b = f32x8::load_unaligned(b.as_ptr());
+        let mut simd_a = unsafe { f32x8::load_unaligned(a.as_ptr()) };
+        let simd_b = unsafe { f32x8::load_unaligned(b.as_ptr()) };
         simd_a -= simd_b;
         assert_eq!(simd_a.reduce_sum(), -80.0);
 
