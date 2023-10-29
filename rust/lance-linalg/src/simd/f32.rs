@@ -68,7 +68,7 @@ impl SIMD<f32> for f32x8 {
             Self(_mm256_load_ps(ptr))
         }
         #[cfg(target_arch = "aarch64")]
-        Self::loadu(ptr)
+        Self::load_unaligned(ptr)
     }
 
     #[inline]
