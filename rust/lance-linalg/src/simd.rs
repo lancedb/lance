@@ -38,15 +38,27 @@ pub trait SIMD<T: Float>:
     fn splat(val: T) -> Self;
 
     /// Load aligned data from aligned memory.
+    ///
+    /// # Safety
+    ///
+    /// It crashes if the ptr is not aligned.
     unsafe fn load(ptr: *const T) -> Self;
 
     /// Load unaligned data from memory.
+    ///
+    /// # Safety
     unsafe fn load_unaligned(ptr: *const T) -> Self;
 
     /// Store the values to aligned memory.
+    ///
+    /// # Safety
+    ///
+    /// It crashes if the ptr is not aligned
     unsafe fn store(&self, ptr: *mut T);
 
     /// Store the values to unaligned memory.
+    ///
+    /// # Safety
     unsafe fn store_unaligned(&self, ptr: *mut T);
 
     /// fused multiply-add
