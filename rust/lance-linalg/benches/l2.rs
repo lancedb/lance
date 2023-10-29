@@ -43,30 +43,6 @@ fn l2_arrow_arity(x: &Float32Array, y: &Float32Array) -> f32 {
     let m: Float32Array = binary(x, y, |a, b| (a - b).powi(2)).unwrap();
     sum(&m).unwrap()
 }
-
-#[inline]
-fn l2_simd_lib(x: &[f32], y: &[f32], dim: usize) -> Vec<f32> {
-    y.chunks(dim)
-        .map(|y_row| {
-            let mut sum1 = f32x8::splat(0.0);
-            let mut sum2 = f32x8::splat(0.0);
-            for i in (0..x.len()).step_by(16) {
-                unsafe {
-                    let x1 = f32x8::load(x.as_ptr().add(i));
-                    let x2 = f32x8::load(x.as_ptr().add(i + 8));
-                    let y1 = f32x8::load(y_row.as_ptr().add(i));
-                    let y2 = f32x8::load(y_row.as_ptr().add(i + 8));
-                    let s = x1 - y1;
-                    let s2 = x2 - y2;
-                    sum1.multiply_add(s, s);
-                    sum2.multiply_add(s2, s2);
-                }
-            }
-            (sum1 + sum2).reduce_sum()
-        })
-        .collect::<Vec<_>>()
-}
-
 #[inline]
 fn l2_auto_vectorization(x: &[f32], y: &[f32]) -> f32 {
     x.iter()
@@ -86,12 +62,6 @@ fn bench_distance(c: &mut Criterion) {
     c.bench_function("L2(simd)", |b| {
         b.iter(|| {
             black_box(l2_distance_batch(key.values(), target.values(), DIMENSION).count());
-        })
-    });
-
-    c.bench_function("L2(simd-lib)", |b| {
-        b.iter(|| {
-            black_box(l2_simd_lib(key.values(), target.values(), DIMENSION));
         })
     });
 
