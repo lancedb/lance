@@ -34,7 +34,7 @@ jobs:
       #     path: integration/duckdb/build/lance.duckdb_extension
       #     retention-days: 1
   MacOS:
-    runs-on: macos-12
+    runs-on: macos-13
     timeout-minutes: 40
     defaults:
       run:

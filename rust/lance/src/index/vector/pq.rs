@@ -110,7 +110,7 @@ impl PQIndex {
                 subvec_centroids,
                 sub_vector_length,
             );
-            distance_table.extend(distances.values());
+            distance_table.extend(distances);
         }
 
         Ok(Arc::new(unsafe {

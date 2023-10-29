@@ -22,6 +22,8 @@ use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, 
 use half::{bf16, f16};
 use num_traits::real::Real;
 
+use crate::simd::{f32::f32x8, SIMD};
+
 /// Calculate the L2 distance between two vectors.
 ///
 pub trait L2 {
@@ -67,27 +69,41 @@ impl L2 for [f32] {
 
     #[inline]
     fn l2(&self, other: &[f32]) -> f32 {
-        #[cfg(target_arch = "x86_64")]
-        {
-            // TODO: Only known platform that does not support FMA is Github Action Mac(Intel) Runner.
-            // However, it introduces one more branch, which may affect performance.
-            if is_x86_feature_detected!("avx2") {
-                // AVX2 / FMA is the lowest x86_64 CPU requirement (released from 2011) for Lance.
-                use x86_64::avx::l2_f32;
-                return l2_f32(self, other);
+        let len = self.len();
+        if len % 16 == 0 {
+            // Likely
+            let dim = self.len();
+            let mut sum1 = f32x8::splat(0.0);
+            let mut sum2 = f32x8::splat(0.0);
+
+            for i in (0..dim).step_by(16) {
+                unsafe {
+                    let mut x1 = f32x8::load_unaligned(self.as_ptr().add(i));
+                    let mut x2 = f32x8::load_unaligned(self.as_ptr().add(i + 8));
+                    let y1 = f32x8::load_unaligned(other.as_ptr().add(i));
+                    let y2 = f32x8::load_unaligned(other.as_ptr().add(i + 8));
+                    x1 -= y1;
+                    x2 -= y2;
+                    sum1.multiply_add(x1, x1);
+                    sum2.multiply_add(x2, x2);
+                }
             }
+            (sum1 + sum2).reduce_sum()
+        } else if len % 8 == 0 {
+            let mut sum1 = f32x8::splat(0.0);
+            for i in (0..len).step_by(8) {
+                unsafe {
+                    let mut x = f32x8::load_unaligned(self.as_ptr().add(i));
+                    let y = f32x8::load_unaligned(other.as_ptr().add(i));
+                    x -= y;
+                    sum1.multiply_add(x, x);
+                }
+            }
+            sum1.reduce_sum()
+        } else {
+            // Fallback to scalar
+            l2_scalar(self, other)
         }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            // Neon is the lowest aarch64 CPU requirement (available in all Apple Silicon / Arm V7+).
-            use aarch64::neon::l2_f32;
-            l2_f32(self, other)
-        }
-
-        // Fallback on x86_64 without AVX2 / FMA, or other platforms.
-        #[cfg(not(target_arch = "aarch64"))]
-        l2_scalar(self, other)
     }
 }
 
@@ -123,12 +139,15 @@ pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
 /// - `from`: the vector to compute distance from.
 /// - `to`: a list of vectors to compute distance to.
 /// - `dimension`: the dimension of the vectors.
-pub fn l2_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Float32Array> {
-    assert_eq!(from.len(), dimension);
-    assert_eq!(to.len() % dimension, 0);
+pub fn l2_distance_batch<'a>(
+    from: &'a [f32],
+    to: &'a [f32],
+    dimension: usize,
+) -> Box<dyn Iterator<Item = f32> + 'a> {
+    debug_assert_eq!(from.len(), dimension);
+    debug_assert_eq!(to.len() % dimension, 0);
 
-    let dists = to.chunks_exact(dimension).map(|v| from.l2(v));
-    Arc::new(Float32Array::new(dists.collect(), None))
+    Box::new(to.chunks_exact(dimension).map(|v| from.l2(v)))
 }
 
 /// Compute L2 distance between a vector and a batch of vectors.
@@ -154,137 +173,6 @@ pub fn l2_distance_arrow_batch(from: &[f32], to: &FixedSizeListArray) -> Arc<Flo
     Arc::new(Float32Array::new(dists.collect(), to.nulls().cloned()))
 }
 
-#[cfg(target_arch = "x86_64")]
-mod x86_64 {
-    pub mod avx {
-        use super::super::l2_scalar;
-
-        #[inline]
-        pub fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
-            unsafe {
-                use std::arch::x86_64::*;
-                debug_assert_eq!(from.len(), to.len());
-
-                // Get the potion of the vector that is aligned to 32 bytes.
-                let len = from.len() / 32 * 32;
-                let mut sums1 = _mm256_setzero_ps();
-                let mut sums2 = _mm256_setzero_ps();
-                let mut sums3 = _mm256_setzero_ps();
-                let mut sums4 = _mm256_setzero_ps();
-
-                // Manually unroll the loop by 4.
-                for i in (0..len).step_by(32) {
-                    let left = _mm256_loadu_ps(from.as_ptr().add(i));
-                    let l2 = _mm256_loadu_ps(from.as_ptr().add(i + 8));
-                    let l3 = _mm256_loadu_ps(from.as_ptr().add(i + 16));
-                    let l4 = _mm256_loadu_ps(from.as_ptr().add(i + 24));
-
-                    let right = _mm256_loadu_ps(to.as_ptr().add(i));
-                    let r2 = _mm256_loadu_ps(to.as_ptr().add(i + 8));
-                    let r3 = _mm256_loadu_ps(to.as_ptr().add(i + 16));
-                    let r4 = _mm256_loadu_ps(to.as_ptr().add(i + 24));
-                    let sub = _mm256_sub_ps(left, right);
-                    // sum = sub * sub + sum
-                    let s2 = _mm256_sub_ps(l2, r2);
-                    let s3 = _mm256_sub_ps(l3, r3);
-                    let s4 = _mm256_sub_ps(l4, r4);
-                    sums1 = _mm256_fmadd_ps(sub, sub, sums1);
-                    sums2 = _mm256_fmadd_ps(s2, s2, sums2);
-                    sums3 = _mm256_fmadd_ps(s3, s3, sums3);
-                    sums4 = _mm256_fmadd_ps(s4, s4, sums4);
-                }
-                sums1 = _mm256_add_ps(sums1, sums2);
-                sums3 = _mm256_add_ps(sums3, sums4);
-                sums1 = _mm256_add_ps(sums1, sums3);
-                // Shift and add vector, until only 1 value left.
-                // sums = [x0-x7], shift = [x4-x7]
-                let mut shift = _mm256_permute2f128_ps(sums1, sums1, 1);
-                // [x0+x4, x1+x5, ..]
-                sums1 = _mm256_add_ps(sums1, shift);
-                shift = _mm256_permute_ps(sums1, 14);
-                sums1 = _mm256_add_ps(sums1, shift);
-                sums1 = _mm256_hadd_ps(sums1, sums1);
-                let mut results: [f32; 8] = [0f32; 8];
-                _mm256_storeu_ps(results.as_mut_ptr(), sums1);
-
-                // Remaining
-                results[0] += l2_scalar(&from[len..], &to[len..]);
-                results[0]
-            }
-        }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-mod aarch64 {
-
-    pub(super) mod neon {
-        use super::super::l2_scalar;
-        use std::arch::aarch64::*;
-
-        // TODO: learn rust macro and refactor to macro instead of manually unroll
-        const UNROLL_FACTOR: usize = 4;
-        const INSTRUCTION_WIDTH: usize = 4;
-
-        const STEP_SIZE: usize = UNROLL_FACTOR * INSTRUCTION_WIDTH;
-
-        #[inline]
-        pub fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
-            unsafe {
-                let len_aligned_to_unroll = from.len() / STEP_SIZE * STEP_SIZE;
-                let buf = [0.0_f32; 4];
-                let mut sum1 = vld1q_f32(buf.as_ptr());
-                let mut sum2 = vld1q_f32(buf.as_ptr());
-                let mut sum3 = vld1q_f32(buf.as_ptr());
-                let mut sum4 = vld1q_f32(buf.as_ptr());
-                for i in (0..len_aligned_to_unroll).step_by(STEP_SIZE) {
-                    let left = vld1q_f32(from.as_ptr().add(i));
-                    let right = vld1q_f32(to.as_ptr().add(i));
-                    let sub1 = vsubq_f32(left, right);
-                    sum1 = vfmaq_f32(sum1, sub1, sub1);
-
-                    let left = vld1q_f32(from.as_ptr().add(i + 4));
-                    let right = vld1q_f32(to.as_ptr().add(i + 4));
-                    let sub2 = vsubq_f32(left, right);
-                    sum2 = vfmaq_f32(sum2, sub2, sub2);
-
-                    let left = vld1q_f32(from.as_ptr().add(i + 8));
-                    let right = vld1q_f32(to.as_ptr().add(i + 8));
-                    let sub3 = vsubq_f32(left, right);
-                    sum3 = vfmaq_f32(sum3, sub3, sub3);
-
-                    let left = vld1q_f32(from.as_ptr().add(i + 12));
-                    let right = vld1q_f32(to.as_ptr().add(i + 12));
-                    let sub4 = vsubq_f32(left, right);
-                    sum4 = vfmaq_f32(sum4, sub4, sub4);
-                }
-
-                let mut sum = vaddq_f32(vaddq_f32(sum1, sum2), vaddq_f32(sum3, sum4));
-
-                let len_aligned_to_instruction = from.len() / INSTRUCTION_WIDTH * INSTRUCTION_WIDTH;
-
-                // non-unrolled tail
-                for i in
-                    (len_aligned_to_unroll..len_aligned_to_instruction).step_by(INSTRUCTION_WIDTH)
-                {
-                    let left = vld1q_f32(from.as_ptr().add(i));
-                    let right = vld1q_f32(to.as_ptr().add(i));
-                    let sub = vsubq_f32(left, right);
-                    sum = vfmaq_f32(sum, sub, sub);
-                }
-
-                // non vectorized tail
-                let mut sum = vaddvq_f32(sum);
-                sum += l2_scalar(
-                    &from[len_aligned_to_instruction..],
-                    &to[len_aligned_to_instruction..],
-                );
-                sum
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,12 +196,10 @@ mod tests {
             point.values(),
             mat.values().as_primitive::<Float32Type>().values(),
             8,
-        );
+        )
+        .collect::<Vec<_>>();
 
-        assert_eq!(
-            distances.as_ref(),
-            &Float32Array::from(vec![32.0, 8.0, 0.0, 8.0])
-        );
+        assert_eq!(distances, vec![32.0, 8.0, 0.0, 8.0]);
     }
 
     #[test]
@@ -326,20 +212,18 @@ mod tests {
             .map(|v| v as f32)
             .collect::<Vec<_>>();
         let point = Float32Array::from((0..10).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let distances = l2_distance_batch(&point.values()[2..], &mat[6..], 8);
+        let distances = l2_distance_batch(&point.values()[2..], &mat[6..], 8).collect::<Vec<_>>();
 
-        assert_eq!(
-            distances.as_ref(),
-            &Float32Array::from(vec![32.0, 8.0, 0.0, 8.0])
-        );
+        assert_eq!(distances, vec![32.0, 8.0, 0.0, 8.0]);
     }
+
     #[test]
     fn test_odd_length_vector() {
         let mat = Float32Array::from_iter((0..5).map(|v| Some(v as f32)));
         let point = Float32Array::from((2..7).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let distances = l2_distance_batch(point.values(), mat.values(), 5);
+        let distances = l2_distance_batch(point.values(), mat.values(), 5).collect::<Vec<_>>();
 
-        assert_eq!(distances.as_ref(), &Float32Array::from(vec![20.0]));
+        assert_eq!(distances, vec![20.0]);
     }
 
     #[test]
@@ -389,7 +273,7 @@ mod tests {
         ]
         .into();
 
-        let d = l2_distance_batch(q.values(), values.values(), 32);
-        assert_relative_eq!(0.319_357_84, d.value(0));
+        let d = l2_distance_batch(q.values(), values.values(), 32).collect::<Vec<_>>();
+        assert_relative_eq!(0.319_357_84, d[0]);
     }
 }

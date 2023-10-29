@@ -20,7 +20,7 @@ use arrow_arith::numeric::sub;
 use arrow_array::{
     cast::{as_primitive_array, as_struct_array, AsArray},
     types::Float32Type,
-    Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
+    Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::DataType;
@@ -452,25 +452,12 @@ impl Ivf {
         nprobes: usize,
         metric_type: MetricType,
     ) -> Result<UInt32Array> {
-        if query.len() != self.dimension() {
-            return Err(Error::IO {
-                message: format!(
-                    "Ivf::find_partition: dimension mismatch: {} != {}",
-                    query.len(),
-                    self.dimension()
-                ),
-                location: location!(),
-            });
-        }
-        let dist_func = metric_type.batch_func();
-        let centroid_values = self.centroids.values();
-        let distances = dist_func(
-            query.values(),
-            centroid_values.as_primitive::<Float32Type>().values(),
-            self.dimension(),
-        ) as ArrayRef;
-        let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;
-        Ok(top_k_partitions)
+        let ivf = lance_index::vector::ivf::Ivf::new(
+            MatrixView::try_from(self.centroids.as_ref())?,
+            metric_type,
+            vec![],
+        );
+        ivf.find_partitions(query, nprobes)
     }
 
     /// Add the offset and length of one partition.
@@ -1083,15 +1070,10 @@ mod tests {
                     }
                     let distances = l2_distance_batch(
                         centroid,
-                        &centroids.values().slice(offset, length),
+                        &centroids.values()[offset..offset + length],
                         self.dim as usize,
                     );
-                    let min_distance = distances
-                        .values()
-                        .iter()
-                        .copied()
-                        .min_by(|a, b| a.total_cmp(b))
-                        .unwrap();
+                    let min_distance = distances.min_by(|a, b| a.total_cmp(b)).unwrap();
                     // In theory we could just replace this one vector but, out of laziness, we just retry all of them
                     if min_distance < distance_needed {
                         broken = true;

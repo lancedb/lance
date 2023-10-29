@@ -22,7 +22,7 @@ use arrow_array::{
     types::Float32Type,
     Float32Array,
 };
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -42,7 +42,6 @@ fn l2_arrow_arity(x: &Float32Array, y: &Float32Array) -> f32 {
     let m: Float32Array = binary(x, y, |a, b| (a - b).powi(2)).unwrap();
     sum(&m).unwrap()
 }
-
 #[inline]
 fn l2_auto_vectorization(x: &[f32], y: &[f32]) -> f32 {
     x.iter()
@@ -61,7 +60,7 @@ fn bench_distance(c: &mut Criterion) {
 
     c.bench_function("L2(simd)", |b| {
         b.iter(|| {
-            l2_distance_batch(key.values(), target.values(), DIMENSION);
+            black_box(l2_distance_batch(key.values(), target.values(), DIMENSION).count());
         })
     });
 
@@ -99,7 +98,7 @@ fn bench_distance(c: &mut Criterion) {
 
     c.bench_function("L2(simd) second rng seed", |b| {
         b.iter(|| {
-            l2_distance_batch(key.values(), target.values(), DIMENSION);
+            black_box(l2_distance_batch(key.values(), target.values(), DIMENSION).count());
         })
     });
 
