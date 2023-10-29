@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use arrow_array::Float32Array;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use lance_linalg::distance::cosine::cosine_distance_batch;
 #[cfg(target_os = "linux")]
@@ -31,7 +31,9 @@ fn bench_distance(c: &mut Criterion) {
 
     c.bench_function("Cosine(simd)", |b| {
         b.iter(|| {
-            cosine_distance_batch(key.values(), target.values(), DIMENSION);
+            black_box(
+                cosine_distance_batch(key.values(), target.values(), DIMENSION).collect::<Vec<_>>(),
+            );
         })
     });
 
@@ -41,7 +43,9 @@ fn bench_distance(c: &mut Criterion) {
 
     c.bench_function("Cosine(simd) second rng seed", |b| {
         b.iter(|| {
-            cosine_distance_batch(key.values(), target.values(), DIMENSION);
+            black_box(
+                cosine_distance_batch(key.values(), target.values(), DIMENSION).collect::<Vec<_>>(),
+            )
         })
     });
 }
