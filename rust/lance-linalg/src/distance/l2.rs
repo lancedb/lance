@@ -73,13 +73,13 @@ fn l2_unrolling_f32(from: &[f32], to: &[f32]) -> f32 {
     for i in (0..dim).step_by(16) {
         unsafe {
             let mut x1 = f32x8::load_unaligned(from.as_ptr().add(i));
-            let x2 = f32x8::load_unaligned(from.as_ptr().add(i + 8));
+            let mut x2 = f32x8::load_unaligned(from.as_ptr().add(i + 8));
             let y1 = f32x8::load_unaligned(to.as_ptr().add(i));
-            let mut y2 = f32x8::load_unaligned(to.as_ptr().add(i + 8));
+            let y2 = f32x8::load_unaligned(to.as_ptr().add(i + 8));
             x1 -= y1;
-            y2 -= x2;
+            x2 -= y2;
             sum1.multiply_add(x1, x1);
-            sum2.multiply_add(y2, y2);
+            sum2.multiply_add(x2, x2);
         }
     }
     (sum1 + sum2).reduce_sum()
