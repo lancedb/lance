@@ -72,8 +72,9 @@ impl L2 for [f32] {
         let mut sum1 = f32x8::splat(0.0);
         let mut sum2 = f32x8::splat(0.0);
 
-        let remain = if self.len() >= 16 {
-            let unrolling_len = self.len() / 16 * 16;
+        let len = self.len();
+        let remain = if len >= 16 {
+            let unrolling_len = len / 16 * 16;
             for i in (0..unrolling_len).step_by(16) {
                 unsafe {
                     let mut x1 = f32x8::load(self.as_ptr().add(i));
@@ -91,8 +92,8 @@ impl L2 for [f32] {
             0
         };
 
-        if remain < self.len() {
-            for i in (remain..self.len()).step_by(8) {
+        if len - remain >= 8 {
+            for i in (remain..len).step_by(8) {
                 unsafe {
                     let mut x = f32x8::load(self.as_ptr().add(i));
                     let y = f32x8::load(other.as_ptr().add(i));
@@ -104,7 +105,7 @@ impl L2 for [f32] {
 
         sum1 += sum2;
         let mut l2_sum = sum1.reduce_sum();
-        let unaligned_remain = self.len() / 8 * 8;
+        let unaligned_remain = len / 8 * 8;
         if unaligned_remain < self.len() {
             l2_sum += l2_scalar(&self[unaligned_remain..], &other[unaligned_remain..]);
         }
