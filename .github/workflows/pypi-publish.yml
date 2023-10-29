@@ -27,14 +27,14 @@ jobs:
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
         args: "--release --strip"
-        arm-build: ${{ matrix.platform == 'aarch64' }} 
+        arm-build: ${{ matrix.platform == 'aarch64' }}
     - uses: ./.github/workflows/upload_wheel
       with:
         token: ${{ secrets.PYPI_TOKEN }}
         repo: "pypi"
   mac:
     timeout-minutes: 60
-    runs-on: "macos-12"
+    runs-on: "macos-13"
     strategy:
       matrix:
         python-minor-version: ["8"]

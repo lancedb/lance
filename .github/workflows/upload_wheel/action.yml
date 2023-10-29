@@ -4,7 +4,7 @@ description: "Upload wheels to Pypi"
 inputs:
   os:
     required: true
-    description: "ubuntu-22.04 or macos-12"
+    description: "ubuntu-22.04 or macos-13"
   repo:
     required: false
     description: "pypi or testpypi"
