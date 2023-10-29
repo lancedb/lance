@@ -103,14 +103,6 @@ impl SIMD<f32> for f32x8 {
         }
     }
 
-    fn argmin(&self) -> u32 {
-        todo!()
-    }
-
-    fn argmax(&self) -> u32 {
-        todo!()
-    }
-
     fn multiply_add(&mut self, a: Self, b: Self) {
         #[cfg(target_arch = "x86_64")]
         unsafe {

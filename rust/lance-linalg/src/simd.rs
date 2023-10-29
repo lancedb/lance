@@ -66,10 +66,6 @@ pub trait SIMD<T: Float>:
     /// c = a * b + c
     fn multiply_add(&mut self, a: Self, b: Self);
 
-    fn argmin(&self) -> u32;
-
-    fn argmax(&self) -> u32;
-
     /// Calculate the sum across this vector.
     fn reduce_sum(&self) -> T;
 }
