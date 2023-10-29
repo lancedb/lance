@@ -42,7 +42,9 @@ pub struct f32x8(float32x4x2_t);
 impl std::fmt::Debug for f32x8 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut arr = [0.0_f32; 8];
-        self.store_unaligned(arr.as_mut_ptr());
+        unsafe {
+            self.store_unaligned(arr.as_mut_ptr());
+        }
         write!(f, "f32x8({:?})", arr)
     }
 }
@@ -60,7 +62,7 @@ impl SIMD<f32> for f32x8 {
     }
 
     #[inline]
-    fn load(ptr: *const f32) -> Self {
+    unsafe fn load(ptr: *const f32) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_load_ps(ptr))
@@ -70,18 +72,16 @@ impl SIMD<f32> for f32x8 {
     }
 
     #[inline]
-    fn load_unaligned(ptr: *const f32) -> Self {
+    unsafe fn load_unaligned(ptr: *const f32) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_loadu_ps(ptr))
         }
         #[cfg(target_arch = "aarch64")]
-        unsafe {
-            Self(vld1q_f32_x2(ptr))
-        }
+        Self(vld1q_f32_x2(ptr))
     }
 
-    fn store(&self, ptr: *mut f32) {
+    unsafe fn store(&self, ptr: *mut f32) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             _mm256_store_ps(ptr, self.0);
@@ -92,7 +92,7 @@ impl SIMD<f32> for f32x8 {
         }
     }
 
-    fn store_unaligned(&self, ptr: *mut f32) {
+    unsafe fn store_unaligned(&self, ptr: *mut f32) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             _mm256_storeu_ps(ptr, self.0);

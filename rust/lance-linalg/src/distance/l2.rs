@@ -88,7 +88,7 @@ impl L2 for [f32] {
                 }
             }
             sum1 += sum2;
-            return sum1.reduce_sum();
+            sum1.reduce_sum()
         } else if len % 8 == 0 {
             let mut sum1 = f32x8::splat(0.0);
             for i in (0..len).step_by(8) {
@@ -99,7 +99,7 @@ impl L2 for [f32] {
                     sum1.multiply_add(x, x);
                 }
             }
-            return sum1.reduce_sum();
+            sum1.reduce_sum()
         } else {
             // Fallback to scalar
             l2_scalar(self, other)

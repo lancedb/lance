@@ -23,22 +23,31 @@
 //!
 //! The API are close to [std::simd] to make migration easier in the future.
 
+use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
+
 pub mod f32;
 
 use num_traits::Float;
 
-pub trait SIMD<T: Float>: std::fmt::Debug {
+/// Lance SIMD lib
+///
+pub trait SIMD<T: Float>:
+    std::fmt::Debug + AddAssign + Add + Mul + Sub + SubAssign + Copy + Clone + Sized
+{
+    /// Create a new instance with all lanes set to `val`.
     fn splat(val: T) -> Self;
 
-    /// Load aligned data from memory.
-    fn load(ptr: *const T) -> Self;
+    /// Load aligned data from aligned memory.
+    unsafe fn load(ptr: *const T) -> Self;
 
     /// Load unaligned data from memory.
-    fn load_unaligned(ptr: *const T) -> Self;
+    unsafe fn load_unaligned(ptr: *const T) -> Self;
 
-    fn store(&self, ptr: *mut T);
+    /// Store the values to aligned memory.
+    unsafe fn store(&self, ptr: *mut T);
 
-    fn store_unaligned(&self, ptr: *mut T);
+    /// Store the values to unaligned memory.
+    unsafe fn store_unaligned(&self, ptr: *mut T);
 
     /// fused multiply-add
     ///
@@ -49,5 +58,6 @@ pub trait SIMD<T: Float>: std::fmt::Debug {
 
     fn argmax(&self) -> u32;
 
+    /// Calculate the sum across this vector.
     fn reduce_sum(&self) -> T;
 }
