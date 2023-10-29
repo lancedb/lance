@@ -105,7 +105,7 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
 
         let schema = file_reader.schema();
         let vertex_projection = schema.project(&[VERTEX_COL])?;
-        let vertex_size = if let Some(field) = vertex_projection.fields.get(0) {
+        let vertex_size = if let Some(field) = vertex_projection.fields.first() {
             match field.data_type() {
                 DataType::FixedSizeBinary(size) => size as usize,
                 _ => {
