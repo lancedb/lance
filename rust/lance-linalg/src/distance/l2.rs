@@ -70,7 +70,8 @@ impl L2 for [f32] {
     #[inline]
     fn l2(&self, other: &[f32]) -> f32 {
         let len = self.len();
-        if len % 16 == 0 {  // Likely
+        if len % 16 == 0 {
+            // Likely
             let mut sum1 = f32x8::splat(0.0);
             let mut sum2 = f32x8::splat(0.0);
 
@@ -138,12 +139,15 @@ pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
 /// - `from`: the vector to compute distance from.
 /// - `to`: a list of vectors to compute distance to.
 /// - `dimension`: the dimension of the vectors.
-pub fn l2_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Float32Array> {
-    assert_eq!(from.len(), dimension);
-    assert_eq!(to.len() % dimension, 0);
+pub fn l2_distance_batch<'a>(
+    from: &'a [f32],
+    to: &'a [f32],
+    dimension: usize,
+) -> Box<dyn Iterator<Item = f32> + 'a> {
+    debug_assert_eq!(from.len(), dimension);
+    debug_assert_eq!(to.len() % dimension, 0);
 
-    let dists = to.chunks_exact(dimension).map(|v| from.l2(v));
-    Arc::new(Float32Array::new(dists.collect(), None))
+    Box::new(to.chunks_exact(dimension).map(|v| from.l2(v)))
 }
 
 /// Compute L2 distance between a vector and a batch of vectors.
@@ -169,7 +173,6 @@ pub fn l2_distance_arrow_batch(from: &[f32], to: &FixedSizeListArray) -> Arc<Flo
     Arc::new(Float32Array::new(dists.collect(), to.nulls().cloned()))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,12 +196,10 @@ mod tests {
             point.values(),
             mat.values().as_primitive::<Float32Type>().values(),
             8,
-        );
+        )
+        .collect::<Vec<_>>();
 
-        assert_eq!(
-            distances.as_ref(),
-            &Float32Array::from(vec![32.0, 8.0, 0.0, 8.0])
-        );
+        assert_eq!(distances, vec![32.0, 8.0, 0.0, 8.0]);
     }
 
     #[test]
@@ -211,20 +212,18 @@ mod tests {
             .map(|v| v as f32)
             .collect::<Vec<_>>();
         let point = Float32Array::from((0..10).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let distances = l2_distance_batch(&point.values()[2..], &mat[6..], 8);
+        let distances = l2_distance_batch(&point.values()[2..], &mat[6..], 8).collect::<Vec<_>>();
 
-        assert_eq!(
-            distances.as_ref(),
-            &Float32Array::from(vec![32.0, 8.0, 0.0, 8.0])
-        );
+        assert_eq!(distances, vec![32.0, 8.0, 0.0, 8.0]);
     }
+
     #[test]
     fn test_odd_length_vector() {
         let mat = Float32Array::from_iter((0..5).map(|v| Some(v as f32)));
         let point = Float32Array::from((2..7).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let distances = l2_distance_batch(point.values(), mat.values(), 5);
+        let distances = l2_distance_batch(point.values(), mat.values(), 5).collect::<Vec<_>>();
 
-        assert_eq!(distances.as_ref(), &Float32Array::from(vec![20.0]));
+        assert_eq!(distances, vec![20.0]);
     }
 
     #[test]
@@ -274,7 +273,7 @@ mod tests {
         ]
         .into();
 
-        let d = l2_distance_batch(q.values(), values.values(), 32);
-        assert_relative_eq!(0.319_357_84, d.value(0));
+        let d = l2_distance_batch(q.values(), values.values(), 32).collect::<Vec<_>>();
+        assert_relative_eq!(0.319_357_84, d[0]);
     }
 }

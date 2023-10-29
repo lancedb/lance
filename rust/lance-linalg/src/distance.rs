@@ -54,15 +54,6 @@ pub type ArrowBatchDistanceFunc = fn(&[f32], &FixedSizeListArray) -> Arc<Float32
 
 impl DistanceType {
     /// Compute the distance from one vector to a batch of vectors.
-    pub fn batch_func(&self) -> BatchDistanceFunc {
-        match self {
-            Self::L2 => l2_distance_batch,
-            Self::Cosine => cosine_distance_batch,
-            Self::Dot => dot_distance_batch,
-        }
-    }
-
-    /// Compute the distance from one vector to a batch of vectors.
     ///
     /// This propagates nulls to the output.
     pub fn arrow_batch_func(&self) -> ArrowBatchDistanceFunc {

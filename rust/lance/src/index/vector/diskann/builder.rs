@@ -24,7 +24,11 @@ use arrow_select::concat::concat_batches;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::io::WriteExt;
-use lance_linalg::{distance::l2_distance, kernels::argmin_opt, matrix::MatrixView};
+use lance_linalg::kernels::argmin;
+use lance_linalg::{
+    distance::{cosine_distance_batch, dot_distance_batch, l2_distance, l2_distance_batch},
+    matrix::MatrixView,
+};
 use ordered_float::OrderedFloat;
 use rand::{distributions::Uniform, prelude::*, Rng, SeedableRng};
 
@@ -255,14 +259,16 @@ async fn find_medoid(vectors: &MatrixView<Float32Type>, metric_type: MetricType)
         message: "Cannot find the medoid of an empty matrix".to_string(),
     })?;
 
-    let dist_func = metric_type.batch_func();
     // Find the closest vertex to the centroid.
-    let dists = dist_func(
-        centroid.values(),
-        vectors.data().values(),
-        vectors.num_columns(),
-    );
-    let medoid_idx = argmin_opt(dists.iter()).unwrap();
+    let centrodis = centroid.values();
+    let data = vectors.data();
+    let dim = vectors.ndim();
+    let dists = match metric_type {
+        MetricType::L2 => l2_distance_batch(centrodis, data.values(), dim),
+        MetricType::Cosine => cosine_distance_batch(centrodis, data.values(), dim),
+        MetricType::Dot => dot_distance_batch(centrodis, data.values(), dim),
+    };
+    let medoid_idx = argmin(dists).unwrap();
     Ok(medoid_idx as usize)
 }
 

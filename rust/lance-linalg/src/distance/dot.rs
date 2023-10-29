@@ -75,13 +75,15 @@ impl Dot for [f64] {
 }
 
 /// Negative dot product, to present the relative order of dot distance.
-pub fn dot_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Float32Array> {
+pub fn dot_distance_batch<'a>(
+    from: &'a [f32],
+    to: &'a [f32],
+    dimension: usize,
+) -> Box<dyn Iterator<Item = f32> + 'a> {
     debug_assert_eq!(from.len(), dimension);
     debug_assert_eq!(to.len() % dimension, 0);
 
-    let dists = to.chunks_exact(dimension).map(|v| dot_distance(from, v));
-
-    Arc::new(Float32Array::new(dists.collect(), None))
+    Box::new(to.chunks_exact(dimension).map(|v| dot_distance(from, v)))
 }
 
 /// Compute negative dot product distance between a vector and a batch of vectors.

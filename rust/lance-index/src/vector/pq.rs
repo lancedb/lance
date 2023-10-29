@@ -14,7 +14,6 @@
 
 use std::sync::Arc;
 
-use arrow_arith::aggregate::min;
 use arrow_array::{
     builder::Float32Builder, cast::AsArray, types::Float32Type, Array, FixedSizeListArray,
     Float32Array, UInt8Array,
@@ -22,7 +21,8 @@ use arrow_array::{
 use futures::{stream, stream::repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use lance_linalg::kernels::argmin_opt;
+use lance_linalg::distance::{cosine_distance_batch, dot_distance_batch, l2_distance_batch};
+use lance_linalg::kernels::argmin;
 use lance_linalg::{distance::MetricType, MatrixView};
 use rand::SeedableRng;
 pub mod transform;
@@ -258,7 +258,6 @@ impl ProductQuantizer {
             .map(|(sub_idx, (vec, codebook))| async move {
                 let cb = codebook.clone();
                 tokio::task::spawn_blocking(move || {
-                    let dist_func = metric_type.batch_func();
                     let centroid = get_sub_vector_centroids(
                         cb.as_ref(),
                         dimension,
@@ -270,8 +269,18 @@ impl ProductQuantizer {
                         .map(|i| {
                             let value = vec.value(i);
                             let vector: &Float32Array = value.as_primitive();
-                            let distances = dist_func(vector.values(), centroid, vector.len());
-                            min(distances.as_ref()).unwrap_or(0.0)
+                            let distances = match metric_type {
+                                lance_linalg::distance::DistanceType::L2 => {
+                                    l2_distance_batch(vector.values(), centroid, dimension)
+                                }
+                                lance_linalg::distance::DistanceType::Cosine => {
+                                    cosine_distance_batch(vector.values(), centroid, dimension)
+                                }
+                                lance_linalg::distance::DistanceType::Dot => {
+                                    dot_distance_batch(vector.values(), centroid, dimension)
+                                }
+                            };
+                            distances.fold(f32::INFINITY, |a, b| a.min(b))
                         })
                         .sum::<f32>() as f64 // in case of overflow
                 })
@@ -287,8 +296,6 @@ impl ProductQuantizer {
 
     /// Transform the vector array to PQ code array.
     pub async fn transform(&self, data: &MatrixView<Float32Type>) -> Result<FixedSizeListArray> {
-        let dist_func = self.metric_type.batch_func();
-
         let flatten_data = data.data();
         let num_sub_vectors = self.num_sub_vectors;
         let dim = self.dimension;
@@ -296,6 +303,7 @@ impl ProductQuantizer {
         let num_bits = self.num_bits;
         let codebook = self.codebook.clone();
 
+        let metric_type = self.metric_type;
         let values = tokio::task::spawn_blocking(move || {
             let all_centroids = (0..num_sub_vectors)
                 .map(|idx| {
@@ -314,9 +322,19 @@ impl ProductQuantizer {
                     let offset = row_offset + sub_idx * sub_dim;
                     let sub_vector = &flatten_values[offset..offset + sub_dim];
                     let centroids = all_centroids[sub_idx];
-                    // TODO(lei): use kmeans.compute_membership()
-                    let code =
-                        argmin_opt(dist_func(sub_vector, centroids, sub_dim).iter()).unwrap();
+
+                    let dist_iter = match metric_type {
+                        lance_linalg::distance::DistanceType::L2 => {
+                            l2_distance_batch(sub_vector, centroids, sub_dim)
+                        }
+                        lance_linalg::distance::DistanceType::Cosine => {
+                            cosine_distance_batch(sub_vector, centroids, sub_dim)
+                        }
+                        lance_linalg::distance::DistanceType::Dot => {
+                            dot_distance_batch(sub_vector, centroids, sub_dim)
+                        }
+                    };
+                    let code = argmin(dist_iter).unwrap();
                     builder[i * num_sub_vectors + sub_idx] = code as u8;
                 }
             }

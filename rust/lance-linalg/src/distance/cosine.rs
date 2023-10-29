@@ -218,13 +218,17 @@ pub fn cosine_distance<T: Cosine + ?Sized>(from: &T, to: &T) -> T::Output {
 /// Cosine Distance
 ///
 /// <https://en.wikipedia.org/wiki/Cosine_similarity>
-pub fn cosine_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Float32Array> {
+pub fn cosine_distance_batch<'a>(
+    from: &'a [f32],
+    to: &'a [f32],
+    dimension: usize,
+) -> Box<dyn Iterator<Item = f32> + 'a> {
     let x_norm = norm_l2(from);
 
-    let dists = to
-        .chunks_exact(dimension)
-        .map(|y| from.cosine_fast(x_norm, y));
-    Arc::new(Float32Array::new(dists.collect(), None))
+    Box::new(
+        to.chunks_exact(dimension)
+            .map(move |y| from.cosine_fast(x_norm, y)),
+    )
 }
 
 /// Compute Cosine distance between a vector and a batch of vectors.
@@ -393,23 +397,23 @@ mod tests {
     fn test_cosine() {
         let x: Float32Array = (1..9).map(|v| v as f32).collect();
         let y: Float32Array = (100..108).map(|v| v as f32).collect();
-        let d = cosine_distance_batch(x.values(), y.values(), 8);
+        let d = cosine_distance_batch(x.values(), y.values(), 8).collect::<Vec<_>>();
         // from scipy.spatial.distance.cosine
-        assert_relative_eq!(d.value(0), 1.0 - 0.900_957);
+        assert_relative_eq!(d[0], 1.0 - 0.900_957);
 
         let x = Float32Array::from_iter_values([3.0, 45.0, 7.0, 2.0, 5.0, 20.0, 13.0, 12.0]);
         let y = Float32Array::from_iter_values([2.0, 54.0, 13.0, 15.0, 22.0, 34.0, 50.0, 1.0]);
-        let d = cosine_distance_batch(x.values(), y.values(), 8);
+        let d = cosine_distance_batch(x.values(), y.values(), 8).collect::<Vec<_>>();
         // from sklearn.metrics.pairwise import cosine_similarity
-        assert_relative_eq!(d.value(0), 1.0 - 0.873_580_63);
+        assert_relative_eq!(d[0], 1.0 - 0.873_580_63);
     }
 
     #[test]
     fn test_cosine_not_aligned() {
         let x: Float32Array = vec![16_f32, 32_f32].into();
         let y: Float32Array = vec![1_f32, 2_f32, 4_f32, 8_f32].into();
-        let d = cosine_distance_batch(x.values(), y.values(), 2);
-        assert_relative_eq!(d.value(0), 0.0);
-        assert_relative_eq!(d.value(1), 0.0);
+        let d = cosine_distance_batch(x.values(), y.values(), 2).collect::<Vec<_>>();
+        assert_relative_eq!(d[0], 0.0);
+        assert_relative_eq!(d[0], 0.0);
     }
 }

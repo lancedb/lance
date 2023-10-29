@@ -20,14 +20,17 @@ use std::sync::Arc;
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt32Type},
-    Array, ArrayRef, Float32Array, RecordBatch, UInt32Array,
+    Array, Float32Array, RecordBatch, UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::Field;
 use arrow_select::take::take;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
-use lance_linalg::{distance::MetricType, MatrixView};
+use lance_linalg::{
+    distance::{cosine_distance_batch, dot_distance_batch, l2_distance_batch, MetricType},
+    MatrixView,
+};
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -127,10 +130,21 @@ impl Ivf {
                 location: location!(),
             });
         }
-        let dist_func = self.metric_type.batch_func();
         let centroid_values = self.centroids.data();
-        let distances =
-            dist_func(query.values(), centroid_values.values(), self.dimension()) as ArrayRef;
+        let centroids = centroid_values.values();
+        let dim = query.len();
+        let distances: Float32Array = match self.metric_type {
+            lance_linalg::distance::DistanceType::L2 => {
+                l2_distance_batch(query.values(), centroids, dim)
+            }
+            lance_linalg::distance::DistanceType::Cosine => {
+                cosine_distance_batch(query.values(), centroids, dim)
+            }
+            lance_linalg::distance::DistanceType::Dot => {
+                dot_distance_batch(query.values(), centroids, dim)
+            }
+        }
+        .collect();
         let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;
         Ok(top_k_partitions)
     }
