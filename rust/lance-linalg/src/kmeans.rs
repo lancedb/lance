@@ -468,8 +468,7 @@ impl KMeans {
                         let values = &data.values()[start_idx * dimension..last_idx * dimension];
 
                         if metric_type == MetricType::L2 {
-                            let partitions =
-                                compute_partitions_l2_f32(centroids_array, values, dimension);
+                            return compute_partitions_l2_f32(centroids_array, values, dimension).collect();
                         }
 
                         values
