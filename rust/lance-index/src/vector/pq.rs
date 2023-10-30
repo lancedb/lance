@@ -367,44 +367,40 @@ impl ProductQuantizer {
         let sub_vector_dimension = dimension / params.num_sub_vectors;
 
         let mut codebook_builder = Float32Builder::with_capacity(num_centroids * dimension);
-        let rng = rand::rngs::SmallRng::from_entropy();
 
         const REDOS: usize = 1;
         // TODO: parallel training.
-        let prev_centroids = params.codebook.clone();
-        for sub_vec in sub_vectors.iter() {
-            // Centroids for one sub vector.
-            let flatten_array: &Float32Array = sub_vec.values().as_primitive();
-            let centroids = train_kmeans(
-                flatten_array,
-                prev_centroids.as_ref().map(|centroids| {
-                    Arc::new(Float32Array::from_iter_values(
-                        get_sub_vector_centroids(
-                            centroids.as_ref(),
-                            dimension,
-                            params.num_bits as u32,
-                            params.num_sub_vectors,
-                            0,
-                        )
-                        .iter()
-                        .cloned(),
-                    ))
-                }),
-                sub_vector_dimension,
-                num_centroids,
-                params.max_iters as u32,
-                REDOS,
-                rng.clone(),
-                params.metric_type,
-                params.sample_rate,
-            )
+        let d = stream::iter(sub_vectors.into_iter())
+            .map(|sub_vec| async move {
+                let rng = rand::rngs::SmallRng::from_entropy();
+
+                // Centroids for one sub vector.
+                let sub_vec = sub_vec.clone();
+                let flatten_array: &Float32Array = sub_vec.values().as_primitive();
+                let centroids = train_kmeans(
+                    flatten_array,
+                    None,
+                    sub_vector_dimension,
+                    num_centroids,
+                    params.max_iters as u32,
+                    REDOS,
+                    rng.clone(),
+                    params.metric_type,
+                    params.sample_rate,
+                )
+                .await;
+                centroids
+            })
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
             .await?;
 
-            // TODO: COPIED COPIED COPIED
+        for centroid in d.iter() {
             unsafe {
-                codebook_builder.append_trusted_len_iter(centroids.values().iter().copied());
+                codebook_builder.append_trusted_len_iter(centroid.values().iter().copied());
             }
         }
+
         let pd_centroids = codebook_builder.finish();
 
         Ok(Self::new(
