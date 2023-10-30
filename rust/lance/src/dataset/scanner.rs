@@ -197,10 +197,6 @@ impl Scanner {
     /// If false then the filter will be applied to the nearest results.  This means
     /// you may get back fewer results than you ask for (or none at all) if the closest
     /// results do not match the filter.
-    ///
-    /// EXPERIMENTAL: Currently, prefiltering is only supported when a vector index
-    /// is not used and the query is performing a flat knn search.  If the filter matches
-    /// many rows then the query could be very expensive.
     pub fn prefilter(&mut self, should_prefilter: bool) -> &mut Self {
         self.prefilter = should_prefilter;
         self
