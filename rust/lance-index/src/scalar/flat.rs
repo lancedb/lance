@@ -92,8 +92,6 @@ impl SubIndexTrainer for FlatIndexTrainer {
 #[async_trait]
 impl ScalarIndex for FlatIndex {
     async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
-        dbg!(&self.data);
-        dbg!(&query);
         let predicate = match query {
             ScalarQuery::Equals(value) => arrow_ord::cmp::eq(self.values(), &value.to_scalar())?,
             ScalarQuery::IsNull() => arrow::compute::is_null(self.values())?,

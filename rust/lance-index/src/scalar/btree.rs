@@ -196,8 +196,6 @@ impl BTreeIndex {
             let null_count = null_counts.values()[idx];
             let offset = offsets.values()[idx];
 
-            dbg!(&max, &null_count, &offset);
-
             map.entry(OrderableScalarValue(max))
                 .or_default()
                 .push(offset);
