@@ -88,8 +88,8 @@ fn bench_distance(c: &mut Criterion) {
             }))
         });
     });
-    run_bench::<Float32Type>(c);
 
+    run_bench::<Float32Type>(c);
     c.bench_function("Dot(f32, SIMD)", |b| {
         let key: Float32Array = generate_random_array_with_seed(DIMENSION, [0; 32]);
         // 1M of 1024 D vectors
@@ -102,6 +102,7 @@ fn bench_distance(c: &mut Criterion) {
             }))
         });
     });
+
     run_bench::<Float64Type>(c);
 }
 
