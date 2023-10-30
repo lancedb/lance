@@ -114,7 +114,8 @@ async fn kmean_plusplus(
 
     for _ in 1..k {
         let membership = kmeans.compute_membership(data.clone(), None).await;
-        let weights = WeightedIndex::new(&membership.distances).unwrap();
+        let weights =
+            WeightedIndex::new(membership.cluster_id_and_distances.iter().map(|(_, d)| d)).unwrap();
         let mut chosen;
         loop {
             chosen = weights.sample(&mut rng);
@@ -169,11 +170,8 @@ pub struct KMeanMembership {
 
     dimension: usize,
 
-    /// Cluster Id for each vector.
-    pub cluster_ids: Vec<u32>,
-
-    /// Distance between each vector, to its corresponding centroids.
-    distances: Vec<f32>,
+    /// Cluster Id and distances for each vector.
+    pub cluster_id_and_distances: Vec<(u32, f32)>,
 
     /// Number of centroids.
     k: usize,
@@ -191,7 +189,7 @@ impl KMeanMembership {
         self.data
             .values()
             .chunks_exact(dimension)
-            .zip(self.cluster_ids.iter())
+            .zip(self.cluster_id_and_distances.iter().map(|(c, _)| c))
             .for_each(|(vector, cluster_id)| {
                 cluster_cnts[*cluster_id as usize] += 1;
                 // TODO: simd
@@ -223,18 +221,18 @@ impl KMeanMembership {
     }
 
     fn distance_sum(&self) -> f32 {
-        self.distances.iter().sum()
+        self.cluster_id_and_distances.iter().map(|(_, d)| d).sum()
     }
 
     /// Returns how many data points are here
     fn len(&self) -> usize {
-        self.cluster_ids.len()
+        self.cluster_id_and_distances.len()
     }
 
     /// Histogram of the size of each cluster.
     fn histogram(&self) -> Vec<usize> {
         let mut hist: Vec<usize> = vec![0; self.k];
-        for cluster_id in self.cluster_ids.iter() {
+        for (cluster_id, _) in self.cluster_id_and_distances.iter() {
             hist[*cluster_id as usize] += 1;
         }
         hist
@@ -433,7 +431,7 @@ impl KMeans {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let metric_type = self.metric_type;
-        const CHUNK_SIZE: usize = 2048;
+        const CHUNK_SIZE: usize = 1024;
 
         // Normalized centroids for fast cosine. cosine(A, B) = A * B / (|A| * |B|).
         // So here, norm_centroids = |B| for each centroid B.
@@ -468,7 +466,8 @@ impl KMeans {
                         let values = &data.values()[start_idx * dimension..last_idx * dimension];
 
                         if metric_type == MetricType::L2 {
-                            return compute_partitions_l2_f32(centroids_array, values, dimension).collect();
+                            return compute_partitions_l2_f32(centroids_array, values, dimension)
+                                .collect();
                         }
 
                         values
@@ -528,16 +527,7 @@ impl KMeans {
         KMeanMembership {
             data,
             dimension,
-            cluster_ids: cluster_with_distances
-                .iter()
-                .flatten()
-                .map(|(c, _)| *c)
-                .collect(),
-            distances: cluster_with_distances
-                .iter()
-                .flatten()
-                .map(|(_, d)| *d)
-                .collect(),
+            cluster_id_and_distances: cluster_with_distances.iter().flatten().copied().collect(),
             k: self.k,
             metric_type: self.metric_type,
         }
