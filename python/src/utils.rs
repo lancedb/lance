@@ -100,7 +100,11 @@ impl KMeans {
         };
         let values: Arc<Float32Array> = fixed_size_arr.values().as_primitive().clone().into();
         let membership = RT.block_on(Some(py), kmeans.compute_membership(values, None))?;
-        let cluster_ids: UInt32Array = membership.cluster_id_and_distances.iter().map(|(c, _)| *c).collect();
+        let cluster_ids: UInt32Array = membership
+            .cluster_id_and_distances
+            .iter()
+            .map(|(c, _)| *c)
+            .collect();
         cluster_ids.into_data().to_pyarrow(py)
     }
 
