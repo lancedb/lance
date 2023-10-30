@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Utilities connecting scalar indices to the lance format
+//! Utilities for serializing and deserializing scalar indices in the lance format
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -30,6 +30,11 @@ use lance_core::{
 
 use super::{IndexReader, IndexStore, IndexWriter};
 
+/// An index store that serializes scalar indices using the lance format
+///
+/// Scalar indices are made up of named collections of record batches.  This
+/// struct relies on there being a dedicated directory for the index and stores
+/// each collection in a file in the lance format.
 #[derive(Debug)]
 pub struct LanceIndexStore {
     object_store: ObjectStore,
@@ -37,6 +42,7 @@ pub struct LanceIndexStore {
 }
 
 impl LanceIndexStore {
+    /// Create a new index store at the given directory
     pub fn new(object_store: ObjectStore, index_dir: PathBuf) -> Self {
         Self {
             object_store,
@@ -160,6 +166,7 @@ mod tests {
             .await
             .unwrap();
 
-        dbg!(row_ids);
+        assert_eq!(1, row_ids.len());
+        assert_eq!(Some(10000), row_ids.values().into_iter().copied().next());
     }
 }

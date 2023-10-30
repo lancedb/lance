@@ -100,7 +100,7 @@ pub enum Operation {
     },
     /// A new index has been created.
     CreateIndex {
-        /// The new indices that are being added
+        /// The new secondary indices that are being added
         new_indices: Vec<Index>,
         /// The indices that have been modified.
         removed_indices: Vec<Index>,

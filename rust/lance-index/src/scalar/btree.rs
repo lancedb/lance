@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BinaryHeap},
     fmt::Debug,
     ops::Bound,
@@ -35,6 +36,7 @@ use super::{
 const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
 
+/// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Debug)]
 struct OrderableScalarValue(ScalarValue);
 
@@ -52,13 +54,438 @@ impl PartialOrd for OrderableScalarValue {
     }
 }
 
+// manual implementation of `Ord` that panics when asked to compare scalars of different type
+// and always puts nulls before non-nulls (this is consistent with Option<T>'s implementation
+// of Ord)
+//
+// TODO: Consider upstreaming this
 impl Ord for OrderableScalarValue {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // TODO: impl Ord for ScalarValue directly upstream in DataFusion
-        self.partial_cmp(other).unwrap()
+    fn cmp(&self, other: &Self) -> Ordering {
+        use ScalarValue::*;
+        // This purposely doesn't have a catch-all "(_, _)" so that
+        // any newly added enum variant will require editing this list
+        // or else face a compile error
+        match (&self.0, &other.0) {
+            (Decimal128(v1, p1, s1), Decimal128(v2, p2, s2)) => {
+                if p1.eq(p2) && s1.eq(s2) {
+                    v1.cmp(v2)
+                } else {
+                    // Two decimal values can only be compared if they have the same precision and scale.
+                    panic!("Attempt to compare decimals with unequal precision / scale")
+                }
+            }
+            (Decimal128(v1, _, _), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Decimal128(_, _, _), _) => panic!("Attempt to compare decimal with non-decimal"),
+            (Decimal256(v1, p1, s1), Decimal256(v2, p2, s2)) => {
+                if p1.eq(p2) && s1.eq(s2) {
+                    v1.cmp(v2)
+                } else {
+                    // Two decimal values can only be compared if they have the same precision and scale.
+                    panic!("Attempt to compare decimals with unequal precision / scale")
+                }
+            }
+            (Decimal256(v1, _, _), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Decimal256(_, _, _), _) => panic!("Attempt to compare decimal with non-decimal"),
+            (Boolean(v1), Boolean(v2)) => v1.cmp(v2),
+            (Boolean(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Boolean(_), _) => panic!("Attempt to compare boolean with non-boolean"),
+            (Float32(v1), Float32(v2)) => match (v1, v2) {
+                (Some(f1), Some(f2)) => f1.total_cmp(f2),
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+            (Float32(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Float32(_), _) => panic!("Attempt to compare f32 with non-f32"),
+            (Float64(v1), Float64(v2)) => match (v1, v2) {
+                (Some(f1), Some(f2)) => f1.total_cmp(f2),
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+            (Float64(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Float64(_), _) => panic!("Attempt to compare f64 with non-f64"),
+            (Int8(v1), Int8(v2)) => v1.cmp(v2),
+            (Int8(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Int8(_), _) => panic!("Attempt to compare Int8 with non-Int8"),
+            (Int16(v1), Int16(v2)) => v1.cmp(v2),
+            (Int16(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Int16(_), _) => panic!("Attempt to compare Int16 with non-Int16"),
+            (Int32(v1), Int32(v2)) => v1.cmp(v2),
+            (Int32(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Int32(_), _) => panic!("Attempt to compare Int32 with non-Int32"),
+            (Int64(v1), Int64(v2)) => v1.cmp(v2),
+            (Int64(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Int64(_), _) => panic!("Attempt to compare Int16 with non-Int64"),
+            (UInt8(v1), UInt8(v2)) => v1.cmp(v2),
+            (UInt8(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (UInt8(_), _) => panic!("Attempt to compare UInt8 with non-UInt8"),
+            (UInt16(v1), UInt16(v2)) => v1.cmp(v2),
+            (UInt16(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (UInt16(_), _) => panic!("Attempt to compare UInt16 with non-UInt16"),
+            (UInt32(v1), UInt32(v2)) => v1.cmp(v2),
+            (UInt32(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (UInt32(_), _) => panic!("Attempt to compare UInt32 with non-UInt32"),
+            (UInt64(v1), UInt64(v2)) => v1.cmp(v2),
+            (UInt64(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (UInt64(_), _) => panic!("Attempt to compare Int16 with non-UInt64"),
+            (Utf8(v1), Utf8(v2)) => v1.cmp(v2),
+            (Utf8(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Utf8(_), _) => panic!("Attempt to compare Utf8 with non-Utf8"),
+            (LargeUtf8(v1), LargeUtf8(v2)) => v1.cmp(v2),
+            (LargeUtf8(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (LargeUtf8(_), _) => panic!("Attempt to compare LargeUtf8 with non-LargeUtf8"),
+            (Binary(v1), Binary(v2)) => v1.cmp(v2),
+            (Binary(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Binary(_), _) => panic!("Attempt to compare Binary with non-Binary"),
+            (FixedSizeBinary(_, v1), FixedSizeBinary(_, v2)) => v1.cmp(v2),
+            (FixedSizeBinary(_, v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (FixedSizeBinary(_, _), _) => {
+                panic!("Attempt to compare FixedSizeBinary with non-FixedSizeBinary")
+            }
+            (LargeBinary(v1), LargeBinary(v2)) => v1.cmp(v2),
+            (LargeBinary(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (LargeBinary(_), _) => panic!("Attempt to compare LargeBinary with non-LargeBinary"),
+            (Fixedsizelist(_v1, t1, l1), Fixedsizelist(_v2, t2, l2)) => {
+                if t1.eq(t2) && l1.eq(l2) {
+                    todo!()
+                } else {
+                    panic!(
+                        "Attempt to compare fixed size list elements with different widths/fields"
+                    )
+                }
+            }
+            (Fixedsizelist(v1, _, _), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Fixedsizelist(_, _, _), _) => {
+                panic!("Attempt to compare Fixedsizelist with non-Fixedsizelist")
+            }
+            (List(_, _), List(_, _)) => todo!(),
+            (List(v1, _), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (List(_, _), _) => {
+                panic!("Attempt to compare List with non-List")
+            }
+            (Date32(v1), Date32(v2)) => v1.cmp(v2),
+            (Date32(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Date32(_), _) => panic!("Attempt to compare Date32 with non-Date32"),
+            (Date64(v1), Date64(v2)) => v1.cmp(v2),
+            (Date64(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Date64(_), _) => panic!("Attempt to compare Date64 with non-Date64"),
+            (Time32Second(v1), Time32Second(v2)) => v1.cmp(v2),
+            (Time32Second(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Time32Second(_), _) => panic!("Attempt to compare Time32Second with non-Time32Second"),
+            (Time32Millisecond(v1), Time32Millisecond(v2)) => v1.cmp(v2),
+            (Time32Millisecond(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Time32Millisecond(_), _) => {
+                panic!("Attempt to compare Time32Millisecond with non-Time32Millisecond")
+            }
+            (Time64Microsecond(v1), Time64Microsecond(v2)) => v1.cmp(v2),
+            (Time64Microsecond(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Time64Microsecond(_), _) => {
+                panic!("Attempt to compare Time64Microsecond with non-Time64Microsecond")
+            }
+            (Time64Nanosecond(v1), Time64Nanosecond(v2)) => v1.cmp(v2),
+            (Time64Nanosecond(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Time64Nanosecond(_), _) => {
+                panic!("Attempt to compare Time64Nanosecond with non-Time64Nanosecond")
+            }
+            (TimestampSecond(v1, _), TimestampSecond(v2, _)) => v1.cmp(v2),
+            (TimestampSecond(v1, _), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (TimestampSecond(_, _), _) => {
+                panic!("Attempt to compare TimestampSecond with non-TimestampSecond")
+            }
+            (TimestampMillisecond(v1, _), TimestampMillisecond(v2, _)) => v1.cmp(v2),
+            (TimestampMillisecond(v1, _), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (TimestampMillisecond(_, _), _) => {
+                panic!("Attempt to compare TimestampMillisecond with non-TimestampMillisecond")
+            }
+            (TimestampMicrosecond(v1, _), TimestampMicrosecond(v2, _)) => v1.cmp(v2),
+            (TimestampMicrosecond(v1, _), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (TimestampMicrosecond(_, _), _) => {
+                panic!("Attempt to compare TimestampMicrosecond with non-TimestampMicrosecond")
+            }
+            (TimestampNanosecond(v1, _), TimestampNanosecond(v2, _)) => v1.cmp(v2),
+            (TimestampNanosecond(v1, _), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (TimestampNanosecond(_, _), _) => {
+                panic!("Attempt to compare TimestampNanosecond with non-TimestampNanosecond")
+            }
+            (IntervalYearMonth(v1), IntervalYearMonth(v2)) => v1.cmp(v2),
+            (IntervalYearMonth(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (IntervalYearMonth(_), _) => {
+                panic!("Attempt to compare IntervalYearMonth with non-IntervalYearMonth")
+            }
+            (IntervalDayTime(v1), IntervalDayTime(v2)) => v1.cmp(v2),
+            (IntervalDayTime(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (IntervalDayTime(_), _) => {
+                panic!("Attempt to compare IntervalDayTime with non-IntervalDayTime")
+            }
+            (IntervalMonthDayNano(v1), IntervalMonthDayNano(v2)) => v1.cmp(v2),
+            (IntervalMonthDayNano(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (IntervalMonthDayNano(_), _) => {
+                panic!("Attempt to compare IntervalMonthDayNano with non-IntervalMonthDayNano")
+            }
+            (DurationSecond(v1), DurationSecond(v2)) => v1.cmp(v2),
+            (DurationSecond(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (DurationSecond(_), _) => {
+                panic!("Attempt to compare DurationSecond with non-DurationSecond")
+            }
+            (DurationMillisecond(v1), DurationMillisecond(v2)) => v1.cmp(v2),
+            (DurationMillisecond(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (DurationMillisecond(_), _) => {
+                panic!("Attempt to compare DurationMillisecond with non-DurationMillisecond")
+            }
+            (DurationMicrosecond(v1), DurationMicrosecond(v2)) => v1.cmp(v2),
+            (DurationMicrosecond(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (DurationMicrosecond(_), _) => {
+                panic!("Attempt to compare DurationMicrosecond with non-DurationMicrosecond")
+            }
+            (DurationNanosecond(v1), DurationNanosecond(v2)) => v1.cmp(v2),
+            (DurationNanosecond(v1), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (DurationNanosecond(_), _) => {
+                panic!("Attempt to compare DurationNanosecond with non-DurationNanosecond")
+            }
+            (Struct(_v1, _t1), Struct(_v2, _t2)) => todo!(),
+            (Struct(v1, _), Null) => {
+                if v1.is_none() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Struct(_, _), _) => panic!("Attempt to compare Struct with non-Struct"),
+            (Dictionary(_k1, _v1), Dictionary(_k2, _v2)) => todo!(),
+            (Dictionary(_, v1), Null) => {
+                OrderableScalarValue(*v1.clone()).cmp(&OrderableScalarValue(ScalarValue::Null))
+            }
+            (Dictionary(_, _), _) => panic!("Attempt to compare Dictionary with non-Dictionary"),
+            (Null, Null) => Ordering::Equal,
+            (Null, _) => todo!(),
+        }
     }
 }
 
+/// An in-memory structure that can quickly satisfy scalar queries using a btree of ScalarValue
 #[derive(Debug)]
 pub struct BTreeLookup {
     tree: BTreeMap<OrderableScalarValue, Vec<u64>>,
@@ -66,7 +493,6 @@ pub struct BTreeLookup {
     null_pages: Vec<u64>,
 }
 
-// impl<T: Ord + Send + Sync + Debug> BTreeLookup<T> {
 impl BTreeLookup {
     fn new(tree: BTreeMap<OrderableScalarValue, Vec<u64>>, null_pages: Vec<u64>) -> Self {
         Self { tree, null_pages }
@@ -123,6 +549,10 @@ impl BTreeLookup {
     }
 }
 
+/// A trait that must be implemented by a btree sub-index
+///
+/// A sub-index must be capable of indexing a single page of data.  We represent
+/// pages as a single record batch.
 #[async_trait]
 pub trait SubIndexLoader: std::fmt::Debug + Send + Sync {
     async fn load_subindex(
@@ -132,6 +562,21 @@ pub trait SubIndexLoader: std::fmt::Debug + Send + Sync {
     ) -> Result<Arc<dyn ScalarIndex>>;
 }
 
+/// A btree index satisfies scalar queries using a b tree
+///
+/// The upper layers of the btree are expected to be cached and, when unloaded,
+/// are stored in a btree structure in memory.  The leaves of the btree are left
+/// to be searched by some other kind of index (currently a flat search).
+///
+/// This strikes a balance between an expensive memory structure containing all
+/// of the values and an expensive disk structure that can't be efficiently searched.
+///
+/// For example, given 1Bi values we can store 256Ki leaves of size 4Ki.  We only
+/// need memory space for 256Ki leaves (depends on the data type but usually a few MiB
+/// at most) and can narrow our search to 4Ki values.
+///
+/// Note: this is very similar to the IVF index except we store the IVF part in a btree
+/// for faster lookup
 #[derive(Debug)]
 pub struct BTreeIndex {
     page_lookup: BTreeLookup,
@@ -332,6 +777,11 @@ fn btree_stats_as_batch(stats: Vec<EncodedBatch>) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
+/// Train a btree index from a stream of sorted page-size batches of values and row ids
+///
+/// Note: This is likely to change.  It is unreasonable to expect the caller to do the sorting
+/// and re-chunking into page-size batches.  This is left for simplicity as this feature is still
+/// a work in progress
 pub async fn train_btree_index<S: Stream<Item = Result<RecordBatch>> + Unpin>(
     mut batches: S,
     sub_index_trainer: &dyn SubIndexTrainer,

@@ -27,22 +27,36 @@ pub mod btree;
 pub mod flat;
 pub mod lance;
 
+/// Trait for storing an index (or parts of an index) into storage
 #[async_trait]
 pub trait IndexWriter: Send {
+    /// Writes a record batch into the file, returning the 0-based index of the batch in the file
+    ///
+    /// E.g. if this is the third time this is called this method will return 2
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64>;
+    /// Finishes writing the file and closes the file
     async fn finish(&mut self) -> Result<()>;
 }
 
+/// Trait for reading an index (or parts of an index) from storage
 #[async_trait]
 pub trait IndexReader: Send + Sync {
-    async fn read_record_batch(&self, offset: u64) -> Result<RecordBatch>;
+    /// Read the n-th record batch from the file
+    async fn read_record_batch(&self, n: u64) -> Result<RecordBatch>;
 }
 
+/// Trait abstracting I/O away from index logic
+///
+/// Scalar indices are currently serialized as indexable arrow record batches stored in
+/// named "files".  The index store is responsible for serializing and deserializing
+/// these batches into file data (e.g. as .lance files or .parquet files, etc.)
 #[async_trait]
 pub trait IndexStore: std::fmt::Debug + Send + Sync {
+    /// Create a new file and return a writer to store data in the file
     async fn new_index_file(&self, name: &str, schema: Arc<Schema>)
         -> Result<Box<dyn IndexWriter>>;
 
+    /// Open an existing file for retrieval
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>>;
 }
 
@@ -67,13 +81,15 @@ pub enum ScalarQuery {
     IsNull(),
 }
 
+/// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug {
-    /// Searches the scalar index
+    /// Search the scalar index
     ///
     /// Returns all row ids that satisfy the query, these row ids are not neccesarily ordered
     async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array>;
 
+    /// Load the scalar index from storage
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
     where
         Self: Sized;

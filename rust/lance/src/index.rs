@@ -39,7 +39,7 @@ pub use lance_index::pb;
 
 use self::vector::{build_vector_index, VectorIndexParams};
 
-/// Common trait for both scalar & vector indices
+/// Trait of a secondary index.
 pub(crate) trait Index: Send + Sync {
     /// Cast to [Any].
     fn as_any(&self) -> &dyn Any;

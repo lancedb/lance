@@ -29,7 +29,7 @@ use super::{
 /// A flat index is just a batch of value/row-id pairs
 ///
 /// The batch always has two columns.  The first column "values" contains
-/// the values.  The second column "addresses" contains the row addresses
+/// the values.  The second column "row_ids" contains the row ids
 ///
 /// Evaluating a query requires O(N) time where N is the # of rows
 #[derive(Debug)]
@@ -47,6 +47,9 @@ impl FlatIndex {
     }
 }
 
+/// Trains a flat index from a record batch of values & ids by simply storing the batch
+///
+/// This allows the flat index to be used as a sub-index
 pub struct FlatIndexTrainer {
     schema: Arc<Schema>,
 }
@@ -61,6 +64,9 @@ impl FlatIndexTrainer {
     }
 }
 
+/// Loads a flat index from a serialized record batch by simply loading the batch
+///
+/// This allows the flat index to be used as a sub-index
 #[derive(Debug)]
 pub struct FlatIndexLoader {}
 
@@ -92,6 +98,8 @@ impl SubIndexTrainer for FlatIndexTrainer {
 #[async_trait]
 impl ScalarIndex for FlatIndex {
     async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
+        // Since we have all the values in memory we can use basic arrow-rs compute
+        // functions to satisfy scalar queries.
         let predicate = match query {
             ScalarQuery::Equals(value) => arrow_ord::cmp::eq(self.values(), &value.to_scalar())?,
             ScalarQuery::IsNull() => arrow::compute::is_null(self.values())?,
@@ -138,8 +146,9 @@ impl ScalarIndex for FlatIndex {
             .clone())
     }
 
-    // Note that there is no write/train method for flat index at the moment.  If there is we
-    // assume it will write all data as a single batch named data.lance
+    // Note that there is no write/train method for flat index at the moment and so it isn't
+    // really possible for this method to be called.  If there was we assume it will write all
+    // data as a single batch named data.lance
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
         let batches = store.open_index_file("data.lance").await?;
         let batch = batches.read_record_batch(0).await?;
