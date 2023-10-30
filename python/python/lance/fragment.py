@@ -159,7 +159,9 @@ class LanceFragment(pa.dataset.Fragment):
         max_rows_per_group: int, default 1024
             The maximum number of rows per group in the data file.
         progress: FragmentWriteProgress, optional
-            *Experimental API*. Progress tracking for writing the fragment.
+            *Experimental API*. Progress tracking for writing the fragment. Pass
+            a custom class that defines hooks to be called when each fragment is
+            starting to write and finishing writing.
 
         See Also
         --------
@@ -424,7 +426,9 @@ def write_fragments(
         defaults to 90 GB, since we have a hard limit of 100 GB per file on
         object stores.
     progress : FragmentWriteProgress, optional
-        *Experimental API*. Progress tracking for writing the fragment.
+        *Experimental API*. Progress tracking for writing the fragment. Pass
+        a custom class that defines hooks to be called when each fragment is
+        starting to write and finishing writing.
 
     Returns
     -------
@@ -446,15 +450,13 @@ def write_fragments(
 
     if isinstance(dataset_uri, Path):
         dataset_uri = str(dataset_uri)
-    if progress is None:
-        progress = NoopFragmentWriteProgress()
 
     fragments = _write_fragments(
         dataset_uri,
         reader,
-        progress,
         max_rows_per_file=max_rows_per_file,
         max_rows_per_group=max_rows_per_group,
         max_bytes_per_file=max_bytes_per_file,
+        progress=progress,
     )
     return [FragmentMetadata(frag.json()) for frag in fragments]

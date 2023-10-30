@@ -15,14 +15,14 @@
 import json
 import multiprocessing
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import pyarrow as pa
 import pytest
+from helper import ProgressForTest
 from lance import FragmentMetadata, LanceDataset, LanceFragment, LanceOperation
 from lance.fragment import write_fragments
-from lance.progress import FileSystemFragmentWriteProgress, FragmentWriteProgress
+from lance.progress import FileSystemFragmentWriteProgress
 
 
 def test_write_fragment(tmp_path: Path):
@@ -68,26 +68,19 @@ def test_write_fragments(tmp_path: Path):
             "a": pa.array(range(1024)),
         }
     )
+    progress = ProgressForTest()
     fragments = write_fragments(
-        tab, tmp_path, max_rows_per_group=512, max_bytes_per_file=1024
+        tab,
+        tmp_path,
+        max_rows_per_group=512,
+        max_bytes_per_file=1024,
+        progress=progress,
     )
     assert len(fragments) == 2
     assert all(isinstance(f, FragmentMetadata) for f in fragments)
-
-
-class ProgressForTest(FragmentWriteProgress):
-    def __init__(self):
-        super().__init__()
-        self.begin_called = 0
-        self.complete_called = 0
-
-    def begin(
-        self, fragment: FragmentMetadata, multipart_id: Optional[str] = None, **kwargs
-    ):
-        self.begin_called += 1
-
-    def complete(self, fragment: FragmentMetadata):
-        self.complete_called += 1
+    # progress hook was called for each fragment
+    assert progress.begin_called == 2
+    assert progress.complete_called == 2
 
 
 def test_write_fragment_with_progress(tmp_path: Path):
