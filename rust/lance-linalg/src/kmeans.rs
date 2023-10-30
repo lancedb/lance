@@ -540,12 +540,22 @@ fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f3
     &data[x * dim + y..x * dim + y + strip]
 }
 
+fn compute_partitions_l2_f32_small<'a>(centroids: &'a [f32], data: &'a [f32], dim: usize) -> Box<dyn Iterator<Item=(u32, f32)> + 'a> {
+    Box::new(data.chunks(dim).map(move |row| {
+        argmin_value(centroids.chunks(dim).map(|centroid| row.l2(centroid))).unwrap()
+    }))
+}
+
 /// Fast partition computation for L2 distance.
 fn compute_partitions_l2_f32<'a>(
     centroids: &'a [f32],
     data: &'a [f32],
     dim: usize,
-) -> impl Iterator<Item = (u32, f32)> + 'a {
+) -> Box<dyn Iterator<Item = (u32, f32)> + 'a> {
+    if centroids.len() * std::mem::size_of::<f32>() <= 16 * 1024 {
+        return compute_partitions_l2_f32_small(centroids, data, dim)
+    }
+
     const STRIPE_SIZE: usize = 128;
     const TILE_SIZE: usize = 16;
 
@@ -554,7 +564,7 @@ fn compute_partitions_l2_f32<'a>(
     let num_centroids = centroids.len() / dim;
 
     // Read a tile of data, `data[idx..idx+TILE_SIZE]`
-    data.chunks(TILE_SIZE * dim).flat_map(move |data_tile| {
+    let stream = data.chunks(TILE_SIZE * dim).flat_map(move |data_tile| {
         // Loop over each strip.
         // s is the index of value in each vector.
         let num_rows_in_tile = data_tile.len() / dim;
@@ -593,7 +603,8 @@ fn compute_partitions_l2_f32<'a>(
             }
         }
         partitions.into_iter().zip(min_dists.into_iter())
-    })
+    });
+    Box::new(stream)
 }
 
 fn compute_partitions_cosine(centroids: &[f32], data: &[f32], dimension: usize) -> Vec<u32> {
