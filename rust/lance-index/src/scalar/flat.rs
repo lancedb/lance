@@ -141,7 +141,7 @@ impl ScalarIndex for FlatIndex {
     // Note that there is no write/train method for flat index at the moment.  If there is we
     // assume it will write all data as a single batch named data.lance
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
-        let mut batches = store.open_index_file("data.lance").await?;
+        let batches = store.open_index_file("data.lance").await?;
         let batch = batches.read_record_batch(0).await?;
         Ok(Arc::new(Self {
             data: Arc::new(batch),
@@ -155,7 +155,6 @@ mod tests {
     use arrow_array::types::Int32Type;
     use arrow_array::types::UInt64Type;
     use datafusion_common::ScalarValue;
-    use lance_core::Error;
     use lance_datagen::{array, gen, RowCount};
 
     fn example_index() -> FlatIndex {

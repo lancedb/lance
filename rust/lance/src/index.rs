@@ -27,7 +27,6 @@ use uuid::Uuid;
 pub(crate) mod append;
 pub(crate) mod cache;
 pub(crate) mod prefilter;
-pub mod scalar;
 pub mod vector;
 
 use crate::dataset::transaction::{Operation, Transaction};
@@ -53,6 +52,7 @@ pub(crate) trait Index: Send + Sync {
 /// Index Type
 pub enum IndexType {
     // Preserve 0-100 for simple indices.
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100,

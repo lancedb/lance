@@ -5,10 +5,9 @@ use arrow_array::{
     RecordBatchReader,
 };
 use criterion::{criterion_group, criterion_main, Criterion};
-use datafusion::scalar::ScalarValue;
+use datafusion_common::ScalarValue;
 use futures::{stream, TryStreamExt};
 use lance::{
-    index::scalar::LanceIndexStore,
     io::{object_store::ObjectStoreParams, ObjectStore},
     Dataset,
 };
@@ -17,6 +16,7 @@ use lance_datagen::{array, gen, BatchCount, RowCount};
 use lance_index::scalar::{
     btree::{train_btree_index, BTreeIndex},
     flat::FlatIndexTrainer,
+    lance::LanceIndexStore,
     IndexStore, ScalarIndex, ScalarQuery,
 };
 #[cfg(target_os = "linux")]

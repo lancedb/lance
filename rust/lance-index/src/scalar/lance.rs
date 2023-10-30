@@ -20,10 +20,15 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 
-use lance_core::{io::ReadBatchParams, Error, Result};
-use lance_index::scalar::{IndexReader, IndexStore, IndexWriter};
+use lance_core::{
+    io::{
+        object_store::ObjectStore, writer::FileWriterOptions, FileReader, FileWriter,
+        ReadBatchParams,
+    },
+    Error, Result,
+};
 
-use crate::io::{FileReader, FileWriter, FileWriterOptions, ObjectStore};
+use super::{IndexReader, IndexStore, IndexWriter};
 
 #[derive(Debug)]
 pub struct LanceIndexStore {
@@ -100,22 +105,21 @@ mod tests {
 
     use std::path::Path;
 
-    use crate::io::object_store::ObjectStoreParams;
+    use crate::scalar::{
+        btree::{train_btree_index, BTreeIndex},
+        flat::FlatIndexTrainer,
+        ScalarIndex, ScalarQuery,
+    };
 
     use super::*;
     use arrow_array::{
         types::{UInt32Type, UInt64Type},
         RecordBatchReader,
     };
-    use datafusion::scalar::ScalarValue;
+    use datafusion_common::ScalarValue;
     use futures::stream;
-    use lance_core::Error;
+    use lance_core::{io::object_store::ObjectStoreParams, Error};
     use lance_datagen::{array, gen, BatchCount, RowCount};
-    use lance_index::scalar::{
-        btree::{train_btree_index, BTreeIndex},
-        flat::FlatIndexTrainer,
-        ScalarIndex, ScalarQuery,
-    };
     use tempfile::{tempdir, TempDir};
 
     fn test_data() -> impl RecordBatchReader {

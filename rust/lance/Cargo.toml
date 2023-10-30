@@ -137,7 +137,3 @@ harness = false
 [[bench]]
 name = "ivf_pq"
 harness = false
-
-[[bench]]
-name = "scalar_index"
-harness = false

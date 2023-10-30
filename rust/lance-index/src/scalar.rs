@@ -25,6 +25,7 @@ use lance_core::Result;
 
 pub mod btree;
 pub mod flat;
+pub mod lance;
 
 #[async_trait]
 pub trait IndexWriter: Send {

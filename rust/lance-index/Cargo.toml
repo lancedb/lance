@@ -35,12 +35,19 @@ tokio.workspace = true
 tracing.workspace = true
 datafusion-physical-expr = { version = "32.0.0", default-features = false }
 datafusion-expr = "32.0.0"
+object_store.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
+criterion.workspace = true
 lance-datagen.workspace = true
 lance.workspace = true
+pprof.workspace = true
 tempfile.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
+
+[[bench]]
+name = "scalar_index"
+harness = false
