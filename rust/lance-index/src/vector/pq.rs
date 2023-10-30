@@ -377,7 +377,7 @@ impl ProductQuantizer {
                 // Centroids for one sub vector.
                 let sub_vec = sub_vec.clone();
                 let flatten_array: &Float32Array = sub_vec.values().as_primitive();
-                let centroids = train_kmeans(
+                train_kmeans(
                     flatten_array,
                     None,
                     sub_vector_dimension,
@@ -388,8 +388,7 @@ impl ProductQuantizer {
                     params.metric_type,
                     params.sample_rate,
                 )
-                .await;
-                centroids
+                .await
             })
             .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()

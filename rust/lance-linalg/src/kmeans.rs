@@ -540,7 +540,11 @@ fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f3
     &data[x * dim + y..x * dim + y + strip]
 }
 
-fn compute_partitions_l2_f32_small<'a>(centroids: &'a [f32], data: &'a [f32], dim: usize) -> Box<dyn Iterator<Item=(u32, f32)> + 'a> {
+fn compute_partitions_l2_f32_small<'a>(
+    centroids: &'a [f32],
+    data: &'a [f32],
+    dim: usize,
+) -> Box<dyn Iterator<Item = (u32, f32)> + 'a> {
     Box::new(data.chunks(dim).map(move |row| {
         argmin_value(centroids.chunks(dim).map(|centroid| row.l2(centroid))).unwrap()
     }))
@@ -552,8 +556,8 @@ fn compute_partitions_l2_f32<'a>(
     data: &'a [f32],
     dim: usize,
 ) -> Box<dyn Iterator<Item = (u32, f32)> + 'a> {
-    if centroids.len() * std::mem::size_of::<f32>() <= 16 * 1024 {
-        return compute_partitions_l2_f32_small(centroids, data, dim)
+    if std::mem::size_of_val(centroids) <= 16 * 1024 {
+        return compute_partitions_l2_f32_small(centroids, data, dim);
     }
 
     const STRIPE_SIZE: usize = 128;
@@ -602,7 +606,7 @@ fn compute_partitions_l2_f32<'a>(
                 }
             }
         }
-        partitions.into_iter().zip(min_dists.into_iter())
+        partitions.into_iter().zip(min_dists)
     });
     Box::new(stream)
 }
