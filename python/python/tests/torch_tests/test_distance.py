@@ -47,7 +47,7 @@ def test_l2_distance():
     assert dist.shape == (20, 100)
 
     expect_arr = (
-        np.array([[np.linalg.norm(x_row - y_row) for y_row in y] for x_row in x])
+        np.array([[np.linalg.norm(x_row - y_row) ** 2 for y_row in y] for x_row in x])
         .astype(np.float32)
         .reshape(20, 100)
     )
