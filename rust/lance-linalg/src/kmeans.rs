@@ -114,7 +114,8 @@ async fn kmean_plusplus(
 
     for _ in 1..k {
         let membership = kmeans.compute_membership(data.clone(), None).await;
-        let weights = WeightedIndex::new(&membership.distances).unwrap();
+        let weights =
+            WeightedIndex::new(membership.cluster_id_and_distances.iter().map(|(_, d)| d)).unwrap();
         let mut chosen;
         loop {
             chosen = weights.sample(&mut rng);
@@ -169,11 +170,8 @@ pub struct KMeanMembership {
 
     dimension: usize,
 
-    /// Cluster Id for each vector.
-    pub cluster_ids: Vec<u32>,
-
-    /// Distance between each vector, to its corresponding centroids.
-    distances: Vec<f32>,
+    /// Cluster Id and distances for each vector.
+    pub cluster_id_and_distances: Vec<(u32, f32)>,
 
     /// Number of centroids.
     k: usize,
@@ -191,7 +189,7 @@ impl KMeanMembership {
         self.data
             .values()
             .chunks_exact(dimension)
-            .zip(self.cluster_ids.iter())
+            .zip(self.cluster_id_and_distances.iter().map(|(c, _)| c))
             .for_each(|(vector, cluster_id)| {
                 cluster_cnts[*cluster_id as usize] += 1;
                 // TODO: simd
@@ -223,18 +221,18 @@ impl KMeanMembership {
     }
 
     fn distance_sum(&self) -> f32 {
-        self.distances.iter().sum()
+        self.cluster_id_and_distances.iter().map(|(_, d)| d).sum()
     }
 
     /// Returns how many data points are here
     fn len(&self) -> usize {
-        self.cluster_ids.len()
+        self.cluster_id_and_distances.len()
     }
 
     /// Histogram of the size of each cluster.
     fn histogram(&self) -> Vec<usize> {
         let mut hist: Vec<usize> = vec![0; self.k];
-        for cluster_id in self.cluster_ids.iter() {
+        for (cluster_id, _) in self.cluster_id_and_distances.iter() {
             hist[*cluster_id as usize] += 1;
         }
         hist
@@ -433,7 +431,7 @@ impl KMeans {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let metric_type = self.metric_type;
-        const CHUNK_SIZE: usize = 2048;
+        const CHUNK_SIZE: usize = 1024;
 
         // Normalized centroids for fast cosine. cosine(A, B) = A * B / (|A| * |B|).
         // So here, norm_centroids = |B| for each centroid B.
@@ -462,11 +460,17 @@ impl KMeans {
             .map(
                 |(start_idx, (data, centroids, norms, norm_data))| async move {
                     let data = tokio::task::spawn_blocking(move || {
-                        let array = data.values();
-                        let centroids_array = centroids.values();
-
                         let last_idx = min(start_idx + CHUNK_SIZE, n);
-                        array[start_idx * dimension..last_idx * dimension]
+
+                        let centroids_array = centroids.values();
+                        let values = &data.values()[start_idx * dimension..last_idx * dimension];
+
+                        if metric_type == MetricType::L2 {
+                            return compute_partitions_l2_f32(centroids_array, values, dimension)
+                                .collect();
+                        }
+
+                        values
                             .chunks_exact(dimension)
                             .enumerate()
                             .map(|(idx, vector)| {
@@ -523,16 +527,7 @@ impl KMeans {
         KMeanMembership {
             data,
             dimension,
-            cluster_ids: cluster_with_distances
-                .iter()
-                .flatten()
-                .map(|(c, _)| *c)
-                .collect(),
-            distances: cluster_with_distances
-                .iter()
-                .flatten()
-                .map(|(_, d)| *d)
-                .collect(),
+            cluster_id_and_distances: cluster_with_distances.iter().flatten().copied().collect(),
             k: self.k,
             metric_type: self.metric_type,
         }
@@ -545,25 +540,41 @@ fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f3
     &data[x * dim + y..x * dim + y + strip]
 }
 
+fn compute_partitions_l2_f32_small<'a>(
+    centroids: &'a [f32],
+    data: &'a [f32],
+    dim: usize,
+) -> Box<dyn Iterator<Item = (u32, f32)> + 'a> {
+    Box::new(data.chunks(dim).map(move |row| {
+        argmin_value(centroids.chunks(dim).map(|centroid| row.l2(centroid))).unwrap()
+    }))
+}
+
 /// Fast partition computation for L2 distance.
-fn compute_partitions_l2_f32(centroids: &[f32], data: &[f32], dim: usize) -> Vec<u32> {
+fn compute_partitions_l2_f32<'a>(
+    centroids: &'a [f32],
+    data: &'a [f32],
+    dim: usize,
+) -> Box<dyn Iterator<Item = (u32, f32)> + 'a> {
+    if std::mem::size_of_val(centroids) <= 16 * 1024 {
+        return compute_partitions_l2_f32_small(centroids, data, dim);
+    }
+
     const STRIPE_SIZE: usize = 128;
     const TILE_SIZE: usize = 16;
 
     // 128 * 4bytes * 16 = 8KB for centroid and data respectively, so both of them can
     // stay in L1 cache.
-    let num_rows = data.len() / dim;
     let num_centroids = centroids.len() / dim;
 
-    let mut partition_ids = vec![0_u32; num_rows];
-
     // Read a tile of data, `data[idx..idx+TILE_SIZE]`
-    for idx in (0..num_rows).step_by(TILE_SIZE) {
-        let num_rows_in_tile = min(TILE_SIZE, num_rows - idx);
-
+    let stream = data.chunks(TILE_SIZE * dim).flat_map(move |data_tile| {
         // Loop over each strip.
         // s is the index of value in each vector.
-        let mut min_dists = [f32::MAX; TILE_SIZE];
+        let num_rows_in_tile = data_tile.len() / dim;
+        let mut min_dists = vec![f32::MAX; num_rows_in_tile];
+        let mut partitions = vec![0_u32; num_rows_in_tile];
+
         for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
             // 4B * 16 * 16 = 1 KB
             let mut dists = vec![0_f32; TILE_SIZE * TILE_SIZE];
@@ -572,7 +583,7 @@ fn compute_partitions_l2_f32(centroids: &[f32], data: &[f32], dim: usize) -> Vec
                 // Calculate L2 within each TILE * STRIP
                 let slice_len = min(STRIPE_SIZE, dim - s);
                 for di in 0..num_rows_in_tile {
-                    let data_slice = get_slice(data, idx + di, s, dim, slice_len);
+                    let data_slice = get_slice(data_tile, di, s, dim, slice_len);
                     for ci in centroid_start..centroid_start + num_centroids_in_tile {
                         // Get a slice of `data[di][s..s+STRIP_SIZE]`.
                         let cent_slice = get_slice(centroids, ci, s, dim, slice_len);
@@ -581,18 +592,23 @@ fn compute_partitions_l2_f32(centroids: &[f32], data: &[f32], dim: usize) -> Vec
                     }
                 }
             }
+
             for i in 0..num_rows_in_tile {
-                for j in 0..num_centroids_in_tile {
-                    let dist = dists[i * TILE_SIZE + j];
-                    if dist < min_dists[i] {
-                        min_dists[i] = dist;
-                        partition_ids[idx + i] = (centroid_start + j) as u32;
-                    }
+                let (part_id, dist) = argmin_value(
+                    dists[i * TILE_SIZE..(i * TILE_SIZE + num_centroids_in_tile)]
+                        .iter()
+                        .copied(),
+                )
+                .unwrap();
+                if dist < min_dists[i] {
+                    min_dists[i] = dist;
+                    partitions[i] = centroid_start as u32 + part_id;
                 }
             }
         }
-    }
-    partition_ids
+        partitions.into_iter().zip(min_dists)
+    });
+    Box::new(stream)
 }
 
 fn compute_partitions_cosine(centroids: &[f32], data: &[f32], dimension: usize) -> Vec<u32> {
@@ -634,7 +650,9 @@ pub fn compute_partitions(
     metric_type: MetricType,
 ) -> Vec<u32> {
     match metric_type {
-        MetricType::L2 => compute_partitions_l2_f32(centroids, data, dimension),
+        MetricType::L2 => compute_partitions_l2_f32(centroids, data, dimension)
+            .map(|(c, _)| c)
+            .collect(),
         MetricType::Cosine => compute_partitions_cosine(centroids, data, dimension),
         MetricType::Dot => compute_partitions_dot(centroids, data, dimension),
     }
