@@ -36,7 +36,7 @@ except ImportError:
 import lance
 from helper import PYARROW_VERSION
 from lance.fragment import LanceFragment
-from lance.tf.data import from_lance, lance_fragments
+from lance.tf.data import from_lance, lance_batches, lance_fragments, lance_take_batches
 from lance.tf.tfrecord import infer_tfrecord_schema, read_tfrecord
 
 pytestmark = pytest.mark.skipif(PYARROW_VERSION.major < 12, reason="requires arrow 12+")
@@ -148,6 +148,53 @@ def test_shuffle(tf_dataset):
             100,
             128,
         )  # Fixed size list
+
+
+def test_dataset_batches(tf_dataset):
+    tf_dataset = lance.dataset(tf_dataset)
+    batch_size = 300
+    batches = list(lance_batches(tf_dataset, batch_size=batch_size).as_numpy_iterator())
+    assert tf_dataset.count_rows() // batch_size + 1 == len(batches)
+    assert all(end - start == batch_size for start, end in batches[:-2])
+    assert batches[-1][1] - batches[-1][0] == tf_dataset.count_rows() % batch_size
+
+    skip = 5
+    batches_skipped = list(
+        lance_batches(tf_dataset, batch_size=batch_size, skip=skip).as_numpy_iterator()
+    )
+    assert batches_skipped == batches[skip:]
+
+    batches_shuffled = list(
+        lance_batches(
+            tf_dataset, batch_size=batch_size, shuffle=True, seed=42
+        ).as_numpy_iterator()
+    )
+    # make sure it does a shuffle
+    assert batches_shuffled != batches
+    batches_shuffled2 = list(
+        lance_batches(
+            tf_dataset, batch_size=batch_size, shuffle=True, seed=42
+        ).as_numpy_iterator()
+    )
+    # make sure the shuffle can be deterministic
+    assert batches_shuffled == batches_shuffled2
+
+
+def test_take_dataset(tf_dataset):
+    tf_dataset = lance.dataset(tf_dataset)
+    batch_ds = lance_batches(
+        tf_dataset, batch_size=100, shuffle=True, seed=42
+    ).as_numpy_iterator()
+    lance_ds = lance_take_batches(tf_dataset, batch_ds)
+    lance_ds = lance_ds.unbatch().shuffle(400, seed=42).batch(100)
+
+    for batch in lance_ds:
+        assert batch["a"].numpy().shape == (100,)
+
+    batches = [(0, 200), (100, 200)]
+    lance_ds = lance_take_batches(tf_dataset, batches)
+    for (start, end), batch in zip(batches, lance_ds):
+        assert batch["a"].numpy().tolist() == np.arange(start, end).tolist()
 
 
 def test_var_length_list(tmp_path):
