@@ -24,14 +24,17 @@ use crate::Result;
 ///
 /// When stop writing a [`Fragment`], WriteProgress::complete() will be called after.
 ///
+/// This might be called concurrently when writing multiple [`Fragment`]s. Therefore,
+/// the methods require non-exclusive access to `self`.
+///
 /// This is an experimental API and may change in the future.
 #[async_trait]
 pub trait WriteFragmentProgress: std::fmt::Debug + Sync + Send {
     /// Indicate the beginning of writing a [Fragment], with the in-flight multipart ID.
-    async fn begin(&mut self, fragment: &Fragment, multipart_id: &str) -> Result<()>;
+    async fn begin(&self, fragment: &Fragment, multipart_id: &str) -> Result<()>;
 
     /// Complete writing a [Fragment].
-    async fn complete(&mut self, fragment: &Fragment) -> Result<()>;
+    async fn complete(&self, fragment: &Fragment) -> Result<()>;
 }
 
 /// By default, Progress tracker is Noop.
@@ -47,12 +50,12 @@ impl NoopFragmentWriteProgress {
 #[async_trait]
 impl WriteFragmentProgress for NoopFragmentWriteProgress {
     #[inline]
-    async fn begin(&mut self, _fragment: &Fragment, _multipart_id: &str) -> Result<()> {
+    async fn begin(&self, _fragment: &Fragment, _multipart_id: &str) -> Result<()> {
         Ok(())
     }
 
     #[inline]
-    async fn complete(&mut self, _fragment: &Fragment) -> Result<()> {
+    async fn complete(&self, _fragment: &Fragment) -> Result<()> {
         Ok(())
     }
 }

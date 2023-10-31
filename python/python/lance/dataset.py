@@ -41,12 +41,11 @@ import pyarrow as pa
 import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 
-from lance.optimize import Compaction
-
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import CleanupStats, _Dataset, _Operation, _Scanner, _write_dataset
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
+from .optimize import Compaction
 from .util import td_to_micros
 
 try:
@@ -75,6 +74,7 @@ if TYPE_CHECKING:
     from pyarrow._compute import Expression
 
     from .commit import CommitLock
+    from .progress import FragmentWriteProgress
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -191,8 +191,6 @@ class LanceDataset(pa.dataset.Dataset):
             If True then the filter will be applied before the vector query is run.
             This will generate more correct results but it may be a more costly
             query.  It's generally good when the filter is highly selective.
-            Right now, this must be used with ``use_index=False`` in the
-            ``nearest`` parameters.
 
             If False then the filter will be applied after the vector query is run.
             This will perform well but the results may have fewer than the requested
@@ -1673,6 +1671,7 @@ def write_dataset(
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
     commit_lock: Optional[CommitLock] = None,
+    progress: Optional[FragmentWriteProgress] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -1704,7 +1703,10 @@ def write_dataset(
     commit_lock : CommitLock, optional
         A custom commit lock.  Only needed if your object store does not support
         atomic commits.  See the user guide for more details.
-
+    progress: FragmentWriteProgress, optional
+        *Experimental API*. Progress tracking for writing the fragment. Pass
+        a custom class that defines hooks to be called when each fragment is
+        starting to write and finishing writing.
     """
     reader = _coerce_reader(data_obj, schema)
     _validate_schema(reader.schema)
@@ -1715,6 +1717,7 @@ def write_dataset(
         "max_rows_per_file": max_rows_per_file,
         "max_rows_per_group": max_rows_per_group,
         "max_bytes_per_file": max_bytes_per_file,
+        "progress": progress,
     }
 
     if commit_lock:

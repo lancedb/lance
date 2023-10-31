@@ -38,7 +38,6 @@ use uuid::Uuid;
 
 use super::chunker::chunk_stream;
 use super::hash_joiner::HashJoiner;
-use super::progress::WriteFragmentProgress;
 use super::scanner::Scanner;
 use super::updater::Updater;
 use super::write::reader_to_stream;
@@ -74,9 +73,9 @@ impl FileFragment {
         id: usize,
         reader: impl RecordBatchReader + Send + 'static,
         params: Option<WriteParams>,
-        progress: &mut dyn WriteFragmentProgress,
     ) -> Result<Fragment> {
         let params = params.unwrap_or_default();
+        let progress = params.progress.as_ref();
 
         let reader = Box::new(reader);
         let (stream, schema) = reader_to_stream(reader)?;
@@ -678,7 +677,6 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::dataset::progress::NoopFragmentWriteProgress;
     use crate::dataset::transaction::Operation;
     use crate::dataset::{WriteParams, ROW_ID};
 
@@ -1144,7 +1142,6 @@ mod tests {
                 max_rows_per_group: 100,
                 ..Default::default()
             }),
-            &mut NoopFragmentWriteProgress::new(),
         )
         .await
         .unwrap();

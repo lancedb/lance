@@ -35,7 +35,7 @@ use object_store::path::Path;
 use tracing::instrument;
 use uuid::Uuid;
 
-use super::progress::WriteFragmentProgress;
+use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::{chunker::chunk_stream, DATA_DIR};
 
 /// The mode to write dataset.
@@ -76,7 +76,7 @@ pub struct WriteParams {
 
     pub store_params: Option<ObjectStoreParams>,
 
-    pub progress: Option<Arc<dyn WriteFragmentProgress>>,
+    pub progress: Arc<dyn WriteFragmentProgress>,
 }
 
 impl Default for WriteParams {
@@ -89,7 +89,7 @@ impl Default for WriteParams {
             max_bytes_per_file: 90 * 1024 * 1024 * 1024, // 90 GB
             mode: WriteMode::Create,
             store_params: None,
-            progress: None,
+            progress: Arc::new(NoopFragmentWriteProgress::new()),
         }
     }
 }
@@ -174,6 +174,10 @@ pub async fn write_fragments_internal(
 
         if writer.is_none() {
             let (new_writer, new_fragment) = writer_generator.new_writer().await?;
+            // rustc has a hard time analyzing the lifetime of the &str returned
+            // by multipart_id(), so we convert it to an owned value here.
+            let multipart_id = new_writer.multipart_id().to_string();
+            params.progress.begin(&new_fragment, &multipart_id).await?;
             writer = Some(new_writer);
             fragments.push(new_fragment);
         }
@@ -188,6 +192,7 @@ pub async fn write_fragments_internal(
         {
             let num_rows = writer.take().unwrap().finish().await?;
             debug_assert_eq!(num_rows, num_rows_in_current_file);
+            params.progress.complete(fragments.last().unwrap()).await?;
             fragments.last_mut().unwrap().physical_rows = num_rows;
             num_rows_in_current_file = 0;
         }
