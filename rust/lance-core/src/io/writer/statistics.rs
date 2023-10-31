@@ -120,6 +120,12 @@ where
             if stats.max_value == ScalarValue::Float32(Some(-0.0)) {
                 stats.max_value = ScalarValue::Float32(Some(0.0));
             }
+            if stats.min_value == ScalarValue::Float32(Some(f32::MAX)) {
+                stats.min_value = ScalarValue::Float32(Some(f32::MIN));
+            }
+            if stats.max_value == ScalarValue::Float32(Some(f32::MIN)) {
+                stats.max_value = ScalarValue::Float32(Some(f32::MAX));
+            }
         }
         DataType::Float64 => {
             if stats.min_value == ScalarValue::Float64(Some(0.0)) {
@@ -127,6 +133,12 @@ where
             }
             if stats.max_value == ScalarValue::Float64(Some(-0.0)) {
                 stats.max_value = ScalarValue::Float64(Some(0.0));
+            }
+            if stats.min_value == ScalarValue::Float64(Some(f64::MAX)) {
+                stats.min_value = ScalarValue::Float64(Some(f64::MIN));
+            }
+            if stats.max_value == ScalarValue::Float64(Some(f64::MIN)) {
+                stats.max_value = ScalarValue::Float64(Some(f64::MAX));
             }
         }
         _ => {}
@@ -1358,6 +1370,24 @@ mod tests {
                 max_value: ScalarValue::from(0.0_f32),
             }
         );
+
+        // If all values are NaN, min and max are -Inf and Inf respectively,
+        // NaN values don't count towards null count.
+        let arrays: Vec<ArrayRef> = vec![Arc::new(Float64Array::from(vec![
+            std::f64::NAN,
+            std::f64::NAN,
+            std::f64::NAN,
+        ]))];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        let stats = collect_statistics(&array_refs);
+        assert_eq!(
+            stats,
+            StatisticsRow {
+                null_count: 0,
+                min_value: ScalarValue::from(f64::MIN),
+                max_value: ScalarValue::from(f64::MAX),
+            }
+        );
     }
 
     // #[test]
@@ -1375,7 +1405,7 @@ mod tests {
     //     ];
     //
     //     let expected_stats = StatisticsRow {
-    //         null_count: 1_i64,
+    //         null_count: 1,
     //         min_value: ScalarValue::from(0_i16),
     //         max_value: ScalarValue::from(9_i16),
     //     };
@@ -1408,7 +1438,7 @@ mod tests {
     //         Some(vec![Some(6), Some(7), Some(8)]),
     //     ];
     //     let expected_stats = StatisticsRow {
-    //         null_count: 1_i64,
+    //         null_count: 1,
     //         min_value: ScalarValue::from(0_i64),
     //         max_value: ScalarValue::from(9_i64),
     //     };
@@ -1449,7 +1479,7 @@ mod tests {
                         Arc::new(StringArray::from(vec!["yee", "haw"])),
                     ],
                     stats: StatisticsRow {
-                        null_count: 1_i64,
+                        null_count: 1,
                         min_value: ScalarValue::from("bar"),
                         max_value: ScalarValue::from("yee"),
                     },
@@ -1462,7 +1492,7 @@ mod tests {
                         format!("{}{}", filler, "terrestial planet"),
                     ]))],
                     stats: StatisticsRow {
-                        null_count: 0_i64,
+                        null_count: 0,
                         // Bacteriologists is just 15 bytes, but the next character is multi-byte
                         // so we truncate before.
                         min_value: ScalarValue::from(
@@ -1481,7 +1511,7 @@ mod tests {
                         filler, "terrestial planf"
                     )]))],
                     stats: StatisticsRow {
-                        null_count: 0_i64,
+                        null_count: 0,
                         min_value: ScalarValue::from(
                             format!("{}{}", filler, "terrestial planf").as_str(),
                         ),
@@ -1497,7 +1527,7 @@ mod tests {
                         Arc::new(LargeStringArray::from(vec!["yee", "haw"])),
                     ],
                     stats: StatisticsRow {
-                        null_count: 1_i64,
+                        null_count: 1,
                         min_value: ScalarValue::LargeUtf8(Some("bar".to_string())),
                         max_value: ScalarValue::LargeUtf8(Some("yee".to_string())),
                     },
@@ -1508,7 +1538,7 @@ mod tests {
                         format!("{}{}", filler, "terrestial planet"),
                     ]))],
                     stats: StatisticsRow {
-                        null_count: 0_i64,
+                        null_count: 0,
                         // Bacteriologists is just 15 bytes, but the next character is multi-byte
                         // so we truncate before.
                         min_value: ScalarValue::LargeUtf8(Some(format!(
@@ -1529,7 +1559,7 @@ mod tests {
                         filler, "terrestial planf"
                     )]))],
                     stats: StatisticsRow {
-                        null_count: 0_i64,
+                        null_count: 0,
                         min_value: ScalarValue::LargeUtf8(Some(format!(
                             "{}{}",
                             filler, "terrestial planf"
@@ -1551,7 +1581,7 @@ mod tests {
                     ]
                     .as_ref()]))],
                     stats: StatisticsRow {
-                        null_count: 0_i64,
+                        null_count: 0,
                         // We can truncate the minimum value, since the prefix is less than the full value
                         min_value: ScalarValue::Binary(Some(min_binary_value.clone())),
                         // We can't truncate the max value, so we return None
@@ -1563,7 +1593,7 @@ mod tests {
                         vec![0xFFu8; BINARY_PREFIX_LENGTH].as_ref(),
                     ]))],
                     stats: StatisticsRow {
-                        null_count: 0_i64,
+                        null_count: 0,
                         min_value: ScalarValue::Binary(Some(min_binary_value.clone())),
                         max_value: ScalarValue::Binary(Some(min_binary_value.clone())),
                     },
@@ -1579,7 +1609,7 @@ mod tests {
                     ]
                     .as_ref()]))],
                     stats: StatisticsRow {
-                        null_count: 0_i64,
+                        null_count: 0,
                         // We can truncate the minimum value, since the prefix is less than the full value
                         min_value: ScalarValue::LargeBinary(Some(min_binary_value.clone())),
                         // We can't truncate the max value, so we return None
@@ -1591,7 +1621,7 @@ mod tests {
                         vec![0xFFu8; BINARY_PREFIX_LENGTH].as_ref(),
                     ]))],
                     stats: StatisticsRow {
-                        null_count: 0_i64,
+                        null_count: 0,
                         // We can truncate the minimum value, since the prefix is less than the full value
                         min_value: ScalarValue::LargeBinary(Some(min_binary_value.clone())),
                         // We can't truncate the max value, so we return None
@@ -1608,7 +1638,7 @@ mod tests {
                         Some(vec![8, 9].as_slice()),
                     ]))],
                     stats: StatisticsRow {
-                        null_count: 0_i64,
+                        null_count: 0,
                         min_value: ScalarValue::FixedSizeBinary(2, Some(vec![0, 1])),
                         max_value: ScalarValue::FixedSizeBinary(2, Some(vec![8, 9])),
                     },
@@ -1645,7 +1675,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: 1_i64,
+                null_count: 1,
                 min_value: ScalarValue::from("abc"),
                 max_value: ScalarValue::from("def"),
             }
@@ -1663,7 +1693,7 @@ mod tests {
         assert_eq!(
             stats,
             StatisticsRow {
-                null_count: 0_i64,
+                null_count: 0,
                 min_value: ScalarValue::from("A"),
                 max_value: ScalarValue::from("T"),
             }
@@ -1686,12 +1716,12 @@ mod tests {
         let id = schema.field("a").unwrap().id;
         let builder = collector.get_builder(id).unwrap();
         builder.append(StatisticsRow {
-            null_count: 2_i64,
+            null_count: 2,
             min_value: ScalarValue::from(1_i32),
             max_value: ScalarValue::from(3_i32),
         });
         builder.append(StatisticsRow {
-            null_count: 0_i64,
+            null_count: 0,
             min_value: ScalarValue::Int32(Some(std::i32::MIN)),
             max_value: ScalarValue::Int32(Some(std::i32::MAX)),
         });
@@ -1706,12 +1736,12 @@ mod tests {
         let id = schema.field("a").unwrap().id;
         let builder = collector.get_builder(id).unwrap();
         builder.append(StatisticsRow {
-            null_count: 2_i64,
+            null_count: 2,
             min_value: ScalarValue::from(1_i32),
             max_value: ScalarValue::from(3_i32),
         });
         builder.append(StatisticsRow {
-            null_count: 0_i64,
+            null_count: 0,
             min_value: ScalarValue::Int32(Some(std::i32::MIN)),
             max_value: ScalarValue::Int32(Some(std::i32::MAX)),
         });
@@ -1720,12 +1750,12 @@ mod tests {
         let id = schema.field("b").unwrap().id;
         let builder = collector.get_builder(id).unwrap();
         builder.append(StatisticsRow {
-            null_count: 6_i64,
+            null_count: 6,
             min_value: ScalarValue::from("aaa"),
             max_value: ScalarValue::from("bbb"),
         });
         builder.append(StatisticsRow {
-            null_count: 0_i64,
+            null_count: 0,
             min_value: ScalarValue::Utf8(None),
             max_value: ScalarValue::Utf8(None),
         });
