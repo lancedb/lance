@@ -238,18 +238,13 @@ fn get_string_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
         }
 
         array.iter().for_each(|value| {
-            if let Some(val) = value {
-                // TODO: don't compare full strings
-                // for i in (BINARY_PREFIX_LENGTH..val.len()).rev() {
-                //     if val.is_char_boundary(i) {
-                //         val = &val[..i];
-                //         break;
-                //     }
-                // }
-                // TODO: if we discovered a max value greater than expressable
-                //  with BINARY_PREFIX_LENGTH we can skip comparing remaining values
-                //  in the array.
-                //  Same for min value.
+            if let Some(mut val) = value {
+                for i in (BINARY_PREFIX_LENGTH..val.len() + 4).rev() {
+                    if val.is_char_boundary(i) {
+                        val = &val[..i];
+                        break;
+                    }
+                }
 
                 if let Some(v) = min_value {
                     if let Some(Ordering::Less) = val[..].partial_cmp(v) {
