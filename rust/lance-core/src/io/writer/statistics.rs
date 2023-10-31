@@ -347,11 +347,7 @@ fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
     let max_value = if let Some(v) = max_value {
         if v.len() > BINARY_PREFIX_LENGTH {
             max_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
-            if let Some(x) = increment(max_value.unwrap().to_vec()) {
-                Some(x)
-            } else {
-                None
-            }
+            increment(max_value.unwrap().to_vec())
         } else {
             Some(v.to_vec())
         }
@@ -426,11 +422,7 @@ fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     let max_value = if let Some(v) = max_value {
         if v.len() > BINARY_PREFIX_LENGTH {
             max_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
-            if let Some(x) = increment(max_value.unwrap().to_vec()) {
-                Some(x)
-            } else {
-                None
-            }
+            increment(max_value.unwrap().to_vec())
         } else {
             Some(v.to_vec())
         }
@@ -690,8 +682,12 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::UInt64 => get_statistics::<UInt64Type>(arrays),
         DataType::Float32 => get_float_statistics::<Float32Type>(arrays),
         DataType::Float64 => get_float_statistics::<Float64Type>(arrays),
-        DataType::Date32 | DataType::Time32(_) | DataType::Date64 | DataType::Time64(_)
-        | DataType::Timestamp(_, _) | DataType::Duration(_) => get_temporal_statistics(arrays),
+        DataType::Date32
+        | DataType::Time32(_)
+        | DataType::Date64
+        | DataType::Time64(_)
+        | DataType::Timestamp(_, _)
+        | DataType::Duration(_) => get_temporal_statistics(arrays),
         DataType::Decimal128(_, _) => get_decimal_statistics(arrays),
         // TODO: Decimal256
         DataType::Binary => get_binary_statistics::<i32>(arrays),
@@ -813,13 +809,6 @@ impl StatisticsBuilder {
     }
 
     fn binary_statistics_appender(&mut self, row: StatisticsRow) {
-        let ScalarValue::Binary(Some(min_value)) = row.min_value else {
-            todo!()
-        };
-        let ScalarValue::Binary(Some(max_value)) = row.max_value else {
-            todo!()
-        };
-
         let min_value_builder = self
             .min_value
             .as_any_mut()
@@ -832,18 +821,32 @@ impl StatisticsBuilder {
             .unwrap();
 
         self.null_count.append_value(row.null_count);
-        min_value_builder.append_value(min_value);
-        max_value_builder.append_value(max_value);
+
+        if let ScalarValue::Binary(Some(min_value)) = row.min_value {
+            min_value_builder.append_value(min_value);
+        } else {
+            min_value_builder.append_null();
+        };
+
+        if let ScalarValue::Binary(Some(max_value)) = row.max_value {
+            max_value_builder.append_value(max_value);
+        } else {
+            max_value_builder.append_null();
+        };
     }
 
     fn statistics_appender<T: arrow_array::ArrowPrimitiveType>(&mut self, row: StatisticsRow) {
-        self.null_count.append_value(row.null_count);
-
         let min_value_builder = self
             .min_value
             .as_any_mut()
             .downcast_mut::<PrimitiveBuilder<T>>()
             .unwrap();
+        let max_value_builder = self
+            .max_value
+            .as_any_mut()
+            .downcast_mut::<PrimitiveBuilder<T>>()
+            .unwrap();
+
         let min_value = row
             .min_value
             .to_array()
@@ -851,13 +854,6 @@ impl StatisticsBuilder {
             .downcast_ref::<PrimitiveArray<T>>()
             .unwrap()
             .value(0);
-        min_value_builder.append_value(min_value);
-
-        let max_value_builder = self
-            .max_value
-            .as_any_mut()
-            .downcast_mut::<PrimitiveBuilder<T>>()
-            .unwrap();
         let max_value = row
             .max_value
             .to_array()
@@ -865,17 +861,13 @@ impl StatisticsBuilder {
             .downcast_ref::<PrimitiveArray<T>>()
             .unwrap()
             .value(0);
+
+        self.null_count.append_value(row.null_count);
+        min_value_builder.append_value(min_value);
         max_value_builder.append_value(max_value);
     }
 
     fn boolean_appender(&mut self, row: StatisticsRow) {
-        let ScalarValue::Boolean(Some(max_value)) = row.max_value else {
-            todo!()
-        };
-        let ScalarValue::Boolean(Some(min_value)) = row.min_value else {
-            todo!()
-        };
-
         let min_value_builder = self
             .min_value
             .as_any_mut()
@@ -888,8 +880,18 @@ impl StatisticsBuilder {
             .unwrap();
 
         self.null_count.append_value(row.null_count);
-        min_value_builder.append_value(min_value);
-        max_value_builder.append_value(max_value);
+
+        if let ScalarValue::Boolean(Some(min_value)) = row.min_value {
+            min_value_builder.append_value(min_value);
+        } else {
+            min_value_builder.append_null();
+        };
+
+        if let ScalarValue::Boolean(Some(max_value)) = row.max_value {
+            max_value_builder.append_value(max_value);
+        } else {
+            max_value_builder.append_null();
+        };
     }
 
     pub fn append(&mut self, row: StatisticsRow) {
@@ -961,10 +963,10 @@ mod tests {
         Decimal128Array, DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
         DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, Float32Array,
         Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
-        LargeStringArray, StringArray, StructArray,
-        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        LargeStringArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
+        UInt32Array, UInt64Array, UInt8Array,
     };
 
     use super::*;
@@ -1035,6 +1037,18 @@ mod tests {
                 null_count: 0,
                 min_value: ScalarValue::LargeBinary(None),
                 max_value: ScalarValue::LargeBinary(None),
+            }
+        );
+
+        let empty_boolean_vec: Vec<Option<bool>> = vec![];
+        let arrays: Vec<ArrayRef> = vec![Arc::new(BooleanArray::from(empty_boolean_vec))];
+        let array_refs = arrays.iter().collect::<Vec<_>>();
+        assert_eq!(
+            collect_statistics(array_refs.as_slice()),
+            StatisticsRow {
+                null_count: 0,
+                min_value: ScalarValue::from(false),
+                max_value: ScalarValue::from(true),
             }
         );
     }
@@ -1310,7 +1324,7 @@ mod tests {
                 StatisticsRow {
                     min_value: case.expected_min,
                     max_value: case.expected_max,
-                    null_count: case.expected_null_count.into(),
+                    null_count: case.expected_null_count,
                 },
                 "Statistics are wrong for input data: {:?}",
                 case.source_arrays
