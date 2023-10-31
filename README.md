@@ -160,6 +160,7 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://lancedb.github.io/lance/format.html).
 
 **Vector index**: Vector index for similarity search over embedding space.
+Support both CPUs (``x86_64`` and ``arm``) and GPU (``Nvidia (cuda)`` and ``Apple Silicon (mps)``).
 
 **Encodings**: To achieve both fast columnar scan and sub-linear point queries, Lance uses custom encodings and layouts.
 
