@@ -22,7 +22,7 @@ use crate::datatypes::Field;
 use crate::error::Result;
 use arrow_array::{
     builder::{make_builder, ArrayBuilder, BooleanBuilder, PrimitiveBuilder},
-    builder::{BinaryBuilder, StringBuilder},
+    builder::{GenericBinaryBuilder, GenericStringBuilder},
     cast::{as_generic_binary_array, as_primitive_array, AsArray},
     types::{
         ArrowDictionaryKeyType, Date32Type, Date64Type, Decimal128Type, DurationMicrosecondType,
@@ -735,8 +735,8 @@ impl StatisticsCollector {
             let max_value = Arc::new(builder.max_value.finish());
             let struct_fields = vec![
                 ArrowField::new("null_count", DataType::Int64, false),
-                ArrowField::new("min_value", field.data_type(), field.nullable),
-                ArrowField::new("max_value", field.data_type(), field.nullable),
+                ArrowField::new("min_value", field.data_type(), true),
+                ArrowField::new("max_value", field.data_type(), true),
             ];
 
             let stats = StructArray::new(
@@ -781,58 +781,94 @@ impl StatisticsBuilder {
         }
     }
 
-    fn string_statistics_appender(&mut self, row: StatisticsRow) {
+    fn string_statistics_appender<T: OffsetSizeTrait>(&mut self, row: StatisticsRow) {
         let min_value_builder = self
             .min_value
             .as_any_mut()
-            .downcast_mut::<StringBuilder>()
+            .downcast_mut::<GenericStringBuilder<T>>()
             .unwrap();
         let max_value_builder = self
             .max_value
             .as_any_mut()
-            .downcast_mut::<StringBuilder>()
+            .downcast_mut::<GenericStringBuilder<T>>()
             .unwrap();
 
         self.null_count.append_value(row.null_count);
 
-        if let ScalarValue::Utf8(Some(min_value)) = row.min_value {
-            min_value_builder.append_value(min_value);
-        } else {
-            min_value_builder.append_null();
-        }
+        match self.dt {
+            DataType::Utf8 => {
+                if let ScalarValue::Utf8(Some(min_value)) = row.min_value {
+                    min_value_builder.append_value(min_value);
+                } else {
+                    min_value_builder.append_null();
+                }
 
-        if let ScalarValue::Utf8(Some(max_value)) = row.max_value {
-            max_value_builder.append_value(max_value);
-        } else {
-            max_value_builder.append_null();
+                if let ScalarValue::Utf8(Some(max_value)) = row.max_value {
+                    max_value_builder.append_value(max_value);
+                } else {
+                    max_value_builder.append_null();
+                }
+            }
+            DataType::LargeUtf8 => {
+                if let ScalarValue::LargeUtf8(Some(min_value)) = row.min_value {
+                    min_value_builder.append_value(min_value);
+                } else {
+                    min_value_builder.append_null();
+                }
+
+                if let ScalarValue::LargeUtf8(Some(max_value)) = row.max_value {
+                    max_value_builder.append_value(max_value);
+                } else {
+                    max_value_builder.append_null();
+                }
+            }
+            _ => todo!(),
         }
     }
 
-    fn binary_statistics_appender(&mut self, row: StatisticsRow) {
+    fn binary_statistics_appender<T: OffsetSizeTrait>(&mut self, row: StatisticsRow) {
         let min_value_builder = self
             .min_value
             .as_any_mut()
-            .downcast_mut::<BinaryBuilder>()
+            .downcast_mut::<GenericBinaryBuilder<T>>()
             .unwrap();
         let max_value_builder = self
             .max_value
             .as_any_mut()
-            .downcast_mut::<BinaryBuilder>()
+            .downcast_mut::<GenericBinaryBuilder<T>>()
             .unwrap();
 
         self.null_count.append_value(row.null_count);
 
-        if let ScalarValue::Binary(Some(min_value)) = row.min_value {
-            min_value_builder.append_value(min_value);
-        } else {
-            min_value_builder.append_null();
-        };
+        match self.dt {
+            DataType::Binary => {
+                if let ScalarValue::Binary(Some(min_value)) = row.min_value {
+                    min_value_builder.append_value(min_value);
+                } else {
+                    min_value_builder.append_null();
+                }
 
-        if let ScalarValue::Binary(Some(max_value)) = row.max_value {
-            max_value_builder.append_value(max_value);
-        } else {
-            max_value_builder.append_null();
-        };
+                if let ScalarValue::Binary(Some(max_value)) = row.max_value {
+                    max_value_builder.append_value(max_value);
+                } else {
+                    max_value_builder.append_null();
+                }
+            }
+            DataType::LargeBinary => {
+                if let ScalarValue::LargeBinary(Some(min_value)) = row.min_value {
+                    min_value_builder.append_value(min_value);
+                } else {
+                    min_value_builder.append_null();
+                }
+
+                if let ScalarValue::LargeBinary(Some(max_value)) = row.max_value {
+                    max_value_builder.append_value(max_value);
+                } else {
+                    max_value_builder.append_null();
+                }
+            }
+            _ => todo!(),
+        }
     }
 
     fn statistics_appender<T: arrow_array::ArrowPrimitiveType>(&mut self, row: StatisticsRow) {
@@ -944,9 +980,10 @@ impl StatisticsBuilder {
                 self.statistics_appender::<DurationNanosecondType>(row)
             }
             DataType::Decimal128(_, _) => self.statistics_appender::<Decimal128Type>(row),
-            DataType::Binary => self.binary_statistics_appender(row),
-            DataType::Utf8 => self.string_statistics_appender(row),
-            DataType::LargeUtf8 => self.string_statistics_appender(row),
+            DataType::Binary => self.binary_statistics_appender::<i32>(row),
+            DataType::LargeBinary => self.binary_statistics_appender::<i64>(row),
+            DataType::Utf8 => self.string_statistics_appender::<i32>(row),
+            DataType::LargeUtf8 => self.string_statistics_appender::<i64>(row),
             // Dictionary type is not needed here. We collected stats for values.
             _ => {
                 println!("Stats collection for {} is not supported yet", self.dt);
@@ -1353,8 +1390,8 @@ mod tests {
         // (Negative) Infinity can be min or max.
         let arrays: Vec<ArrayRef> = vec![Arc::new(Float64Array::from(vec![
             4.0f64,
-            std::f64::INFINITY,
-            std::f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN,
         ]))];
         let array_refs = arrays.iter().collect::<Vec<_>>();
         let stats = collect_statistics(&array_refs);
@@ -1362,8 +1399,8 @@ mod tests {
             stats,
             StatisticsRow {
                 null_count: 0,
-                min_value: ScalarValue::from(std::f64::NEG_INFINITY),
-                max_value: ScalarValue::from(std::f64::INFINITY),
+                min_value: ScalarValue::from(f64::MIN),
+                max_value: ScalarValue::from(f64::MAX),
             }
         );
 
@@ -1777,8 +1814,8 @@ mod tests {
                 "0",
                 DataType::Struct(ArrowFields::from(vec![
                     ArrowField::new("null_count", DataType::Int64, false),
-                    ArrowField::new("min_value", DataType::Int32, false),
-                    ArrowField::new("max_value", DataType::Int32, false),
+                    ArrowField::new("min_value", DataType::Int32, true),
+                    ArrowField::new("max_value", DataType::Int32, true),
                 ])),
                 false,
             ),
@@ -1804,11 +1841,11 @@ mod tests {
                         Arc::new(Int64Array::from(vec![2, 0])) as ArrayRef,
                     ),
                     (
-                        Arc::new(ArrowField::new("min_value", DataType::Int32, false)),
+                        Arc::new(ArrowField::new("min_value", DataType::Int32, true)),
                         Arc::new(Int32Array::from(vec![1, std::i32::MIN])) as ArrayRef,
                     ),
                     (
-                        Arc::new(ArrowField::new("max_value", DataType::Int32, false)),
+                        Arc::new(ArrowField::new("max_value", DataType::Int32, true)),
                         Arc::new(Int32Array::from(vec![3, std::i32::MAX])) as ArrayRef,
                     ),
                 ])),
@@ -1830,6 +1867,185 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(batch, expected_batch);
+
+        // Check boolean, binary and string collectors return null for min/max if no
+        // values are supplied
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("boolean", DataType::Boolean, false),
+            ArrowField::new("binary", DataType::Binary, false),
+            ArrowField::new("large_binary", DataType::LargeBinary, false),
+            ArrowField::new("string", DataType::Utf8, false),
+            ArrowField::new("large_string", DataType::LargeUtf8, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut collector = StatisticsCollector::new(&schema.fields);
+
+        // Collect stats
+        let id = schema.field("boolean").unwrap().id;
+        let builder = collector.get_builder(id).unwrap();
+        builder.append(StatisticsRow {
+            null_count: 0,
+            min_value: ScalarValue::Boolean(None),
+            max_value: ScalarValue::Boolean(None),
+        });
+        let id = schema.field("binary").unwrap().id;
+        let builder = collector.get_builder(id).unwrap();
+        builder.append(StatisticsRow {
+            null_count: 0,
+            min_value: ScalarValue::Binary(None),
+            max_value: ScalarValue::Binary(None),
+        });
+        let id = schema.field("large_binary").unwrap().id;
+        let builder = collector.get_builder(id).unwrap();
+        builder.append(StatisticsRow {
+            null_count: 0,
+            min_value: ScalarValue::LargeBinary(None),
+            max_value: ScalarValue::LargeBinary(None),
+        });
+        let id = schema.field("string").unwrap().id;
+        let builder = collector.get_builder(id).unwrap();
+        builder.append(StatisticsRow {
+            null_count: 0,
+            min_value: ScalarValue::Utf8(None),
+            max_value: ScalarValue::Utf8(None),
+        });
+        let id = schema.field("large_string").unwrap().id;
+        let builder = collector.get_builder(id).unwrap();
+        builder.append(StatisticsRow {
+            null_count: 0,
+            min_value: ScalarValue::LargeUtf8(None),
+            max_value: ScalarValue::LargeUtf8(None),
+        });
+
+        let expected_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "0",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("null_count", DataType::Int64, false),
+                    ArrowField::new("min_value", DataType::Boolean, true),
+                    ArrowField::new("max_value", DataType::Boolean, true),
+                ])),
+                false,
+            ),
+            ArrowField::new(
+                "1",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("null_count", DataType::Int64, false),
+                    ArrowField::new("min_value", DataType::Binary, true),
+                    ArrowField::new("max_value", DataType::Binary, true),
+                ])),
+                false,
+            ),
+            ArrowField::new(
+                "2",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("null_count", DataType::Int64, false),
+                    ArrowField::new("min_value", DataType::LargeBinary, true),
+                    ArrowField::new("max_value", DataType::LargeBinary, true),
+                ])),
+                false,
+            ),
+            ArrowField::new(
+                "3",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("null_count", DataType::Int64, false),
+                    ArrowField::new("min_value", DataType::Utf8, true),
+                    ArrowField::new("max_value", DataType::Utf8, true),
+                ])),
+                false,
+            ),
+            ArrowField::new(
+                "4",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("null_count", DataType::Int64, false),
+                    ArrowField::new("min_value", DataType::LargeUtf8, true),
+                    ArrowField::new("max_value", DataType::LargeUtf8, true),
+                ])),
+                false,
+            ),
+        ]);
+
+        let none_str_vec: Vec<Option<&str>> = vec![None];
+        let expected_batch = RecordBatch::try_new(
+            Arc::new(expected_schema.clone()),
+            vec![
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(ArrowField::new("null_count", DataType::Int64, false)),
+                        Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("min_value", DataType::Boolean, true)),
+                        Arc::new(BooleanArray::from(vec![None])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("max_value", DataType::Boolean, true)),
+                        Arc::new(BooleanArray::from(vec![None])) as ArrayRef,
+                    ),
+                ])),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(ArrowField::new("null_count", DataType::Int64, false)),
+                        Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("min_value", DataType::Binary, true)),
+                        Arc::new(BinaryArray::from(vec![None])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("max_value", DataType::Binary, true)),
+                        Arc::new(BinaryArray::from(vec![None])) as ArrayRef,
+                    ),
+                ])),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(ArrowField::new("null_count", DataType::Int64, false)),
+                        Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("min_value", DataType::LargeBinary, true)),
+                        Arc::new(LargeBinaryArray::from(vec![None])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("max_value", DataType::LargeBinary, true)),
+                        Arc::new(LargeBinaryArray::from(vec![None])) as ArrayRef,
+                    ),
+                ])),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(ArrowField::new("null_count", DataType::Int64, false)),
+                        Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("min_value", DataType::Utf8, true)),
+                        Arc::new(StringArray::from(none_str_vec.clone())) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("max_value", DataType::Utf8, true)),
+                        Arc::new(StringArray::from(none_str_vec.clone())) as ArrayRef,
+                    ),
+                ])),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(ArrowField::new("null_count", DataType::Int64, false)),
+                        Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("min_value", DataType::LargeUtf8, true)),
+                        Arc::new(LargeStringArray::from(none_str_vec.clone())) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(ArrowField::new("max_value", DataType::LargeUtf8, true)),
+                        Arc::new(LargeStringArray::from(none_str_vec.clone())) as ArrayRef,
+                    ),
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let batch = collector.finish().unwrap();
+        assert_eq!(batch.schema().as_ref(), &expected_schema);
         assert_eq!(batch, expected_batch);
     }
 }
