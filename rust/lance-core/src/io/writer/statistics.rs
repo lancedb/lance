@@ -339,21 +339,21 @@ fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
         }
     }
 
-    let max_value_bound: Vec<u8>;
-    if let Some(v) = max_value {
+    let min_value = min_value.map(|x| x.to_vec());
+    let max_value = if let Some(v) = max_value {
         if v.len() > BINARY_PREFIX_LENGTH {
             max_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
             if let Some(x) = increment(max_value.unwrap().to_vec()) {
-                max_value_bound = x;
-                max_value = Some(&max_value_bound);
+                Some(x)
             } else {
-                max_value = None;
+                None
             }
+        } else {
+            Some(v.to_vec())
         }
-    }
-
-    let min_value = min_value.map(|x| x.to_vec());
-    let max_value = max_value.map(|x| x.to_vec());
+    } else {
+        None
+    }    
 
     match arrays[0].data_type() {
         DataType::Binary => StatisticsRow {
@@ -685,12 +685,8 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::UInt64 => get_statistics::<UInt64Type>(arrays),
         DataType::Float32 => get_statistics::<Float32Type>(arrays),
         DataType::Float64 => get_statistics::<Float64Type>(arrays),
-        DataType::Date32 => get_temporal_statistics(arrays),
-        DataType::Time32(_) => get_temporal_statistics(arrays),
-        DataType::Date64 => get_temporal_statistics(arrays),
-        DataType::Time64(_) => get_temporal_statistics(arrays),
-        DataType::Timestamp(_, _) => get_temporal_statistics(arrays),
-        DataType::Duration(_) => get_temporal_statistics(arrays),
+        DataType::Date32 | DataType::Time32(_) | DataType::Date64 | DataType::Time64(_)
+        | DataType::Timestamp(_, _) | DataType::Duration(_) => get_temporal_statistics(arrays),
         DataType::Decimal128(_, _) => get_decimal_statistics(arrays),
         DataType::Binary => get_binary_statistics::<i32>(arrays),
         DataType::LargeBinary => get_binary_statistics::<i64>(arrays),
