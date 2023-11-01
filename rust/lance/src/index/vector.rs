@@ -103,7 +103,6 @@ impl VectorIndexParams {
             num_bits: num_bits as usize,
             num_sub_vectors,
             use_opq,
-            metric_type,
             max_iters: max_iterations,
             max_opq_iters: max_iterations,
             ..Default::default()

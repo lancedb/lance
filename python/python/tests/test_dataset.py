@@ -32,6 +32,7 @@ import pyarrow as pa
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
+from helper import ProgressForTest
 from lance.commit import CommitConflictError
 
 # Various valid inputs for write_dataset
@@ -937,3 +938,12 @@ def test_count_index_rows(tmp_path: Path):
     # assert rows added since index was created are uncounted
     assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 512
     assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+
+
+def test_dataset_progress(tmp_path: Path):
+    data = pa.table({"a": range(10)})
+    progress = ProgressForTest()
+    ds = lance.write_dataset(data, tmp_path, max_rows_per_file=5, progress=progress)
+    assert len(ds.get_fragments()) == 2
+    assert progress.begin_called == 2
+    assert progress.complete_called == 2

@@ -197,10 +197,6 @@ impl Scanner {
     /// If false then the filter will be applied to the nearest results.  This means
     /// you may get back fewer results than you ask for (or none at all) if the closest
     /// results do not match the filter.
-    ///
-    /// EXPERIMENTAL: Currently, prefiltering is only supported when a vector index
-    /// is not used and the query is performing a flat knn search.  If the filter matches
-    /// many rows then the query could be very expensive.
     pub fn prefilter(&mut self, should_prefilter: bool) -> &mut Self {
         self.prefilter = should_prefilter;
         self
@@ -322,7 +318,13 @@ impl Scanner {
 
     /// Apply a refine step to the vector search.
     ///
-    /// A refine step uses the original vector values to re-rank the distances.
+    /// A refine improves query accuracy but also makes search slower, by reading extra elements
+    /// and using the original vector values to re-rank the distances.
+    ///
+    /// * `factor` - the factor of extra elements to read.  For example, if factor is 2, then
+    ///              the search will read 2x more elements than the requested k before performing
+    ///              the re-ranking. Note: even if the factor is 1, the  results will still be
+    ///              re-ranked without fetching additional elements.
     pub fn refine(&mut self, factor: u32) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.refine_factor = Some(factor)

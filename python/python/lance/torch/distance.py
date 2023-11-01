@@ -62,13 +62,15 @@ def l2_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         raise ValueError(
             f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
         )
-    # TODO: can we do pair-wise subtract directly?
-    result = []
-    for x_row in x:
-        sub = x_row - y
-        norms = torch.linalg.norm(sub, dim=1)
-        result.append(norms)
-    return torch.stack(result)
+    # (x - y)^2 = x^2 + y^2 - 2xy
+    x2 = (x * x).sum(dim=1)
+    y2 = (y * y).sum(dim=1)
+    xy = x @ y.T
+    return (
+        x2.broadcast_to(y2.shape[0], x2.shape[0]).T
+        + y2.broadcast_to(x2.shape[0], y2.shape[0])
+        - 2 * xy
+    )
 
 
 @torch.jit.script

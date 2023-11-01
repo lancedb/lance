@@ -27,6 +27,8 @@ use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::ArrowError;
+#[cfg(feature = "datagen")]
+use datagen::register_datagen;
 use dataset::cleanup::CleanupStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
@@ -40,6 +42,8 @@ use pyo3::prelude::*;
 extern crate lazy_static;
 
 pub(crate) mod arrow;
+#[cfg(feature = "datagen")]
+pub(crate) mod datagen;
 pub(crate) mod dataset;
 pub(crate) mod errors;
 pub(crate) mod executor;
@@ -63,13 +67,28 @@ pub use scanner::Scanner;
 
 use crate::executor::BackgroundExecutor;
 
+#[cfg(not(feature = "datagen"))]
+#[pyfunction]
+pub fn is_datagen_supported() -> bool {
+    false
+}
+
+// A fallback module for when datagen is not enabled
+#[cfg(not(feature = "datagen"))]
+fn register_datagen(py: Python, m: &PyModule) -> PyResult<()> {
+    let datagen = PyModule::new(py, "datagen")?;
+    datagen.add_wrapped(wrap_pyfunction!(is_datagen_supported))?;
+    m.add_submodule(datagen)?;
+    Ok(())
+}
+
 // TODO: make this runtime configurable (e.g. num threads)
 lazy_static! {
     static ref RT: BackgroundExecutor = BackgroundExecutor::new();
 }
 
 #[pymodule]
-fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
+fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")
         .write_style("LANCE_LOG_STYLE");
@@ -100,6 +119,7 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(cleanup_partial_writes))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    register_datagen(py, m)?;
     Ok(())
 }
 
