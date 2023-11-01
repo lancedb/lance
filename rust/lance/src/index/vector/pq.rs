@@ -349,9 +349,10 @@ impl VectorIndex for PQIndex {
 /// Train product quantization over (OPQ-rotated) residual vectors.
 pub(crate) async fn train_pq(
     data: &MatrixView<Float32Type>,
+    metric_type: MetricType,
     params: &PQBuildParams,
 ) -> Result<ProductQuantizer> {
-    ProductQuantizer::train(data, params).await
+    ProductQuantizer::train(data, metric_type, params).await
 }
 
 #[cfg(test)]

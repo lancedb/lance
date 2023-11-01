@@ -748,7 +748,7 @@ pub async fn build_ivf_pq_index(
         let residuals = span!(Level::INFO, "compute residual for PQ training")
             .in_scope(|| ivf_model.compute_residual(&training_data, &part_ids));
         info!("Start train PQ: params={:#?}", pq_params);
-        train_pq(&residuals, pq_params).await?
+        train_pq(&residuals, metric_type, pq_params).await?
     };
     info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
 
@@ -757,8 +757,6 @@ pub async fn build_ivf_pq_index(
     scanner.batch_readahead(num_cpus::get() * 2);
     scanner.project(&[column])?;
     scanner.with_row_id();
-
-    let metric_type = pq_params.metric_type;
 
     // Scan the dataset and compute residual, pq with with partition ID.
     // For now, it loads all data into memory.

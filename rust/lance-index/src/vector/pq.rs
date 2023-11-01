@@ -39,9 +39,6 @@ pub struct PQBuildParams {
     /// The number of bits to present one PQ centroid.
     pub num_bits: usize,
 
-    /// Metric type, L2 or Cosine.
-    pub metric_type: MetricType,
-
     /// Train as optimized product quantization.
     pub use_opq: bool,
 
@@ -62,7 +59,6 @@ impl Default for PQBuildParams {
         Self {
             num_sub_vectors: 16,
             num_bits: 8,
-            metric_type: MetricType::L2,
             use_opq: false,
             max_iters: 50,
             max_opq_iters: 50,
@@ -349,7 +345,7 @@ impl ProductQuantizer {
     }
 
     /// Train [`ProductQuantizer`] using vectors.
-    pub async fn train(data: &MatrixView<Float32Type>, params: &PQBuildParams) -> Result<Self> {
+    pub async fn train(data: &MatrixView<Float32Type>, metric_type: MetricType, params: &PQBuildParams) -> Result<Self> {
         if data.num_columns() % params.num_sub_vectors != 0 {
             return Err(Error::Index {
                 message: format!(
@@ -385,7 +381,7 @@ impl ProductQuantizer {
                     params.max_iters as u32,
                     REDOS,
                     rng.clone(),
-                    params.metric_type,
+                    metric_type,
                     params.sample_rate,
                 )
                 .await
@@ -407,7 +403,7 @@ impl ProductQuantizer {
             params.num_bits as u32,
             dimension,
             Arc::new(pd_centroids),
-            params.metric_type,
+            metric_type,
         ))
     }
 
@@ -517,7 +513,7 @@ mod tests {
         // A 16-dim array.
         let dim = 16;
         let mat = MatrixView::new(values.into(), dim);
-        let pq = ProductQuantizer::train(&mat, &params).await.unwrap();
+        let pq = ProductQuantizer::train(&mat, MetricType::L2, &params).await.unwrap();
 
         // Init centroids
         let centroids = pq.codebook.clone();
@@ -535,7 +531,7 @@ mod tests {
             let code = actual_pq.transform(&mat).await.unwrap();
             actual_pq.reset_centroids(&mat, &code).unwrap();
             params.codebook = Some(actual_pq.codebook.clone());
-            actual_pq = ProductQuantizer::train(&mat, &params).await.unwrap();
+            actual_pq = ProductQuantizer::train(&mat, MetricType::L2, &params).await.unwrap();
         }
 
         let result = pq.codebook;
