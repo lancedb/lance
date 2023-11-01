@@ -30,6 +30,10 @@ use num_traits::{AsPrimitive, FromPrimitive};
 
 use super::dot::dot;
 use super::norm_l2::{norm_l2, Normalize};
+use crate::simd::{
+    f32::{f32x16, f32x8},
+    SIMD,
+};
 
 /// Cosine Distance
 pub trait Cosine {
@@ -113,20 +117,33 @@ impl Cosine for [f32] {
 
     #[inline]
     fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output {
-        #[cfg(target_arch = "aarch64")]
-        {
-            aarch64::neon::cosine_f32(self, other, x_norm)
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("fma") {
-                return x86_64::avx::cosine_f32(self, other, x_norm);
+        let dim = self.len();
+        let unrolled_len = dim / 16 * 16;
+        let mut y_norm16 = f32x16::zeros();
+        let mut xy16 = f32x16::zeros();
+        for i in (0..unrolled_len).step_by(16) {
+            unsafe {
+                let x = f32x16::load_unaligned(self.as_ptr().add(i));
+                let y = f32x16::load_unaligned(other.as_ptr().add(i));
+                xy16.multiply_add(x, y);
+                y_norm16.multiply_add(y, y);
             }
         }
-
-        #[cfg(not(target_arch = "aarch64"))]
-        cosine_scalar(self, x_norm, other)
+        let aligned_len = dim / 8 * 8;
+        let mut y_norm8 = f32x8::zeros();
+        let mut xy8 = f32x8::zeros();
+        for i in (unrolled_len..aligned_len).step_by(8) {
+            unsafe {
+                let x = f32x8::load_unaligned(self.as_ptr().add(i));
+                let y = f32x8::load_unaligned(other.as_ptr().add(i));
+                xy8.multiply_add(x, y);
+                y_norm8.multiply_add(y, y);
+            }
+        }
+        let y_norm = y_norm16.reduce_sum() + y_norm8.reduce_sum() + norm_l2(&other[aligned_len..]);
+        let xy =
+            xy16.reduce_sum() + xy8.reduce_sum() + dot(&self[aligned_len..], &other[aligned_len..]);
+        xy / x_norm / y_norm.sqrt()
     }
 
     #[inline]
@@ -136,23 +153,28 @@ impl Cosine for [f32] {
         y_norm: Self::Output,
         y: &Self,
     ) -> Self::Output {
-        #[cfg(target_arch = "aarch64")]
-        {
-            // TODO: SIMD with normalized X and Y.
-            let _ = y_norm; // Make compiler happy.
-            aarch64::neon::cosine_f32(self, y, x_norm)
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("fma") {
-                return x86_64::avx::cosine_f32_norms(self, y, x_norm, y_norm);
+        let dim = self.len();
+        let unrolled_len = dim / 16 * 16;
+        let mut xy16 = f32x16::zeros();
+        for i in (0..unrolled_len).step_by(16) {
+            unsafe {
+                let x = f32x16::load_unaligned(self.as_ptr().add(i));
+                let y = f32x16::load_unaligned(y.as_ptr().add(i));
+                xy16.multiply_add(x, y);
             }
         }
-
-        // Slow path
-        #[cfg(not(target_arch = "aarch64"))]
-        cosine_scalar_fast(self, x_norm, y, y_norm)
+        let aligned_len = dim / 8 * 8;
+        let mut xy8 = f32x8::zeros();
+        for i in (unrolled_len..aligned_len).step_by(8) {
+            unsafe {
+                let x = f32x8::load_unaligned(self.as_ptr().add(i));
+                let y = f32x8::load_unaligned(y.as_ptr().add(i));
+                xy8.multiply_add(x, y);
+            }
+        }
+        let xy =
+            xy16.reduce_sum() + xy8.reduce_sum() + dot(&self[aligned_len..], &y[aligned_len..]);
+        xy / x_norm / y_norm
     }
 }
 
@@ -218,15 +240,28 @@ pub fn cosine_distance<T: Cosine + ?Sized>(from: &T, to: &T) -> T::Output {
 /// Cosine Distance
 ///
 /// <https://en.wikipedia.org/wiki/Cosine_similarity>
+///
+/// Parameters
+/// -----------
+///
+/// - *from*: the vector to compute distance from.
+/// - *to*: the batch of vectors to compute distance to.
+/// - *dimension*: the dimension of the vector.
+///
+/// Returns
+/// -------
+/// An iterator of pair-wise cosine distance between from vector to each vector in the batch.
+///
 pub fn cosine_distance_batch<'a>(
     from: &'a [f32],
-    to: &'a [f32],
+    batch: &'a [f32],
     dimension: usize,
 ) -> Box<dyn Iterator<Item = f32> + 'a> {
     let x_norm = norm_l2(from);
 
     Box::new(
-        to.chunks_exact(dimension)
+        batch
+            .chunks_exact(dimension)
             .map(move |y| from.cosine_fast(x_norm, y)),
     )
 }
@@ -256,135 +291,6 @@ pub fn cosine_distance_arrow_batch(from: &[f32], to: &FixedSizeListArray) -> Arc
         .map(|v| from.cosine_fast(x_norm, v));
 
     Arc::new(Float32Array::new(dists.collect(), to.nulls().cloned()))
-}
-
-#[cfg(target_arch = "x86_64")]
-mod x86_64 {
-    use std::arch::x86_64::*;
-
-    use super::dot;
-    use super::norm_l2;
-
-    pub mod avx {
-        use super::*;
-
-        #[inline]
-        pub fn cosine_f32(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -> f32 {
-            unsafe {
-                use crate::distance::x86_64::avx::add_f32_register;
-
-                let len = x_vector.len() / 8 * 8;
-                let mut xy = _mm256_setzero_ps();
-                let mut y_sq = _mm256_setzero_ps();
-                for i in (0..len).step_by(8) {
-                    let x = _mm256_loadu_ps(x_vector.as_ptr().add(i));
-                    let y = _mm256_loadu_ps(y_vector.as_ptr().add(i));
-                    xy = _mm256_fmadd_ps(x, y, xy);
-                    y_sq = _mm256_fmadd_ps(y, y, y_sq);
-                }
-                // handle remaining elements
-                let mut dotprod = add_f32_register(xy);
-                dotprod += dot(&x_vector[len..], &y_vector[len..]);
-                let mut y_sq_sum = add_f32_register(y_sq);
-                y_sq_sum += norm_l2(&y_vector[len..]).powi(2);
-                let div = x_norm * y_sq_sum.sqrt();
-                if div == 0.0 {
-                    1.0
-                } else {
-                    1.0 - dotprod / div
-                }
-            }
-        }
-
-        #[inline]
-        pub fn cosine_f32_norms(
-            x_vector: &[f32],
-            y_vector: &[f32],
-            x_norm: f32,
-            y_norm: f32,
-        ) -> f32 {
-            unsafe {
-                use crate::distance::x86_64::avx::add_f32_register;
-
-                let len = x_vector.len() / 8 * 8;
-                let mut xy = _mm256_setzero_ps();
-                for i in (0..len).step_by(8) {
-                    let x = _mm256_loadu_ps(x_vector.as_ptr().add(i));
-                    let y = _mm256_loadu_ps(y_vector.as_ptr().add(i));
-                    xy = _mm256_fmadd_ps(x, y, xy);
-                }
-                // handle remaining elements
-                let mut dotprod = add_f32_register(xy);
-                dotprod += dot(&x_vector[len..], &y_vector[len..]);
-                let div = x_norm * y_norm;
-                if div == 0.0 {
-                    1.0
-                } else {
-                    1.0 - dotprod / div
-                }
-            }
-        }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-mod aarch64 {
-    use std::arch::aarch64::*;
-
-    use super::dot;
-    use super::norm_l2;
-
-    pub mod neon {
-        use super::*;
-
-        #[inline]
-        pub fn cosine_f32(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
-            unsafe {
-                let len = x.len() / 16 * 16;
-                let buf = [0.0_f32; 4];
-                let mut xy = vld1q_f32(buf.as_ptr());
-                let mut y_sq = xy;
-
-                let mut xy1 = vld1q_f32(buf.as_ptr());
-                let mut y_sq1 = xy1;
-
-                let mut xy2 = vld1q_f32(buf.as_ptr());
-                let mut y_sq2 = xy2;
-
-                let mut xy3 = vld1q_f32(buf.as_ptr());
-                let mut y_sq3 = xy3;
-                for i in (0..len).step_by(16) {
-                    let left = vld1q_f32(x.as_ptr().add(i));
-                    let right = vld1q_f32(y.as_ptr().add(i));
-                    xy = vfmaq_f32(xy, left, right);
-                    y_sq = vfmaq_f32(y_sq, right, right);
-
-                    let left1 = vld1q_f32(x.as_ptr().add(i + 4));
-                    let right1 = vld1q_f32(y.as_ptr().add(i + 4));
-                    xy1 = vfmaq_f32(xy1, left1, right1);
-                    y_sq1 = vfmaq_f32(y_sq1, right1, right1);
-
-                    let left2 = vld1q_f32(x.as_ptr().add(i + 8));
-                    let right2 = vld1q_f32(y.as_ptr().add(i + 8));
-                    xy2 = vfmaq_f32(xy2, left2, right2);
-                    y_sq2 = vfmaq_f32(y_sq2, right2, right2);
-
-                    let left3 = vld1q_f32(x.as_ptr().add(i + 12));
-                    let right3 = vld1q_f32(y.as_ptr().add(i + 12));
-                    xy3 = vfmaq_f32(xy3, left3, right3);
-                    y_sq3 = vfmaq_f32(y_sq3, right3, right3);
-                }
-                xy = vaddq_f32(vaddq_f32(xy, xy3), vaddq_f32(xy1, xy2));
-                y_sq = vaddq_f32(vaddq_f32(y_sq, y_sq3), vaddq_f32(y_sq1, y_sq2));
-                // handle remaining elements
-                let mut dotprod = vaddvq_f32(xy);
-                dotprod += dot(&x[len..], &y[len..]);
-                let mut y_sq_sum = vaddvq_f32(y_sq);
-                y_sq_sum += norm_l2(&y[len..]).powi(2);
-                1.0 - dotprod / (x_norm * y_sq_sum.sqrt())
-            }
-        }
-    }
 }
 
 #[cfg(test)]

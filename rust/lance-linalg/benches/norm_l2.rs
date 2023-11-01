@@ -14,7 +14,7 @@
 
 use arrow_arith::{aggregate::sum, numeric::mul};
 use arrow_array::{cast::AsArray, types::Float32Type, Float32Array};
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};

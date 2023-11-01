@@ -48,6 +48,17 @@ fn bench_distance(c: &mut Criterion) {
             )
         })
     });
+
+    let key: Float32Array = generate_random_array_with_seed(8, [0; 32]);
+    let target: Float32Array = generate_random_array_with_seed(TOTAL * 8, [42; 32]);
+
+    c.bench_function("Cosine(simd,8-f32) rng seed", |b| {
+        b.iter(|| {
+            black_box(
+                cosine_distance_batch(key.values(), target.values(), DIMENSION).collect::<Vec<_>>(),
+            )
+        })
+    });
 }
 
 #[cfg(target_os = "linux")]
