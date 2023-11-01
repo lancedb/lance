@@ -238,12 +238,15 @@ pub fn cosine_distance<T: Cosine + ?Sized>(from: &T, to: &T) -> T::Output {
 }
 
 mod f32 {
+    use num_traits::Float;
+
     use super::*;
 
+    // TODO: how can we explicity infer F and N?
     #[inline]
-    pub(super) fn cosine_f32x8(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-        let x = unsafe { f32x8::load_unaligned(x.as_ptr()) };
-        let y = unsafe { f32x8::load_unaligned(y.as_ptr()) };
+    pub(super) fn cosine_once<S: SIMD<F, N>, F: Float, const N: usize>(x: &[F], x_norm: F, y: &[F]) -> F {
+        let x = unsafe { S::load_unaligned(x.as_ptr()) };
+        let y = unsafe { S::load_unaligned(y.as_ptr()) };
         let y2 = y * y;
         let xy = x * y;
         xy.reduce_sum() / x_norm / y2.reduce_sum()
@@ -276,7 +279,12 @@ pub fn cosine_distance_batch<'a>(
         8 => Box::new(
             batch
                 .chunks_exact(dimension)
-                .map(move |y| f32::cosine_f32x8(from, x_norm, y)),
+                .map(move |y| f32::cosine_once::<f32x8, f32, 8>(from, x_norm, y)),
+        ),
+        16 => Box::new(
+            batch
+                .chunks_exact(dimension)
+                .map(move |y| f32::cosine_once::<f32x16, f32, 16>(from, x_norm, y)),
         ),
         _ => Box::new(
             batch

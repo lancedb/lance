@@ -32,7 +32,15 @@ use num_traits::Float;
 /// Lance SIMD lib
 ///
 pub trait SIMD<T: Float, const N: usize>:
-    std::fmt::Debug + AddAssign + Add + Mul + Sub + SubAssign + Copy + Clone + Sized
+    std::fmt::Debug
+    + AddAssign<Self>
+    + Add<Self, Output = Self>
+    + Mul<Self, Output = Self>
+    + Sub<Self, Output = Self>
+    + SubAssign<Self>
+    + Copy
+    + Clone
+    + Sized
 {
     const LANES: usize = N;
 
