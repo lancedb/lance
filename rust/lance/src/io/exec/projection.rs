@@ -57,15 +57,9 @@ impl ProjectionStream {
                 })
                 .map(|r| r.map_err(|e| DataFusionError::Execution(e.to_string())))
                 .try_for_each(|b| async {
-                    if tx.is_closed() {
-                        eprintln!("ExecNode(Projection): channel closed");
-                        return Err(DataFusionError::Execution(
-                            "ExecNode(Projection): channel closed".to_string(),
-                        ));
-                    }
-                    if let Err(e) = tx.send(Ok(b)).await {
-                        eprintln!("ExecNode(Projection): {}", e);
-                        return Err(DataFusionError::Execution(
+                    if tx.send(Ok(b)).await.is_err() {
+                        // If channel is closed, make sure we return an error to end the stream.
+                        return Err(DataFusionError::Internal(
                             "ExecNode(Projection): channel closed".to_string(),
                         ));
                     }
@@ -74,7 +68,14 @@ impl ProjectionStream {
                 .await
             {
                 if let Err(e) = tx.send(Err(e)).await {
-                    eprintln!("ExecNode(Projection): {}", e);
+                    if let Err(e) = e.0 {
+                        // if channel was closed, it was cancelled by the receiver.
+                        // But if there was a different error we should send it
+                        // or log it.
+                        if !e.to_string().contains("channel closed") {
+                            log::error!("channel was closed by receiver, but error occurred in background thread: {:?}", e);
+                        }
+                    }
                 }
             }
         });
