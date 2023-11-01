@@ -192,9 +192,10 @@ def test_take_dataset(tf_dataset):
         assert batch["a"].numpy().shape == (100,)
 
     batches = [(0, 200), (100, 200)]
-    lance_ds = lance_take_batches(tf_dataset, batches)
+    lance_ds = lance_take_batches(tf_dataset, batches, columns=["a"])
     for (start, end), batch in zip(batches, lance_ds):
         assert batch["a"].numpy().tolist() == np.arange(start, end).tolist()
+        assert batch.keys() == {"a"}
 
 
 def test_var_length_list(tmp_path):

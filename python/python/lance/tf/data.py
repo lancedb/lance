@@ -354,7 +354,7 @@ def lance_take_batches(
         dataset = lance.dataset(dataset)
 
     if output_signature is None:
-        schema = dataset.schema
+        schema = dataset.scanner(columns=columns).projected_schema
         output_signature = schema_to_spec(schema)
     logging.debug("Output signature: %s", output_signature)
 
