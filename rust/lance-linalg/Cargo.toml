@@ -49,6 +49,10 @@ name = "cosine"
 harness = false
 
 [[bench]]
+name = "norm_l2"
+harness = false
+
+[[bench]]
 name = "kmeans"
 harness = false
 

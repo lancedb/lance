@@ -22,7 +22,10 @@ use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, 
 use half::{bf16, f16};
 use num_traits::real::Real;
 
-use crate::simd::{f32::f32x8, SIMD};
+use crate::simd::{
+    f32::{f32x16, f32x8},
+    SIMD,
+};
 
 /// Calculate the L2 distance between two vectors.
 ///
@@ -73,33 +76,29 @@ impl L2 for [f32] {
         if len % 16 == 0 {
             // Likely
             let dim = self.len();
-            let mut sum1 = f32x8::splat(0.0);
-            let mut sum2 = f32x8::splat(0.0);
+            let mut sum = f32x16::zeros();
 
             for i in (0..dim).step_by(16) {
                 unsafe {
-                    let mut x1 = f32x8::load_unaligned(self.as_ptr().add(i));
-                    let mut x2 = f32x8::load_unaligned(self.as_ptr().add(i + 8));
-                    let y1 = f32x8::load_unaligned(other.as_ptr().add(i));
-                    let y2 = f32x8::load_unaligned(other.as_ptr().add(i + 8));
-                    x1 -= y1;
-                    x2 -= y2;
-                    sum1.multiply_add(x1, x1);
-                    sum2.multiply_add(x2, x2);
+                    let mut x = f32x16::load_unaligned(self.as_ptr().add(i));
+
+                    let y = f32x16::load_unaligned(other.as_ptr().add(i));
+                    x -= y;
+                    sum.multiply_add(x, x);
                 }
             }
-            (sum1 + sum2).reduce_sum()
+            sum.reduce_sum()
         } else if len % 8 == 0 {
-            let mut sum1 = f32x8::splat(0.0);
+            let mut sum = f32x8::zeros();
             for i in (0..len).step_by(8) {
                 unsafe {
                     let mut x = f32x8::load_unaligned(self.as_ptr().add(i));
                     let y = f32x8::load_unaligned(other.as_ptr().add(i));
                     x -= y;
-                    sum1.multiply_add(x, x);
+                    sum.multiply_add(x, x);
                 }
             }
-            sum1.reduce_sum()
+            sum.reduce_sum()
         } else {
             // Fallback to scalar
             l2_scalar(self, other)
