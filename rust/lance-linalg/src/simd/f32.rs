@@ -492,15 +492,15 @@ mod tests {
         let simd_add = simd_a + simd_b;
         assert!((0..8)
             .zip(simd_add.as_array().iter())
-            .all(|(x, &y)| relative_eq!((x + x + 10) as f32, y)));
+            .all(|(x, &y)| (x + x + 10) as f32 == y));
 
-        let simd_add = simd_a + simd_b;
+        let simd_mul = simd_a * simd_b;
         assert!((0..8)
-            .zip(simd_add.as_array().iter())
-            .all(|(x, &y)| relative_eq!((x + x + 10) as f32, y)));
+            .zip(simd_mul.as_array().iter())
+            .all(|(x, &y)| (x * (x + 10)) as f32 == y));
 
-        let simd_sub = simd_b + simd_a;
-        assert!(simd_add.as_array().iter().all(|v| v == 10.0));
+        let simd_sub = simd_b - simd_a;
+        assert!(simd_sub.as_array().iter().all(|&v| v == 10.0));
 
         simd_a -= simd_b;
         assert_eq!(simd_a.reduce_sum(), -80.0);
