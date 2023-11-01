@@ -249,6 +249,8 @@ impl std::fmt::Debug for f32x16 {
     }
 }
 impl SIMD<f32> for f32x16 {
+    #[inline]
+
     fn splat(val: f32) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -265,6 +267,8 @@ impl SIMD<f32> for f32x16 {
         }
     }
 
+    #[inline]
+
     unsafe fn load(ptr: *const f32) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -273,6 +277,8 @@ impl SIMD<f32> for f32x16 {
         #[cfg(target_arch = "aarch64")]
         Self::load_unaligned(ptr)
     }
+
+    #[inline]
 
     unsafe fn load_unaligned(ptr: *const f32) -> Self {
         #[cfg(target_arch = "x86_64")]
@@ -283,6 +289,7 @@ impl SIMD<f32> for f32x16 {
         Self(vld1q_f32_x4(ptr))
     }
 
+    #[inline]
     unsafe fn store(&self, ptr: *mut f32) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -294,6 +301,8 @@ impl SIMD<f32> for f32x16 {
             vst1q_f32_x4(ptr, self.0);
         }
     }
+
+    #[inline]
 
     unsafe fn store_unaligned(&self, ptr: *mut f32) {
         #[cfg(target_arch = "x86_64")]
@@ -307,7 +316,20 @@ impl SIMD<f32> for f32x16 {
         }
     }
 
+    #[inline]
     fn multiply_add(&mut self, a: Self, b: Self) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            self.0 = _mm256_fmadd_ps(a.0, b.0, self.0);
+            self.1 = _mm256_fmadd_ps(a.1, b.1, self.1);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            self.0 .0 = vfmaq_f32(self.0 .0, a.0 .0, b.0 .0);
+            self.0 .1 = vfmaq_f32(self.0 .1, a.0 .1, b.0 .1);
+            self.0 .2 = vfmaq_f32(self.0 .2, a.0 .2, b.0 .2);
+            self.0 .3 = vfmaq_f32(self.0 .3, a.0 .3, b.0 .3);
+        }
         todo!()
     }
 
