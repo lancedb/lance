@@ -237,6 +237,19 @@ pub fn cosine_distance<T: Cosine + ?Sized>(from: &T, to: &T) -> T::Output {
     from.cosine(to)
 }
 
+mod f32 {
+    use super::*;
+
+    #[inline]
+    pub(super) fn cosine_f32x8(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
+        let x = unsafe { f32x8::load_unaligned(x.as_ptr()) };
+        let y = unsafe { f32x8::load_unaligned(y.as_ptr()) };
+        let y2 = y * y;
+        let xy = x * y;
+        xy.reduce_sum() / x_norm / y2.reduce_sum()
+    }
+}
+
 /// Cosine Distance
 ///
 /// <https://en.wikipedia.org/wiki/Cosine_similarity>
@@ -259,11 +272,18 @@ pub fn cosine_distance_batch<'a>(
 ) -> Box<dyn Iterator<Item = f32> + 'a> {
     let x_norm = norm_l2(from);
 
-    Box::new(
-        batch
-            .chunks_exact(dimension)
-            .map(move |y| from.cosine_fast(x_norm, y)),
-    )
+    match dimension {
+        8 => Box::new(
+            batch
+                .chunks_exact(dimension)
+                .map(move |y| f32::cosine_f32x8(from, x_norm, y)),
+        ),
+        _ => Box::new(
+            batch
+                .chunks_exact(dimension)
+                .map(move |y| from.cosine_fast(x_norm, y)),
+        ),
+    }
 }
 
 /// Compute Cosine distance between a vector and a batch of vectors.

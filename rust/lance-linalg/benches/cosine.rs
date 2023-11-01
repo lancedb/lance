@@ -54,9 +54,7 @@ fn bench_distance(c: &mut Criterion) {
 
     c.bench_function("Cosine(simd,8-f32) rng seed", |b| {
         b.iter(|| {
-            black_box(
-                cosine_distance_batch(key.values(), target.values(), DIMENSION).collect::<Vec<_>>(),
-            )
+            black_box(cosine_distance_batch(key.values(), target.values(), 8).collect::<Vec<_>>())
         })
     });
 }
@@ -64,7 +62,7 @@ fn bench_distance(c: &mut Criterion) {
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
-    config = Criterion::default().significance_level(0.1).sample_size(10)
+    config = Criterion::default().significance_level(0.1).sample_size(50)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_distance);
 

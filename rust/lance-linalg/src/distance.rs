@@ -28,9 +28,6 @@ pub mod dot;
 pub mod l2;
 pub mod norm_l2;
 
-#[cfg(target_arch = "x86_64")]
-mod x86_64;
-
 use arrow_schema::ArrowError;
 pub use cosine::*;
 pub use dot::*;
