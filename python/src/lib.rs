@@ -45,7 +45,6 @@ pub(crate) mod arrow;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
-pub(crate) mod errors;
 pub(crate) mod executor;
 pub(crate) mod fragment;
 pub(crate) mod reader;

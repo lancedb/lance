@@ -325,6 +325,7 @@ def lance_take_batches(
     *,
     columns: Optional[List[str]] = None,
     output_signature: Optional[Dict[str, tf.TypeSpec]] = None,
+    batch_readahead: int = 10,
 ) -> tf.data.Dataset:
     """
     Create a ``tf.data.Dataset`` of batches from a Lance dataset.
@@ -341,6 +342,8 @@ def lance_take_batches(
     output_signature : Optional[tf.TypeSpec], optional
         Override output signature of the returned tensors. If not provided,
         the output signature is inferred from the projection Schema.
+    batch_readahead : int, default 10
+        The number of batches to read ahead in parallel.
 
     Examples
     --------
@@ -363,12 +366,17 @@ def lance_take_batches(
         output_signature = schema_to_spec(schema)
     logging.debug("Output signature: %s", output_signature)
 
+    def gen_ranges():
+        for start, end in batch_ranges:
+            yield (start, end)
+
     def gen_batches():
-        # TODO: provide an implementation that does readahead.
-        for index_range in batch_ranges:
-            start, end = index_range
-            indices = list(range(start, end))
-            batch = dataset.take(indices, columns=columns)
+        batches = dataset._ds.take_scan(
+            gen_ranges(),
+            columns=columns,
+            batch_readahead=batch_readahead,
+        )
+        for batch in batches:
             yield {
                 name: column_to_tensor(batch[name], output_signature[name])
                 for name in batch.schema.names

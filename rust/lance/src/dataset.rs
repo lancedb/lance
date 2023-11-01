@@ -25,6 +25,8 @@ use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::interleave::interleave;
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::{prelude::*, Duration};
+use datafusion::error::DataFusionError;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt};
@@ -60,7 +62,7 @@ mod write;
 use self::cleanup::RemovalStats;
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
-use self::scanner::Scanner;
+use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::{reader_to_stream, write_fragments_internal};
 use crate::dataset::index::unindexed_fragments;
@@ -1086,6 +1088,39 @@ impl Dataset {
             let reordered = take(&struct_arr, &remapping_index, None)?;
             Ok(as_struct_array(&reordered).into())
         }
+    }
+
+    /// Get a stream of batches based on iterator of slices of row numbers.
+    ///
+    /// This is an experimental API. It may change at any time.
+    pub fn take_scan(
+        &self,
+        row_slices: Box<dyn Iterator<Item = Result<(u64, u64)>> + Send>,
+        projection: Arc<Schema>,
+        batch_readahead: usize,
+    ) -> DatasetRecordBatchStream {
+        let arrow_schema = Arc::new(projection.as_ref().into());
+        let dataset = Arc::new(self.clone());
+        let batch_stream = futures::stream::iter(row_slices)
+            .map(move |res| {
+                let dataset = dataset.clone();
+                let projection = projection.clone();
+                async move {
+                    let (start, end) =
+                        res.map_err(|err| DataFusionError::External(Box::new(err)))?;
+                    let row_pos: Vec<u64> = (start..end).collect();
+                    dataset
+                        .take(&row_pos, projection.as_ref())
+                        .await
+                        .map_err(|err| DataFusionError::External(Box::new(err)))
+                }
+            })
+            .buffered(batch_readahead);
+
+        DatasetRecordBatchStream::new(Box::pin(RecordBatchStreamAdapter::new(
+            arrow_schema,
+            batch_stream,
+        )))
     }
 
     /// Sample `n` rows from the dataset.

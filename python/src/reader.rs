@@ -22,6 +22,7 @@ use futures::lock::Mutex;
 use futures::stream::StreamExt;
 
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner as LanceScanner};
+use lance_core::io::RecordBatchStream;
 
 use crate::RT;
 
@@ -42,6 +43,13 @@ impl LanceReader {
             schema: scanner.schema()?,
             stream: Arc::new(Mutex::new(scanner.try_into_stream().await?)), // needs tokio Runtime
         })
+    }
+
+    pub fn from_stream(stream: DatasetRecordBatchStream) -> Self {
+        Self {
+            schema: stream.schema(),
+            stream: Arc::new(Mutex::new(stream)),
+        }
     }
 }
 
