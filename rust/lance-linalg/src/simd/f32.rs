@@ -479,7 +479,6 @@ impl SubAssign for f32x16 {
 mod tests {
 
     use super::*;
-    use approx::relative_eq;
 
     #[test]
     fn test_basic_ops() {
@@ -525,12 +524,12 @@ mod tests {
         let simd_add = simd_a + simd_b;
         assert!((0..16)
             .zip(simd_add.as_array().iter())
-            .all(|(x, &y)| relative_eq!((x + x + 10) as f32, y)));
+            .all(|(x, &y)| (x + x + 10) as f32 == y));
 
         let simd_mul = simd_a * simd_b;
         assert!((0..16)
             .zip(simd_mul.as_array().iter())
-            .all(|(x, &y)| relative_eq!((x * (x + 10)) as f32, y)));
+            .all(|(x, &y)| (x * (x + 10)) as f32 == y));
 
         simd_a -= simd_b;
         assert_eq!(simd_a.reduce_sum(), -160.0);
