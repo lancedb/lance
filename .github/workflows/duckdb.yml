@@ -8,6 +8,11 @@ on:
       - integration/duckdb_lance/*
       - .github/workflows/duckdb.yml
       - ./rust/*
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+  
 jobs:
   Linux:
     runs-on: ubuntu-22.04
