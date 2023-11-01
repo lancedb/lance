@@ -18,7 +18,7 @@
 use std::iter::Sum;
 use std::sync::Arc;
 
-use crate::distance::l2::f32::l2_f32x8;
+use crate::distance::l2::f32::{l2_f32x16, l2_f32x8};
 use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
 use num_traits::real::Real;
@@ -132,14 +132,25 @@ pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
     from.l2(to)
 }
 
+// f32 kernels for L2
 mod f32 {
     use super::*;
 
     #[inline]
     pub(crate) fn l2_f32x8(x: &[f32], y: &[f32]) -> f32 {
+        debug_assert_eq!(x.len(), 16);
         debug_assert_eq!(y.len(), 8);
-        let x = unsafe { f32x8::load_unaligned(x.as_ptr()) };
-        let y = unsafe { f32x8::load_unaligned(y.as_ptr()) };
+        let x = unsafe { f32x16::load_unaligned(x.as_ptr()) };
+        let y = unsafe { f32x16::load_unaligned(y.as_ptr()) };
+        let s = x - y;
+        (s * s).reduce_sum()
+    }
+
+    #[inline]
+    pub(crate) fn l2_f32x16(x: &[f32], y: &[f32]) -> f32 {
+        debug_assert_eq!(y.len(), 16);
+        let x = unsafe { f32x16::load_unaligned(x.as_ptr()) };
+        let y = unsafe { f32x16::load_unaligned(y.as_ptr()) };
         let s = x - y;
         (s * s).reduce_sum()
     }
@@ -167,6 +178,7 @@ pub fn l2_distance_batch<'a>(
     // Dispatch based on the dimension.
     match dimension {
         8 => Box::new(to.chunks_exact(dimension).map(move |v| l2_f32x8(from, v))),
+        16 => Box::new(to.chunks_exact(dimension).map(move |v| l2_f32x16(from, v))),
         _ => Box::new(to.chunks_exact(dimension).map(|v| from.l2(v))),
     }
 }
