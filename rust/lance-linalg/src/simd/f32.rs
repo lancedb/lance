@@ -12,15 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `f32x8`, 8 of f32 values.s
+//! `f32x8`, 8 of `f32` values.s
 
 use std::fmt::Formatter;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::{
-    float32x4x2_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32_x2, vmulq_f32,
-    vst1q_f32_x2, vsubq_f32,
+    float32x4x2_t, float32x4x4_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32_x2,
+    vmulq_f32, vst1q_f32_x2, vsubq_f32,
 };
+use std::arch::aarch64::{vld1q_f32_x4, vst1q_f32_x4};
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
@@ -222,6 +223,116 @@ impl Mul for f32x8 {
                 vmulq_f32(self.0 .0, rhs.0 .0),
                 vmulq_f32(self.0 .1, rhs.0 .1),
             ))
+        }
+    }
+}
+
+/// 8 of 32-bit `f32` values. Use 256-bit SIMD if possible.
+#[allow(non_camel_case_types)]
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+pub struct f32x16(__m256, __m256);
+
+/// 8 of 32-bit `f32` values. Use 256-bit SIMD if possible.
+#[allow(non_camel_case_types)]
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+pub struct f32x16(float32x4x4_t);
+
+impl std::fmt::Debug for f32x16 {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut arr = [0.0_f32; 16];
+        unsafe {
+            self.store_unaligned(arr.as_mut_ptr());
+        }
+        write!(f, "f32x16({:?})", arr)
+    }
+}
+impl SIMD<f32> for f32x16 {
+    fn splat(val: f32) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_set1_ps(val), _mm256_set1_ps(val))
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            Self(float32x4x4_t(
+                vdupq_n_f32(val),
+                vdupq_n_f32(val),
+                vdupq_n_f32(val),
+                vdupq_n_f32(val),
+            ))
+        }
+    }
+
+    unsafe fn load(ptr: *const f32) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_load_ps(ptr), _mm256_load_ps(ptr.add(8)))
+        }
+        #[cfg(target_arch = "aarch64")]
+        Self::load_unaligned(ptr)
+    }
+
+    unsafe fn load_unaligned(ptr: *const f32) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_loadu_ps(ptr), _mm256_loadu_ps(ptr.add(8)))
+        }
+        #[cfg(target_arch = "aarch64")]
+        Self(vld1q_f32_x4(ptr))
+    }
+
+    unsafe fn store(&self, ptr: *mut f32) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            _mm256_store_ps(ptr, self.0);
+            _mm256_store_ps(ptr.add(8), self.1);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            vst1q_f32_x4(ptr, self.0);
+        }
+    }
+
+    unsafe fn store_unaligned(&self, ptr: *mut f32) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            _mm256_storeu_ps(ptr, self.0);
+            _mm256_storeu_ps(ptr.add(8), self.1);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            vst1q_f32_x4(ptr, self.0);
+        }
+    }
+
+    fn multiply_add(&mut self, a: Self, b: Self) {
+        todo!()
+    }
+
+    fn reduce_sum(&self) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let mut sum = _mm256_add_ps(self.0, self.1);
+            // Shift and add vector, until only 1 value left.
+            // sums = [x0-x7], shift = [x4-x7]
+            let mut shift = _mm256_permute2f128_ps(sum, sum, 1);
+            // [x0+x4, x1+x5, ..]
+            sum = _mm256_add_ps(sum, shift);
+            shift = _mm256_permute_ps(sum, 14);
+            sum = _mm256_add_ps(sum, shift);
+            sum = _mm256_hadd_ps(sum, sum);
+            let mut results: [f32; 8] = [0f32; 8];
+            _mm256_storeu_ps(results.as_mut_ptr(), sum);
+            results[0]
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let mut sum1 = vaddq_f32(self.0 .0, self.0 .1);
+            let sum2 = vaddq_f32(self.0 .2, self.0 .3);
+            sum1 = vaddq_f32(sum1, sum2);
+            vaddvq_f32(sum1)
         }
     }
 }
