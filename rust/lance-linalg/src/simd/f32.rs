@@ -422,7 +422,7 @@ impl Mul for f32x16 {
     fn mul(self, rhs: Self) -> Self::Output {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm256_mul_ps(self.0, rhs.0))
+            Self(_mm256_mul_ps(self.0, rhs.0), _mm256_mul_ps(self.1, rhs.1))
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
