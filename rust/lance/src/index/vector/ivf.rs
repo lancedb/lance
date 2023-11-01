@@ -561,10 +561,13 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
     };
     if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
         if !matches!(elem_type.data_type(), DataType::Float32) {
-            return Err(
-        Error::Index{message:
-            format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
-            elem_type.data_type()),            location: location!()        });
+            return Err(Error::Index{
+                message:format!(
+                    "VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+                    elem_type.data_type()
+                ),
+                location: location!()
+            });
         }
     } else {
         return Err(Error::Index {
