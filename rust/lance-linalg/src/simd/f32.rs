@@ -49,7 +49,7 @@ impl std::fmt::Debug for f32x8 {
     }
 }
 
-impl SIMD<f32> for f32x8 {
+impl SIMD<f32, 8> for f32x8 {
     fn splat(val: f32) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -256,7 +256,7 @@ impl std::fmt::Debug for f32x16 {
         write!(f, "f32x16({:?})", arr)
     }
 }
-impl SIMD<f32> for f32x16 {
+impl SIMD<f32, 16> for f32x16 {
     #[inline]
 
     fn splat(val: f32) -> Self {
@@ -479,6 +479,7 @@ impl SubAssign for f32x16 {
 mod tests {
 
     use super::*;
+    use approx::relative_eq;
 
     #[test]
     fn test_basic_ops() {
@@ -487,6 +488,17 @@ mod tests {
 
         let mut simd_a = unsafe { f32x8::load_unaligned(a.as_ptr()) };
         let simd_b = unsafe { f32x8::load_unaligned(b.as_ptr()) };
+
+        let simd_add = simd_a + simd_b;
+        assert!((0..8)
+            .zip(simd_add.as_array().iter())
+            .all(|(x, &y)| relative_eq!((x + x + 10) as f32, y)));
+
+        let simd_add = simd_a + simd_b;
+        assert!((0..8)
+            .zip(simd_add.as_array().iter())
+            .all(|(x, &y)| relative_eq!((x + x + 10) as f32, y)));
+
         simd_a -= simd_b;
         assert_eq!(simd_a.reduce_sum(), -80.0);
 
@@ -506,10 +518,21 @@ mod tests {
 
         let mut simd_a = unsafe { f32x16::load_unaligned(a.as_ptr()) };
         let simd_b = unsafe { f32x16::load_unaligned(b.as_ptr()) };
+
+        let simd_add = simd_a + simd_b;
+        assert!((0..16)
+            .zip(simd_add.as_array().iter())
+            .all(|(x, &y)| relative_eq!((x + x + 10) as f32, y)));
+
+        let simd_mul = simd_a * simd_b;
+        assert!((0..16)
+            .zip(simd_mul.as_array().iter())
+            .all(|(x, &y)| relative_eq!((x * (x + 10)) as f32, y)));
+
         simd_a -= simd_b;
         assert_eq!(simd_a.reduce_sum(), -160.0);
 
-        let mut simd_power = f32x16::splat(0.0);
+        let mut simd_power = f32x16::zeros();
         simd_power.multiply_add(simd_a, simd_a);
 
         assert_eq!(

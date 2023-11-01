@@ -31,9 +31,11 @@ use num_traits::Float;
 
 /// Lance SIMD lib
 ///
-pub trait SIMD<T: Float>:
+pub trait SIMD<T: Float, const N: usize>:
     std::fmt::Debug + AddAssign + Add + Mul + Sub + SubAssign + Copy + Clone + Sized
 {
+    const LANES: usize = N;
+
     /// Create a new instance with all lanes set to `val`.
     fn splat(val: T) -> Self;
 
@@ -63,6 +65,15 @@ pub trait SIMD<T: Float>:
     ///
     /// # Safety
     unsafe fn store_unaligned(&self, ptr: *mut T);
+
+    /// Return the values as an array.
+    fn as_array(&self) -> [T; N] {
+        let mut arr = [T::zero(); N];
+        unsafe {
+            self.store_unaligned(arr.as_mut_ptr());
+        }
+        arr
+    }
 
     /// fused multiply-add
     ///
