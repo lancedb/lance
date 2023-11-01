@@ -827,7 +827,6 @@ class LanceDataset(pa.dataset.Dataset):
             "dot",
         ]:
             raise ValueError(f"Metric {metric} not supported.")
-        kwargs["metric"] = metric.lower()
         index_type = index_type.upper()
         if index_type not in ["IVF_PQ", "DISKANN"]:
             raise NotImplementedError(
