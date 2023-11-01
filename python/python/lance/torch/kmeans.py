@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 import logging
+import time
 from typing import List, Optional, Union
 
 import numpy as np
@@ -146,6 +147,7 @@ class KMeans:
             2-D input data to train kmeans.
 
         """
+        start = time.time()
         assert self.centroids is None
 
         if isinstance(data, pa.FixedSizeListArray):
@@ -180,6 +182,7 @@ class KMeans:
                 break
             if i % 10 == 0:
                 logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
+        logging.info("Finish KMean training in %{}s", time.time() - start)
 
     @staticmethod
     def _split_centroids(centroids: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:

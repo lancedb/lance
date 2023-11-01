@@ -748,7 +748,7 @@ pub async fn build_ivf_pq_index(
         let residuals = span!(Level::INFO, "compute residual for PQ training")
             .in_scope(|| ivf_model.compute_residual(&training_data, &part_ids));
         info!("Start train PQ: params={:#?}", pq_params);
-        train_pq(&residuals, pq_params).await?
+        train_pq(&residuals, metric_type, pq_params).await?
     };
     info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
 
@@ -757,8 +757,6 @@ pub async fn build_ivf_pq_index(
     scanner.batch_readahead(num_cpus::get() * 2);
     scanner.project(&[column])?;
     scanner.with_row_id();
-
-    let metric_type = pq_params.metric_type;
 
     // Scan the dataset and compute residual, pq with with partition ID.
     // For now, it loads all data into memory.
@@ -1453,5 +1451,51 @@ mod tests {
                 is_not_remapped,
             )
             .await;
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_pq_cosine() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let (mut dataset, vector_array) = generate_test_dataset(test_uri).await;
+
+        let centroids = generate_random_array(2 * DIM);
+        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
+        let ivf_params = IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
+
+        let codebook = Arc::new(generate_random_array(256 * DIM));
+        let pq_params = PQBuildParams::with_codebook(4, 8, codebook);
+
+        let params =
+            VectorIndexParams::with_ivf_pq_params(MetricType::Cosine, ivf_params, pq_params);
+
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let sample_query = vector_array.value(10);
+        let query = sample_query.as_primitive::<Float32Type>();
+        let results = dataset
+            .scan()
+            .nearest("vector", query, 5)
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(1, results.len());
+        assert_eq!(5, results[0].num_rows());
+        for batch in results.iter() {
+            let dist = &batch["_distance"];
+            assert!(dist
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|v| *v >= 0.0 && *v < 1.0));
+        }
     }
 }

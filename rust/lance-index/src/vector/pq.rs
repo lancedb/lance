@@ -39,9 +39,6 @@ pub struct PQBuildParams {
     /// The number of bits to present one PQ centroid.
     pub num_bits: usize,
 
-    /// Metric type, L2 or Cosine.
-    pub metric_type: MetricType,
-
     /// Train as optimized product quantization.
     pub use_opq: bool,
 
@@ -62,7 +59,6 @@ impl Default for PQBuildParams {
         Self {
             num_sub_vectors: 16,
             num_bits: 8,
-            metric_type: MetricType::L2,
             use_opq: false,
             max_iters: 50,
             max_opq_iters: 50,
@@ -349,7 +345,11 @@ impl ProductQuantizer {
     }
 
     /// Train [`ProductQuantizer`] using vectors.
-    pub async fn train(data: &MatrixView<Float32Type>, params: &PQBuildParams) -> Result<Self> {
+    pub async fn train(
+        data: &MatrixView<Float32Type>,
+        metric_type: MetricType,
+        params: &PQBuildParams,
+    ) -> Result<Self> {
         if data.num_columns() % params.num_sub_vectors != 0 {
             return Err(Error::Index {
                 message: format!(
@@ -367,44 +367,39 @@ impl ProductQuantizer {
         let sub_vector_dimension = dimension / params.num_sub_vectors;
 
         let mut codebook_builder = Float32Builder::with_capacity(num_centroids * dimension);
-        let rng = rand::rngs::SmallRng::from_entropy();
 
         const REDOS: usize = 1;
         // TODO: parallel training.
-        let prev_centroids = params.codebook.clone();
-        for sub_vec in sub_vectors.iter() {
-            // Centroids for one sub vector.
-            let flatten_array: &Float32Array = sub_vec.values().as_primitive();
-            let centroids = train_kmeans(
-                flatten_array,
-                prev_centroids.as_ref().map(|centroids| {
-                    Arc::new(Float32Array::from_iter_values(
-                        get_sub_vector_centroids(
-                            centroids.as_ref(),
-                            dimension,
-                            params.num_bits as u32,
-                            params.num_sub_vectors,
-                            0,
-                        )
-                        .iter()
-                        .cloned(),
-                    ))
-                }),
-                sub_vector_dimension,
-                num_centroids,
-                params.max_iters as u32,
-                REDOS,
-                rng.clone(),
-                params.metric_type,
-                params.sample_rate,
-            )
+        let d = stream::iter(sub_vectors.into_iter())
+            .map(|sub_vec| async move {
+                let rng = rand::rngs::SmallRng::from_entropy();
+
+                // Centroids for one sub vector.
+                let sub_vec = sub_vec.clone();
+                let flatten_array: &Float32Array = sub_vec.values().as_primitive();
+                train_kmeans(
+                    flatten_array,
+                    None,
+                    sub_vector_dimension,
+                    num_centroids,
+                    params.max_iters as u32,
+                    REDOS,
+                    rng.clone(),
+                    metric_type,
+                    params.sample_rate,
+                )
+                .await
+            })
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
             .await?;
 
-            // TODO: COPIED COPIED COPIED
+        for centroid in d.iter() {
             unsafe {
-                codebook_builder.append_trusted_len_iter(centroids.values().iter().copied());
+                codebook_builder.append_trusted_len_iter(centroid.values().iter().copied());
             }
         }
+
         let pd_centroids = codebook_builder.finish();
 
         Ok(Self::new(
@@ -412,7 +407,7 @@ impl ProductQuantizer {
             params.num_bits as u32,
             dimension,
             Arc::new(pd_centroids),
-            params.metric_type,
+            metric_type,
         ))
     }
 
@@ -522,7 +517,9 @@ mod tests {
         // A 16-dim array.
         let dim = 16;
         let mat = MatrixView::new(values.into(), dim);
-        let pq = ProductQuantizer::train(&mat, &params).await.unwrap();
+        let pq = ProductQuantizer::train(&mat, MetricType::L2, &params)
+            .await
+            .unwrap();
 
         // Init centroids
         let centroids = pq.codebook.clone();
@@ -540,7 +537,9 @@ mod tests {
             let code = actual_pq.transform(&mat).await.unwrap();
             actual_pq.reset_centroids(&mat, &code).unwrap();
             params.codebook = Some(actual_pq.codebook.clone());
-            actual_pq = ProductQuantizer::train(&mat, &params).await.unwrap();
+            actual_pq = ProductQuantizer::train(&mat, MetricType::L2, &params)
+                .await
+                .unwrap();
         }
 
         let result = pq.codebook;
