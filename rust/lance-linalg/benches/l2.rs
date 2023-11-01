@@ -129,6 +129,15 @@ fn bench_distance(c: &mut Criterion) {
             }))
         });
     });
+
+    let key: Float32Array = generate_random_array_with_seed(8, [5; 32]);
+    // 1M of 1024 D vectors. 4GB in memory.
+    let target: Float32Array = generate_random_array_with_seed(TOTAL * 8, [7; 32]);
+    c.bench_function("L2(simd,f32x8)", |b| {
+        b.iter(|| {
+            black_box(l2_distance_batch(key.values(), target.values(), 8).count());
+        })
+    });
 }
 
 #[cfg(target_os = "linux")]

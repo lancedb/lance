@@ -56,17 +56,6 @@ impl Dot for [f16] {
     }
 }
 
-pub(crate) mod f32 {
-    use super::*;
-
-    #[inline]
-    pub(crate) fn dot_f32x8(x: &[f32], y: &[f32]) -> f32x8 {
-        let x = unsafe { f32x8::load_unaligned(x.as_ptr()) };
-        let y = unsafe { f32x8::load_unaligned(y.as_ptr()) };
-        x * y
-    }
-}
-
 impl Dot for [f32] {
     type Output = f32;
 
