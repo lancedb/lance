@@ -499,6 +499,9 @@ mod tests {
             .zip(simd_add.as_array().iter())
             .all(|(x, &y)| relative_eq!((x + x + 10) as f32, y)));
 
+        let simd_sub = simd_b + simd_a;
+        assert!(simd_add.as_array().iter().all(|v| v == 10.0));
+
         simd_a -= simd_b;
         assert_eq!(simd_a.reduce_sum(), -80.0);
 
