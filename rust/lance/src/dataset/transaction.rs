@@ -492,7 +492,7 @@ impl Transaction {
                     }
                     new_bitmap.extend(group.new_fragments.iter().map(|frag| frag.id as u32));
                 } else {
-                    return Err(Error::invalid_input("The compaction plan included a rewrite group that was a split of indexed and non-indexed data"));
+                    return Err(Error::invalid_input("The compaction plan included a rewrite group that was a split of indexed and non-indexed data", location!()));
                 }
             }
         }
@@ -508,25 +508,31 @@ impl Transaction {
 
         for rewritten_index in rewritten_indices {
             if !modified_indices.insert(rewritten_index.old_id) {
-                return Err(Error::invalid_input(format!("An invalid compaction plan must have been generated because multiple tasks modified the same index: {}", rewritten_index.old_id)));
+                return Err(Error::invalid_input(format!("An invalid compaction plan must have been generated because multiple tasks modified the same index: {}", rewritten_index.old_id), location!()));
             }
 
             let index = indices
                 .iter_mut()
                 .find(|idx| idx.uuid == rewritten_index.old_id)
                 .ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "Invalid compaction plan refers to index {} which does not exist",
-                        rewritten_index.old_id
-                    ))
+                    Error::invalid_input(
+                        format!(
+                            "Invalid compaction plan refers to index {} which does not exist",
+                            rewritten_index.old_id
+                        ),
+                        location!(),
+                    )
                 })?;
 
             index.fragment_bitmap = Some(Self::recalculate_fragment_bitmap(
                 index.fragment_bitmap.as_ref().ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "Cannot rewrite index {} which did not store fragment bitmap",
-                        index.uuid
-                    ))
+                    Error::invalid_input(
+                        format!(
+                            "Cannot rewrite index {} which did not store fragment bitmap",
+                            index.uuid
+                        ),
+                        location!(),
+                    )
                 })?,
                 groups,
             )?);

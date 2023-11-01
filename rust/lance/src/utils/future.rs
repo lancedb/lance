@@ -96,7 +96,10 @@ mod tests {
         }
 
         // On error
-        let fut = future::ready(crate::Result::Err(crate::Error::invalid_input("xyz")));
+        let fut = future::ready(crate::Result::Err(crate::Error::invalid_input(
+            "xyz",
+            location!(),
+        )));
         let prereq = SharedPrerequisite::<u32>::spawn(fut);
 
         let mut tasks = Vec::with_capacity(10);

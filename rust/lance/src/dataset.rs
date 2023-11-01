@@ -650,6 +650,7 @@ impl Dataset {
                 Operation::Overwrite { .. } | Operation::Restore { .. } => Ok(0),
                 _ => Err(Error::invalid_input(
                     "read_version must be specified for this operation",
+                    location!(),
                 )),
             },
             Ok,
@@ -735,17 +736,20 @@ impl Dataset {
     ) -> Result<()> {
         // Sanity check.
         if self.schema().field(left_on).is_none() {
-            return Err(Error::invalid_input(format!(
-                "Column {} does not exist in the left side dataset",
-                left_on
-            )));
+            return Err(Error::invalid_input(
+                format!("Column {} does not exist in the left side dataset", left_on),
+                location!(),
+            ));
         };
         let right_schema = stream.schema();
         if right_schema.field_with_name(right_on).is_err() {
-            return Err(Error::invalid_input(format!(
-                "Column {} does not exist in the right side dataset",
-                right_on
-            )));
+            return Err(Error::invalid_input(
+                format!(
+                    "Column {} does not exist in the right side dataset",
+                    right_on
+                ),
+                location!(),
+            ));
         };
         for field in right_schema.fields() {
             if field.name() == right_on {
@@ -754,10 +758,13 @@ impl Dataset {
                 continue;
             }
             if self.schema().field(field.name()).is_some() {
-                return Err(Error::invalid_input(format!(
-                    "Column {} exists in both sides of the dataset",
-                    field.name()
-                )));
+                return Err(Error::invalid_input(
+                    format!(
+                        "Column {} exists in both sides of the dataset",
+                        field.name()
+                    ),
+                    location!(),
+                ));
             }
         }
 
@@ -951,7 +958,10 @@ impl Dataset {
             let range = range_start..(range_end + 1);
 
             let fragment = self.get_fragment(fragment_id).ok_or_else(|| {
-                Error::invalid_input(format!("row_id belongs to non-existant fragment: {start}"))
+                Error::invalid_input(
+                    format!("row_id belongs to non-existant fragment: {start}"),
+                    location!(),
+                )
             })?;
 
             let reader = fragment.open(projection.as_ref()).await?;
@@ -983,10 +993,13 @@ impl Dataset {
                 };
 
                 let fragment = self.get_fragment(fragment_id as usize).ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "row_id belongs to non-existant fragment: {}",
-                        row_ids[current_start]
-                    ))
+                    Error::invalid_input(
+                        format!(
+                            "row_id belongs to non-existant fragment: {}",
+                            row_ids[current_start]
+                        ),
+                        location!(),
+                    )
                 })?;
                 let row_ids: Vec<u32> = row_ids[range].iter().map(|x| *x as u32).collect();
 
@@ -1328,6 +1341,7 @@ impl Dataset {
                         "Duplicate fragment id {} found in dataset {:?}",
                         id, self.base
                     ),
+                    location!(),
                 ));
             }
         }

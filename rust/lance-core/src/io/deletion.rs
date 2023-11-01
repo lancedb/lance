@@ -25,7 +25,7 @@ use bytes::Buf;
 use object_store::path::Path;
 use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
-use snafu::ResultExt;
+use snafu::{location, Location, ResultExt};
 
 use super::object_store::ObjectStore;
 use crate::error::{box_error, CorruptFileSnafu};
@@ -315,6 +315,7 @@ pub async fn read_deletion_file(
                         "Expected exactly one batch in deletion file, got {}",
                         batches.len()
                     ),
+                    location!(),
                 ));
             }
 
@@ -327,6 +328,7 @@ pub async fn read_deletion_file(
                         deletion_arrow_schema(),
                         batch.schema()
                     ),
+                    location!(),
                 ));
             }
 
@@ -343,6 +345,7 @@ pub async fn read_deletion_file(
                     return Err(Error::corrupt_file(
                         path,
                         "Null values are not allowed in deletion files",
+                        location!(),
                     ));
                 }
             }

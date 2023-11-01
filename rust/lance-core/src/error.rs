@@ -80,20 +80,24 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn corrupt_file(path: object_store::path::Path, message: impl Into<String>) -> Self {
+    pub fn corrupt_file(
+        path: object_store::path::Path,
+        message: impl Into<String>,
+        location: Location,
+    ) -> Self {
         let message: String = message.into();
         Self::CorruptFile {
             path,
             source: message.into(),
-            location: location!(),
+            location,
         }
     }
 
-    pub fn invalid_input(message: impl Into<String>) -> Self {
+    pub fn invalid_input(message: impl Into<String>, location: Location) -> Self {
         let message: String = message.into();
         Self::InvalidInput {
             source: message.into(),
-            location: location!(),
+            location,
         }
     }
 }

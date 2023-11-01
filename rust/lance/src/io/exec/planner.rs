@@ -417,10 +417,10 @@ impl Planner {
                     if can_cast_types(&right_data_type, &left_data_type) {
                         Arc::new(CastExpr::new(right, left_data_type, None))
                     } else {
-                        return Err(Error::invalid_input(format!(
-                            "Cannot compare {} and {}",
-                            left_data_type, right_data_type
-                        )));
+                        return Err(Error::invalid_input(
+                            format!("Cannot compare {} and {}", left_data_type, right_data_type),
+                            location!(),
+                        ));
                     }
                 } else {
                     right
