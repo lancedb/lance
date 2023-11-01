@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{ops::Bound, sync::Arc};
+use std::{any::Any, ops::Bound, sync::Arc};
 
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -20,6 +20,9 @@ use async_trait::async_trait;
 
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use lance_core::Result;
+use serde::Serialize;
+
+use crate::Index;
 
 use super::{
     btree::{SubIndexLoader, SubIndexTrainer},
@@ -91,7 +94,35 @@ impl SubIndexTrainer for FlatIndexTrainer {
     }
 
     async fn train(&self, batch: RecordBatch, writer: &mut dyn IndexWriter) -> Result<u64> {
+        // The data source may not call the columns "values" and "row_ids" so we need to replace
+        // the schema
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![batch.column(0).clone(), batch.column(1).clone()],
+        )?;
         writer.write_record_batch(batch).await
+    }
+}
+
+#[derive(Serialize)]
+struct FlatStatistics {
+    num_values: u32,
+}
+
+impl Index for FlatIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+
+    fn statistics(&self) -> Result<String> {
+        serde_json::to_string(&FlatStatistics {
+            num_values: self.data.num_rows() as u32,
+        })
+        .map_err(|err| err.into())
     }
 }
 

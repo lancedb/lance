@@ -34,14 +34,14 @@ use rand::{distributions::Uniform, prelude::*, Rng, SeedableRng};
 use snafu::{location, Location};
 
 use crate::dataset::{Dataset, ROW_ID};
-use crate::index::pb;
 use crate::index::vector::diskann::row_vertex::RowVertexSerDe;
 use crate::index::vector::diskann::DiskANNParams;
 use crate::index::vector::graph::{
     builder::GraphBuilder, write_graph, VertexWithDistance, WriteGraphParams,
 };
 use crate::index::vector::graph::{Graph, Vertex};
-use crate::index::vector::{MetricType, INDEX_FILE_NAME};
+use crate::index::vector::MetricType;
+use crate::index::{pb, INDEX_FILE_NAME};
 use crate::{Error, Result};
 
 use super::row_vertex::RowVertex;

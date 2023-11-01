@@ -37,9 +37,12 @@ use lance_core::io::{
 use lance_core::{
     datatypes::Field, encodings::plain::PlainEncoder, format::Index as IndexMetadata, Error, Result,
 };
-use lance_index::vector::{
-    pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
-    Query, DIST_COL, RESIDUAL_COLUMN,
+use lance_index::{
+    vector::{
+        pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
+        Query, DIST_COL, RESIDUAL_COLUMN,
+    },
+    Index,
 };
 use lance_linalg::matrix::MatrixView;
 use log::{debug, info, warn};
@@ -54,7 +57,7 @@ use super::opq::train_opq;
 use super::{
     pq::{train_pq, PQIndex},
     utils::maybe_sample_training_data,
-    MetricType, VectorIndex, INDEX_FILE_NAME,
+    MetricType, VectorIndex,
 };
 use crate::{
     dataset::Dataset,
@@ -65,7 +68,7 @@ use crate::{
             ivf::{builder::shuffle_dataset, io::write_index_partitions},
             Transformer,
         },
-        Index,
+        INDEX_FILE_NAME,
     },
     session::Session,
 };
@@ -125,7 +128,7 @@ impl IVFIndex {
     #[instrument(level = "debug", skip(self))]
     pub(crate) async fn load_partition(&self, partition_id: usize) -> Result<Arc<dyn VectorIndex>> {
         let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
-        let part_index = if let Some(part_idx) = self.session.index_cache.get(&cache_key) {
+        let part_index = if let Some(part_idx) = self.session.index_cache.get_vector(&cache_key) {
             part_idx
         } else {
             let offset = self.ivf.offsets[partition_id];
@@ -135,7 +138,9 @@ impl IVFIndex {
                 .load(self.reader.as_ref(), offset, length)
                 .await?;
             let idx: Arc<dyn VectorIndex> = idx.into();
-            self.session.index_cache.insert(&cache_key, idx.clone());
+            self.session
+                .index_cache
+                .insert_vector(&cache_key, idx.clone());
             idx
         };
         Ok(part_index)
@@ -243,7 +248,11 @@ impl Index for IVFIndex {
         self
     }
 
-    fn statistics(&self) -> Result<serde_json::Value> {
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+
+    fn statistics(&self) -> Result<String> {
         let partitions_statistics = self
             .ivf
             .lengths
@@ -261,13 +270,14 @@ impl Index for IVFIndex {
             })
             .collect::<Vec<_>>();
 
-        Ok(serde_json::to_value(IvfIndexStatistics {
+        Ok(serde_json::to_string(&IvfIndexStatistics {
             index_type: "IVF".to_string(),
             uuid: self.uuid.clone(),
             uri: to_local_path(self.reader.path()),
             metric_type: self.metric_type.to_string(),
             num_partitions: self.ivf.num_partitions(),
-            sub_index: self.sub_index.statistics()?,
+            // TODO: Not ideal that we have to re-parse the JSON here
+            sub_index: serde_json::from_str(&self.sub_index.statistics()?)?,
             partitions: partitions_statistics,
         })?)
     }
@@ -1009,10 +1019,7 @@ mod tests {
 
     use crate::{
         format::RowAddress,
-        index::{
-            vector::{open_index, VectorIndexParams},
-            DatasetIndexExt, IndexType,
-        },
+        index::{vector::VectorIndexParams, DatasetIndexExt, IndexType},
     };
 
     const DIM: usize = 32;
@@ -1374,7 +1381,8 @@ mod tests {
         .await
         .unwrap();
 
-        let index = open_index(dataset.clone(), WellKnownIvfPqData::COLUMN, &uuid_str)
+        let index = dataset
+            .open_vector_index(WellKnownIvfPqData::COLUMN, &uuid_str)
             .await
             .unwrap();
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
@@ -1428,13 +1436,10 @@ mod tests {
         .await
         .unwrap();
 
-        let remapped = open_index(
-            dataset.clone(),
-            WellKnownIvfPqData::COLUMN,
-            &new_uuid.to_string(),
-        )
-        .await
-        .unwrap();
+        let remapped = dataset
+            .open_vector_index(WellKnownIvfPqData::COLUMN, &new_uuid.to_string())
+            .await
+            .unwrap();
         let ivf_remapped = remapped.as_any().downcast_ref::<IVFIndex>().unwrap();
 
         // If the ids were remapped then make sure the new row id is in the results

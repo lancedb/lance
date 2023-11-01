@@ -24,15 +24,15 @@ use lance_core::{
     io::{object_writer::ObjectWriter, Reader},
     Result,
 };
-use lance_index::vector::Query;
+use lance_index::{vector::Query, Index};
 use lance_linalg::MatrixView;
 
-use crate::index::{pb::Transform, prefilter::PreFilter, Index};
+use crate::index::{pb::Transform, prefilter::PreFilter};
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
 #[async_trait]
 #[allow(clippy::redundant_pub_crate)]
-pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
+pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// Search the vector for nearest neighbors.
     ///
     /// It returns a [RecordBatch] with Schema of:

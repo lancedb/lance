@@ -23,7 +23,10 @@ use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use lance_core::{io::Reader, Error, Result, ROW_ID_FIELD};
-use lance_index::vector::{Query, DIST_COL};
+use lance_index::{
+    vector::{Query, DIST_COL},
+    Index,
+};
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
 use serde::Serialize;
@@ -40,7 +43,6 @@ use crate::{
     index::{
         prefilter::PreFilter,
         vector::graph::{GraphReadParams, PersistedGraph},
-        Index,
     },
 };
 
@@ -205,8 +207,12 @@ impl Index for DiskANNIndex {
         self
     }
 
-    fn statistics(&self) -> Result<serde_json::Value> {
-        Ok(serde_json::to_value(DiskANNIndexStatistics {
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+
+    fn statistics(&self) -> Result<String> {
+        Ok(serde_json::to_string(&DiskANNIndexStatistics {
             index_type: "DiskANNIndex".to_string(),
             length: self.graph.len(),
         })?)

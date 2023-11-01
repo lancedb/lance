@@ -14,20 +14,20 @@
 
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use snafu::{location, Location};
 
 use lance_core::{
     io::{
         object_store::ObjectStore, writer::FileWriterOptions, FileReader, FileWriter,
         ReadBatchParams,
     },
-    Error, Result,
+    Result,
 };
+use object_store::path::Path;
 
 use super::{IndexReader, IndexStore, IndexWriter};
 
@@ -39,12 +39,12 @@ use super::{IndexReader, IndexStore, IndexWriter};
 #[derive(Debug)]
 pub struct LanceIndexStore {
     object_store: ObjectStore,
-    index_dir: PathBuf,
+    index_dir: Path,
 }
 
 impl LanceIndexStore {
     /// Create a new index store at the given directory
-    pub fn new(object_store: ObjectStore, index_dir: PathBuf) -> Self {
+    pub fn new(object_store: ObjectStore, index_dir: Path) -> Self {
         Self {
             object_store,
             index_dir,
@@ -80,12 +80,7 @@ impl IndexStore for LanceIndexStore {
         name: &str,
         schema: Arc<Schema>,
     ) -> Result<Box<dyn IndexWriter>> {
-        let path = self.index_dir.join(name);
-        let path = path.as_os_str().to_str().ok_or_else(|| Error::Internal {
-            message: format!("Could not parse path {path:?}"),
-            location: location!(),
-        })?;
-        let path = object_store::path::Path::parse(path)?;
+        let path = self.index_dir.child(name);
         let schema = schema.as_ref().try_into()?;
         let writer = FileWriter::try_new(
             &self.object_store,
@@ -98,12 +93,7 @@ impl IndexStore for LanceIndexStore {
     }
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
-        let path = self.index_dir.join(name);
-        let path = path.as_os_str().to_str().ok_or_else(|| Error::Internal {
-            message: format!("Could not parse {path:?}"),
-            location: location!(),
-        })?;
-        let path = object_store::path::Path::parse(path)?;
+        let path = self.index_dir.child(name);
         let file_reader = FileReader::try_new(&self.object_store, &path).await?;
         Ok(Arc::new(file_reader))
     }
@@ -115,7 +105,7 @@ mod tests {
     use std::{ops::Bound, path::Path};
 
     use crate::scalar::{
-        btree::{train_btree_index, BTreeIndex},
+        btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
         flat::FlatIndexTrainer,
         ScalarIndex, ScalarQuery,
     };
@@ -129,14 +119,17 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use arrow_select::take::TakeOptions;
     use datafusion_common::ScalarValue;
-    use futures::stream;
+    use futures::{
+        stream::{self, BoxStream},
+        StreamExt,
+    };
     use lance_core::{io::object_store::ObjectStoreParams, Error};
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path: &Path = tempdir.path();
-        let (object_store, _) = ObjectStore::from_path(
+        let (object_store, test_path) = ObjectStore::from_path(
             test_path.as_os_str().to_str().unwrap(),
             &ObjectStoreParams::default(),
         )
@@ -144,14 +137,34 @@ mod tests {
         Arc::new(LanceIndexStore::new(object_store, test_path.to_owned()))
     }
 
+    struct MockTrainingSource<R: RecordBatchReader + Send + Sync + 'static> {
+        data: R,
+    }
+
+    impl<R: RecordBatchReader + Send + Sync + 'static> MockTrainingSource<R> {
+        fn new(data: R) -> Self {
+            Self { data }
+        }
+    }
+
+    #[async_trait]
+    impl<R: RecordBatchReader + Send + Sync + 'static> BtreeTrainingSource for MockTrainingSource<R> {
+        async fn scan_ordered_chunks(
+            self: Box<Self>,
+            _chunk_size: u32,
+        ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+            Ok(stream::iter(self.data.map(|batch| batch.map_err(Error::from))).boxed())
+        }
+    }
+
     async fn train_index(
         index_store: &Arc<dyn IndexStore>,
-        data: impl RecordBatchReader,
+        data: impl RecordBatchReader + Send + Sync + 'static,
         value_type: DataType,
     ) {
         let sub_index_trainer = FlatIndexTrainer::new(value_type);
 
-        let data = stream::iter(data.map(|batch| batch.map_err(Error::from)));
+        let data = Box::new(MockTrainingSource::new(data));
         train_btree_index(data, &sub_index_trainer, index_store.as_ref())
             .await
             .unwrap();
@@ -518,7 +531,7 @@ mod tests {
         let data = RecordBatchIterator::new(batches, schema);
         let sub_index_trainer = FlatIndexTrainer::new(DataType::Float32);
 
-        let data = stream::iter(data.map(|batch| batch.map_err(Error::from)));
+        let data = Box::new(MockTrainingSource::new(data));
         // Until DF handles NaN reliably we need to make sure we reject input
         // containing NaN
         assert!(

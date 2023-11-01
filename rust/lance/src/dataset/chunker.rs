@@ -21,8 +21,8 @@ use futures::{Stream, StreamExt};
 
 use crate::Result;
 
-/// Wraps a [`RecordBatchReader`] into an iterator of RecordBatch chunks of a given size.
-/// This slices but does not copy any buffers.
+/// Wraps a [`SendableRecordBatchStream`] into a stream of RecordBatch chunks of
+/// a given size.  This slices but does not copy any buffers.
 struct BatchReaderChunker {
     /// The inner stream
     inner: SendableRecordBatchStream,
@@ -108,7 +108,7 @@ impl BatchReaderChunker {
     }
 }
 
-pub(super) fn chunk_stream(
+pub fn chunk_stream(
     stream: SendableRecordBatchStream,
     chunk_size: usize,
 ) -> Pin<Box<dyn Stream<Item = Result<Vec<RecordBatch>>> + Send>> {

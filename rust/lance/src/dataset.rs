@@ -47,7 +47,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::instrument;
 
-mod chunker;
+pub(crate) mod chunker;
 pub mod cleanup;
 mod feature_flags;
 pub mod fragment;
@@ -70,7 +70,7 @@ use crate::dataset::index::unindexed_fragments;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{Fragment, Index, Manifest};
-use crate::index::vector::open_index;
+use crate::index::DatasetIndexExt;
 use crate::io::commit::{commit_new_dataset, commit_transaction};
 use crate::session::Session;
 
@@ -1308,11 +1308,12 @@ impl Dataset {
             .map(|idx| idx.uuid.to_string());
 
         if let Some(index_uuid) = index_uuid {
-            let index_statistics = open_index(Arc::new(self.clone()), "vector", &index_uuid)
+            let index_statistics = self
+                .open_generic_index("vector", &index_uuid)
                 .await?
                 .statistics()
                 .unwrap();
-            Ok(Some(serde_json::to_string(&index_statistics).unwrap()))
+            Ok(Some(index_statistics))
         } else {
             Ok(None)
         }
@@ -1492,6 +1493,7 @@ mod tests {
     use crate::arrow::FixedSizeListArrayExt;
     use crate::dataset::WriteMode::Overwrite;
     use crate::datatypes::Schema;
+    use crate::index::scalar::ScalarIndexParams;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, IndexType};
     use crate::io::deletion::read_deletion_file;
 
@@ -1508,6 +1510,7 @@ mod tests {
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
     use lance_core::format::WriterVersion;
+    use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::vector::DIST_COL;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
@@ -2438,14 +2441,19 @@ mod tests {
         assert_eq!(fragment_bitmap.len(), 1);
         assert!(fragment_bitmap.contains(0));
 
-        let expected_statistics =
-            "{\"index_type\":\"IVF\",\"metric_type\":\"l2\",\"num_partitions\":10";
-        let actual_statistics = dataset
-            .index_statistics("embeddings_idx")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(actual_statistics.starts_with(expected_statistics));
+        let actual_statistics: serde_json::value::Value = serde_json::from_str(
+            &dataset
+                .index_statistics("embeddings_idx")
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        dbg!(&actual_statistics);
+        let actual_statistics = actual_statistics.as_object().unwrap();
+        assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF");
+        assert_eq!(actual_statistics["metric_type"].as_str().unwrap(), "l2");
+        assert_eq!(actual_statistics["num_partitions"].as_i64().unwrap(), 10);
 
         assert_eq!(
             dataset.index_statistics("non-existent_idx").await.unwrap(),
@@ -2470,6 +2478,44 @@ mod tests {
         let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
         assert_eq!(fragment_bitmap.len(), 1);
         assert!(fragment_bitmap.contains(0));
+    }
+
+    #[tokio::test]
+    async fn test_create_scalar_index() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = gen().col(Some("int".to_string()), array::step::<Int32Type>());
+        // Write 64Ki rows.  We should get 16 4Ki pages
+        let mut dataset = Dataset::write(
+            data.into_reader_rows(RowCount::from(16 * 1024), BatchCount::from(4)),
+            test_uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let index_name = "my_index".to_string();
+
+        dataset
+            .create_index(
+                &["int"],
+                IndexType::Scalar,
+                Some(index_name.clone()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let index = dataset.load_index_by_name(&index_name).await.unwrap();
+
+        assert_eq!(index.dataset_version, 1);
+        assert_eq!(index.fields, vec![0]);
+        assert_eq!(index.name, index_name);
+
+        let statistics = dataset.index_statistics(&index_name).await.unwrap();
+        dbg!(&statistics);
     }
 
     async fn create_bad_file() -> Result<Dataset> {
