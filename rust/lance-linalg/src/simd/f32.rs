@@ -19,9 +19,8 @@ use std::fmt::Formatter;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::{
     float32x4x2_t, float32x4x4_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32_x2,
-    vmulq_f32, vst1q_f32_x2, vsubq_f32,
+    vld1q_f32_x4, vmulq_f32, vst1q_f32_x2, vst1q_f32_x4, vsubq_f32,
 };
-use std::arch::aarch64::{vld1q_f32_x4, vst1q_f32_x4};
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
@@ -227,13 +226,13 @@ impl Mul for f32x8 {
     }
 }
 
-/// 8 of 32-bit `f32` values. Use 256-bit SIMD if possible.
+/// 16 of 32-bit `f32` values. Use 512-bit SIMD if possible.
 #[allow(non_camel_case_types)]
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 pub struct f32x16(__m256, __m256);
 
-/// 8 of 32-bit `f32` values. Use 256-bit SIMD if possible.
+/// 16 of 32-bit `f32` values. Use 512-bit SIMD if possible.
 #[allow(non_camel_case_types)]
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
@@ -330,7 +329,6 @@ impl SIMD<f32> for f32x16 {
             self.0 .2 = vfmaq_f32(self.0 .2, a.0 .2, b.0 .2);
             self.0 .3 = vfmaq_f32(self.0 .3, a.0 .3, b.0 .3);
         }
-        todo!()
     }
 
     fn reduce_sum(&self) -> f32 {
@@ -355,6 +353,105 @@ impl SIMD<f32> for f32x16 {
             let sum2 = vaddq_f32(self.0 .2, self.0 .3);
             sum1 = vaddq_f32(sum1, sum2);
             vaddvq_f32(sum1)
+        }
+    }
+}
+
+impl Add for f32x16 {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: Self) -> Self::Output {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_add_ps(self.0, rhs.0), _mm256_add_ps(self.1, rhs.1))
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            Self(float32x4x4_t(
+                vaddq_f32(self.0 .0, rhs.0 .0),
+                vaddq_f32(self.0 .1, rhs.0 .1),
+                vaddq_f32(self.0 .2, rhs.0 .2),
+                vaddq_f32(self.0 .3, rhs.0 .3),
+            ))
+        }
+    }
+}
+
+impl AddAssign for f32x16 {
+    #[inline]
+    fn add_assign(&mut self, rhs: Self) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            self.0 = _mm256_add_ps(self.0, rhs.0);
+            self.1 = _mm256_add_ps(self.1, rhs.1);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            self.0 .0 = vaddq_f32(self.0 .0, rhs.0 .0);
+            self.0 .1 = vaddq_f32(self.0 .1, rhs.0 .1);
+            self.0 .2 = vaddq_f32(self.0 .2, rhs.0 .2);
+            self.0 .3 = vaddq_f32(self.0 .3, rhs.0 .3);
+        }
+    }
+}
+
+impl Mul for f32x16 {
+    type Output = Self;
+
+    #[inline]
+    fn mul(self, rhs: Self) -> Self::Output {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_mul_ps(self.0, rhs.0))
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            Self(float32x4x4_t(
+                vmulq_f32(self.0 .0, rhs.0 .0),
+                vmulq_f32(self.0 .1, rhs.0 .1),
+                vmulq_f32(self.0 .2, rhs.0 .2),
+                vmulq_f32(self.0 .3, rhs.0 .3),
+            ))
+        }
+    }
+}
+
+impl Sub for f32x16 {
+    type Output = Self;
+
+    #[inline]
+    fn sub(self, rhs: Self) -> Self::Output {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_sub_ps(self.0, rhs.0), _mm256_sub_ps(self.1, rhs.1))
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            Self(float32x4x4_t(
+                vsubq_f32(self.0 .0, rhs.0 .0),
+                vsubq_f32(self.0 .1, rhs.0 .1),
+                vsubq_f32(self.0 .2, rhs.0 .2),
+                vsubq_f32(self.0 .3, rhs.0 .3),
+            ))
+        }
+    }
+}
+
+impl SubAssign for f32x16 {
+    #[inline]
+    fn sub_assign(&mut self, rhs: Self) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            self.0 = _mm256_sub_ps(self.0, rhs.0);
+            self.1 = _mm256_sub_ps(self.1, rhs.1);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            self.0 .0 = vsubq_f32(self.0 .0, rhs.0 .0);
+            self.0 .1 = vsubq_f32(self.0 .1, rhs.0 .1);
+            self.0 .2 = vsubq_f32(self.0 .2, rhs.0 .2);
+            self.0 .3 = vsubq_f32(self.0 .3, rhs.0 .3);
         }
     }
 }
