@@ -37,6 +37,9 @@ pub trait SIMD<T: Float>:
     /// Create a new instance with all lanes set to `val`.
     fn splat(val: T) -> Self;
 
+    /// Create a new instance with all lanes set to zero.
+    fn zeros() -> Self;
+
     /// Load aligned data from aligned memory.
     ///
     /// # Safety

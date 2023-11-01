@@ -61,6 +61,15 @@ impl SIMD<f32> for f32x8 {
         }
     }
 
+    fn zeros() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_setzero_ps())
+        }
+        #[cfg(target_arch = "aarch64")]
+        Self::splat(0.0)
+    }
+
     #[inline]
     unsafe fn load(ptr: *const f32) -> Self {
         #[cfg(target_arch = "x86_64")]
@@ -264,6 +273,16 @@ impl SIMD<f32> for f32x16 {
                 vdupq_n_f32(val),
             ))
         }
+    }
+
+    #[inline]
+    fn zeros() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_setzero_ps(), _mm256_setzero_ps())
+        }
+        #[cfg(target_arch = "aarch64")]
+        Self::splat(0.0)
     }
 
     #[inline]
@@ -476,6 +495,25 @@ mod tests {
 
         assert_eq!(
             "f32x8([100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0])",
+            format!("{:?}", simd_power)
+        );
+    }
+
+    #[test]
+    fn test_basic_f32x16_ops() {
+        let a = (0..16).map(|f| f as f32).collect::<Vec<_>>();
+        let b = (10..26).map(|f| f as f32).collect::<Vec<_>>();
+
+        let mut simd_a = unsafe { f32x16::load_unaligned(a.as_ptr()) };
+        let simd_b = unsafe { f32x16::load_unaligned(b.as_ptr()) };
+        simd_a -= simd_b;
+        assert_eq!(simd_a.reduce_sum(), -160.0);
+
+        let mut simd_power = f32x16::splat(0.0);
+        simd_power.multiply_add(simd_a, simd_a);
+
+        assert_eq!(
+            format!("f32x16({:?})", [100.0; 16]),
             format!("{:?}", simd_power)
         );
     }
