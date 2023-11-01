@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::simd::{
+    f32::{f32x16, f32x8},
+    SIMD,
+};
 use half::{bf16, f16};
 use num_traits::Float;
 
@@ -48,20 +52,25 @@ impl Normalize<f32> for &[f32] {
 
     #[inline]
     fn norm_l2(&self) -> Self::Output {
-        #[cfg(target_arch = "aarch64")]
-        {
-            aarch64::neon::norm_l2(self)
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("fma") {
-                return x86_64::avx::norm_l2_f32(self);
+        let dim = self.len();
+        if dim % 16 == 0 {
+            let mut sum = f32x16::zeros();
+            for i in (0..dim).step_by(16) {
+                let x = unsafe { f32x16::load_unaligned(self.as_ptr().add(i)) };
+                sum += x * x;
             }
+            sum.reduce_sum().sqrt()
+        } else if dim % 8 == 0 {
+            let mut sum = f32x8::zeros();
+            for i in (0..dim).step_by(8) {
+                let x = unsafe { f32x8::load_unaligned(self.as_ptr().add(i)) };
+                sum += x * x;
+            }
+            sum.reduce_sum().sqrt()
+        } else {
+            // Fallback to scalar
+            return self.iter().map(|v| v * v).sum::<f32>().sqrt();
         }
-
-        #[cfg(not(target_arch = "aarch64"))]
-        self.iter().map(|v| v * v).sum::<f32>().sqrt()
     }
 }
 
@@ -80,67 +89,7 @@ impl Normalize<f64> for &[f64] {
 /// Arrow Arrays, i.e., Float32Array
 #[inline]
 pub fn norm_l2(vector: &[f32]) -> f32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        aarch64::neon::norm_l2(vector)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("fma") {
-            return x86_64::avx::norm_l2_f32(vector);
-        }
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    vector.iter().map(|v| v * v).sum::<f32>().sqrt()
-}
-
-#[cfg(target_arch = "x86_64")]
-mod x86_64 {
-
-    pub mod avx {
-        use crate::distance::x86_64::avx::*;
-        use std::arch::x86_64::*;
-
-        #[inline]
-        pub fn norm_l2_f32(vector: &[f32]) -> f32 {
-            let len = vector.len() / 8 * 8;
-            let mut sum = unsafe {
-                let mut sums = _mm256_setzero_ps();
-                vector.chunks_exact(8).for_each(|chunk| {
-                    let x = _mm256_loadu_ps(chunk.as_ptr());
-                    sums = _mm256_fmadd_ps(x, x, sums);
-                });
-                add_f32_register(sums)
-            };
-            sum += vector[len..].iter().map(|v| v * v).sum::<f32>();
-            sum.sqrt()
-        }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-mod aarch64 {
-    pub mod neon {
-        use std::arch::aarch64::*;
-
-        #[inline]
-        pub fn norm_l2(vector: &[f32]) -> f32 {
-            let len = vector.len() / 4 * 4;
-            let mut sum = unsafe {
-                let buf = [0.0_f32; 4];
-                let mut sum = vld1q_f32(buf.as_ptr());
-                for i in (0..len).step_by(4) {
-                    let x = vld1q_f32(vector.as_ptr().add(i));
-                    sum = vfmaq_f32(sum, x, x);
-                }
-                vaddvq_f32(sum)
-            };
-            sum += vector[len..].iter().map(|v| v.powi(2)).sum::<f32>();
-            sum.sqrt()
-        }
-    }
+    vector.norm_l2()
 }
 
 #[cfg(test)]
