@@ -102,7 +102,9 @@ mod tests {
         let mat: MatrixView<Float32Type> = arr.as_ref().try_into().unwrap();
 
         let params = PQBuildParams::new(1, 8);
-        let pq = ProductQuantizer::train(&mat, MetricType::L2, &params).await.unwrap();
+        let pq = ProductQuantizer::train(&mat, MetricType::L2, &params)
+            .await
+            .unwrap();
 
         let schema = Schema::new(vec![
             Field::new(

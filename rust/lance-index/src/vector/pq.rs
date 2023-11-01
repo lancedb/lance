@@ -345,7 +345,11 @@ impl ProductQuantizer {
     }
 
     /// Train [`ProductQuantizer`] using vectors.
-    pub async fn train(data: &MatrixView<Float32Type>, metric_type: MetricType, params: &PQBuildParams) -> Result<Self> {
+    pub async fn train(
+        data: &MatrixView<Float32Type>,
+        metric_type: MetricType,
+        params: &PQBuildParams,
+    ) -> Result<Self> {
         if data.num_columns() % params.num_sub_vectors != 0 {
             return Err(Error::Index {
                 message: format!(
@@ -513,7 +517,9 @@ mod tests {
         // A 16-dim array.
         let dim = 16;
         let mat = MatrixView::new(values.into(), dim);
-        let pq = ProductQuantizer::train(&mat, MetricType::L2, &params).await.unwrap();
+        let pq = ProductQuantizer::train(&mat, MetricType::L2, &params)
+            .await
+            .unwrap();
 
         // Init centroids
         let centroids = pq.codebook.clone();
@@ -531,7 +537,9 @@ mod tests {
             let code = actual_pq.transform(&mat).await.unwrap();
             actual_pq.reset_centroids(&mat, &code).unwrap();
             params.codebook = Some(actual_pq.codebook.clone());
-            actual_pq = ProductQuantizer::train(&mat, MetricType::L2, &params).await.unwrap();
+            actual_pq = ProductQuantizer::train(&mat, MetricType::L2, &params)
+                .await
+                .unwrap();
         }
 
         let result = pq.codebook;

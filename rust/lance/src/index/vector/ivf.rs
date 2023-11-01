@@ -1467,7 +1467,8 @@ mod tests {
         let codebook = Arc::new(generate_random_array(256 * DIM));
         let pq_params = PQBuildParams::with_codebook(4, 8, codebook);
 
-        let params = VectorIndexParams::with_ivf_pq_params(MetricType::Cosine, ivf_params, pq_params);
+        let params =
+            VectorIndexParams::with_ivf_pq_params(MetricType::Cosine, ivf_params, pq_params);
 
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
@@ -1490,8 +1491,11 @@ mod tests {
         assert_eq!(5, results[0].num_rows());
         for batch in results.iter() {
             let dist = &batch["_distance"];
-            assert!(dist.as_primitive::<Float32Type>().values().iter().all(|v| *v >= 0.0 && *v < 1.0));
+            assert!(dist
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|v| *v >= 0.0 && *v < 1.0));
         }
     }
-
 }
