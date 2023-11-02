@@ -24,7 +24,8 @@ implementation for Lance.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Union
+from functools import partial
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -265,5 +266,119 @@ def lance_fragments(dataset: Union[str, Path, LanceDataset]) -> tf.data.Dataset:
     )
 
 
+def _ith_batch(i: int, batch_size: int, total_size: int) -> Tuple[int, int]:
+    """
+    Get the start and end index of the ith batch.
+
+    This takes into account the total_size, the total number of rows in the dataset.
+    """
+    start = i * batch_size
+    end = tf.math.minimum(start + batch_size, total_size)
+    return (start, end)
+
+
+def from_lance_batches(
+    dataset: Union[str, Path, LanceDataset],
+    *,
+    shuffle: bool = False,
+    seed: Optional[int] = None,
+    batch_size: int = 1024,
+    skip: int = 0,
+) -> tf.data.Dataset:
+    """
+    Create a ``tf.data.Dataset`` of batch indices for a Lance dataset.
+
+    Parameters
+    ----------
+    dataset : Union[str, Path, LanceDataset]
+        A Lance Dataset or dataset URI/path.
+    shuffle : bool, optional
+        Shuffle the batches, by default False
+    seed : Optional[int], optional
+        Random seed for shuffling, by default None
+    batch_size : int, optional
+        Batch size, by default 1024
+    skip : int, optional
+        Number of batches to skip.
+
+    Returns
+    -------
+    tf.data.Dataset
+        A tensorflow dataset of batch slice ranges. These can be passed to
+        :func:`lance_take_batches` to create a Tensorflow dataset of batches.
+    """
+    if not isinstance(dataset, LanceDataset):
+        dataset = lance.dataset(dataset)
+    num_rows = dataset.count_rows()
+    num_batches = (num_rows + batch_size - 1) // batch_size
+    indices = tf.data.Dataset.range(num_batches, dtype=tf.int64)
+    if shuffle:
+        indices = indices.shuffle(num_batches, seed=seed)
+    if skip > 0:
+        indices = indices.skip(skip)
+    return indices.map(partial(_ith_batch, batch_size=batch_size, total_size=num_rows))
+
+
+def lance_take_batches(
+    dataset: Union[str, Path, LanceDataset],
+    batch_ranges: Iterable[Tuple[int, int]],
+    *,
+    columns: Optional[List[str]] = None,
+    output_signature: Optional[Dict[str, tf.TypeSpec]] = None,
+) -> tf.data.Dataset:
+    """
+    Create a ``tf.data.Dataset`` of batches from a Lance dataset.
+
+    Parameters
+    ----------
+    dataset : Union[str, Path, LanceDataset]
+        A Lance Dataset or dataset URI/path.
+    batch_ranges : Iterable[Tuple[int, int]]
+        Iterable of batch indices.
+    columns : Optional[List[str]], optional
+        List of columns to include in the output dataset.
+        If not set, all columns will be read.
+    output_signature : Optional[tf.TypeSpec], optional
+        Override output signature of the returned tensors. If not provided,
+        the output signature is inferred from the projection Schema.
+
+    Examples
+    --------
+    You can compose this with ``from_lance_batches`` to create a randomized Tensorflow
+    dataset. With ``from_lance_batches``, you can deterministically randomized the
+    batches by setting ``seed``.
+
+    .. code-block:: python
+
+        batch_iter = from_lance_batches(dataset, batch_size=100, shuffle=True, seed=200)
+        batch_iter = batch_iter.as_numpy_iterator()
+        lance_ds = lance_take_batches(dataset, batch_iter)
+        lance_ds = lance_ds.unbatch().shuffle(500, seed=42).batch(100)
+    """
+    if not isinstance(dataset, LanceDataset):
+        dataset = lance.dataset(dataset)
+
+    if output_signature is None:
+        schema = dataset.scanner(columns=columns).projected_schema
+        output_signature = schema_to_spec(schema)
+    logging.debug("Output signature: %s", output_signature)
+
+    def gen_batches():
+        # TODO: provide an implementation that does readahead.
+        for index_range in batch_ranges:
+            start, end = index_range
+            indices = list(range(start, end))
+            batch = dataset.take(indices, columns=columns)
+            yield {
+                name: column_to_tensor(batch[name], output_signature[name])
+                for name in batch.schema.names
+            }
+
+    return tf.data.Dataset.from_generator(
+        gen_batches, output_signature=output_signature
+    )
+
+
 # Register `from_lance` to ``tf.data.Dataset``.
 tf.data.Dataset.from_lance = from_lance
+tf.data.Dataset.from_lance_batches = from_lance_batches
