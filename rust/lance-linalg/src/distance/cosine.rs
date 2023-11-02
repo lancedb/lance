@@ -244,7 +244,11 @@ mod f32 {
 
     // TODO: how can we explicity infer F and N?
     #[inline]
-    pub(super) fn cosine_once<S: SIMD<F, N>, F: Float, const N: usize>(x: &[F], x_norm: F, y: &[F]) -> F {
+    pub(super) fn cosine_once<S: SIMD<F, N>, F: Float, const N: usize>(
+        x: &[F],
+        x_norm: F,
+        y: &[F],
+    ) -> F {
         let x = unsafe { S::load_unaligned(x.as_ptr()) };
         let y = unsafe { S::load_unaligned(y.as_ptr()) };
         let y2 = y * y;

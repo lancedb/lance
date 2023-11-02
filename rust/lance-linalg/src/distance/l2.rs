@@ -139,7 +139,7 @@ mod f32 {
     use num_traits::Float;
 
     #[inline]
-    pub(crate) fn l2_once<S: SIMD<F, N>, F: Float, const N: usize>(x: &[F], y: &[F]) -> F {
+    pub(crate) fn l2_once<F: Float, S = SIMD<F, 16>>(x: &[F], y: &[F]) -> F {
         debug_assert_eq!(x.len(), S::LANES);
         debug_assert_eq!(y.len(), S::LANES);
         let x = unsafe { S::load_unaligned(x.as_ptr()) };
@@ -172,7 +172,7 @@ pub fn l2_distance_batch<'a>(
     match dimension {
         8 => Box::new(
             to.chunks_exact(dimension)
-                .map(move |v| l2_once::<f32x8, f32, 8>(from, v)),
+                .map(move |v| l2_once::<f32x8>(from, v)),
         ),
         16 => Box::new(
             to.chunks_exact(dimension)
