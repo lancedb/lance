@@ -140,10 +140,11 @@ impl Cosine for [f32] {
                 y_norm8.multiply_add(y, y);
             }
         }
-        let y_norm = y_norm16.reduce_sum() + y_norm8.reduce_sum() + norm_l2(&other[aligned_len..]);
+        let y_norm =
+            y_norm16.reduce_sum() + y_norm8.reduce_sum() + norm_l2(&other[aligned_len..]).powi(2);
         let xy =
             xy16.reduce_sum() + xy8.reduce_sum() + dot(&self[aligned_len..], &other[aligned_len..]);
-        xy / x_norm / y_norm.sqrt()
+        1.0 - xy / x_norm / y_norm.sqrt()
     }
 
     #[inline]
@@ -174,7 +175,7 @@ impl Cosine for [f32] {
         }
         let xy =
             xy16.reduce_sum() + xy8.reduce_sum() + dot(&self[aligned_len..], &y[aligned_len..]);
-        xy / x_norm / y_norm
+        1.0 - xy / x_norm / y_norm
     }
 }
 
@@ -251,7 +252,7 @@ mod f32 {
         let y = unsafe { S::load_unaligned(y.as_ptr()) };
         let y2 = y * y;
         let xy = x * y;
-        xy.reduce_sum() / x_norm / y2.reduce_sum()
+        1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt()
     }
 }
 

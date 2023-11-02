@@ -14,6 +14,8 @@
 
 //! High-performance [Apache Arrow](https://docs.rs/arrow/latest/arrow/) native Linear Algebra algorithms.
 
+#![feature(core_intrinsics)]
+
 pub mod distance;
 pub mod kernels;
 pub mod kmeans;
