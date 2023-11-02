@@ -151,7 +151,7 @@ mod tests {
     ) {
         let sub_index_trainer = FlatIndexTrainer::new(value_type);
 
-        let data = stream::iter(data.map(|batch| batch.map_err(|err| Error::from(err))));
+        let data = stream::iter(data.map(|batch| batch.map_err(Error::from)));
         train_btree_index(data, &sub_index_trainer, index_store.as_ref())
             .await
             .unwrap();
@@ -443,7 +443,7 @@ mod tests {
             let tempdir = tempdir().unwrap();
             let index_store = test_store(&tempdir);
             let data: RecordBatch = gen()
-                .col(Some("values".to_string()), array::rand_type(&data_type))
+                .col(Some("values".to_string()), array::rand_type(data_type))
                 .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
                 .into_batch_rows(RowCount::from(4096 * 3))
                 .unwrap();
@@ -476,9 +476,7 @@ mod tests {
             let batch_two = sorted_batch.slice(4096, 4096);
             let batch_three = sorted_batch.slice(8192, 4096);
             let training_data = RecordBatchIterator::new(
-                vec![batch_one, batch_two, batch_three]
-                    .into_iter()
-                    .map(|x| Ok(x)),
+                vec![batch_one, batch_two, batch_three].into_iter().map(Ok),
                 data.schema().clone(),
             );
 
@@ -492,7 +490,7 @@ mod tests {
 
             // The random data may have had duplicates so there might be more than 1 result
             // but even for boolean we shouldn't match the entire thing
-            assert!(row_ids.len() >= 1);
+            assert!(!row_ids.is_empty());
             assert!(row_ids.len() < data.num_rows());
             assert!(row_ids.values().iter().any(|val| *val == sample_row_id));
         }
@@ -520,7 +518,7 @@ mod tests {
         let data = RecordBatchIterator::new(batches, schema);
         let sub_index_trainer = FlatIndexTrainer::new(DataType::Float32);
 
-        let data = stream::iter(data.map(|batch| batch.map_err(|err| Error::from(err))));
+        let data = stream::iter(data.map(|batch| batch.map_err(Error::from)));
         // Until DF handles NaN reliably we need to make sure we reject input
         // containing NaN
         assert!(
