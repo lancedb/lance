@@ -531,7 +531,7 @@ impl TryFrom<&pb::Ivf> for Ivf {
             debug!("Ivf: loading IVF centroids from index format v2");
             Arc::new(FixedSizeListArray::try_from(tensor)?)
         } else {
-            warn!("Ivf: loading IVF centroids from index format v1");
+            debug!("Ivf: loading IVF centroids from index format v1");
             // For backward-compatibility
             let f32_centroids = Float32Array::from(proto.centroids.clone());
             let dimension = f32_centroids.len() / proto.offsets.len();
