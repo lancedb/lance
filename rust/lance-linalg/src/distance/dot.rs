@@ -21,7 +21,10 @@ use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, 
 use half::{bf16, f16};
 use num_traits::real::Real;
 
-use crate::simd::SIMD;
+use crate::simd::{
+    f32::{f32x16, f32x8},
+    SIMD,
+};
 
 /// Naive implementation of dot product.
 #[inline]
@@ -57,33 +60,28 @@ impl Dot for [f32] {
     type Output = f32;
 
     fn dot(&self, other: &[f32]) -> f32 {
-        use crate::simd::f32::f32x8;
-
         let dim = self.len();
         let unrolling_len = dim / 16 * 16;
-        let mut sum1 = f32x8::splat(0.0);
-        let mut sum2 = f32x8::splat(0.0);
+        let mut sum16 = f32x16::zeros();
         for i in (0..unrolling_len).step_by(16) {
             unsafe {
-                let x1 = f32x8::load_unaligned(self.as_ptr().add(i));
-                let x2 = f32x8::load_unaligned(self.as_ptr().add(i + 8));
-                let y1 = f32x8::load_unaligned(other.as_ptr().add(i));
-                let y2 = f32x8::load_unaligned(other.as_ptr().add(i + 8));
-                sum1.multiply_add(x1, y1);
-                sum2.multiply_add(x2, y2);
+                let x = f32x16::load_unaligned(self.as_ptr().add(i));
+                let y = f32x16::load_unaligned(other.as_ptr().add(i));
+                sum16.multiply_add(x, y);
             }
         }
 
         let aligned_len = dim / 8 * 8;
+        let mut sum8 = f32x8::zeros();
         for i in (unrolling_len..aligned_len).step_by(8) {
             unsafe {
                 let x = f32x8::load_unaligned(self.as_ptr().add(i));
                 let y = f32x8::load_unaligned(other.as_ptr().add(i));
-                sum1.multiply_add(x, y);
+                sum8.multiply_add(x, y);
             }
         }
 
-        let mut sum = (sum1 + sum2).reduce_sum();
+        let mut sum = sum16.reduce_sum() + sum8.reduce_sum();
         if aligned_len < dim {
             sum += dot(&self[aligned_len..], &other[aligned_len..]);
         }

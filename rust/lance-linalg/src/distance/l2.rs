@@ -18,6 +18,7 @@
 use std::iter::Sum;
 use std::sync::Arc;
 
+use crate::distance::l2::f32::l2_once;
 use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
 use num_traits::real::Real;
@@ -131,6 +132,21 @@ pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
     from.l2(to)
 }
 
+// f32 kernels for L2
+mod f32 {
+    use super::*;
+
+    #[inline]
+    pub(crate) fn l2_once<S: SIMD<f32, N>, const N: usize>(x: &[f32], y: &[f32]) -> f32 {
+        debug_assert_eq!(x.len(), N);
+        debug_assert_eq!(y.len(), N);
+        let x = unsafe { S::load_unaligned(x.as_ptr()) };
+        let y = unsafe { S::load_unaligned(y.as_ptr()) };
+        let s = x - y;
+        (s * s).reduce_sum()
+    }
+}
+
 /// Compute L2 distance between a vector and a batch of vectors.
 ///
 /// Parameters
@@ -138,6 +154,10 @@ pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
 /// - `from`: the vector to compute distance from.
 /// - `to`: a list of vectors to compute distance to.
 /// - `dimension`: the dimension of the vectors.
+///
+/// Returns
+///
+/// An iterator of pair-wise distance between `from` vector to each vector in the batch.
 pub fn l2_distance_batch<'a>(
     from: &'a [f32],
     to: &'a [f32],
@@ -146,7 +166,18 @@ pub fn l2_distance_batch<'a>(
     debug_assert_eq!(from.len(), dimension);
     debug_assert_eq!(to.len() % dimension, 0);
 
-    Box::new(to.chunks_exact(dimension).map(|v| from.l2(v)))
+    // Dispatch based on the dimension.
+    match dimension {
+        8 => Box::new(
+            to.chunks_exact(dimension)
+                .map(move |v| l2_once::<f32x8, 8>(from, v)),
+        ),
+        16 => Box::new(
+            to.chunks_exact(dimension)
+                .map(move |v| l2_once::<f32x16, 16>(from, v)),
+        ),
+        _ => Box::new(to.chunks_exact(dimension).map(|v| from.l2(v))),
+    }
 }
 
 /// Compute L2 distance between a vector and a batch of vectors.

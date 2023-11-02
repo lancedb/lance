@@ -27,6 +27,8 @@ use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 use tracing::instrument;
 
+use crate::distance::l2_distance_batch;
+use crate::kernels::argmin_value_float;
 use crate::{
     distance::{Cosine, Dot, MetricType, Normalize, L2},
     kernels::{argmin, argmin_value},
@@ -545,9 +547,10 @@ fn compute_partitions_l2_f32_small<'a>(
     data: &'a [f32],
     dim: usize,
 ) -> Box<dyn Iterator<Item = (u32, f32)> + 'a> {
-    Box::new(data.chunks(dim).map(move |row| {
-        argmin_value(centroids.chunks(dim).map(|centroid| row.l2(centroid))).unwrap()
-    }))
+    Box::new(
+        data.chunks(dim)
+            .map(move |row| argmin_value_float(l2_distance_batch(row, centroids, dim))),
+    )
 }
 
 /// Fast partition computation for L2 distance.
