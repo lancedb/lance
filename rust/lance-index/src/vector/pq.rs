@@ -14,7 +14,6 @@
 
 use std::sync::Arc;
 
-use arrow_arith::aggregate::min;
 use arrow_array::{
     builder::Float32Builder, cast::AsArray, types::Float32Type, Array, FixedSizeListArray,
     Float32Array, UInt8Array,
