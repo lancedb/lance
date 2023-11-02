@@ -704,4 +704,24 @@ mod tests {
             format!("{:?}", simd_power)
         );
     }
+
+    #[test]
+    fn test_f32x16_cmp_ops() {
+        let a = [
+            1.0_f32, 2.0, 5.0, 6.0, 7.0, 3.0, 2.0, 1.0, -0.5, 5.0, 6.0, 7.0, 8.0, 9.0, 1.0, 2.0,
+        ];
+        let b = [
+            2.0_f32, 1.0, 4.0, 5.0, 9.0, 5.0, 6.0, 2.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 2.0, 1.0,
+        ];
+        let simd_a: f32x16 = (&a).into();
+        let simd_b: f32x16 = (&b).into();
+
+        let min_simd = simd_a.min(&simd_b);
+        assert_eq!(
+            min_simd.as_array(),
+            [1.0, 1.0, 4.0, 5.0, 7.0, 3.0, 2.0, 1.0, -0.5, 5.0, 6.0, 7.0, 8.0, 9.0, 1.0, 1.0]
+        );
+        let min_val = min_simd.reduce_min();
+        assert_eq!(min_val, -0.5);
+    }
 }
