@@ -511,7 +511,7 @@ impl FileReader {
             return Ok(batches[0].clone());
         }
         let schema = batches[0].schema();
-        Ok(concat_batches(&schema, &batches)?)
+        Ok(tokio::task::spawn_blocking(move || concat_batches(&schema, &batches)).await??)
     }
 
     /// Take by records by indices within the file.
@@ -535,7 +535,7 @@ impl FileReader {
         }
         let schema = Arc::new(schema);
 
-        Ok(concat_batches(&schema, &batches)?)
+        Ok(tokio::task::spawn_blocking(move || concat_batches(&schema, &batches)).await??)
     }
 
     pub async fn read_page_stats(&self, projection: &Schema) -> Result<Option<RecordBatch>> {

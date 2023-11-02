@@ -1105,7 +1105,7 @@ impl Dataset {
             .map(move |res| {
                 let dataset = dataset.clone();
                 let projection = projection.clone();
-                async move {
+                let fut = async move {
                     let (start, end) =
                         res.map_err(|err| DataFusionError::External(Box::new(err)))?;
                     let row_pos: Vec<u64> = (start..end).collect();
@@ -1113,7 +1113,8 @@ impl Dataset {
                         .take(&row_pos, projection.as_ref())
                         .await
                         .map_err(|err| DataFusionError::External(Box::new(err)))
-                }
+                };
+                async move { tokio::spawn(fut).await.unwrap() }
             })
             .buffered(batch_readahead);
 

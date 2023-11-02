@@ -480,6 +480,7 @@ impl Dataset {
                     Err(err) if err.is_instance_of::<PyStopIteration>(py) => None,
                     Err(err) => Some(Err(lance::Error::InvalidInput {
                         source: Box::new(err),
+                        location: location!(),
                     })),
                 }
             })
