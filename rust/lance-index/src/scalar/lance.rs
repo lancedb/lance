@@ -112,7 +112,7 @@ impl IndexStore for LanceIndexStore {
 #[cfg(test)]
 mod tests {
 
-    use std::{future, ops::Bound, path::Path};
+    use std::{ops::Bound, path::Path};
 
     use crate::scalar::{
         btree::{train_btree_index, BTreeIndex},
@@ -123,13 +123,13 @@ mod tests {
     use super::*;
     use arrow_array::{
         cast::AsArray,
-        types::{Int32Type, UInt64Type, Utf8Type},
+        types::{Float32Type, Int32Type, UInt64Type},
         RecordBatchIterator, RecordBatchReader, UInt64Array,
     };
     use arrow_schema::{DataType, Field};
     use arrow_select::take::TakeOptions;
     use datafusion_common::ScalarValue;
-    use futures::{stream, TryFutureExt};
+    use futures::stream;
     use lance_core::{io::object_store::ObjectStoreParams, Error};
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use tempfile::{tempdir, TempDir};
@@ -496,5 +496,37 @@ mod tests {
             assert!(row_ids.len() < data.num_rows());
             assert!(row_ids.values().iter().any(|val| *val == sample_row_id));
         }
+    }
+
+    #[tokio::test]
+    async fn btree_reject_nan() {
+        let tempdir = tempdir().unwrap();
+        let index_store = test_store(&tempdir);
+        let batch = gen()
+            .col(
+                Some("values".to_string()),
+                array::cycle::<Float32Type>(vec![0.0, f32::NAN]),
+            )
+            .col(
+                Some("row_ids".to_string()),
+                array::cycle::<UInt64Type>(vec![0, 1]),
+            )
+            .into_batch_rows(RowCount::from(2));
+        let batches = vec![batch];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("values", DataType::Float32, false),
+            Field::new("row_ids", DataType::UInt64, false),
+        ]));
+        let data = RecordBatchIterator::new(batches, schema);
+        let sub_index_trainer = FlatIndexTrainer::new(DataType::Float32);
+
+        let data = stream::iter(data.map(|batch| batch.map_err(|err| Error::from(err))));
+        // Until DF handles NaN reliably we need to make sure we reject input
+        // containing NaN
+        assert!(
+            train_btree_index(data, &sub_index_trainer, index_store.as_ref())
+                .await
+                .is_err()
+        );
     }
 }
