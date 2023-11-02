@@ -1426,7 +1426,7 @@ mod tests {
             stats: StatisticsRow,
         }
 
-        let cases: [TestCase; 11] =
+        let cases: [TestCase; 13] =
             [
                 // StringArray
                 // Whole strings are used if short enough
@@ -1581,7 +1581,6 @@ mod tests {
                         null_count: 0,
                         // We can truncate the minimum value, since the prefix is less than the full value
                         min_value: ScalarValue::LargeBinary(Some(min_binary_value.clone())),
-                        // We can't truncate the max value, so we return None
                         max_value: ScalarValue::LargeBinary(Some(min_binary_value.clone())),
                     },
                 },
@@ -1598,6 +1597,42 @@ mod tests {
                         null_count: 0,
                         min_value: ScalarValue::FixedSizeBinary(2, Some(vec![0, 1])),
                         max_value: ScalarValue::FixedSizeBinary(2, Some(vec![8, 9])),
+                    },
+                },
+                TestCase {
+                    source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![
+                        min_binary_value.clone().as_ref(),
+                    ]))],
+                    stats: StatisticsRow {
+                        null_count: 0,
+                        min_value: ScalarValue::FixedSizeBinary(
+                            BINARY_PREFIX_LENGTH.try_into().unwrap(),
+                            Some(min_binary_value.clone()),
+                        ),
+                        max_value: ScalarValue::FixedSizeBinary(
+                            BINARY_PREFIX_LENGTH.try_into().unwrap(),
+                            Some(min_binary_value.clone()),
+                        ),
+                    },
+                },
+                TestCase {
+                    source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![vec![
+                        0xFFu8;
+                        BINARY_PREFIX_LENGTH
+                            + 7
+                    ]
+                    .as_ref()]))],
+                    stats: StatisticsRow {
+                        null_count: 0,
+                        min_value: ScalarValue::FixedSizeBinary(
+                            (BINARY_PREFIX_LENGTH + 7).try_into().unwrap(),
+                            Some(vec![0xFFu8; BINARY_PREFIX_LENGTH]),
+                        ),
+                        // We can't truncate the max value, so we return None
+                        max_value: ScalarValue::FixedSizeBinary(
+                            (BINARY_PREFIX_LENGTH).try_into().unwrap(),
+                            None,
+                        ),
                     },
                 },
             ];
