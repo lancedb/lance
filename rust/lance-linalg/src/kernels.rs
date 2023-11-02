@@ -80,7 +80,7 @@ pub fn argmin_value_float<T: Float>(iter: impl Iterator<Item = T>) -> (u32, T) {
     let mut min_idx: usize = 0;
     let mut min_value = T::max_value();
     for (idx, value) in iter.enumerate() {
-        if std::intrinsics::unlikely(value < min_value) {
+        if value < min_value {
             min_value = value;
             min_idx = idx;
         }
