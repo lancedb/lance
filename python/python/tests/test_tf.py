@@ -36,7 +36,12 @@ except ImportError:
 import lance
 from helper import PYARROW_VERSION
 from lance.fragment import LanceFragment
-from lance.tf.data import from_lance, lance_batches, lance_fragments, lance_take_batches
+from lance.tf.data import (
+    from_lance,
+    from_lance_batches,
+    lance_fragments,
+    lance_take_batches,
+)
 from lance.tf.tfrecord import infer_tfrecord_schema, read_tfrecord
 
 pytestmark = pytest.mark.skipif(PYARROW_VERSION.major < 12, reason="requires arrow 12+")
@@ -153,26 +158,30 @@ def test_shuffle(tf_dataset):
 def test_dataset_batches(tf_dataset):
     tf_dataset = lance.dataset(tf_dataset)
     batch_size = 300
-    batches = list(lance_batches(tf_dataset, batch_size=batch_size).as_numpy_iterator())
+    batches = list(
+        from_lance_batches(tf_dataset, batch_size=batch_size).as_numpy_iterator()
+    )
     assert tf_dataset.count_rows() // batch_size + 1 == len(batches)
     assert all(end - start == batch_size for start, end in batches[:-2])
     assert batches[-1][1] - batches[-1][0] == tf_dataset.count_rows() % batch_size
 
     skip = 5
     batches_skipped = list(
-        lance_batches(tf_dataset, batch_size=batch_size, skip=skip).as_numpy_iterator()
+        from_lance_batches(
+            tf_dataset, batch_size=batch_size, skip=skip
+        ).as_numpy_iterator()
     )
     assert batches_skipped == batches[skip:]
 
     batches_shuffled = list(
-        lance_batches(
+        from_lance_batches(
             tf_dataset, batch_size=batch_size, shuffle=True, seed=42
         ).as_numpy_iterator()
     )
     # make sure it does a shuffle
     assert batches_shuffled != batches
     batches_shuffled2 = list(
-        lance_batches(
+        from_lance_batches(
             tf_dataset, batch_size=batch_size, shuffle=True, seed=42
         ).as_numpy_iterator()
     )
@@ -182,7 +191,7 @@ def test_dataset_batches(tf_dataset):
 
 def test_take_dataset(tf_dataset):
     tf_dataset = lance.dataset(tf_dataset)
-    batch_ds = lance_batches(
+    batch_ds = from_lance_batches(
         tf_dataset, batch_size=100, shuffle=True, seed=42
     ).as_numpy_iterator()
     lance_ds = lance_take_batches(tf_dataset, batch_ds)

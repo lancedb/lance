@@ -267,12 +267,17 @@ def lance_fragments(dataset: Union[str, Path, LanceDataset]) -> tf.data.Dataset:
 
 
 def _ith_batch(i: int, batch_size: int, total_size: int) -> Tuple[int, int]:
+    """
+    Get the start and end index of the ith batch.
+
+    This takes into account the total_size, the total number of rows in the dataset.
+    """
     start = i * batch_size
     end = tf.math.minimum(start + batch_size, total_size)
     return (start, end)
 
 
-def lance_batches(
+def from_lance_batches(
     dataset: Union[str, Path, LanceDataset],
     *,
     shuffle: bool = False,
@@ -339,13 +344,13 @@ def lance_take_batches(
 
     Examples
     --------
-    You can compose this with ``lance_batches`` to create a randomized Tensorflow
-    dataset. With ``lance_batches``, you can deterministically randomized the
+    You can compose this with ``from_lance_batches`` to create a randomized Tensorflow
+    dataset. With ``from_lance_batches``, you can deterministically randomized the
     batches by setting ``seed``.
 
     .. code-block:: python
 
-        batch_iter = lance_batches(dataset, batch_size=100, shuffle=True, seed=200)
+        batch_iter = from_lance_batches(dataset, batch_size=100, shuffle=True, seed=200)
         batch_iter = batch_iter.as_numpy_iterator()
         lance_ds = lance_take_batches(dataset, batch_iter)
         lance_ds = lance_ds.unbatch().shuffle(500, seed=42).batch(100)
@@ -376,3 +381,4 @@ def lance_take_batches(
 
 # Register `from_lance` to ``tf.data.Dataset``.
 tf.data.Dataset.from_lance = from_lance
+tf.data.Dataset.from_lance_batches = from_lance_batches
