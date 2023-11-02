@@ -239,15 +239,15 @@ fn get_string_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
 
         array.iter().for_each(|value| {
             if let Some(mut val) = value {
-                for i in (BINARY_PREFIX_LENGTH..val.len() + 4).rev() {
-                    if val.is_char_boundary(i) {
-                        val = &val[..i];
-                        break;
-                    }
+                // Truncate string to the longest length that is still a valid UTF8 string,
+                // while being of BINARY_PREFIX_LENGTH lenght or just greate. This is to avoid
+                // comparing potentially very long strings.
+                if val.len() > BINARY_PREFIX_LENGTH + 4 {
+                    val = truncate_utf8(val, BINARY_PREFIX_LENGTH + 4).unwrap();
                 }
 
                 if let Some(v) = min_value {
-                    if let Some(Ordering::Less) = val[..].partial_cmp(v) {
+                    if let Some(Ordering::Less) = val.partial_cmp(v) {
                         min_value = Some(val);
                     }
                 } else {
@@ -295,7 +295,7 @@ fn get_string_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
             max_value: ScalarValue::LargeUtf8(max_value),
         },
         _ => {
-            todo!()
+            unreachable!()
         }
     }
 }
@@ -314,9 +314,13 @@ fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
         }
 
         array.iter().for_each(|value| {
-            if let Some(val) = value {
-                // don't compare full buffers if possible
-                let val = &val[..std::cmp::min(BINARY_PREFIX_LENGTH + 4, val.len())];
+            if let Some(mut val) = value {
+                // Truncate binary buffer to BINARY_PREFIX_LENGTH to avoid comparing potentially
+                // very long buffers.
+                if val.len() > BINARY_PREFIX_LENGTH {
+                    // Truncate to longer length to have a valid comparison
+                    val = truncate_binary(val, BINARY_PREFIX_LENGTH + 4).unwrap();
+                }
 
                 if let Some(v) = min_value {
                     if let Some(Ordering::Less) = val.partial_cmp(v) {
@@ -367,7 +371,7 @@ fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
             max_value: ScalarValue::LargeBinary(max_value),
         },
         _ => {
-            todo!()
+            unreachable!()
         }
     }
 }
@@ -380,7 +384,7 @@ fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     let array_iterator = arrays.iter().map(|x| as_fixed_size_binary_array(x));
 
     let length = as_fixed_size_binary_array(arrays[0]).value_length() as usize;
-    let length = std::cmp::min(BINARY_PREFIX_LENGTH, length);
+    let do_truncate = length > BINARY_PREFIX_LENGTH;
 
     for array in array_iterator {
         null_count += array.null_count() as i64;
@@ -389,9 +393,13 @@ fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         }
 
         array.iter().for_each(|value| {
-            if let Some(val) = value {
-                // don't compare full buffers if possible
-                let val = &val[..length];
+            if let Some(mut val) = value {
+                // Truncate binary buffer to BINARY_PREFIX_LENGTH to avoid comparing potentially
+                // very long buffers.
+                if do_truncate {
+                    // Truncate to longer length to have a valid comparison
+                    val = truncate_binary(val, BINARY_PREFIX_LENGTH + 4).unwrap();
+                }
 
                 if let Some(v) = min_value {
                     if let Some(Ordering::Less) = val.partial_cmp(v) {
@@ -470,37 +478,6 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         max_value: ScalarValue::Boolean(Some(true_present || !false_present)),
     }
 }
-// fn get_list_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
-//     let mut null_count: i64 = 0;
-//     let mut stats: StatisticsRow;
-//     match arrays[0].data_type() {
-//         DataType::List(_) => {
-//             let arrays = arrays
-//                 .iter()
-//                 .map(|x| {
-//                     null_count += x.null_count() as i64;
-//                     x.as_list::<i32>().values()
-//                 })
-//                 .collect::<Vec<_>>();
-//             stats = collect_statistics(&arrays);
-//         }
-//         DataType::LargeList(_) => {
-//             let arrays = arrays
-//                 .iter()
-//                 .map(|x| {
-//                     null_count += x.null_count() as i64;
-//                     x.as_list::<i64>().values()
-//                 })
-//                 .collect::<Vec<_>>();
-//             stats = collect_statistics(&arrays);
-//         }
-//         _ => {
-//             todo!()
-//         }
-//     }
-//     stats.null_count = null_count;
-//     stats
-// }
 
 fn cast_dictionary_arrays<'a, T: ArrowDictionaryKeyType + 'static>(
     arrays: &'a [&'a ArrayRef],
@@ -661,7 +638,7 @@ fn get_temporal_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
             }
         }
         _ => {
-            todo!()
+            unreachable!()
         }
     }
 }
@@ -735,8 +712,8 @@ impl StatisticsCollector {
             let max_value = Arc::new(builder.max_value.finish());
             let struct_fields = vec![
                 ArrowField::new("null_count", DataType::Int64, false),
-                ArrowField::new("min_value", field.data_type(), true),
-                ArrowField::new("max_value", field.data_type(), true),
+                ArrowField::new("min_value", field.data_type(), field.nullable),
+                ArrowField::new("max_value", field.data_type(), field.nullable),
             ];
 
             let stats = StructArray::new(
@@ -822,7 +799,7 @@ impl StatisticsBuilder {
                     max_value_builder.append_null();
                 }
             }
-            _ => todo!(),
+            _ => unreachable!(),
         }
     }
 
@@ -867,7 +844,7 @@ impl StatisticsBuilder {
                     max_value_builder.append_null();
                 }
             }
-            _ => todo!(),
+            _ => unreachable!(),
         }
     }
 
@@ -920,13 +897,13 @@ impl StatisticsBuilder {
         if let ScalarValue::Boolean(Some(min_value)) = row.min_value {
             min_value_builder.append_value(min_value);
         } else {
-            min_value_builder.append_null();
+            min_value_builder.append_value(false);
         };
 
         if let ScalarValue::Boolean(Some(max_value)) = row.max_value {
             max_value_builder.append_value(max_value);
         } else {
-            max_value_builder.append_null();
+            max_value_builder.append_value(true);
         };
     }
 
@@ -980,6 +957,7 @@ impl StatisticsBuilder {
                 self.statistics_appender::<DurationNanosecondType>(row)
             }
             DataType::Decimal128(_, _) => self.statistics_appender::<Decimal128Type>(row),
+            // TODO: Decimal256
             DataType::Binary => self.binary_statistics_appender::<i32>(row),
             DataType::LargeBinary => self.binary_statistics_appender::<i64>(row),
             DataType::Utf8 => self.string_statistics_appender::<i32>(row),
@@ -1436,73 +1414,6 @@ mod tests {
         );
     }
 
-    // #[test]
-    // fn test_collect_list_stats() {
-    //     let data1 = vec![
-    //         Some(vec![Some(0)]),
-    //         Some(vec![Some(9)]),
-    //         Some(vec![Some(9), Some(2), Some(2)]),
-    //     ];
-    //     let data2 = vec![
-    //         Some(vec![Some(0), Some(1), Some(2)]),
-    //         None,
-    //         Some(vec![Some(3), None]),
-    //         Some(vec![Some(6), Some(7), Some(8)]),
-    //     ];
-    //
-    //     let expected_stats = StatisticsRow {
-    //         null_count: 1,
-    //         min_value: ScalarValue::from(0_i16),
-    //         max_value: ScalarValue::from(9_i16),
-    //     };
-    //     let arrays = vec![
-    //         Arc::new(ListArray::from_iter_primitive::<Int16Type, _, _>(
-    //             data1.clone(),
-    //         )) as ArrayRef,
-    //         Arc::new(ListArray::from_iter_primitive::<Int16Type, _, _>(
-    //             data2.clone(),
-    //         )) as ArrayRef,
-    //     ];
-    //
-    //     let binding = arrays.iter().collect::<Vec<_>>();
-    //     let array_refs = binding.as_slice();
-    //     let stats = collect_statistics(array_refs);
-    //     assert_eq!(stats, expected_stats);
-    // }
-
-    // #[test]
-    // fn test_collect_large_list_stats() {
-    //     let data1 = vec![
-    //         Some(vec![Some(0)]),
-    //         Some(vec![Some(9)]),
-    //         Some(vec![Some(9), Some(2), Some(2)]),
-    //     ];
-    //     let data2 = vec![
-    //         Some(vec![Some(0), Some(1), Some(2)]),
-    //         None,
-    //         Some(vec![Some(3), None]),
-    //         Some(vec![Some(6), Some(7), Some(8)]),
-    //     ];
-    //     let expected_stats = StatisticsRow {
-    //         null_count: 1,
-    //         min_value: ScalarValue::from(0_i64),
-    //         max_value: ScalarValue::from(9_i64),
-    //     };
-    //     let arrays = vec![
-    //         Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(
-    //             data1.clone(),
-    //         )) as ArrayRef,
-    //         Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(
-    //             data2.clone(),
-    //         )) as ArrayRef,
-    //     ];
-    //
-    //     let binding = arrays.iter().collect::<Vec<_>>();
-    //     let array_refs = binding.as_slice();
-    //     let stats = collect_statistics(array_refs);
-    //     assert_eq!(stats, expected_stats);
-    // }
-
     #[test]
     fn test_collect_binary_stats() {
         // Test string, binary with truncation and null values.
@@ -1752,7 +1663,7 @@ mod tests {
 
         // Check the output schema is correct
         let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("a", DataType::Int32, true),
             ArrowField::new("b", DataType::Utf8, true),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
@@ -1872,11 +1783,11 @@ mod tests {
         // Check boolean, binary and string collectors return null for min/max if no
         // values are supplied
         let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("boolean", DataType::Boolean, false),
-            ArrowField::new("binary", DataType::Binary, false),
-            ArrowField::new("large_binary", DataType::LargeBinary, false),
-            ArrowField::new("string", DataType::Utf8, false),
-            ArrowField::new("large_string", DataType::LargeUtf8, false),
+            ArrowField::new("boolean", DataType::Boolean, true),
+            ArrowField::new("binary", DataType::Binary, true),
+            ArrowField::new("large_binary", DataType::LargeBinary, true),
+            ArrowField::new("string", DataType::Utf8, true),
+            ArrowField::new("large_string", DataType::LargeUtf8, true),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let mut collector = StatisticsCollector::new(&schema.fields);
@@ -1886,8 +1797,8 @@ mod tests {
         let builder = collector.get_builder(id).unwrap();
         builder.append(StatisticsRow {
             null_count: 0,
-            min_value: ScalarValue::Boolean(None),
-            max_value: ScalarValue::Boolean(None),
+            min_value: ScalarValue::Boolean(Some(false)),
+            max_value: ScalarValue::Boolean(Some(true)),
         });
         let id = schema.field("binary").unwrap().id;
         let builder = collector.get_builder(id).unwrap();
@@ -1977,11 +1888,11 @@ mod tests {
                     ),
                     (
                         Arc::new(ArrowField::new("min_value", DataType::Boolean, true)),
-                        Arc::new(BooleanArray::from(vec![None])) as ArrayRef,
+                        Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
                     ),
                     (
                         Arc::new(ArrowField::new("max_value", DataType::Boolean, true)),
-                        Arc::new(BooleanArray::from(vec![None])) as ArrayRef,
+                        Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
                     ),
                 ])),
                 Arc::new(StructArray::from(vec![
