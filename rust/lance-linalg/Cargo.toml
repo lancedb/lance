@@ -15,12 +15,12 @@ arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 futures = { workspace = true }
 half = { workspace = true }
+lance-arrow = { workspace = true }
 log = { workspace = true }
 num_cpus = { workspace = true }
 num-traits = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
-lance-arrow = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -28,6 +28,9 @@ approx = { workspace = true }
 arrow-arith = { workspace = true }
 criterion = { workspace = true }
 lance-testing = { path = "../lance-testing" }
+
+[features]
+avx512 = []
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof = { workspace = true }

@@ -123,6 +123,7 @@ impl SIMD<f32, 8> for f32x8 {
             self.0 .1 = vfmaq_f32(self.0 .1, a.0 .1, b.0 .1);
         }
     }
+
     #[inline]
     fn reduce_sum(&self) -> f32 {
         #[cfg(target_arch = "x86_64")]
@@ -237,9 +238,13 @@ impl Mul for f32x8 {
 
 /// 16 of 32-bit `f32` values. Use 512-bit SIMD if possible.
 #[allow(non_camel_case_types)]
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
 #[derive(Clone, Copy)]
 pub struct f32x16(__m256, __m256);
+#[allow(non_camel_case_types)]
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[derive(Clone, Copy)]
+pub struct f32x16(__m512);
 
 /// 16 of 32-bit `f32` values. Use 512-bit SIMD if possible.
 #[allow(non_camel_case_types)]
@@ -260,7 +265,11 @@ impl SIMD<f32, 16> for f32x16 {
     #[inline]
 
     fn splat(val: f32) -> Self {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            Self(_mm512_set1_ps(val))
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
             Self(_mm256_set1_ps(val), _mm256_set1_ps(val))
         }
@@ -277,7 +286,11 @@ impl SIMD<f32, 16> for f32x16 {
 
     #[inline]
     fn zeros() -> Self {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            Self(_mm512_setzero_ps())
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
             Self(_mm256_setzero_ps(), _mm256_setzero_ps())
         }
@@ -286,22 +299,28 @@ impl SIMD<f32, 16> for f32x16 {
     }
 
     #[inline]
-
     unsafe fn load(ptr: *const f32) -> Self {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
             Self(_mm256_load_ps(ptr), _mm256_load_ps(ptr.add(8)))
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            Self(_mm512_load_ps(ptr))
         }
         #[cfg(target_arch = "aarch64")]
         Self::load_unaligned(ptr)
     }
 
     #[inline]
-
     unsafe fn load_unaligned(ptr: *const f32) -> Self {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
             Self(_mm256_loadu_ps(ptr), _mm256_loadu_ps(ptr.add(8)))
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            Self(_mm512_loadu_ps(ptr))
         }
         #[cfg(target_arch = "aarch64")]
         Self(vld1q_f32_x4(ptr))
@@ -309,7 +328,11 @@ impl SIMD<f32, 16> for f32x16 {
 
     #[inline]
     unsafe fn store(&self, ptr: *mut f32) {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            _mm512_store_ps(ptr, self.0)
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
             _mm256_store_ps(ptr, self.0);
             _mm256_store_ps(ptr.add(8), self.1);
@@ -323,7 +346,11 @@ impl SIMD<f32, 16> for f32x16 {
     #[inline]
 
     unsafe fn store_unaligned(&self, ptr: *mut f32) {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            _mm512_storeu_ps(ptr, self.0)
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
             _mm256_storeu_ps(ptr, self.0);
             _mm256_storeu_ps(ptr.add(8), self.1);
@@ -336,7 +363,11 @@ impl SIMD<f32, 16> for f32x16 {
 
     #[inline]
     fn multiply_add(&mut self, a: Self, b: Self) {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            self.0 = _mm512_fmadd_ps(a.0, b.0, self.0)
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
             self.0 = _mm256_fmadd_ps(a.0, b.0, self.0);
             self.1 = _mm256_fmadd_ps(a.1, b.1, self.1);
@@ -351,7 +382,11 @@ impl SIMD<f32, 16> for f32x16 {
     }
 
     fn reduce_sum(&self) -> f32 {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            _mm512_mask_reduce_add_ps(0xFFFF, self.0)
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
             let mut sum = _mm256_add_ps(self.0, self.1);
             // Shift and add vector, until only 1 value left.
@@ -381,7 +416,11 @@ impl Add for f32x16 {
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            Self(_mm512_add_ps(self.0, rhs.0))
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
             Self(_mm256_add_ps(self.0, rhs.0), _mm256_add_ps(self.1, rhs.1))
         }
@@ -400,7 +439,11 @@ impl Add for f32x16 {
 impl AddAssign for f32x16 {
     #[inline]
     fn add_assign(&mut self, rhs: Self) {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            self.0 = _mm512_add_ps(self.0, rhs.0)
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
             self.0 = _mm256_add_ps(self.0, rhs.0);
             self.1 = _mm256_add_ps(self.1, rhs.1);
@@ -420,7 +463,11 @@ impl Mul for f32x16 {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            Self(_mm512_mul_ps(self.0, rhs.0))
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
             Self(_mm256_mul_ps(self.0, rhs.0), _mm256_mul_ps(self.1, rhs.1))
         }
@@ -441,7 +488,11 @@ impl Sub for f32x16 {
 
     #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            Self(_mm512_sub_ps(self.0, rhs.0))
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
             Self(_mm256_sub_ps(self.0, rhs.0), _mm256_sub_ps(self.1, rhs.1))
         }
@@ -460,7 +511,11 @@ impl Sub for f32x16 {
 impl SubAssign for f32x16 {
     #[inline]
     fn sub_assign(&mut self, rhs: Self) {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            self.0 = _mm512_sub_ps(self.0, rhs.0)
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
             self.0 = _mm256_sub_ps(self.0, rhs.0);
             self.1 = _mm256_sub_ps(self.1, rhs.1);
