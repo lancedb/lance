@@ -44,12 +44,6 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
-use std::{
-    collections::HashSet,
-    future,
-    sync::{Mutex, MutexGuard},
-};
-
 use chrono::{DateTime, Duration, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_core::{
@@ -62,6 +56,11 @@ use lance_core::{
     Error, Result,
 };
 use object_store::path::Path;
+use std::{
+    collections::HashSet,
+    future,
+    sync::{Mutex, MutexGuard},
+};
 
 use crate::{utils::temporal::utc_now, Dataset};
 
@@ -461,6 +460,7 @@ mod tests {
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
+    use snafu::{location, Location};
     use tokio::io::AsyncWriteExt;
 
     use crate::{
@@ -652,6 +652,7 @@ mod tests {
                     if op.contains("copy") {
                         return Err(Error::Internal {
                             message: "Copy blocked".to_string(),
+                            location: location!(),
                         });
                     }
                     Ok(())
@@ -667,6 +668,7 @@ mod tests {
                     if op.contains("delete") && path.extension() == Some("manifest") {
                         Err(Error::Internal {
                             message: "Delete manifest blocked".to_string(),
+                            location: location!(),
                         })
                     } else {
                         Ok(())

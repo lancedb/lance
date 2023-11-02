@@ -27,6 +27,7 @@ use lance_index::vector::{Query, DIST_COL};
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
 use serde::Serialize;
+use snafu::{location, Location};
 use tracing::instrument;
 
 use super::row_vertex::{RowVertex, RowVertexSerDe};
@@ -263,18 +264,21 @@ impl VectorIndex for DiskANNIndex {
     ) -> Result<Box<dyn VectorIndex>> {
         Err(Error::Index {
             message: "DiskANNIndex is not loadable".to_string(),
+            location: location!(),
         })
     }
 
     fn check_can_remap(&self) -> Result<()> {
         Err(Error::NotSupported {
             source: "DiskANNIndex does not yet support remap".into(),
+            location: location!(),
         })
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         Err(Error::NotSupported {
             source: "DiskANNIndex does not yet support remap".into(),
+            location: location!(),
         })
     }
 }

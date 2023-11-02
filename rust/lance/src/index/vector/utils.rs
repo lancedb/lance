@@ -18,6 +18,7 @@ use arrow_array::{cast::AsArray, types::Float32Type};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat_batches;
 use futures::stream::TryStreamExt;
+use snafu::{location, Location};
 
 use lance_linalg::MatrixView;
 
@@ -50,6 +51,7 @@ pub async fn maybe_sample_training_data(
             "Sample training data: column {} does not exist in return",
             column
         ),
+        location: location!(),
     })?;
     Ok(array.as_fixed_size_list().try_into()?)
 }

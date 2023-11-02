@@ -17,6 +17,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use snafu::{location, Location};
+
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +101,7 @@ impl TryFrom<&DataType> for JsonDataType {
             _ => {
                 return Err(Error::Arrow {
                     message: format!("Json conversion: Unsupported type: {dt}"),
+                    location: location!(),
                 })
             }
         };
@@ -138,6 +141,7 @@ impl TryFrom<&JsonDataType> for DataType {
                     .as_ref()
                     .ok_or_else(|| Error::Arrow {
                         message: "Json conversion: List type requires a field".to_string(),
+                        location: location!(),
                     })?
                     .iter()
                     .map(Field::try_from)
@@ -150,6 +154,7 @@ impl TryFrom<&JsonDataType> for DataType {
                         let length = value.length.ok_or_else(|| Error::Arrow {
                             message: "Json conversion: FixedSizeList type requires a length"
                                 .to_string(),
+                            location: location!(),
                         })?;
                         Ok(Self::FixedSizeList(
                             Arc::new(fields[0].clone()),
@@ -162,6 +167,7 @@ impl TryFrom<&JsonDataType> for DataType {
             }
             _ => Err(Error::Arrow {
                 message: format!("Json conversion: Unsupported type: {value:?}"),
+                location: location!(),
             }),
         }
     }

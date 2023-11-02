@@ -164,6 +164,7 @@ impl Ivf {
     ) -> Result<RecordBatch> {
         let vector_arr = batch.column_by_name(column).ok_or(Error::Index {
             message: format!("Column {} does not exist.", column),
+            location: location!(),
         })?;
         let data = vector_arr.as_fixed_size_list_opt().ok_or(Error::Index {
             message: format!(
@@ -171,6 +172,7 @@ impl Ivf {
                 column,
                 vector_arr.data_type()
             ),
+            location: location!(),
         })?;
         let matrix = MatrixView::<Float32Type>::try_from(data)?;
         let part_ids = self.compute_partitions(&matrix).await;

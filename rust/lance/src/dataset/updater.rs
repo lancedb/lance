@@ -178,6 +178,7 @@ impl Updater {
                     batch.num_rows(),
                     row_id_stride
                 ),
+                location: location!(),
             });
         }
 
@@ -221,6 +222,7 @@ pub(crate) fn add_blanks(
         // This is difficult because we need to create a batch for arbitrary schemas.
         return Err(Error::NotSupported {
             source: "Missing many rows in merge".into(),
+            location: location!(),
         });
     }
 
@@ -246,6 +248,7 @@ pub(crate) fn add_blanks(
             arrow::compute::take(array.as_ref(), &selection_vector, None).map_err(|e| {
                 Error::Arrow {
                     message: format!("Failed to add blanks: {}", e),
+                    location: location!(),
                 }
             })
         })

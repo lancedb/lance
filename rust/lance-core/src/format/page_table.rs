@@ -15,6 +15,7 @@
 use arrow_array::builder::Int64Builder;
 use arrow_array::{Array, Int64Array};
 use arrow_schema::DataType;
+use snafu::{location, Location};
 use std::collections::BTreeMap;
 use tokio::io::AsyncWriteExt;
 
@@ -96,6 +97,7 @@ impl PageTable {
         if self.pages.is_empty() {
             return Err(Error::InvalidInput {
                 source: "empty page table".into(),
+                location: location!(),
             });
         }
 

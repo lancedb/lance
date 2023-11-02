@@ -138,6 +138,7 @@ pub fn parse_version_from_path(path: &Path) -> Result<u64> {
         .and_then(|(version, _)| version.parse::<u64>().ok())
         .ok_or(crate::Error::Internal {
             message: format!("Expected manifest file, but found {}", path),
+            location: location!(),
         })
 }
 
@@ -248,6 +249,7 @@ impl From<CommitError> for Error {
         match e {
             CommitError::CommitConflict => Self::Internal {
                 message: "Commit conflict".to_string(),
+                location: location!(),
             },
             CommitError::OtherError(e) => e,
         }

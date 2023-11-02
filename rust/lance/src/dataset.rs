@@ -15,11 +15,6 @@
 //! Lance Dataset
 //!
 
-use std::collections::{BTreeMap, HashMap};
-use std::default::Default;
-use std::ops::Range;
-use std::sync::Arc;
-
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::Array;
@@ -42,6 +37,11 @@ use lance_core::io::{
 };
 use log::warn;
 use object_store::path::Path;
+use snafu::{location, Location};
+use std::collections::{BTreeMap, HashMap};
+use std::default::Default;
+use std::ops::Range;
+use std::sync::Arc;
 use tracing::instrument;
 
 mod chunker;
@@ -196,6 +196,7 @@ impl Dataset {
             .map_err(|e| Error::DatasetNotFound {
                 path: base_path.to_string(),
                 source: Box::new(e),
+                location: location!(),
             })?;
 
         let session = if let Some(session) = params.session.as_ref() {
@@ -279,6 +280,7 @@ impl Dataset {
                 Error::NotFound { uri, .. } => Error::DatasetNotFound {
                     path: uri.clone(),
                     source: box_error(e),
+                    location: location!(),
                 },
                 _ => e,
             })?;
@@ -291,6 +293,7 @@ impl Dataset {
                 object_store::Error::NotFound { path: _, source } => Error::DatasetNotFound {
                     path: base_path.to_string(),
                     source,
+                    location: location!(),
                 },
                 _ => e.into(),
             })?;
@@ -306,6 +309,7 @@ impl Dataset {
             );
             return Err(Error::NotSupported {
                 source: message.into(),
+                location: location!(),
             });
         }
 
@@ -351,6 +355,7 @@ impl Dataset {
         if dataset_exists && matches!(params.mode, WriteMode::Create) {
             return Err(Error::DatasetAlreadyExists {
                 uri: uri.to_owned(),
+                location: location!(),
             });
         }
 
@@ -405,6 +410,7 @@ impl Dataset {
                 );
                 return Err(Error::NotSupported {
                     source: message.into(),
+                    location: location!(),
                 });
             }
         }
@@ -644,6 +650,7 @@ impl Dataset {
                 Operation::Overwrite { .. } | Operation::Restore { .. } => Ok(0),
                 _ => Err(Error::invalid_input(
                     "read_version must be specified for this operation",
+                    location!(),
                 )),
             },
             Ok,
@@ -668,6 +675,7 @@ impl Dataset {
             return Err(Error::DatasetNotFound {
                 path: base.to_string(),
                 source: "The dataset must already exist unless the operation is Overwrite".into(),
+                location: location!(),
             });
         }
 
@@ -728,17 +736,20 @@ impl Dataset {
     ) -> Result<()> {
         // Sanity check.
         if self.schema().field(left_on).is_none() {
-            return Err(Error::invalid_input(format!(
-                "Column {} does not exist in the left side dataset",
-                left_on
-            )));
+            return Err(Error::invalid_input(
+                format!("Column {} does not exist in the left side dataset", left_on),
+                location!(),
+            ));
         };
         let right_schema = stream.schema();
         if right_schema.field_with_name(right_on).is_err() {
-            return Err(Error::invalid_input(format!(
-                "Column {} does not exist in the right side dataset",
-                right_on
-            )));
+            return Err(Error::invalid_input(
+                format!(
+                    "Column {} does not exist in the right side dataset",
+                    right_on
+                ),
+                location!(),
+            ));
         };
         for field in right_schema.fields() {
             if field.name() == right_on {
@@ -747,10 +758,13 @@ impl Dataset {
                 continue;
             }
             if self.schema().field(field.name()).is_some() {
-                return Err(Error::invalid_input(format!(
-                    "Column {} exists in both sides of the dataset",
-                    field.name()
-                )));
+                return Err(Error::invalid_input(
+                    format!(
+                        "Column {} exists in both sides of the dataset",
+                        field.name()
+                    ),
+                    location!(),
+                ));
             }
         }
 
@@ -841,6 +855,7 @@ impl Dataset {
         let mut fragments_iter = fragments.iter();
         let mut current_fragment = fragments_iter.next().ok_or_else(|| Error::InvalidInput {
             source: "Called take on an empty dataset.".to_string().into(),
+            location: location!(),
         })?;
         let mut current_fragment_len = current_fragment.count_rows().await?;
         let mut curr_fragment_offset: u64 = 0;
@@ -869,6 +884,7 @@ impl Dataset {
                         row_index
                     )
                     .into(),
+                    location: location!(),
                 })?;
                 curr_fragment_offset += current_fragment_len as u64;
                 current_fragment_len = current_fragment.count_rows().await?;
@@ -942,7 +958,10 @@ impl Dataset {
             let range = range_start..(range_end + 1);
 
             let fragment = self.get_fragment(fragment_id).ok_or_else(|| {
-                Error::invalid_input(format!("row_id belongs to non-existant fragment: {start}"))
+                Error::invalid_input(
+                    format!("row_id belongs to non-existant fragment: {start}"),
+                    location!(),
+                )
             })?;
 
             let reader = fragment.open(projection.as_ref()).await?;
@@ -974,10 +993,13 @@ impl Dataset {
                 };
 
                 let fragment = self.get_fragment(fragment_id as usize).ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "row_id belongs to non-existant fragment: {}",
-                        row_ids[current_start]
-                    ))
+                    Error::invalid_input(
+                        format!(
+                            "row_id belongs to non-existant fragment: {}",
+                            row_ids[current_start]
+                        ),
+                        location!(),
+                    )
                 })?;
                 let row_ids: Vec<u32> = row_ids[range].iter().map(|x| *x as u32).collect();
 
@@ -1040,6 +1062,7 @@ impl Dataset {
                 .column_by_name(ROW_ID)
                 .ok_or_else(|| Error::Internal {
                     message: "ROW_ID column not found".into(),
+                    location: location!(),
                 })?
                 .as_primitive::<UInt64Type>()
                 .values();
@@ -1318,6 +1341,7 @@ impl Dataset {
                         "Duplicate fragment id {} found in dataset {:?}",
                         id, self.base
                     ),
+                    location!(),
                 ));
             }
         }

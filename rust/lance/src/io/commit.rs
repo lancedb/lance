@@ -35,6 +35,8 @@
 
 use std::sync::Arc;
 
+use snafu::{location, Location};
+
 use futures::future::Either;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{
@@ -100,6 +102,7 @@ fn check_transaction(
                 and it was missing transaction metadata.",
                 other_version
             ),
+            location: location!(),
         });
     }
 
@@ -113,6 +116,7 @@ fn check_transaction(
                 transaction, other_transaction
             )
             .into(),
+            location: location!(),
         });
     }
 
@@ -363,6 +367,7 @@ pub(crate) async fn commit_transaction(
             commit_config.num_retries
         )
         .into(),
+        location: location!(),
     })
 }
 

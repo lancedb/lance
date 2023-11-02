@@ -27,56 +27,77 @@ pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedErro
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("Invalid user input: {source}"))]
-    InvalidInput { source: BoxedError },
-    #[snafu(display("Dataset already exists: {uri}"))]
-    DatasetAlreadyExists { uri: String },
+    #[snafu(display("Invalid user input: {source}, {location}"))]
+    InvalidInput {
+        source: BoxedError,
+        location: Location,
+    },
+    #[snafu(display("Dataset already exists: {uri}, {location}"))]
+    DatasetAlreadyExists { uri: String, location: Location },
     // #[snafu(display("Append with different schema: original={original} new={new}"))]
     #[snafu(display("Append with different schema:"))]
     SchemaMismatch {},
-    #[snafu(display("Dataset at path {path} was not found: {source}"))]
-    DatasetNotFound { path: String, source: BoxedError },
-    #[snafu(display("Encountered corrupt file {path}: {source}"))]
+    #[snafu(display("Dataset at path {path} was not found: {source}, {location}"))]
+    DatasetNotFound {
+        path: String,
+        source: BoxedError,
+        location: Location,
+    },
+    #[snafu(display("Encountered corrupt file {path}: {source}, {location}"))]
     CorruptFile {
         path: object_store::path::Path,
         source: BoxedError,
+        location: Location,
         // TODO: add backtrace?
     },
-    #[snafu(display("Not supported: {source}"))]
-    NotSupported { source: BoxedError },
-    #[snafu(display("Commit conflict for version {version}: {source}"))]
-    CommitConflict { version: u64, source: BoxedError },
-    #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lancedb/lance/issues. {message}"))]
-    Internal { message: String },
-    #[snafu(display("A prerequisite task failed: {message}"))]
-    PrerequisiteFailed { message: String },
-    #[snafu(display("LanceError(Arrow): {message}"))]
-    Arrow { message: String },
+    #[snafu(display("Not supported: {source}, {location}"))]
+    NotSupported {
+        source: BoxedError,
+        location: Location,
+    },
+    #[snafu(display("Commit conflict for version {version}: {source}, {location}"))]
+    CommitConflict {
+        version: u64,
+        source: BoxedError,
+        location: Location,
+    },
+    #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lancedb/lance/issues. {message}, {location}"))]
+    Internal { message: String, location: Location },
+    #[snafu(display("A prerequisite task failed: {message}, {location}"))]
+    PrerequisiteFailed { message: String, location: Location },
+    #[snafu(display("LanceError(Arrow): {message}, {location}"))]
+    Arrow { message: String, location: Location },
     #[snafu(display("LanceError(Schema): {message}, {location}"))]
     Schema { message: String, location: Location },
     #[snafu(display("Not found: {uri}, {location}"))]
     NotFound { uri: String, location: Location },
     #[snafu(display("LanceError(IO): {message}, {location}"))]
     IO { message: String, location: Location },
-    #[snafu(display("LanceError(Index): {message}"))]
-    Index { message: String },
+    #[snafu(display("LanceError(Index): {message}, {location}"))]
+    Index { message: String, location: Location },
     /// Stream early stop
     Stop,
 }
 
 impl Error {
-    pub fn corrupt_file(path: object_store::path::Path, message: impl Into<String>) -> Self {
+    pub fn corrupt_file(
+        path: object_store::path::Path,
+        message: impl Into<String>,
+        location: Location,
+    ) -> Self {
         let message: String = message.into();
         Self::CorruptFile {
             path,
             source: message.into(),
+            location,
         }
     }
 
-    pub fn invalid_input(message: impl Into<String>) -> Self {
+    pub fn invalid_input(message: impl Into<String>, location: Location) -> Self {
         let message: String = message.into();
         Self::InvalidInput {
             source: message.into(),
+            location,
         }
     }
 }
@@ -87,6 +108,7 @@ impl From<ArrowError> for Error {
     fn from(e: ArrowError) -> Self {
         Self::Arrow {
             message: e.to_string(),
+            location: location!(),
         }
     }
 }
@@ -95,6 +117,7 @@ impl From<&ArrowError> for Error {
     fn from(e: &ArrowError) -> Self {
         Self::Arrow {
             message: e.to_string(),
+            location: location!(),
         }
     }
 }
@@ -157,6 +180,7 @@ impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Self::Arrow {
             message: e.to_string(),
+            location: location!(),
         }
     }
 }
@@ -171,10 +195,10 @@ fn arrow_io_error_from_msg(message: String) -> ArrowError {
 impl From<Error> for ArrowError {
     fn from(value: Error) -> Self {
         match value {
-            Error::Arrow { message } => arrow_io_error_from_msg(message), // we lose the error type converting to LanceError
+            Error::Arrow { message, .. } => arrow_io_error_from_msg(message), // we lose the error type converting to LanceError
             Error::IO { message, .. } => arrow_io_error_from_msg(message),
             Error::Schema { message, .. } => Self::SchemaError(message),
-            Error::Index { message } => arrow_io_error_from_msg(message),
+            Error::Index { message, .. } => arrow_io_error_from_msg(message),
             Error::Stop => arrow_io_error_from_msg("early stop".to_string()),
             e => arrow_io_error_from_msg(e.to_string()), // Find a more scalable way of doing this
         }

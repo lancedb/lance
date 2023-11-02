@@ -462,6 +462,7 @@ impl ObjectStore {
                         source:
                             "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
                                 .into(),
+                        location: location!(),
                     });
                 }
 
@@ -473,6 +474,7 @@ impl ObjectStore {
                             source:
                                 "`s3+ddb://` scheme and expects exactly one query `ddbTableName`"
                                     .into(),
+                            location: location!(),
                         });
                     }
                     match url.query_pairs().next() {
@@ -484,13 +486,15 @@ impl ObjectStore {
                                     source:
                                         "`s3+ddb://` scheme requires non empty dynamodb table name"
                                             .into(),
+                                    location: location!(),
                                 });
                             }
                             Some(table_name)
                         }
                         _ => {
                             return Err(Error::InvalidInput {
-                                source: "`s3+ddb://` scheme and expects exactly one query `ddbTableName`".into()
+                                source: "`s3+ddb://` scheme and expects exactly one query `ddbTableName`".into(),
+                                location: location!(),
                             });
                         }
                     }
@@ -519,6 +523,7 @@ impl ObjectStore {
                         return Err(Error::InvalidInput {
                             source: "`s3+ddb://` scheme requires `dynamodb` feature to be enabled"
                                 .into(),
+                            location: location!(),
                         });
                     }
                     None => params
@@ -530,6 +535,7 @@ impl ObjectStore {
                 // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
                 url.set_scheme("s3").map_err(|()| Error::Internal {
                     message: "could not set scheme".into(),
+                    location: location!(),
                 })?;
                 url.set_query(None);
 

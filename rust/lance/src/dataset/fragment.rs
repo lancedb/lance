@@ -81,7 +81,10 @@ impl FileFragment {
         let (stream, schema) = reader_to_stream(reader)?;
 
         if schema.fields.is_empty() {
-            return Err(Error::invalid_input("Cannot write with an empty schema."));
+            return Err(Error::invalid_input(
+                "Cannot write with an empty schema.",
+                location!(),
+            ));
         }
 
         let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
@@ -287,6 +290,7 @@ impl FileFragment {
                         "data file has incorrect length. Expected: {} Got: {}",
                         expected_length, length
                     ),
+                    location!(),
                 ));
             }
         }
@@ -302,6 +306,7 @@ impl FileFragment {
                             &deletion_file_meta,
                         ),
                         format!("deletion vector contains row id that is out of range. Row id: {} Fragment length: {}", row_id, expected_length),
+                        location!(),
                     ));
                 }
             }
@@ -526,6 +531,7 @@ impl FileFragment {
                 Examples: {:?}",
                     physical_rows, dv_len, examples
                 ),
+                location: location!(),
             });
         }
 

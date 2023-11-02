@@ -25,6 +25,7 @@ use lance_linalg::distance::{cosine_distance_batch, dot_distance_batch, l2_dista
 use lance_linalg::kernels::argmin;
 use lance_linalg::{distance::MetricType, MatrixView};
 use rand::SeedableRng;
+use snafu::{location, Location};
 pub mod transform;
 
 use super::kmeans::train_kmeans;
@@ -357,6 +358,7 @@ impl ProductQuantizer {
                     data.num_columns(),
                     params.num_sub_vectors
                 ),
+                location: location!(),
             });
         }
         assert_eq!(data.data().null_count(), 0);

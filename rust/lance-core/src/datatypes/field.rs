@@ -310,6 +310,7 @@ impl Field {
                     "Attempt to intersect different fields: {} and {}",
                     self.name, other.name,
                 ),
+                location: location!(),
             });
         }
         let self_type = self.data_type();
@@ -347,6 +348,7 @@ impl Field {
                     "Attempt to intersect different fields: ({}, {}) and ({}, {})",
                     self.name, self_type, other.name, other_type
                 ),
+                location: location!(),
             });
         }
 

@@ -140,11 +140,14 @@ impl HashJoiner {
     /// Will run in parallel over columns using all available cores.
     pub(super) async fn collect(&self, index_column: ArrayRef) -> Result<RecordBatch> {
         if index_column.data_type() != &self.index_type {
-            return Err(Error::invalid_input(format!(
-                "Index column type mismatch: expected {}, got {}",
-                self.index_type,
-                index_column.data_type()
-            )));
+            return Err(Error::invalid_input(
+                format!(
+                    "Index column type mismatch: expected {}, got {}",
+                    self.index_type,
+                    index_column.data_type()
+                ),
+                location!(),
+            ));
         }
 
         // Index to use for null values
@@ -196,7 +199,7 @@ impl HashJoiner {
                                     "Found rows on LHS that do not match any rows on RHS. Lance would need to write \
                                     nulls on the RHS, but Lance does not yet support nulls for type {:?}.",
                                     array.data_type()
-                                )));
+                                ), location!()));
                             }
                             Ok(array)
                         },

@@ -17,6 +17,7 @@ use arrow_array::RecordBatch;
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::stream::StreamExt;
 use futures::TryStreamExt;
+use snafu::{location, Location};
 
 use lance::dataset::Dataset;
 use lance::index::{vector::VectorIndexParams, DatasetIndexExt};
@@ -169,9 +170,11 @@ async fn create_index(
 ) -> Result<()> {
     let col = column.as_ref().ok_or_else(|| Error::Index {
         message: "Must specify column".to_string(),
+        location: location!(),
     })?;
     let _ = index_type.ok_or_else(|| Error::Index {
         message: "Must specify index type".to_string(),
+        location: location!(),
     })?;
     let mt = match metric_type.as_ref().unwrap_or(&"l2".to_string()).as_str() {
         "l2" => MetricType::L2,
@@ -182,6 +185,7 @@ async fn create_index(
                     "Only l2 and cosine metric type are supported, got: {}",
                     metric_type.as_ref().unwrap_or(&"N/A".to_string())
                 ),
+                location: location!(),
             });
         }
     };
@@ -191,6 +195,7 @@ async fn create_index(
         true => {
             return Err(Error::Index {
                 message: "Feature 'opq' not installed.".to_string(),
+                location: location!(),
             });
         }
     };

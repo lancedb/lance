@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use lance_core::{format::Index as IndexMetadata, Error, Result};
 use log::info;
+use snafu::{location, Location};
 use uuid::Uuid;
 
 use crate::dataset::index::unindexed_fragments;
@@ -40,6 +41,7 @@ pub async fn append_index(
                 "Append index: column {} does not exist",
                 old_index.fields[0]
             ),
+            location: location!(),
         })?;
 
     let index = open_index(

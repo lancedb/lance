@@ -77,6 +77,7 @@ fn parse_timeunit(unit: &str) -> Result<TimeUnit> {
         "ns" => Ok(TimeUnit::Nanosecond),
         _ => Err(Error::Arrow {
             message: format!("Unsupported TimeUnit: {unit}"),
+            location: location!(),
         }),
     }
 }

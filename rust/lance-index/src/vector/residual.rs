@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
 use arrow_array::types::UInt32Type;
 use arrow_array::{
     cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array, RecordBatch,
@@ -23,6 +21,8 @@ use async_trait::async_trait;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::MatrixView;
+use snafu::{location, Location};
+use std::sync::Arc;
 
 use super::transform::Transformer;
 
@@ -70,12 +70,14 @@ impl Transformer for ResidualTransform {
                 "Compute residual vector: partition id column not found: {}",
                 self.part_col
             ),
+            location: location!(),
         })?;
         let original = batch.column_by_name(&self.vec_col).ok_or(Error::Index {
             message: format!(
                 "Compute residual vector: original vector column not found: {}",
                 self.vec_col
             ),
+            location: location!(),
         })?;
         let original_vectors = original.as_fixed_size_list_opt().ok_or(Error::Index {
             message: format!(
@@ -83,6 +85,7 @@ impl Transformer for ResidualTransform {
                 self.vec_col,
                 original.data_type(),
             ),
+            location: location!(),
         })?;
         let original_matrix = MatrixView::<Float32Type>::try_from(original_vectors)?;
         let mut residual_arr: Vec<f32> =

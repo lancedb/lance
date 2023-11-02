@@ -21,6 +21,7 @@ use arrow_array::UInt32Array;
 use async_trait::async_trait;
 use lance_linalg::distance::{DistanceFunc, MetricType};
 use lance_linalg::matrix::MatrixView;
+use snafu::{location, Location};
 
 use super::{Graph, Vertex};
 use crate::{Error, Result};
@@ -99,6 +100,7 @@ impl<V: Vertex + Clone + Sync + Send> Graph for GraphBuilder<V> {
                 a,
                 self.data.num_rows()
             ),
+            location: location!(),
         })?;
 
         let vector_b = self.data.row(b).ok_or_else(|| Error::Index {
@@ -107,6 +109,7 @@ impl<V: Vertex + Clone + Sync + Send> Graph for GraphBuilder<V> {
                 b,
                 self.data.num_rows()
             ),
+            location: location!(),
         })?;
         Ok((self.distance_func)(vector_a, vector_b))
     }
@@ -118,6 +121,7 @@ impl<V: Vertex + Clone + Sync + Send> Graph for GraphBuilder<V> {
                 idx,
                 self.data.num_rows()
             ),
+            location: location!(),
         })?;
         Ok((self.distance_func)(query, vector))
     }

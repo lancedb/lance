@@ -268,6 +268,7 @@ impl FileReader {
                                     "File {} not found in fragment {:?}",
                                     path, fragment
                                 ),
+                                location: location!(),
                             })?
                             .fields,
                     )

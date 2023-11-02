@@ -31,6 +31,7 @@ use lance_linalg::{
 };
 use ordered_float::OrderedFloat;
 use rand::{distributions::Uniform, prelude::*, Rng, SeedableRng};
+use snafu::{location, Location};
 
 use crate::dataset::{Dataset, ROW_ID};
 use crate::index::pb;
@@ -146,12 +147,14 @@ async fn init_graph(
         .column_by_qualified_name(ROW_ID)
         .ok_or(Error::Index {
             message: "row_id not found".to_string(),
+            location: location!(),
         })?
         .as_primitive::<UInt64Type>();
     let vectors = batch
         .column_by_qualified_name(column)
         .ok_or(Error::Index {
             message: format!("column {} not found", column),
+            location: location!(),
         })?
         .as_fixed_size_list();
     let matrix = MatrixView::<Float32Type>::try_from(vectors)?;
@@ -188,9 +191,11 @@ async fn init_graph(
 fn distance(matrix: &MatrixView<Float32Type>, i: usize, j: usize) -> Result<f32> {
     let vector_i = matrix.row(i).ok_or(Error::Index {
         message: "Invalid row index".to_string(),
+        location: location!(),
     })?;
     let vector_j = matrix.row(j).ok_or(Error::Index {
         message: "Invalid row index".to_string(),
+        location: location!(),
     })?;
 
     Ok(l2_distance(vector_i, vector_j))
@@ -257,6 +262,7 @@ async fn robust_prune<V: Vertex + Clone + Sync + Send>(
 async fn find_medoid(vectors: &MatrixView<Float32Type>, metric_type: MetricType) -> Result<usize> {
     let centroid = vectors.centroid().ok_or_else(|| Error::Index {
         message: "Cannot find the medoid of an empty matrix".to_string(),
+        location: location!(),
     })?;
 
     // Find the closest vertex to the centroid.
@@ -287,6 +293,7 @@ async fn index_once<V: Vertex + Clone + Sync + Send>(
     for (i, &id) in ids.iter().enumerate() {
         let vector = graph.data.row(i).ok_or_else(|| Error::Index {
             message: format!("Cannot find vector with id {}", id),
+            location: location!(),
         })?;
 
         let state = greedy_search(graph, medoid, vector, 1, l).await?;
