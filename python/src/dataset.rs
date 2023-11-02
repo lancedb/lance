@@ -23,6 +23,7 @@ use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use chrono::Duration;
 
+use futures::StreamExt;
 use lance::arrow::as_fixed_size_list_array;
 use lance::dataset::progress::WriteFragmentProgress;
 use lance::dataset::{
@@ -476,7 +477,7 @@ impl Dataset {
                     .call_method0(py, "__next__")
                     .and_then(|range| range.extract::<(u64, u64)>(py))
                 {
-                    Ok(range) => Some(Ok(range)),
+                    Ok((start, end)) => Some(Ok(start..end)),
                     Err(err) if err.is_instance_of::<PyStopIteration>(py) => None,
                     Err(err) => Some(Err(lance::Error::InvalidInput {
                         source: Box::new(err),
@@ -486,9 +487,9 @@ impl Dataset {
             })
         });
 
-        let stream = self
-            .ds
-            .take_scan(Box::new(slice_iter), projection, batch_readahead);
+        let slice_stream = futures::stream::iter(slice_iter).boxed();
+
+        let stream = self.ds.take_scan(slice_stream, projection, batch_readahead);
 
         Ok(PyArrowType(Box::new(LanceReader::from_stream(stream))))
     }

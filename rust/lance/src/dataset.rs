@@ -29,7 +29,7 @@ use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use futures::{Future, FutureExt};
+use futures::{Future, FutureExt, Stream};
 use lance_core::io::{
     commit::CommitError,
     object_store::{ObjectStore, ObjectStoreParams},
@@ -43,6 +43,7 @@ use snafu::{location, Location};
 use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -1090,31 +1091,30 @@ impl Dataset {
         }
     }
 
-    /// Get a stream of batches based on iterator of slices of row numbers.
+    /// Get a stream of batches based on iterator of ranges of row numbers.
     ///
     /// This is an experimental API. It may change at any time.
     pub fn take_scan(
         &self,
-        row_slices: Box<dyn Iterator<Item = Result<(u64, u64)>> + Send>,
+        row_ranges: Pin<Box<dyn Stream<Item = Result<Range<u64>>> + Send>>,
         projection: Arc<Schema>,
         batch_readahead: usize,
     ) -> DatasetRecordBatchStream {
         let arrow_schema = Arc::new(projection.as_ref().into());
         let dataset = Arc::new(self.clone());
-        let batch_stream = futures::stream::iter(row_slices)
+        let batch_stream = row_ranges
             .map(move |res| {
                 let dataset = dataset.clone();
                 let projection = projection.clone();
                 let fut = async move {
-                    let (start, end) =
-                        res.map_err(|err| DataFusionError::External(Box::new(err)))?;
-                    let row_pos: Vec<u64> = (start..end).collect();
+                    let range = res.map_err(|err| DataFusionError::External(Box::new(err)))?;
+                    let row_pos: Vec<u64> = (range.start..range.end).collect();
                     dataset
                         .take(&row_pos, projection.as_ref())
                         .await
                         .map_err(|err| DataFusionError::External(Box::new(err)))
                 };
-                async move { tokio::spawn(fut).await.unwrap() }
+                async move { tokio::task::spawn(fut).await.unwrap() }
             })
             .buffered(batch_readahead);
 
@@ -3093,5 +3093,62 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await?;
         Ok(results)
+    }
+
+    #[tokio::test]
+    async fn take_scan_dataset() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("x", DataType::Float32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0])),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let write_params = WriteParams {
+            max_rows_per_group: 2,
+            ..Default::default()
+        };
+
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+
+        let projection = Arc::new(dataset.schema().project(&["i"]).unwrap());
+        let ranges = [0_u64..3, 1..4, 0..1];
+        let range_stream = futures::stream::iter(ranges).map(Ok).boxed();
+        let results = dataset
+            .take_scan(range_stream, projection.clone(), 10)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let expected_schema = projection.as_ref().into();
+        for batch in &results {
+            assert_eq!(batch.schema().as_ref(), &expected_schema);
+        }
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results[0].column(0).as_primitive::<Int32Type>().values(),
+            &[1, 2, 3],
+        );
+        assert_eq!(
+            results[1].column(0).as_primitive::<Int32Type>().values(),
+            &[2, 3, 4],
+        );
+        assert_eq!(
+            results[2].column(0).as_primitive::<Int32Type>().values(),
+            &[1],
+        );
     }
 }
