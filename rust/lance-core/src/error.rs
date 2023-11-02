@@ -16,7 +16,7 @@
 // under the License.
 
 use arrow_schema::ArrowError;
-use snafu::{location, Location, Snafu};
+use snafu::{Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -102,85 +102,104 @@ impl Error {
     }
 }
 
+trait ToSnafuLocation {
+    fn to_snafu_location(&'static self) -> snafu::Location;
+}
+
+impl ToSnafuLocation for std::panic::Location<'static> {
+    fn to_snafu_location(&'static self) -> snafu::Location {
+        snafu::Location::new(self.file(), self.line(), self.column())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl From<ArrowError> for Error {
+    #[track_caller]
     fn from(e: ArrowError) -> Self {
         Self::Arrow {
             message: e.to_string(),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
 
 impl From<&ArrowError> for Error {
+    #[track_caller]
     fn from(e: &ArrowError) -> Self {
         Self::Arrow {
             message: e.to_string(),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
 
 impl From<std::io::Error> for Error {
+    #[track_caller]
     fn from(e: std::io::Error) -> Self {
         Self::IO {
             message: (e.to_string()),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
 
 impl From<object_store::Error> for Error {
+    #[track_caller]
     fn from(e: object_store::Error) -> Self {
         Self::IO {
             message: (e.to_string()),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
 
 impl From<prost::DecodeError> for Error {
+    #[track_caller]
     fn from(e: prost::DecodeError) -> Self {
         Self::IO {
             message: (e.to_string()),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
 
 impl From<tokio::task::JoinError> for Error {
+    #[track_caller]
     fn from(e: tokio::task::JoinError) -> Self {
         Self::IO {
             message: (e.to_string()),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
 
 impl From<object_store::path::Error> for Error {
+    #[track_caller]
     fn from(e: object_store::path::Error) -> Self {
         Self::IO {
             message: (e.to_string()),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
 
 impl From<url::ParseError> for Error {
+    #[track_caller]
     fn from(e: url::ParseError) -> Self {
         Self::IO {
             message: (e.to_string()),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
 
 impl From<serde_json::Error> for Error {
+    #[track_caller]
     fn from(e: serde_json::Error) -> Self {
         Self::Arrow {
             message: e.to_string(),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
@@ -206,34 +225,38 @@ impl From<Error> for ArrowError {
 }
 
 impl From<datafusion_sql::sqlparser::parser::ParserError> for Error {
+    #[track_caller]
     fn from(e: datafusion_sql::sqlparser::parser::ParserError) -> Self {
         Self::IO {
             message: e.to_string(),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
 
 impl From<datafusion_sql::sqlparser::tokenizer::TokenizerError> for Error {
+    #[track_caller]
     fn from(e: datafusion_sql::sqlparser::tokenizer::TokenizerError) -> Self {
         Self::IO {
             message: e.to_string(),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
 
 impl From<Error> for datafusion_common::DataFusionError {
+    #[track_caller]
     fn from(e: Error) -> Self {
         Self::Execution(e.to_string())
     }
 }
 
 impl From<datafusion_common::DataFusionError> for Error {
+    #[track_caller]
     fn from(e: datafusion_common::DataFusionError) -> Self {
         Self::IO {
             message: e.to_string(),
-            location: location!(),
+            location: std::panic::Location::caller().to_snafu_location(),
         }
     }
 }
@@ -246,6 +269,38 @@ impl From<Error> for object_store::Error {
         Self::Generic {
             store: "N/A",
             source: Box::new(err),
+        }
+    }
+}
+
+#[track_caller]
+pub fn get_caller_location() -> &'static std::panic::Location<'static> {
+    std::panic::Location::caller()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_caller_location_capture() {
+        let current_fn = get_caller_location();
+        // make sure ? captures the correct location
+        // .into() WILL NOT capture the correct location
+        let f: Box<dyn Fn() -> Result<()>> = Box::new(|| {
+            Err(object_store::Error::Generic {
+                store: "",
+                source: "".into(),
+            })?;
+            Ok(())
+        });
+        match f().unwrap_err() {
+            Error::IO { location, .. } => {
+                // +4 is the beginning of object_store::Error::Generic...
+                assert_eq!(location.line, current_fn.line() + 4, "{}", location)
+            }
+            #[allow(unreachable_patterns)]
+            _ => panic!("expected ObjectStore error"),
         }
     }
 }
