@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.10"
+version = "0.8.11"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -36,13 +36,13 @@ categories = [
 rust-version = "1.70"
 
 [workspace.dependencies]
-lance-arrow = { version = "=0.8.10", path = "./lance-arrow" }
-lance-core = { version = "=0.8.10", path = "./lance-core" }
-lance-datagen = { version = "=0.8.10", path = "./lance-datagen" }
-lance-index = { version = "=0.8.10", path = "./lance-index" }
-lance-linalg = { version = "=0.8.10", path = "./lance-linalg" }
-lance-test-macros = { version = "=0.8.10", path = "./lance-test-macros" }
-lance-testing = { version = "=0.8.10", path = "./lance-testing" }
+lance-arrow = { version = "=0.8.11", path = "./lance-arrow" }
+lance-core = { version = "=0.8.11", path = "./lance-core" }
+lance-datagen = { version = "=0.8.11", path = "./lance-datagen" }
+lance-index = { version = "=0.8.11", path = "./lance-index" }
+lance-linalg = { version = "=0.8.11", path = "./lance-linalg" }
+lance-test-macros = { version = "=0.8.11", path = "./lance-test-macros" }
+lance-testing = { version = "=0.8.11", path = "./lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "47.0.0", optional = false }
