@@ -17,15 +17,12 @@
 use std::fmt::Formatter;
 
 #[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::{
-    float32x4x2_t, float32x4x4_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32_x2,
-    vld1q_f32_x4, vmulq_f32, vst1q_f32_x2, vst1q_f32_x4, vsubq_f32,
-};
+use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
-use super::SIMD;
+use super::{i32::i32x8, FloatSimd, SIMD};
 
 /// 8 of 32-bit `f32` values. Use 256-bit SIMD if possible.
 #[allow(non_camel_case_types)]
@@ -112,18 +109,6 @@ impl SIMD<f32, 8> for f32x8 {
         }
     }
 
-    fn multiply_add(&mut self, a: Self, b: Self) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            self.0 = _mm256_fmadd_ps(a.0, b.0, self.0);
-        }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            self.0 .0 = vfmaq_f32(self.0 .0, a.0 .0, b.0 .0);
-            self.0 .1 = vfmaq_f32(self.0 .1, a.0 .1, b.0 .1);
-        }
-    }
-
     #[inline]
     fn reduce_sum(&self) -> f32 {
         #[cfg(target_arch = "x86_64")]
@@ -145,6 +130,59 @@ impl SIMD<f32, 8> for f32x8 {
         unsafe {
             let sum = vaddq_f32(self.0 .0, self.0 .1);
             vaddvq_f32(sum)
+        }
+    }
+
+    fn reduce_min(&self) -> f32 {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let m = vminq_f32(self.0 .0, self.0 .1);
+            vminvq_f32(m)
+        }
+    }
+
+    fn min(&self, rhs: &Self) -> Self {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            Self(float32x4x2_t(
+                vminq_f32(self.0 .0, rhs.0 .0),
+                vminq_f32(self.0 .1, rhs.0 .1),
+            ))
+        }
+    }
+
+    fn gather(slice: &[f32], indices: &i32x8) -> Self {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            // aarch64 does not have relevant SIMD instructions.
+            let idx = indices.as_array();
+            let ptr = slice.as_ptr();
+
+            let values = [
+                *ptr.add(idx[0] as usize),
+                *ptr.add(idx[1] as usize),
+                *ptr.add(idx[2] as usize),
+                *ptr.add(idx[3] as usize),
+                *ptr.add(idx[4] as usize),
+                *ptr.add(idx[5] as usize),
+                *ptr.add(idx[6] as usize),
+                *ptr.add(idx[7] as usize),
+            ];
+            Self::load_unaligned(values.as_ptr())
+        }
+    }
+}
+
+impl FloatSimd<f32, 8> for f32x8 {
+    fn multiply_add(&mut self, a: Self, b: Self) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            self.0 = _mm256_fmadd_ps(a.0, b.0, self.0);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            self.0 .0 = vfmaq_f32(self.0 .0, a.0 .0, b.0 .0);
+            self.0 .1 = vfmaq_f32(self.0 .1, a.0 .1, b.0 .1);
         }
     }
 }
@@ -261,6 +299,7 @@ impl std::fmt::Debug for f32x16 {
         write!(f, "f32x16({:?})", arr)
     }
 }
+
 impl SIMD<f32, 16> for f32x16 {
     #[inline]
 
@@ -361,26 +400,6 @@ impl SIMD<f32, 16> for f32x16 {
         }
     }
 
-    #[inline]
-    fn multiply_add(&mut self, a: Self, b: Self) {
-        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-        unsafe {
-            self.0 = _mm512_fmadd_ps(a.0, b.0, self.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
-        unsafe {
-            self.0 = _mm256_fmadd_ps(a.0, b.0, self.0);
-            self.1 = _mm256_fmadd_ps(a.1, b.1, self.1);
-        }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            self.0 .0 = vfmaq_f32(self.0 .0, a.0 .0, b.0 .0);
-            self.0 .1 = vfmaq_f32(self.0 .1, a.0 .1, b.0 .1);
-            self.0 .2 = vfmaq_f32(self.0 .2, a.0 .2, b.0 .2);
-            self.0 .3 = vfmaq_f32(self.0 .3, a.0 .3, b.0 .3);
-        }
-    }
-
     fn reduce_sum(&self) -> f32 {
         #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
         unsafe {
@@ -407,6 +426,43 @@ impl SIMD<f32, 16> for f32x16 {
             let sum2 = vaddq_f32(self.0 .2, self.0 .3);
             sum1 = vaddq_f32(sum1, sum2);
             vaddvq_f32(sum1)
+        }
+    }
+
+    #[inline]
+    fn gather(slice: &[f32], indices: &i32x8) -> Self {
+        todo!()
+    }
+
+    #[inline]
+    fn reduce_min(&self) -> f32 {
+        todo!()
+    }
+
+    #[inline]
+    fn min(&self, rhs: &Self) -> Self {
+        todo!()
+    }
+}
+
+impl FloatSimd<f32, 16> for f32x16 {
+    #[inline]
+    fn multiply_add(&mut self, a: Self, b: Self) {
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            self.0 = _mm512_fmadd_ps(a.0, b.0, self.0)
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
+        unsafe {
+            self.0 = _mm256_fmadd_ps(a.0, b.0, self.0);
+            self.1 = _mm256_fmadd_ps(a.1, b.1, self.1);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            self.0 .0 = vfmaq_f32(self.0 .0, a.0 .0, b.0 .0);
+            self.0 .1 = vfmaq_f32(self.0 .1, a.0 .1, b.0 .1);
+            self.0 .2 = vfmaq_f32(self.0 .2, a.0 .2, b.0 .2);
+            self.0 .3 = vfmaq_f32(self.0 .3, a.0 .3, b.0 .3);
         }
     }
 }

@@ -26,12 +26,14 @@
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
 pub mod f32;
+pub mod i32;
 
-use num_traits::Float;
+use crate::simd::i32::i32x8;
+use num_traits::{Float, Num, Zero};
 
 /// Lance SIMD lib
 ///
-pub trait SIMD<T: Float, const N: usize>:
+pub trait SIMD<T: Num + Copy, const N: usize>:
     std::fmt::Debug
     + AddAssign<Self>
     + Add<Self, Output = Self>
@@ -49,6 +51,9 @@ pub trait SIMD<T: Float, const N: usize>:
 
     /// Create a new instance with all lanes set to zero.
     fn zeros() -> Self;
+
+    /// Gather elements from the slice, using i32 indices.
+    fn gather(slice: &[T], indices: &i32x8) -> Self;
 
     /// Load aligned data from aligned memory.
     ///
@@ -83,11 +88,19 @@ pub trait SIMD<T: Float, const N: usize>:
         arr
     }
 
+    /// Calculate the sum across this vector.
+    fn reduce_sum(&self) -> T;
+
+    /// Find the minimal value in the vector.
+    fn reduce_min(&self) -> T;
+
+    /// Return the minimal value of these two vectors.
+    fn min(&self, rhs: &Self) -> Self;
+}
+
+pub trait FloatSimd<F: Float, const N: usize>: SIMD<F, N> {
     /// fused multiply-add
     ///
     /// c = a * b + c
     fn multiply_add(&mut self, a: Self, b: Self);
-
-    /// Calculate the sum across this vector.
-    fn reduce_sum(&self) -> T;
 }

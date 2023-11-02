@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use half::{bf16, f16};
+use num_traits::Float;
+
 use crate::simd::{
     f32::{f32x16, f32x8},
     SIMD,
 };
-use half::{bf16, f16};
-use num_traits::Float;
 
 /// L2 normalization
 pub trait Normalize<T: Float> {

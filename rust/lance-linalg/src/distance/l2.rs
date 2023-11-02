@@ -25,7 +25,7 @@ use num_traits::real::Real;
 
 use crate::simd::{
     f32::{f32x16, f32x8},
-    SIMD,
+    FloatSimd, SIMD,
 };
 
 /// Calculate the L2 distance between two vectors.
