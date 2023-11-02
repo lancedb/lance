@@ -167,9 +167,20 @@ async fn migrate_manifest(dataset: &Dataset, manifest: &mut Manifest) -> Result<
         return Ok(());
     }
 
-    let dataset = Arc::new(dataset.clone());
+    manifest.fragments = Arc::new(migrate_fragments(dataset, dataset.fragments()).await?);
 
-    let new_fragments = futures::stream::iter(manifest.fragments.as_ref())
+    Ok(())
+}
+
+/// Get updated vector of fragments that has `physical_rows` and `num_deleted_rows`
+/// filled in. This is no-op for newer tables, but may do IO for tables written
+/// with older versions of Lance.
+pub(crate) async fn migrate_fragments(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+) -> Result<Vec<Fragment>> {
+    let dataset = Arc::new(dataset.clone());
+    let new_fragments = futures::stream::iter(fragments)
         .map(|fragment| async {
             let physical_rows = if fragment.physical_rows == 0 {
                 let file_fragment = FileFragment::new(dataset.clone(), fragment.clone());
@@ -213,9 +224,7 @@ async fn migrate_manifest(dataset: &Dataset, manifest: &mut Manifest) -> Result<
         .buffered(num_cpus::get() * 2)
         .boxed();
 
-    manifest.fragments = Arc::new(new_fragments.try_collect().await?);
-
-    Ok(())
+    new_fragments.try_collect().await
 }
 
 /// Update indices with new fields.
