@@ -136,12 +136,10 @@ pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
 mod f32 {
     use super::*;
 
-    use num_traits::Float;
-
     #[inline]
-    pub(crate) fn l2_once<F: Float, S = SIMD<F, 16>>(x: &[F], y: &[F]) -> F {
-        debug_assert_eq!(x.len(), S::LANES);
-        debug_assert_eq!(y.len(), S::LANES);
+    pub(crate) fn l2_once<S: SIMD<f32, N>, const N: usize>(x: &[f32], y: &[f32]) -> f32  {
+        debug_assert_eq!(x.len(), N);
+        debug_assert_eq!(y.len(), N);
         let x = unsafe { S::load_unaligned(x.as_ptr()) };
         let y = unsafe { S::load_unaligned(y.as_ptr()) };
         let s = x - y;
@@ -172,11 +170,11 @@ pub fn l2_distance_batch<'a>(
     match dimension {
         8 => Box::new(
             to.chunks_exact(dimension)
-                .map(move |v| l2_once::<f32x8>(from, v)),
+                .map(move |v| l2_once::<f32x8, 8>(from, v)),
         ),
         16 => Box::new(
             to.chunks_exact(dimension)
-                .map(move |v| l2_once::<f32x16, f32, 16>(from, v)),
+                .map(move |v| l2_once::<f32x16, 16>(from, v)),
         ),
         _ => Box::new(to.chunks_exact(dimension).map(|v| from.l2(v))),
     }
