@@ -115,6 +115,24 @@ impl SIMD<i32, 8> for i32x8 {
             ))
         }
     }
+
+    fn find(&self, val: i32) -> Option<i32> {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let tgt = vdupq_n_s32(val);
+            let mut arr = [0; 8];
+            let mask1 = vceqq_s32(self.0 .0, tgt);
+            let mask2 = vceqq_s32(self.0 .1, tgt);
+            vst1q_u32(arr.as_mut_ptr(), mask1);
+            vst1q_u32(arr.as_mut_ptr().add(4), mask2);
+            for i in 0..8 {
+                if arr.get_unchecked(i) != &0 {
+                    return Some(i as i32);
+                }
+            }
+        }
+        None
+    }
 }
 
 impl Add for i32x8 {

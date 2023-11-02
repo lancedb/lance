@@ -185,6 +185,24 @@ impl SIMD<f32, 8> for f32x8 {
             ))
         }
     }
+
+    fn find(&self, val: f32) -> Option<i32> {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let tgt = vdupq_n_f32(val);
+            let mut arr = [0; 8];
+            let mask1 = vceqq_f32(self.0 .0, tgt);
+            let mask2 = vceqq_f32(self.0 .1, tgt);
+            vst1q_u32(arr.as_mut_ptr(), mask1);
+            vst1q_u32(arr.as_mut_ptr().add(4), mask2);
+            for i in 0..8 {
+                if arr.get_unchecked(i) != &0 {
+                    return Some(i as i32);
+                }
+            }
+        }
+        None
+    }
 }
 
 impl FloatSimd<f32, 8> for f32x8 {
@@ -478,6 +496,30 @@ impl SIMD<f32, 16> for f32x16 {
             ))
         }
     }
+
+    fn find(&self, val: f32) -> Option<i32> {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let tgt = vdupq_n_f32(val);
+            let mut arr = [0; 16];
+            let mask1 = vceqq_f32(self.0 .0, tgt);
+            let mask2 = vceqq_f32(self.0 .1, tgt);
+            let mask3 = vceqq_f32(self.0 .2, tgt);
+            let mask4 = vceqq_f32(self.0 .3, tgt);
+
+            vst1q_u32(arr.as_mut_ptr(), mask1);
+            vst1q_u32(arr.as_mut_ptr().add(4), mask2);
+            vst1q_u32(arr.as_mut_ptr().add(8), mask3);
+            vst1q_u32(arr.as_mut_ptr().add(12), mask4);
+
+            for i in 0..16 {
+                if arr.get_unchecked(i) != &0 {
+                    return Some(i as i32);
+                }
+            }
+        }
+        None
+    }
 }
 
 impl FloatSimd<f32, 16> for f32x16 {
@@ -673,6 +715,10 @@ mod tests {
         );
         let min_val = min_simd.reduce_min();
         assert_eq!(min_val, 1.0);
+
+        assert_eq!(Some(2), simd_a.find(5.0));
+        assert_eq!(Some(1), simd_a.find(2.0));
+        assert_eq!(None, simd_a.find(-200.0));
     }
 
     #[test]
@@ -723,5 +769,10 @@ mod tests {
         );
         let min_val = min_simd.reduce_min();
         assert_eq!(min_val, -0.5);
+
+        assert_eq!(Some(2), simd_a.find(5.0));
+        assert_eq!(Some(1), simd_a.find(2.0));
+        assert_eq!(Some(13), simd_a.find(9.0));
+        assert_eq!(None, simd_a.find(-200.0));
     }
 }

@@ -96,6 +96,9 @@ pub trait SIMD<T: Num + Copy, const N: usize>:
 
     /// Return the minimal value of these two vectors.
     fn min(&self, rhs: &Self) -> Self;
+
+    /// Find the index of value in the vector. If not found, return None.
+    fn find(&self, val: T) -> Option<i32>;
 }
 
 pub trait FloatSimd<F: Float, const N: usize>: SIMD<F, N> {
