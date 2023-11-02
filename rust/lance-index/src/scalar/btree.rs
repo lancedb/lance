@@ -27,7 +27,7 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::Accumulator;
 use datafusion_physical_expr::expressions::{MaxAccumulator, MinAccumulator};
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
-use lance_core::Result;
+use lance_core::{Error, Result};
 
 use super::{
     flat::FlatIndexLoader, IndexReader, IndexStore, IndexWriter, ScalarIndex, ScalarQuery,
@@ -489,7 +489,7 @@ impl Ord for OrderableScalarValue {
 #[derive(Debug)]
 pub struct BTreeLookup {
     tree: BTreeMap<OrderableScalarValue, Vec<u64>>,
-    /// Pages where the value is null
+    /// Pages where the value may be null
     null_pages: Vec<u64>,
 }
 
@@ -706,16 +706,31 @@ struct BatchStats {
     null_count: u32,
 }
 
+// See https://github.com/apache/arrow-datafusion/issues/8031 for the underlying issue.  We use
+// MinAccumulator / MaxAccumulator to retrieve the min/max values and these are unreliable in the
+// presence of NaN
+fn check_for_nan(value: ScalarValue) -> Result<ScalarValue> {
+    match value {
+        ScalarValue::Float32(Some(val)) if val.is_nan() => Err(Error::NotSupported {
+            source: "Scalar indices cannot currently be created on columns with NaN values".into(),
+        }),
+        ScalarValue::Float64(Some(val)) if val.is_nan() => Err(Error::NotSupported {
+            source: "Scalar indices cannot currently be created on columns with NaN values".into(),
+        }),
+        _ => Ok(value),
+    }
+}
+
 fn min_val(array: &Arc<dyn Array>) -> Result<ScalarValue> {
     let mut acc = MinAccumulator::try_new(array.data_type())?;
     acc.update_batch(&[array.clone()])?;
-    Ok(acc.evaluate()?)
+    check_for_nan(acc.evaluate()?)
 }
 
 fn max_val(array: &Arc<dyn Array>) -> Result<ScalarValue> {
     let mut acc = MaxAccumulator::try_new(array.data_type())?;
     acc.update_batch(&[array.clone()])?;
-    Ok(acc.evaluate()?)
+    check_for_nan(acc.evaluate()?)
 }
 
 fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
