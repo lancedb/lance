@@ -414,6 +414,10 @@ impl Scanner {
     /// the first batch can be returned.
     pub fn order_by(&mut self, ordering: Option<Vec<ColumnOrdering>>) -> Result<&mut Self> {
         if let Some(ordering) = &ordering {
+            if ordering.is_empty() {
+                self.ordering = None;
+                return Ok(self);
+            }
             // Verify early that the fields exist
             for column in ordering {
                 self.dataset
@@ -1795,6 +1799,18 @@ mod test {
             .unwrap();
 
         assert_eq!(batches_by_str[0], sorted_by_str);
+
+        // Ensure an empty sort vec does not break anything (sorting is disabled)
+        dataset
+            .scan()
+            .order_by(Some(vec![]))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
