@@ -137,7 +137,7 @@ mod f32 {
     use super::*;
 
     #[inline]
-    pub(crate) fn l2_once<S: SIMD<f32, N>, const N: usize>(x: &[f32], y: &[f32]) -> f32  {
+    pub(crate) fn l2_once<S: SIMD<f32, N>, const N: usize>(x: &[f32], y: &[f32]) -> f32 {
         debug_assert_eq!(x.len(), N);
         debug_assert_eq!(y.len(), N);
         let x = unsafe { S::load_unaligned(x.as_ptr()) };
