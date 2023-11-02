@@ -74,3 +74,6 @@ python_version = "3.11"
 check_untyped_defs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+markers = ["cuda"]

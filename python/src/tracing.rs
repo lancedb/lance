@@ -61,7 +61,18 @@ pub fn trace_to_chrome(path: Option<&str>, level: Option<&str>) -> PyResult<Trac
         builder = builder.file(path);
     }
     let (chrome_layer, guard) = builder.build();
-    let subscriber = Registry::default().with(chrome_layer.with_filter(get_filter(level)?));
+    let level_filter = get_filter(level)?;
+    // Narrow down to just our targets, otherwise we get a lot of spam from
+    // our dependencies.
+    let filter = filter::Targets::new()
+        .with_target("lance", level_filter)
+        .with_target("lance_arrow", level_filter)
+        .with_target("lance_core", level_filter)
+        .with_target("lance_datagen", level_filter)
+        .with_target("lance_index", level_filter)
+        .with_target("lance_linalg", level_filter)
+        .with_target("pylance", level_filter);
+    let subscriber = Registry::default().with(chrome_layer.with_filter(filter));
     subscriber::set_global_default(subscriber)
         .map(move |_| TraceGuard { guard: Some(guard) })
         .map_err(|_| {

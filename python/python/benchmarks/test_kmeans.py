@@ -16,12 +16,11 @@ import numpy as np
 import pytest
 from lance.util import KMeans
 
-CLUSTERS = 1024
+CLUSTERS = 32
 NUM_VECTORS = CLUSTERS * 256
 
 
 @pytest.mark.benchmark(group="kmeans")
-@pytest.mark.skip()
 def test_kmeans(benchmark):
     data = np.random.random((NUM_VECTORS, 1536)).astype("f")
 
@@ -34,7 +33,6 @@ def test_kmeans(benchmark):
 
 @pytest.mark.benchmark(group="kmeans")
 @pytest.mark.gpu
-@pytest.mark.skip()
 def test_kmeans_torch(benchmark):
     data = np.random.random((NUM_VECTORS, 1536)).astype("f")
 

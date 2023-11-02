@@ -84,7 +84,7 @@ benchmarks added there should run in less than 5 seconds.
 Before running benchmarks, you should build pylance in release mode:
 
 ```shell
-maturin develop --profile release-with-debug --extras benchmarks
+maturin develop --profile release-with-debug --extras benchmarks --features datagen
 ```
 
 (You can also use `--release` or `--profile release`, but `--profile release-with-debug`
@@ -136,17 +136,19 @@ the setup is complete and not captured as part of profiling.
 
 ### Compare benchmarks against previous version
 
-You can easily compare the performance of the current version against a previous
-version of pylance. Install the previous version, run the benchmarks, and save
+You can easily compare the performance of the current version against `main`.
+Checkout `main` branch, run the benchmarks, and save
 the output using `--benchmark-save`. Then install the current version and run
 the benchmarks again with `--benchmark-compare`.
 
 ```shell
-pip uninstall -y pylance
-pip install pylance==0.4.18
+CURRENT_BRANCH=$(git branch --show-current)
+git checkout main
+maturin develop --profile release-with-debug  --features datagen
 pytest --benchmark-save=baseline python/benchmarks
 COMPARE_ID=$(ls .benchmarks/*/ | tail -1 | cut -c1-4)
-maturin develop --profile release-with-debug
+git checkout $CURRENT_BRANCH
+maturin develop --profile release-with-debug  --features datagen
 pytest --benchmark-compare=$COMPARE_ID python/benchmarks
 ```
 
@@ -207,12 +209,23 @@ do so using the lance.tracing module.  Simply call:
 ```python
 from lance.tracing import trace_to_chrome
 
-trace_to_chrome()
+trace_to_chrome(level="debug")
 
 # rest of script
 ```
 
 A single .json trace file will be generated after python has exited.
+
+You can use the `trace_to_chrome` function within the benchmarks, but for 
+sensible results you'll want to force the benchmark to just run only once.
+To do this, rewrite the benchmark using the pedantic API:
+
+```python
+def run():
+    "Put code to benchmark here"
+    ...
+benchmark.pedantic(run, iterations=1, rounds=1)
+```
 
 ### Trace visualization limitations
 
