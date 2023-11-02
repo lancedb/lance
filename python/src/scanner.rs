@@ -17,15 +17,14 @@
 
 use std::sync::Arc;
 
-use arrow::ffi_stream::*;
 use arrow::pyarrow::*;
+use arrow_array::RecordBatchReader;
 use pyo3::prelude::*;
 use pyo3::{pyclass, PyObject, PyResult};
 
 use ::lance::dataset::scanner::Scanner as LanceScanner;
 use pyo3::exceptions::PyValueError;
 
-use crate::errors::ioerror;
 use crate::reader::LanceReader;
 use crate::RT;
 
@@ -76,7 +75,9 @@ impl Scanner {
             .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 
-    fn to_pyarrow(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+    fn to_pyarrow(
+        self_: PyRef<'_, Self>,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         let scanner = self_.scanner.clone();
         let reader = RT
             .spawn(Some(self_.py()), async move {
@@ -84,14 +85,6 @@ impl Scanner {
             })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        // Export a `RecordBatchReader` through `FFI_ArrowArrayStream`
-        let mut ffi_stream = FFI_ArrowArrayStream::empty();
-        unsafe {
-            export_reader_into_raw(Box::new(reader), &mut ffi_stream);
-            match ArrowArrayStreamReader::from_raw(&mut ffi_stream) {
-                Ok(reader) => reader.into_pyarrow(self_.py()),
-                Err(err) => Err(ioerror(self_.py(), err.to_string())),
-            }
-        }
+        Ok(PyArrowType(Box::new(reader)))
     }
 }

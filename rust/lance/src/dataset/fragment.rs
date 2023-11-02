@@ -421,7 +421,29 @@ impl FileFragment {
         if with_row_id {
             reader.with_row_id();
         }
-        reader.take(row_ids).await
+        if row_ids.len() > 1 && Self::row_ids_contiguous(row_ids) {
+            let range = (row_ids[0] as usize)..(row_ids[row_ids.len() - 1] as usize + 1);
+            reader.read_range(range).await
+        } else {
+            reader.take(row_ids).await
+        }
+    }
+
+    fn row_ids_contiguous(row_ids: &[u32]) -> bool {
+        if row_ids.is_empty() {
+            return false;
+        }
+
+        let mut last_id = row_ids[0];
+
+        for id in row_ids.iter().skip(1) {
+            if *id != last_id + 1 {
+                return false;
+            }
+            last_id = *id;
+        }
+
+        true
     }
 
     /// Scan this [`FileFragment`].

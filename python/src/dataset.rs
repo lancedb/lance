@@ -17,12 +17,13 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::{ToPyArrow, *};
-use arrow_array::{Float32Array, RecordBatch};
+use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use chrono::Duration;
 
+use futures::StreamExt;
 use lance::arrow::as_fixed_size_list_array;
 use lance::dataset::progress::WriteFragmentProgress;
 use lance::dataset::{
@@ -39,6 +40,7 @@ use lance::index::{
 use lance::io::object_store::ObjectStoreParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_linalg::distance::MetricType;
+use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
 use pyo3::types::PySet;
 use pyo3::{
@@ -50,8 +52,8 @@ use pyo3::{
 use snafu::{location, Location};
 
 use crate::fragment::{FileFragment, FragmentMetadata};
-use crate::Scanner;
 use crate::RT;
+use crate::{LanceReader, Scanner};
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
@@ -447,6 +449,49 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         crate::arrow::record_batch_to_pyarrow(self_.py(), &batch)
+    }
+
+    #[pyo3(signature = (row_slices, columns = None, batch_readahead = 10))]
+    fn take_scan(
+        &self,
+        row_slices: PyObject,
+        columns: Option<Vec<String>>,
+        batch_readahead: usize,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let projection = if let Some(columns) = columns {
+            Arc::new(
+                self.ds
+                    .schema()
+                    .project(&columns)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            )
+        } else {
+            Arc::new(self.ds.schema().clone())
+        };
+
+        // Call into the Python iterable, only holding the GIL as necessary.
+        let py_iter = Python::with_gil(|py| row_slices.call_method0(py, "__iter__"))?;
+        let slice_iter = std::iter::from_fn(move || {
+            Python::with_gil(|py| {
+                match py_iter
+                    .call_method0(py, "__next__")
+                    .and_then(|range| range.extract::<(u64, u64)>(py))
+                {
+                    Ok((start, end)) => Some(Ok(start..end)),
+                    Err(err) if err.is_instance_of::<PyStopIteration>(py) => None,
+                    Err(err) => Some(Err(lance::Error::InvalidInput {
+                        source: Box::new(err),
+                        location: location!(),
+                    })),
+                }
+            })
+        });
+
+        let slice_stream = futures::stream::iter(slice_iter).boxed();
+
+        let stream = self.ds.take_scan(slice_stream, projection, batch_readahead);
+
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(stream))))
     }
 
     fn merge(
