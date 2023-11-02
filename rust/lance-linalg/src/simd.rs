@@ -28,8 +28,7 @@ use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 pub mod f32;
 pub mod i32;
 
-use crate::simd::i32::i32x8;
-use num_traits::{Float, Num, Zero};
+use num_traits::{Float, Num};
 
 /// Lance SIMD lib
 ///
@@ -55,7 +54,6 @@ pub trait SIMD<T: Num + Copy, const N: usize>:
     fn zeros() -> Self;
 
     /// Gather elements from the slice, using i32 indices.
-    fn gather(slice: &[T], indices: &i32x8) -> Self;
 
     /// Load aligned data from aligned memory.
     ///

@@ -69,11 +69,6 @@ impl SIMD<i32, 8> for i32x8 {
     }
 
     #[inline]
-    fn gather(slice: &[i32], indices: &Self) -> Self {
-        todo!()
-    }
-
-    #[inline]
     unsafe fn load(ptr: *const i32) -> Self {
         #[cfg(target_arch = "aarch64")]
         Self(vld1q_s32_x2(ptr))

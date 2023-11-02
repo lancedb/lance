@@ -46,6 +46,29 @@ impl std::fmt::Debug for f32x8 {
     }
 }
 
+impl f32x8 {
+    pub fn gather(slice: &[f32], indices: &i32x8) -> Self {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            // aarch64 does not have relevant SIMD instructions.
+            let idx = indices.as_array();
+            let ptr = slice.as_ptr();
+
+            let values = [
+                *ptr.add(idx[0] as usize),
+                *ptr.add(idx[1] as usize),
+                *ptr.add(idx[2] as usize),
+                *ptr.add(idx[3] as usize),
+                *ptr.add(idx[4] as usize),
+                *ptr.add(idx[5] as usize),
+                *ptr.add(idx[6] as usize),
+                *ptr.add(idx[7] as usize),
+            ];
+            Self::load_unaligned(values.as_ptr())
+        }
+    }
+}
+
 impl From<&[f32]> for f32x8 {
     fn from(value: &[f32]) -> Self {
         unsafe { Self::load_unaligned(value.as_ptr()) }
@@ -160,27 +183,6 @@ impl SIMD<f32, 8> for f32x8 {
                 vminq_f32(self.0 .0, rhs.0 .0),
                 vminq_f32(self.0 .1, rhs.0 .1),
             ))
-        }
-    }
-
-    fn gather(slice: &[f32], indices: &i32x8) -> Self {
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            // aarch64 does not have relevant SIMD instructions.
-            let idx = indices.as_array();
-            let ptr = slice.as_ptr();
-
-            let values = [
-                *ptr.add(idx[0] as usize),
-                *ptr.add(idx[1] as usize),
-                *ptr.add(idx[2] as usize),
-                *ptr.add(idx[3] as usize),
-                *ptr.add(idx[4] as usize),
-                *ptr.add(idx[5] as usize),
-                *ptr.add(idx[6] as usize),
-                *ptr.add(idx[7] as usize),
-            ];
-            Self::load_unaligned(values.as_ptr())
         }
     }
 }
@@ -359,11 +361,6 @@ impl SIMD<f32, 16> for f32x16 {
         }
         #[cfg(target_arch = "aarch64")]
         Self::splat(0.0)
-    }
-
-    #[inline]
-    fn gather(slice: &[f32], indices: &i32x8) -> Self {
-        todo!()
     }
 
     #[inline]
