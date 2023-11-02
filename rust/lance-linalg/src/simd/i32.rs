@@ -37,6 +37,18 @@ impl std::fmt::Debug for i32x8 {
     }
 }
 
+impl From<&[i32]> for i32x8 {
+    fn from(value: &[i32]) -> Self {
+        unsafe { Self::load_unaligned(value.as_ptr()) }
+    }
+}
+
+impl From<&[i32; 8]> for i32x8 {
+    fn from(value: &[i32; 8]) -> Self {
+        unsafe { Self::load_unaligned(value.as_ptr()) }
+    }
+}
+
 impl SIMD<i32, 8> for i32x8 {
     #[inline]
     fn splat(val: i32) -> Self {

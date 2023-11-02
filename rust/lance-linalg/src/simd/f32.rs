@@ -46,6 +46,18 @@ impl std::fmt::Debug for f32x8 {
     }
 }
 
+impl From<&[f32]> for f32x8 {
+    fn from(value: &[f32]) -> Self {
+        unsafe { Self::load_unaligned(value.as_ptr()) }
+    }
+}
+
+impl<'a> From<&'a [f32; 8]> for f32x8 {
+    fn from(value: &'a [f32; 8]) -> Self {
+        unsafe { Self::load_unaligned(value.as_ptr()) }
+    }
+}
+
 impl SIMD<f32, 8> for f32x8 {
     fn splat(val: f32) -> Self {
         #[cfg(target_arch = "x86_64")]
@@ -300,6 +312,18 @@ impl std::fmt::Debug for f32x16 {
     }
 }
 
+impl From<&[f32]> for f32x16 {
+    fn from(value: &[f32]) -> Self {
+        unsafe { Self::load_unaligned(value.as_ptr()) }
+    }
+}
+
+impl<'a> From<&'a [f32; 16]> for f32x16 {
+    fn from(value: &'a [f32; 16]) -> Self {
+        unsafe { Self::load_unaligned(value.as_ptr()) }
+    }
+}
+
 impl SIMD<f32, 16> for f32x16 {
     #[inline]
 
@@ -335,6 +359,11 @@ impl SIMD<f32, 16> for f32x16 {
         }
         #[cfg(target_arch = "aarch64")]
         Self::splat(0.0)
+    }
+
+    #[inline]
+    fn gather(slice: &[f32], indices: &i32x8) -> Self {
+        todo!()
     }
 
     #[inline]
@@ -430,18 +459,27 @@ impl SIMD<f32, 16> for f32x16 {
     }
 
     #[inline]
-    fn gather(slice: &[f32], indices: &i32x8) -> Self {
-        todo!()
-    }
-
-    #[inline]
     fn reduce_min(&self) -> f32 {
-        todo!()
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let m1 = vminq_f32(self.0 .0, self.0 .1);
+            let m2 = vminq_f32(self.0 .2, self.0 .3);
+            let m = vminq_f32(m1, m2);
+            vminvq_f32(m)
+        }
     }
 
     #[inline]
     fn min(&self, rhs: &Self) -> Self {
-        todo!()
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            Self(float32x4x4_t(
+                vminq_f32(self.0 .0, rhs.0 .0),
+                vminq_f32(self.0 .1, rhs.0 .1),
+                vminq_f32(self.0 .2, rhs.0 .2),
+                vminq_f32(self.0 .3, rhs.0 .3),
+            ))
+        }
     }
 }
 
@@ -622,6 +660,22 @@ mod tests {
             "f32x8([100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0])",
             format!("{:?}", simd_power)
         );
+    }
+
+    #[test]
+    fn test_f32x8_cmp_ops() {
+        let a = [1.0_f32, 2.0, 5.0, 6.0, 7.0, 3.0, 2.0, 1.0];
+        let b = [2.0_f32, 1.0, 4.0, 5.0, 9.0, 5.0, 6.0, 2.0];
+        let simd_a: f32x8 = (&a).into();
+        let simd_b: f32x8 = (&b).into();
+
+        let min_simd = simd_a.min(&simd_b);
+        assert_eq!(
+            min_simd.as_array(),
+            [1.0, 1.0, 4.0, 5.0, 7.0, 3.0, 2.0, 1.0]
+        );
+        let min_val = min_simd.reduce_min();
+        assert_eq!(min_val, 1.0);
     }
 
     #[test]
