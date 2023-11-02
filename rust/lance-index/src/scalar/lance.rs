@@ -19,6 +19,7 @@ use std::{path::PathBuf, sync::Arc};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use snafu::{location, Location};
 
 use lance_core::{
     io::{
@@ -60,13 +61,13 @@ impl IndexWriter for FileWriter {
     }
 
     async fn finish(&mut self) -> Result<()> {
-        FileWriter::finish(self).await.map(|_| ())
+        Self::finish(self).await.map(|_| ())
     }
 }
 
 #[async_trait]
 impl IndexReader for FileReader {
-    async fn read_record_batch(&self, offset: u64) -> Result<RecordBatch> {
+    async fn read_record_batch(&self, offset: u32) -> Result<RecordBatch> {
         self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
             .await
     }
@@ -82,6 +83,7 @@ impl IndexStore for LanceIndexStore {
         let path = self.index_dir.join(name);
         let path = path.as_os_str().to_str().ok_or_else(|| Error::Internal {
             message: format!("Could not parse path {path:?}"),
+            location: location!(),
         })?;
         let path = object_store::path::Path::parse(path)?;
         let schema = schema.as_ref().try_into()?;
@@ -99,6 +101,7 @@ impl IndexStore for LanceIndexStore {
         let path = self.index_dir.join(name);
         let path = path.as_os_str().to_str().ok_or_else(|| Error::Internal {
             message: format!("Could not parse {path:?}"),
+            location: location!(),
         })?;
         let path = object_store::path::Path::parse(path)?;
         let file_reader = FileReader::try_new(&self.object_store, &path).await?;
@@ -109,7 +112,7 @@ impl IndexStore for LanceIndexStore {
 #[cfg(test)]
 mod tests {
 
-    use std::path::Path;
+    use std::{future, ops::Bound, path::Path};
 
     use crate::scalar::{
         btree::{train_btree_index, BTreeIndex},
@@ -119,21 +122,17 @@ mod tests {
 
     use super::*;
     use arrow_array::{
-        types::{UInt32Type, UInt64Type},
-        RecordBatchReader,
+        cast::AsArray,
+        types::{Int32Type, UInt64Type, Utf8Type},
+        RecordBatchIterator, RecordBatchReader, UInt64Array,
     };
+    use arrow_schema::{DataType, Field};
+    use arrow_select::take::TakeOptions;
     use datafusion_common::ScalarValue;
-    use futures::stream;
+    use futures::{stream, TryFutureExt};
     use lance_core::{io::object_store::ObjectStoreParams, Error};
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use tempfile::{tempdir, TempDir};
-
-    fn test_data() -> impl RecordBatchReader {
-        gen()
-            .col(Some("values".to_string()), array::step::<UInt32Type>())
-            .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
-            .into_reader_rows(RowCount::from(4096), BatchCount::from(100))
-    }
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path: &Path = tempdir.path();
@@ -145,28 +144,357 @@ mod tests {
         Arc::new(LanceIndexStore::new(object_store, test_path.to_owned()))
     }
 
-    async fn train_index(index_store: &Arc<dyn IndexStore>) {
-        let sub_index_trainer = FlatIndexTrainer::new(arrow_schema::DataType::UInt32);
+    async fn train_index(
+        index_store: &Arc<dyn IndexStore>,
+        data: impl RecordBatchReader,
+        value_type: DataType,
+    ) {
+        let sub_index_trainer = FlatIndexTrainer::new(value_type);
 
-        let data = stream::iter(test_data().map(|batch| batch.map_err(|err| Error::from(err))));
+        let data = stream::iter(data.map(|batch| batch.map_err(|err| Error::from(err))));
         train_btree_index(data, &sub_index_trainer, index_store.as_ref())
             .await
             .unwrap();
     }
 
     #[tokio::test]
-    async fn test_btree() {
+    async fn test_basic_btree() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        train_index(&index_store).await;
+        let data = gen()
+            .col(Some("values".to_string()), array::step::<Int32Type>())
+            .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
+        train_index(&index_store, data, DataType::Int32).await;
         let index = BTreeIndex::load(index_store).await.unwrap();
 
         let row_ids = index
-            .search(&ScalarQuery::Equals(ScalarValue::UInt32(Some(10000))))
+            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(10000))))
             .await
             .unwrap();
 
         assert_eq!(1, row_ids.len());
         assert_eq!(Some(10000), row_ids.values().into_iter().copied().next());
+
+        let row_ids = index
+            .search(&ScalarQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Int32(Some(-100))),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(0, row_ids.len());
+
+        let row_ids = index
+            .search(&ScalarQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Int32(Some(100))),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(100, row_ids.len());
+    }
+
+    async fn check(index: &BTreeIndex, query: ScalarQuery, expected: &[u64]) {
+        let results = index.search(&query).await.unwrap();
+        let expected_arr = UInt64Array::from_iter_values(expected.iter().copied());
+        assert_eq!(results, expected_arr);
+    }
+
+    #[tokio::test]
+    async fn test_btree_with_gaps() {
+        let tempdir = tempdir().unwrap();
+        let index_store = test_store(&tempdir);
+        let batch_one = gen()
+            .col(
+                Some("values".to_string()),
+                array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
+            )
+            .col(
+                Some("row_ids".to_string()),
+                array::cycle::<UInt64Type>(vec![0, 1, 2, 3]),
+            )
+            .into_batch_rows(RowCount::from(4));
+        let batch_two = gen()
+            .col(
+                Some("values".to_string()),
+                array::cycle::<Int32Type>(vec![10, 11, 11, 15]),
+            )
+            .col(
+                Some("row_ids".to_string()),
+                array::cycle::<UInt64Type>(vec![40, 50, 60, 70]),
+            )
+            .into_batch_rows(RowCount::from(4));
+        let batch_three = gen()
+            .col(
+                Some("values".to_string()),
+                array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
+            )
+            .col(
+                Some("row_ids".to_string()),
+                array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
+            )
+            .into_batch_rows(RowCount::from(4));
+        let batch_four = gen()
+            .col(
+                Some("values".to_string()),
+                array::cycle::<Int32Type>(vec![15, 16, 20, 20]),
+            )
+            .col(
+                Some("row_ids".to_string()),
+                array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
+            )
+            .into_batch_rows(RowCount::from(4));
+        let batches = vec![batch_one, batch_two, batch_three, batch_four];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("values", DataType::Int32, false),
+            Field::new("row_ids", DataType::UInt64, false),
+        ]));
+        let data = RecordBatchIterator::new(batches, schema);
+        train_index(&index_store, data, DataType::Int32).await;
+        let index = BTreeIndex::load(index_store).await.unwrap();
+
+        // The above should create four pages
+        //
+        // 0 - 5
+        // 10 - 15
+        // 15 - 15
+        // 15 - 20
+        //
+        // This will help us test various indexing corner cases
+
+        // No results (off the left side)
+        check(
+            &index,
+            ScalarQuery::Equals(ScalarValue::Int32(Some(-3))),
+            &[],
+        )
+        .await;
+
+        check(
+            &index,
+            ScalarQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int32(Some(-3))),
+            ),
+            &[],
+        )
+        .await;
+
+        check(
+            &index,
+            ScalarQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(-10))),
+                Bound::Included(ScalarValue::Int32(Some(-3))),
+            ),
+            &[],
+        )
+        .await;
+
+        // Hitting the middle of a bucket
+        check(
+            &index,
+            ScalarQuery::Equals(ScalarValue::Int32(Some(4))),
+            &[2],
+        )
+        .await;
+
+        // Hitting a gap between two buckets
+        check(
+            &index,
+            ScalarQuery::Equals(ScalarValue::Int32(Some(7))),
+            &[],
+        )
+        .await;
+
+        // Hitting the lowest of the overlapping buckets
+        check(
+            &index,
+            ScalarQuery::Equals(ScalarValue::Int32(Some(11))),
+            &[50, 60],
+        )
+        .await;
+
+        // Hitting the 15 shared on all three buckets
+        check(
+            &index,
+            ScalarQuery::Equals(ScalarValue::Int32(Some(15))),
+            &[70, 400, 500, 600, 700, 4000],
+        )
+        .await;
+
+        // Hitting the upper part of the three overlapping buckets
+        check(
+            &index,
+            ScalarQuery::Equals(ScalarValue::Int32(Some(20))),
+            &[6000, 7000],
+        )
+        .await;
+
+        // Ranges that capture multiple buckets
+        check(
+            &index,
+            ScalarQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int32(Some(11))),
+            ),
+            &[0, 1, 2, 3, 40, 50, 60],
+        )
+        .await;
+
+        check(
+            &index,
+            ScalarQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Int32(Some(11))),
+            ),
+            &[0, 1, 2, 3, 40],
+        )
+        .await;
+
+        check(
+            &index,
+            ScalarQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(4))),
+                Bound::Unbounded,
+            ),
+            &[
+                2, 3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
+        )
+        .await;
+
+        check(
+            &index,
+            ScalarQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(4))),
+                Bound::Included(ScalarValue::Int32(Some(11))),
+            ),
+            &[2, 3, 40, 50, 60],
+        )
+        .await;
+
+        check(
+            &index,
+            ScalarQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(4))),
+                Bound::Excluded(ScalarValue::Int32(Some(11))),
+            ),
+            &[2, 3, 40],
+        )
+        .await;
+
+        check(
+            &index,
+            ScalarQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(4))),
+                Bound::Unbounded,
+            ),
+            &[
+                3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
+        )
+        .await;
+
+        check(
+            &index,
+            ScalarQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(4))),
+                Bound::Included(ScalarValue::Int32(Some(11))),
+            ),
+            &[3, 40, 50, 60],
+        )
+        .await;
+
+        check(
+            &index,
+            ScalarQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(4))),
+                Bound::Excluded(ScalarValue::Int32(Some(11))),
+            ),
+            &[3, 40],
+        )
+        .await;
+
+        check(
+            &index,
+            ScalarQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(-50))),
+                Bound::Excluded(ScalarValue::Int32(Some(1000))),
+            ),
+            &[
+                0, 1, 2, 3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_btree_types() {
+        for data_type in &[
+            DataType::Boolean,
+            DataType::Int32,
+            DataType::Utf8,
+            DataType::Float32,
+            DataType::Date32,
+        ] {
+            let tempdir = tempdir().unwrap();
+            let index_store = test_store(&tempdir);
+            let data: RecordBatch = gen()
+                .col(Some("values".to_string()), array::rand_type(&data_type))
+                .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
+                .into_batch_rows(RowCount::from(4096 * 3))
+                .unwrap();
+
+            let sample_value = ScalarValue::try_from_array(data.column(0), 0).unwrap();
+            let sample_row_id = data.column(1).as_primitive::<UInt64Type>().value(0);
+
+            let sort_indices = arrow::compute::sort_to_indices(data.column(0), None, None).unwrap();
+            let sorted_values = arrow_select::take::take(
+                data.column(0),
+                &sort_indices,
+                Some(TakeOptions {
+                    check_bounds: false,
+                }),
+            )
+            .unwrap();
+            let sorted_row_ids = arrow_select::take::take(
+                data.column(1),
+                &sort_indices,
+                Some(TakeOptions {
+                    check_bounds: false,
+                }),
+            )
+            .unwrap();
+            let sorted_batch =
+                RecordBatch::try_new(data.schema().clone(), vec![sorted_values, sorted_row_ids])
+                    .unwrap();
+
+            let batch_one = sorted_batch.slice(0, 4096);
+            let batch_two = sorted_batch.slice(4096, 4096);
+            let batch_three = sorted_batch.slice(8192, 4096);
+            let training_data = RecordBatchIterator::new(
+                vec![batch_one, batch_two, batch_three]
+                    .into_iter()
+                    .map(|x| Ok(x)),
+                data.schema().clone(),
+            );
+
+            train_index(&index_store, training_data, data_type.clone()).await;
+            let index = BTreeIndex::load(index_store).await.unwrap();
+
+            let row_ids = index
+                .search(&ScalarQuery::Equals(sample_value))
+                .await
+                .unwrap();
+
+            // The random data may have had duplicates so there might be more than 1 result
+            // but even for boolean we shouldn't match the entire thing
+            assert!(row_ids.len() >= 1);
+            assert!(row_ids.len() < data.num_rows());
+            assert!(row_ids.values().iter().any(|val| *val == sample_row_id));
+        }
     }
 }

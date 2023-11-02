@@ -42,7 +42,7 @@ pub trait IndexWriter: Send {
 #[async_trait]
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
-    async fn read_record_batch(&self, n: u64) -> Result<RecordBatch>;
+    async fn read_record_batch(&self, n: u32) -> Result<RecordBatch>;
 }
 
 /// Trait abstracting I/O away from index logic

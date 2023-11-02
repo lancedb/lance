@@ -74,7 +74,7 @@ pub struct FlatIndexLoader {}
 impl SubIndexLoader for FlatIndexLoader {
     async fn load_subindex(
         &self,
-        offset: u64,
+        offset: u32,
         index_reader: Arc<dyn IndexReader>,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let batch = index_reader.read_record_batch(offset).await?;
@@ -126,17 +126,34 @@ impl ScalarIndex for FlatIndex {
                 (Bound::Unbounded, Bound::Unbounded) => {
                     panic!("Scalar range query received with no upper or lower bound")
                 }
-                (Bound::Included(lower), Bound::Unbounded) => {
-                    arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar())?
+                (Bound::Unbounded, Bound::Included(upper)) => {
+                    arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar())?
                 }
                 (Bound::Unbounded, Bound::Excluded(upper)) => {
                     arrow_ord::cmp::lt(self.values(), &upper.to_scalar())?
                 }
+                (Bound::Included(lower), Bound::Unbounded) => {
+                    arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar())?
+                }
+                (Bound::Included(lower), Bound::Included(upper)) => arrow::compute::and(
+                    &arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar())?,
+                    &arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar())?,
+                )?,
                 (Bound::Included(lower), Bound::Excluded(upper)) => arrow::compute::and(
                     &arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar())?,
                     &arrow_ord::cmp::lt(self.values(), &upper.to_scalar())?,
                 )?,
-                _ => panic!("Scalar range query had excluded lower bound or included upper bound"),
+                (Bound::Excluded(lower), Bound::Unbounded) => {
+                    arrow_ord::cmp::gt(self.values(), &lower.to_scalar())?
+                }
+                (Bound::Excluded(lower), Bound::Included(upper)) => arrow::compute::and(
+                    &arrow_ord::cmp::gt(self.values(), &lower.to_scalar())?,
+                    &arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar())?,
+                )?,
+                (Bound::Excluded(lower), Bound::Excluded(upper)) => arrow::compute::and(
+                    &arrow_ord::cmp::gt(self.values(), &lower.to_scalar())?,
+                    &arrow_ord::cmp::lt(self.values(), &upper.to_scalar())?,
+                )?,
             },
         };
         Ok(arrow_select::filter::filter(self.ids(), &predicate)?

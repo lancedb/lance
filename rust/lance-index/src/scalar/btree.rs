@@ -28,6 +28,7 @@ use datafusion_expr::Accumulator;
 use datafusion_physical_expr::expressions::{MaxAccumulator, MinAccumulator};
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
+use snafu::{location, Location};
 
 use super::{
     flat::FlatIndexLoader, IndexReader, IndexStore, IndexWriter, ScalarIndex, ScalarQuery,
@@ -50,7 +51,7 @@ impl Eq for OrderableScalarValue {}
 
 impl PartialOrd for OrderableScalarValue {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 
@@ -475,9 +476,7 @@ impl Ord for OrderableScalarValue {
             }
             (Struct(_, _), _) => panic!("Attempt to compare Struct with non-Struct"),
             (Dictionary(_k1, _v1), Dictionary(_k2, _v2)) => todo!(),
-            (Dictionary(_, v1), Null) => {
-                OrderableScalarValue(*v1.clone()).cmp(&OrderableScalarValue(ScalarValue::Null))
-            }
+            (Dictionary(_, v1), Null) => Self(*v1.clone()).cmp(&Self(ScalarValue::Null)),
             (Dictionary(_, _), _) => panic!("Attempt to compare Dictionary with non-Dictionary"),
             (Null, Null) => Ordering::Equal,
             (Null, _) => todo!(),
@@ -485,36 +484,46 @@ impl Ord for OrderableScalarValue {
     }
 }
 
+#[derive(Debug)]
+struct PageRecord {
+    max: OrderableScalarValue,
+    page_number: u32,
+}
+
+trait BTreeMapExt<K, V> {
+    fn largest_node_less(&self, key: &K) -> Option<(&K, &V)>;
+}
+
+impl<K: Ord, V> BTreeMapExt<K, V> for BTreeMap<K, V> {
+    fn largest_node_less(&self, key: &K) -> Option<(&K, &V)> {
+        self.range((Bound::Unbounded, Bound::Excluded(key)))
+            .next_back()
+    }
+}
+
 /// An in-memory structure that can quickly satisfy scalar queries using a btree of ScalarValue
 #[derive(Debug)]
 pub struct BTreeLookup {
-    tree: BTreeMap<OrderableScalarValue, Vec<u64>>,
+    tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
     /// Pages where the value may be null
-    null_pages: Vec<u64>,
+    null_pages: Vec<u32>,
 }
 
 impl BTreeLookup {
-    fn new(tree: BTreeMap<OrderableScalarValue, Vec<u64>>, null_pages: Vec<u64>) -> Self {
+    fn new(tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>, null_pages: Vec<u32>) -> Self {
         Self { tree, null_pages }
     }
 
     // All pages that could have a value equal to val
-    fn pages_eq(&self, val: &ScalarValue) -> Vec<u64> {
-        self.tree
-            .range((
-                Bound::Included(OrderableScalarValue(val.clone())),
-                Bound::Unbounded,
-            ))
-            .next()
-            .map(|(_, val)| val.clone())
-            .unwrap_or_default()
+    fn pages_eq(&self, query: &OrderableScalarValue) -> Vec<u32> {
+        self.pages_between((Bound::Included(query), Bound::Excluded(query)))
     }
 
     // All pages that could have a value equal to one of the values
-    fn pages_in(&self, values: &[ScalarValue]) -> Vec<u64> {
+    fn pages_in(&self, values: impl IntoIterator<Item = OrderableScalarValue>) -> Vec<u32> {
         let page_lists = values
-            .iter()
-            .map(|val| self.pages_eq(val))
+            .into_iter()
+            .map(|val| self.pages_eq(&val))
             .collect::<Vec<_>>();
         let total_size = page_lists.iter().map(|set| set.len()).sum();
         let mut heap = BinaryHeap::with_capacity(total_size);
@@ -526,25 +535,63 @@ impl BTreeLookup {
         all_pages
     }
 
-    fn wrap_bound(bound: Bound<ScalarValue>) -> Bound<OrderableScalarValue> {
-        match bound {
+    // All pages that could have a value in the range
+    fn pages_between(
+        &self,
+        range: (Bound<&OrderableScalarValue>, Bound<&OrderableScalarValue>),
+    ) -> Vec<u32> {
+        // We need to grab a little bit left of the given range because the query might be 7
+        // and the first page might be something like 5-10.
+        let lower_bound = match range.0 {
             Bound::Unbounded => Bound::Unbounded,
-            Bound::Included(val) => Bound::Included(OrderableScalarValue(val)),
-            Bound::Excluded(val) => Bound::Excluded(OrderableScalarValue(val)),
+            // It doesn't matter if the bound is exclusive or inclusive.  We are going to grab
+            // the first node whose min is strictly less than the given bound.  Then we grab
+            // all nodes greater than or equal to that
+            //
+            // We have to peek a bit to the left because we might have something like a lower
+            // bound of 7 and there is a page [5-10] we want to search for.
+            Bound::Included(lower) => self
+                .tree
+                .largest_node_less(lower)
+                .map(|val| Bound::Included(val.0))
+                .unwrap_or(Bound::Unbounded),
+            Bound::Excluded(lower) => self
+                .tree
+                .largest_node_less(lower)
+                .map(|val| Bound::Included(val.0))
+                .unwrap_or(Bound::Unbounded),
+        };
+        let upper_bound = match range.1 {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(upper) => Bound::Included(upper),
+            // Even if the upper bound is excluded we need to include it on an [x, x) query.  This is because the
+            // query might be [x, x).  Our lower bound might find some [a-x] bucket and we still
+            // want to include any [x, z] bucket.
+            //
+            // We could be slightly more accurate here and only include the upper bound if the lower bound
+            // is defined, inclusive, and equal to the upper bound.  However, let's keep it simple for now.  This
+            // should only affect the probably rare case that our query is a true range query and the value
+            // matches an upper bound.  This will all be moot if/when we merge pages.
+            Bound::Excluded(upper) => Bound::Included(upper),
+        };
+        let candidates = self
+            .tree
+            .range((lower_bound, upper_bound))
+            .flat_map(|val| val.1);
+        match lower_bound {
+            Bound::Unbounded => candidates.map(|val| val.page_number).collect(),
+            Bound::Included(lower_bound) => candidates
+                .filter(|val| val.max.cmp(lower_bound) != Ordering::Less)
+                .map(|val| val.page_number)
+                .collect(),
+            Bound::Excluded(lower_bound) => candidates
+                .filter(|val| val.max.cmp(lower_bound) == Ordering::Greater)
+                .map(|val| val.page_number)
+                .collect(),
         }
     }
 
-    // All pages that could have a value in the range
-    fn pages_between(&self, range: (Bound<ScalarValue>, Bound<ScalarValue>)) -> Vec<u64> {
-        self.tree
-            .range((Self::wrap_bound(range.0), Self::wrap_bound(range.1)))
-            .map(|(_, val)| val)
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>()
-    }
-
-    fn pages_null(&self) -> Vec<u64> {
+    fn pages_null(&self) -> Vec<u32> {
         self.null_pages.clone()
     }
 }
@@ -557,7 +604,7 @@ impl BTreeLookup {
 pub trait SubIndexLoader: std::fmt::Debug + Send + Sync {
     async fn load_subindex(
         &self,
-        offset: u64,
+        page_number: u32,
         index_reader: Arc<dyn IndexReader>,
     ) -> Result<Arc<dyn ScalarIndex>>;
 }
@@ -586,8 +633,8 @@ pub struct BTreeIndex {
 
 impl BTreeIndex {
     fn new(
-        tree: BTreeMap<OrderableScalarValue, Vec<u64>>,
-        null_pages: Vec<u64>,
+        tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
+        null_pages: Vec<u32>,
         store: Arc<dyn IndexStore>,
         sub_index: Arc<dyn SubIndexLoader>,
     ) -> Self {
@@ -602,12 +649,12 @@ impl BTreeIndex {
     async fn search_page(
         &self,
         query: &ScalarQuery,
-        page_offset: u64,
+        page_number: u32,
         index_reader: Arc<dyn IndexReader>,
     ) -> Result<UInt64Array> {
         let subindex = self
             .sub_index
-            .load_subindex(page_offset, index_reader)
+            .load_subindex(page_number, index_reader)
             .await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
@@ -617,8 +664,15 @@ impl BTreeIndex {
     }
 
     fn try_from_serialized(data: RecordBatch, store: Arc<dyn IndexStore>) -> Result<Self> {
-        let mut map = BTreeMap::<OrderableScalarValue, Vec<u64>>::new();
-        let mut null_pages = Vec::<u64>::new();
+        let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
+        let mut null_pages = Vec::<u32>::new();
+
+        if data.num_rows() == 0 {
+            return Err(Error::Internal {
+                message: "attempt to load btree index from empty stats batch".into(),
+                location: location!(),
+            });
+        }
 
         let mins = data.column(0);
         let maxs = data.column(1);
@@ -627,27 +681,28 @@ impl BTreeIndex {
             .as_any()
             .downcast_ref::<UInt32Array>()
             .unwrap();
-        let offsets = data
+        let page_numbers = data
             .column(3)
             .as_any()
-            .downcast_ref::<UInt64Array>()
+            .downcast_ref::<UInt32Array>()
             .unwrap();
 
-        let first_min = ScalarValue::try_from_array(&mins, 0)?;
-        map.entry(OrderableScalarValue(first_min)).or_default();
-
         for idx in 0..data.num_rows() {
-            let max = ScalarValue::try_from_array(&maxs, idx)?;
+            let min = OrderableScalarValue(ScalarValue::try_from_array(&mins, idx)?);
+            let max = OrderableScalarValue(ScalarValue::try_from_array(&maxs, idx)?);
             let null_count = null_counts.values()[idx];
-            let offset = offsets.values()[idx];
+            let page_number = page_numbers.values()[idx];
 
-            map.entry(OrderableScalarValue(max))
+            map.entry(min)
                 .or_default()
-                .push(offset);
+                .push(PageRecord { max, page_number });
             if null_count > 0 {
-                null_pages.push(offset);
+                null_pages.push(page_number);
             }
         }
+
+        let last_max = ScalarValue::try_from_array(&maxs, data.num_rows() - 1)?;
+        map.entry(OrderableScalarValue(last_max)).or_default();
 
         // TODO: Support other page types?
         let sub_index = Arc::new(FlatIndexLoader {});
@@ -656,15 +711,27 @@ impl BTreeIndex {
     }
 }
 
+fn wrap_bound(bound: &Bound<ScalarValue>) -> Bound<OrderableScalarValue> {
+    match bound {
+        Bound::Unbounded => Bound::Unbounded,
+        Bound::Included(val) => Bound::Included(OrderableScalarValue(val.clone())),
+        Bound::Excluded(val) => Bound::Excluded(OrderableScalarValue(val.clone())),
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for BTreeIndex {
     async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
         let pages = match query {
-            ScalarQuery::Equals(val) => self.page_lookup.pages_eq(val),
-            ScalarQuery::Range(start, end) => {
-                self.page_lookup.pages_between((start.clone(), end.clone()))
-            }
-            ScalarQuery::IsIn(values) => self.page_lookup.pages_in(values),
+            ScalarQuery::Equals(val) => self
+                .page_lookup
+                .pages_eq(&OrderableScalarValue(val.clone())),
+            ScalarQuery::Range(start, end) => self
+                .page_lookup
+                .pages_between((wrap_bound(start).as_ref(), wrap_bound(end).as_ref())),
+            ScalarQuery::IsIn(values) => self
+                .page_lookup
+                .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
             ScalarQuery::IsNull() => self.page_lookup.pages_null(),
         };
         let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
@@ -713,9 +780,11 @@ fn check_for_nan(value: ScalarValue) -> Result<ScalarValue> {
     match value {
         ScalarValue::Float32(Some(val)) if val.is_nan() => Err(Error::NotSupported {
             source: "Scalar indices cannot currently be created on columns with NaN values".into(),
+            location: location!(),
         }),
         ScalarValue::Float64(Some(val)) if val.is_nan() => Err(Error::NotSupported {
             source: "Scalar indices cannot currently be created on columns with NaN values".into(),
+            location: location!(),
         }),
         _ => Ok(value),
     }
@@ -735,8 +804,8 @@ fn max_val(array: &Arc<dyn Array>) -> Result<ScalarValue> {
 
 fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
     let values = batch.column(0);
-    let min = min_val(&values)?;
-    let max = max_val(&values)?;
+    let min = min_val(values)?;
+    let max = max_val(values)?;
     Ok(BatchStats {
         min,
         max,
@@ -752,7 +821,7 @@ pub trait SubIndexTrainer: Send + Sync {
 
 struct EncodedBatch {
     stats: BatchStats,
-    offset: u64,
+    page_number: u32,
 }
 
 async fn train_btree_page(
@@ -765,7 +834,7 @@ async fn train_btree_page(
     sub_index_trainer.train(batch, writer).await?;
     Ok(EncodedBatch {
         stats,
-        offset: batch_idx as u64,
+        page_number: batch_idx,
     })
 }
 
@@ -773,20 +842,20 @@ fn btree_stats_as_batch(stats: Vec<EncodedBatch>) -> Result<RecordBatch> {
     let mins = ScalarValue::iter_to_array(stats.iter().map(|stat| stat.stats.min.clone()))?;
     let maxs = ScalarValue::iter_to_array(stats.iter().map(|stat| stat.stats.max.clone()))?;
     let null_counts = UInt32Array::from_iter_values(stats.iter().map(|stat| stat.stats.null_count));
-    let offsets = UInt64Array::from_iter_values(stats.iter().map(|stat| stat.offset));
+    let page_numbers = UInt32Array::from_iter_values(stats.iter().map(|stat| stat.page_number));
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("min", mins.data_type().clone(), false),
         Field::new("max", maxs.data_type().clone(), false),
         Field::new("null_count", null_counts.data_type().clone(), false),
-        Field::new("idx_offset", offsets.data_type().clone(), false),
+        Field::new("page_idx", page_numbers.data_type().clone(), false),
     ]));
 
     let columns = vec![
         mins,
         maxs,
         Arc::new(null_counts) as Arc<dyn Array>,
-        Arc::new(offsets) as Arc<dyn Array>,
+        Arc::new(page_numbers) as Arc<dyn Array>,
     ];
 
     Ok(RecordBatch::try_new(schema, columns)?)
