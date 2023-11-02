@@ -651,7 +651,7 @@ impl Scanner {
                 plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
             }
             let col_exprs = ordering
-                .into_iter()
+                .iter()
                 .map(|col| {
                     Ok(PhysicalSortExpr {
                         expr: expressions::col(&col.column_name, plan.schema().as_ref())?,

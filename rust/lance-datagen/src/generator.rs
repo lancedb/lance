@@ -242,7 +242,7 @@ impl ArrayGeneratorExt for Box<dyn ArrayGenerator> {
     fn with_validity(self, validity: &[bool]) -> Box<dyn ArrayGenerator> {
         Box::new(CycleNullGenerator {
             generator: self,
-            validity: validity.iter().copied().collect(),
+            validity: validity.to_vec(),
             idx: 0,
         })
     }
