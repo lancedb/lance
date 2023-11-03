@@ -48,6 +48,11 @@ impl std::fmt::Debug for f32x8 {
 
 impl f32x8 {
     pub fn gather(slice: &[f32], indices: &i32x8) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_i32gather_ps::<1>(slice.as_ptr(), indices.0))
+        }
+
         #[cfg(target_arch = "aarch64")]
         unsafe {
             // aarch64 does not have relevant SIMD instructions.
@@ -475,6 +480,22 @@ impl SIMD<f32, 16> for f32x16 {
 
     #[inline]
     fn reduce_min(&self) -> f32 {
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            _mm512_mask_reduce_min_ps(0xFFFF, self.0)
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
+        unsafe {
+            let mut m1 = _mm256_min_ps(self.0, self.1);
+            let mut m2 = _mm256_permute2f128_ps(m1, m1, 1);
+            m1 = _mm256_min_ps(m1, m2);
+            m2 = _mm256_permute_ps(m1, 14);
+            m1 = _mm256_min_ps(m1, m2);
+            let mut results: [f32; 8] = [0f32; 8];
+            _mm256_storeu_ps(results.as_mut_ptr(), m1);
+            results[0]
+        }
+
         #[cfg(target_arch = "aarch64")]
         unsafe {
             let m1 = vminq_f32(self.0 .0, self.0 .1);
@@ -486,6 +507,14 @@ impl SIMD<f32, 16> for f32x16 {
 
     #[inline]
     fn min(&self, rhs: &Self) -> Self {
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            Self(_mm512_min_ps(self.0, rhs.0))
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
+        unsafe {
+            Self(_mm256_min_ps(self.0, rhs.0), _mm256_min_ps(self.1, rhs.1))
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(float32x4x4_t(

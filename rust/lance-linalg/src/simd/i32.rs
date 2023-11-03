@@ -23,6 +23,11 @@ use std::arch::x86_64::*;
 use super::SIMD;
 
 #[allow(non_camel_case_types)]
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+pub struct i32x8(pub(crate) __m256i);
+
+#[allow(non_camel_case_types)]
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
 pub struct i32x8(int32x4x2_t);
@@ -52,6 +57,10 @@ impl From<&[i32; 8]> for i32x8 {
 impl SIMD<i32, 8> for i32x8 {
     #[inline]
     fn splat(val: i32) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_set1_epi32(val))
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(int32x4x2_t(vdupq_n_s32(val), vdupq_n_s32(val)))
@@ -62,7 +71,7 @@ impl SIMD<i32, 8> for i32x8 {
     fn zeros() -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm256_setzero_i32())
+            Self(_mm256_setzero_si256())
         }
         #[cfg(target_arch = "aarch64")]
         Self::splat(0)
@@ -70,24 +79,34 @@ impl SIMD<i32, 8> for i32x8 {
 
     #[inline]
     unsafe fn load(ptr: *const i32) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_loadu_si256(ptr as *const __m256i))
+        }
         #[cfg(target_arch = "aarch64")]
         Self(vld1q_s32_x2(ptr))
     }
 
     #[inline]
     unsafe fn load_unaligned(ptr: *const i32) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_loadu_si256(ptr as *const __m256i))
+        }
         #[cfg(target_arch = "aarch64")]
         Self(vld1q_s32_x2(ptr))
     }
 
+    #[inline]
     unsafe fn store(&self, ptr: *mut i32) {
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            vst1q_s32_x2(ptr, self.0)
-        }
+        self.store_unaligned(ptr)
     }
 
     unsafe fn store_unaligned(&self, ptr: *mut i32) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            _mm256_storeu_si256(ptr as *mut __m256i, self.0);
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             vst1q_s32_x2(ptr, self.0)
@@ -95,6 +114,10 @@ impl SIMD<i32, 8> for i32x8 {
     }
 
     fn reduce_sum(&self) -> i32 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            todo!()
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             let sum = vaddq_s32(self.0 .0, self.0 .1);
@@ -107,6 +130,10 @@ impl SIMD<i32, 8> for i32x8 {
     }
 
     fn min(&self, rhs: &Self) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_min_epi32(self.0, rhs.0))
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(int32x4x2_t(
@@ -117,6 +144,10 @@ impl SIMD<i32, 8> for i32x8 {
     }
 
     fn find(&self, val: i32) -> Option<i32> {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             let tgt = vdupq_n_s32(val);
@@ -140,6 +171,10 @@ impl Add for i32x8 {
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_add_epi32(self.0, rhs.0))
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(int32x4x2_t(
@@ -153,6 +188,10 @@ impl Add for i32x8 {
 impl AddAssign for i32x8 {
     #[inline]
     fn add_assign(&mut self, rhs: Self) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            self.0 = _mm256_add_epi32(self.0, rhs.0);
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             self.0 .0 = vaddq_s32(self.0 .0, rhs.0 .0);
@@ -166,6 +205,10 @@ impl Sub for i32x8 {
 
     #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_sub_epi32(self.0, rhs.0))
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(int32x4x2_t(
@@ -179,6 +222,10 @@ impl Sub for i32x8 {
 impl SubAssign for i32x8 {
     #[inline]
     fn sub_assign(&mut self, rhs: Self) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            self.0 = _mm256_sub_epi32(self.0, rhs.0);
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             self.0 .0 = vsubq_s32(self.0 .0, rhs.0 .0);
@@ -192,6 +239,10 @@ impl Mul for i32x8 {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_mul_epi32(self.0, rhs.0))
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(int32x4x2_t(
