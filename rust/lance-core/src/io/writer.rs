@@ -14,6 +14,7 @@
 
 mod statistics;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
@@ -110,9 +111,15 @@ impl FileWriter {
     ///
     /// Returns [Err] if the schema does not match with the batch.
     pub async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
-        let expected_schema: ArrowSchema = (&self.schema).into();
+        let expected_schema = ArrowSchema::from(&self.schema).with_metadata(HashMap::new());
         for batch in batches {
-            assert_eq!(&expected_schema, batch.schema().as_ref());
+            // Compare with metadata reset
+            let schema = batch
+                .schema()
+                .as_ref()
+                .clone()
+                .with_metadata(HashMap::new());
+            assert_eq!(&expected_schema, &schema);
         }
 
         // Copy a list of fields to avoid borrow checker error.

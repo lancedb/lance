@@ -101,10 +101,11 @@ pub async fn shuffle_dataset(
     // TODO: dynamically detect schema from the transforms.
     let schema = Schema::new(vec![
         ROW_ID_FIELD.clone(),
+        Field::new(PART_ID_COLUMN, DataType::UInt32, false),
         Field::new(
             PQ_CODE_COLUMN,
             DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::UInt8, false)),
+                Arc::new(Field::new("item", DataType::UInt8, true)),
                 num_sub_vectors as i32,
             ),
             false,
