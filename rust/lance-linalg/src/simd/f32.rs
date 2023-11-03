@@ -174,6 +174,21 @@ impl SIMD<f32, 8> for f32x8 {
     }
 
     fn reduce_min(&self) -> f32 {
+        #[cfg(target_arch = "x86_64")] {
+            unsafe {
+                let mut min = self.0;
+                // Shift and add vector, until only 1 value left.
+                // sums = [x0-x7], shift = [x4-x7]
+                let mut shift = _mm256_permute2f128_ps(min, min, 1);
+                // [x0+x4, x1+x5, ..]
+                min = _mm256_min_ps(min, shift);
+                shift = _mm256_permute_ps(min, 14);
+                min = _mm256_min_ps(min, shift);
+                let mut results: [f32; 8] = [0f32; 8];
+                _mm256_storeu_ps(results.as_mut_ptr(), min);
+                results[0]
+            }
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             let m = vminq_f32(self.0 .0, self.0 .1);
@@ -182,6 +197,10 @@ impl SIMD<f32, 8> for f32x8 {
     }
 
     fn min(&self, rhs: &Self) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm256_min_ps(self.0, rhs.0))
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(float32x4x2_t(
@@ -192,6 +211,14 @@ impl SIMD<f32, 8> for f32x8 {
     }
 
     fn find(&self, val: f32) -> Option<i32> {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            for i in 0..8 {
+                if self.as_array().get_unchecked(i) == &val {
+                    return Some(i as i32);
+                }
+            }
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             let tgt = vdupq_n_f32(val);
@@ -527,6 +554,24 @@ impl SIMD<f32, 16> for f32x16 {
     }
 
     fn find(&self, val: f32) -> Option<i32> {
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe {
+            let tgt = _mm512_set1_ps(val);
+            let mask = _mm512_cmpeq_ps_mask(self.0, tgt);
+            if mask != 0 {
+                return Some(mask.trailing_zeros() as i32);
+            }
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
+        unsafe {
+            // _mm256_cmpeq_ps_mask requires "avx512l".
+            for i in 0..16 {
+                if self.as_array().get_unchecked(i) == &val {
+                    return Some(i as i32);
+                }
+            }
+            None
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             let tgt = vdupq_n_f32(val);
@@ -546,8 +591,9 @@ impl SIMD<f32, 16> for f32x16 {
                     return Some(i as i32);
                 }
             }
+            None
+
         }
-        None
     }
 }
 

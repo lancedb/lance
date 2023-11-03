@@ -114,9 +114,8 @@ impl SIMD<i32, 8> for i32x8 {
     }
 
     fn reduce_sum(&self) -> i32 {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            todo!()
+        #[cfg(target_arch = "x86_64")] {
+            self.as_array().iter().sum()
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -146,7 +145,11 @@ impl SIMD<i32, 8> for i32x8 {
     fn find(&self, val: i32) -> Option<i32> {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-
+            for i in 0..8 {
+                if self.as_array().get_unchecked(i) == &val {
+                    return Some(i as i32);
+                }
+            }
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
