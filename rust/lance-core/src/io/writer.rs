@@ -21,7 +21,7 @@ use arrow_array::cast::{as_large_list_array, as_list_array, as_struct_array};
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_buffer::ArrowNativeType;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_recursion::async_recursion;
 use lance_arrow::*;
 
@@ -110,6 +110,11 @@ impl FileWriter {
     ///
     /// Returns [Err] if the schema does not match with the batch.
     pub async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
+        let expected_schema: ArrowSchema = (&self.schema).into();
+        for batch in batches {
+            assert_eq!(&expected_schema, batch.schema().as_ref());
+        }
+
         // Copy a list of fields to avoid borrow checker error.
         let fields = self.schema.fields.clone();
         for field in fields.iter() {
