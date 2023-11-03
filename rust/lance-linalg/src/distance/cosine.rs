@@ -32,7 +32,7 @@ use super::dot::dot;
 use super::norm_l2::{norm_l2, Normalize};
 use crate::simd::{
     f32::{f32x16, f32x8},
-    SIMD,
+    FloatSimd, SIMD,
 };
 
 /// Cosine Distance
