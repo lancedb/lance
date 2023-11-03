@@ -114,7 +114,8 @@ impl SIMD<i32, 8> for i32x8 {
     }
 
     fn reduce_sum(&self) -> i32 {
-        #[cfg(target_arch = "x86_64")] {
+        #[cfg(target_arch = "x86_64")]
+        {
             self.as_array().iter().sum()
         }
         #[cfg(target_arch = "aarch64")]

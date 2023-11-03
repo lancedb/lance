@@ -174,7 +174,8 @@ impl SIMD<f32, 8> for f32x8 {
     }
 
     fn reduce_min(&self) -> f32 {
-        #[cfg(target_arch = "x86_64")] {
+        #[cfg(target_arch = "x86_64")]
+        {
             unsafe {
                 let mut min = self.0;
                 // Shift and add vector, until only 1 value left.
@@ -600,7 +601,6 @@ impl SIMD<f32, 16> for f32x16 {
                 }
             }
             None
-
         }
     }
 }
