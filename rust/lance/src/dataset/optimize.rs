@@ -102,13 +102,14 @@ use datafusion::error::Result as DFResult;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use nohash_hasher::BuildNoHashHasher;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::dataset::ROW_ID;
 use crate::format::RowAddress;
-use crate::io::commit::commit_transaction;
+use crate::io::commit::{commit_transaction, migrate_fragments};
 use crate::Result;
 use crate::{format::Fragment, Dataset};
 
@@ -615,7 +616,7 @@ pub struct RewriteResult {
     pub read_version: u64,
     /// The original fragments being replaced
     pub original_fragments: Vec<Fragment>,
-    pub row_id_map: HashMap<u64, Option<u64>>,
+    pub row_id_map: HashMap<u64, Option<u64>, BuildNoHashHasher<u64>>,
 }
 
 fn extract_row_ids(
@@ -677,6 +678,8 @@ fn make_rowid_capture_stream(
     Ok(Box::pin(stream))
 }
 
+/// Iterator that yields row_ids that are in the given fragments but not in
+/// the given row_ids iterator.
 struct MissingIds<'a, I: Iterator<Item = u64>> {
     row_ids: I,
     expected_row_id: u64,
@@ -686,6 +689,9 @@ struct MissingIds<'a, I: Iterator<Item = u64>> {
 }
 
 impl<'a, I: Iterator<Item = u64>> MissingIds<'a, I> {
+    /// row_ids must be sorted in the same order in which the rows would be
+    /// found by scanning fragments in the order they are presented in.
+    /// fragments is not guaranteed to be sorted by id.
     fn new(row_ids: I, fragments: &'a Vec<Fragment>) -> Self {
         assert!(!fragments.is_empty());
         let first_frag = &fragments[0];
@@ -721,6 +727,10 @@ impl<'a, I: Iterator<Item = u64>> Iterator for MissingIds<'a, I> {
             let frag = val / RowAddress::FRAGMENT_SIZE;
             let expected_row_id = self.expected_row_id;
             self.expected_row_id += 1;
+            assert!(
+                current_fragment.physical_rows > 0,
+                "Fragment doesn't have physical rows recorded"
+            );
             if (self.expected_row_id % RowAddress::FRAGMENT_SIZE)
                 == current_fragment.physical_rows as u64
             {
@@ -746,7 +756,7 @@ fn transpose_row_ids(
     row_ids: RoaringTreemap,
     old_fragments: &Vec<Fragment>,
     new_fragments: &[Fragment],
-) -> HashMap<u64, Option<u64>> {
+) -> HashMap<u64, Option<u64>, BuildNoHashHasher<u64>> {
     let new_ids = new_fragments.iter().flat_map(|frag| {
         (0..frag.physical_rows as u32).map(|offset| {
             Some(u64::from(RowAddress::new_from_parts(
@@ -755,7 +765,24 @@ fn transpose_row_ids(
             )))
         })
     });
-    let mut mapping = row_ids.iter().zip(new_ids).collect::<HashMap<_, _>>();
+    // The hashmap will have an entry for each row id to map plus all rows that
+    // were deleted.
+    let expected_size = row_ids.len() as usize
+        + old_fragments
+            .iter()
+            .map(|frag| {
+                frag.deletion_file
+                    .as_ref()
+                    .map(|d| d.num_deleted_rows)
+                    .unwrap_or(0)
+            })
+            .sum::<usize>();
+    // We expect row ids to be unique, so we should already not get many collisions.
+    // The default hasher is designed to be resistance to DoS attacks, which is
+    // more than we need for this use case.
+    let mut mapping: HashMap<u64, Option<u64>, BuildNoHashHasher<u64>> =
+        HashMap::with_capacity_and_hasher(expected_size, BuildNoHashHasher::default());
+    mapping.extend(row_ids.iter().zip(new_ids));
     MissingIds::new(row_ids.into_iter(), old_fragments).for_each(|id| {
         mapping.insert(id, None);
     });
@@ -807,11 +834,14 @@ async fn rewrite_files(
             new_fragments: Vec::new(),
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
-            row_id_map: HashMap::new(),
+            row_id_map: HashMap::with_hasher(BuildNoHashHasher::default()),
         });
     }
 
-    let fragments = task.fragments.to_vec();
+    // It's possible the fragments are old and don't have physical rows or
+    // num deletions recorded. If that's the case, we need to grab and set that
+    // information.
+    let fragments = migrate_fragments(dataset.as_ref(), &task.fragments).await?;
     let mut scanner = dataset.scan();
     scanner.with_fragments(fragments.clone()).with_row_id();
 
@@ -841,7 +871,7 @@ async fn rewrite_files(
 
     reserve_fragment_ids(&dataset, &mut new_fragments).await?;
 
-    let row_id_map: HashMap<u64, Option<u64>> =
+    let row_id_map: HashMap<u64, Option<u64>, _> =
         transpose_row_ids(row_ids, &fragments, &new_fragments);
 
     metrics.files_removed = task
@@ -1584,5 +1614,56 @@ mod tests {
         // The reserve fragments call already happened for this task
         // and so we just see the bump from the commit_compaction
         assert_eq!(dataset.manifest.version, 6);
+    }
+
+    #[test]
+    fn test_missing_ids() {
+        // test with missing first row
+        // test with missing last row
+        // test fragment ids out of order
+
+        let fragments = vec![
+            Fragment {
+                id: 0,
+                files: Vec::new(),
+                deletion_file: None,
+                physical_rows: 5,
+            },
+            Fragment {
+                id: 3,
+                files: Vec::new(),
+                deletion_file: None,
+                physical_rows: 3,
+            },
+            Fragment {
+                id: 1,
+                files: Vec::new(),
+                deletion_file: None,
+                physical_rows: 3,
+            },
+        ];
+
+        // Written as pairs of (fragment_id, offset)
+        let row_ids = vec![
+            (0, 1),
+            (0, 3),
+            (0, 4),
+            (3, 0),
+            (3, 2),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+        ];
+        let row_ids = row_ids
+            .into_iter()
+            .map(|(frag, offset)| RowAddress::new_from_parts(frag, offset).into());
+        let result = MissingIds::new(row_ids, &fragments).collect::<Vec<_>>();
+
+        let expected = vec![(0, 0), (0, 2), (3, 1)];
+        let expected = expected
+            .into_iter()
+            .map(|(frag, offset)| RowAddress::new_from_parts(frag, offset).into())
+            .collect::<Vec<u64>>();
+        assert_eq!(result, expected);
     }
 }
