@@ -981,11 +981,147 @@ mod tests {
         LargeStringArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray,
         Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
         TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
-        UInt32Array, UInt64Array, UInt8Array,
+        UInt32Array, UInt64Array, UInt8Array, RecordBatchReader,
     };
-
+    use lance_testing::datagen::{
+        sample_without_replacement,
+        // generate_random_array, generate_scaled_random_array,
+    };
+    use lance_datagen::{rand as datagen_rand, ByteCount, BatchCount, RoundingBehavior};
     use super::*;
-    use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
+    use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema, TimeUnit};
+    use proptest::prelude::*;
+
+    // fn vec_of_vec() -> impl Strategy<Value = Vec<Vec<u16>>> {
+    //     const N: u16 = 10;
+    //
+    //     let length = 0..N;
+    //     length.prop_flat_map(vec_from_length)
+    // }
+    // fn vec_from_length(length: u16) -> impl Strategy<Value = Vec<Vec<u16>>> {
+    //     const K: usize = 5;
+    //     let mut result = vec![];
+    //     for index in 1..length {
+    //         let inner = proptest::collection::vec(0..index, 0..K);
+    //         result.push(inner);
+    //     }
+    //     result
+    // }
+    //
+    // fn vec_of_vec_to_array(vecs: Vec<Vec<u16>>) -> Vec<ArrayRef> {
+    //     let mut arrays: Vec<ArrayRef> = vec![];
+    //
+    //     for v in vecs.iter() {
+    //         let array = Arc::new(UInt16Array::from_iter_values(v.to_vec()));
+    //         arrays.push(array);
+    //     }
+    //     arrays
+    // }
+
+    proptest! {
+        #[test]
+        fn test_something(ncol in 1..23, col_type in 0..10, nbatch in 0..10, max_batch_length in 0..100, null_probability in 0.0..1.0) {
+            // TODO: control value range with "range fraction"?
+
+            // TODO: Some types don't have generator support yet
+            let data_types = vec![
+                // DataType::Boolean,
+                DataType::Int8,
+                DataType::UInt8,
+                DataType::Int16,
+                DataType::UInt16,
+                DataType::Int32,
+                DataType::UInt32,
+                DataType::Int64,
+                DataType::UInt64,
+                DataType::Float32,
+                DataType::Float64,
+                DataType::Date32,
+                DataType::Date64,
+                // DataType::Time32(TimeUnit::Second),
+                // DataType::Time32(TimeUnit::Millisecond),
+                // DataType::Time64(TimeUnit::Microsecond),
+                // DataType::Time64(TimeUnit::Nanosecond),
+                // DataType::Timestamp(TimeUnit::Nanosecond, None),
+                // DataType::Duration(TimeUnit::Nanosecond),
+                // DataType::Decimal128(_, _),
+                DataType::Binary,
+                // DataType::LargeBinary,
+                // DataType::FixedSizeBinary(_), // TODO: Pick enghts
+                DataType::Utf8,
+                // DataType::LargeUtf8,
+                // DataType::Dictionary(_, _), // TODO: Pick types
+            ];
+            let type_indeces = (0..data_types.len() as usize).collect::<Vec<_>>();
+            let column_fields = sample_without_replacement(&type_indeces, ncol as u32)
+                .iter()
+                .enumerate()
+                .map(|(idx, i)| ArrowField::new("aaaa", data_types[*i].clone(), true))
+                .collect::<Vec<_>>();
+
+            let schema = ArrowSchema::new(column_fields);
+            let rbr = lance_datagen::rand(&schema)
+                .into_reader_bytes(
+                    ByteCount::from(1024 * 1024),
+                    BatchCount::from(8),
+                    RoundingBehavior::ExactOrErr,
+                )
+                .unwrap();
+            assert_eq!(*rbr.schema(), schema);
+
+        }
+    //         let arrays = vec_of_vec_to_array(vecs);
+    //         let array_refs = arrays.iter().collect::<Vec<_>>();
+    //         let stats = collect_statistics(array_refs.as_ref());
+    //
+    //         let some_values : bool = array_refs.iter().map(|x| x.len() > 0).any(|x| x);
+    //
+    //         if some_values {
+    //             prop_assert_eq!(stats.null_count, ScalarValue::from(0_i64));
+    //             prop_assert!(stats.min_value >= ScalarValue::from(0_u16));
+    //             prop_assert!(stats.max_value <= ScalarValue::from(100_u16));
+    //         } else if arrays.is_empty() {
+    //             prop_assert_eq!(stats, StatisticsRow{
+    //                 null_count: ScalarValue::Int64(Some(0)),
+    //                 min_value: ScalarValue::Null,
+    //                 max_value: ScalarValue::Null,
+    //             });
+    //         } else {
+    //             prop_assert_eq!(stats, StatisticsRow{
+    //                 null_count: ScalarValue::Int64(Some(0)),
+    //                 min_value: ScalarValue::from(0_u16),
+    //                 max_value: ScalarValue::from(u16::MAX),
+    //             });
+    //         }
+    //     }
+
+        // #[test]
+        // fn test_something(vecs in vec_of_vec()) {
+        //     let arrays = vec_of_vec_to_array(vecs);
+        //     let array_refs = arrays.iter().collect::<Vec<_>>();
+        //     let stats = collect_statistics(array_refs.as_ref());
+        //
+        //     let some_values : bool = array_refs.iter().map(|x| x.len() > 0).any(|x| x);
+        //
+        //     if some_values {
+        //         prop_assert_eq!(stats.null_count, ScalarValue::from(0_i64));
+        //         prop_assert!(stats.min_value >= ScalarValue::from(0_u16));
+        //         prop_assert!(stats.max_value <= ScalarValue::from(100_u16));
+        //     } else if arrays.is_empty() {
+        //         prop_assert_eq!(stats, StatisticsRow{
+        //             null_count: ScalarValue::Int64(Some(0)),
+        //             min_value: ScalarValue::Null,
+        //             max_value: ScalarValue::Null,
+        //         });
+        //     } else {
+        //         prop_assert_eq!(stats, StatisticsRow{
+        //             null_count: ScalarValue::Int64(Some(0)),
+        //             min_value: ScalarValue::from(0_u16),
+        //             max_value: ScalarValue::from(u16::MAX),
+        //         });
+        //     }
+        // }
+    }
 
     #[test]
     #[should_panic(expected = "No arrays to collect statistics from")]
