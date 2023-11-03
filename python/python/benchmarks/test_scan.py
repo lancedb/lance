@@ -21,10 +21,6 @@ import pytest
 
 NUM_ROWS = 10_000
 
-from lance.tracing import trace_to_chrome
-
-trace_to_chrome(level="debug")
-
 
 @pytest.mark.parametrize(
     "array_factory",
