@@ -17,3 +17,4 @@
 
 pub(crate) mod logical_expr;
 pub(crate) mod physical_expr;
+pub(crate) mod table_provider;

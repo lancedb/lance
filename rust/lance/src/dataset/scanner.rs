@@ -70,6 +70,7 @@ const DEFAULT_FRAGMENT_READAHEAD: usize = 4;
 ///
 /// Floats are sorted using the IEEE 754 total ordering
 /// Strings are sorted using UTF-8 lexicographic order (i.e. we sort the binary)
+#[derive(Clone, Debug, PartialEq)]
 pub struct ColumnOrdering {
     pub ascending: bool,
     pub nulls_first: bool,
@@ -123,6 +124,7 @@ impl ColumnOrdering {
 ///   .buffered(16)
 ///   .sum()
 /// ```
+#[derive(Clone)]
 pub struct Scanner {
     dataset: Arc<Dataset>,
 
@@ -591,7 +593,7 @@ impl Scanner {
     /// 3. Sort
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
-    async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    pub(crate) async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         // NOTE: we only support node that have one partition. So any nodes that
         // produce multiple need to be repartitioned to 1.
         let mut filter_expr = if let Some(filter) = self.filter.as_ref() {
