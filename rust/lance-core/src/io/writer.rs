@@ -56,6 +56,7 @@ use crate::{
 pub struct FileWriter {
     object_writer: ObjectWriter,
     schema: Schema,
+    arrow_schema: ArrowSchema,
     batch_id: i32,
     page_table: PageTable,
     metadata: Metadata,
@@ -95,9 +96,14 @@ impl FileWriter {
             None
         };
 
+        // This is used for validation. We clear the metadata because we don't
+        // care about mismatches in metadata.
+        let arrow_schema = ArrowSchema::from(&schema).with_metadata(HashMap::new());
+
         Ok(Self {
             object_writer,
             schema,
+            arrow_schema,
             batch_id: 0,
             page_table: PageTable::default(),
             metadata: Metadata::default(),
@@ -111,7 +117,6 @@ impl FileWriter {
     ///
     /// Returns [Err] if the schema does not match with the batch.
     pub async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
-        let expected_schema = ArrowSchema::from(&self.schema).with_metadata(HashMap::new());
         for batch in batches {
             // Compare with metadata reset
             let schema = batch
@@ -119,11 +124,11 @@ impl FileWriter {
                 .as_ref()
                 .clone()
                 .with_metadata(HashMap::new());
-            if expected_schema != schema {
+            if self.arrow_schema != schema {
                 return Err(Error::Schema {
                     message: format!(
                         "FileWriter::write: schema mismatch: expected: {:?}, actual: {:?}",
-                        expected_schema, schema
+                        self.arrow_schema, schema
                     ),
                     location: location!(),
                 });
