@@ -119,7 +119,15 @@ impl FileWriter {
                 .as_ref()
                 .clone()
                 .with_metadata(HashMap::new());
-            assert_eq!(&expected_schema, &schema);
+            if expected_schema != schema {
+                return Err(Error::Schema {
+                    message: format!(
+                        "FileWriter::write: schema mismatch: expected: {:?}, actual: {:?}",
+                        expected_schema, schema
+                    ),
+                    location: location!(),
+                });
+            }
         }
 
         // Copy a list of fields to avoid borrow checker error.
