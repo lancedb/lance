@@ -36,6 +36,7 @@ categories = [
 rust-version = "1.70"
 
 [workspace.dependencies]
+lance = { version = "=0.8.11", path = "./lance" }
 lance-arrow = { version = "=0.8.11", path = "./lance-arrow" }
 lance-core = { version = "=0.8.11", path = "./lance-core" }
 lance-datagen = { version = "=0.8.11", path = "./lance-datagen" }
@@ -93,7 +94,12 @@ serde_json = { version = "1" }
 shellexpand = "3.0"
 snafu = "0.7.4"
 tempfile = "3"
-tokio = { version = "1.23", features = ["rt-multi-thread", "macros", "fs", "sync"] }
+tokio = { version = "1.23", features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "sync",
+] }
 tracing = "0.1"
 url = "2.3"
 uuid = { version = "1.2", features = ["v4", "serde"] }

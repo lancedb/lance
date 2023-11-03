@@ -60,16 +60,16 @@ fn bench_null_gen(c: &mut Criterion) {
     let mut group = c.benchmark_group("null");
     group.throughput(Throughput::Bytes(BYTES_PER_BENCH));
     bench_gen(&mut group, "0.0", || {
-        lance_datagen::array::fill::<Int32Type>(42).with_nulls(0.0)
+        lance_datagen::array::fill::<Int32Type>(42).with_random_nulls(0.0)
     });
     bench_gen(&mut group, "0.25", || {
-        lance_datagen::array::fill::<Int16Type>(42).with_nulls(0.25)
+        lance_datagen::array::fill::<Int16Type>(42).with_random_nulls(0.25)
     });
     bench_gen(&mut group, "0.75", || {
-        lance_datagen::array::fill::<Int32Type>(42).with_nulls(0.75)
+        lance_datagen::array::fill::<Int32Type>(42).with_random_nulls(0.75)
     });
     bench_gen(&mut group, "1.0", || {
-        lance_datagen::array::fill::<Int64Type>(42).with_nulls(1.0)
+        lance_datagen::array::fill::<Int64Type>(42).with_random_nulls(1.0)
     });
     group.finish();
 }

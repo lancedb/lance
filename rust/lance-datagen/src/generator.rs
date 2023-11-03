@@ -422,6 +422,33 @@ impl ArrayGenerator for CycleVectorGenerator {
     }
 }
 
+#[derive(Default)]
+pub struct RandomBooleanGenerator {}
+
+impl ArrayGenerator for RandomBooleanGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let num_bytes = (length.0 + 7) / 8;
+        let mut bytes = vec![0; num_bytes as usize];
+        rng.fill_bytes(&mut bytes);
+        let bytes = BooleanBuffer::new(Buffer::from(bytes), 0, length.0 as usize);
+        Ok(Arc::new(arrow_array::BooleanArray::new(bytes, None)))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &DataType::Boolean
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        // We can't say 1/8th of a byte and 1 byte would be a pretty extreme over-count so let's leave
+        // it at None until someone needs this.  Then we can probably special case this (e.g. make a ByteCount::ONE_BIT)
+        None
+    }
+}
+
 pub struct RandomBinaryGenerator {
     bytes_per_element: ByteCount,
     scale_to_utf8: bool,
@@ -1103,9 +1130,15 @@ pub mod array {
         Box::new(RandomBinaryGenerator::new(bytes_per_element, true))
     }
 
+    /// Create a random generator of boolean values
+    pub fn rand_boolean() -> Box<dyn ArrayGenerator> {
+        Box::<RandomBooleanGenerator>::default()
+    }
+
     /// Create a generator of random values
     pub fn rand_type(data_type: &DataType) -> Box<dyn ArrayGenerator> {
         match data_type {
+            DataType::Boolean => rand_boolean(),
             DataType::Int8 => rand::<Int8Type>(),
             DataType::Int16 => rand::<Int16Type>(),
             DataType::Int32 => rand::<Int32Type>(),
@@ -1185,7 +1218,7 @@ mod tests {
 
     use arrow_array::{
         types::{Float32Type, Int16Type, Int32Type, Int8Type, UInt32Type},
-        Float32Array, Int16Array, Int32Array, Int8Array, StringArray, UInt32Array,
+        BooleanArray, Float32Array, Int16Array, Int32Array, Int8Array, StringArray, UInt32Array,
     };
 
     use super::*;
@@ -1309,6 +1342,14 @@ mod tests {
         let mut gen = array::rand_date64();
         let days_64 = gen.generate(RowCount::from(3), &mut rng).unwrap();
         assert_eq!(days_64.data_type(), &DataType::Date64);
+
+        let mut gen = array::rand_boolean();
+        let bools = gen.generate(RowCount::from(1024), &mut rng).unwrap();
+        assert_eq!(bools.data_type(), &DataType::Boolean);
+        let bools = bools.as_any().downcast_ref::<BooleanArray>().unwrap();
+        // Sanity check to ensure we're getting at least some rng
+        assert!(bools.false_count() > 100);
+        assert!(bools.true_count() > 100);
     }
 
     #[test]
