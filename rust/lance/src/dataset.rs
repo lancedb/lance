@@ -2885,8 +2885,7 @@ mod tests {
         let data = RecordBatch::try_new(schema.clone(), vec![vectors]);
         let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
-        dataset.delete("vec IS NOT NULL").await.unwrap();
-        let dataset = Dataset::open(test_uri).await.unwrap();
+        dataset.delete("true").await.unwrap();
 
         let mut stream = dataset
             .scan()
