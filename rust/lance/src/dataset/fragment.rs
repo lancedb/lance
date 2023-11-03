@@ -504,13 +504,20 @@ impl FileFragment {
 
         // scan with predicate and row ids
         let mut scanner = self.scan();
-        scanner.with_row_id();
 
-        // if predicate is true, delete the whole fragment
-        // else, filter the predicate
-        if predicate != "true" {
-            scanner.filter(predicate)?.project::<&str>(&[])?;
+        // if predicate is `true`, delete the whole fragment
+        // else if predicate is `false`, filter the predicate
+        let predicate_lower = predicate.trim().to_lowercase();
+        if predicate_lower == "true" {
+            return Ok(None);
+        } else if predicate_lower == "false" {
+            return Ok(Some(self));
         }
+
+        scanner
+            .with_row_id()
+            .filter(predicate)?
+            .project::<&str>(&[])?;
 
         // As we get row ids, add them into our deletion vector
         scanner
