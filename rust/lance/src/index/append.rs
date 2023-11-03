@@ -59,6 +59,7 @@ pub async fn append_index(
     let mut scanner = dataset.scan();
     scanner.with_fragments(unindexed);
     scanner.with_row_id();
+    scanner.project(&[&column.name])?;
     let stream = scanner.try_into_stream().await?;
 
     let new_index = ivf_idx
