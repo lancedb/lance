@@ -103,7 +103,7 @@ pub fn norm_l2<T: Real + Sum>(vector: &[T]) -> T {
             sums[i] = sums[i].add(chunk[i].powi(2));
         }
     }
-    Real::sqrt(sum + sums.iter().copied().sum::<T>())
+    sum + sums.iter().copied().sum::<T>().sqrt()
 }
 
 #[cfg(test)]
