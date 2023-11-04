@@ -26,7 +26,7 @@ use num_traits::{real::Real, FromPrimitive};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance_linalg::distance::dot::{dot, Dot};
+use lance_linalg::distance::dot::{dot, dot_distance};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 #[inline]
@@ -84,7 +84,7 @@ fn bench_distance(c: &mut Criterion) {
             let x = key.values().as_ref();
             Float16Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                Some(x.dot(y))
+                Some(dot_distance(x, y))
             }))
         });
     });
@@ -98,7 +98,7 @@ fn bench_distance(c: &mut Criterion) {
             let x = key.values().as_ref();
             Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                Some(x.dot(y))
+                Some(dot_distance(x, y))
             }))
         });
     });

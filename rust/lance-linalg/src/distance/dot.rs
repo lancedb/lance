@@ -103,11 +103,14 @@ impl Dot for Float64Type {
 }
 
 /// Negative dot product, to present the relative order of dot distance.
-pub fn dot_distance_batch<'a>(
-    from: &'a [f32],
-    to: &'a [f32],
+pub fn dot_distance_batch<'a, T: FloatToArrayType>(
+    from: &'a [T],
+    to: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = f32> + 'a> {
+) -> Box<dyn Iterator<Item = T> + 'a>
+where
+    T::ArrowType: Dot,
+{
     debug_assert_eq!(from.len(), dimension);
     debug_assert_eq!(to.len() % dimension, 0);
 

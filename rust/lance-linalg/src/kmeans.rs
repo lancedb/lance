@@ -27,10 +27,9 @@ use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 use tracing::instrument;
 
-use crate::distance::{dot_distance, l2_distance_batch};
 use crate::kernels::argmin_value_float;
 use crate::{
-    distance::{Cosine, Dot, MetricType, Normalize, L2},
+    distance::{dot_distance, l2_distance_batch, Cosine, MetricType, Normalize, L2},
     kernels::{argmin, argmin_value},
     matrix::MatrixView,
 };
