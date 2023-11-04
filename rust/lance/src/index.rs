@@ -19,9 +19,11 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::io::{read_message, read_message_from_buf, read_metadata_offset, Reader};
 use lance_index::pb::index::Implementation;
+use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::ScalarIndex;
 use lance_index::{pb, Index, IndexType, INDEX_FILE_NAME};
 use snafu::{location, Location};
@@ -96,6 +98,16 @@ pub(crate) async fn remap_index(
     .await?;
 
     Ok(new_id)
+}
+
+pub struct ScalarIndexInfo {
+    indexed_columns: HashMap<String, DataType>,
+}
+
+impl IndexInformationProvider for ScalarIndexInfo {
+    fn get_index(&self, col: &str) -> Option<&DataType> {
+        self.indexed_columns.get(col)
+    }
 }
 
 /// Extends Dataset with secondary index.
@@ -308,6 +320,8 @@ pub(crate) trait DatasetIndexInternalExt {
     async fn open_scalar_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn ScalarIndex>>;
     /// Opens the requested vector index
     async fn open_vector_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn VectorIndex>>;
+    /// Loads information about all the available scalar indices on the dataset
+    async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
 }
 
 #[async_trait]
@@ -378,6 +392,23 @@ impl DatasetIndexInternalExt for Dataset {
                 location: location!(),
             }),
         }
+    }
+
+    async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {
+        let indices = self.load_indices().await?;
+        let schema = self.schema();
+        let indexed_fields = indices
+        .iter()
+        .filter(|idx| idx.fields.len() == 1)
+        .map(|idx| {
+            let field = idx.fields[0];
+            let field = schema.field_by_id(field).ok_or_else(|| Error::Internal { message: format!("Index referenced a field with id {field} which did not exist in the schema"), location: location!() });
+            field.map(|field| (field.name.clone(), field.data_type()))
+        }).collect::<Result<Vec<_>>>()?;
+        let index_info_map = HashMap::from_iter(indexed_fields);
+        Ok(ScalarIndexInfo {
+            indexed_columns: index_info_map,
+        })
     }
 }
 

@@ -18,6 +18,7 @@ arrow-ord.workspace = true
 arrow-schema.workspace = true
 arrow-arith.workspace = true
 arrow-select.workspace = true
+async-recursion.workspace = true
 async-trait.workspace = true
 datafusion-common.workspace = true
 datafusion-expr = "32.0.0"
@@ -33,6 +34,7 @@ num-traits.workspace = true
 object_store.workspace = true
 prost.workspace = true
 rand.workspace = true
+roaring.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 snafu.workspace = true
@@ -46,6 +48,8 @@ lance-datagen.workspace = true
 lance-testing.workspace = true
 pprof.workspace = true
 tempfile.workspace = true
+sqlparser = "0.39.0"
+datafusion-sql = "32.0.0"
 
 [build-dependencies]
 prost-build.workspace = true

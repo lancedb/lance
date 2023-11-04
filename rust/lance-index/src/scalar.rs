@@ -26,6 +26,7 @@ use lance_core::Result;
 use crate::Index;
 
 pub mod btree;
+pub mod expression;
 pub mod flat;
 pub mod lance_format;
 
@@ -71,7 +72,7 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync {
 /// example, to invert an equality query (e.g. all rows where the value is not 7)
 /// you can grab all rows where the value = 7 and then do an inverted take (or use
 /// a block list instead of an allow list for prefiltering)
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ScalarQuery {
     /// Retrieve all row ids where the value is in the given [min, max) range
     Range(Bound<ScalarValue>, Bound<ScalarValue>),
@@ -81,6 +82,49 @@ pub enum ScalarQuery {
     Equals(ScalarValue),
     /// Retrieve all row ids where the value is null
     IsNull(),
+}
+
+impl ScalarQuery {
+    pub fn fmt_with_col(&self, col: &str) -> String {
+        match self {
+            Self::Range(lower, upper) => match (lower, upper) {
+                (Bound::Unbounded, Bound::Unbounded) => "true".to_string(),
+                (Bound::Unbounded, Bound::Included(rhs)) => format!("{} <= {}", col, rhs),
+                (Bound::Unbounded, Bound::Excluded(rhs)) => format!("{} < {}", col, rhs),
+                (Bound::Included(lhs), Bound::Unbounded) => format!("{} >= {}", col, lhs),
+                (Bound::Included(lhs), Bound::Included(rhs)) => {
+                    format!("{} >= {} && {} <= {}", col, lhs, col, rhs)
+                }
+                (Bound::Included(lhs), Bound::Excluded(rhs)) => {
+                    format!("{} >= {} && {} < {}", col, lhs, col, rhs)
+                }
+                (Bound::Excluded(lhs), Bound::Unbounded) => format!("{} > {}", col, lhs),
+                (Bound::Excluded(lhs), Bound::Included(rhs)) => {
+                    format!("{} > {} && {} <= {}", col, lhs, col, rhs)
+                }
+                (Bound::Excluded(lhs), Bound::Excluded(rhs)) => {
+                    format!("{} > {} && {} < {}", col, lhs, col, rhs)
+                }
+            },
+            Self::IsIn(values) => {
+                format!(
+                    "{} IN [{}]",
+                    col,
+                    values
+                        .iter()
+                        .map(|val| val.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            }
+            Self::IsNull() => {
+                format!("{} IS NULL", col)
+            }
+            Self::Equals(val) => {
+                format!("{} = {}", col, val)
+            }
+        }
+    }
 }
 
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries

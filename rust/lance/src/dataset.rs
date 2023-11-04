@@ -1301,6 +1301,22 @@ impl Dataset {
             .find(|idx| idx.name == name)
     }
 
+    pub(crate) async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<Index>> {
+        Ok(self
+            .load_indices()
+            .await?
+            .into_iter()
+            .filter(|idx| idx.fields.len() == 1)
+            .find(|idx| {
+                let field = self.schema().field_by_id(idx.fields[0]);
+                if let Some(field) = field {
+                    field.name == col
+                } else {
+                    false
+                }
+            }))
+    }
+
     /// Find index with a given index_name and return its serialized statistics.
     pub async fn index_statistics(&self, index_name: &str) -> Result<Option<String>> {
         let index_uuid = self
@@ -2451,7 +2467,6 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        dbg!(&actual_statistics);
         let actual_statistics = actual_statistics.as_object().unwrap();
         assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF");
         assert_eq!(actual_statistics["metric_type"].as_str().unwrap(), "l2");
@@ -2516,8 +2531,7 @@ mod tests {
         assert_eq!(index.fields, vec![0]);
         assert_eq!(index.name, index_name);
 
-        let statistics = dataset.index_statistics(&index_name).await.unwrap();
-        dbg!(&statistics);
+        dataset.index_statistics(&index_name).await.unwrap();
     }
 
     async fn create_bad_file() -> Result<Dataset> {
