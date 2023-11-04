@@ -17,7 +17,6 @@ use std::iter::Sum;
 use half::{bf16, f16};
 use num_traits::{real::Real, Float};
 
-use super::dot::dot;
 use crate::simd::{
     f32::{f32x16, f32x8},
     SIMD,
@@ -91,7 +90,20 @@ impl Normalize<f64> for &[f64] {
 /// Arrow Arrays, i.e., Float32Array
 #[inline]
 pub fn norm_l2<T: Real + Sum>(vector: &[T]) -> T {
-    dot(vector, vector).sqrt()
+    const LANES: usize = 16;
+    let chunks = vector.chunks_exact(LANES);
+    let sum = if chunks.remainder().is_empty() {
+        T::zero()
+    } else {
+        chunks.remainder().iter().map(|&v| v * v).sum::<T>()
+    };
+    let mut sums = [T::zero(); LANES];
+    for chunk in chunks {
+        for i in 0..LANES {
+            sums[i] = sums[i].add(chunk[i] * chunk[i]);
+        }
+    }
+    (sum + sums.iter().copied().sum::<T>()).sqrt()
 }
 
 #[cfg(test)]
