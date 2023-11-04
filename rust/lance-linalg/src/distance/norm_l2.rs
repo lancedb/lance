@@ -100,7 +100,7 @@ pub fn norm_l2<T: Real + Sum>(vector: &[T]) -> T {
     let mut sums = [T::zero(); LANES];
     for chunk in chunks {
         for i in 0..LANES {
-            sums[i] = sums[i].add(chunk[i] * chunk[i]);
+            sums[i] = sums[i].add(chunk[i].powi(2));
         }
     }
     Real::sqrt(sum + sums.iter().copied().sum::<T>())
