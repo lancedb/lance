@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use half::{bf16, f16};
-use num_traits::Float;
+use std::iter::Sum;
 
+use half::{bf16, f16};
+use num_traits::{real::Real, Float};
+
+use super::dot::dot;
 use crate::simd::{
     f32::{f32x16, f32x8},
     SIMD,
@@ -33,8 +36,7 @@ impl Normalize<f16> for &[f16] {
 
     #[inline]
     fn norm_l2(&self) -> Self::Output {
-        // Aarch64 does not have SIMD for f16
-        self.iter().map(|v| v * v).sum::<f16>().sqrt()
+        norm_l2(self)
     }
 }
 
@@ -43,8 +45,7 @@ impl Normalize<bf16> for &[bf16] {
 
     #[inline]
     fn norm_l2(&self) -> Self::Output {
-        // Aarch64 does not have SIMD for bf16
-        self.iter().map(|v| v * v).sum::<bf16>().sqrt()
+        norm_l2(self)
     }
 }
 
@@ -80,7 +81,7 @@ impl Normalize<f64> for &[f64] {
 
     #[inline]
     fn norm_l2(&self) -> Self::Output {
-        self.iter().map(|v| v * v).sum::<f64>().sqrt()
+        norm_l2(self)
     }
 }
 
@@ -89,8 +90,8 @@ impl Normalize<f64> for &[f64] {
 /// The parameters must be cache line aligned. For example, from
 /// Arrow Arrays, i.e., Float32Array
 #[inline]
-pub fn norm_l2(vector: &[f32]) -> f32 {
-    vector.norm_l2()
+pub fn norm_l2<T: Real + Sum>(vector: &[T]) -> T {
+    dot(vector, vector).sqrt()
 }
 
 #[cfg(test)]
