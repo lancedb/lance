@@ -21,7 +21,7 @@ use arrow_array::{
     Array, Float16Array, Float32Array, Float64Array,
 };
 use half::{bf16, f16};
-use num_traits::{Float, FromPrimitive};
+use num_traits::{Bounded, Float, FromPrimitive};
 
 use super::bfloat16::{BFloat16Array, BFloat16Type};
 
@@ -59,7 +59,7 @@ pub trait ArrowFloatType {
     type ArrayType: FloatArray<Self>;
 }
 
-pub trait FloatToArrayType: Float {
+pub trait FloatToArrayType: Float + Bounded {
     type ArrowType: ArrowFloatType<Native = Self>;
 }
 

@@ -22,6 +22,7 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
+use lance_arrow::FloatToArrayType;
 use log::{info, warn};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
@@ -29,7 +30,7 @@ use tracing::instrument;
 
 use crate::kernels::argmin_value_float;
 use crate::{
-    distance::{dot_distance, l2_distance_batch, Cosine, MetricType, Normalize, L2},
+    distance::{dot_distance, l2_distance_batch, Cosine, Dot, MetricType, Normalize, L2},
     kernels::{argmin, argmin_value},
     matrix::MatrixView,
 };
@@ -631,7 +632,14 @@ fn compute_partitions_cosine(centroids: &[f32], data: &[f32], dimension: usize) 
         .collect()
 }
 
-fn compute_partitions_dot(centroids: &[f32], data: &[f32], dimension: usize) -> Vec<u32> {
+fn compute_partitions_dot<T: FloatToArrayType>(
+    centroids: &[T],
+    data: &[T],
+    dimension: usize,
+) -> Vec<u32>
+where
+    <T as FloatToArrayType>::ArrowType: Dot,
+{
     data.chunks(dimension)
         .map(|row| {
             argmin(
