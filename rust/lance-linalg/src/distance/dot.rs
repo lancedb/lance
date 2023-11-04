@@ -15,10 +15,14 @@
 //! Dot product.
 
 use std::iter::Sum;
+use std::ops::Neg;
 use std::sync::Arc;
 
+use arrow_array::types::{Float16Type, Float64Type};
 use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
+use lance_arrow::bfloat16::BFloat16Type;
+use lance_arrow::{ArrowFloatType, FloatToArrayType};
 use num_traits::real::Real;
 
 use crate::simd::{
@@ -33,39 +37,39 @@ pub fn dot<T: Real + Sum>(from: &[T], to: &[T]) -> T {
 }
 
 /// Dot product
-pub trait Dot {
-    type Output;
+pub trait Dot: ArrowFloatType {
+    type Output: Neg<Output = Self::Native>;
 
     /// Dot product.
-    fn dot(&self, other: &Self) -> Self::Output;
+    fn dot(x: &[Self::Native], y: &[Self::Native]) -> Self::Output;
 }
 
-impl Dot for [bf16] {
+impl Dot for BFloat16Type {
     type Output = bf16;
 
-    fn dot(&self, other: &[bf16]) -> bf16 {
-        dot(self, other)
+    fn dot(x: &[bf16], y: &[bf16]) -> bf16 {
+        dot(x, y)
     }
 }
 
-impl Dot for [f16] {
+impl Dot for Float16Type {
     type Output = f16;
 
-    fn dot(&self, other: &[f16]) -> f16 {
-        dot(self, other)
+    fn dot(x: &[f16], y: &[f16]) -> f16 {
+        dot(x, y)
     }
 }
 
-impl Dot for [f32] {
+impl Dot for Float32Type {
     type Output = f32;
 
-    fn dot(&self, other: &[f32]) -> f32 {
-        let dim = self.len();
+    fn dot(x: &[f32], other: &[f32]) -> f32 {
+        let dim = x.len();
         let unrolling_len = dim / 16 * 16;
         let mut sum16 = f32x16::zeros();
         for i in (0..unrolling_len).step_by(16) {
             unsafe {
-                let x = f32x16::load_unaligned(self.as_ptr().add(i));
+                let x = f32x16::load_unaligned(x.as_ptr().add(i));
                 let y = f32x16::load_unaligned(other.as_ptr().add(i));
                 sum16.multiply_add(x, y);
             }
@@ -75,7 +79,7 @@ impl Dot for [f32] {
         let mut sum8 = f32x8::zeros();
         for i in (unrolling_len..aligned_len).step_by(8) {
             unsafe {
-                let x = f32x8::load_unaligned(self.as_ptr().add(i));
+                let x = f32x8::load_unaligned(x.as_ptr().add(i));
                 let y = f32x8::load_unaligned(other.as_ptr().add(i));
                 sum8.multiply_add(x, y);
             }
@@ -83,18 +87,18 @@ impl Dot for [f32] {
 
         let mut sum = sum16.reduce_sum() + sum8.reduce_sum();
         if aligned_len < dim {
-            sum += dot(&self[aligned_len..], &other[aligned_len..]);
+            sum += dot(&x[aligned_len..], &other[aligned_len..]);
         }
 
         sum
     }
 }
 
-impl Dot for [f64] {
+impl Dot for Float64Type {
     type Output = f64;
 
-    fn dot(&self, other: &[f64]) -> f64 {
-        dot(self, other)
+    fn dot(x: &[f64], y: &[f64]) -> f64 {
+        dot(x, y)
     }
 }
 
@@ -137,8 +141,11 @@ pub fn dot_distance_arrow_batch(from: &[f32], to: &FixedSizeListArray) -> Arc<Fl
 
 /// Negative dot distance.
 #[inline]
-pub fn dot_distance(from: &[f32], to: &[f32]) -> f32 {
-    -from.dot(to)
+pub fn dot_distance<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> T
+where
+    T::ArrowType: Dot,
+{
+    T::ArrowType::dot(from, to).neg()
 }
 
 #[cfg(test)]
@@ -152,14 +159,14 @@ mod tests {
         let x: Vec<f32> = (0..20).map(|v| v as f32).collect();
         let y: Vec<f32> = (100..120).map(|v| v as f32).collect();
 
-        assert_eq!(x.dot(&y), dot(&x, &y));
+        assert_eq!(Float32Type::dot(&x, &y), dot(&x, &y));
 
         let x: Vec<f16> = (0..20).map(|v| f16::from_i32(v).unwrap()).collect();
         let y: Vec<f16> = (100..120).map(|v| f16::from_i32(v).unwrap()).collect();
-        assert_eq!(x.dot(&y), dot(&x, &y));
+        assert_eq!(Float16Type::dot(&x, &y), dot(&x, &y));
 
         let x: Vec<f64> = (20..40).map(|v| f64::from_i32(v).unwrap()).collect();
         let y: Vec<f64> = (120..140).map(|v| f64::from_i32(v).unwrap()).collect();
-        assert_eq!(x.dot(&y), dot(&x, &y));
+        assert_eq!(Float64Type::dot(&x, &y), dot(&x, &y));
     }
 }

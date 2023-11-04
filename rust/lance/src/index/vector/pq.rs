@@ -31,6 +31,7 @@ use lance_core::{
 };
 pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
 use lance_index::vector::{Query, DIST_COL};
+use lance_linalg::distance::dot_distance_batch;
 use lance_linalg::{
     distance::{l2::l2_distance_batch, norm_l2::norm_l2, Dot, MetricType, Normalize},
     matrix::MatrixView,
@@ -152,10 +153,11 @@ impl PQIndex {
             let key_sub_vector =
                 &query.values()[i * sub_vector_length..(i + 1) * sub_vector_length];
             let sub_vector_centroids = self.pq.centroids(i);
-            let xy = sub_vector_centroids
-                .chunks_exact(sub_vector_length)
-                .map(|cent| cent.dot(key_sub_vector));
-            xy_table.extend(xy);
+            xy_table.extend(dot_distance_batch(
+                key_sub_vector,
+                sub_vector_centroids,
+                sub_vector_length,
+            ));
 
             let y2 = sub_vector_centroids
                 .chunks_exact(sub_vector_length)

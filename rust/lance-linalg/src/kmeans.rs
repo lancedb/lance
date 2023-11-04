@@ -27,7 +27,7 @@ use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 use tracing::instrument;
 
-use crate::distance::l2_distance_batch;
+use crate::distance::{dot_distance, l2_distance_batch};
 use crate::kernels::argmin_value_float;
 use crate::{
     distance::{Cosine, Dot, MetricType, Normalize, L2},
@@ -504,9 +504,9 @@ impl KMeans {
                                             )
                                         }
                                     }
-                                    crate::distance::DistanceType::Dot => {
-                                        argmin_value(centroid_stream.map(|cent| vector.dot(cent)))
-                                    }
+                                    crate::distance::DistanceType::Dot => argmin_value(
+                                        centroid_stream.map(|cent| dot_distance(vector, cent)),
+                                    ),
                                 }
                                 .unwrap()
                             })
@@ -638,7 +638,7 @@ fn compute_partitions_dot(centroids: &[f32], data: &[f32], dimension: usize) -> 
             argmin(
                 centroids
                     .chunks(dimension)
-                    .map(|centroid| centroid.dot(row)),
+                    .map(|centroid| dot_distance(row, centroid)),
             )
             .unwrap()
         })

@@ -59,6 +59,14 @@ pub trait ArrowFloatType {
     type ArrayType: FloatArray<Self>;
 }
 
+pub trait FloatToArrayType: Float {
+    type ArrowType: ArrowFloatType<Native = Self>;
+}
+
+impl FloatToArrayType for f32 {
+    type ArrowType = Float32Type;
+}
+
 impl ArrowFloatType for BFloat16Type {
     type Native = bf16;
 
