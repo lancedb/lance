@@ -30,10 +30,30 @@ use crate::simd::{
     FloatSimd, SIMD,
 };
 
-/// Naive implementation of dot product.
+/// Default implementation of dot product.
 #[inline]
 pub fn dot<T: Real + Sum>(from: &[T], to: &[T]) -> T {
-    from.iter().zip(to.iter()).map(|(x, y)| x.mul(*y)).sum()
+    const LANES: usize = 16;
+    let x_chunks = to.chunks_exact(LANES);
+    let y_chunks = from.chunks_exact(LANES);
+    let sum = if x_chunks.remainder().is_empty() {
+        T::zero()
+    } else {
+        x_chunks
+            .remainder()
+            .iter()
+            .zip(y_chunks.remainder().iter())
+            .map(|(&x, &y)| x * y)
+            .sum::<T>()
+    };
+    // Use known size to allow LLVM to kick in auto-vectorization.
+    let mut sums = [T::zero(); LANES];
+    for (x, y) in x_chunks.zip(y_chunks) {
+        for i in 0..LANES {
+            sums[i] = sums[i].add(x[i] * y[i]);
+        }
+    }
+    sum + sums.iter().copied().sum::<T>()
 }
 
 /// Dot product
@@ -55,6 +75,7 @@ impl Dot for BFloat16Type {
 impl Dot for Float16Type {
     type Output = f16;
 
+    #[inline]
     fn dot(x: &[f16], y: &[f16]) -> f16 {
         dot(x, y)
     }
@@ -63,6 +84,7 @@ impl Dot for Float16Type {
 impl Dot for Float32Type {
     type Output = f32;
 
+    #[inline]
     fn dot(x: &[f32], other: &[f32]) -> f32 {
         let dim = x.len();
         let unrolling_len = dim / 16 * 16;
