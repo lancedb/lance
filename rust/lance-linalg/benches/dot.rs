@@ -58,15 +58,18 @@ where
         });
     });
 
-    c.bench_function(format!("Dot({type_name})").as_str(), |b| {
-        let x = key.values();
-        b.iter(|| unsafe {
-            PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
-                let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                Some(dot(x, y))
-            }));
-        });
-    });
+    c.bench_function(
+        format!("Dot({type_name}, auto-vectorization)").as_str(),
+        |b| {
+            let x = key.values();
+            b.iter(|| unsafe {
+                PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
+                    let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
+                    Some(dot(x, y))
+                }));
+            });
+        },
+    );
 
     // TODO: SIMD needs generic specialization
 }
