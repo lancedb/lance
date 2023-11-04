@@ -33,7 +33,7 @@ pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
 use lance_index::vector::{Query, DIST_COL};
 use lance_linalg::distance::dot_distance_batch;
 use lance_linalg::{
-    distance::{l2::l2_distance_batch, norm_l2::norm_l2, Dot, MetricType, Normalize},
+    distance::{l2::l2_distance_batch, norm_l2::norm_l2, MetricType, Normalize},
     matrix::MatrixView,
 };
 use serde::Serialize;
