@@ -108,7 +108,7 @@ pub fn norm_l2<T: Real + Sum>(vector: &[T]) -> T {
 
 #[cfg(test)]
 mod tests {
-    use num_traits::{Float, FromPrimitive};
+    use num_traits::FromPrimitive;
 
     use super::*;
 
@@ -121,19 +121,13 @@ mod tests {
             let result = data.as_slice().norm_l2();
             assert_eq!(
                 result,
-                (1..=8)
-                    .map(|v| <$t>::from_i32(v * v).unwrap())
-                    .sum::<$t>()
-                    .sqrt()
+                Real::sqrt((1..=8).map(|v| <$t>::from_i32(v * v).unwrap()).sum::<$t>())
             );
 
             let not_aligned = (&data[2..]).norm_l2();
             assert_eq!(
                 not_aligned,
-                (3..=8)
-                    .map(|v| <$t>::from_i32(v * v).unwrap())
-                    .sum::<$t>()
-                    .sqrt()
+                Real::sqrt((3..=8).map(|v| <$t>::from_i32(v * v).unwrap()).sum::<$t>())
             );
         };
     }
