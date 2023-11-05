@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::iter::Sum;
+use std::ops::AddAssign;
 
 use arrow_arith::{aggregate::sum, numeric::mul};
 use arrow_array::{
@@ -20,7 +21,7 @@ use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
     ArrowNumericType, Float16Array, Float32Array, NativeAdapter, PrimitiveArray,
 };
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion, black_box};
 use num_traits::{real::Real, FromPrimitive};
 
 #[cfg(target_os = "linux")]
@@ -72,7 +73,7 @@ fn dot_simd_f32(x: &[f32], y: &[f32]) -> f32 {
 
 fn run_bench<T: ArrowNumericType>(c: &mut Criterion)
 where
-    T::Native: Real + FromPrimitive + Sum,
+    T::Native: Real + FromPrimitive + Sum + AddAssign,
     NativeAdapter<T>: From<T::Native>,
 {
     const DIMENSION: usize = 1024;
@@ -100,7 +101,7 @@ where
             b.iter(|| unsafe {
                 PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
                     let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                    Some(dot(x, y))
+                    Some(black_box(dot(x, y)))
                 }));
             });
         },
@@ -136,7 +137,7 @@ fn bench_distance(c: &mut Criterion) {
             let x = key.values().as_ref();
             Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                Some(dot_simd_f32(x, y))
+                Some(Float32Type::dot(x, y))
             }))
         });
     });

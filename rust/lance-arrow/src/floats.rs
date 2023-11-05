@@ -14,7 +14,7 @@
 
 //! Floats Array
 
-use std::fmt::Formatter;
+use std::{fmt::Formatter, ops::AddAssign};
 
 use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
@@ -51,7 +51,7 @@ impl std::fmt::Display for FloatType {
 /// Trait for float types used in Arrow Array.
 ///
 pub trait ArrowFloatType {
-    type Native: Float + FromPrimitive;
+    type Native: Float + FromPrimitive + AddAssign<Self::Native>;
 
     const FLOAT_TYPE: FloatType;
 

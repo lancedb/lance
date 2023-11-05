@@ -19,6 +19,7 @@
 //! `bf16, f16, f32, f64` types are supported.
 
 use std::iter::Sum;
+use std::ops::AddAssign;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -208,7 +209,7 @@ impl Cosine for [f64] {
 /// Fallback non-SIMD implementation
 #[allow(dead_code)] // Does not fallback on aarch64.
 #[inline]
-fn cosine_scalar<T: Real + Sum + AsPrimitive<f64> + FromPrimitive>(
+fn cosine_scalar<T: Real + Sum + AsPrimitive<f64> + FromPrimitive + AddAssign>(
     x: &[T],
     x_norm: T,
     y: &[T],
@@ -221,7 +222,7 @@ fn cosine_scalar<T: Real + Sum + AsPrimitive<f64> + FromPrimitive>(
 }
 
 #[inline]
-fn cosine_scalar_fast<T: Real + Sum + AsPrimitive<f64> + FromPrimitive>(
+fn cosine_scalar_fast<T: Real + Sum + AsPrimitive<f64> + FromPrimitive + AddAssign>(
     x: &[T],
     x_norm: T,
     y: &[T],

@@ -214,11 +214,12 @@ impl SIMD<f32, 8> for f32x8 {
     fn find(&self, val: f32) -> Option<i32> {
         #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
         unsafe {
-            let tgt = _mm256_set1_ps(val);
-            let mask = _mm256_cmpeq_ps_mask(self.0, tgt);
-            if mask != 0 {
-                return Some(mask.trailing_zeros() as i32);
-            }
+            // let tgt = _mm256_set1_ps(val);
+            // let mask = _mm256_cmpeq_ps_mask(self.0, tgt);
+            // if mask != 0 {
+            //     return Some(mask.trailing_zeros() as i32);
+            // }
+            todo!()
         }
         #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
@@ -565,11 +566,12 @@ impl SIMD<f32, 16> for f32x16 {
     fn find(&self, val: f32) -> Option<i32> {
         #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
         unsafe {
-            let tgt = _mm512_set1_ps(val);
-            let mask = _mm512_cmpeq_ps_mask(self.0, tgt);
-            if mask != 0 {
-                return Some(mask.trailing_zeros() as i32);
-            }
+            // let tgt = _mm512_set1_ps(val);
+            // let mask = _mm512_cmpeq_ps_mask(self.0, tgt);
+            // if mask != 0 {
+            //     return Some(mask.trailing_zeros() as i32);
+            // }
+            todo!()
         }
         #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {

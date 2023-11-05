@@ -15,7 +15,7 @@
 //! Dot product.
 
 use std::iter::Sum;
-use std::ops::Neg;
+use std::ops::{AddAssign, Neg};
 use std::sync::Arc;
 
 use arrow_array::types::{Float16Type, Float64Type};
@@ -27,7 +27,7 @@ use num_traits::real::Real;
 
 /// Default implementation of dot product.
 #[inline]
-pub fn dot<T: Real + Sum>(from: &[T], to: &[T]) -> T {
+pub fn dot<T: Real + Sum + AddAssign>(from: &[T], to: &[T]) -> T {
     const LANES: usize = 16;
     let x_chunks = to.chunks_exact(LANES);
     let y_chunks = from.chunks_exact(LANES);
@@ -44,12 +44,12 @@ pub fn dot<T: Real + Sum>(from: &[T], to: &[T]) -> T {
     // Use known size to allow LLVM to kick in auto-vectorization.
     let mut sums = [T::zero(); LANES];
     for (x, y) in x_chunks.zip(y_chunks) {
-        for i in 0..LANES {
-            sums[i] = sums[i] + x[i] * y[i];
+        for i in (0..16) {
+            sums[i] += x[i] * y[i];
         }
     }
     for i in 0..4 {
-        sum = sum + ((sums[i] + sums[i + 4]) + (sums[i + 8] + sums[i + 12]));
+        sum = sum + (sums[i] + sums[i + 4]) + (sums[i + 8] + sums[i + 12]);
     }
     sum
 }
@@ -83,9 +83,53 @@ impl Dot for Float16Type {
 impl Dot for Float32Type {
     type Output = f32;
 
-    #[inline]
-    fn dot(x: &[f32], y: &[f32]) -> f32 {
-        dot(x, y)
+    // #[inline]
+    fn dot(x: &[f32], other: &[f32]) -> f32 {
+        let mut sum16 = f32x16::zeros();
+        x.chunks_exact(128)
+            .zip(other.chunks_exact(16))
+            .for_each(|(x, y)| unsafe {
+                let x1 = f32x16::load_unaligned(x.as_ptr());
+                let x2 = f32x16::load_unaligned(x.as_ptr().add(16));
+                let x3 = f32x16::load_unaligned(x.as_ptr().add(32));
+                let x4 = f32x16::load_unaligned(x.as_ptr().add(48));
+                let x5 = f32x16::load_unaligned(x.as_ptr().add(64));
+                let x6 = f32x16::load_unaligned(x.as_ptr().add(80));
+                let x7 = f32x16::load_unaligned(x.as_ptr().add(96));
+                let x8 = f32x16::load_unaligned(x.as_ptr().add(112));
+
+                let y1 = f32x16::load_unaligned(y.as_ptr());
+                let y2 = f32x16::load_unaligned(y.as_ptr().add(16));
+                let y3 = f32x16::load_unaligned(y.as_ptr().add(32));
+                let y4 = f32x16::load_unaligned(y.as_ptr().add(48));
+                let y5 = f32x16::load_unaligned(y.as_ptr().add(64));
+                let y6 = f32x16::load_unaligned(y.as_ptr().add(80));
+                let y7 = f32x16::load_unaligned(y.as_ptr().add(96));
+                let y8 = f32x16::load_unaligned(y.as_ptr().add(112));
+
+                sum16 += (x1 * y1 + x2 * y2)
+                    + (x3 * y3 + x4 * y4)
+                    + (x5 * y5 + x6 * y6)
+                    + (x7 * y7 + x8 * y8);
+            });
+        sum16.reduce_sum()
+
+        // let aligned_len = dim / 8 * 8;
+        // let mut sum8 = f32x8::zeros();
+        // for i in (unrolling_len..aligned_len).step_by(8) {
+        //     unsafe {
+        //         let x = f32x8::load_unaligned(x.as_ptr().add(i));
+        //         let y = f32x8::load_unaligned(other.as_ptr().add(i));
+        //         sum8.multiply_add(x, y);
+        //     }
+        // }
+
+        // let mut sum = sum16.reduce_sum() + sum8.reduce_sum();
+        // if aligned_len < dim {
+        //     sum += dot(&x[aligned_len..], &other[aligned_len..]);
+        // }
+
+        // sum
     }
 }
 
