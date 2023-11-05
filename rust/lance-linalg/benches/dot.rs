@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::iter::Sum;
-use std::ops::AddAssign;
-
 use arrow_arith::{aggregate::sum, numeric::mul};
 use arrow_array::{
     cast::AsArray,
@@ -22,7 +19,8 @@ use arrow_array::{
     ArrowNumericType, Float16Array, Float32Array, NativeAdapter, PrimitiveArray,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use num_traits::{real::Real, FromPrimitive};
+use lance_arrow::FloatToArrayType;
+use num_traits::FromPrimitive;
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -38,8 +36,9 @@ fn dot_arrow_artiy<T: ArrowNumericType>(x: &PrimitiveArray<T>, y: &PrimitiveArra
 
 fn run_bench<T: ArrowNumericType>(c: &mut Criterion)
 where
-    T::Native: Real + FromPrimitive + Sum + AddAssign,
+    T::Native: FromPrimitive + FloatToArrayType,
     NativeAdapter<T>: From<T::Native>,
+    <T::Native as FloatToArrayType>::ArrowType: Dot,
 {
     const DIMENSION: usize = 1024;
     const TOTAL: usize = 1024 * 1024; // 1M vectors
@@ -62,7 +61,7 @@ where
     c.bench_function(
         format!("Dot({type_name}, auto-vectorization)").as_str(),
         |b| {
-            let x = key.values();
+            let x = &key.values()[..];
             b.iter(|| unsafe {
                 PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
                     let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
