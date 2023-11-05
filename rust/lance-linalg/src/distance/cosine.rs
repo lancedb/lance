@@ -331,6 +331,17 @@ mod tests {
 
     use approx::assert_relative_eq;
 
+    fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
+        let xy = x
+            .iter()
+            .zip(y.iter())
+            .map(|(&xi, &yi)| xi * yi)
+            .sum::<f32>();
+        let x_sq = x.iter().map(|&xi| xi * xi).sum::<f32>().sqrt();
+        let y_sq = y.iter().map(|&yi| yi * yi).sum::<f32>().sqrt();
+        1.0 - xy / x_sq / y_sq
+    }
+
     #[test]
     fn test_cosine() {
         let x: Float32Array = (1..9).map(|v| v as f32).collect();
@@ -344,6 +355,15 @@ mod tests {
         let d = cosine_distance_batch(x.values(), y.values(), 8).collect::<Vec<_>>();
         // from sklearn.metrics.pairwise import cosine_similarity
         assert_relative_eq!(d[0], 1.0 - 0.873_580_63);
+    }
+
+    #[test]
+    fn test_cosine_large() {
+        let total = 1024;
+        let x = (0..total).map(|v| v as f32).collect::<Vec<_>>();
+        let y = (1024..1024 + total).map(|v| v as f32).collect::<Vec<_>>();
+        let d = cosine_distance_batch(&x, &y, total).collect::<Vec<_>>();
+        assert_relative_eq!(d[0], cosine_dist_brute_force(&x, &y));
     }
 
     #[test]

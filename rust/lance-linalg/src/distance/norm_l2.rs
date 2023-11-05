@@ -95,7 +95,7 @@ pub fn norm_l2<T: Real + Sum>(vector: &[T]) -> T {
     let sum = if chunks.remainder().is_empty() {
         T::zero()
     } else {
-        chunks.remainder().iter().map(|&v| v * v).sum::<T>()
+        chunks.remainder().iter().map(|&v| v.powi(2)).sum::<T>()
     };
     let mut sums = [T::zero(); LANES];
     for chunk in chunks {
