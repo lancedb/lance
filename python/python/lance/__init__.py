@@ -80,8 +80,8 @@ def dataset(
         or when there are no concurrent writers.
     index_cache_size : optional, int
         Index cache size. Index cache is a LRU cache with TTL. This number specify the
-        number of index page, for example, an IVF partition, to be cached in the host memory.
-        Default value is 256.
+        number of index page, for example, an IVF partition, to be cached in
+        the host memory. Default value is 256.
     """
     ds = LanceDataset(uri, version, block_size, commit_lock=commit_lock)
     if version is None and asof is not None:
