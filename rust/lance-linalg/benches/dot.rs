@@ -27,48 +27,13 @@ use num_traits::{real::Real, FromPrimitive};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance_linalg::distance::dot::{dot, dot_distance};
-use lance_linalg::simd::{
-    f32::{f32x16, f32x8},
-    FloatSimd, SIMD,
-};
+use lance_linalg::distance::dot::{dot, dot_distance, Dot};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 #[inline]
 fn dot_arrow_artiy<T: ArrowNumericType>(x: &PrimitiveArray<T>, y: &PrimitiveArray<T>) -> T::Native {
     let m = mul(x, y).unwrap();
     sum(m.as_primitive::<T>()).unwrap()
-}
-
-#[inline]
-fn dot_simd_f32(x: &[f32], y: &[f32]) -> f32 {
-    let dim = x.len();
-    let unrolling_len = dim / 16 * 16;
-    let mut sum16 = f32x16::zeros();
-    for i in (0..unrolling_len).step_by(16) {
-        unsafe {
-            let x = f32x16::load_unaligned(x.as_ptr().add(i));
-            let y = f32x16::load_unaligned(y.as_ptr().add(i));
-            sum16.multiply_add(x, y);
-        }
-    }
-
-    let aligned_len = dim / 8 * 8;
-    let mut sum8 = f32x8::zeros();
-    for i in (unrolling_len..aligned_len).step_by(8) {
-        unsafe {
-            let x = f32x8::load_unaligned(x.as_ptr().add(i));
-            let y = f32x8::load_unaligned(y.as_ptr().add(i));
-            sum8.multiply_add(x, y);
-        }
-    }
-
-    let mut sum = sum16.reduce_sum() + sum8.reduce_sum();
-    if aligned_len < dim {
-        sum += dot(&x[aligned_len..], &y[aligned_len..]);
-    }
-
-    sum
 }
 
 fn run_bench<T: ArrowNumericType>(c: &mut Criterion)

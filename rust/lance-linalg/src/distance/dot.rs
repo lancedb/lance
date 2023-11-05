@@ -40,7 +40,7 @@ pub fn dot<T: Real + Sum + AddAssign>(from: &[T], to: &[T]) -> T {
     const LANES: usize = 16;
     let x_chunks = to.chunks_exact(LANES);
     let y_chunks = from.chunks_exact(LANES);
-    let mut sum = if x_chunks.remainder().is_empty() {
+    let sum = if x_chunks.remainder().is_empty() {
         T::zero()
     } else {
         x_chunks
@@ -57,10 +57,7 @@ pub fn dot<T: Real + Sum + AddAssign>(from: &[T], to: &[T]) -> T {
             sums[i] += x[i] * y[i];
         }
     }
-    for i in 0..4 {
-        sum = sum + (sums[i] + sums[i + 4]) + (sums[i + 8] + sums[i + 12]);
-    }
-    sum
+    sum + sums.iter().copied().sum::<T>()
 }
 
 /// Dot product
