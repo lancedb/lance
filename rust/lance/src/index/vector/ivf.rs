@@ -1504,6 +1504,7 @@ mod tests {
         assert_eq!(5, results[0].num_rows());
         for batch in results.iter() {
             let dist = &batch["_distance"];
+            println!("Dist array is: {:?}", dist);
             assert!(dist
                 .as_primitive::<Float32Type>()
                 .values()
