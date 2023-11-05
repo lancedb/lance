@@ -36,7 +36,7 @@ pub fn dot<T: Real + Sum>(from: &[T], to: &[T]) -> T {
     const LANES: usize = 16;
     let x_chunks = to.chunks_exact(LANES);
     let y_chunks = from.chunks_exact(LANES);
-    let sum = if x_chunks.remainder().is_empty() {
+    let mut sum = if x_chunks.remainder().is_empty() {
         T::zero()
     } else {
         x_chunks
@@ -50,10 +50,13 @@ pub fn dot<T: Real + Sum>(from: &[T], to: &[T]) -> T {
     let mut sums = [T::zero(); LANES];
     for (x, y) in x_chunks.zip(y_chunks) {
         for i in 0..LANES {
-            sums[i] = sums[i].add(x[i] * y[i]);
+            sums[i] = sums[0] + x[i] * y[i];
         }
     }
-    sum + sums.iter().copied().sum::<T>()
+    for i in 0..4 {
+        sum = sum + (sums[i] + sums[i + 4]) + (sums[i + 8] + sums[i + 12]);
+    }
+    sum
 }
 
 /// Dot product
@@ -67,6 +70,7 @@ pub trait Dot: ArrowFloatType {
 impl Dot for BFloat16Type {
     type Output = bf16;
 
+    #[inline]
     fn dot(x: &[bf16], y: &[bf16]) -> bf16 {
         dot(x, y)
     }
@@ -119,6 +123,7 @@ impl Dot for Float32Type {
 impl Dot for Float64Type {
     type Output = f64;
 
+    #[inline]
     fn dot(x: &[f64], y: &[f64]) -> f64 {
         dot(x, y)
     }
