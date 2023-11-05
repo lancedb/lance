@@ -36,8 +36,7 @@ use crate::simd::{
 // Please make sure run `cargo bench --bench dot` with and without AVX-512 before any change.
 // Tested `target-features`: avx512f,avx512vl,f16c
 #[inline]
-pub fn dot<T: Real + Sum + AddAssign>(from: &[T], to: &[T]) -> T {
-    const LANES: usize = 16;
+fn dot_scalar<T: Real + Sum + AddAssign, const LANES: usize>(from: &[T], to: &[T]) -> T {
     let x_chunks = to.chunks_exact(LANES);
     let y_chunks = from.chunks_exact(LANES);
     let sum = if x_chunks.remainder().is_empty() {
@@ -60,39 +59,47 @@ pub fn dot<T: Real + Sum + AddAssign>(from: &[T], to: &[T]) -> T {
     sum + sums.iter().copied().sum::<T>()
 }
 
+/// Dot product.
+#[inline]
+pub fn dot<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> T
+where
+    T::ArrowType: Dot,
+{
+    T::ArrowType::dot(from, to)
+}
+
+/// Negative dot distance.
+#[inline]
+pub fn dot_distance<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> T
+where
+    T::ArrowType: Dot,
+{
+    T::ArrowType::dot(from, to).neg()
+}
+
 /// Dot product
 pub trait Dot: ArrowFloatType {
-    type Output: Neg<Output = Self::Native>;
-
     /// Dot product.
-    fn dot(x: &[Self::Native], y: &[Self::Native]) -> Self::Output;
+    fn dot(x: &[Self::Native], y: &[Self::Native]) -> Self::Native;
 }
 
 impl Dot for BFloat16Type {
-    type Output = bf16;
-
     #[inline]
     fn dot(x: &[bf16], y: &[bf16]) -> bf16 {
-        dot(x, y)
+        dot_scalar::<bf16, 16>(x, y)
     }
 }
 
 impl Dot for Float16Type {
-    type Output = f16;
-
     #[inline]
     fn dot(x: &[f16], y: &[f16]) -> f16 {
-        dot(x, y)
+        dot_scalar::<f16, 16>(x, y)
     }
 }
 
 impl Dot for Float32Type {
-    type Output = f32;
-
     #[inline]
     fn dot(x: &[f32], y: &[f32]) -> f32 {
-        // TODO: split these to fast and slow kernels based on `(dimension, type)` pair.
-
         // Manually unrolled 8 times to get enough registers.
         // TODO: avx512 can unroll more
         let x_unrolled_chunks = x.chunks_exact(64);
@@ -147,11 +154,9 @@ impl Dot for Float32Type {
 }
 
 impl Dot for Float64Type {
-    type Output = f64;
-
     #[inline]
     fn dot(x: &[f64], y: &[f64]) -> f64 {
-        dot(x, y)
+        dot_scalar::<f64, 8>(x, y)
     }
 }
 
@@ -166,7 +171,6 @@ where
 {
     debug_assert_eq!(from.len(), dimension);
     debug_assert_eq!(to.len() % dimension, 0);
-
     Box::new(to.chunks_exact(dimension).map(|v| dot_distance(from, v)))
 }
 
@@ -193,15 +197,6 @@ pub fn dot_distance_arrow_batch(from: &[f32], to: &FixedSizeListArray) -> Arc<Fl
         .map(|v| dot_distance(from, v));
 
     Arc::new(Float32Array::new(dists.collect(), to.nulls().cloned()))
-}
-
-/// Negative dot distance.
-#[inline]
-pub fn dot_distance<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> T
-where
-    T::ArrowType: Dot,
-{
-    T::ArrowType::dot(from, to).neg()
 }
 
 #[cfg(test)]

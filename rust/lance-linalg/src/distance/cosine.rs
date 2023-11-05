@@ -18,15 +18,13 @@
 //!
 //! `bf16, f16, f32, f64` types are supported.
 
-use std::iter::Sum;
-use std::ops::AddAssign;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float32Type;
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
-use num_traits::real::Real;
+use lance_arrow::FloatToArrayType;
 use num_traits::{AsPrimitive, FromPrimitive};
 
 use super::dot::dot;
@@ -209,11 +207,14 @@ impl Cosine for [f64] {
 /// Fallback non-SIMD implementation
 #[allow(dead_code)] // Does not fallback on aarch64.
 #[inline]
-fn cosine_scalar<T: Real + Sum + AsPrimitive<f64> + FromPrimitive + AddAssign>(
+fn cosine_scalar<T: AsPrimitive<f64> + FromPrimitive + FloatToArrayType>(
     x: &[T],
     x_norm: T,
     y: &[T],
-) -> T {
+) -> T
+where
+    <T as FloatToArrayType>::ArrowType: super::dot::Dot,
+{
     let y_sq = dot(y, y);
     let xy = dot(x, y);
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
@@ -222,12 +223,15 @@ fn cosine_scalar<T: Real + Sum + AsPrimitive<f64> + FromPrimitive + AddAssign>(
 }
 
 #[inline]
-fn cosine_scalar_fast<T: Real + Sum + AsPrimitive<f64> + FromPrimitive + AddAssign>(
+fn cosine_scalar_fast<T: AsPrimitive<f64> + FromPrimitive + FloatToArrayType>(
     x: &[T],
     x_norm: T,
     y: &[T],
     y_norm: T,
-) -> T {
+) -> T
+where
+    <T as FloatToArrayType>::ArrowType: super::dot::Dot,
+{
     let xy = dot(x, y);
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
     // use f64 for overflow protection.

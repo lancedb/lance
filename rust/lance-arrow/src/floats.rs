@@ -14,6 +14,7 @@
 
 //! Floats Array
 
+use std::iter::Sum;
 use std::{fmt::Formatter, ops::AddAssign};
 
 use arrow_array::{
@@ -59,7 +60,7 @@ pub trait ArrowFloatType {
     type ArrayType: FloatArray<Self>;
 }
 
-pub trait FloatToArrayType: Float + Bounded {
+pub trait FloatToArrayType: Float + Bounded + Sum + AddAssign {
     type ArrowType: ArrowFloatType<Native = Self>;
 }
 
