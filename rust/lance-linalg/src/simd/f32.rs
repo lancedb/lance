@@ -212,7 +212,7 @@ impl SIMD<f32, 8> for f32x8 {
     }
 
     fn find(&self, val: f32) -> Option<i32> {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
         unsafe {
             let tgt = _mm256_set1_ps(val);
             let mask = _mm256_cmpeq_ps_mask(self.0, tgt);
@@ -220,7 +220,7 @@ impl SIMD<f32, 8> for f32x8 {
                 return Some(mask.trailing_zeros() as i32);
             }
         }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(all(target_arch = "x86_64", not(feature = "avx512")))]
         unsafe {
             for i in 0..8 {
                 if self.as_array().get_unchecked(i) == &val {
