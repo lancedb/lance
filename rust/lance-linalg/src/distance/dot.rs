@@ -50,11 +50,11 @@ pub fn dot<T: Real + Sum>(from: &[T], to: &[T]) -> T {
     let mut sums = [T::zero(); LANES];
     for (x, y) in x_chunks.zip(y_chunks) {
         for i in 0..LANES {
-            sums[i] = sums[0] + x[i] * y[i];
+            sums[i] = sums[i] + x[i] * y[i];
         }
     }
     for i in 0..4 {
-        sum = sum + (sums[i] + sums[i + 4]) + (sums[i + 8] + sums[i + 12]);
+        sum = sum + ((sums[i] + sums[i + 4]) + (sums[i + 8] + sums[i + 12]));
     }
     sum
 }
