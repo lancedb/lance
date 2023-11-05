@@ -31,6 +31,7 @@ use crate::simd::{f32::f32x16, SIMD};
 ///
 // The following code has been tuned for auto-vectorization.
 // Please make sure run `cargo bench --bench dot` with and without AVX-512 before any change.
+// Tested `target-features`: avx512f,avx512vl,f16c
 #[inline]
 pub fn dot<T: Real + Sum + AddAssign>(from: &[T], to: &[T]) -> T {
     const LANES: usize = 16;
