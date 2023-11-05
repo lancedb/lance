@@ -25,6 +25,8 @@ use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatToArrayType};
 use num_traits::real::Real;
 
+use crate::simd::{f32::f32x16, SIMD};
+
 /// Default implementation of dot product.
 #[inline]
 pub fn dot<T: Real + Sum + AddAssign>(from: &[T], to: &[T]) -> T {
@@ -44,7 +46,7 @@ pub fn dot<T: Real + Sum + AddAssign>(from: &[T], to: &[T]) -> T {
     // Use known size to allow LLVM to kick in auto-vectorization.
     let mut sums = [T::zero(); LANES];
     for (x, y) in x_chunks.zip(y_chunks) {
-        for i in (0..16) {
+        for i in 0..LANES {
             sums[i] += x[i] * y[i];
         }
     }
