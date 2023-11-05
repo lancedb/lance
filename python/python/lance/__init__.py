@@ -79,7 +79,9 @@ def dataset(
         committing a new version. Not necessary on object stores other than S3
         or when there are no concurrent writers.
     index_cache_size : optional, int
-        Number of index partition be cached in memory. If not specified, defaults to 256
+        Index cache size. Index cache is a LRU cache with TTL. This number specify the
+        number of index page, for example, an IVF partition, to be cached in the host memory.
+        Default value is 256.
     """
     ds = LanceDataset(uri, version, block_size, commit_lock=commit_lock)
     if version is None and asof is not None:
