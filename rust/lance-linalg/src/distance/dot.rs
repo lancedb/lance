@@ -25,11 +25,6 @@ use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatToArrayType};
 use num_traits::real::Real;
 
-use crate::simd::{
-    f32::{f32x16, f32x8},
-    FloatSimd, SIMD,
-};
-
 /// Default implementation of dot product.
 #[inline]
 pub fn dot<T: Real + Sum>(from: &[T], to: &[T]) -> T {
@@ -89,34 +84,8 @@ impl Dot for Float32Type {
     type Output = f32;
 
     #[inline]
-    fn dot(x: &[f32], other: &[f32]) -> f32 {
-        let dim = x.len();
-        let unrolling_len = dim / 16 * 16;
-        let mut sum16 = f32x16::zeros();
-        for i in (0..unrolling_len).step_by(16) {
-            unsafe {
-                let x = f32x16::load_unaligned(x.as_ptr().add(i));
-                let y = f32x16::load_unaligned(other.as_ptr().add(i));
-                sum16.multiply_add(x, y);
-            }
-        }
-
-        let aligned_len = dim / 8 * 8;
-        let mut sum8 = f32x8::zeros();
-        for i in (unrolling_len..aligned_len).step_by(8) {
-            unsafe {
-                let x = f32x8::load_unaligned(x.as_ptr().add(i));
-                let y = f32x8::load_unaligned(other.as_ptr().add(i));
-                sum8.multiply_add(x, y);
-            }
-        }
-
-        let mut sum = sum16.reduce_sum() + sum8.reduce_sum();
-        if aligned_len < dim {
-            sum += dot(&x[aligned_len..], &other[aligned_len..]);
-        }
-
-        sum
+    fn dot(x: &[f32], y: &[f32]) -> f32 {
+        dot(x, y)
     }
 }
 

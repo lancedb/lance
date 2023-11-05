@@ -70,7 +70,7 @@ impl Normalize<f32> for &[f32] {
             sum.reduce_sum().sqrt()
         } else {
             // Fallback to scalar
-            return self.iter().map(|v| v * v).sum::<f32>().sqrt();
+            norm_l2(self)
         }
     }
 }
