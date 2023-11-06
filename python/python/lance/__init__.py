@@ -86,7 +86,8 @@ def dataset(
         Roughly, for an ``IVF_PQ`` partition with ``n`` rows, the size of each index
         page equals the combination of the pq code (``nd.array([n,pq], dtype=uint8))``
         and the row ids (``nd.array([n], dtype=uint64)``).
-        Approximately, ``n = Total Rows / number of IVF``.
+        Approximately, ``n = Total Rows / number of IVF partitions``.
+        ``pq = number of PQ sub-vectors``.
     """
     ds = LanceDataset(uri, version, block_size, commit_lock=commit_lock)
     if version is None and asof is not None:
