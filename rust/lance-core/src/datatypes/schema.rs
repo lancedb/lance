@@ -69,12 +69,6 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
-    pub fn new(fields: Vec<Field>) -> Self {
-        Self {
-            fields,
-            metadata: HashMap::default(),
-        }
-    }
     /// Project the columns over the schema.
     ///
     /// ```ignore

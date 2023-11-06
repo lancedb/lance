@@ -546,13 +546,6 @@ impl fmt::Display for Field {
             "Field(id={}, name={}, type={}",
             self.id, self.name, self.logical_type.0,
         )?;
-        if !self.children.is_empty() {
-            write!(f, ", children=[")?;
-            for child in self.children.iter() {
-                write!(f, "{}, ", child)?;
-            }
-            write!(f, "]")?;
-        }
 
         if let Some(dictionary) = &self.dictionary {
             write!(f, ", dictionary={:?}", dictionary)?;
