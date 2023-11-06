@@ -1507,6 +1507,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
+    use lance_core::format::WriterVersion;
     use lance_index::vector::DIST_COL;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
@@ -1561,6 +1562,10 @@ mod tests {
 
         let actual_ds = Dataset::open(test_uri).await.unwrap();
         assert_eq!(actual_ds.version().version, 1);
+        assert_eq!(
+            actual_ds.manifest.writer_version,
+            Some(WriterVersion::default())
+        );
         let actual_schema = ArrowSchema::from(actual_ds.schema());
         assert_eq!(&actual_schema, schema.as_ref());
 
