@@ -28,7 +28,7 @@ use lance_core::{
     io::{object_store::ObjectStore, FileReader, FileWriter},
     Error, Result,
 };
-use lance_linalg::distance::l2::L2;
+use lance_linalg::distance::l2::l2;
 use lru_time_cache::LruCache;
 use object_store::path::Path;
 use snafu::{location, Location};
@@ -234,7 +234,7 @@ impl<V: Vertex + Send + Sync + Debug> Graph for PersistedGraph<V> {
 
     async fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
         let vertex = self.vertex(idx as u32).await?;
-        Ok(vertex.vector().l2(query))
+        Ok(l2(vertex.vector(), query))
     }
 
     /// Get the neighbors of a vertex, specified by its id.

@@ -30,7 +30,11 @@ use tracing::instrument;
 
 use crate::kernels::argmin_value_float;
 use crate::{
-    distance::{dot_distance, l2::{l2, l2_distance_batch}, Cosine, Dot, MetricType, Normalize},
+    distance::{
+        dot_distance,
+        l2::{l2, l2_distance_batch},
+        Cosine, Dot, MetricType, Normalize,
+    },
     kernels::{argmin, argmin_value},
     matrix::MatrixView,
 };
@@ -478,7 +482,9 @@ impl KMeans {
                             .map(|(idx, vector)| {
                                 let centroid_stream = centroids_array.chunks_exact(dimension);
                                 match metric_type {
-                                    MetricType::L2 => { panic!("L2 is handled above") },
+                                    MetricType::L2 => {
+                                        panic!("L2 is handled above")
+                                    }
                                     MetricType::Cosine => {
                                         let centroid_norms = norms.as_ref().as_ref().unwrap();
                                         if let Some(norm_vectors) = norm_data.as_ref() {
