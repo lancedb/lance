@@ -80,7 +80,7 @@ def dataset(
         or when there are no concurrent writers.
     index_cache_size : optional, int
         Index cache size. Index cache is a LRU cache with TTL. This number specifies the
-        number of index page, for example, an IVF partition, to be cached in
+        number of index pages, for example, IVF partitions, to be cached in
         the host memory. Default value is ``256``.
 
         Roughly, for an ``IVF_PQ`` partition with ``n`` rows, the size of each index
