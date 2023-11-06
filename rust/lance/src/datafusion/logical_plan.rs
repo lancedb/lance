@@ -145,7 +145,7 @@ mod tests {
             .await
             .unwrap();
 
-        let dataset = Dataset::open(&test_uri).await.unwrap();
+        let dataset = Dataset::open(test_uri).await.unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("my_table", Arc::new(dataset)).unwrap();
         let df = ctx.sql("SELECT vector, utf8 FROM my_table").await.unwrap();
@@ -185,7 +185,7 @@ mod tests {
             .await
             .unwrap();
 
-        let dataset = Dataset::open(&test_uri).await.unwrap();
+        let dataset = Dataset::open(test_uri).await.unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("my_table", Arc::new(dataset)).unwrap();
         let df = ctx
