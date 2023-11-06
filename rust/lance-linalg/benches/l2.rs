@@ -27,7 +27,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance_linalg::distance::l2_distance_batch;
+use lance_linalg::distance::{l2_distance_batch, l2_scalar};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 #[inline]
@@ -41,21 +41,6 @@ fn l2_arrow(x: &Float32Array, y: &Float32Array) -> f32 {
 fn l2_arrow_arity(x: &Float32Array, y: &Float32Array) -> f32 {
     let m: Float32Array = binary(x, y, |a, b| (a - b).powi(2)).unwrap();
     sum(&m).unwrap()
-}
-
-#[inline]
-fn l2_auto_vectorization(x: &[f32], y: &[f32]) -> f32 {
-    const LANES: usize = 16;
-    let x_chunks = x.chunks_exact(LANES);
-    let y_chunks = y.chunks_exact(LANES);
-    let mut sums = [0.0; LANES];
-    for (x, y) in x_chunks.zip(y_chunks) {
-        for i in 0..LANES {
-            let diff = x[i] - y[i];
-            sums[i] += diff * diff;
-        }
-    }
-    sums.iter().copied().sum()
 }
 
 fn bench_distance(c: &mut Criterion) {
@@ -95,7 +80,7 @@ fn bench_distance(c: &mut Criterion) {
         b.iter(|| unsafe {
             Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                Some(l2_auto_vectorization(x, y))
+                Some(l2_scalar::<f32, 16>(x, y))
             }))
         });
     });
@@ -133,7 +118,7 @@ fn bench_distance(c: &mut Criterion) {
         b.iter(|| unsafe {
             Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                Some(l2_auto_vectorization(x, y))
+                Some(l2_scalar::<f32, 16>(x, y))
             }))
         });
     });

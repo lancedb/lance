@@ -40,9 +40,9 @@ pub trait L2 {
 
 /// Calculate the L2 distance between two vectors, using scalar operations.
 ///
-/// Rely on compiler auto-vectorization.
+/// It relies on LLVM for auto-vectorization and unrolling.
 #[inline]
-fn l2_scalar<T: Float + Sum + AddAssign, const LANES: usize>(from: &[T], to: &[T]) -> T {
+pub fn l2_scalar<T: Float + Sum + AddAssign, const LANES: usize>(from: &[T], to: &[T]) -> T {
     let x_chunks = from.chunks_exact(LANES);
     let y_chunks = to.chunks_exact(LANES);
 
@@ -64,7 +64,7 @@ fn l2_scalar<T: Float + Sum + AddAssign, const LANES: usize>(from: &[T], to: &[T
     for (x, y) in x_chunks.zip(y_chunks) {
         for i in 0..LANES {
             let diff = x[i] - y[i];
-            sums[i] = sums[i] + diff * diff;
+            sums[i] += diff * diff;
         }
     }
 
