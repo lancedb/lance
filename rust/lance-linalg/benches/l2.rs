@@ -42,12 +42,20 @@ fn l2_arrow_arity(x: &Float32Array, y: &Float32Array) -> f32 {
     let m: Float32Array = binary(x, y, |a, b| (a - b).powi(2)).unwrap();
     sum(&m).unwrap()
 }
+
 #[inline]
 fn l2_auto_vectorization(x: &[f32], y: &[f32]) -> f32 {
-    x.iter()
-        .zip(y.iter())
-        .map(|(a, b)| (a - b).powi(2))
-        .sum::<f32>()
+    const LANES: usize = 16;
+    let x_chunks = x.chunks_exact(LANES);
+    let y_chunks = y.chunks_exact(LANES);
+    let mut sums= [0.0; LANES];
+    for (x, y) in x_chunks.zip(y_chunks) {
+        for i in 0..LANES {
+            let diff = x[i] - y[i];
+            sums[i] += diff * diff;
+        }
+    }
+    sums.iter().copied().sum()
 }
 
 fn bench_distance(c: &mut Criterion) {
