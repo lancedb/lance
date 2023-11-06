@@ -57,6 +57,7 @@ def dataset(
     asof: Optional[ts_types] = None,
     block_size: Optional[int] = None,
     commit_lock: Optional[CommitLock] = None,
+    index_cache_size: Optional[int] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -77,6 +78,16 @@ def dataset(
         If specified, use the provided commit handler to lock the table while
         committing a new version. Not necessary on object stores other than S3
         or when there are no concurrent writers.
+    index_cache_size : optional, int
+        Index cache size. Index cache is a LRU cache with TTL. This number specifies the
+        number of index pages, for example, IVF partitions, to be cached in
+        the host memory. Default value is ``256``.
+
+        Roughly, for an ``IVF_PQ`` partition with ``n`` rows, the size of each index
+        page equals the combination of the pq code (``nd.array([n,pq], dtype=uint8))``
+        and the row ids (``nd.array([n], dtype=uint64)``).
+        Approximately, ``n = Total Rows / number of IVF partitions``.
+        ``pq = number of PQ sub-vectors``.
     """
     ds = LanceDataset(uri, version, block_size, commit_lock=commit_lock)
     if version is None and asof is not None:
@@ -90,6 +101,12 @@ def dataset(
                 f"{ts_cutoff} is earlier than the first version of this dataset"
             )
         else:
-            return LanceDataset(uri, ver_cutoff, block_size, commit_lock=commit_lock)
+            return LanceDataset(
+                uri,
+                ver_cutoff,
+                block_size,
+                commit_lock=commit_lock,
+                index_cache_size=index_cache_size,
+            )
     else:
         return ds
