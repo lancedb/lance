@@ -651,7 +651,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def cleanup_old_versions(
         self,
-        older_than: timedelta = None,
+        older_than: Optional[timedelta] = None,
         *,
         delete_unverified: bool = False,
     ) -> CleanupStats:
@@ -691,7 +691,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def create_index(
         self,
-        column: str,
+        column: Union[str, List[str]],
         index_type: str,
         name: Optional[str] = None,
         metric: str = "L2",
@@ -1276,9 +1276,9 @@ class ScannerBuilder:
         self._offset = None
         self._columns = None
         self._nearest = None
-        self._batch_size = None
-        self._batch_readahead = None
-        self._fragment_readahead = None
+        self._batch_size: Optional[int] = None
+        self._batch_readahead: Optional[int] = None
+        self._fragment_readahead: Optional[int] = None
         self._scan_in_order = True
         self._fragments = None
         self._with_row_id = False
