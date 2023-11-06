@@ -405,7 +405,7 @@ impl Planner {
         use datafusion::physical_expr::expressions::{BinaryExpr, NegativeExpr};
 
         Ok(match expr {
-            Expr::Column(c) => Arc::new(Column::new(c.flat_name())),
+            Expr::Column(c) => Arc::new(Column::new(c.name.clone())),
             Expr::Literal(v) => Arc::new(Literal::new(v.clone())),
             Expr::BinaryExpr(expr) => {
                 let left = self.create_physical_expr(expr.left.as_ref())?;

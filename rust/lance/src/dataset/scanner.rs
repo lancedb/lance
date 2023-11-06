@@ -124,27 +124,27 @@ impl ColumnOrdering {
 ///   .sum()
 /// ```
 pub struct Scanner {
-    dataset: Arc<Dataset>,
+    pub(crate) dataset: Arc<Dataset>,
 
-    projections: Schema,
+    pub(crate) projections: Schema,
 
     /// If true then the filter will be applied before an index scan
-    prefilter: bool,
+    pub(crate) prefilter: bool,
 
     /// Optional filters string.
-    filter: Option<String>,
+    pub(crate) filter: Option<String>,
 
     /// The batch size controls the maximum size of rows to return for each read.
-    batch_size: usize,
+    pub(crate) batch_size: usize,
 
     /// Number of batches to prefetch
-    batch_readahead: usize,
+    pub(crate) batch_readahead: usize,
 
     /// Number of fragments to read concurrently
-    fragment_readahead: usize,
+    pub(crate) fragment_readahead: usize,
 
-    limit: Option<i64>,
-    offset: Option<i64>,
+    pub(crate) limit: Option<i64>,
+    pub(crate) offset: Option<i64>,
 
     /// If Some then results will be ordered by the provided ordering
     ///
@@ -154,12 +154,12 @@ pub struct Scanner {
     ///
     /// If this is Some then the value of `ordered` is ignored.  The scan
     /// will always be unordered since we are just going to reorder it anyways.
-    ordering: Option<Vec<ColumnOrdering>>,
+    pub(crate) ordering: Option<Vec<ColumnOrdering>>,
 
-    nearest: Option<Query>,
+    pub(crate) nearest: Option<Query>,
 
     /// Scan the dataset with a meta column: "_rowid"
-    with_row_id: bool,
+    pub(crate) with_row_id: bool,
 
     /// Whether to scan in deterministic order (default: true)
     ///
@@ -458,7 +458,7 @@ impl Scanner {
     }
 
     /// The output schema of the Scanner, in Lance Schema format.
-    fn output_schema(&self) -> Result<Arc<Schema>> {
+    pub(crate) fn output_schema(&self) -> Result<Arc<Schema>> {
         let mut extra_columns = vec![];
 
         if let Some(q) = self.nearest.as_ref() {
@@ -591,7 +591,7 @@ impl Scanner {
     /// 3. Sort
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
-    async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         // NOTE: we only support node that have one partition. So any nodes that
         // produce multiple need to be repartitioned to 1.
         let mut filter_expr = if let Some(filter) = self.filter.as_ref() {
@@ -690,7 +690,7 @@ impl Scanner {
     }
 
     // KNN search execution node with optional prefilter
-    async fn knn(
+    pub(crate) async fn knn(
         &self,
         prefilter: Option<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -829,7 +829,7 @@ impl Scanner {
     ///
     /// Setting `with_make_deletions_null` will use the validity of the _rowid
     /// column as a selection vector. Read more in [crate::io::FileReader].
-    fn scan(
+    pub(crate) fn scan(
         &self,
         with_row_id: bool,
         with_make_deletions_null: bool,
@@ -910,7 +910,7 @@ impl Scanner {
     }
 
     /// Take row indices produced by input plan from the dataset (with projection)
-    fn take(
+    pub(crate) fn take(
         &self,
         input: Arc<dyn ExecutionPlan>,
         projection: &Schema,
@@ -925,7 +925,7 @@ impl Scanner {
     }
 
     /// Global offset-limit of the result of the input plan
-    fn limit_node(&self, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    pub(crate) fn limit_node(&self, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         Arc::new(GlobalLimitExec::new(
             plan,
             *self.offset.as_ref().unwrap_or(&0) as usize,

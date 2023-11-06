@@ -177,9 +177,12 @@ impl ExecutionPlan for ProjectionExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        Ok(Arc::new(ProjectionExec::try_new(
+            children[0].clone(),
+            self.project.clone(),
+        )?))
     }
 
     fn execute(

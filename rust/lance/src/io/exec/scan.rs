@@ -325,6 +325,21 @@ impl ExecutionPlan for LanceScanExec {
     }
 
     fn statistics(&self) -> datafusion::physical_plan::Statistics {
-        todo!()
+        let stats = self.fragments.iter().fold(
+            datafusion::physical_plan::Statistics::default(),
+            |mut stats, fragment| {
+                match stats.num_rows {
+                    Some(num_rows) => {
+                        stats.num_rows = Some(num_rows + fragment.num_rows().unwrap_or(0));
+                    }
+                    None => {
+                        stats.num_rows = fragment.num_rows();
+                    }
+                }
+                stats
+            },
+        );
+        // Statistics not yet fully implemented. currently only contains `num_rows`
+        stats
     }
 }
