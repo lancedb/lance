@@ -29,7 +29,7 @@ use arrow_array::{
 };
 use arrow_array::{make_array, BooleanArray};
 use arrow_buffer::{ArrowNativeType, NullBuffer};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, FieldRef, Schema as ArrowSchema};
 use arrow_select::{
     concat::{concat, concat_batches},
     filter::filter_record_batch,
@@ -898,19 +898,14 @@ async fn read_struct_array(
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
     // TODO: use tokio to make the reads in parallel.
-    let mut fields: Vec<ArrowField> = vec![];
-    let mut arrays = vec![];
+    let mut sub_arrays: Vec<(FieldRef, ArrayRef)> = vec![];
 
     for child in field.children.as_slice() {
         let arr = read_array(reader, child, batch_id, page_table, params).await?;
-        fields.push(child.into());
-
-        arrays.push(arr);
+        sub_arrays.push((Arc::new(child.into()), arr));
     }
 
-    let sa = StructArray::try_new(fields.into(), arrays, None)?;
-
-    Ok(Arc::new(sa))
+    Ok(Arc::new(StructArray::from(sub_arrays)))
 }
 
 async fn take_list_array<T: ArrowNumericType>(
