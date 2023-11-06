@@ -41,6 +41,7 @@ object_store.workspace = true
 approx.workspace = true
 criterion.workspace = true
 lance-datagen.workspace = true
+lance-testing.workspace = true
 lance.workspace = true
 pprof.workspace = true
 tempfile.workspace = true
@@ -50,4 +51,8 @@ prost-build.workspace = true
 
 [[bench]]
 name = "scalar_index"
+harness = false
+
+[[bench]]
+name = "find_partitions"
 harness = false
