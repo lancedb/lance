@@ -2885,8 +2885,42 @@ mod tests {
         let data = RecordBatch::try_new(schema.clone(), vec![vectors]);
         let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
-        dataset.delete("vec IS NOT NULL").await.unwrap();
-        let dataset = Dataset::open(test_uri).await.unwrap();
+        dataset.delete("true").await.unwrap();
+
+        let mut stream = dataset
+            .scan()
+            .nearest(
+                "vec",
+                &Float32Array::from_iter_values((0..128).map(|_| 0.1)),
+                1,
+            )
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+
+        while let Some(batch) = stream.next().await {
+            let schema = batch.unwrap().schema();
+            assert_eq!(schema.fields.len(), 2);
+            assert_eq!(
+                schema.field_with_name("vec").unwrap(),
+                &Field::new(
+                    "vec",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        128
+                    ),
+                    false,
+                )
+            );
+            assert_eq!(
+                schema.field_with_name(DIST_COL).unwrap(),
+                &Field::new(DIST_COL, DataType::Float32, true)
+            );
+        }
+
+        // predicate with redundant whitespace
+        dataset.delete(" True").await.unwrap();
 
         let mut stream = dataset
             .scan()

@@ -504,6 +504,16 @@ impl FileFragment {
 
         // scan with predicate and row ids
         let mut scanner = self.scan();
+
+        // if predicate is `true`, delete the whole fragment
+        // else if predicate is `false`, filter the predicate
+        let predicate_lower = predicate.trim().to_lowercase();
+        if predicate_lower == "true" {
+            return Ok(None);
+        } else if predicate_lower == "false" {
+            return Ok(Some(self));
+        }
+
         scanner
             .with_row_id()
             .filter(predicate)?
