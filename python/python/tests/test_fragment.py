@@ -184,5 +184,5 @@ def test_fragment_meta():
     assert repr(meta) == (
         'Fragment { id: 0, files: [DataFile { path: "0.lance", fields: [0] },'
         ' DataFile { path: "1.lance", fields: [1] }], deletion_file: None,'
-        " physical_rows: 100 }"
+        " physical_rows: Some(100) }"
     )

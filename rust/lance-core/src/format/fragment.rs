@@ -369,7 +369,7 @@ mod tests {
                     {"path": "foobar.lance", "fields": [0]}],
                      "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
                                        "num_deleted_rows": 10},
-                "physical_rows": 0}),
+                "physical_rows": None::<usize>}),
         );
 
         let frag2 = Fragment::from_json(&json).unwrap();
