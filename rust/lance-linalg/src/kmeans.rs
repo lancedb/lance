@@ -473,7 +473,7 @@ impl KMeans {
                         let values = &data.values()[start_idx * dimension..last_idx * dimension];
 
                         if metric_type == MetricType::L2 {
-                            return compute_partitions_l2_f32(centroids_array, values, dimension)
+                            return compute_partitions_l2(centroids_array, values, dimension)
                                 .collect();
                         }
 
@@ -543,11 +543,11 @@ impl KMeans {
 
 /// Return a slice of `data[x,y..y+strip]`.
 #[inline]
-fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f32] {
+fn get_slice<T: Float>(data: &[T], x: usize, y: usize, dim: usize, strip: usize) -> &[T] {
     &data[x * dim + y..x * dim + y + strip]
 }
 
-fn compute_partitions_l2_f32_small<'a, T: FloatToArrayType>(
+fn compute_partitions_l2_small<'a, T: FloatToArrayType>(
     centroids: &'a [T],
     data: &'a [T],
     dim: usize,
@@ -560,13 +560,16 @@ where
 }
 
 /// Fast partition computation for L2 distance.
-fn compute_partitions_l2_f32<'a>(
-    centroids: &'a [f32],
-    data: &'a [f32],
+fn compute_partitions_l2<'a, T: FloatToArrayType>(
+    centroids: &'a [T],
+    data: &'a [T],
     dim: usize,
-) -> Box<dyn Iterator<Item = (u32, f32)> + 'a> {
+) -> Box<dyn Iterator<Item = (u32, T)> + 'a>
+where
+    T::ArrowType: L2,
+{
     if std::mem::size_of_val(centroids) <= 16 * 1024 {
-        return Box::new(compute_partitions_l2_f32_small(centroids, data, dim));
+        return Box::new(compute_partitions_l2_small(centroids, data, dim));
     }
 
     const STRIPE_SIZE: usize = 128;
@@ -581,12 +584,12 @@ fn compute_partitions_l2_f32<'a>(
         // Loop over each strip.
         // s is the index of value in each vector.
         let num_rows_in_tile = data_tile.len() / dim;
-        let mut min_dists = vec![f32::MAX; num_rows_in_tile];
+        let mut min_dists = vec![<T as Float>::max_value(); num_rows_in_tile];
         let mut partitions = vec![0_u32; num_rows_in_tile];
 
         for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
             // 4B * 16 * 16 = 1 KB
-            let mut dists = vec![0_f32; TILE_SIZE * TILE_SIZE];
+            let mut dists = vec![T::zero(); TILE_SIZE * TILE_SIZE];
             let num_centroids_in_tile = min(TILE_SIZE, num_centroids - centroid_start);
             for s in (0..dim).step_by(STRIPE_SIZE) {
                 // Calculate L2 within each TILE * STRIP
@@ -666,7 +669,7 @@ pub fn compute_partitions(
     metric_type: MetricType,
 ) -> Vec<u32> {
     match metric_type {
-        MetricType::L2 => compute_partitions_l2_f32(centroids, data, dimension)
+        MetricType::L2 => compute_partitions_l2(centroids, data, dimension)
             .map(|(c, _)| c)
             .collect(),
         MetricType::Cosine => compute_partitions_cosine(centroids, data, dimension),
