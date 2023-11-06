@@ -20,8 +20,9 @@ use std::ops::AddAssign;
 use std::sync::Arc;
 
 use crate::distance::l2::f32::l2_once;
-use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
+use arrow_array::{cast::AsArray, types::{Float32Type, Float16Type, Float64Type}, Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
+use lance_arrow::{FloatToArrayType, ArrowFloatType, bfloat16::BFloat16Type};
 use num_traits::Float;
 
 use crate::simd::{
@@ -31,16 +32,24 @@ use crate::simd::{
 
 /// Calculate the L2 distance between two vectors.
 ///
-pub trait L2 {
-    type Output;
-
+pub trait L2 : ArrowFloatType {
     /// Calculate the L2 distance between two vectors.
-    fn l2(&self, other: &Self) -> Self::Output;
+    fn l2(x: &[Self::Native], y: &[Self::Native]) -> Self::Native;
+}
+
+#[inline]
+pub fn l2<T: FloatToArrayType>(from: &[T], to: &[T]) -> T
+where
+    T::ArrowType: L2,
+{
+    T::ArrowType::l2(from, to)
 }
 
 /// Calculate the L2 distance between two vectors, using scalar operations.
 ///
 /// It relies on LLVM for auto-vectorization and unrolling.
+///
+/// This is pub for test/benchmark only. use [l2] instead.
 #[inline]
 pub fn l2_scalar<T: Float + Sum + AddAssign, const LANES: usize>(from: &[T], to: &[T]) -> T {
     let x_chunks = from.chunks_exact(LANES);
@@ -71,42 +80,36 @@ pub fn l2_scalar<T: Float + Sum + AddAssign, const LANES: usize>(from: &[T], to:
     s + sums.iter().copied().sum()
 }
 
-impl L2 for [bf16] {
-    type Output = bf16;
-
+impl L2 for BFloat16Type {
     #[inline]
-    fn l2(&self, other: &[bf16]) -> bf16 {
+    fn l2(x: &[bf16], y: &[bf16]) -> bf16 {
         // TODO: add SIMD support
-        l2_scalar::<bf16, 16>(self, other)
+        l2_scalar::<bf16, 16>(x, y)
     }
 }
 
-impl L2 for [f16] {
-    type Output = f16;
-
+impl L2 for Float16Type {
     #[inline]
-    fn l2(&self, other: &[f16]) -> f16 {
+    fn l2(x: &[f16], y: &[f16]) -> f16 {
         // TODO: add SIMD support
-        l2_scalar::<f16, 16>(self, other)
+        l2_scalar::<f16, 16>(x, y)
     }
 }
 
-impl L2 for [f32] {
-    type Output = f32;
-
+impl L2 for Float32Type {
     #[inline]
-    fn l2(&self, other: &[f32]) -> f32 {
-        let len = self.len();
+    fn l2(x: &[f32], y: &[f32]) -> f32 {
+        let len = x.len();
         if len % 16 == 0 {
             // Likely
-            let dim = self.len();
+            let dim = x.len();
             let mut sum = f32x16::zeros();
 
             for i in (0..dim).step_by(16) {
                 unsafe {
-                    let mut x = f32x16::load_unaligned(self.as_ptr().add(i));
+                    let mut x = f32x16::load_unaligned(x.as_ptr().add(i));
 
-                    let y = f32x16::load_unaligned(other.as_ptr().add(i));
+                    let y = f32x16::load_unaligned(y.as_ptr().add(i));
                     x -= y;
                     sum.multiply_add(x, x);
                 }
@@ -116,8 +119,8 @@ impl L2 for [f32] {
             let mut sum = f32x8::zeros();
             for i in (0..len).step_by(8) {
                 unsafe {
-                    let mut x = f32x8::load_unaligned(self.as_ptr().add(i));
-                    let y = f32x8::load_unaligned(other.as_ptr().add(i));
+                    let mut x = f32x8::load_unaligned(x.as_ptr().add(i));
+                    let y = f32x8::load_unaligned(y.as_ptr().add(i));
                     x -= y;
                     sum.multiply_add(x, x);
                 }
@@ -125,34 +128,24 @@ impl L2 for [f32] {
             sum.reduce_sum()
         } else {
             // Fallback to scalar
-            l2_scalar::<f32, 16>(self, other)
+            l2_scalar::<f32, 16>(x, y)
         }
     }
 }
 
-impl L2 for Float32Array {
-    type Output = f32;
 
+impl L2 for Float64Type {
     #[inline]
-    fn l2(&self, other: &Self) -> f32 {
-        self.values().l2(other.values())
-    }
-}
-
-impl L2 for [f64] {
-    type Output = f64;
-
-    #[inline]
-    fn l2(&self, other: &[f64]) -> f64 {
+    fn l2(x: &[f64], y: &[f64]) -> f64 {
         // TODO: add SIMD support
-        l2_scalar::<f64, 8>(self, other)
+        l2_scalar::<f64, 8>(x, y)
     }
 }
 
 /// Compute L2 distance between two vectors.
 #[inline]
 pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
-    from.l2(to)
+    Float32Type::l2(from, to)
 }
 
 // f32 kernels for L2
