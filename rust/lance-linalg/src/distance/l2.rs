@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::distance::l2::f32::l2_once;
 use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
-use num_traits::{Float};
+use num_traits::Float;
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -44,18 +44,23 @@ pub trait L2 {
 #[inline]
 fn l2_scalar<T: Float + Sum + AddAssign, const LANES: usize>(from: &[T], to: &[T]) -> T {
     let x_chunks = from.chunks_exact(LANES);
-    let y_chunks =  to.chunks_exact(LANES);
+    let y_chunks = to.chunks_exact(LANES);
 
     let s = if x_chunks.remainder().is_empty() {
-        x_chunks.remainder().iter().zip(y_chunks.remainder()).map(|(&x, &y)| {
-            let diff = x - y;
-            diff * diff
-        }).sum()
+        x_chunks
+            .remainder()
+            .iter()
+            .zip(y_chunks.remainder())
+            .map(|(&x, &y)| {
+                let diff = x - y;
+                diff * diff
+            })
+            .sum()
     } else {
         T::zero()
     };
 
-    let mut sums= [T::zero(); LANES];
+    let mut sums = [T::zero(); LANES];
     for (x, y) in x_chunks.zip(y_chunks) {
         for i in 0..LANES {
             let diff = x[i] - y[i];

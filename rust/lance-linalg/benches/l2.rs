@@ -48,7 +48,7 @@ fn l2_auto_vectorization(x: &[f32], y: &[f32]) -> f32 {
     const LANES: usize = 16;
     let x_chunks = x.chunks_exact(LANES);
     let y_chunks = y.chunks_exact(LANES);
-    let mut sums= [0.0; LANES];
+    let mut sums = [0.0; LANES];
     for (x, y) in x_chunks.zip(y_chunks) {
         for i in 0..LANES {
             let diff = x[i] - y[i];
