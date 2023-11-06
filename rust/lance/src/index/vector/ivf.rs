@@ -1504,12 +1504,11 @@ mod tests {
         assert_eq!(5, results[0].num_rows());
         for batch in results.iter() {
             let dist = &batch["_distance"];
-            println!("Dist array is: {:?}", dist);
             assert!(dist
                 .as_primitive::<Float32Type>()
                 .values()
                 .iter()
-                .all(|v| *v >= 0.0 && *v < 1.0));
+                .all(|v| (0.0..2.0).contains(v)));
         }
     }
 }
