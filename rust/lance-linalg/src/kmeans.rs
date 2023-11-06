@@ -22,15 +22,15 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
+use lance_arrow::FloatToArrayType;
 use log::{info, warn};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 use tracing::instrument;
 
-use crate::distance::l2_distance_batch;
 use crate::kernels::argmin_value_float;
 use crate::{
-    distance::{Cosine, Dot, MetricType, Normalize, L2},
+    distance::{dot_distance, l2_distance_batch, Cosine, Dot, MetricType, Normalize, L2},
     kernels::{argmin, argmin_value},
     matrix::MatrixView,
 };
@@ -504,9 +504,9 @@ impl KMeans {
                                             )
                                         }
                                     }
-                                    crate::distance::DistanceType::Dot => {
-                                        argmin_value(centroid_stream.map(|cent| vector.dot(cent)))
-                                    }
+                                    crate::distance::DistanceType::Dot => argmin_value(
+                                        centroid_stream.map(|cent| dot_distance(vector, cent)),
+                                    ),
                                 }
                                 .unwrap()
                             })
@@ -632,13 +632,20 @@ fn compute_partitions_cosine(centroids: &[f32], data: &[f32], dimension: usize) 
         .collect()
 }
 
-fn compute_partitions_dot(centroids: &[f32], data: &[f32], dimension: usize) -> Vec<u32> {
+fn compute_partitions_dot<T: FloatToArrayType>(
+    centroids: &[T],
+    data: &[T],
+    dimension: usize,
+) -> Vec<u32>
+where
+    <T as FloatToArrayType>::ArrowType: Dot,
+{
     data.chunks(dimension)
         .map(|row| {
             argmin(
                 centroids
                     .chunks(dimension)
-                    .map(|centroid| centroid.dot(row)),
+                    .map(|centroid| dot_distance(row, centroid)),
             )
             .unwrap()
         })

@@ -14,14 +14,15 @@
 
 //! Floats Array
 
-use std::fmt::Formatter;
+use std::iter::Sum;
+use std::{fmt::Formatter, ops::AddAssign};
 
 use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
     Array, Float16Array, Float32Array, Float64Array,
 };
 use half::{bf16, f16};
-use num_traits::{Float, FromPrimitive};
+use num_traits::{Bounded, Float, FromPrimitive};
 
 use super::bfloat16::{BFloat16Array, BFloat16Type};
 
@@ -51,12 +52,32 @@ impl std::fmt::Display for FloatType {
 /// Trait for float types used in Arrow Array.
 ///
 pub trait ArrowFloatType {
-    type Native: Float + FromPrimitive;
+    type Native: Float + FromPrimitive + AddAssign<Self::Native>;
 
     const FLOAT_TYPE: FloatType;
 
     /// Arrow Float Array Type.
     type ArrayType: FloatArray<Self>;
+}
+
+pub trait FloatToArrayType: Float + Bounded + Sum + AddAssign {
+    type ArrowType: ArrowFloatType<Native = Self>;
+}
+
+impl FloatToArrayType for bf16 {
+    type ArrowType = BFloat16Type;
+}
+
+impl FloatToArrayType for f16 {
+    type ArrowType = Float16Type;
+}
+
+impl FloatToArrayType for f32 {
+    type ArrowType = Float32Type;
+}
+
+impl FloatToArrayType for f64 {
+    type ArrowType = Float64Type;
 }
 
 impl ArrowFloatType for BFloat16Type {
