@@ -16,12 +16,13 @@
 //!
 
 use std::iter::Sum;
+use std::ops::AddAssign;
 use std::sync::Arc;
 
 use crate::distance::l2::f32::l2_once;
 use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
-use num_traits::real::Real;
+use num_traits::{Float};
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -41,11 +42,28 @@ pub trait L2 {
 ///
 /// Rely on compiler auto-vectorization.
 #[inline]
-fn l2_scalar<T: Real + Sum>(from: &[T], to: &[T]) -> T {
-    from.iter()
-        .zip(to.iter())
-        .map(|(a, b)| (a.sub(*b).powi(2)))
-        .sum::<T>()
+fn l2_scalar<T: Float + Sum + AddAssign, const LANES: usize>(from: &[T], to: &[T]) -> T {
+    let x_chunks = from.chunks_exact(LANES);
+    let y_chunks =  to.chunks_exact(LANES);
+
+    let s = if x_chunks.remainder().is_empty() {
+        x_chunks.remainder().iter().zip(y_chunks.remainder()).map(|(&x, &y)| {
+            let diff = x - y;
+            diff * diff
+        }).sum()
+    } else {
+        T::zero()
+    };
+
+    let mut sums= [T::zero(); LANES];
+    for (x, y) in x_chunks.zip(y_chunks) {
+        for i in 0..LANES {
+            let diff = x[i] - y[i];
+            sums[i] = sums[i] + diff * diff;
+        }
+    }
+
+    s + sums.iter().copied().sum()
 }
 
 impl L2 for [bf16] {
@@ -54,7 +72,7 @@ impl L2 for [bf16] {
     #[inline]
     fn l2(&self, other: &[bf16]) -> bf16 {
         // TODO: add SIMD support
-        l2_scalar(self, other)
+        l2_scalar::<bf16, 16>(self, other)
     }
 }
 
@@ -64,7 +82,7 @@ impl L2 for [f16] {
     #[inline]
     fn l2(&self, other: &[f16]) -> f16 {
         // TODO: add SIMD support
-        l2_scalar(self, other)
+        l2_scalar::<f16, 16>(self, other)
     }
 }
 
@@ -102,7 +120,7 @@ impl L2 for [f32] {
             sum.reduce_sum()
         } else {
             // Fallback to scalar
-            l2_scalar(self, other)
+            l2_scalar::<f32, 16>(self, other)
         }
     }
 }
@@ -122,7 +140,7 @@ impl L2 for [f64] {
     #[inline]
     fn l2(&self, other: &[f64]) -> f64 {
         // TODO: add SIMD support
-        l2_scalar(self, other)
+        l2_scalar::<f64, 8>(self, other)
     }
 }
 
