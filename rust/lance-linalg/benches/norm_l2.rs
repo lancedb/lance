@@ -19,18 +19,13 @@ use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance_linalg::distance::norm_l2::Normalize;
+use lance_linalg::distance::norm_l2::{norm_l2, Normalize};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 #[inline]
 fn norm_l2_arrow(x: &Float32Array) -> f32 {
     let m = mul(&x, &x).unwrap();
     sum(m.as_primitive::<Float32Type>()).unwrap()
-}
-
-#[inline]
-fn norm_l2_auto_vectorization(x: &[f32]) -> f32 {
-    x.iter().map(|v| v * v).sum::<f32>()
 }
 
 fn bench_distance(c: &mut Criterion) {
@@ -53,7 +48,7 @@ fn bench_distance(c: &mut Criterion) {
         b.iter(|| unsafe {
             Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let arr = target.slice(idx * DIMENSION, DIMENSION);
-                Some(norm_l2_auto_vectorization(arr.values()))
+                Some(norm_l2(arr.values()))
             }))
         });
     });

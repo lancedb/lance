@@ -12,21 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::iter::Sum;
-
 use arrow_arith::{aggregate::sum, numeric::mul};
 use arrow_array::{
     cast::AsArray,
     types::{Float16Type, Float32Type, Float64Type},
     ArrowNumericType, Float16Array, Float32Array, NativeAdapter, PrimitiveArray,
 };
-use criterion::{criterion_group, criterion_main, Criterion};
-use num_traits::{real::Real, FromPrimitive};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use lance_arrow::FloatToArrayType;
+use num_traits::FromPrimitive;
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance_linalg::distance::dot::{dot, Dot};
+use lance_linalg::distance::dot::{dot, dot_distance, Dot};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 #[inline]
@@ -37,8 +36,9 @@ fn dot_arrow_artiy<T: ArrowNumericType>(x: &PrimitiveArray<T>, y: &PrimitiveArra
 
 fn run_bench<T: ArrowNumericType>(c: &mut Criterion)
 where
-    T::Native: Real + FromPrimitive + Sum,
+    T::Native: FromPrimitive + FloatToArrayType,
     NativeAdapter<T>: From<T::Native>,
+    <T::Native as FloatToArrayType>::ArrowType: Dot,
 {
     const DIMENSION: usize = 1024;
     const TOTAL: usize = 1024 * 1024; // 1M vectors
@@ -58,15 +58,18 @@ where
         });
     });
 
-    c.bench_function(format!("Dot({type_name})").as_str(), |b| {
-        let x = key.values();
-        b.iter(|| unsafe {
-            PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
-                let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                Some(dot(x, y))
-            }));
-        });
-    });
+    c.bench_function(
+        format!("Dot({type_name}, auto-vectorization)").as_str(),
+        |b| {
+            let x = &key.values()[..];
+            b.iter(|| unsafe {
+                PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
+                    let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
+                    Some(black_box(dot(x, y)))
+                }));
+            });
+        },
+    );
 
     // TODO: SIMD needs generic specialization
 }
@@ -84,7 +87,7 @@ fn bench_distance(c: &mut Criterion) {
             let x = key.values().as_ref();
             Float16Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                Some(x.dot(y))
+                Some(dot_distance(x, y))
             }))
         });
     });
@@ -98,7 +101,7 @@ fn bench_distance(c: &mut Criterion) {
             let x = key.values().as_ref();
             Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                Some(x.dot(y))
+                Some(Float32Type::dot(x, y))
             }))
         });
     });

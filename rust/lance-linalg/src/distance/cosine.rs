@@ -18,14 +18,13 @@
 //!
 //! `bf16, f16, f32, f64` types are supported.
 
-use std::iter::Sum;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float32Type;
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
-use num_traits::real::Real;
+use lance_arrow::FloatToArrayType;
 use num_traits::{AsPrimitive, FromPrimitive};
 
 use super::dot::dot;
@@ -208,11 +207,14 @@ impl Cosine for [f64] {
 /// Fallback non-SIMD implementation
 #[allow(dead_code)] // Does not fallback on aarch64.
 #[inline]
-fn cosine_scalar<T: Real + Sum + AsPrimitive<f64> + FromPrimitive>(
+fn cosine_scalar<T: AsPrimitive<f64> + FromPrimitive + FloatToArrayType>(
     x: &[T],
     x_norm: T,
     y: &[T],
-) -> T {
+) -> T
+where
+    <T as FloatToArrayType>::ArrowType: super::dot::Dot,
+{
     let y_sq = dot(y, y);
     let xy = dot(x, y);
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
@@ -221,12 +223,15 @@ fn cosine_scalar<T: Real + Sum + AsPrimitive<f64> + FromPrimitive>(
 }
 
 #[inline]
-fn cosine_scalar_fast<T: Real + Sum + AsPrimitive<f64> + FromPrimitive>(
+fn cosine_scalar_fast<T: AsPrimitive<f64> + FromPrimitive + FloatToArrayType>(
     x: &[T],
     x_norm: T,
     y: &[T],
     y_norm: T,
-) -> T {
+) -> T
+where
+    <T as FloatToArrayType>::ArrowType: super::dot::Dot,
+{
     let xy = dot(x, y);
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
     // use f64 for overflow protection.
@@ -330,6 +335,17 @@ mod tests {
 
     use approx::assert_relative_eq;
 
+    fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
+        let xy = x
+            .iter()
+            .zip(y.iter())
+            .map(|(&xi, &yi)| xi * yi)
+            .sum::<f32>();
+        let x_sq = x.iter().map(|&xi| xi * xi).sum::<f32>().sqrt();
+        let y_sq = y.iter().map(|&yi| yi * yi).sum::<f32>().sqrt();
+        1.0 - xy / x_sq / y_sq
+    }
+
     #[test]
     fn test_cosine() {
         let x: Float32Array = (1..9).map(|v| v as f32).collect();
@@ -343,6 +359,15 @@ mod tests {
         let d = cosine_distance_batch(x.values(), y.values(), 8).collect::<Vec<_>>();
         // from sklearn.metrics.pairwise import cosine_similarity
         assert_relative_eq!(d[0], 1.0 - 0.873_580_63);
+    }
+
+    #[test]
+    fn test_cosine_large() {
+        let total = 1024;
+        let x = (0..total).map(|v| v as f32).collect::<Vec<_>>();
+        let y = (1024..1024 + total).map(|v| v as f32).collect::<Vec<_>>();
+        let d = cosine_distance_batch(&x, &y, total).collect::<Vec<_>>();
+        assert_relative_eq!(d[0], cosine_dist_brute_force(&x, &y));
     }
 
     #[test]

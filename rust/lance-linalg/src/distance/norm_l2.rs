@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::iter::Sum;
+
 use half::{bf16, f16};
-use num_traits::Float;
+use num_traits::{real::Real, Float};
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -33,8 +35,7 @@ impl Normalize<f16> for &[f16] {
 
     #[inline]
     fn norm_l2(&self) -> Self::Output {
-        // Aarch64 does not have SIMD for f16
-        self.iter().map(|v| v * v).sum::<f16>().sqrt()
+        norm_l2(self)
     }
 }
 
@@ -43,8 +44,7 @@ impl Normalize<bf16> for &[bf16] {
 
     #[inline]
     fn norm_l2(&self) -> Self::Output {
-        // Aarch64 does not have SIMD for bf16
-        self.iter().map(|v| v * v).sum::<bf16>().sqrt()
+        norm_l2(self)
     }
 }
 
@@ -70,7 +70,7 @@ impl Normalize<f32> for &[f32] {
             sum.reduce_sum().sqrt()
         } else {
             // Fallback to scalar
-            return self.iter().map(|v| v * v).sum::<f32>().sqrt();
+            norm_l2(self)
         }
     }
 }
@@ -80,7 +80,7 @@ impl Normalize<f64> for &[f64] {
 
     #[inline]
     fn norm_l2(&self) -> Self::Output {
-        self.iter().map(|v| v * v).sum::<f64>().sqrt()
+        norm_l2(self)
     }
 }
 
@@ -89,13 +89,26 @@ impl Normalize<f64> for &[f64] {
 /// The parameters must be cache line aligned. For example, from
 /// Arrow Arrays, i.e., Float32Array
 #[inline]
-pub fn norm_l2(vector: &[f32]) -> f32 {
-    vector.norm_l2()
+pub fn norm_l2<T: Real + Sum>(vector: &[T]) -> T {
+    const LANES: usize = 16;
+    let chunks = vector.chunks_exact(LANES);
+    let sum = if chunks.remainder().is_empty() {
+        T::zero()
+    } else {
+        chunks.remainder().iter().map(|&v| v.powi(2)).sum::<T>()
+    };
+    let mut sums = [T::zero(); LANES];
+    for chunk in chunks {
+        for i in 0..LANES {
+            sums[i] = sums[i].add(chunk[i].powi(2));
+        }
+    }
+    (sum + sums.iter().copied().sum::<T>()).sqrt()
 }
 
 #[cfg(test)]
 mod tests {
-    use num_traits::{Float, FromPrimitive};
+    use num_traits::FromPrimitive;
 
     use super::*;
 
@@ -108,19 +121,13 @@ mod tests {
             let result = data.as_slice().norm_l2();
             assert_eq!(
                 result,
-                (1..=8)
-                    .map(|v| <$t>::from_i32(v * v).unwrap())
-                    .sum::<$t>()
-                    .sqrt()
+                Real::sqrt((1..=8).map(|v| <$t>::from_i32(v * v).unwrap()).sum::<$t>())
             );
 
             let not_aligned = (&data[2..]).norm_l2();
             assert_eq!(
                 not_aligned,
-                (3..=8)
-                    .map(|v| <$t>::from_i32(v * v).unwrap())
-                    .sum::<$t>()
-                    .sqrt()
+                Real::sqrt((3..=8).map(|v| <$t>::from_i32(v * v).unwrap()).sum::<$t>())
             );
         };
     }

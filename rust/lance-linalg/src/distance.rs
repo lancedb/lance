@@ -22,13 +22,13 @@
 use std::sync::Arc;
 
 use arrow_array::{FixedSizeListArray, Float32Array};
+use arrow_schema::ArrowError;
 
 pub mod cosine;
 pub mod dot;
 pub mod l2;
 pub mod norm_l2;
 
-use arrow_schema::ArrowError;
 pub use cosine::*;
 pub use dot::*;
 pub use l2::*;
