@@ -124,27 +124,27 @@ impl ColumnOrdering {
 ///   .sum()
 /// ```
 pub struct Scanner {
-    pub(crate) dataset: Arc<Dataset>,
+    dataset: Arc<Dataset>,
 
-    pub(crate) projections: Schema,
+    projections: Schema,
 
     /// If true then the filter will be applied before an index scan
-    pub(crate) prefilter: bool,
+    prefilter: bool,
 
     /// Optional filters string.
-    pub(crate) filter: Option<String>,
+    filter: Option<String>,
 
     /// The batch size controls the maximum size of rows to return for each read.
-    pub(crate) batch_size: usize,
+    batch_size: usize,
 
     /// Number of batches to prefetch
-    pub(crate) batch_readahead: usize,
+    batch_readahead: usize,
 
     /// Number of fragments to read concurrently
-    pub(crate) fragment_readahead: usize,
+    fragment_readahead: usize,
 
-    pub(crate) limit: Option<i64>,
-    pub(crate) offset: Option<i64>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 
     /// If Some then results will be ordered by the provided ordering
     ///
@@ -154,12 +154,12 @@ pub struct Scanner {
     ///
     /// If this is Some then the value of `ordered` is ignored.  The scan
     /// will always be unordered since we are just going to reorder it anyways.
-    pub(crate) ordering: Option<Vec<ColumnOrdering>>,
+    ordering: Option<Vec<ColumnOrdering>>,
 
-    pub(crate) nearest: Option<Query>,
+    nearest: Option<Query>,
 
     /// Scan the dataset with a meta column: "_rowid"
-    pub(crate) with_row_id: bool,
+    with_row_id: bool,
 
     /// Whether to scan in deterministic order (default: true)
     ///
@@ -591,7 +591,7 @@ impl Scanner {
     /// 3. Sort
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
-    pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         // NOTE: we only support node that have one partition. So any nodes that
         // produce multiple need to be repartitioned to 1.
         let mut filter_expr = if let Some(filter) = self.filter.as_ref() {
@@ -690,7 +690,7 @@ impl Scanner {
     }
 
     // KNN search execution node with optional prefilter
-    pub(crate) async fn knn(
+    async fn knn(
         &self,
         prefilter: Option<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -910,7 +910,7 @@ impl Scanner {
     }
 
     /// Take row indices produced by input plan from the dataset (with projection)
-    pub(crate) fn take(
+    fn take(
         &self,
         input: Arc<dyn ExecutionPlan>,
         projection: &Schema,
@@ -925,7 +925,7 @@ impl Scanner {
     }
 
     /// Global offset-limit of the result of the input plan
-    pub(crate) fn limit_node(&self, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    fn limit_node(&self, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         Arc::new(GlobalLimitExec::new(
             plan,
             *self.offset.as_ref().unwrap_or(&0) as usize,

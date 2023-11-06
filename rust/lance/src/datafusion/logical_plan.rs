@@ -6,17 +6,12 @@ use datafusion::{
     datasource::TableProvider,
     error::Result as DatafusionResult,
     execution::context::SessionState,
-    logical_expr::{LogicalPlan, TableProviderFilterPushDown, TableType},
-    optimizer::utils::conjunction,
-    physical_plan::{filter::FilterExec, limit::GlobalLimitExec, ExecutionPlan, Statistics},
+    logical_expr::{LogicalPlan, TableType},
+    physical_plan::ExecutionPlan,
     prelude::Expr,
 };
 
-use crate::{
-    datafusion::physical_expr::column_names_in_expr,
-    io::exec::{Planner, ProjectionExec},
-    Dataset,
-};
+use crate::Dataset;
 
 #[async_trait]
 impl TableProvider for Dataset {
@@ -44,101 +39,172 @@ impl TableProvider for Dataset {
         &self,
         _: &SessionState,
         projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+        _: &[Expr],
         limit: Option<usize>,
     ) -> DatafusionResult<Arc<dyn ExecutionPlan>> {
-        let scanner = self.scan();
-        let filter_expr = conjunction(filters.iter().cloned());
-        // NOTE: we only support node that have one partition. So any nodes that
-        // produce multiple need to be repartitioned to 1.
-        let mut filter_expr = if let Some(filter) = filter_expr {
-            let planner = Planner::new(Arc::new(scanner.dataset.schema().into()));
-            Some(planner.create_physical_expr(&filter)?)
-        } else {
-            None
-        };
+        let mut scanner = self.scan();
 
-        // Stage 1: source
-        let mut plan: Arc<dyn ExecutionPlan> = if scanner.nearest.is_some() {
-            if scanner.prefilter {
-                let prefilter = filter_expr;
-                filter_expr = None;
-                scanner.knn(prefilter).await?
+        let schema_ref = self.schema();
+        let projections = if let Some(projection) = projection {
+            if projection.len() != schema_ref.fields.len() {
+                let arrow_schema: ArrowSchema = schema_ref.into();
+                let arrow_schema = arrow_schema.project(&projection)?;
+                schema_ref.project_by_schema(&arrow_schema)?
             } else {
-                scanner.knn(None).await?
+                schema_ref.clone()
             }
-        } else if let Some(expr) = filter_expr.as_ref() {
-            let columns_in_filter = column_names_in_expr(expr.as_ref());
-            let filter_schema = Arc::new(scanner.dataset.schema().project(&columns_in_filter)?);
-            scanner.scan(true, false, filter_schema)
         } else {
-            // Scan without filter or limits
-            scanner.scan(
-                scanner.with_row_id,
-                false,
-                scanner.projections.clone().into(),
-            )
+            schema_ref.clone()
         };
 
-        // Stage 2: filter
-        if let Some(predicates) = filter_expr.as_ref() {
-            let mut columns_in_filter = column_names_in_expr(predicates.as_ref());
-            // If we are going to sort then grab the ordering column at the same time we grab
-            // the columns we need for filtering
-            if let Some(ordering) = &scanner.ordering {
-                for column in ordering {
-                    if !columns_in_filter.contains(&column.column_name) {
-                        columns_in_filter.push(column.column_name.clone())
-                    }
-                }
-            }
-            let filter_schema = Arc::new(scanner.dataset.schema().project(&columns_in_filter)?);
-            let remaining_schema = filter_schema.exclude(plan.schema().as_ref())?;
-            if !remaining_schema.fields.is_empty() {
-                // Not all columns for filter are ready, so we need to take them first
-                plan = scanner.take(plan, &remaining_schema, scanner.batch_readahead)?;
-            }
-            plan = Arc::new(FilterExec::try_new(predicates.clone(), plan)?);
-        }
-
-        // Stage 3: limit / offset
         if let Some(limit) = limit {
-            plan = Arc::new(GlobalLimitExec::new(plan, limit, None))
+            scanner.limit(Some(limit as i64), None)?;
         }
-
-        // Stage 4: take remaining columns / projection
-        if let Some(projection) = projection {
-            let schema = self.schema();
-            let projection_columns = projection.iter().map(|i| *i as i32).collect::<Vec<_>>();
-
-            let output_schema = schema.project_by_ids(&projection_columns);
-
-            let remaining_schema = output_schema.exclude(plan.schema().as_ref())?;
-            if !remaining_schema.fields.is_empty() {
-                plan = scanner.take(plan, &remaining_schema, scanner.batch_readahead)?;
-            }
-
-            plan = Arc::new(ProjectionExec::try_new(plan, Arc::new(output_schema))?);
-        }
+        let plan: Arc<dyn ExecutionPlan> = scanner.scan(false, false, projections.into());
 
         Ok(plan)
     }
+}
 
-    fn supports_filter_pushdown(
-        &self,
-        filter: &Expr,
-    ) -> DatafusionResult<TableProviderFilterPushDown> {
-        let schema = &self.manifest.schema;
-        let planner = Planner::new(Arc::new(schema.into()));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{dataset::WriteParams, io::exec::LanceScanExec};
+    use arrow_array::{
+        builder::{FixedSizeListBuilder, Int32Builder},
+        Float64Array, RecordBatch, RecordBatchIterator, StringArray, StructArray,
+    };
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
+    use datafusion::prelude::*;
+    use tempfile::tempdir;
 
-        planner
-            .create_physical_expr(filter)
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
-            .map(|_| TableProviderFilterPushDown::Exact)
+    fn create_batches() -> (SchemaRef, Vec<RecordBatch>) {
+        let nested_fields = vec![
+            ArrowField::new("lat", DataType::Float64, true),
+            ArrowField::new("long", DataType::Float64, true),
+        ];
+        let nested = ArrowField::new_struct("point", nested_fields.clone(), true);
+
+        let vector = ArrowField::new(
+            "vector",
+            DataType::FixedSizeList(ArrowField::new("item", DataType::Int32, true).into(), 2),
+            true,
+        );
+        let utf8_fld = ArrowField::new("utf8", DataType::Utf8, true);
+
+        let arrow_schema: SchemaRef = ArrowSchema::new(vec![vector, nested, utf8_fld]).into();
+
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let lat = vec![45.5, 46.5, -23.0]
+            .into_iter()
+            .collect::<Float64Array>();
+        let long = vec![-73.5, -74.5, 0.0]
+            .into_iter()
+            .collect::<Float64Array>();
+
+        let sa = StructArray::new(
+            nested_fields.into(),
+            vec![Arc::new(lat), Arc::new(long)],
+            None,
+        );
+        let values_builder = Int32Builder::new();
+        let mut vector_builder = FixedSizeListBuilder::new(values_builder, 2);
+        vector_builder.values().append_value(0);
+        vector_builder.values().append_value(1);
+        vector_builder.append(true);
+        vector_builder.values().append_value(0);
+        vector_builder.values().append_value(1);
+        vector_builder.append(true);
+        vector_builder.values().append_value(2);
+        vector_builder.values().append_value(3);
+        vector_builder.append(true);
+        let vector = vector_builder.finish();
+
+        let utf8_values = StringArray::from(vec!["foo", "bar", "baz"]);
+
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(vector), Arc::new(sa), Arc::new(utf8_values)],
+        )
+        .unwrap();
+        batches.push(batch);
+
+        (arrow_schema, batches)
     }
 
-    fn statistics(&self) -> Option<Statistics> {
-        // Statistics not yet implemented
-        None
+    #[tokio::test]
+    async fn test_dataset_logicalplan_projection_pd() {
+        let (schema, batches) = create_batches();
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let batch_reader =
+            RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone());
+
+        Dataset::write(batch_reader, test_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(&test_uri).await.unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("my_table", Arc::new(dataset)).unwrap();
+        let df = ctx.sql("SELECT vector, utf8 FROM my_table").await.unwrap();
+        let physical_plan = df.clone().create_physical_plan().await.unwrap();
+
+        assert!(physical_plan
+            .as_any()
+            .downcast_ref::<LanceScanExec>()
+            .is_some());
+
+        let expected_fields = schema
+            .fields()
+            .iter()
+            .filter_map(|f| {
+                if f.name() == "vector" || f.name() == "utf8" {
+                    Some(f.as_ref().clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let expected_schema = ArrowSchema::new(expected_fields);
+        assert_eq!(physical_plan.schema().as_ref(), &expected_schema);
+    }
+
+    #[tokio::test]
+    async fn test_dataset_logicalplan_struct_fields() {
+        let (schema, batches) = create_batches();
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let batch_reader =
+            RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone());
+
+        Dataset::write(batch_reader, test_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(&test_uri).await.unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("my_table", Arc::new(dataset)).unwrap();
+        let df = ctx
+            .sql("SELECT point.lat as lat, point.long as long FROM my_table")
+            .await
+            .unwrap();
+        let out = df.collect().await.unwrap();
+        let batch = out.first().unwrap();
+
+        let out_schema = batch.schema();
+        let expected_fields = vec![
+            ArrowField::new("lat", DataType::Float64, true),
+            ArrowField::new("long", DataType::Float64, true),
+        ];
+        let actual = out_schema
+            .fields()
+            .into_iter()
+            .map(|f| f.as_ref().clone())
+            .collect::<Vec<ArrowField>>();
+        assert_eq!(actual, expected_fields);
     }
 }

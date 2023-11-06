@@ -446,9 +446,7 @@ fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
             )));
         }
     }
-    Ok(StructArray::from(
-        fields.iter().cloned().zip(columns).collect::<Vec<_>>(),
-    ))
+    StructArray::try_new(fields.clone(), columns, None)
 }
 
 /// Merge the fields and columns of two RecordBatch's recursively
