@@ -1351,11 +1351,17 @@ impl Dataset {
         }
     }
 
-    pub fn num_small_files(&self, max_rows_per_group: usize) -> usize {
-        self.fragments()
-            .iter()
-            .filter(|f| f.physical_rows < max_rows_per_group)
+    /// Gets the number of files that are so small they don't even have a full
+    /// group. These are considered too small because reading many of them is
+    /// much less efficient than reading a single file because the separate files
+    /// split up what would otherwise be single IO requests into multiple.
+    pub async fn num_small_files(&self, max_rows_per_group: usize) -> usize {
+        futures::stream::iter(self.get_fragments())
+            .map(|f| async move { f.physical_rows().await })
+            .buffered(num_cpus::get() * 4)
+            .try_filter(|row_count| futures::future::ready(*row_count < max_rows_per_group))
             .count()
+            .await
     }
 
     pub async fn validate(&self) -> Result<()> {
@@ -3065,8 +3071,8 @@ mod tests {
         let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
         dataset.validate().await.unwrap();
 
-        assert!(dataset.num_small_files(1024) > 0);
-        assert!(dataset.num_small_files(512) == 0);
+        assert!(dataset.num_small_files(1024).await > 0);
+        assert!(dataset.num_small_files(512).await == 0);
     }
 
     #[tokio::test]

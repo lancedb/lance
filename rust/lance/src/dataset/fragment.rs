@@ -89,7 +89,7 @@ impl FileFragment {
 
         let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
         let filename = format!("{}.lance", Uuid::new_v4());
-        let mut fragment = Fragment::with_file(id as u64, &filename, &schema, 0);
+        let mut fragment = Fragment::with_file(id as u64, &filename, &schema, None);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
         let mut writer = FileWriter::try_new(
             &object_store,
@@ -107,7 +107,7 @@ impl FileFragment {
             writer.write(&batch).await?;
         }
 
-        fragment.physical_rows = writer.finish().await?;
+        fragment.physical_rows = Some(writer.finish().await?);
 
         progress.complete(&fragment).await?;
 
@@ -120,12 +120,7 @@ impl FileFragment {
         fragment_id: usize,
         physical_rows: Option<usize>,
     ) -> Result<Fragment> {
-        let fragment = Fragment::with_file(
-            fragment_id as u64,
-            filename,
-            schema,
-            physical_rows.unwrap_or_default(),
-        );
+        let fragment = Fragment::with_file(fragment_id as u64, filename, schema, physical_rows);
         Ok(fragment)
     }
 
@@ -227,8 +222,8 @@ impl FileFragment {
             });
         };
 
-        if self.metadata.physical_rows > 0 {
-            return Ok(self.metadata.physical_rows);
+        if let Some(size) = self.metadata.physical_rows {
+            return Ok(size);
         }
 
         // Just open any file. All of them should have same size.

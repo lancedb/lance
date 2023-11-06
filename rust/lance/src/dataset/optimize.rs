@@ -727,13 +727,11 @@ impl<'a, I: Iterator<Item = u64>> Iterator for MissingIds<'a, I> {
             let frag = val / RowAddress::FRAGMENT_SIZE;
             let expected_row_id = self.expected_row_id;
             self.expected_row_id += 1;
-            assert!(
-                current_fragment.physical_rows > 0,
-                "Fragment doesn't have physical rows recorded"
-            );
-            if (self.expected_row_id % RowAddress::FRAGMENT_SIZE)
-                == current_fragment.physical_rows as u64
-            {
+            // We validate before this we should have physical rows recorded
+            let current_physical_rows = current_fragment
+                .physical_rows
+                .expect("Fragment doesn't have physical rows recorded");
+            if (self.expected_row_id % RowAddress::FRAGMENT_SIZE) == current_physical_rows as u64 {
                 self.current_fragment_idx += 1;
                 if self.current_fragment_idx < self.fragments.len() {
                     self.expected_row_id =
@@ -758,7 +756,7 @@ fn transpose_row_ids(
     new_fragments: &[Fragment],
 ) -> HashMap<u64, Option<u64>, BuildNoHashHasher<u64>> {
     let new_ids = new_fragments.iter().flat_map(|frag| {
-        (0..frag.physical_rows as u32).map(|offset| {
+        (0..frag.physical_rows.unwrap() as u32).map(|offset| {
             Some(u64::from(RowAddress::new_from_parts(
                 frag.id as u32,
                 offset,
@@ -985,13 +983,13 @@ mod tests {
                 id: 0,
                 files: Vec::new(),
                 deletion_file: None,
-                physical_rows: 5,
+                physical_rows: Some(5),
             },
             Fragment {
                 id: 3,
                 files: Vec::new(),
                 deletion_file: None,
-                physical_rows: 3,
+                physical_rows: Some(3),
             },
         ];
         let rows = [(0, 1), (0, 3), (0, 4), (3, 0), (3, 2)]
@@ -1116,7 +1114,7 @@ mod tests {
             id: 0,
             files: vec![],
             deletion_file: None,
-            physical_rows: 0,
+            physical_rows: Some(0),
         };
         let single_bin = CandidateBin {
             fragments: vec![fragment.clone()],
@@ -1627,19 +1625,19 @@ mod tests {
                 id: 0,
                 files: Vec::new(),
                 deletion_file: None,
-                physical_rows: 5,
+                physical_rows: Some(5),
             },
             Fragment {
                 id: 3,
                 files: Vec::new(),
                 deletion_file: None,
-                physical_rows: 3,
+                physical_rows: Some(3),
             },
             Fragment {
                 id: 1,
                 files: Vec::new(),
                 deletion_file: None,
-                physical_rows: 3,
+                physical_rows: Some(3),
             },
         ];
 

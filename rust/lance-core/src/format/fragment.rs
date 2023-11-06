@@ -123,9 +123,10 @@ pub struct Fragment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deletion_file: Option<DeletionFile>,
 
-    /// Original number of rows in the fragment. If this is zero, then it is
-    /// unknown.
-    pub physical_rows: usize,
+    /// Original number of rows in the fragment. If this is None, then it is
+    /// unknown. This is only optional for legacy reasons. All new tables should
+    /// have this set.
+    pub physical_rows: Option<usize>,
 }
 
 impl Fragment {
@@ -134,19 +135,19 @@ impl Fragment {
             id,
             files: vec![],
             deletion_file: None,
-            physical_rows: 0,
+            physical_rows: None,
         }
     }
 
     pub fn num_rows(&self) -> Option<usize> {
         match (self.physical_rows, &self.deletion_file) {
             // Unknown fragment length
-            (0, _) => None,
+            (None, _) => None,
             // Known fragment length, no deletion file.
-            (len, None) => Some(len),
+            (Some(len), None) => Some(len),
             // Known fragment length, but don't know deletion file size.
             (_, Some(deletion_file)) if deletion_file.num_deleted_rows == 0 => None,
-            (len, Some(deletion_file)) => Some(len - deletion_file.num_deleted_rows),
+            (Some(len), Some(deletion_file)) => Some(len - deletion_file.num_deleted_rows),
         }
     }
 
@@ -156,7 +157,7 @@ impl Fragment {
     }
 
     /// Create a `Fragment` with one DataFile
-    pub fn with_file(id: u64, path: &str, schema: &Schema, physical_rows: usize) -> Self {
+    pub fn with_file(id: u64, path: &str, schema: &Schema, physical_rows: Option<usize>) -> Self {
         Self {
             id,
             files: vec![DataFile::new(path, schema)],
@@ -180,11 +181,16 @@ impl Fragment {
 
 impl From<&pb::DataFragment> for Fragment {
     fn from(p: &pb::DataFragment) -> Self {
+        let physical_rows = if p.physical_rows > 0 {
+            Some(p.physical_rows as usize)
+        } else {
+            None
+        };
         Self {
             id: p.id,
             files: p.files.iter().map(DataFile::from).collect(),
             deletion_file: p.deletion_file.as_ref().map(DeletionFile::from),
-            physical_rows: p.physical_rows as usize,
+            physical_rows,
         }
     }
 }
@@ -207,7 +213,7 @@ impl From<&Fragment> for pb::DataFragment {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
             deletion_file,
-            physical_rows: f.physical_rows as u64,
+            physical_rows: f.physical_rows.unwrap_or_default() as u64,
         }
     }
 }
@@ -288,7 +294,7 @@ mod tests {
             ArrowField::new("bool", DataType::Boolean, true),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let fragment = Fragment::with_file(123, path, &schema, 10);
+        let fragment = Fragment::with_file(123, path, &schema, Some(10));
 
         assert_eq!(123, fragment.id);
         assert_eq!(fragment.field_ids(), [0, 1, 2, 3]);

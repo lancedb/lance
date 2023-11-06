@@ -193,7 +193,7 @@ pub async fn write_fragments_internal(
             let num_rows = writer.take().unwrap().finish().await?;
             debug_assert_eq!(num_rows, num_rows_in_current_file);
             params.progress.complete(fragments.last().unwrap()).await?;
-            fragments.last_mut().unwrap().physical_rows = num_rows;
+            fragments.last_mut().unwrap().physical_rows = Some(num_rows);
             num_rows_in_current_file = 0;
         }
     }
@@ -201,7 +201,7 @@ pub async fn write_fragments_internal(
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
         let num_rows = writer.finish().await?;
-        fragments.last_mut().unwrap().physical_rows = num_rows;
+        fragments.last_mut().unwrap().physical_rows = Some(num_rows);
     }
 
     Ok(fragments)

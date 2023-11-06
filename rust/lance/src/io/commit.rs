@@ -156,7 +156,7 @@ pub(crate) async fn commit_new_dataset(
 /// in older datasets. To bring these old manifests up-to-date, we add them here.
 async fn migrate_manifest(dataset: &Dataset, manifest: &mut Manifest) -> Result<()> {
     if manifest.fragments.iter().all(|f| {
-        f.physical_rows > 0
+        f.physical_rows.is_some()
             && (f.deletion_file.is_none()
                 || f.deletion_file
                     .as_ref()
@@ -182,11 +182,11 @@ pub(crate) async fn migrate_fragments(
     let dataset = Arc::new(dataset.clone());
     let new_fragments = futures::stream::iter(fragments)
         .map(|fragment| async {
-            let physical_rows = if fragment.physical_rows == 0 {
-                let file_fragment = FileFragment::new(dataset.clone(), fragment.clone());
-                Either::Left(async move { file_fragment.count_rows().await })
+            let physical_rows = if let Some(physical_rows) = fragment.physical_rows {
+                Either::Right(futures::future::ready(Ok(physical_rows)))
             } else {
-                Either::Right(futures::future::ready(Ok(fragment.physical_rows)))
+                let file_fragment = FileFragment::new(dataset.clone(), fragment.clone());
+                Either::Left(async move { file_fragment.physical_rows().await })
             };
             let num_deleted_rows = match &fragment.deletion_file {
                 None => Either::Left(futures::future::ready(Ok(0))),
@@ -216,7 +216,7 @@ pub(crate) async fn migrate_fragments(
                 });
 
             Ok::<_, Error>(Fragment {
-                physical_rows,
+                physical_rows: Some(physical_rows),
                 deletion_file,
                 ..fragment.clone()
             })
