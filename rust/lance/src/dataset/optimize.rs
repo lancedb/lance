@@ -771,7 +771,7 @@ fn transpose_row_ids(
             .map(|frag| {
                 frag.deletion_file
                     .as_ref()
-                    .map(|d| d.num_deleted_rows)
+                    .and_then(|d| d.num_deleted_rows)
                     .unwrap_or(0)
             })
             .sum::<usize>();
@@ -839,7 +839,7 @@ async fn rewrite_files(
     // It's possible the fragments are old and don't have physical rows or
     // num deletions recorded. If that's the case, we need to grab and set that
     // information.
-    let fragments = migrate_fragments(dataset.as_ref(), &task.fragments).await?;
+    let fragments = migrate_fragments(dataset.as_ref(), &task.fragments, false).await?;
     let mut scanner = dataset.scan();
     scanner.with_fragments(fragments.clone()).with_row_id();
 

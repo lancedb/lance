@@ -897,6 +897,7 @@ class LanceDataset(pa.dataset.Dataset):
         operation: LanceOperation.BaseOperation,
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
+        manifest_write_config: Optional[Dict[str, Any]] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -968,7 +969,7 @@ class LanceDataset(pa.dataset.Dataset):
                     f"commit_lock must be a function, got {type(commit_lock)}"
                 )
 
-        _Dataset.commit(base_uri, operation._to_inner(), read_version, commit_lock)
+        _Dataset.commit(base_uri, operation._to_inner(), read_version, commit_lock, manifest_write_config)
         return LanceDataset(base_uri)
 
     @property

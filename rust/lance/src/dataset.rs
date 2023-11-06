@@ -647,6 +647,7 @@ impl Dataset {
         operation: Operation,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
+        manifest_config: &ManifestWriteConfig,
     ) -> Result<Self> {
         let read_version = read_version.map_or_else(
             || match operation {
@@ -704,12 +705,12 @@ impl Dataset {
                 dataset,
                 &object_store,
                 &transaction,
-                &Default::default(),
+                manifest_config,
                 &Default::default(),
             )
             .await?
         } else {
-            commit_new_dataset(&object_store, &base, &transaction, &Default::default()).await?
+            commit_new_dataset(&object_store, &base, &transaction, manifest_config).await?
         };
 
         Ok(Self {
@@ -1180,15 +1181,12 @@ impl Dataset {
         Ok(())
     }
 
-    pub fn count_deleted_rows(&self) -> usize {
-        self.manifest
-            .fragments
-            .iter()
-            .map(|f| match f.deletion_file.as_ref() {
-                Some(d) => d.num_deleted_rows,
-                None => 0,
-            })
-            .sum()
+    pub async fn count_deleted_rows(&self) -> Result<usize> {
+        futures::stream::iter(self.get_fragments())
+            .map(|f| async move { f.count_deletions().await })
+            .buffer_unordered(num_cpus::get() * 4)
+            .try_fold(0, |acc, x| futures::future::ready(Ok(acc + x)))
+            .await
     }
 
     pub(crate) fn object_store(&self) -> &ObjectStore {
@@ -1399,10 +1397,17 @@ impl Dataset {
     }
 }
 
+/// Configuration for writing a manifest file.
 #[derive(Debug)]
-pub(crate) struct ManifestWriteConfig {
-    auto_set_feature_flags: bool,  // default true
-    timestamp: Option<SystemTime>, // default None
+pub struct ManifestWriteConfig {
+    /// If true, automatically set feature flags based on the schema. This defaults
+    /// to True.
+    pub auto_set_feature_flags: bool, // default true
+    pub timestamp: Option<SystemTime>, // default None
+    /// If true, will recompute statistics present in the manifest, such as
+    /// `physical_rows` in fragments or `num_deletions` in deletion files. Defaults
+    /// to false.
+    pub recompute_stats: bool, // default false
 }
 
 impl Default for ManifestWriteConfig {
@@ -1410,6 +1415,7 @@ impl Default for ManifestWriteConfig {
         Self {
             auto_set_feature_flags: true,
             timestamp: None,
+            recompute_stats: false,
         }
     }
 }
@@ -1804,6 +1810,7 @@ mod tests {
             &ManifestWriteConfig {
                 auto_set_feature_flags: false,
                 timestamp: None,
+                recompute_stats: false,
             },
         )
         .await
@@ -2658,7 +2665,7 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
         assert_eq!(dataset.count_fragments(), 2);
-        assert_eq!(dataset.count_deleted_rows(), 0);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 0);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
         assert!(fragments[0].metadata.deletion_file.is_none());
         assert!(fragments[1].metadata.deletion_file.is_none());
@@ -2676,7 +2683,7 @@ mod tests {
         assert!(fragments[1].metadata.deletion_file.is_some());
 
         // The deletion file should contain 20 rows
-        assert_eq!(dataset.count_deleted_rows(), 20);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 20);
         let store = dataset.object_store().clone();
         let path = Path::from_filesystem_path(test_uri).unwrap();
         // First fragment has 0..10 deleted
@@ -2707,7 +2714,7 @@ mod tests {
         dataset.validate().await.unwrap();
 
         // Verify result
-        assert_eq!(dataset.count_deleted_rows(), 30);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 30);
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
         assert!(fragments[0].metadata.deletion_file.is_some());
@@ -2738,7 +2745,7 @@ mod tests {
 
         // Verify the count_deleted_rows only contains the rows from the first fragment
         // i.e. - deleted_rows from the fragment that has been deleted are not counted
-        assert_eq!(dataset.count_deleted_rows(), 20);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 20);
 
         // Append after delete
         let data = sequence_data(0..100);

@@ -85,8 +85,8 @@ pub struct DeletionFile {
     pub read_version: u64,
     pub id: u64,
     pub file_type: DeletionFileType,
-    /// Number of deleted rows in this file. If 0, this is unknown.
-    pub num_deleted_rows: usize,
+    /// Number of deleted rows in this file. If None, this is unknown.
+    pub num_deleted_rows: Option<usize>,
 }
 
 // TODO: should we convert this to TryFrom and surface the error?
@@ -98,11 +98,16 @@ impl From<&pb::DeletionFile> for DeletionFile {
             1 => DeletionFileType::Bitmap,
             _ => panic!("Invalid deletion file type"),
         };
+        let num_deleted_rows = if value.num_deleted_rows == 0 {
+            None
+        } else {
+            Some(value.num_deleted_rows as usize)
+        };
         Self {
             read_version: value.read_version,
             id: value.id,
             file_type,
-            num_deleted_rows: value.num_deleted_rows as usize,
+            num_deleted_rows,
         }
     }
 }
@@ -146,8 +151,20 @@ impl Fragment {
             // Known fragment length, no deletion file.
             (Some(len), None) => Some(len),
             // Known fragment length, but don't know deletion file size.
-            (_, Some(deletion_file)) if deletion_file.num_deleted_rows == 0 => None,
-            (Some(len), Some(deletion_file)) => Some(len - deletion_file.num_deleted_rows),
+            (
+                _,
+                Some(DeletionFile {
+                    num_deleted_rows: None,
+                    ..
+                }),
+            ) => None,
+            (
+                Some(len),
+                Some(DeletionFile {
+                    num_deleted_rows: Some(num_deleted_rows),
+                    ..
+                }),
+            ) => Some(len - num_deleted_rows),
         }
     }
 
@@ -206,7 +223,7 @@ impl From<&Fragment> for pb::DataFragment {
                 read_version: f.read_version,
                 id: f.id,
                 file_type: file_type.into(),
-                num_deleted_rows: f.num_deleted_rows as u64,
+                num_deleted_rows: f.num_deleted_rows.unwrap_or_default() as u64,
             }
         });
         Self {
@@ -316,7 +333,7 @@ mod tests {
             read_version: 123,
             id: 456,
             file_type: DeletionFileType::Array,
-            num_deleted_rows: 10,
+            num_deleted_rows: Some(10),
         });
 
         let proto = pb::DataFragment::from(&fragment);
@@ -338,7 +355,7 @@ mod tests {
             read_version: 123,
             id: 456,
             file_type: DeletionFileType::Array,
-            num_deleted_rows: 10,
+            num_deleted_rows: Some(10),
         });
 
         let json = serde_json::to_string(&fragment).unwrap();

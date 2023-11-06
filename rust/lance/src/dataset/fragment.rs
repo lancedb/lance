@@ -23,6 +23,7 @@ use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::format::DeletionFile;
 use lance_core::{
     datatypes::Schema,
     io::{
@@ -197,7 +198,10 @@ impl FileFragment {
     /// Get the number of rows that have been deleted in this fragment.
     pub async fn count_deletions(&self) -> Result<usize> {
         match &self.metadata().deletion_file {
-            Some(f) if f.num_deleted_rows > 0 => Ok(f.num_deleted_rows),
+            Some(DeletionFile {
+                num_deleted_rows: Some(num_deleted),
+                ..
+            }) => Ok(*num_deleted),
             _ => {
                 read_deletion_file(
                     &self.dataset.base,
@@ -954,7 +958,9 @@ mod tests {
             fragments,
         };
 
-        let new_dataset = Dataset::commit(test_uri, op, None, None).await.unwrap();
+        let new_dataset = Dataset::commit(test_uri, op, None, None, &Default::default())
+            .await
+            .unwrap();
 
         assert_eq!(new_dataset.count_rows().await.unwrap(), dataset_rows);
 
@@ -993,7 +999,7 @@ mod tests {
         assert!(fragment.metadata.deletion_file.is_some());
         assert_eq!(
             fragment.metadata.deletion_file.unwrap().num_deleted_rows,
-            13
+            Some(13)
         );
     }
 
@@ -1042,7 +1048,9 @@ mod tests {
                 schema: full_schema.clone(),
             };
 
-            let dataset = Dataset::commit(test_uri, op, None, None).await.unwrap();
+            let dataset = Dataset::commit(test_uri, op, None, None, &Default::default())
+                .await
+                .unwrap();
 
             // We only kept the first fragment of 40 rows
             assert_eq!(
