@@ -30,7 +30,7 @@ use tracing::instrument;
 
 use crate::kernels::argmin_value_float;
 use crate::{
-    distance::{dot_distance, l2_distance_batch, Cosine, Dot, MetricType, Normalize, L2},
+    distance::{dot_distance, l2::{l2, l2_distance_batch}, Cosine, Dot, MetricType, Normalize},
     kernels::{argmin, argmin_value},
     matrix::MatrixView,
 };
@@ -478,9 +478,7 @@ impl KMeans {
                             .map(|(idx, vector)| {
                                 let centroid_stream = centroids_array.chunks_exact(dimension);
                                 match metric_type {
-                                    MetricType::L2 => {
-                                        argmin_value(centroid_stream.map(|cent| vector.l2(cent)))
-                                    }
+                                    MetricType::L2 => { panic!("L2 is handled above") },
                                     MetricType::Cosine => {
                                         let centroid_norms = norms.as_ref().as_ref().unwrap();
                                         if let Some(norm_vectors) = norm_data.as_ref() {
@@ -590,7 +588,7 @@ fn compute_partitions_l2_f32<'a>(
                     for ci in centroid_start..centroid_start + num_centroids_in_tile {
                         // Get a slice of `data[di][s..s+STRIP_SIZE]`.
                         let cent_slice = get_slice(centroids, ci, s, dim, slice_len);
-                        let dist = data_slice.l2(cent_slice);
+                        let dist = l2(data_slice, cent_slice);
                         dists[di * TILE_SIZE + (ci - centroid_start)] += dist;
                     }
                 }
@@ -702,7 +700,7 @@ mod tests {
                     centroids
                         .values()
                         .chunks(DIM)
-                        .map(|centroid| row.l2(centroid)),
+                        .map(|centroid| l2(row, centroid)),
                 )
                 .unwrap()
             })
