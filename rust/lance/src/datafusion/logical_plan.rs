@@ -109,10 +109,7 @@ impl TableProvider for Dataset {
         // Stage 4: take remaining columns / projection
         if let Some(projection) = projection {
             let schema = self.schema();
-            let projection_columns = projection
-                .into_iter()
-                .map(|i| *i as i32)
-                .collect::<Vec<_>>();
+            let projection_columns = projection.iter().map(|i| *i as i32).collect::<Vec<_>>();
 
             let output_schema = schema.project_by_ids(&projection_columns);
 
