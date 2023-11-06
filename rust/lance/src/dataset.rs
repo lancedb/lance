@@ -647,7 +647,6 @@ impl Dataset {
         operation: Operation,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
-        manifest_config: &ManifestWriteConfig,
     ) -> Result<Self> {
         let read_version = read_version.map_or_else(
             || match operation {
@@ -705,12 +704,12 @@ impl Dataset {
                 dataset,
                 &object_store,
                 &transaction,
-                manifest_config,
+                &Default::default(),
                 &Default::default(),
             )
             .await?
         } else {
-            commit_new_dataset(&object_store, &base, &transaction, manifest_config).await?
+            commit_new_dataset(&object_store, &base, &transaction, &Default::default()).await?
         };
 
         Ok(Self {
@@ -1397,17 +1396,10 @@ impl Dataset {
     }
 }
 
-/// Configuration for writing a manifest file.
 #[derive(Debug)]
-pub struct ManifestWriteConfig {
-    /// If true, automatically set feature flags based on the schema. This defaults
-    /// to True.
-    pub auto_set_feature_flags: bool, // default true
-    pub timestamp: Option<SystemTime>, // default None
-    /// If true, will recompute statistics present in the manifest, such as
-    /// `physical_rows` in fragments or `num_deletions` in deletion files. Defaults
-    /// to false.
-    pub recompute_stats: bool, // default false
+pub(crate) struct ManifestWriteConfig {
+    auto_set_feature_flags: bool,  // default true
+    timestamp: Option<SystemTime>, // default None
 }
 
 impl Default for ManifestWriteConfig {
@@ -1415,7 +1407,6 @@ impl Default for ManifestWriteConfig {
         Self {
             auto_set_feature_flags: true,
             timestamp: None,
-            recompute_stats: false,
         }
     }
 }
@@ -1810,7 +1801,6 @@ mod tests {
             &ManifestWriteConfig {
                 auto_set_feature_flags: false,
                 timestamp: None,
-                recompute_stats: false,
             },
         )
         .await

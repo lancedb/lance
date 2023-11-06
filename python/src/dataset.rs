@@ -26,7 +26,6 @@ use chrono::Duration;
 use futures::StreamExt;
 use lance::arrow::as_fixed_size_list_array;
 use lance::dataset::progress::WriteFragmentProgress;
-use lance::dataset::ManifestWriteConfig;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, scanner::Scanner as LanceScanner,
     transaction::Operation as LanceOperation, Dataset as LanceDataset, ReadParams, Version,
@@ -770,7 +769,6 @@ impl Dataset {
         operation: Operation,
         read_version: Option<u64>,
         commit_lock: Option<&PyAny>,
-        manifest_config: Option<&PyDict>,
     ) -> PyResult<Self> {
         let store_params = if let Some(commit_handler) = commit_lock {
             let py_commit_lock = PyCommitLock::new(commit_handler.to_object(commit_handler.py()));
@@ -780,24 +778,10 @@ impl Dataset {
         } else {
             None
         };
-
-        let mut write_config = ManifestWriteConfig::default();
-        if let Some(manifest_config) = manifest_config {
-            if let Some(recompute_stats) = manifest_config.get_item("recompute_stats") {
-                write_config.recompute_stats = recompute_stats.extract()?;
-            }
-        }
-
         let ds = RT
             .block_on(
                 commit_lock.map(|cl| cl.py()),
-                LanceDataset::commit(
-                    dataset_uri,
-                    operation.0,
-                    read_version,
-                    store_params,
-                    &write_config,
-                ),
+                LanceDataset::commit(dataset_uri, operation.0, read_version, store_params),
             )?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {

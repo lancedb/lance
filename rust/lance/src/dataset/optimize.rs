@@ -839,7 +839,7 @@ async fn rewrite_files(
     // It's possible the fragments are old and don't have physical rows or
     // num deletions recorded. If that's the case, we need to grab and set that
     // information.
-    let fragments = migrate_fragments(dataset.as_ref(), &task.fragments, false).await?;
+    let fragments = migrate_fragments(dataset.as_ref(), &task.fragments).await?;
     let mut scanner = dataset.scan();
     scanner.with_fragments(fragments.clone()).with_row_id();
 
