@@ -48,7 +48,7 @@ impl TableProvider for Dataset {
         let projections = if let Some(projection) = projection {
             if projection.len() != schema_ref.fields.len() {
                 let arrow_schema: ArrowSchema = schema_ref.into();
-                let arrow_schema = arrow_schema.project(&projection)?;
+                let arrow_schema = arrow_schema.project(projection)?;
                 schema_ref.project_by_schema(&arrow_schema)?
             } else {
                 schema_ref.clone()
