@@ -1508,7 +1508,7 @@ mod tests {
                 .as_primitive::<Float32Type>()
                 .values()
                 .iter()
-                .all(|&v| v >= 0.0 && v < 2.0));
+                .all(|v| (0.0..2.0).contains(v)));
         }
     }
 }
