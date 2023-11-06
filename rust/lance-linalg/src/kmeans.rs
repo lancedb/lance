@@ -24,6 +24,7 @@ use arrow_schema::{ArrowError, DataType};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::FloatToArrayType;
 use log::{info, warn};
+use num_traits::Float;
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 use tracing::instrument;
@@ -32,7 +33,7 @@ use crate::kernels::argmin_value_float;
 use crate::{
     distance::{
         dot_distance,
-        l2::{l2, l2_distance_batch},
+        l2::{l2, l2_distance_batch, L2},
         Cosine, Dot, MetricType, Normalize,
     },
     kernels::{argmin, argmin_value},
@@ -546,15 +547,16 @@ fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f3
     &data[x * dim + y..x * dim + y + strip]
 }
 
-fn compute_partitions_l2_f32_small<'a>(
-    centroids: &'a [f32],
-    data: &'a [f32],
+fn compute_partitions_l2_f32_small<'a, T: FloatToArrayType>(
+    centroids: &'a [T],
+    data: &'a [T],
     dim: usize,
-) -> Box<dyn Iterator<Item = (u32, f32)> + 'a> {
-    Box::new(
-        data.chunks(dim)
-            .map(move |row| argmin_value_float(l2_distance_batch(row, centroids, dim))),
-    )
+) -> impl Iterator<Item = (u32, T)> + 'a
+where
+    T::ArrowType: L2,
+{
+    data.chunks(dim)
+        .map(move |row| argmin_value_float(l2_distance_batch::<T>(row, centroids, dim)))
 }
 
 /// Fast partition computation for L2 distance.
@@ -564,7 +566,7 @@ fn compute_partitions_l2_f32<'a>(
     dim: usize,
 ) -> Box<dyn Iterator<Item = (u32, f32)> + 'a> {
     if std::mem::size_of_val(centroids) <= 16 * 1024 {
-        return compute_partitions_l2_f32_small(centroids, data, dim);
+        return Box::new(compute_partitions_l2_f32_small(centroids, data, dim));
     }
 
     const STRIPE_SIZE: usize = 128;
