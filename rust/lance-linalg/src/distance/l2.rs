@@ -139,7 +139,6 @@ impl L2 for Float32Type {
             sum.reduce_sum()
         } else {
             // Fallback to scalar
-            println!("Fallb ack");
             l2_scalar::<f32, 16>(x, y)
         }
     }
@@ -149,7 +148,6 @@ impl L2 for Float32Type {
         y: &'a [Self::Native],
         dimension: usize,
     ) -> Box<dyn Iterator<Item = Self::Native> + 'a> {
-        println!("Use f32::l2_batch");
         use self::f32::l2_once;
         // Dispatch based on the dimension.
         match dimension {
