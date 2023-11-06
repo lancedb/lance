@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
+use pprof::criterion::{Output, PProfProfiler};
 
 use lance_index::vector::ivf::Ivf;
 use lance_linalg::distance::MetricType;
