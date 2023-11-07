@@ -13,21 +13,20 @@
 // limitations under the License.
 
 use std::cmp::min;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::vec;
 
 use arrow_array::{
     cast::AsArray, new_empty_array, types::Float32Type, Array, ArrowNumericType,
-    ArrowPrimitiveType, FixedSizeListArray, Float32Array, PrimitiveArray,
+    ArrowPrimitiveType, FixedSizeListArray, Float32Array,
 };
 use arrow_schema::{ArrowError, DataType};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
-use lance_arrow::{ArrowFloatType, FloatToArrayType};
+use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 use log::{info, warn};
-use num_traits::{AsPrimitive, Float, Zero};
+use num_traits::{AsPrimitive, Float, FromPrimitive, Zero};
 use rand::prelude::*;
-use rand::{distributions::WeightedIndex, Rng};
+use rand::Rng;
 use tracing::instrument;
 
 use crate::distance::norm_l2;
@@ -89,11 +88,11 @@ impl Default for KMeansParams {
 
 /// KMeans implementation for Apache Arrow Arrays.
 #[derive(Debug, Clone)]
-pub struct KMeans {
+pub struct KMeans<T: ArrowFloatType> {
     /// Centroids for each of the k clusters.
     ///
     /// k * dimension.
-    pub centroids: Arc<Float32Array>,
+    pub centroids: Arc<T::ArrayType>,
 
     /// Vector dimension.
     pub dimension: usize,
@@ -104,81 +103,35 @@ pub struct KMeans {
     pub metric_type: MetricType,
 }
 
-/// Initialize using kmean++, and returns the centroids of k clusters.
-async fn kmean_plusplus(
-    data: Arc<Float32Array>,
-    dimension: usize,
-    k: usize,
-    mut rng: impl Rng,
-    metric_type: MetricType,
-) -> KMeans {
-    assert!(data.len() > k * dimension);
-    let mut kmeans = KMeans::empty(k, dimension, metric_type);
-    let first_idx = rng.gen_range(0..data.len() / dimension);
-    let first_vector: Float32Array = data.slice(first_idx * dimension, dimension);
-    kmeans.centroids = Arc::new(first_vector);
-
-    let mut seen = HashSet::new();
-    seen.insert(first_idx);
-
-    for _ in 1..k {
-        let membership = kmeans.compute_membership(data.clone(), None).await;
-        let weights =
-            WeightedIndex::new(membership.cluster_id_and_distances.iter().map(|(_, d)| d)).unwrap();
-        let mut chosen;
-        loop {
-            chosen = weights.sample(&mut rng);
-            if !seen.contains(&chosen) {
-                seen.insert(chosen);
-                break;
-            }
-        }
-
-        let new_vector: Float32Array = data.slice(chosen * dimension, dimension);
-
-        let new_centroid_values = Float32Array::from_iter_values(
-            kmeans
-                .centroids
-                .as_ref()
-                .values()
-                .iter()
-                .copied()
-                .chain(new_vector.values().iter().copied()),
-        );
-        kmeans.centroids = Arc::new(new_centroid_values);
-    }
-    kmeans
-}
-
 /// Randomly initialize kmeans centroids.
 ///
 ///
-async fn kmeans_random_init(
-    data: &Float32Array,
+async fn kmeans_random_init<T: ArrowFloatType>(
+    data: &T::ArrayType,
     dimension: usize,
     k: usize,
     mut rng: impl Rng,
     metric_type: MetricType,
-) -> Result<KMeans> {
+) -> Result<KMeans<T>> {
     assert!(data.len() >= k * dimension);
     let chosen = (0..data.len() / dimension)
         .choose_multiple(&mut rng, k)
         .to_vec();
-    let mut builder: Vec<f32> = Vec::with_capacity(k * dimension);
+    let mut builder: Vec<T::Native> = Vec::with_capacity(k * dimension);
     for i in chosen {
-        builder.extend(data.values()[i * dimension..(i + 1) * dimension].iter());
+        builder.extend(data.as_slice()[i * dimension..(i + 1) * dimension].iter());
     }
     let mut kmeans = KMeans::empty(k, dimension, metric_type);
     kmeans.centroids = Arc::new(builder.into());
     Ok(kmeans)
 }
 
-pub struct KMeanMembership<T: ArrowNumericType>
+pub struct KMeanMembership<T: ArrowFloatType>
 where
     T::Native: Float + Zero,
 {
     /// Reference to the input vectors, with dimension `dimension`.
-    data: Arc<PrimitiveArray<T>>,
+    data: Arc<T::ArrayType>,
 
     dimension: usize,
 
@@ -191,21 +144,21 @@ where
     metric_type: MetricType,
 }
 
-impl<T: ArrowPrimitiveType> KMeanMembership<T> {
+impl<T: ArrowFloatType> KMeanMembership<T> {
     /// Reconstruct a KMeans model from the membership.
-    async fn to_kmeans(&self) -> Result<KMeans> {
+    async fn to_kmeans(&self) -> Result<KMeans<T>> {
         let dimension = self.dimension;
 
-        let mut cluster_cnts = vec![0_usize; self.k];
+        let mut cluster_cnts = vec![0_u64; self.k];
         let mut new_centroids = vec![T::Native::zero(); self.k * dimension];
         self.data
-            .values()
+            .as_slice()
             .chunks_exact(dimension)
             .zip(self.cluster_id_and_distances.iter().map(|(c, _)| c))
             .for_each(|(vector, cluster_id)| {
                 cluster_cnts[*cluster_id as usize] += 1;
                 // TODO: simd
-                for (old, new) in new_centroids
+                for (old, &new) in new_centroids
                     [*cluster_id as usize * dimension..(1 + *cluster_id as usize) * dimension]
                     .iter_mut()
                     .zip(vector)
@@ -220,7 +173,7 @@ impl<T: ArrowPrimitiveType> KMeanMembership<T> {
                 // TODO: simd
                 new_centroids[i * dimension..(i + 1) * dimension]
                     .iter_mut()
-                    .for_each(|v| *v /= cnt as f32);
+                    .for_each(|v| *v /= T::Native::from_u64(cnt).unwrap());
             }
         });
 
@@ -263,7 +216,7 @@ impl<T: ArrowPrimitiveType> KMeanMembership<T> {
     }
 }
 
-impl KMeans {
+impl<T: ArrowFloatType> KMeans<T> {
     fn empty(k: usize, dimension: usize, metric_type: MetricType) -> Self {
         let empty_array = new_empty_array(&DataType::Float32);
         Self {
@@ -277,7 +230,7 @@ impl KMeans {
     /// Create a [`KMeans`] with existing centroids.
     /// It is useful for continuing training.
     fn with_centroids(
-        centroids: Arc<Float32Array>,
+        centroids: Arc<T::ArrayType>,
         k: usize,
         dimension: usize,
         metric_type: MetricType,
@@ -298,7 +251,7 @@ impl KMeans {
     /// - *metric_type*: the metric type to calculate distance.
     /// - *rng*: random generator.
     pub async fn init_random(
-        data: &MatrixView<Float32Type>,
+        data: &MatrixView<T>,
         k: usize,
         metric_type: MetricType,
         rng: impl Rng,
@@ -333,9 +286,9 @@ impl KMeans {
             ));
         }
 
-        if !matches!(data.value_type(), DataType::Float32) {
+        if !data.value_type().is_floating() {
             return Err(ArrowError::InvalidArgumentError(format!(
-                "KMeans: data must be Float32, got: {}",
+                "KMeans: data must be floating number, got: {}",
                 data.value_type()
             )));
         }
@@ -344,7 +297,7 @@ impl KMeans {
         // TODO: refactor kmeans to work with reference instead of Arc?
         let data = Arc::new(values.clone());
         let mut best_kmeans = Self::empty(k, dimension, params.metric_type);
-        let mut best_stddev = f32::MAX;
+        let mut best_stddev = T::Native::max_value();
 
         let rng = rand::rngs::SmallRng::from_entropy();
         let mat = MatrixView::new(data.clone(), dimension);
@@ -358,14 +311,13 @@ impl KMeans {
                         Self::init_random(&mat, k, params.metric_type, rng.clone()).await?
                     }
                     KMeanInit::KMeanPlusPlus => {
-                        kmean_plusplus(data.clone(), dimension, k, rng.clone(), params.metric_type)
-                            .await
+                        unimplemented!()
                     }
                 }
             };
 
-            let mut dist_sum: f32 = f32::MAX;
-            let mut stddev: f32 = f32::MAX;
+            let mut dist_sum = T::Native::max_value();
+            let mut stddev = T::Native::max_value();
             for i in 1..=params.max_iters {
                 if i % 10 == 0 {
                     info!(
@@ -411,19 +363,16 @@ impl KMeans {
     /// }
     /// ```
     #[instrument(level = "debug", skip_all)]
-    pub async fn train_once(&self, data: &MatrixView<Float32Type>) -> KMeanMembership {
+    pub async fn train_once(&self, data: &MatrixView<T>) -> KMeanMembership<T> {
         match self.metric_type {
             MetricType::Cosine => self.train_cosine_once(data).await,
             _ => self.compute_membership(data.data().clone(), None).await,
         }
     }
 
-    async fn train_cosine_once(&self, data: &MatrixView<Float32Type>) -> KMeanMembership {
+    async fn train_cosine_once(&self, data: &MatrixView<T>) -> KMeanMembership<T> {
         let norm_data = Some(Arc::new(
-            data.iter()
-                .map(|v| v.norm_l2())
-                .collect::<Vec<f32>>()
-                .into(),
+            data.iter().map(|v| norm_l2(v)).collect::<Vec<_>>().into(),
         ));
         self.compute_membership(data.data().clone(), norm_data)
             .await
@@ -437,9 +386,9 @@ impl KMeans {
     /// - *dist_fn*: the function to compute distances.
     pub async fn compute_membership(
         &self,
-        data: Arc<Float32Array>,
-        norm_data: Option<Arc<Float32Array>>,
-    ) -> KMeanMembership {
+        data: Arc<T::ArrayType>,
+        norm_data: Option<Arc<T::ArrayType>>,
+    ) -> KMeanMembership<T> {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let metric_type = self.metric_type;
@@ -450,10 +399,10 @@ impl KMeans {
         let norm_centroids = if matches!(metric_type, MetricType::Cosine) {
             Arc::new(Some(
                 self.centroids
-                    .values()
+                    .as_slice()
                     .chunks_exact(dimension)
-                    .map(|centroid| centroid.norm_l2())
-                    .collect::<Vec<f32>>(),
+                    .map(|centroid| norm_l2(centroid))
+                    .collect::<Vec<_>>(),
             ))
         } else {
             Arc::new(None)
@@ -475,7 +424,7 @@ impl KMeans {
                         let last_idx = min(start_idx + CHUNK_SIZE, n);
 
                         let centroids_array = centroids.values();
-                        let values = &data.values()[start_idx * dimension..last_idx * dimension];
+                        let values = &data.as_slice()[start_idx * dimension..last_idx * dimension];
 
                         if metric_type == MetricType::L2 {
                             return compute_partitions_l2(centroids_array, values, dimension)
@@ -494,7 +443,7 @@ impl KMeans {
                                     MetricType::Cosine => {
                                         let centroid_norms = norms.as_ref().as_ref().unwrap();
                                         if let Some(norm_vectors) = norm_data.as_ref() {
-                                            let norm_vec = norm_vectors.values()[idx];
+                                            let norm_vec = norm_vectors.as_slice()[idx];
                                             argmin_value(
                                                 centroid_stream.zip(centroid_norms.iter()).map(
                                                     |(cent, &cent_norm)| {
