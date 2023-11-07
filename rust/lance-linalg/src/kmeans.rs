@@ -664,6 +664,7 @@ where
 mod tests {
     use super::*;
 
+    use arrow_array::types::Float32Type;
     use arrow_array::Float32Array;
     use lance_arrow::*;
     use lance_testing::datagen::generate_random_array;
@@ -672,7 +673,7 @@ mod tests {
     async fn test_train_with_small_dataset() {
         let data = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
         let data = FixedSizeListArray::try_new_from_values(data, 2).unwrap();
-        match KMeans::new(&data, 128, 5).await {
+        match KMeans::<Float32Type>::new(&data, 128, 5).await {
             Ok(_) => panic!("Should fail to train KMeans"),
             Err(e) => {
                 assert!(e.to_string().contains("smaller than"));
@@ -699,7 +700,12 @@ mod tests {
                 .unwrap()
             })
             .collect::<Vec<_>>();
-        let actual = compute_partitions(centroids.values(), data.values(), DIM, MetricType::L2);
+        let actual = compute_partitions::<Float32Type>(
+            centroids.values(),
+            data.values(),
+            DIM,
+            MetricType::L2,
+        );
         assert_eq!(expected, actual);
     }
 }
