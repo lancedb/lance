@@ -347,7 +347,7 @@ class LanceFragment(pa.dataset.Fragment):
         >>> dataset = lance.write_dataset(tab, "dataset")
         >>> frag = dataset.get_fragment(0)
         >>> frag.delete("a > 1")
-        Fragment { id: 0, files: ..., deletion_file: Some(...), physical_rows: 3 }
+        Fragment { id: 0, files: ..., deletion_file: Some(...), physical_rows: Some(3) }
         >>> frag.delete("a > 0") is None
         True
 
