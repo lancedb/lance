@@ -25,7 +25,7 @@ use num_traits::FromPrimitive;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance_linalg::distance::norm_l2::{norm_l2, Normalize};
+use lance_linalg::distance::norm_l2::Normalize;
 use lance_testing::datagen::generate_random_array_with_seed;
 
 #[inline]
@@ -65,7 +65,7 @@ where
                     target
                         .values()
                         .chunks_exact(DIMENSION)
-                        .map(|arr| norm_l2(arr))
+                        .map(|arr| arr.norm_l2())
                         .collect::<Vec<_>>(),
                 );
             });
@@ -81,9 +81,13 @@ fn bench_distance(c: &mut Criterion) {
     let target: Float32Array = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
     c.bench_function("norm_l2(f32, SIMD)", |b| {
         b.iter(|| {
-            target.values().chunks_exact(DIMENSION).for_each(|arr| {
-                let _ = arr.norm_l2();
-            })
+            black_box(
+                target
+                    .values()
+                    .chunks_exact(DIMENSION)
+                    .map(|arr| arr.norm_l2())
+                    .collect::<Vec<_>>(),
+            )
         });
     });
 

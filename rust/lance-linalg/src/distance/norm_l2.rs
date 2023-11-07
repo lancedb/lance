@@ -15,7 +15,7 @@
 use std::iter::Sum;
 
 use half::{bf16, f16};
-use num_traits::{real::Real, Float};
+use num_traits::Float;
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -35,8 +35,48 @@ impl Normalize<f16> for &[f16] {
 
     #[inline]
     fn norm_l2(&self) -> Self::Output {
-        norm_l2(self)
+        #[cfg(target_feature = "neon")]
+        {
+            // No explict f16c CVT instructions available in [std::arch::aarch64].
+            // So, we convert to f32 manually and then back to f16.
+            // This is about 40% faster than the scalar implementation on a M2 Macbook Pro.
+            //
+            // Please run `cargo bench --bench norm_l2" on Apple Silicon when
+            // change the following code.
+            const LANES: usize = 8;
+            let chunks = self.chunks_exact(LANES);
+            let sum = if chunks.remainder().is_empty() {
+                0.0
+            } else {
+                chunks.remainder().iter().map(|v| v.to_f32().powi(2)).sum()
+            };
+            let mut sums: [f32; LANES] = [0_f32; LANES];
+            for chk in chunks {
+                // Convert to f32
+                let mut f32_vals: [f32; LANES] = [0_f32; LANES];
+                for i in 0..LANES {
+                    f32_vals[i] = chk[i].to_f32();
+                }
+                // Vectorized multiply
+                for i in 0..LANES {
+                    sums[i] += f32_vals[i].powi(2);
+                }
+            }
+            f16::from_f32((sums.iter().copied().sum::<f32>() + sum).sqrt())
+        }
+        #[cfg(not(target_feature = "neon"))]
+        {
+            norm_l2(self)
+        }
     }
+}
+
+pub fn norm_l2_f16(x: &[f16]) -> f16 {
+    x.norm_l2()
+}
+
+pub fn norm_l2_f32(x: &[f32]) -> f32 {
+    norm_l2(&x)
 }
 
 impl Normalize<bf16> for &[bf16] {
@@ -108,35 +148,44 @@ pub fn norm_l2<T: Float + Sum>(vector: &[T]) -> T {
 
 #[cfg(test)]
 mod tests {
-    use num_traits::FromPrimitive;
+    use num_traits::{real::Real, FromPrimitive};
+    use std::fmt::Debug;
 
     use super::*;
 
-    macro_rules! do_norm_l2_test {
-        ($t: ty) => {
-            let data = (1..=8)
-                .map(|v| <$t>::from_i32(v).unwrap())
-                .collect::<Vec<$t>>();
+    fn do_norm_l2_test<T: Float + FromPrimitive + Sum + Debug>()
+    where
+        for<'a> &'a [T]: Normalize<T>,
+        for<'a> <&'a [T] as Normalize<T>>::Output: PartialEq<T> + Debug,
+    {
+        let data = (1..=185)
+            .map(|v| T::from_i32(v).unwrap())
+            .collect::<Vec<T>>();
 
-            let result = data.as_slice().norm_l2();
-            assert_eq!(
-                result,
-                Real::sqrt((1..=8).map(|v| <$t>::from_i32(v * v).unwrap()).sum::<$t>())
-            );
+        let result = data.as_slice().norm_l2();
+        assert_eq!(
+            result,
+            (1..=185)
+                .map(|v| T::from_i32(v * v).unwrap())
+                .sum::<T>()
+                .sqrt()
+        );
 
-            let not_aligned = (&data[2..]).norm_l2();
-            assert_eq!(
-                not_aligned,
-                Real::sqrt((3..=8).map(|v| <$t>::from_i32(v * v).unwrap()).sum::<$t>())
-            );
-        };
+        let not_aligned = (&data[2..]).norm_l2();
+        assert_eq!(
+            not_aligned,
+            (3..=185)
+                .map(|v| T::from_i32(v * v).unwrap())
+                .sum::<T>()
+                .sqrt()
+        );
     }
 
     #[test]
     fn test_norm_l2() {
-        do_norm_l2_test!(bf16);
-        do_norm_l2_test!(f16);
-        do_norm_l2_test!(f32);
-        do_norm_l2_test!(f64);
+        do_norm_l2_test::<bf16>();
+        do_norm_l2_test::<f16>();
+        do_norm_l2_test::<f32>();
+        do_norm_l2_test::<f64>();
     }
 }
