@@ -18,13 +18,14 @@ use std::sync::Arc;
 use std::vec;
 
 use arrow_array::{
-    cast::AsArray, new_empty_array, types::Float32Type, Array, FixedSizeListArray, Float32Array,
+    cast::AsArray, new_empty_array, types::Float32Type, Array, ArrowNumericType,
+    ArrowPrimitiveType, FixedSizeListArray, Float32Array, PrimitiveArray,
 };
 use arrow_schema::{ArrowError, DataType};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FloatToArrayType};
 use log::{info, warn};
-use num_traits::{AsPrimitive, Float};
+use num_traits::{AsPrimitive, Float, Zero};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 use tracing::instrument;
@@ -172,9 +173,12 @@ async fn kmeans_random_init(
     Ok(kmeans)
 }
 
-pub struct KMeanMembership {
+pub struct KMeanMembership<T: ArrowNumericType>
+where
+    T::Native: Float + Zero,
+{
     /// Reference to the input vectors, with dimension `dimension`.
-    data: Arc<Float32Array>,
+    data: Arc<PrimitiveArray<T>>,
 
     dimension: usize,
 
@@ -187,13 +191,13 @@ pub struct KMeanMembership {
     metric_type: MetricType,
 }
 
-impl KMeanMembership {
+impl<T: ArrowPrimitiveType> KMeanMembership<T> {
     /// Reconstruct a KMeans model from the membership.
     async fn to_kmeans(&self) -> Result<KMeans> {
         let dimension = self.dimension;
 
         let mut cluster_cnts = vec![0_usize; self.k];
-        let mut new_centroids = vec![0.0_f32; self.k * dimension];
+        let mut new_centroids = vec![T::Native::zero(); self.k * dimension];
         self.data
             .values()
             .chunks_exact(dimension)
