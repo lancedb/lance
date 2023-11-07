@@ -226,8 +226,13 @@ impl FileFragment {
             });
         };
 
-        if let Some(size) = self.metadata.physical_rows {
-            return Ok(size);
+        // Early versions that did not write the writer version also could write
+        // incorrect `physical_row` values. So if we don't have a writer version,
+        // we should not used the cached value. On write, we update the values
+        // in the manifest, fixing the issue for future reads.
+        // See: https://github.com/lancedb/lance/issues/1531
+        if self.dataset.manifest.writer_version.is_some() && self.metadata.physical_rows.is_some() {
+            return Ok(self.metadata.physical_rows.unwrap());
         }
 
         // Just open any file. All of them should have same size.
@@ -252,6 +257,8 @@ impl FileFragment {
     /// Verifies:
     /// * All data files exist and have the same length
     /// * Deletion file exists and has rowids in the correct range
+    /// * `Fragment.physical_rows` matches length of file
+    /// * `DeletionFile.num_deleted_rows` matches length of deletion vector
     pub async fn validate(&self) -> Result<()> {
         let data_file_paths: Vec<Path> = self
             .metadata
@@ -293,16 +300,53 @@ impl FileFragment {
                 ));
             }
         }
+        if let Some(physical_rows) = self.metadata.physical_rows {
+            if physical_rows != *expected_length {
+                return Err(Error::corrupt_file(
+                    self.dataset
+                        .data_dir()
+                        .child(self.metadata.files[0].path.as_str()),
+                    format!(
+                        "Fragment metadata has incorrect physical_rows. Actual: {} Metadata: {}",
+                        expected_length, physical_rows
+                    ),
+                    location!(),
+                ));
+            }
+        }
 
         if let Some(deletion_vector) = deletion_vector? {
-            for row_id in deletion_vector {
-                if row_id >= *expected_length as u32 {
-                    let deletion_file_meta = self.metadata.deletion_file.clone().unwrap();
+            if let Some(num_deletions) = self
+                .metadata
+                .deletion_file
+                .as_ref()
+                .unwrap()
+                .num_deleted_rows
+            {
+                if num_deletions != deletion_vector.len() {
                     return Err(Error::corrupt_file(
                         deletion_file_path(
                             &self.dataset.base,
                             self.metadata.id,
-                            &deletion_file_meta,
+                            self.metadata.deletion_file.as_ref().unwrap(),
+                        ),
+                        format!(
+                            "deletion vector length does not match metadata. Metadata: {} Deletion vector: {}",
+                            num_deletions, deletion_vector.len()
+                        ),
+                        location!(),
+                    ));
+                }
+            }
+
+            for row_id in deletion_vector {
+                if row_id >= *expected_length as u32 {
+                    let deletion_file_meta = self.metadata.deletion_file.as_ref().unwrap();
+                    return Err(Error::corrupt_file(
+                        deletion_file_path(
+                            &self.dataset.base,
+                            self.metadata.id,
+                            deletion_file_meta,
                         ),
                         format!("deletion vector contains row id that is out of range. Row id: {} Fragment length: {}", row_id, expected_length),
                         location!(),

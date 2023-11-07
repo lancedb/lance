@@ -41,10 +41,7 @@ fn transpose<T: Float>(input: &[T], dimension: usize) -> Vec<T> {
 /// A 2-D dense matrix on top of Arrow Arrays.
 ///
 #[derive(Debug)]
-pub struct MatrixView<T: ArrowFloatType>
-where
-    Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,
-{
+pub struct MatrixView<T: ArrowFloatType> {
     /// Underneath data array.
     data: Arc<T::ArrayType>,
 
@@ -55,10 +52,7 @@ where
     pub transpose: bool,
 }
 
-impl<T: ArrowFloatType> Clone for MatrixView<T>
-where
-    Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,
-{
+impl<T: ArrowFloatType> Clone for MatrixView<T> {
     fn clone(&self) -> Self {
         Self {
             data: self.data.clone(),
@@ -68,10 +62,7 @@ where
     }
 }
 
-impl<T: ArrowFloatType> MatrixView<T>
-where
-    Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,
-{
+impl<T: ArrowFloatType> MatrixView<T> {
     /// Create a MatrixView from a f32 data.
     pub fn new(data: Arc<T::ArrayType>, num_columns: impl AsPrimitive<usize>) -> Self {
         Self {
@@ -88,6 +79,9 @@ where
             (&mut rng)
                 .sample_iter(Standard)
                 .take(num_columns * num_rows)
+                .collect::<Vec<f32>>()
+                .iter()
+                .map(|&v| T::Native::from_f32(v).unwrap())
                 .collect::<Vec<_>>(),
         ));
         Self {
@@ -302,10 +296,7 @@ where
     }
 }
 
-impl<T: ArrowFloatType + ArrowPrimitiveType> TryFrom<&FixedSizeListArray> for MatrixView<T>
-where
-    Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,
-{
+impl<T: ArrowFloatType + ArrowPrimitiveType> TryFrom<&FixedSizeListArray> for MatrixView<T> {
     type Error = Error;
 
     fn try_from(value: &FixedSizeListArray) -> Result<Self> {
@@ -343,18 +334,12 @@ where
 }
 
 /// Iterator over the matrix one row at a time.
-pub struct MatrixRowIter<'a, T: ArrowFloatType>
-where
-    Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,
-{
+pub struct MatrixRowIter<'a, T: ArrowFloatType> {
     data: &'a MatrixView<T>,
     cur_idx: usize,
 }
 
-impl<'a, T: ArrowFloatType> Iterator for MatrixRowIter<'a, T>
-where
-    Standard: rand::distributions::Distribution<<T as ArrowFloatType>::Native>,
-{
+impl<'a, T: ArrowFloatType> Iterator for MatrixRowIter<'a, T> {
     type Item = &'a [T::Native];
 
     fn next(&mut self) -> Option<Self::Item> {

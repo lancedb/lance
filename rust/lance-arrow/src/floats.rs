@@ -15,7 +15,10 @@
 //! Floats Array
 
 use std::iter::Sum;
-use std::{fmt::Formatter, ops::AddAssign};
+use std::{
+    fmt::Formatter,
+    ops::{AddAssign, DivAssign},
+};
 
 use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
@@ -52,15 +55,22 @@ impl std::fmt::Display for FloatType {
 /// Trait for float types used in Arrow Array.
 ///
 pub trait ArrowFloatType {
-    type Native: FromPrimitive + FloatToArrayType;
+    type Native: FromPrimitive + FloatToArrayType<ArrowType = Self>;
 
     const FLOAT_TYPE: FloatType;
 
     /// Arrow Float Array Type.
     type ArrayType: FloatArray<Self>;
+
+    /// Returns empty array of this type.
+    fn empty_array() -> Self::ArrayType {
+        Vec::<Self::Native>::new().into()
+    }
 }
 
-pub trait FloatToArrayType: Float + Bounded + Sum + AddAssign<Self> + AsPrimitive<f64> {
+pub trait FloatToArrayType:
+    Float + Bounded + Sum + AddAssign<Self> + AsPrimitive<f64> + DivAssign + Send + Sync + Copy
+{
     type ArrowType: ArrowFloatType<Native = Self>;
 }
 

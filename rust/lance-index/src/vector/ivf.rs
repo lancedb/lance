@@ -217,7 +217,13 @@ impl Ivf {
         let metric_type = self.metric_type;
 
         tokio::task::spawn_blocking(move || {
-            compute_partitions(centroids.values(), data.values(), dimension, metric_type).into()
+            compute_partitions::<Float32Type>(
+                centroids.values(),
+                data.values(),
+                dimension,
+                metric_type,
+            )
+            .into()
         })
         .await
         .expect("compute_partitions: schedule CPU task")

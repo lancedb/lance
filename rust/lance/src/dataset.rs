@@ -1507,10 +1507,11 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
+    use lance_core::format::WriterVersion;
     use lance_index::vector::DIST_COL;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
@@ -1561,6 +1562,10 @@ mod tests {
 
         let actual_ds = Dataset::open(test_uri).await.unwrap();
         assert_eq!(actual_ds.version().version, 1);
+        assert_eq!(
+            actual_ds.manifest.writer_version,
+            Some(WriterVersion::default())
+        );
         let actual_schema = ArrowSchema::from(actual_ds.schema());
         assert_eq!(&actual_schema, schema.as_ref());
 
@@ -3187,5 +3192,187 @@ mod tests {
             results[2].column(0).as_primitive::<Int32Type>().values(),
             &[1],
         );
+    }
+
+    fn copy_dir_all(
+        src: impl AsRef<std::path::Path>,
+        dst: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<()> {
+        use std::fs;
+        fs::create_dir_all(&dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            if ty.is_dir() {
+                copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+            } else {
+                fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copies a test dataset into a temporary directory, returning the tmpdir.
+    ///
+    /// The `table_path` should be relative to `test_data/` at the root of the
+    /// repo.
+    fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
+        use std::path::PathBuf;
+
+        let mut src = PathBuf::new();
+        src.push(env!("CARGO_MANIFEST_DIR"));
+        src.push("../../test_data");
+        src.push(table_path);
+
+        let test_dir = tempdir().unwrap();
+
+        copy_dir_all(src.as_path(), test_dir.path())?;
+
+        Ok(test_dir)
+    }
+
+    #[tokio::test]
+    async fn test_v0_7_5_migration() {
+        // We migrate to add Fragment.physical_rows and DeletionFile.num_deletions
+        // after this version.
+
+        // Copy over table
+        let test_dir = copy_test_data_to_tmp("v0.7.5/with_deletions").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Assert num rows, deletions, and physical rows are all correct.
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.count_rows().await.unwrap(), 90);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
+        let total_physical_rows = futures::stream::iter(dataset.get_fragments())
+            .then(|f| async move { f.physical_rows().await })
+            .try_fold(0, |acc, x| async move { Ok(acc + x) })
+            .await
+            .unwrap();
+        assert_eq!(total_physical_rows, 100);
+
+        // Append 5 rows
+        let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(100..105))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Assert num rows, deletions, and physical rows are all correct.
+        assert_eq!(dataset.count_rows().await.unwrap(), 95);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
+        let total_physical_rows = futures::stream::iter(dataset.get_fragments())
+            .then(|f| async move { f.physical_rows().await })
+            .try_fold(0, |acc, x| async move { Ok(acc + x) })
+            .await
+            .unwrap();
+        assert_eq!(total_physical_rows, 105);
+
+        dataset.validate().await.unwrap();
+
+        // Scan data and assert it is as expected.
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(
+                (0..10).chain(20..105),
+            ))],
+        )
+        .unwrap();
+        let actual_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_fix_v0_8_0_broken_migration() {
+        // The migration from v0.7.5 was broken in 0.8.0. This validates we can
+        // automatically fix tables that have this problem.
+
+        // Copy over table
+        let test_dir = copy_test_data_to_tmp("v0.8.0/migrated_from_v0.7.5").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Assert num rows, deletions, and physical rows are all correct, even
+        // though stats are bad.
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.count_rows().await.unwrap(), 92);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
+        let total_physical_rows = futures::stream::iter(dataset.get_fragments())
+            .then(|f| async move { f.physical_rows().await })
+            .try_fold(0, |acc, x| async move { Ok(acc + x) })
+            .await
+            .unwrap();
+        assert_eq!(total_physical_rows, 102);
+
+        // Append 5 rows to table.
+        let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(100..105))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Assert statistics are all now correct.
+        let physical_rows: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata.physical_rows)
+            .collect();
+        assert_eq!(physical_rows, vec![Some(100), Some(2), Some(5)]);
+        let num_deletions: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| {
+                f.metadata
+                    .deletion_file
+                    .as_ref()
+                    .and_then(|df| df.num_deleted_rows)
+            })
+            .collect();
+        assert_eq!(num_deletions, vec![Some(10), None, None]);
+        assert_eq!(dataset.count_rows().await.unwrap(), 97);
+
+        // Scan data and assert it is as expected.
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(
+                (0..10).chain(20..100).chain(0..2).chain(100..105),
+            ))],
+        )
+        .unwrap();
+        let actual_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+        assert_eq!(actual, expected);
     }
 }

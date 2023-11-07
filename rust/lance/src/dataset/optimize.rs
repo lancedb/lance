@@ -836,10 +836,17 @@ async fn rewrite_files(
         });
     }
 
+    let previous_writer_version = &dataset.manifest.writer_version;
+    // The versions of Lance prior to when we started writing the writer version
+    // sometimes wrote incorrect `Fragment.phyiscal_rows` values, so we should
+    // make sure to recompute them.
+    // See: https://github.com/lancedb/lance/issues/1531
+    let recompute_stats = previous_writer_version.is_none();
+
     // It's possible the fragments are old and don't have physical rows or
     // num deletions recorded. If that's the case, we need to grab and set that
     // information.
-    let fragments = migrate_fragments(dataset.as_ref(), &task.fragments).await?;
+    let fragments = migrate_fragments(dataset.as_ref(), &task.fragments, recompute_stats).await?;
     let mut scanner = dataset.scan();
     scanner.with_fragments(fragments.clone()).with_row_id();
 

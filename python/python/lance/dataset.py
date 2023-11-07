@@ -971,6 +971,15 @@ class LanceDataset(pa.dataset.Dataset):
         _Dataset.commit(base_uri, operation._to_inner(), read_version, commit_lock)
         return LanceDataset(base_uri)
 
+    def validate(self):
+        """
+        Validate the dataset.
+
+        This checks the integrity of the dataset and will raise an exception if
+        the dataset is corrupted.
+        """
+        self._ds.validate()
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)

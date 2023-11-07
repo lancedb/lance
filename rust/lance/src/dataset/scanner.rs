@@ -458,7 +458,7 @@ impl Scanner {
     }
 
     /// The output schema of the Scanner, in Lance Schema format.
-    fn output_schema(&self) -> Result<Arc<Schema>> {
+    pub(crate) fn output_schema(&self) -> Result<Arc<Schema>> {
         let mut extra_columns = vec![];
 
         if let Some(q) = self.nearest.as_ref() {
@@ -829,7 +829,7 @@ impl Scanner {
     ///
     /// Setting `with_make_deletions_null` will use the validity of the _rowid
     /// column as a selection vector. Read more in [crate::io::FileReader].
-    fn scan(
+    pub(crate) fn scan(
         &self,
         with_row_id: bool,
         with_make_deletions_null: bool,
