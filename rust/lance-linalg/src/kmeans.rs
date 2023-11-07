@@ -24,7 +24,7 @@ use arrow_schema::{ArrowError, DataType};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::FloatToArrayType;
 use log::{info, warn};
-use num_traits::AsPrimitive;
+use num_traits::{AsPrimitive, Float};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 use tracing::instrument;
@@ -32,7 +32,11 @@ use tracing::instrument;
 use crate::distance::norm_l2;
 use crate::kernels::argmin_value_float;
 use crate::{
-    distance::{dot_distance, l2_distance_batch, Cosine, Dot, MetricType, Normalize, L2},
+    distance::{
+        dot_distance,
+        l2::{l2, l2_distance_batch, L2},
+        Cosine, Dot, MetricType, Normalize,
+    },
     kernels::{argmin, argmin_value},
     matrix::MatrixView,
 };
@@ -470,7 +474,7 @@ impl KMeans {
                         let values = &data.values()[start_idx * dimension..last_idx * dimension];
 
                         if metric_type == MetricType::L2 {
-                            return compute_partitions_l2_f32(centroids_array, values, dimension)
+                            return compute_partitions_l2(centroids_array, values, dimension)
                                 .collect();
                         }
 
@@ -481,7 +485,7 @@ impl KMeans {
                                 let centroid_stream = centroids_array.chunks_exact(dimension);
                                 match metric_type {
                                     MetricType::L2 => {
-                                        argmin_value(centroid_stream.map(|cent| vector.l2(cent)))
+                                        panic!("L2 is handled above")
                                     }
                                     MetricType::Cosine => {
                                         let centroid_norms = norms.as_ref().as_ref().unwrap();
@@ -542,29 +546,33 @@ impl KMeans {
 
 /// Return a slice of `data[x,y..y+strip]`.
 #[inline]
-fn get_slice(data: &[f32], x: usize, y: usize, dim: usize, strip: usize) -> &[f32] {
+fn get_slice<T: Float>(data: &[T], x: usize, y: usize, dim: usize, strip: usize) -> &[T] {
     &data[x * dim + y..x * dim + y + strip]
 }
 
-fn compute_partitions_l2_f32_small<'a>(
-    centroids: &'a [f32],
-    data: &'a [f32],
+fn compute_partitions_l2_small<'a, T: FloatToArrayType>(
+    centroids: &'a [T],
+    data: &'a [T],
     dim: usize,
-) -> Box<dyn Iterator<Item = (u32, f32)> + 'a> {
-    Box::new(
-        data.chunks(dim)
-            .map(move |row| argmin_value_float(l2_distance_batch(row, centroids, dim))),
-    )
+) -> impl Iterator<Item = (u32, T)> + 'a
+where
+    T::ArrowType: L2,
+{
+    data.chunks(dim)
+        .map(move |row| argmin_value_float(l2_distance_batch::<T>(row, centroids, dim)))
 }
 
 /// Fast partition computation for L2 distance.
-fn compute_partitions_l2_f32<'a>(
-    centroids: &'a [f32],
-    data: &'a [f32],
+fn compute_partitions_l2<'a, T: FloatToArrayType>(
+    centroids: &'a [T],
+    data: &'a [T],
     dim: usize,
-) -> Box<dyn Iterator<Item = (u32, f32)> + 'a> {
+) -> Box<dyn Iterator<Item = (u32, T)> + 'a>
+where
+    T::ArrowType: L2,
+{
     if std::mem::size_of_val(centroids) <= 16 * 1024 {
-        return compute_partitions_l2_f32_small(centroids, data, dim);
+        return Box::new(compute_partitions_l2_small(centroids, data, dim));
     }
 
     const STRIPE_SIZE: usize = 128;
@@ -579,12 +587,12 @@ fn compute_partitions_l2_f32<'a>(
         // Loop over each strip.
         // s is the index of value in each vector.
         let num_rows_in_tile = data_tile.len() / dim;
-        let mut min_dists = vec![f32::MAX; num_rows_in_tile];
+        let mut min_dists = vec![<T as Float>::max_value(); num_rows_in_tile];
         let mut partitions = vec![0_u32; num_rows_in_tile];
 
         for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
             // 4B * 16 * 16 = 1 KB
-            let mut dists = vec![0_f32; TILE_SIZE * TILE_SIZE];
+            let mut dists = [T::zero(); TILE_SIZE * TILE_SIZE];
             let num_centroids_in_tile = min(TILE_SIZE, num_centroids - centroid_start);
             for s in (0..dim).step_by(STRIPE_SIZE) {
                 // Calculate L2 within each TILE * STRIP
@@ -594,7 +602,7 @@ fn compute_partitions_l2_f32<'a>(
                     for ci in centroid_start..centroid_start + num_centroids_in_tile {
                         // Get a slice of `data[di][s..s+STRIP_SIZE]`.
                         let cent_slice = get_slice(centroids, ci, s, dim, slice_len);
-                        let dist = data_slice.l2(cent_slice);
+                        let dist = l2(data_slice, cent_slice);
                         dists[di * TILE_SIZE + (ci - centroid_start)] += dist;
                     }
                 }
@@ -672,7 +680,7 @@ pub fn compute_partitions(
     metric_type: MetricType,
 ) -> Vec<u32> {
     match metric_type {
-        MetricType::L2 => compute_partitions_l2_f32(centroids, data, dimension)
+        MetricType::L2 => compute_partitions_l2(centroids, data, dimension)
             .map(|(c, _)| c)
             .collect(),
         MetricType::Cosine => compute_partitions_cosine(centroids, data, dimension),
@@ -714,7 +722,7 @@ mod tests {
                     centroids
                         .values()
                         .chunks(DIM)
-                        .map(|centroid| row.l2(centroid)),
+                        .map(|centroid| l2(row, centroid)),
                 )
                 .unwrap()
             })
