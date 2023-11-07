@@ -145,11 +145,7 @@ impl PQIndex {
             // The sub-vector section of the query vector.
             let from = key.slice(i * sub_vector_length, sub_vector_length);
             let subvec_centroids = self.pq.centroids(i);
-            let distances = dot_distance_batch(
-                as_primitive_array::<Float32Type>(&from).values(),
-                subvec_centroids,
-                sub_vector_length,
-            );
+            let distances = dot_distance_batch(from.values(), subvec_centroids, sub_vector_length);
             distance_table.extend(distances);
         }
 
@@ -304,14 +300,10 @@ impl VectorIndex for PQIndex {
             }?;
 
             // Pre-compute distance table for each sub-vector.
-            let distances = if this.metric_type == MetricType::L2 {
-                this.fast_l2_distances(&query.key, code.as_ref())?
-            } else if this.metric_type == MetricType::Dot {
-                this.dot_distances(&query.key, code.as_ref())?
-            } else if this.metric_type == MetricType::Cosine {
-                this.cosine_distances(&query.key, code.as_ref())?
-            } else {
-                unreachable!();
+            let distances = match this.metric_type {
+                MetricType::L2 => this.fast_l2_distances(&query.key, code.as_ref())?,
+                MetricType::Dot => this.dot_distances(&query.key, code.as_ref())?,
+                MetricType::Cosine => this.cosine_distances(&query.key, code.as_ref())?,
             };
 
             debug_assert_eq!(distances.len(), row_ids.len());
