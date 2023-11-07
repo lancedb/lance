@@ -131,6 +131,45 @@ impl PQIndex {
         }))
     }
 
+    /// Pre-compute dot product to each sub-centroids.
+    /// Parameters
+    ///  - query: the query vector, with shape (dimension, )
+    ///  - code: the PQ code in one partition.
+    ///
+    fn dot_distances(&self, key: &Float32Array, code: &UInt8Array) -> Result<ArrayRef> {
+        // Distance table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
+        let mut distance_table: Vec<f32> = vec![];
+
+        let sub_vector_length = self.dimension / self.num_sub_vectors;
+        for i in 0..self.num_sub_vectors {
+            // The sub-vector section of the query vector.
+            let from = key.slice(i * sub_vector_length, sub_vector_length);
+            let subvec_centroids = self.pq.centroids(i);
+            let distances = dot_distance_batch(
+                as_primitive_array::<Float32Type>(&from).values(),
+                subvec_centroids,
+                sub_vector_length,
+            );
+            distance_table.extend(distances);
+        }
+
+        // Compute distance from the pre-compute table.
+        Ok(Arc::new(unsafe {
+            Float32Array::from_trusted_len_iter(
+                code.values().chunks_exact(self.num_sub_vectors).map(|c| {
+                    Some(
+                        c.iter()
+                            .enumerate()
+                            .map(|(sub_vec_idx, centroid)| {
+                                distance_table[sub_vec_idx * 256 + *centroid as usize]
+                            })
+                            .sum::<f32>(),
+                    )
+                }),
+            )
+        }))
+    }
+
     /// Pre-compute cosine distance to each sub-centroids.
     ///
     /// Parameters
@@ -267,8 +306,12 @@ impl VectorIndex for PQIndex {
             // Pre-compute distance table for each sub-vector.
             let distances = if this.metric_type == MetricType::L2 {
                 this.fast_l2_distances(&query.key, code.as_ref())?
-            } else {
+            } else if this.metric_type == MetricType::Dot {
+                this.dot_distances(&query.key, code.as_ref())?
+            } else if this.metric_type == MetricType::Cosine {
                 this.cosine_distances(&query.key, code.as_ref())?
+            } else {
+                unreachable!();
             };
 
             debug_assert_eq!(distances.len(), row_ids.len());
