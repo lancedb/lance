@@ -40,6 +40,9 @@ pub struct Manifest {
     /// Dataset version
     pub version: u64,
 
+    /// Version of the writer library that wrote this manifest.
+    pub writer_version: Option<WriterVersion>,
+
     /// Fragments, the pieces to build the dataset.
     pub fragments: Arc<Vec<Fragment>>,
 
@@ -73,6 +76,7 @@ impl Manifest {
         Self {
             schema: schema.clone(),
             version: 1,
+            writer_version: Some(WriterVersion::default()),
             fragments,
             version_aux_data: 0,
             index_section: None,
@@ -93,6 +97,7 @@ impl Manifest {
         Self {
             schema: schema.clone(),
             version: previous.version + 1,
+            writer_version: Some(WriterVersion::default()),
             fragments,
             version_aux_data: 0,
             index_section: None, // Caller should update index if they want to keep them.
@@ -171,6 +176,34 @@ impl Manifest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriterVersion {
+    pub library: String,
+    pub version: String,
+}
+
+impl WriterVersion {
+    /// Try to parse the version string as a semver string. Returns None if
+    /// not successful.
+    pub fn semver(&self) -> Option<(u32, u32, u32, Option<&str>)> {
+        let mut parts = self.version.split('.');
+        let major = parts.next().unwrap_or("0").parse().ok()?;
+        let minor = parts.next().unwrap_or("0").parse().ok()?;
+        let patch = parts.next().unwrap_or("0").parse().ok()?;
+        let tag = parts.next();
+        Some((major, minor, patch, tag))
+    }
+}
+
+impl Default for WriterVersion {
+    fn default() -> Self {
+        Self {
+            library: "lance".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
 impl ProtoStruct for Manifest {
     type Proto = pb::Manifest;
 }
@@ -182,9 +215,17 @@ impl From<pb::Manifest> for Manifest {
             let nanos = ts.nanos as u128;
             sec + nanos
         });
+        // We only use the writer version if it is fully set.
+        let writer_version = match p.writer_version {
+            Some(pb::manifest::WriterVersion { library, version }) => {
+                Some(WriterVersion { library, version })
+            }
+            _ => None,
+        };
         Self {
             schema: Schema::from((&p.fields, p.metadata)),
             version: p.version,
+            writer_version,
             fragments: Arc::new(p.fragments.iter().map(Fragment::from).collect()),
             version_aux_data: p.version_aux_data as usize,
             index_section: p.index_section.map(|i| i as usize),
@@ -218,6 +259,13 @@ impl From<&Manifest> for pb::Manifest {
         Self {
             fields,
             version: m.version,
+            writer_version: m
+                .writer_version
+                .as_ref()
+                .map(|wv| pb::manifest::WriterVersion {
+                    library: wv.library.clone(),
+                    version: wv.version.clone(),
+                }),
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
             metadata,
             version_aux_data: m.version_aux_data as u64,
@@ -229,5 +277,26 @@ impl From<&Manifest> for pb::Manifest {
             max_fragment_id: m.max_fragment_id,
             transaction_file: m.transaction_file.clone().unwrap_or_default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_writer_version() {
+        let wv = WriterVersion::default();
+        assert_eq!(wv.library, "lance");
+        assert_eq!(wv.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            wv.semver(),
+            Some((
+                env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
+                env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
+                env!("CARGO_PKG_VERSION_PATCH").parse().unwrap(),
+                None
+            ))
+        );
     }
 }
