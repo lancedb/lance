@@ -15,18 +15,15 @@
 //! Floats Array
 
 use std::iter::Sum;
-use std::sync::Arc;
 use std::{
     fmt::Formatter,
     ops::{AddAssign, DivAssign},
 };
 
 use arrow_array::{
-    new_empty_array,
     types::{Float16Type, Float32Type, Float64Type},
-    Array, ArrayRef, Float16Array, Float32Array, Float64Array,
+    Array, Float16Array, Float32Array, Float64Array,
 };
-use arrow_schema::DataType;
 use half::{bf16, f16};
 use num_traits::{AsPrimitive, Bounded, Float, FromPrimitive};
 

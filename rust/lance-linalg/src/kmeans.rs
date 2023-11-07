@@ -16,9 +16,7 @@ use std::cmp::min;
 use std::sync::Arc;
 use std::vec;
 
-use arrow_array::{
-    cast::AsArray, Array, ArrowNumericType, ArrowPrimitiveType, FixedSizeListArray, Float32Array,
-};
+use arrow_array::{Array, FixedSizeListArray};
 use arrow_schema::ArrowError;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
@@ -28,13 +26,12 @@ use rand::prelude::*;
 use rand::Rng;
 use tracing::instrument;
 
-use crate::distance::norm_l2;
 use crate::kernels::argmin_value_float;
 use crate::{
     distance::{
         dot_distance,
         l2::{l2, l2_distance_batch, L2},
-        Cosine, Dot, MetricType, Normalize,
+        norm_l2, Cosine, Dot, MetricType,
     },
     kernels::{argmin, argmin_value},
     matrix::MatrixView,

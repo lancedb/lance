@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use arrow_array::types::Float32Type;
 use arrow_array::{builder::Float32Builder, FixedSizeListArray, Float32Array};
 use lance_arrow::FixedSizeListArrayExt;
 use log::info;
@@ -73,6 +74,6 @@ pub async fn train_kmeans(
         ..Default::default()
     };
     let data = FixedSizeListArray::try_new_from_values(data, dimension as i32)?;
-    let model = KMeans::new_with_params(&data, k, &params).await?;
+    let model = KMeans::<Float32Type>::new_with_params(&data, k, &params).await?;
     Ok(model.centroids.as_ref().clone())
 }
