@@ -146,18 +146,9 @@ impl Fragment {
 
     pub fn num_rows(&self) -> Option<usize> {
         match (self.physical_rows, &self.deletion_file) {
-            // Unknown fragment length
-            (None, _) => None,
             // Known fragment length, no deletion file.
             (Some(len), None) => Some(len),
             // Known fragment length, but don't know deletion file size.
-            (
-                _,
-                Some(DeletionFile {
-                    num_deleted_rows: None,
-                    ..
-                }),
-            ) => None,
             (
                 Some(len),
                 Some(DeletionFile {
@@ -165,6 +156,7 @@ impl Fragment {
                     ..
                 }),
             ) => Some(len - num_deleted_rows),
+            _ => None,
         }
     }
 
