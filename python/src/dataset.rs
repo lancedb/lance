@@ -789,6 +789,11 @@ impl Dataset {
             uri: dataset_uri.to_string(),
         })
     }
+
+    fn validate(&self) -> PyResult<()> {
+        RT.block_on(None, self.ds.validate())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
 }
 
 impl Dataset {
