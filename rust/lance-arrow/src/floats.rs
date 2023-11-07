@@ -22,7 +22,7 @@ use arrow_array::{
     Array, Float16Array, Float32Array, Float64Array,
 };
 use half::{bf16, f16};
-use num_traits::{Bounded, Float, FromPrimitive};
+use num_traits::{AsPrimitive, Bounded, Float, FromPrimitive};
 
 use super::bfloat16::{BFloat16Array, BFloat16Type};
 
@@ -52,7 +52,7 @@ impl std::fmt::Display for FloatType {
 /// Trait for float types used in Arrow Array.
 ///
 pub trait ArrowFloatType {
-    type Native: Float + FromPrimitive + AddAssign<Self::Native>;
+    type Native: FromPrimitive + FloatToArrayType;
 
     const FLOAT_TYPE: FloatType;
 
@@ -60,7 +60,7 @@ pub trait ArrowFloatType {
     type ArrayType: FloatArray<Self>;
 }
 
-pub trait FloatToArrayType: Float + Bounded + Sum + AddAssign {
+pub trait FloatToArrayType: Float + Bounded + Sum + AddAssign<Self> + AsPrimitive<f64> {
     type ArrowType: ArrowFloatType<Native = Self>;
 }
 
