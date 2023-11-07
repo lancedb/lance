@@ -1,5 +1,5 @@
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 
 [profile.release-with-debug]
@@ -30,4 +30,4 @@ rustflags = [
 rustflags = ["-C", "target-cpu=haswell", "-C", "target-feature=+avx2,+fma,+f16c"]
 
 [target.aarch64-apple-darwin]
-rustflags = ["-C", "target-cpu=apple-m1", "-C", "target-feature=+neon,+fp16"]
+rustflags = ["-C", "target-cpu=apple-m1", "-C", "target-feature=+neon,+fp16,+fhm"]
