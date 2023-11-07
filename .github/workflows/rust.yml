@@ -99,6 +99,30 @@ jobs:
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Run clippy
         run: cargo clippy --features cli,dynamodb,tensorflow,dynamodb_tests --tests -- -D warnings
+  check-publish:
+    # Do a dry run of release to ensure we haven't broken anything that would
+    # prevent publication.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ./rust
+    steps:
+      - uses: actions/checkout@v3
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - uses: katyo/publish-crates@v2
+        with:
+          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          args: '--all-features'
+          path: ./rust
+          check-repo: false
+          dry-run: true
   mac-build:
     runs-on: macos-13
     timeout-minutes: 45
