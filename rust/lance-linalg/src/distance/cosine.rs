@@ -72,6 +72,20 @@ where
     {
         cosine_scalar_fast(x, x_norm, y, y_norm)
     }
+
+    fn cosine_batch<'a>(
+        x: &'a [Self::Native],
+        batch: &'a [Self::Native],
+        dimension: usize,
+    ) -> Box<dyn Iterator<Item = Self::Native> + 'a> {
+        let x_norm = norm_l2(x);
+
+        Box::new(
+            batch
+                .chunks_exact(dimension)
+                .map(move |y| Self::cosine_fast(x, x_norm, y)),
+        )
+    }
 }
 
 impl Cosine for BFloat16Type {}
@@ -134,6 +148,32 @@ impl Cosine for Float32Type {
         }
         let xy = xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &y[aligned_len..]);
         1.0 - xy / x_norm / y_norm
+    }
+
+    fn cosine_batch<'a>(
+        x: &'a [Self::Native],
+        batch: &'a [Self::Native],
+        dimension: usize,
+    ) -> Box<dyn Iterator<Item = Self::Native> + 'a> {
+        let x_norm = norm_l2(x);
+
+        match dimension {
+            8 => Box::new(
+                batch
+                    .chunks_exact(dimension)
+                    .map(move |y| f32::cosine_once::<f32x8, 8>(x, x_norm, y)),
+            ),
+            16 => Box::new(
+                batch
+                    .chunks_exact(dimension)
+                    .map(move |y| f32::cosine_once::<f32x16, 16>(x, x_norm, y)),
+            ),
+            _ => Box::new(
+                batch
+                    .chunks_exact(dimension)
+                    .map(move |y| Self::cosine_fast(x, x_norm, y)),
+            ),
+        }
     }
 }
 
@@ -214,30 +254,15 @@ mod f32 {
 /// -------
 /// An iterator of pair-wise cosine distance between from vector to each vector in the batch.
 ///
-pub fn cosine_distance_batch<'a>(
-    from: &'a [f32],
-    batch: &'a [f32],
+pub fn cosine_distance_batch<'a, T: FloatToArrayType>(
+    from: &'a [T],
+    batch: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = f32> + 'a> {
-    let x_norm = norm_l2(from);
-
-    match dimension {
-        8 => Box::new(
-            batch
-                .chunks_exact(dimension)
-                .map(move |y| f32::cosine_once::<f32x8, 8>(from, x_norm, y)),
-        ),
-        16 => Box::new(
-            batch
-                .chunks_exact(dimension)
-                .map(move |y| f32::cosine_once::<f32x16, 16>(from, x_norm, y)),
-        ),
-        _ => Box::new(
-            batch
-                .chunks_exact(dimension)
-                .map(move |y| Float32Type::cosine_fast(from, x_norm, y)),
-        ),
-    }
+) -> Box<dyn Iterator<Item = T> + 'a>
+where
+    T::ArrowType: Cosine,
+{
+    T::ArrowType::cosine_batch(from, batch, dimension)
 }
 
 /// Compute Cosine distance between a vector and a batch of vectors.
