@@ -22,7 +22,7 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
-use lance_arrow::FloatToArrayType;
+use lance_arrow::{ArrowFloatType, FloatToArrayType};
 use log::{info, warn};
 use num_traits::{AsPrimitive, Float};
 use rand::prelude::*;
@@ -673,12 +673,15 @@ where
 }
 
 #[inline]
-pub fn compute_partitions(
-    centroids: &[f32],
-    data: &[f32],
+pub fn compute_partitions<T: ArrowFloatType>(
+    centroids: &[T::Native],
+    data: &[T::Native],
     dimension: usize,
     metric_type: MetricType,
-) -> Vec<u32> {
+) -> Vec<u32>
+where
+    <T::Native as FloatToArrayType>::ArrowType: Dot + Cosine + L2,
+{
     match metric_type {
         MetricType::L2 => compute_partitions_l2(centroids, data, dimension)
             .map(|(c, _)| c)
