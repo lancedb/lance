@@ -89,7 +89,7 @@ impl Normalize<f64> for &[f64] {
 /// The parameters must be cache line aligned. For example, from
 /// Arrow Arrays, i.e., Float32Array
 #[inline]
-pub fn norm_l2<T: Real + Sum>(vector: &[T]) -> T {
+pub fn norm_l2<T: Float + Sum>(vector: &[T]) -> T {
     const LANES: usize = 16;
     let chunks = vector.chunks_exact(LANES);
     let sum = if chunks.remainder().is_empty() {
