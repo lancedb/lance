@@ -40,6 +40,7 @@ impl Normalize<f16> for &[f16] {
             // No explict f16c CVT instructions available in [std::arch::aarch64].
             // So, we convert to f32 manually and then back to f16.
             // This is about 40% faster than the scalar implementation on a M2 Macbook Pro.
+            // Sadly, more than half the time is do element-wise load and cvt f16 -> f32.
             //
             // Please run `cargo bench --bench norm_l2" on Apple Silicon when
             // change the following code.
