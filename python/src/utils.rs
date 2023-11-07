@@ -15,7 +15,9 @@
 use std::sync::Arc;
 
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
-use arrow_array::{cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array};
+use arrow_array::{
+    cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array, UInt32Array,
+};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
 use lance_arrow::FixedSizeListArrayExt;
@@ -41,7 +43,7 @@ pub struct KMeans {
     max_iters: u32,
 
     /// A trained KMean model. This is set after calling `fit`.
-    trained_kmeans: Option<LanceKMeans>,
+    trained_kmeans: Option<LanceKMeans<Float32Type>>,
 }
 
 #[pymethods]
