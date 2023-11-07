@@ -72,14 +72,6 @@ impl Normalize<f16> for &[f16] {
     }
 }
 
-pub fn norm_l2_f16(x: &[f16]) -> f16 {
-    x.norm_l2()
-}
-
-pub fn norm_l2_f32(x: &[f32]) -> f32 {
-    norm_l2(&x)
-}
-
 impl Normalize<bf16> for &[bf16] {
     type Output = bf16;
 
