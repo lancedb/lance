@@ -139,7 +139,7 @@ where
     dimension: usize,
 
     /// Cluster Id and distances for each vector.
-    pub cluster_id_and_distances: Vec<(u32, f32)>,
+    pub cluster_id_and_distances: Vec<(u32, T::Native)>,
 
     /// Number of centroids.
     k: usize,
