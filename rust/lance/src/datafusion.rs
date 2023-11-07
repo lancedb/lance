@@ -16,4 +16,5 @@
 //!
 
 pub(crate) mod logical_expr;
+pub(crate) mod logical_plan;
 pub(crate) mod physical_expr;
