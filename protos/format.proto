@@ -64,6 +64,22 @@ message Manifest {
   // Schema metadata.
   map<string, bytes> metadata = 5;
 
+  message WriterVersion {
+    // The name of the library that created this file.
+    string library = 1;
+    // The version of the library that created this file. Because we cannot assume
+    // that the library is semantically versioned, this is a string. However, if it
+    // is semantically versioned, it should be a valid semver string without any 'v'
+    // prefix. For example: `2.0.0`, `2.0.0-rc.1`.
+    string version = 2;
+  }
+
+  // The version of the writer that created this file.
+  //
+  // This information may be used to detect whether the file may have known bugs
+  // associated with that writer.
+  WriterVersion writer_version = 13;
+
   // If presented, the file position of the index metadata.
   optional uint64 index_section = 6;
 
