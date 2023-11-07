@@ -16,12 +16,17 @@
 //!
 
 use std::iter::Sum;
+use std::ops::AddAssign;
 use std::sync::Arc;
 
-use crate::distance::l2::f32::l2_once;
-use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
+use arrow_array::{
+    cast::AsArray,
+    types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type},
+    Array, ArrowNumericType, FixedSizeListArray, PrimitiveArray,
+};
 use half::{bf16, f16};
-use num_traits::real::Real;
+use lance_arrow::{bfloat16::BFloat16Type, ArrowFloatType, FloatToArrayType};
+use num_traits::Float;
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -30,60 +35,92 @@ use crate::simd::{
 
 /// Calculate the L2 distance between two vectors.
 ///
-pub trait L2 {
-    type Output;
-
+pub trait L2: ArrowFloatType {
     /// Calculate the L2 distance between two vectors.
-    fn l2(&self, other: &Self) -> Self::Output;
+    fn l2(x: &[Self::Native], y: &[Self::Native]) -> Self::Native;
+
+    fn l2_batch<'a>(
+        x: &'a [Self::Native],
+        y: &'a [Self::Native],
+        dimension: usize,
+    ) -> Box<dyn Iterator<Item = Self::Native> + 'a> {
+        Box::new(y.chunks_exact(dimension).map(|v| Self::l2(x, v)))
+    }
+}
+
+#[inline]
+pub fn l2<T: FloatToArrayType>(from: &[T], to: &[T]) -> T
+where
+    T::ArrowType: L2,
+{
+    T::ArrowType::l2(from, to)
 }
 
 /// Calculate the L2 distance between two vectors, using scalar operations.
 ///
-/// Rely on compiler auto-vectorization.
+/// It relies on LLVM for auto-vectorization and unrolling.
+///
+/// This is pub for test/benchmark only. use [l2] instead.
 #[inline]
-fn l2_scalar<T: Real + Sum>(from: &[T], to: &[T]) -> T {
-    from.iter()
-        .zip(to.iter())
-        .map(|(a, b)| (a.sub(*b).powi(2)))
-        .sum::<T>()
+pub fn l2_scalar<T: Float + Sum + AddAssign, const LANES: usize>(from: &[T], to: &[T]) -> T {
+    let x_chunks = from.chunks_exact(LANES);
+    let y_chunks = to.chunks_exact(LANES);
+
+    let s = if !x_chunks.remainder().is_empty() {
+        x_chunks
+            .remainder()
+            .iter()
+            .zip(y_chunks.remainder())
+            .map(|(&x, &y)| {
+                let diff = x - y;
+                diff * diff
+            })
+            .sum()
+    } else {
+        T::zero()
+    };
+
+    let mut sums = [T::zero(); LANES];
+    for (x, y) in x_chunks.zip(y_chunks) {
+        for i in 0..LANES {
+            let diff = x[i] - y[i];
+            sums[i] += diff * diff;
+        }
+    }
+
+    s + sums.iter().copied().sum()
 }
 
-impl L2 for [bf16] {
-    type Output = bf16;
-
+impl L2 for BFloat16Type {
     #[inline]
-    fn l2(&self, other: &[bf16]) -> bf16 {
+    fn l2(x: &[bf16], y: &[bf16]) -> bf16 {
         // TODO: add SIMD support
-        l2_scalar(self, other)
+        l2_scalar::<bf16, 16>(x, y)
     }
 }
 
-impl L2 for [f16] {
-    type Output = f16;
-
+impl L2 for Float16Type {
     #[inline]
-    fn l2(&self, other: &[f16]) -> f16 {
+    fn l2(x: &[f16], y: &[f16]) -> f16 {
         // TODO: add SIMD support
-        l2_scalar(self, other)
+        l2_scalar::<f16, 16>(x, y)
     }
 }
 
-impl L2 for [f32] {
-    type Output = f32;
-
+impl L2 for Float32Type {
     #[inline]
-    fn l2(&self, other: &[f32]) -> f32 {
-        let len = self.len();
+    fn l2(x: &[f32], y: &[f32]) -> f32 {
+        let len = x.len();
         if len % 16 == 0 {
             // Likely
-            let dim = self.len();
+            let dim = x.len();
             let mut sum = f32x16::zeros();
 
             for i in (0..dim).step_by(16) {
                 unsafe {
-                    let mut x = f32x16::load_unaligned(self.as_ptr().add(i));
+                    let mut x = f32x16::load_unaligned(x.as_ptr().add(i));
 
-                    let y = f32x16::load_unaligned(other.as_ptr().add(i));
+                    let y = f32x16::load_unaligned(y.as_ptr().add(i));
                     x -= y;
                     sum.multiply_add(x, x);
                 }
@@ -93,8 +130,8 @@ impl L2 for [f32] {
             let mut sum = f32x8::zeros();
             for i in (0..len).step_by(8) {
                 unsafe {
-                    let mut x = f32x8::load_unaligned(self.as_ptr().add(i));
-                    let y = f32x8::load_unaligned(other.as_ptr().add(i));
+                    let mut x = f32x8::load_unaligned(x.as_ptr().add(i));
+                    let y = f32x8::load_unaligned(y.as_ptr().add(i));
                     x -= y;
                     sum.multiply_add(x, x);
                 }
@@ -102,34 +139,43 @@ impl L2 for [f32] {
             sum.reduce_sum()
         } else {
             // Fallback to scalar
-            l2_scalar(self, other)
+            l2_scalar::<f32, 16>(x, y)
+        }
+    }
+
+    fn l2_batch<'a>(
+        x: &'a [Self::Native],
+        y: &'a [Self::Native],
+        dimension: usize,
+    ) -> Box<dyn Iterator<Item = Self::Native> + 'a> {
+        use self::f32::l2_once;
+        // Dispatch based on the dimension.
+        match dimension {
+            8 => Box::new(
+                y.chunks_exact(dimension)
+                    .map(move |v| l2_once::<f32x8, 8>(x, v)),
+            ),
+            16 => Box::new(
+                y.chunks_exact(dimension)
+                    .map(move |v| l2_once::<f32x16, 16>(x, v)),
+            ),
+            _ => Box::new(y.chunks_exact(dimension).map(|v| Self::l2(x, v))),
         }
     }
 }
 
-impl L2 for Float32Array {
-    type Output = f32;
-
+impl L2 for Float64Type {
     #[inline]
-    fn l2(&self, other: &Self) -> f32 {
-        self.values().l2(other.values())
-    }
-}
-
-impl L2 for [f64] {
-    type Output = f64;
-
-    #[inline]
-    fn l2(&self, other: &[f64]) -> f64 {
+    fn l2(x: &[f64], y: &[f64]) -> f64 {
         // TODO: add SIMD support
-        l2_scalar(self, other)
+        l2_scalar::<f64, 8>(x, y)
     }
 }
 
 /// Compute L2 distance between two vectors.
 #[inline]
 pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
-    from.l2(to)
+    Float32Type::l2(from, to)
 }
 
 // f32 kernels for L2
@@ -158,26 +204,18 @@ mod f32 {
 /// Returns
 ///
 /// An iterator of pair-wise distance between `from` vector to each vector in the batch.
-pub fn l2_distance_batch<'a>(
-    from: &'a [f32],
-    to: &'a [f32],
+pub fn l2_distance_batch<'a, T: FloatToArrayType>(
+    from: &'a [T],
+    to: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = f32> + 'a> {
+) -> Box<dyn Iterator<Item = T> + 'a>
+where
+    T::ArrowType: L2,
+{
     debug_assert_eq!(from.len(), dimension);
     debug_assert_eq!(to.len() % dimension, 0);
 
-    // Dispatch based on the dimension.
-    match dimension {
-        8 => Box::new(
-            to.chunks_exact(dimension)
-                .map(move |v| l2_once::<f32x8, 8>(from, v)),
-        ),
-        16 => Box::new(
-            to.chunks_exact(dimension)
-                .map(move |v| l2_once::<f32x16, 16>(from, v)),
-        ),
-        _ => Box::new(to.chunks_exact(dimension).map(|v| from.l2(v))),
-    }
+    Box::new(T::ArrowType::l2_batch(from, to, dimension))
 }
 
 /// Compute L2 distance between a vector and a batch of vectors.
@@ -192,15 +230,25 @@ pub fn l2_distance_batch<'a>(
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
-pub fn l2_distance_arrow_batch(from: &[f32], to: &FixedSizeListArray) -> Arc<Float32Array> {
+pub fn l2_distance_arrow_batch<T: ArrowNumericType>(
+    from: &[<T as ArrowPrimitiveType>::Native],
+    to: &FixedSizeListArray,
+) -> Arc<PrimitiveArray<T>>
+where
+    <T as ArrowPrimitiveType>::Native: FloatToArrayType,
+    <<T as ArrowPrimitiveType>::Native as FloatToArrayType>::ArrowType: L2,
+{
     let dimension = to.value_length() as usize;
     debug_assert_eq!(from.len(), dimension);
 
     // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values = to.values().as_primitive::<Float32Type>().values();
-    let dists = to_values.chunks_exact(dimension).map(|v| from.l2(v));
+    let to_values = to.values().as_primitive::<T>().values();
+    let dists = l2_distance_batch(from, to_values, dimension);
 
-    Arc::new(Float32Array::new(dists.collect(), to.nulls().cloned()))
+    Arc::new(PrimitiveArray::<T>::new(
+        dists.collect(),
+        to.nulls().cloned(),
+    ))
 }
 
 #[cfg(test)]
@@ -208,7 +256,7 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
-    use arrow_array::{cast::AsArray, types::Float32Type, FixedSizeListArray};
+    use arrow_array::Float32Array;
 
     #[test]
     fn test_euclidean_distance() {

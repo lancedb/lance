@@ -64,7 +64,7 @@ impl DistanceType {
     /// Returns the distance function between two vectors.
     pub fn func(&self) -> DistanceFunc {
         match self {
-            Self::L2 => l2_distance,
+            Self::L2 => l2::<f32>,
             Self::Cosine => cosine_distance,
             Self::Dot => dot_distance,
         }
