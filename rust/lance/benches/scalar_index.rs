@@ -5,7 +5,7 @@ use arrow_array::{
     RecordBatchReader,
 };
 use criterion::{criterion_group, criterion_main, Criterion};
-use datafusion_common::ScalarValue;
+use datafusion::scalar::ScalarValue;
 use futures::{stream, TryStreamExt};
 use lance::{
     io::{object_store::ObjectStoreParams, ObjectStore},
