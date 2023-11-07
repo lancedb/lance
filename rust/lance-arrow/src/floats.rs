@@ -15,12 +15,18 @@
 //! Floats Array
 
 use std::iter::Sum;
-use std::{fmt::Formatter, ops::AddAssign};
+use std::sync::Arc;
+use std::{
+    fmt::Formatter,
+    ops::{AddAssign, DivAssign},
+};
 
 use arrow_array::{
+    new_empty_array,
     types::{Float16Type, Float32Type, Float64Type},
-    Array, Float16Array, Float32Array, Float64Array,
+    Array, ArrayRef, Float16Array, Float32Array, Float64Array,
 };
+use arrow_schema::DataType;
 use half::{bf16, f16};
 use num_traits::{AsPrimitive, Bounded, Float, FromPrimitive};
 
@@ -58,9 +64,16 @@ pub trait ArrowFloatType {
 
     /// Arrow Float Array Type.
     type ArrayType: FloatArray<Self>;
+
+    /// Returns empty array of this type.
+    fn empty_array() -> Self::ArrayType {
+        Vec::<Self::Native>::new().into()
+    }
 }
 
-pub trait FloatToArrayType: Float + Bounded + Sum + AddAssign<Self> + AsPrimitive<f64> {
+pub trait FloatToArrayType:
+    Float + Bounded + Sum + AddAssign<Self> + AsPrimitive<f64> + DivAssign + Send + Sync + Copy
+{
     type ArrowType: ArrowFloatType<Native = Self>;
 }
 

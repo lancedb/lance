@@ -17,10 +17,9 @@ use std::sync::Arc;
 use std::vec;
 
 use arrow_array::{
-    cast::AsArray, new_empty_array, types::Float32Type, Array, ArrowNumericType,
-    ArrowPrimitiveType, FixedSizeListArray, Float32Array,
+    cast::AsArray, Array, ArrowNumericType, ArrowPrimitiveType, FixedSizeListArray, Float32Array,
 };
-use arrow_schema::{ArrowError, DataType};
+use arrow_schema::ArrowError;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 use log::{info, warn};
@@ -51,13 +50,13 @@ pub enum KMeanInit {
 
 /// KMean Training Parameters
 #[derive(Debug)]
-pub struct KMeansParams {
+pub struct KMeansParams<T: ArrowFloatType> {
     /// Max number of iterations.
     pub max_iters: u32,
 
     /// When the difference of mean distance to the centroids is less than this `tolerance`
     /// threshold, stop the training.
-    pub tolerance: f32,
+    pub tolerance: f64,
 
     /// Run kmeans multiple times and pick the best (balanced) one.
     pub redos: usize,
@@ -70,10 +69,10 @@ pub struct KMeansParams {
 
     /// Centroids to continuous training. If present, it will continuously train
     /// from the given centroids. If None, it will initialize centroids via init method.
-    pub centroids: Option<Arc<Float32Array>>,
+    pub centroids: Option<Arc<T::ArrayType>>,
 }
 
-impl Default for KMeansParams {
+impl<T: ArrowFloatType> Default for KMeansParams<T> {
     fn default() -> Self {
         Self {
             max_iters: 50,
@@ -188,8 +187,11 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
         })
     }
 
-    fn distance_sum(&self) -> f32 {
-        self.cluster_id_and_distances.iter().map(|(_, d)| d).sum()
+    fn distance_sum(&self) -> f64 {
+        self.cluster_id_and_distances
+            .iter()
+            .map(|(_, d)| d.as_())
+            .sum::<f64>()
     }
 
     /// Returns how many data points are here
@@ -224,9 +226,8 @@ where
     T: L2 + Dot + Cosine,
 {
     fn empty(k: usize, dimension: usize, metric_type: MetricType) -> Self {
-        let empty_array = new_empty_array(&DataType::Float32);
         Self {
-            centroids: Arc::new(empty_array.as_primitive().clone()),
+            centroids: T::empty_array().into(),
             dimension,
             k,
             metric_type,
@@ -262,7 +263,14 @@ where
         metric_type: MetricType,
         rng: impl Rng,
     ) -> Result<Self> {
-        kmeans_random_init(&data.data(), data.num_columns(), k, rng, metric_type).await
+        kmeans_random_init(
+            data.data().as_ref(),
+            data.num_columns(),
+            k,
+            rng,
+            metric_type,
+        )
+        .await
     }
 
     /// Train a KMeans model on data with `k` clusters.
@@ -279,7 +287,7 @@ where
     pub async fn new_with_params(
         data: &FixedSizeListArray,
         k: usize,
-        params: &KMeansParams,
+        params: &KMeansParams<T>,
     ) -> Result<Self> {
         let dimension = data.value_length() as usize;
         let n = data.len();
@@ -298,15 +306,22 @@ where
                 data.value_type()
             )));
         }
-        let values: &Float32Array = data.values().as_primitive();
 
+        let data = data
+            .values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or(Error::InvalidArgumentError(format!(
+                "KMeans: data must be floating number, got: {}",
+                data.value_type()
+            )))?;
+
+        let mat = MatrixView::<T>::new(Arc::new(data.clone()), dimension);
         // TODO: refactor kmeans to work with reference instead of Arc?
-        let data = Arc::new(values.clone());
         let mut best_kmeans = Self::empty(k, dimension, params.metric_type);
-        let mut best_stddev = T::Native::max_value();
+        let mut best_stddev = f32::MAX;
 
         let rng = rand::rngs::SmallRng::from_entropy();
-        let mat = MatrixView::new(data.clone(), dimension);
         for redo in 1..=params.redos {
             let mut kmeans = if let Some(centroids) = params.centroids.as_ref() {
                 // Use existing centroids.
@@ -322,8 +337,8 @@ where
                 }
             };
 
-            let mut dist_sum = T::Native::max_value();
-            let mut stddev = T::Native::max_value();
+            let mut dist_sum = f64::MAX;
+            let mut stddev = f32::MAX;
             for i in 1..=params.max_iters {
                 if i % 10 == 0 {
                     info!(
@@ -429,7 +444,7 @@ where
                     let data = tokio::task::spawn_blocking(move || {
                         let last_idx = min(start_idx + CHUNK_SIZE, n);
 
-                        let centroids_array = centroids.values();
+                        let centroids_array = centroids.as_slice();
                         let values = &data.as_slice()[start_idx * dimension..last_idx * dimension];
 
                         if metric_type == MetricType::L2 {
@@ -453,7 +468,7 @@ where
                                             argmin_value(
                                                 centroid_stream.zip(centroid_norms.iter()).map(
                                                     |(cent, &cent_norm)| {
-                                                        Float32Type::cosine_with_norms(
+                                                        T::cosine_with_norms(
                                                             cent, cent_norm, norm_vec, vector,
                                                         )
                                                     },
@@ -463,9 +478,7 @@ where
                                             argmin_value(
                                                 centroid_stream.zip(centroid_norms.iter()).map(
                                                     |(cent, &cent_norm)| {
-                                                        Float32Type::cosine_fast(
-                                                            cent, cent_norm, vector,
-                                                        )
+                                                        T::cosine_fast(cent, cent_norm, vector)
                                                     },
                                                 ),
                                             )
