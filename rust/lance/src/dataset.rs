@@ -220,6 +220,36 @@ impl Dataset {
         .await
     }
 
+    pub async fn open_with_storage_options(
+        uri: impl AsRef<str>,
+        storage_options: HashMap<String, String>,
+    ) -> Result<Self> {
+        let uri = uri.as_ref();
+        let uri = url::Url::parse(uri).unwrap();
+        let object_store = ObjectStore::try_new(uri, storage_options).await?;
+        let base_path = object_store.base_path();
+
+        let latest_manifest = object_store
+            .commit_handler
+            .resolve_latest_version(base_path, &object_store.inner)
+            .await
+            .map_err(|e| Error::DatasetNotFound {
+                path: base_path.to_string(),
+                source: Box::new(e),
+                location: location!(),
+            })?;
+
+        let session = Arc::new(Session::default());
+
+        Self::checkout_manifest(
+            Arc::new(object_store.clone()),
+            base_path.clone(),
+            &latest_manifest,
+            session,
+        )
+        .await
+    }
+
     /// Check out a version of the dataset.
     pub async fn checkout(uri: &str, version: u64) -> Result<Self> {
         let params = ReadParams::default();

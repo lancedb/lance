@@ -17,6 +17,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path as StdPath;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -27,7 +28,10 @@ use aws_credential_types::provider::ProvideCredentials;
 use chrono::{DateTime, Utc};
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use http::header::{HeaderMap, CACHE_CONTROL};
-use object_store::aws::AwsCredential as ObjectStoreAwsCredential;
+use object_store::aws::{AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential};
+use object_store::azure::AzureConfigKey;
+use object_store::gcp::GoogleConfigKey;
+use object_store::parse_url_opts;
 use object_store::{
     aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
     local::LocalFileSystem, memory::InMemory, ClientOptions, CredentialProvider,
@@ -451,6 +455,31 @@ impl ObjectStore {
         ))
     }
 
+    fn new_from_path(
+        str_path: &str,
+        commit_handler: Option<Arc<dyn CommitHandler>>,
+    ) -> Result<(Self, Path)> {
+        let expanded = tilde(str_path).to_string();
+        let expanded_path = StdPath::new(&expanded);
+
+        if !expanded_path.try_exists()? {
+            std::fs::create_dir_all(expanded_path)?;
+        }
+
+        let expanded_path = expanded_path.canonicalize()?;
+
+        Ok((
+            Self {
+                inner: Arc::new(LocalFileSystem::new()).traced(),
+                scheme: String::from("file"),
+                base_path: Path::from_absolute_path(&expanded_path)?,
+                block_size: 4 * 1024, // 4KB block size
+                commit_handler: commit_handler.unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+            },
+            Path::from_filesystem_path(&expanded_path)?,
+        ))
+    }
+
     async fn new_from_url(mut url: Url, params: &ObjectStoreParams) -> Result<Self> {
         // Block size: On local file systems, we use 4KB block size. On cloud
         // object stores, we use 64KB block size. This is generally the largest
@@ -745,6 +774,207 @@ impl ObjectStore {
     /// Get file size.
     pub async fn size(&self, path: &Path) -> Result<usize> {
         Ok(self.inner.head(path).await?.size)
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct StorageOptions(pub HashMap<String, String>);
+
+impl StorageOptions {
+    /// Create a new instance of [`StorageOptions`]
+    pub fn new(options: HashMap<String, String>) -> Self {
+        let mut options = options;
+        if let Ok(value) = std::env::var("AZURE_STORAGE_ALLOW_HTTP") {
+            options.insert("allow_http".into(), value);
+        }
+        if let Ok(value) = std::env::var("AZURE_STORAGE_USE_HTTP") {
+            options.insert("allow_http".into(), value);
+        }
+        if let Ok(value) = std::env::var("AWS_ALLOW_HTTP") {
+            options.insert("allow_http".into(), value);
+        }
+        Self(options)
+    }
+
+    /// Add values from the environment to storage options
+    pub fn with_env_azure(&mut self) {
+        for (os_key, os_value) in std::env::vars_os() {
+            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
+                if let Ok(config_key) = AzureConfigKey::from_str(&key.to_ascii_lowercase()) {
+                    if !self.0.contains_key(config_key.as_ref()) {
+                        self.0
+                            .insert(config_key.as_ref().to_string(), value.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Add values from the environment to storage options
+    pub fn with_env_gcs(&mut self) {
+        for (os_key, os_value) in std::env::vars_os() {
+            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
+                if let Ok(config_key) = GoogleConfigKey::from_str(&key.to_ascii_lowercase()) {
+                    if !self.0.contains_key(config_key.as_ref()) {
+                        self.0
+                            .insert(config_key.as_ref().to_string(), value.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Add values from the environment to storage options
+    pub fn with_env_s3(&mut self) {
+        for (os_key, os_value) in std::env::vars_os() {
+            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
+                if let Ok(config_key) = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()) {
+                    if !self.0.contains_key(config_key.as_ref()) {
+                        self.0
+                            .insert(config_key.as_ref().to_string(), value.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Denotes if unsecure connections via http are allowed
+    pub fn allow_http(&self) -> bool {
+        self.0.iter().any(|(key, value)| {
+            key.to_ascii_lowercase().contains("allow_http") & str_is_truthy(value)
+        })
+    }
+
+    /// Subset of options relevant for azure storage
+    pub fn as_azure_options(&self) -> HashMap<AzureConfigKey, String> {
+        self.0
+            .iter()
+            .filter_map(|(key, value)| {
+                let az_key = AzureConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
+                Some((az_key, value.clone()))
+            })
+            .collect()
+    }
+
+    /// Subset of options relevant for s3 storage
+    pub fn as_s3_options(&self) -> HashMap<AmazonS3ConfigKey, String> {
+        self.0
+            .iter()
+            .filter_map(|(key, value)| {
+                let s3_key = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
+                Some((s3_key, value.clone()))
+            })
+            .collect()
+    }
+
+    /// Subset of options relevant for gcs storage
+    pub fn as_gcs_options(&self) -> HashMap<GoogleConfigKey, String> {
+        self.0
+            .iter()
+            .filter_map(|(key, value)| {
+                let gcs_key = GoogleConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
+                Some((gcs_key, value.clone()))
+            })
+            .collect()
+    }
+}
+
+pub(crate) fn str_is_truthy(val: &str) -> bool {
+    val.eq_ignore_ascii_case("1")
+        | val.eq_ignore_ascii_case("true")
+        | val.eq_ignore_ascii_case("on")
+        | val.eq_ignore_ascii_case("yes")
+        | val.eq_ignore_ascii_case("y")
+}
+
+impl From<HashMap<String, String>> for StorageOptions {
+    fn from(value: HashMap<String, String>) -> Self {
+        Self::new(value)
+    }
+}
+
+async fn configure_store(
+    url: &Url,
+    options: &mut StorageOptions,
+    commit_handler: Option<Arc<dyn CommitHandler>>,
+) -> Result<ObjectStore> {
+    // Block size: On local file systems, we use 4KB block size. On cloud
+    // object stores, we use 64KB block size. This is generally the largest
+    // block size where we don't see a latency penalty.
+    match url.scheme() {
+        "s3" => {
+            options.with_env_s3();
+
+            let (store, _) = parse_url_opts(url, options.as_azure_options())?;
+            let store = Arc::new(store);
+
+            Ok(ObjectStore {
+                inner: store,
+                scheme: String::from(url.scheme()),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+                commit_handler: commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(UnsafeCommitHandler)),
+            })
+        }
+        "s3+ddb" => {
+            todo!()
+        }
+        "gs" => {
+            options.with_env_gcs();
+
+            let (store, _) = parse_url_opts(url, options.as_azure_options())?;
+            let store = Arc::new(store);
+            Ok(ObjectStore {
+                inner: store,
+                scheme: String::from("gs"),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+                commit_handler: commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+            })
+        }
+        "az" => {
+            options.with_env_azure();
+
+            let (store, _) = parse_url_opts(url, options.as_azure_options())?;
+            let store = Arc::new(store);
+
+            Ok(ObjectStore {
+                inner: store,
+                scheme: String::from("az"),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+                commit_handler: commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+            })
+        }
+        "file" => Ok(ObjectStore::new_from_path(url.path(), commit_handler)?.0),
+        "memory" => Ok(ObjectStore {
+            inner: Arc::new(InMemory::new()).traced(),
+            scheme: String::from("memory"),
+            base_path: Path::from(url.path()),
+            block_size: 64 * 1024,
+            commit_handler: commit_handler
+                .clone()
+                .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+        }),
+        s => Err(Error::IO {
+            message: format!("Unsupported URI scheme: {}", s),
+            location: location!(),
+        }),
+    }
+}
+
+impl ObjectStore {
+    pub async fn try_new(
+        location: Url,
+        options: impl Into<StorageOptions> + Clone,
+    ) -> Result<Self> {
+        let mut options = options.into();
+        configure_store(&location, &mut options, None).await
     }
 }
 
