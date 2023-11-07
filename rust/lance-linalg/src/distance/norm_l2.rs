@@ -43,7 +43,7 @@ impl Normalize<f16> for &[f16] {
             //
             // Please run `cargo bench --bench norm_l2" on Apple Silicon when
             // change the following code.
-            const LANES: usize = 8;
+            const LANES: usize = 4;
             let chunks = self.chunks_exact(LANES);
             let sum = if chunks.remainder().is_empty() {
                 0.0
