@@ -390,7 +390,7 @@ where
 
     async fn train_cosine_once(&self, data: &MatrixView<T>) -> KMeanMembership<T> {
         let norm_data = Some(Arc::new(
-            data.iter().map(|v| norm_l2(v)).collect::<Vec<_>>().into(),
+            data.iter().map(norm_l2).collect::<Vec<_>>().into(),
         ));
         self.compute_membership(data.data().clone(), norm_data)
             .await
@@ -419,7 +419,7 @@ where
                 self.centroids
                     .as_slice()
                     .chunks_exact(dimension)
-                    .map(|centroid| norm_l2(centroid))
+                    .map(norm_l2)
                     .collect::<Vec<_>>(),
             ))
         } else {
