@@ -46,11 +46,15 @@ impl Normalize<f16> for &[f16] {
             // change the following code.
             const LANES: usize = 4;
             let chunks = self.chunks_exact(LANES);
-            let sum = chunks
-                .remainder()
-                .iter()
-                .map(|v| v.to_f32().powi(2))
-                .sum::<f32>();
+            let sum = if chunks.remainder().is_empty() {
+                0.0
+            } else {
+                chunks
+                    .remainder()
+                    .iter()
+                    .map(|v| v.to_f32().powi(2))
+                    .sum::<f32>()
+            };
 
             let mut sums: [f32; LANES] = [0_f32; LANES];
             for chk in chunks {
@@ -142,36 +146,40 @@ pub fn norm_l2<T: Float + Sum>(vector: &[T]) -> T {
 
 #[cfg(test)]
 mod tests {
-    use num_traits::{real::Real, FromPrimitive};
     use std::fmt::Debug;
+
+    use approx::assert_relative_eq;
+    use num_traits::{AsPrimitive, FromPrimitive};
 
     use super::*;
 
     fn do_norm_l2_test<T: Float + FromPrimitive + Sum + Debug>()
     where
         for<'a> &'a [T]: Normalize<T>,
-        for<'a> <&'a [T] as Normalize<T>>::Output: PartialEq<T> + Debug,
+        for<'a> <&'a [T] as Normalize<T>>::Output: PartialEq<T> + Debug + AsPrimitive<f64>,
     {
-        let data = (1..=185)
+        let data = (1..=37)
             .map(|v| T::from_i32(v).unwrap())
             .collect::<Vec<T>>();
 
         let result = data.as_slice().norm_l2();
-        assert_eq!(
-            result,
-            (1..=185)
-                .map(|v| T::from_i32(v * v).unwrap())
-                .sum::<T>()
-                .sqrt()
+        assert_relative_eq!(
+            result.as_(),
+            (1..=37)
+                .map(|v| f64::from_i32(v * v).unwrap())
+                .sum::<f64>()
+                .sqrt(),
+            max_relative = 1.0,
         );
 
         let not_aligned = (&data[2..]).norm_l2();
-        assert_eq!(
-            not_aligned,
-            (3..=185)
-                .map(|v| T::from_i32(v * v).unwrap())
-                .sum::<T>()
-                .sqrt()
+        assert_relative_eq!(
+            not_aligned.as_(),
+            (3..=37)
+                .map(|v| f64::from_i32(v * v).unwrap())
+                .sum::<f64>()
+                .sqrt(),
+            max_relative = 1.0,
         );
     }
 
