@@ -589,7 +589,7 @@ where
 
         for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
             // 4B * 16 * 16 = 1 KB
-            let mut dists = vec![T::zero(); TILE_SIZE * TILE_SIZE];
+            let mut dists = [T::zero(); TILE_SIZE * TILE_SIZE];
             let num_centroids_in_tile = min(TILE_SIZE, num_centroids - centroid_start);
             for s in (0..dim).step_by(STRIPE_SIZE) {
                 // Calculate L2 within each TILE * STRIP
