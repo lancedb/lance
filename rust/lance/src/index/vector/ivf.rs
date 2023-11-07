@@ -1547,13 +1547,14 @@ mod tests {
             .unwrap();
         assert_eq!(1, results.len());
         assert_eq!(5, results[0].num_rows());
+
         for batch in results.iter() {
             let dist = &batch["_distance"];
             assert!(dist
                 .as_primitive::<Float32Type>()
                 .values()
                 .iter()
-                .all(|v| 0.0 > *v && *v >= -2.0 * DIM  as f32));
+                .all(|v| (-2.0 * DIM as f32..0.0).contains(v)));
         }
     }
 }
