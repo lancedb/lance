@@ -515,8 +515,9 @@ impl Dataset {
         Ok(())
     }
 
-    fn count_deleted_rows(&self) -> usize {
-        self.ds.count_deleted_rows()
+    fn count_deleted_rows(&self) -> PyResult<usize> {
+        RT.block_on(None, self.ds.count_deleted_rows())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
     fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
@@ -704,8 +705,9 @@ impl Dataset {
         self.ds.count_fragments()
     }
 
-    fn num_small_files(&self, max_rows_per_group: usize) -> usize {
-        self.ds.num_small_files(max_rows_per_group)
+    fn num_small_files(&self, max_rows_per_group: usize) -> PyResult<usize> {
+        RT.block_on(None, self.ds.num_small_files(max_rows_per_group))
+            .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
     fn get_fragments(self_: PyRef<'_, Self>) -> PyResult<Vec<FileFragment>> {

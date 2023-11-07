@@ -154,15 +154,16 @@ pub(crate) async fn commit_new_dataset(
 ///
 /// Fields such as `physical_rows` and `num_deleted_rows` may not have been
 /// in older datasets. To bring these old manifests up-to-date, we add them here.
+///
+/// To force recomputation of statistics (such as `physical_rows`), set `recompute_stats` to true.
 async fn migrate_manifest(dataset: &Dataset, manifest: &mut Manifest) -> Result<()> {
     if manifest.fragments.iter().all(|f| {
-        f.physical_rows > 0
-            && (f.deletion_file.is_none()
-                || f.deletion_file
-                    .as_ref()
-                    .map(|d| d.num_deleted_rows)
-                    .unwrap_or_default()
-                    > 0)
+        f.physical_rows.is_some()
+            && (f
+                .deletion_file
+                .as_ref()
+                .map(|d| d.num_deleted_rows.is_some())
+                .unwrap_or(true))
     }) {
         return Ok(());
     }
@@ -182,24 +183,25 @@ pub(crate) async fn migrate_fragments(
     let dataset = Arc::new(dataset.clone());
     let new_fragments = futures::stream::iter(fragments)
         .map(|fragment| async {
-            let physical_rows = if fragment.physical_rows == 0 {
-                let file_fragment = FileFragment::new(dataset.clone(), fragment.clone());
-                Either::Left(async move { file_fragment.count_rows().await })
+            let physical_rows = if let Some(physical_rows) = fragment.physical_rows {
+                Either::Right(futures::future::ready(Ok(physical_rows)))
             } else {
-                Either::Right(futures::future::ready(Ok(fragment.physical_rows)))
+                let file_fragment = FileFragment::new(dataset.clone(), fragment.clone());
+                Either::Left(async move { file_fragment.physical_rows().await })
             };
             let num_deleted_rows = match &fragment.deletion_file {
-                None => Either::Left(futures::future::ready(Ok(0))),
-                Some(deletion_file) if deletion_file.num_deleted_rows > 0 => {
-                    Either::Left(futures::future::ready(Ok(deletion_file.num_deleted_rows)))
-                }
+                None => Either::Left(futures::future::ready(Ok(None))),
+                Some(DeletionFile {
+                    num_deleted_rows: Some(deleted_rows),
+                    ..
+                }) => Either::Left(futures::future::ready(Ok(Some(*deleted_rows)))),
                 Some(_) => Either::Right(async {
                     let deletion_vector =
                         read_deletion_file(&dataset.base, fragment, dataset.object_store()).await?;
                     if let Some(deletion_vector) = deletion_vector {
-                        Ok(deletion_vector.len())
+                        Ok(Some(deletion_vector.len()))
                     } else {
-                        Ok(0)
+                        Ok(None)
                     }
                 }),
             };
@@ -216,7 +218,7 @@ pub(crate) async fn migrate_fragments(
                 });
 
             Ok::<_, Error>(Fragment {
-                physical_rows,
+                physical_rows: Some(physical_rows),
                 deletion_file,
                 ..fragment.clone()
             })

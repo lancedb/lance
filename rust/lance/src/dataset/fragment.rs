@@ -23,6 +23,7 @@ use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::format::DeletionFile;
 use lance_core::{
     datatypes::Schema,
     io::{
@@ -89,7 +90,7 @@ impl FileFragment {
 
         let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
         let filename = format!("{}.lance", Uuid::new_v4());
-        let mut fragment = Fragment::with_file(id as u64, &filename, &schema, 0);
+        let mut fragment = Fragment::with_file(id as u64, &filename, &schema, None);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
         let mut writer = FileWriter::try_new(
             &object_store,
@@ -107,7 +108,7 @@ impl FileFragment {
             writer.write(&batch).await?;
         }
 
-        fragment.physical_rows = writer.finish().await?;
+        fragment.physical_rows = Some(writer.finish().await?);
 
         progress.complete(&fragment).await?;
 
@@ -120,12 +121,7 @@ impl FileFragment {
         fragment_id: usize,
         physical_rows: Option<usize>,
     ) -> Result<Fragment> {
-        let fragment = Fragment::with_file(
-            fragment_id as u64,
-            filename,
-            schema,
-            physical_rows.unwrap_or_default(),
-        );
+        let fragment = Fragment::with_file(fragment_id as u64, filename, schema, physical_rows);
         Ok(fragment)
     }
 
@@ -202,7 +198,10 @@ impl FileFragment {
     /// Get the number of rows that have been deleted in this fragment.
     pub async fn count_deletions(&self) -> Result<usize> {
         match &self.metadata().deletion_file {
-            Some(f) if f.num_deleted_rows > 0 => Ok(f.num_deleted_rows),
+            Some(DeletionFile {
+                num_deleted_rows: Some(num_deleted),
+                ..
+            }) => Ok(*num_deleted),
             _ => {
                 read_deletion_file(
                     &self.dataset.base,
@@ -227,8 +226,8 @@ impl FileFragment {
             });
         };
 
-        if self.metadata.physical_rows > 0 {
-            return Ok(self.metadata.physical_rows);
+        if let Some(size) = self.metadata.physical_rows {
+            return Ok(size);
         }
 
         // Just open any file. All of them should have same size.
@@ -998,7 +997,7 @@ mod tests {
         assert!(fragment.metadata.deletion_file.is_some());
         assert_eq!(
             fragment.metadata.deletion_file.unwrap().num_deleted_rows,
-            13
+            Some(13)
         );
     }
 

@@ -1180,15 +1180,12 @@ impl Dataset {
         Ok(())
     }
 
-    pub fn count_deleted_rows(&self) -> usize {
-        self.manifest
-            .fragments
-            .iter()
-            .map(|f| match f.deletion_file.as_ref() {
-                Some(d) => d.num_deleted_rows,
-                None => 0,
-            })
-            .sum()
+    pub async fn count_deleted_rows(&self) -> Result<usize> {
+        futures::stream::iter(self.get_fragments())
+            .map(|f| async move { f.count_deletions().await })
+            .buffer_unordered(num_cpus::get() * 4)
+            .try_fold(0, |acc, x| futures::future::ready(Ok(acc + x)))
+            .await
     }
 
     pub(crate) fn object_store(&self) -> &ObjectStore {
@@ -1351,11 +1348,17 @@ impl Dataset {
         }
     }
 
-    pub fn num_small_files(&self, max_rows_per_group: usize) -> usize {
-        self.fragments()
-            .iter()
-            .filter(|f| f.physical_rows < max_rows_per_group)
+    /// Gets the number of files that are so small they don't even have a full
+    /// group. These are considered too small because reading many of them is
+    /// much less efficient than reading a single file because the separate files
+    /// split up what would otherwise be single IO requests into multiple.
+    pub async fn num_small_files(&self, max_rows_per_group: usize) -> usize {
+        futures::stream::iter(self.get_fragments())
+            .map(|f| async move { f.physical_rows().await })
+            .buffered(num_cpus::get() * 4)
+            .try_filter(|row_count| futures::future::ready(*row_count < max_rows_per_group))
             .count()
+            .await
     }
 
     pub async fn validate(&self) -> Result<()> {
@@ -2652,7 +2655,7 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
         assert_eq!(dataset.count_fragments(), 2);
-        assert_eq!(dataset.count_deleted_rows(), 0);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 0);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
         assert!(fragments[0].metadata.deletion_file.is_none());
         assert!(fragments[1].metadata.deletion_file.is_none());
@@ -2670,7 +2673,7 @@ mod tests {
         assert!(fragments[1].metadata.deletion_file.is_some());
 
         // The deletion file should contain 20 rows
-        assert_eq!(dataset.count_deleted_rows(), 20);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 20);
         let store = dataset.object_store().clone();
         let path = Path::from_filesystem_path(test_uri).unwrap();
         // First fragment has 0..10 deleted
@@ -2701,7 +2704,7 @@ mod tests {
         dataset.validate().await.unwrap();
 
         // Verify result
-        assert_eq!(dataset.count_deleted_rows(), 30);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 30);
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
         assert!(fragments[0].metadata.deletion_file.is_some());
@@ -2732,7 +2735,7 @@ mod tests {
 
         // Verify the count_deleted_rows only contains the rows from the first fragment
         // i.e. - deleted_rows from the fragment that has been deleted are not counted
-        assert_eq!(dataset.count_deleted_rows(), 20);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 20);
 
         // Append after delete
         let data = sequence_data(0..100);
@@ -3065,8 +3068,8 @@ mod tests {
         let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
         dataset.validate().await.unwrap();
 
-        assert!(dataset.num_small_files(1024) > 0);
-        assert!(dataset.num_small_files(512) == 0);
+        assert!(dataset.num_small_files(1024).await > 0);
+        assert!(dataset.num_small_files(512).await == 0);
     }
 
     #[tokio::test]

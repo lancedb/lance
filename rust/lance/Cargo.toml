@@ -128,6 +128,10 @@ name = "lq"
 required-features = ["cli"]
 
 [[bench]]
+name = "scalar_index"
+harness = false
+
+[[bench]]
 name = "scan"
 harness = false
 
