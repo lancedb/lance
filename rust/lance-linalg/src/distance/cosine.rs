@@ -20,9 +20,11 @@
 
 use std::sync::Arc;
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Float16Type, Float32Type, Float64Type};
-use arrow_array::{Array, FixedSizeListArray, Float32Array};
+use arrow_array::{
+    cast::AsArray,
+    types::{Float16Type, Float32Type, Float64Type},
+    Array, ArrowNumericType, FixedSizeListArray, PrimitiveArray,
+};
 use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatToArrayType};
 use num_traits::{AsPrimitive, FromPrimitive};
@@ -91,6 +93,25 @@ where
 impl Cosine for BFloat16Type {}
 
 impl Cosine for Float16Type {}
+
+/// f32 kernels for Cosine
+mod f32 {
+    use super::*;
+
+    // TODO: how can we explicity infer N?
+    #[inline]
+    pub(super) fn cosine_once<S: SIMD<f32, N>, const N: usize>(
+        x: &[f32],
+        x_norm: f32,
+        y: &[f32],
+    ) -> f32 {
+        let x = unsafe { S::load_unaligned(x.as_ptr()) };
+        let y = unsafe { S::load_unaligned(y.as_ptr()) };
+        let y2 = y * y;
+        let xy = x * y;
+        1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt()
+    }
+}
 
 impl Cosine for Float32Type {
     #[inline]
@@ -221,24 +242,6 @@ where
     T::ArrowType::cosine(from, to)
 }
 
-mod f32 {
-    use super::*;
-
-    // TODO: how can we explicity infer N?
-    #[inline]
-    pub(super) fn cosine_once<S: SIMD<f32, N>, const N: usize>(
-        x: &[f32],
-        x_norm: f32,
-        y: &[f32],
-    ) -> f32 {
-        let x = unsafe { S::load_unaligned(x.as_ptr()) };
-        let y = unsafe { S::load_unaligned(y.as_ptr()) };
-        let y2 = y * y;
-        let xy = x * y;
-        1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt()
-    }
-}
-
 /// Cosine Distance
 ///
 /// <https://en.wikipedia.org/wiki/Cosine_similarity>
@@ -277,15 +280,25 @@ where
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
-pub fn cosine_distance_arrow_batch(from: &[f32], to: &FixedSizeListArray) -> Arc<Float32Array> {
+pub fn cosine_distance_arrow_batch<T: ArrowNumericType>(
+    from: &[T::Native],
+    to: &FixedSizeListArray,
+) -> Arc<PrimitiveArray<T>>
+where
+    T::Native: FloatToArrayType,
+    <T::Native as FloatToArrayType>::ArrowType: Cosine,
+{
     let dimension = to.value_length() as usize;
     debug_assert_eq!(from.len(), dimension);
 
     // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values = to.values().as_primitive::<Float32Type>().values();
-    let dists = cosine_distance_batch(from, to_values, dimension);
+    let to_values = to.values().as_primitive::<T>().values();
+    let dists = cosine_distance_batch(from, &to_values[..], dimension);
 
-    Arc::new(Float32Array::new(dists.collect(), to.nulls().cloned()))
+    Arc::new(PrimitiveArray::<T>::new(
+        dists.collect(),
+        to.nulls().cloned(),
+    ))
 }
 
 #[cfg(test)]
@@ -293,6 +306,7 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
+    use arrow_array::Float32Array;
 
     fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
         let xy = x
