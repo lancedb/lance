@@ -63,7 +63,7 @@ aws-config = "0.56"
 aws-credential-types = "0.56"
 aws-sdk-dynamodb = "0.34"
 half = { "version" = "=2.3.1", default-features = false, features = [
-    "num-traits",
+    "num-traits", "std",
 ] }
 bytes = "1.4"
 byteorder = "1.5"
