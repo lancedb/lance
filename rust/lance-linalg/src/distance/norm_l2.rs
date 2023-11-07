@@ -40,17 +40,18 @@ impl Normalize<f16> for &[f16] {
             // No explict f16c CVT instructions available in [std::arch::aarch64].
             // So, we convert to f32 manually and then back to f16.
             // This is about 40% faster than the scalar implementation on a M2 Macbook Pro.
-            // Sadly, more than half the time is do element-wise load and cvt f16 -> f32.
+            // Sadly, more than half the time is doing element-wise load and cvt f16 -> f32.
             //
             // Please run `cargo bench --bench norm_l2" on Apple Silicon when
             // change the following code.
             const LANES: usize = 4;
             let chunks = self.chunks_exact(LANES);
-            let sum = if chunks.remainder().is_empty() {
-                0.0
-            } else {
-                chunks.remainder().iter().map(|v| v.to_f32().powi(2)).sum()
-            };
+            let sum = chunks
+                .remainder()
+                .iter()
+                .map(|v| v.to_f32().powi(2))
+                .sum::<f32>();
+
             let mut sums: [f32; LANES] = [0_f32; LANES];
             for chk in chunks {
                 // Convert to f32
