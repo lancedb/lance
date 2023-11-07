@@ -24,10 +24,12 @@ use arrow_schema::{ArrowError, DataType};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::FloatToArrayType;
 use log::{info, warn};
+use num_traits::AsPrimitive;
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 use tracing::instrument;
 
+use crate::distance::norm_l2;
 use crate::kernels::argmin_value_float;
 use crate::{
     distance::{dot_distance, l2_distance_batch, Cosine, Dot, MetricType, Normalize, L2},
@@ -488,8 +490,8 @@ impl KMeans {
                                             argmin_value(
                                                 centroid_stream.zip(centroid_norms.iter()).map(
                                                     |(cent, &cent_norm)| {
-                                                        cent.cosine_with_norms(
-                                                            cent_norm, norm_vec, vector,
+                                                        Float32Type::cosine_with_norms(
+                                                            cent, cent_norm, norm_vec, vector,
                                                         )
                                                     },
                                                 ),
@@ -498,7 +500,9 @@ impl KMeans {
                                             argmin_value(
                                                 centroid_stream.zip(centroid_norms.iter()).map(
                                                     |(cent, &cent_norm)| {
-                                                        cent.cosine_fast(cent_norm, vector)
+                                                        Float32Type::cosine_fast(
+                                                            cent, cent_norm, vector,
+                                                        )
                                                     },
                                                 ),
                                             )
@@ -614,10 +618,18 @@ fn compute_partitions_l2_f32<'a>(
     Box::new(stream)
 }
 
-fn compute_partitions_cosine(centroids: &[f32], data: &[f32], dimension: usize) -> Vec<u32> {
+fn compute_partitions_cosine<T: FloatToArrayType + AsPrimitive<f64>>(
+    centroids: &[T],
+    data: &[T],
+    dimension: usize,
+) -> Vec<u32>
+where
+    T::ArrowType: Cosine,
+    <T as FloatToArrayType>::ArrowType: Dot,
+{
     let centroid_norms = centroids
         .chunks(dimension)
-        .map(|centroid| centroid.norm_l2())
+        .map(|centroid| norm_l2(centroid))
         .collect::<Vec<_>>();
     data.chunks(dimension)
         .map(|row| {
@@ -625,7 +637,7 @@ fn compute_partitions_cosine(centroids: &[f32], data: &[f32], dimension: usize) 
                 centroids
                     .chunks(dimension)
                     .zip(centroid_norms.iter())
-                    .map(|(centroid, &norm)| centroid.cosine_fast(norm, row)),
+                    .map(|(centroid, &norm)| T::ArrowType::cosine_fast(centroid, norm, row)),
             )
             .unwrap()
         })
