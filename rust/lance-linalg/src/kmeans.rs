@@ -88,7 +88,10 @@ impl Default for KMeansParams {
 
 /// KMeans implementation for Apache Arrow Arrays.
 #[derive(Debug, Clone)]
-pub struct KMeans<T: ArrowFloatType> {
+pub struct KMeans<T: ArrowFloatType>
+where
+    T: L2 + Dot + Cosine,
+{
     /// Centroids for each of the k clusters.
     ///
     /// k * dimension.
@@ -106,7 +109,7 @@ pub struct KMeans<T: ArrowFloatType> {
 /// Randomly initialize kmeans centroids.
 ///
 ///
-async fn kmeans_random_init<T: ArrowFloatType>(
+async fn kmeans_random_init<T: ArrowFloatType + Dot + Cosine + L2>(
     data: &T::ArrayType,
     dimension: usize,
     k: usize,
@@ -126,7 +129,7 @@ async fn kmeans_random_init<T: ArrowFloatType>(
     Ok(kmeans)
 }
 
-pub struct KMeanMembership<T: ArrowFloatType>
+pub struct KMeanMembership<T: ArrowFloatType + Dot + Cosine + L2>
 where
     T::Native: Float + Zero,
 {
@@ -144,7 +147,7 @@ where
     metric_type: MetricType,
 }
 
-impl<T: ArrowFloatType> KMeanMembership<T> {
+impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
     /// Reconstruct a KMeans model from the membership.
     async fn to_kmeans(&self) -> Result<KMeans<T>> {
         let dimension = self.dimension;
@@ -216,7 +219,10 @@ impl<T: ArrowFloatType> KMeanMembership<T> {
     }
 }
 
-impl<T: ArrowFloatType> KMeans<T> {
+impl<T: ArrowFloatType> KMeans<T>
+where
+    T: L2 + Dot + Cosine,
+{
     fn empty(k: usize, dimension: usize, metric_type: MetricType) -> Self {
         let empty_array = new_empty_array(&DataType::Float32);
         Self {
