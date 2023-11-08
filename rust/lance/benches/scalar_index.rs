@@ -50,10 +50,7 @@ impl BtreeTrainingSource for BenchmarkDataSource {
         self: Box<Self>,
         _chunk_size: u32,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        Ok(
-            stream::iter(Self::test_data().map(|batch| batch.map_err(|err| Error::from(err))))
-                .boxed(),
-        )
+        Ok(stream::iter(Self::test_data().map(|batch| batch.map_err(Error::from))).boxed())
     }
 }
 
