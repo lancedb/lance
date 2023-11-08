@@ -27,7 +27,6 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
 }
 
-
 /// Trait of a secondary index.
 pub trait Index: Send + Sync {
     /// Cast to [Any].

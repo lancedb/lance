@@ -34,11 +34,10 @@ use crate::index::append::append_index;
 use crate::index::vector::remap_vector_index;
 use crate::io::commit::commit_transaction;
 use crate::{dataset::Dataset, Error, Result};
-pub use lance_index::{pb, Index};
 use lance_index::IndexType;
+pub use lance_index::{pb, Index};
 
 use self::vector::{build_vector_index, VectorIndexParams};
-
 
 /// Builds index.
 #[async_trait]
