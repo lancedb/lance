@@ -731,7 +731,7 @@ pub async fn build_ivf_pq_index(
             pq_params.num_sub_vectors,
             pq_params.num_bits as u32,
             dim,
-            codebook.clone(),
+            Arc::new(codebook.as_primitive().clone()),
             metric_type,
         )
     } else {

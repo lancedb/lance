@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Product Quantization
+//!
+
 use std::sync::Arc;
 
 use arrow_array::ArrayRef;
@@ -19,6 +22,7 @@ use arrow_array::{
     builder::Float32Builder, cast::AsArray, types::Float32Type, Array, FixedSizeListArray,
     Float32Array, UInt8Array,
 };
+use async_trait::async_trait;
 use futures::{stream, stream::repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result};
@@ -28,76 +32,18 @@ use lance_linalg::{distance::MetricType, MatrixView};
 use rand::SeedableRng;
 use snafu::{location, Location};
 pub mod transform;
+pub mod builder;
 
 use super::kmeans::train_kmeans;
 use super::pb;
+pub use builder::PQBuildParams;
 
 /// Product Quantization
 
 #[async_trait::async_trait]
 pub trait ProductQuantizer: Send + Sync {
+    /// Transform a vector column to PQ code column.
     async fn transform(&self, data: &dyn Array) -> Result<ArrayRef>;
-}
-
-/// Parameters for building product quantization.
-#[derive(Debug, Clone)]
-pub struct PQBuildParams {
-    /// Number of subvectors to build PQ code
-    pub num_sub_vectors: usize,
-
-    /// The number of bits to present one PQ centroid.
-    pub num_bits: usize,
-
-    /// Train as optimized product quantization.
-    pub use_opq: bool,
-
-    /// The max number of iterations for kmeans training.
-    pub max_iters: usize,
-
-    /// Max number of iterations to train OPQ, if `use_opq` is true.
-    pub max_opq_iters: usize,
-
-    /// User provided codebook.
-    pub codebook: Option<Arc<Float32Array>>,
-
-    pub sample_rate: usize,
-}
-
-impl Default for PQBuildParams {
-    fn default() -> Self {
-        Self {
-            num_sub_vectors: 16,
-            num_bits: 8,
-            use_opq: false,
-            max_iters: 50,
-            max_opq_iters: 50,
-            codebook: None,
-            sample_rate: 256,
-        }
-    }
-}
-
-impl PQBuildParams {
-    pub fn new(num_sub_vectors: usize, num_bits: usize) -> Self {
-        Self {
-            num_sub_vectors,
-            num_bits,
-            ..Default::default()
-        }
-    }
-
-    pub fn with_codebook(
-        num_sub_vectors: usize,
-        num_bits: usize,
-        codebook: Arc<Float32Array>,
-    ) -> Self {
-        Self {
-            num_sub_vectors,
-            num_bits,
-            codebook: Some(codebook),
-            ..Default::default()
-        }
-    }
 }
 
 /// Divide a 2D vector in [`FixedSizeListArray`] to `m` sub-vectors.
@@ -299,60 +245,6 @@ impl ProductQuantizerImpl {
         Ok(distortion / data.num_rows() as f64)
     }
 
-    /// Transform the vector array to PQ code array.
-    pub async fn transform(&self, data: &MatrixView<Float32Type>) -> Result<FixedSizeListArray> {
-        let flatten_data = data.data();
-        let num_sub_vectors = self.num_sub_vectors;
-        let dim = self.dimension;
-        let num_rows = data.num_rows();
-        let num_bits = self.num_bits;
-        let codebook = self.codebook.clone();
-
-        let metric_type = self.metric_type;
-        let values = tokio::task::spawn_blocking(move || {
-            let all_centroids = (0..num_sub_vectors)
-                .map(|idx| {
-                    get_sub_vector_centroids(codebook.as_ref(), dim, num_bits, num_sub_vectors, idx)
-                })
-                .collect::<Vec<_>>();
-            let flatten_values = flatten_data.values();
-            let capacity = num_sub_vectors * num_rows;
-            let mut builder: Vec<u8> = vec![0; capacity];
-            // Dimension of each sub-vector.
-            let sub_dim = dim / num_sub_vectors;
-            for i in 0..num_rows {
-                let row_offset = i * dim;
-
-                for sub_idx in 0..num_sub_vectors {
-                    let offset = row_offset + sub_idx * sub_dim;
-                    let sub_vector = &flatten_values[offset..offset + sub_dim];
-                    let centroids = all_centroids[sub_idx];
-
-                    let dist_iter = match metric_type {
-                        lance_linalg::distance::DistanceType::L2 => {
-                            l2_distance_batch(sub_vector, centroids, sub_dim)
-                        }
-                        lance_linalg::distance::DistanceType::Cosine => {
-                            cosine_distance_batch(sub_vector, centroids, sub_dim)
-                        }
-                        lance_linalg::distance::DistanceType::Dot => {
-                            dot_distance_batch(sub_vector, centroids, sub_dim)
-                        }
-                    };
-                    let code = argmin(dist_iter).unwrap();
-                    builder[i * num_sub_vectors + sub_idx] = code as u8;
-                }
-            }
-            Ok::<UInt8Array, Error>(UInt8Array::from(builder))
-        })
-        .await??;
-
-        Ok(FixedSizeListArray::try_new_from_values(
-            values,
-            self.num_sub_vectors as i32,
-        )?)
-    }
-
     /// Train [`ProductQuantizer`] using vectors.
     pub async fn train(
         data: &MatrixView<Float32Type>,
@@ -474,6 +366,71 @@ impl ProductQuantizerImpl {
     }
 }
 
+#[async_trait]
+impl ProductQuantizer for ProductQuantizerImpl {
+    async fn transform(&self, data: &dyn Array) -> Result<ArrayRef> {
+        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "Expect to be a float vector array, got: {:?}",
+                data.data_type()
+            ),
+            location: location!(),
+        })?;
+
+        let data = MatrixView::<Float32Type>::try_from(fsl)?;
+        let flatten_data = data.data();
+        let num_sub_vectors = self.num_sub_vectors;
+        let dim = self.dimension;
+        let num_rows = data.num_rows();
+        let num_bits = self.num_bits;
+        let codebook = self.codebook.clone();
+
+        let metric_type = self.metric_type;
+        let values = tokio::task::spawn_blocking(move || {
+            let all_centroids = (0..num_sub_vectors)
+                .map(|idx| {
+                    get_sub_vector_centroids(codebook.as_ref(), dim, num_bits, num_sub_vectors, idx)
+                })
+                .collect::<Vec<_>>();
+            let flatten_values = flatten_data.values();
+            let capacity = num_sub_vectors * num_rows;
+            let mut builder: Vec<u8> = vec![0; capacity];
+            // Dimension of each sub-vector.
+            let sub_dim = dim / num_sub_vectors;
+            for i in 0..num_rows {
+                let row_offset = i * dim;
+
+                for sub_idx in 0..num_sub_vectors {
+                    let offset = row_offset + sub_idx * sub_dim;
+                    let sub_vector = &flatten_values[offset..offset + sub_dim];
+                    let centroids = all_centroids[sub_idx];
+
+                    let dist_iter = match metric_type {
+                        lance_linalg::distance::DistanceType::L2 => {
+                            l2_distance_batch(sub_vector, centroids, sub_dim)
+                        }
+                        lance_linalg::distance::DistanceType::Cosine => {
+                            cosine_distance_batch(sub_vector, centroids, sub_dim)
+                        }
+                        lance_linalg::distance::DistanceType::Dot => {
+                            dot_distance_batch(sub_vector, centroids, sub_dim)
+                        }
+                    };
+                    let code = argmin(dist_iter).unwrap();
+                    builder[i * num_sub_vectors + sub_idx] = code as u8;
+                }
+            }
+            Ok::<UInt8Array, Error>(UInt8Array::from(builder))
+        })
+        .await??;
+
+        Ok(Arc::new(FixedSizeListArray::try_new_from_values(
+            values,
+            self.num_sub_vectors as i32,
+        )?))
+    }
+}
+
 #[allow(clippy::fallible_impl_from)]
 impl From<&ProductQuantizerImpl> for pb::Pq {
     fn from(pq: &ProductQuantizerImpl) -> Self {
@@ -488,7 +445,6 @@ impl From<&ProductQuantizerImpl> for pb::Pq {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use approx::relative_eq;
 
     #[test]
     fn test_divide_to_subvectors() {
@@ -515,51 +471,5 @@ mod tests {
                 8
             )
         );
-    }
-
-    #[ignore]
-    #[tokio::test]
-    async fn test_train_pq_iteratively() {
-        let mut params = PQBuildParams::new(2, 8);
-        params.max_iters = 1;
-
-        let values = Float32Array::from_iter((0..16000).map(|v| v as f32));
-        // A 16-dim array.
-        let dim = 16;
-        let mat = MatrixView::new(values.into(), dim);
-        let pq = ProductQuantizerImpl::train(&mat, MetricType::L2, &params)
-            .await
-            .unwrap();
-
-        // Init centroids
-        let centroids = pq.codebook.clone();
-
-        // Keep training 10 times
-        let mut actual_pq = ProductQuantizerImpl {
-            num_bits: 8,
-            num_sub_vectors: 2,
-            dimension: dim,
-            codebook: centroids,
-            metric_type: MetricType::L2,
-        };
-        // Iteratively train for 10 times.
-        for _ in 0..10 {
-            let code = actual_pq.transform(&mat).await.unwrap();
-            actual_pq.reset_centroids(&mat, &code).unwrap();
-            params.codebook = Some(actual_pq.codebook.clone());
-            actual_pq = ProductQuantizerImpl::train(&mat, MetricType::L2, &params)
-                .await
-                .unwrap();
-        }
-
-        let result = pq.codebook;
-        let expected = actual_pq.codebook;
-        result
-            .values()
-            .iter()
-            .zip(expected.values())
-            .for_each(|(&r, &e)| {
-                assert!(relative_eq!(r, e));
-            });
     }
 }
