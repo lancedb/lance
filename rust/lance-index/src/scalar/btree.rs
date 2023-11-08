@@ -35,7 +35,7 @@ use lance_core::{Error, Result};
 use serde::{Serialize, Serializer};
 use snafu::{location, Location};
 
-use crate::Index;
+use crate::{Index, IndexType};
 
 use super::{
     flat::FlatIndexLoader, IndexReader, IndexStore, IndexWriter, ScalarIndex, ScalarQuery,
@@ -759,6 +759,10 @@ impl Index for BTreeIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::Scalar
     }
 
     fn statistics(&self) -> Result<String> {

@@ -39,7 +39,7 @@ use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
 use crate::format::Index;
 use crate::index::prefilter::{AllowListLoader, PreFilter};
-use crate::index::DatasetIndexExt;
+use crate::index::DatasetIndexInternalExt;
 use crate::io::RecordBatchStream;
 use crate::{Error, Result};
 

@@ -33,7 +33,7 @@ use lance_core::{
 pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizerImpl};
 use lance_index::{
     vector::{pq::ProductQuantizer, Query, DIST_COL},
-    Index,
+    Index, IndexType,
 };
 use lance_linalg::{distance::MetricType, matrix::MatrixView};
 use serde::Serialize;
@@ -124,6 +124,10 @@ impl Index for PQIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::Vector
     }
 
     fn statistics(&self) -> Result<String> {

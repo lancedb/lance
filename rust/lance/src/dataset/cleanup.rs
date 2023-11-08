@@ -458,6 +458,7 @@ mod tests {
         utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy},
         Error, Result,
     };
+    use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
     use snafu::{location, Location};
@@ -467,7 +468,7 @@ mod tests {
         dataset::{ReadParams, WriteMode, WriteParams},
         index::{
             vector::{StageParams, VectorIndexParams},
-            DatasetIndexExt, IndexType,
+            DatasetIndexExt,
         },
         io::{
             object_store::{ObjectStoreParams, WrappingObjectStore},

@@ -42,7 +42,7 @@ use lance_index::{
         pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
         Query, DIST_COL, RESIDUAL_COLUMN,
     },
-    Index,
+    Index, IndexType,
 };
 use lance_linalg::matrix::MatrixView;
 use log::{debug, info, warn};
@@ -250,6 +250,10 @@ impl Index for IVFIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::Vector
     }
 
     fn statistics(&self) -> Result<String> {
@@ -1019,7 +1023,7 @@ mod tests {
 
     use crate::{
         format::RowAddress,
-        index::{vector::VectorIndexParams, DatasetIndexExt, IndexType},
+        index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt, IndexType},
     };
 
     const DIM: usize = 32;

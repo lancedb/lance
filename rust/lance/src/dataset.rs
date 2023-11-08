@@ -70,7 +70,7 @@ use crate::dataset::index::unindexed_fragments;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{Fragment, Index, Manifest};
-use crate::index::DatasetIndexExt;
+use crate::index::DatasetIndexInternalExt;
 use crate::io::commit::{commit_new_dataset, commit_transaction};
 use crate::session::Session;
 
@@ -1494,7 +1494,7 @@ mod tests {
     use crate::dataset::WriteMode::Overwrite;
     use crate::datatypes::Schema;
     use crate::index::scalar::ScalarIndexParams;
-    use crate::index::{vector::VectorIndexParams, DatasetIndexExt, IndexType};
+    use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
     use crate::io::deletion::read_deletion_file;
 
     use arrow_array::{
@@ -1512,6 +1512,7 @@ mod tests {
     use lance_core::format::WriterVersion;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::vector::DIST_COL;
+    use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use tempfile::{tempdir, TempDir};

@@ -17,14 +17,13 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::io::{read_message, read_message_from_buf, read_metadata_offset, Reader};
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::ScalarIndex;
-use lance_index::{pb, Index};
+use lance_index::{pb, Index, IndexType, INDEX_FILE_NAME};
 use snafu::{location, Location};
 use uuid::Uuid;
 
@@ -43,26 +42,6 @@ use crate::{dataset::Dataset, Error, Result};
 
 use self::scalar::build_scalar_index;
 use self::vector::{build_vector_index, VectorIndex, VectorIndexParams};
-
-const INDEX_FILE_NAME: &str = "index.idx";
-
-/// Index Type
-pub enum IndexType {
-    // Preserve 0-100 for simple indices.
-    Scalar = 0,
-    // 100+ and up for vector index.
-    /// Flat vector index.
-    Vector = 100,
-}
-
-impl fmt::Display for IndexType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Scalar => write!(f, "Scalar"),
-            Self::Vector => write!(f, "Vector"),
-        }
-    }
-}
 
 /// Builds index.
 #[async_trait]
@@ -145,10 +124,6 @@ pub trait DatasetIndexExt {
 
     /// Optimize indices.
     async fn optimize_indices(&mut self) -> Result<()>;
-
-    async fn open_generic_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn Index>>;
-    async fn open_scalar_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn ScalarIndex>>;
-    async fn open_vector_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn VectorIndex>>;
 }
 
 async fn open_index_proto(dataset: &Dataset, reader: &dyn Reader) -> Result<pb::Index> {
@@ -322,7 +297,21 @@ impl DatasetIndexExt for Dataset {
         self.manifest = Arc::new(new_manifest);
         Ok(())
     }
+}
 
+/// A trait for internal dataset utilities
+#[async_trait]
+pub(crate) trait DatasetIndexInternalExt {
+    /// Opens an index (scalar or vector) as a generic index
+    async fn open_generic_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn Index>>;
+    /// Opens the requested scalar index
+    async fn open_scalar_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn ScalarIndex>>;
+    /// Opens the requested vector index
+    async fn open_vector_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn VectorIndex>>;
+}
+
+#[async_trait]
+impl DatasetIndexInternalExt for Dataset {
     async fn open_generic_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn Index>> {
         // Checking for cache existence is cheap so we just check both scalar and vector caches
         if let Some(index) = self.session.index_cache.get_scalar(uuid) {

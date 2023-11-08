@@ -22,7 +22,7 @@ use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use lance_core::Result;
 use serde::Serialize;
 
-use crate::Index;
+use crate::{Index, IndexType};
 
 use super::{
     btree::{SubIndexLoader, SubIndexTrainer},
@@ -116,6 +116,10 @@ impl Index for FlatIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::Scalar
     }
 
     fn statistics(&self) -> Result<String> {

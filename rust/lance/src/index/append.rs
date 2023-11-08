@@ -23,7 +23,7 @@ use crate::dataset::index::unindexed_fragments;
 use crate::dataset::Dataset;
 use crate::index::vector::ivf::IVFIndex;
 
-use super::DatasetIndexExt;
+use super::DatasetIndexInternalExt;
 
 /// Append new data to the index, without re-train.
 pub async fn append_index(

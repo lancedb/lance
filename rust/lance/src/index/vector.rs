@@ -41,7 +41,7 @@ use self::{
     pq::PQIndex,
 };
 
-use super::{pb, DatasetIndexExt, IndexParams};
+use super::{pb, DatasetIndexInternalExt, IndexParams};
 #[cfg(feature = "opq")]
 use crate::index::vector::opq::{OPQIndex, OptimizedProductQuantizer};
 use crate::{

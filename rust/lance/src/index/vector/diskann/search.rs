@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use lance_core::{io::Reader, Error, Result, ROW_ID_FIELD};
 use lance_index::{
     vector::{Query, DIST_COL},
-    Index,
+    Index, IndexType,
 };
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
@@ -209,6 +209,10 @@ impl Index for DiskANNIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::Vector
     }
 
     fn statistics(&self) -> Result<String> {
