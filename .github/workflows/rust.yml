@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 45
     defaults:
       run:
-        working-directory: ./rust/lance
+        working-directory: ./rust
     steps:
       - uses: actions/checkout@v3
       - uses: Swatinem/rust-cache@v2
