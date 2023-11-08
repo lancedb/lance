@@ -1520,6 +1520,8 @@ mod tests {
         let (mut dataset, vector_array) = generate_test_dataset(test_uri).await;
 
         let centroids = generate_random_array(2 * DIM);
+        assert!(centroids.values().iter().all(|v| (0.0..1.0).contains(v)));
+
         let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
         let ivf_params = IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
 
@@ -1548,13 +1550,20 @@ mod tests {
         assert_eq!(1, results.len());
         assert_eq!(5, results[0].num_rows());
 
+        assert!(vector_array
+            .values()
+            .as_primitive::<Float32Type>()
+            .iter()
+            .all(|v| (Some(0.0)..Some(1.0)).contains(&v)));
+        assert!(query.values().iter().all(|v| (0.0..1.0).contains(v)));
+
         for batch in results.iter() {
             let dist = &batch["_distance"];
             assert!(dist
                 .as_primitive::<Float32Type>()
                 .values()
                 .iter()
-                .all(|v| (-2.0 * DIM as f32..2.0).contains(v)));
+                .all(|v| (-2.0 * DIM as f32..0.0).contains(v)));
         }
     }
 }
