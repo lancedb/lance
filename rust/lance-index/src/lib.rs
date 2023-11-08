@@ -17,8 +17,6 @@
 use std::any::Any;
 use std::fmt;
 
-use serde_json;
-
 use lance_core::Result;
 
 pub mod scalar;
