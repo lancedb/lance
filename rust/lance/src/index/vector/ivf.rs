@@ -38,7 +38,7 @@ use lance_core::{
     datatypes::Field, encodings::plain::PlainEncoder, format::Index as IndexMetadata, Error, Result,
 };
 use lance_index::vector::{
-    pq::{PQBuildParams, ProductQuantizerImpl},
+    pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
     Query, DIST_COL, RESIDUAL_COLUMN,
 };
 use lance_linalg::matrix::MatrixView;
@@ -189,7 +189,7 @@ impl IVFIndex {
             column,
             pq_index.pq.clone(),
         ));
-        let shuffler = shuffle_dataset(data, column, ivf, pq_index.pq.num_sub_vectors).await?;
+        let shuffler = shuffle_dataset(data, column, ivf, pq_index.pq.num_sub_vectors()).await?;
 
         let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
         write_index_partitions(&mut writer, &mut ivf_mut, &shuffler, Some(self)).await?;
@@ -363,7 +363,7 @@ pub struct IvfPQIndexMetadata {
     pub(crate) ivf: Ivf,
 
     /// Product Quantizer
-    pub(crate) pq: Arc<ProductQuantizerImpl>,
+    pub(crate) pq: Arc<dyn ProductQuantizer>,
 
     /// Transforms to be applied before search.
     transforms: Vec<pb::Transform>,

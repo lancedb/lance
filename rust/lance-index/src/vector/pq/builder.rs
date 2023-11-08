@@ -17,16 +17,18 @@
 
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, Array, ArrayRef, types::Float32Type, Float32Array};
+use arrow_array::FixedSizeListArray;
+use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef, Float32Array};
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_linalg::{distance::MetricType, MatrixView};
-use snafu::{location, Location};
 use rand::{self, SeedableRng};
+use snafu::{location, Location};
 
-use super::ProductQuantizer;
-use crate::vector::{pq::ProductQuantizerImpl, kmeans::train_kmeans};
 use super::utils::divide_to_subvectors;
+use super::ProductQuantizer;
+use crate::pb::Pq;
+use crate::vector::{kmeans::train_kmeans, pq::ProductQuantizerImpl};
 
 /// Parameters for building product quantizer.
 #[derive(Debug, Clone)]
@@ -108,7 +110,6 @@ impl PQBuildParams {
         let dimension = data.num_columns();
         let sub_vector_dimension = dimension / self.num_sub_vectors;
 
-
         const REDOS: usize = 1;
         // TODO: parallel training.
         let d = stream::iter(sub_vectors.into_iter())
@@ -147,6 +148,31 @@ impl PQBuildParams {
             self.num_bits as u32,
             dimension,
             Arc::new(pd_centroids),
+            metric_type,
+        )))
+    }
+}
+
+/// Load ProductQuantizer from Protobuf
+pub fn from_proto(proto: &Pq, metric_type: MetricType) -> Result<Arc<dyn ProductQuantizer>> {
+    if let Some(tensor) = &proto.codebook_tensor {
+        let fsl = FixedSizeListArray::try_from(tensor)?;
+
+        Ok(Arc::new(ProductQuantizerImpl::new(
+            proto.num_sub_vectors as usize,
+            proto.num_bits,
+            proto.dimension as usize,
+            Arc::new(fsl.values().as_primitive().clone()), // Support multi-data type later.
+            metric_type,
+        )))
+    } else {
+        Ok(Arc::new(ProductQuantizerImpl::new(
+            proto.num_sub_vectors as usize,
+            proto.num_bits,
+            proto.dimension as usize,
+            Arc::new(Float32Array::from_iter_values(
+                proto.codebook.iter().copied(),
+            )),
             metric_type,
         )))
     }

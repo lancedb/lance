@@ -14,15 +14,18 @@
 
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, types::Float32Type, Float32Array};
-use lance_linalg::MatrixView;
+use arrow_array::{types::Float32Type, FixedSizeListArray, Float32Array};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_linalg::MatrixView;
 
 /// Divide a 2D vector in [`FixedSizeListArray`] to `m` sub-vectors.
 ///
 /// For example, for a `[1024x1M]` matrix, when `n = 8`, this function divides
 /// the matrix into  `[128x1M; 8]` vector of matrix.
-pub(super) fn divide_to_subvectors(data: &MatrixView<Float32Type>, m: usize) -> Vec<Arc<FixedSizeListArray>> {
+pub(super) fn divide_to_subvectors(
+    data: &MatrixView<Float32Type>,
+    m: usize,
+) -> Vec<Arc<FixedSizeListArray>> {
     assert!(!data.num_rows() > 0);
 
     let sub_vector_length = data.num_columns() / m;
