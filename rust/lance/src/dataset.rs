@@ -47,7 +47,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::instrument;
 
+pub mod builder;
 pub(crate) mod chunker;
+
 pub mod cleanup;
 mod feature_flags;
 pub mod fragment;
@@ -60,6 +62,7 @@ pub mod transaction;
 pub mod updater;
 mod write;
 
+use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
@@ -92,7 +95,6 @@ pub struct Dataset {
     pub(crate) object_store: Arc<ObjectStore>,
     pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
-
     pub(crate) session: Arc<Session>,
 }
 
@@ -220,43 +222,16 @@ impl Dataset {
         .await
     }
 
-    pub async fn open_with_storage_options(
-        uri: impl AsRef<str>,
-        storage_options: HashMap<String, String>,
-    ) -> Result<Self> {
-        let uri = uri.as_ref();
-        let uri = url::Url::parse(uri).unwrap();
-        let object_store = ObjectStore::try_new(uri, storage_options).await?;
-        let base_path = object_store.base_path();
-
-        let latest_manifest = object_store
-            .commit_handler
-            .resolve_latest_version(base_path, &object_store.inner)
-            .await
-            .map_err(|e| Error::DatasetNotFound {
-                path: base_path.to_string(),
-                source: Box::new(e),
-                location: location!(),
-            })?;
-
-        let session = Arc::new(Session::default());
-
-        Self::checkout_manifest(
-            Arc::new(object_store.clone()),
-            base_path.clone(),
-            &latest_manifest,
-            session,
-        )
-        .await
-    }
-
     /// Check out a version of the dataset.
     pub async fn checkout(uri: &str, version: u64) -> Result<Self> {
-        let params = ReadParams::default();
-        Self::checkout_with_params(uri, version, &params).await
+        DatasetBuilder::from_uri(uri)
+            .with_version(version)
+            .load()
+            .await
     }
 
     /// Check out a version of the dataset with read params.
+    #[deprecated = "Use DatasetBuilder instead"]
     pub async fn checkout_with_params(
         uri: &str,
         version: u64,

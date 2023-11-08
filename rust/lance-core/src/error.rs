@@ -75,6 +75,8 @@ pub enum Error {
     IO { message: String, location: Location },
     #[snafu(display("LanceError(Index): {message}, {location}"))]
     Index { message: String, location: Location },
+    #[snafu(display("Cannot infer storage location from: {message}"))]
+    InvalidTableLocation { message: String },
     /// Stream early stop
     Stop,
 }

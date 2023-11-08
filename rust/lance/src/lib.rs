@@ -79,6 +79,9 @@
 //!
 //! ```
 
+use std::collections::HashMap;
+
+use dataset::builder::DatasetBuilder;
 pub use lance_core::{datatypes, encodings, error, format};
 pub use lance_core::{Error, Result};
 
@@ -91,3 +94,20 @@ pub mod session;
 pub mod utils;
 
 pub use dataset::Dataset;
+
+/// Creates and loads a [`Dataset`] from the given path.
+/// Infers the storage backend to use from the scheme in the given table path.
+pub async fn open_dataset<T: AsRef<str>>(table_uri: T) -> Result<Dataset> {
+    DatasetBuilder::from_uri(table_uri.as_ref()).load().await
+}
+
+/// Same as `open_dataset`, but also accepts storage options to aid in building the underlying object store
+pub async fn open_dataset_with_storage_options(
+    table_uri: impl AsRef<str>,
+    storage_options: HashMap<String, String>,
+) -> Result<Dataset> {
+    DatasetBuilder::from_uri(table_uri)
+        .with_storage_options(storage_options)
+        .load()
+        .await
+}
