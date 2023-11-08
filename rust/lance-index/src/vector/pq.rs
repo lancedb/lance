@@ -23,8 +23,10 @@ use arrow_array::{
     builder::Float32Builder, cast::AsArray, types::Float32Type, Array, FixedSizeListArray,
     Float32Array, UInt8Array,
 };
+use arrow_schema::DataType;
 use async_trait::async_trait;
 use futures::{stream, stream::repeat_with, StreamExt, TryStreamExt};
+use lance_arrow::floats::FloatArray;
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{
@@ -165,9 +167,9 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
     /// Reconstruct a vector from its PQ code.
     ///
     /// It only supports U8 PQ code for now.
-    pub fn reconstruct(&self, code: &[u8]) -> Arc<Float32Array> {
+    pub(crate) fn reconstruct(&self, code: &[u8]) -> Arc<T::ArrayType> {
         assert_eq!(code.len(), self.num_sub_vectors);
-        let mut builder = Float32Builder::with_capacity(self.dimension);
+        let mut builder = Vec::with_capacity(self.dimension);
         let sub_vector_dim = self.dimension / self.num_sub_vectors;
         for (i, sub_code) in code.iter().enumerate() {
             let centroids = self.centroids(i);
@@ -176,14 +178,20 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                     ..(*sub_code as usize + 1) * sub_vector_dim],
             );
         }
-        Arc::new(builder.finish())
+        Arc::new(T::ArrayType::from(builder))
     }
 
     /// Compute the quantization distortion (E).
     ///
     /// Quantization distortion is the difference between the centroids
     /// from the PQ code to the actual vector.
-    pub async fn distortion(&self, data: &MatrixView<T>, metric_type: MetricType) -> Result<f64> {
+    ///
+    /// This method is just for debugging purpose.
+    pub(crate) async fn distortion(
+        &self,
+        data: &MatrixView<T>,
+        metric_type: MetricType,
+    ) -> Result<f64> {
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
         debug_assert_eq!(sub_vectors.len(), self.num_sub_vectors);
 
@@ -354,11 +362,19 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         Ok(())
     }
 
-    fn l2_distance_table(&self, key: &Float32Array, code: &UInt8Array) -> Result<ArrayRef> {
+    fn l2_distance_table(&self, key: &dyn Array, code: &UInt8Array) -> Result<ArrayRef> {
+        let key: &T::ArrayType = key.as_any().downcast_ref().ok_or(Error::Index {
+            message: format!(
+                "Build L2 distance table, type mismatch: {}",
+                key.data_type()
+            ),
+            location: Default::default(),
+        })?;
+
         // Build distance table for each sub-centroid to the query key.
         //
-        // Distance table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
-        let mut distance_table: Vec<f32> = vec![];
+        // Distance table: `[T::Native: num_sub_vectors(row) * num_centroids(column)]`.
+        let mut distance_table: Vec<T::Native> = vec![];
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {
@@ -368,20 +384,19 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
             distance_table.extend(distances);
         }
 
-        Ok(Arc::new(unsafe {
-            Float32Array::from_trusted_len_iter(
-                code.values().chunks_exact(self.num_sub_vectors).map(|c| {
-                    Some(
-                        c.iter()
-                            .enumerate()
-                            .map(|(sub_vec_idx, centroid)| {
-                                distance_table[sub_vec_idx * 256 + *centroid as usize]
-                            })
-                            .sum::<f32>(),
-                    )
-                }),
-            )
-        }))
+        Ok(Arc::new(T::ArrayType::from(
+            code.values()
+                .chunks_exact(self.num_sub_vectors)
+                .map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .map(|(sub_vec_idx, centroid)| {
+                            distance_table[sub_vec_idx * 256 + *centroid as usize]
+                        })
+                        .sum::<f32>()
+                })
+                .collect::<Vec<_>>(),
+        )))
     }
 
     /// Pre-compute dot product to each sub-centroids.
@@ -389,9 +404,18 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
     ///  - query: the query vector, with shape (dimension, )
     ///  - code: the PQ code in one partition.
     ///
-    fn dot_distance_table(&self, key: &Float32Array, code: &UInt8Array) -> Result<ArrayRef> {
+    fn dot_distance_table(&self, key: &dyn Array, code: &UInt8Array) -> Result<ArrayRef> {
+        let key: &T::ArrayType = key.as_any().downcast_ref().ok_or(Error::Index {
+            message: format!(
+                "Build Dot distance table, type mismatch: {}",
+                key.data_type()
+            ),
+            location: Default::default(),
+        })?;
+
         // Distance table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
-        let mut distance_table: Vec<f32> = vec![];
+        let capacity = self.num_sub_vectors * self.num_centroids(self.num_bits);
+        let mut distance_table = Vec::<T::Native>::with_capacity(capacity);
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {
@@ -403,20 +427,19 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         }
 
         // Compute distance from the pre-compute table.
-        Ok(Arc::new(unsafe {
-            Float32Array::from_trusted_len_iter(
-                code.values().chunks_exact(self.num_sub_vectors).map(|c| {
-                    Some(
-                        c.iter()
-                            .enumerate()
-                            .map(|(sub_vec_idx, centroid)| {
-                                distance_table[sub_vec_idx * 256 + *centroid as usize]
-                            })
-                            .sum::<f32>(),
-                    )
-                }),
-            )
-        }))
+        Ok(Arc::new(T::ArrayType::from(
+            code.values()
+                .chunks_exact(self.num_sub_vectors)
+                .map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .map(|(sub_vec_idx, centroid)| {
+                            distance_table[sub_vec_idx * 256 + *centroid as usize]
+                        })
+                        .sum::<T::Native>()
+                })
+                .collect(),
+        )))
     }
 
     /// Pre-compute cosine distance to each sub-centroids.
@@ -425,7 +448,15 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
     ///  - query: the query vector, with shape (dimension, )
     ///  - code: the PQ code in one partition.
     ///
-    fn cosine_distances(&self, query: &Float32Array, code: &UInt8Array) -> Result<ArrayRef> {
+    fn cosine_distances(&self, key: &dyn Array, code: &UInt8Array) -> Result<ArrayRef> {
+        let query: &T::ArrayType = key.as_any().downcast_ref().ok_or(Error::Index {
+            message: format!(
+                "Build Dot distance table, type mismatch: {}",
+                key.data_type()
+            ),
+            location: Default::default(),
+        })?;
+
         // Build two tables for cosine distance.
         //
         // xy table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
@@ -514,7 +545,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizer for ProductQuantize
                     )
                 })
                 .collect::<Vec<_>>();
-            let flatten_values = flatten_data.values();
+            let flatten_values = flatten_data.as_slice();
             let capacity = num_sub_vectors * num_rows;
             let mut builder: Vec<u8> = vec![0; capacity];
             // Dimension of each sub-vector.
@@ -554,9 +585,9 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizer for ProductQuantize
 
     fn build_distance_table(&self, query: &dyn Array, code: &UInt8Array) -> Result<ArrayRef> {
         match self.metric_type {
-            MetricType::Cosine => self.cosine_distances(query.as_primitive(), code),
-            MetricType::Dot => self.dot_distance_table(query.as_primitive(), code),
-            MetricType::L2 => self.l2_distance_table(query.as_primitive(), code),
+            MetricType::Cosine => self.cosine_distances(query, code),
+            MetricType::Dot => self.dot_distance_table(query, code),
+            MetricType::L2 => self.l2_distance_table(query, code),
         }
     }
 
