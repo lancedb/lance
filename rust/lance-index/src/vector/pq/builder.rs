@@ -22,7 +22,7 @@ use arrow_array::FixedSizeListArray;
 use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef, Float32Array};
 use arrow_schema::DataType;
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_arrow::ArrowFloatType;
+use lance_arrow::{ArrowFloatType, FloatArray};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{Cosine, Dot, L2};
 use lance_linalg::{distance::MetricType, MatrixView};
@@ -104,15 +104,11 @@ impl PQBuildParams {
 
         const REDOS: usize = 1;
         // TODO: parallel training.
-        let d = stream::iter(sub_vectors.into_iter())
+        let d = stream::iter(sub_vectors.iter())
             .map(|sub_vec| async move {
                 let rng = rand::rngs::SmallRng::from_entropy();
-
-                // Centroids for one sub vector.
-                let sub_vec = sub_vec.clone();
-                let flatten_array: &Float32Array = sub_vec.values().as_primitive();
-                train_kmeans(
-                    flatten_array,
+                train_kmeans::<T>(
+                    &sub_vec,
                     None,
                     sub_vector_dimension,
                     num_centroids,
@@ -130,7 +126,7 @@ impl PQBuildParams {
 
         let mut codebook_builder = Vec::with_capacity(num_centroids * dimension);
         for centroid in d.iter() {
-            codebook_builder.extend_from_slice(centroid.values());
+            codebook_builder.extend_from_slice(centroid.as_slice());
         }
 
         let pd_centroids = T::ArrayType::from(codebook_builder);

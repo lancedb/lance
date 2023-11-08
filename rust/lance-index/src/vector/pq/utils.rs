@@ -25,7 +25,7 @@ use lance_linalg::MatrixView;
 pub(super) fn divide_to_subvectors<T: ArrowFloatType>(
     data: &MatrixView<T>,
     m: usize,
-) -> Vec<Arc<FixedSizeListArray>> {
+) -> Vec<Arc<T::ArrayType>> {
     assert!(!data.num_rows() > 0);
 
     let sub_vector_length = data.num_columns() / m;
@@ -42,10 +42,7 @@ pub(super) fn divide_to_subvectors<T: ArrowFloatType>(
             builder.extend_from_slice(&row[start..start + sub_vector_length]);
         }
         let values = T::ArrayType::from(builder);
-        let sub_array = Arc::new(
-            FixedSizeListArray::try_new_from_values(values, sub_vector_length as i32).unwrap(),
-        );
-        subarrays.push(sub_array);
+        subarrays.push(Arc::new(values));
     }
     subarrays
 }
@@ -65,24 +62,14 @@ mod tests {
         let values = Float32Array::from_iter((0..320).map(|v| v as f32));
         // A [10, 32] array.
         let mat = MatrixView::new(values.into(), 32);
-        let sub_vectors = divide_to_subvectors(&mat, 4);
+        let sub_vectors = divide_to_subvectors::<Float32Type>(&mat, 4);
         assert_eq!(sub_vectors.len(), 4);
-        assert_eq!(sub_vectors[0].len(), 10);
-        assert_eq!(sub_vectors[0].value_length(), 8);
+        assert_eq!(sub_vectors[0].len(), 10 * 8);
 
         assert_eq!(
             sub_vectors[0].as_ref(),
-            &FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                (0..10)
-                    .map(|i| {
-                        Some(
-                            (i * 32..i * 32 + 8)
-                                .map(|v| Some(v as f32))
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-                8
+            &Float32Array::from_iter_values(
+                (0..10).flat_map(|i| (0..8).map(move |c| 32.0 * i as f32 + c as f32))
             )
         );
     }

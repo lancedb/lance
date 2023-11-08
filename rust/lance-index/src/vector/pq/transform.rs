@@ -105,7 +105,7 @@ mod tests {
         let mat: MatrixView<Float32Type> = arr.as_ref().try_into().unwrap();
 
         let params = PQBuildParams::new(1, 8);
-        let pq = params.build(&mat, MetricType::L2).await.unwrap();
+        let pq = params.build(arr.as_ref(), MetricType::L2).await.unwrap();
 
         let schema = Schema::new(vec![
             Field::new(

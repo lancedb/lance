@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow_array::types::Float32Type;
 use arrow_array::{Array, FixedSizeListArray};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use log::info;

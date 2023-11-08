@@ -19,22 +19,18 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow_array::ArrayRef;
-use arrow_array::{
-    builder::Float32Builder, cast::AsArray, types::Float32Type, Array, FixedSizeListArray,
-    Float32Array, UInt8Array,
-};
+use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, UInt8Array};
 use async_trait::async_trait;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use lance_arrow::floats::FloatArray;
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{
-    cosine_distance_batch, dot_distance_batch, l2_distance_batch, norm_l2, Cosine, Dot, Normalize,
-    L2,
+    cosine_distance_batch, dot_distance_batch, l2_distance_batch, norm_l2, Cosine, Dot, L2,
 };
 use lance_linalg::kernels::{argmin, argmin_value};
 use lance_linalg::{distance::MetricType, MatrixView};
-use num_traits::{AsPrimitive, Float, One, Zero};
+use num_traits::{AsPrimitive, Float, One};
 use rand::SeedableRng;
 use snafu::{location, Location};
 pub mod builder;
@@ -375,25 +371,26 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
 }
 
 #[async_trait]
-impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizer for ProductQuantizerImpl<T> {
+impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for ProductQuantizerImpl<T> {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     async fn transform(&self, data: &dyn Array) -> Result<ArrayRef> {
-        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "Expect to be a float vector array, got: {:?}",
-                data.data_type()
-            ),
-            location: location!(),
-        })?;
+        let fsl = data
+            .as_fixed_size_list_opt()
+            .ok_or(Error::Index {
+                message: format!(
+                    "Expect to be a float vector array, got: {:?}",
+                    data.data_type()
+                ),
+                location: location!(),
+            })?
+            .clone();
 
-        let data = MatrixView::<T>::try_from(fsl)?;
-        let flatten_data = data.data();
         let num_sub_vectors = self.num_sub_vectors;
         let dim = self.dimension;
-        let num_rows = data.num_rows();
+        let num_rows = fsl.len();
         let num_bits = self.num_bits;
         let codebook = self.codebook.clone();
 
@@ -410,6 +407,18 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizer for ProductQuantize
                     )
                 })
                 .collect::<Vec<_>>();
+            let flatten_data =
+                fsl.values()
+                    .as_any()
+                    .downcast_ref::<T::ArrayType>()
+                    .ok_or(Error::Index {
+                        message: format!(
+                            "Expect to be a float vector array, got: {:?}",
+                            fsl.value_type()
+                        ),
+                        location: location!(),
+                    })?;
+
             let flatten_values = flatten_data.as_slice();
             let capacity = num_sub_vectors * num_rows;
             let mut builder: Vec<u8> = vec![0; capacity];
