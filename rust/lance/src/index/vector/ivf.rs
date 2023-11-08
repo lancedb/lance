@@ -792,7 +792,7 @@ pub async fn build_ivf_pq_index(
         uuid,
         &transforms,
         ivf_model,
-        pq.into(),
+        pq,
         metric_type,
         stream,
     )
