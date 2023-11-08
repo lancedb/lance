@@ -17,10 +17,14 @@
 
 use std::sync::Arc;
 
+use arrow_array::types::{Float16Type, Float64Type};
 use arrow_array::FixedSizeListArray;
 use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef, Float32Array};
+use arrow_schema::DataType;
 use futures::{stream, StreamExt, TryStreamExt};
+use lance_arrow::ArrowFloatType;
 use lance_core::{Error, Result};
+use lance_linalg::distance::{Cosine, Dot, L2};
 use lance_linalg::{distance::MetricType, MatrixView};
 use rand::{self, SeedableRng};
 use snafu::{location, Location};
@@ -88,23 +92,11 @@ impl PQBuildParams {
         }
     }
 
-    /// Build a [ProductQuantizer] from the given data.
-    pub async fn build(
+    async fn build_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
         &self,
-        data: &dyn Array,
+        data: &MatrixView<T>,
         metric_type: MetricType,
     ) -> Result<Arc<dyn ProductQuantizer>> {
-        assert_eq!(data.null_count(), 0);
-
-        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "PQ builder: input is not a FixedSizeList: {}",
-                data.data_type()
-            ),
-            location: location!(),
-        })?;
-        let data = MatrixView::<Float32Type>::try_from(fsl)?;
-
         let sub_vectors = divide_to_subvectors(&data, self.num_sub_vectors);
         let num_centroids = 2_usize.pow(self.num_bits as u32);
         let dimension = data.num_columns();
@@ -143,13 +135,49 @@ impl PQBuildParams {
 
         let pd_centroids = Float32Array::from(codebook_builder);
 
-        Ok(Arc::new(ProductQuantizerImpl::new(
+        Ok(Arc::new(ProductQuantizerImpl::<T>::new(
             self.num_sub_vectors,
             self.num_bits as u32,
             dimension,
             Arc::new(pd_centroids),
             metric_type,
         )))
+    }
+
+    /// Build a [ProductQuantizer] from the given data.
+    pub async fn build(
+        &self,
+        data: &dyn Array,
+        metric_type: MetricType,
+    ) -> Result<Arc<dyn ProductQuantizer>> {
+        assert_eq!(data.null_count(), 0);
+
+        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "PQ builder: input is not a FixedSizeList: {}",
+                data.data_type()
+            ),
+            location: location!(),
+        })?;
+        // TODO: support bf16 later.
+        match fsl.value_type() {
+            DataType::Float16 => {
+                let data = MatrixView::<Float16Type>::try_from(fsl)?;
+                self.build_impl(&data, metric_type).await
+            }
+            DataType::Float32 => {
+                let data = MatrixView::<Float32Type>::try_from(fsl)?;
+                self.build_impl(&data, metric_type).await
+            }
+            DataType::Float64 => {
+                let data = MatrixView::<Float64Type>::try_from(fsl)?;
+                self.build_impl(&data, metric_type).await
+            }
+            _ => Err(Error::Index {
+                message: format!("PQ builder: unsupported data type: {}", fsl.value_type()),
+                location: location!(),
+            }),
+        }
     }
 }
 
@@ -158,7 +186,7 @@ pub fn from_proto(proto: &Pq, metric_type: MetricType) -> Result<Arc<dyn Product
     if let Some(tensor) = &proto.codebook_tensor {
         let fsl = FixedSizeListArray::try_from(tensor)?;
 
-        Ok(Arc::new(ProductQuantizerImpl::new(
+        Ok(Arc::new(ProductQuantizerImpl::<Float32Type>::new(
             proto.num_sub_vectors as usize,
             proto.num_bits,
             proto.dimension as usize,

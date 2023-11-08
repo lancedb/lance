@@ -50,9 +50,15 @@ pub(super) fn divide_to_subvectors<T: ArrowFloatType>(
     subarrays
 }
 
+/// Number of PQ centroids, for the corresponding number of PQ bits.
+pub(super) fn num_centroids(num_bits: impl Into<u32>) -> usize {
+    2_usize.pow(num_bits.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{types::Float32Type, Float32Array};
 
     #[test]
     fn test_divide_to_subvectors() {

@@ -23,9 +23,8 @@ use arrow_array::{
     builder::Float32Builder, cast::AsArray, types::Float32Type, Array, FixedSizeListArray,
     Float32Array, UInt8Array,
 };
-use arrow_schema::DataType;
 use async_trait::async_trait;
-use futures::{stream, stream::repeat_with, StreamExt, TryStreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::floats::FloatArray;
 use lance_arrow::*;
 use lance_core::{Error, Result};
@@ -45,6 +44,7 @@ pub(crate) mod utils;
 use self::utils::divide_to_subvectors;
 use super::kmeans::train_kmeans;
 use super::pb;
+use crate::vector::pq::utils::num_centroids;
 pub use builder::PQBuildParams;
 
 /// Product Quantization
@@ -108,7 +108,7 @@ pub struct ProductQuantizerImpl<T: ArrowFloatType + Cosine + Dot + L2> {
     pub codebook: Arc<T::ArrayType>,
 }
 
-fn get_sub_vector_centroids<T: Float>(
+fn get_sub_vector_centroids<T: FloatToArrayType>(
     codebook: &[T],
     dimension: usize,
     num_bits: impl Into<u32>,
@@ -117,7 +117,7 @@ fn get_sub_vector_centroids<T: Float>(
 ) -> &[T] {
     assert!(sub_vector_idx < num_sub_vectors);
 
-    let num_centroids = ProductQuantizerImpl::num_centroids(num_bits.into());
+    let num_centroids = num_centroids(num_bits);
     let sub_vector_width = dimension / num_sub_vectors;
     &codebook[sub_vector_idx * num_centroids * sub_vector_width
         ..(sub_vector_idx + 1) * num_centroids * sub_vector_width]
@@ -173,7 +173,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         let sub_vector_dim = self.dimension / self.num_sub_vectors;
         for (i, sub_code) in code.iter().enumerate() {
             let centroids = self.centroids(i);
-            builder.append_slice(
+            builder.extend_from_slice(
                 &centroids[*sub_code as usize * sub_vector_dim
                     ..(*sub_code as usize + 1) * sub_vector_dim],
             );
@@ -216,7 +216,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                     })
                     .sum::<f64>()
             })
-            .sum();
+            .sum::<f64>();
         Ok(total_distortion / data.num_rows() as f64)
     }
 
@@ -239,7 +239,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         assert_eq!(data.data().null_count(), 0);
 
         let sub_vectors = divide_to_subvectors(data, params.num_sub_vectors);
-        let num_centroids = 2_usize.pow(params.num_bits as u32);
+        let num_centroids = num_centroids(params.num_bits as u32);
         let dimension = data.num_columns();
         let sub_vector_dimension = dimension / params.num_sub_vectors;
 
@@ -355,12 +355,14 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         let mut distance_table: Vec<T::Native> = vec![];
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
-        for i in 0..self.num_sub_vectors {
-            let from = key.slice(i * sub_vector_length, sub_vector_length);
-            let subvec_centroids = self.centroids(i);
-            let distances = l2_distance_batch(from.values(), subvec_centroids, sub_vector_length);
-            distance_table.extend(distances);
-        }
+        key.as_slice()
+            .chunks_exact(sub_vector_length)
+            .enumerate()
+            .for_each(|(i, sub_vec)| {
+                let subvec_centroids = self.centroids(i);
+                let distances = l2_distance_batch(sub_vec, subvec_centroids, sub_vector_length);
+                distance_table.extend(distances);
+            });
 
         Ok(Arc::new(T::ArrayType::from(
             code.values()
@@ -396,13 +398,14 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         let mut distance_table = Vec::<T::Native>::with_capacity(capacity);
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
-        for i in 0..self.num_sub_vectors {
-            // The sub-vector section of the query vector.
-            let from = key.slice(i * sub_vector_length, sub_vector_length);
-            let subvec_centroids = self.centroids(i);
-            let distances = dot_distance_batch(from.values(), subvec_centroids, sub_vector_length);
-            distance_table.extend(distances);
-        }
+        key.as_slice()
+            .chunks_exact(sub_vector_length)
+            .enumerate()
+            .for_each(|(sub_vec_id, sub_vec)| {
+                let subvec_centroids = self.centroids(sub_vec_id);
+                let distances = dot_distance_batch(sub_vec, subvec_centroids, sub_vector_length);
+                distance_table.extend(distances);
+            });
 
         // Compute distance from the pre-compute table.
         Ok(Arc::new(T::ArrayType::from(
@@ -439,16 +442,16 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         //
         // xy table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
         // y_norm table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
-        let num_centroids = Self::num_centroids(self.num_bits);
-        let mut xy_table: Vec<f32> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
-        let mut y2_table: Vec<f32> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
+        let num_centroids = ProductQuantizerImpl::num_centroids(self.num_bits);
+        let mut xy_table: Vec<T::Native> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
+        let mut y2_table: Vec<T::Native> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
 
-        let x_norm = norm_l2(query.values());
+        let x_norm = norm_l2(query.as_slice());
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {
             // The sub-vector section of the query vector.
             let key_sub_vector =
-                &query.values()[i * sub_vector_length..(i + 1) * sub_vector_length];
+                &query.as_slice()[i * sub_vector_length..(i + 1) * sub_vector_length];
             let sub_vector_centroids = self.centroids(i);
             xy_table.extend(dot_distance_batch(
                 key_sub_vector,
@@ -458,7 +461,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
 
             let y2 = sub_vector_centroids
                 .chunks_exact(sub_vector_length)
-                .map(|cent| cent.norm_l2().powf(2.0));
+                .map(|cent| norm_l2(cent).powf(2.0));
             y2_table.extend(y2);
         }
 
