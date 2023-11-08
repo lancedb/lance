@@ -33,9 +33,9 @@ use lance_linalg::distance::{
     cosine_distance_batch, dot_distance_batch, l2_distance_batch, norm_l2, Cosine, Dot, Normalize,
     L2,
 };
-use lance_linalg::kernels::argmin;
+use lance_linalg::kernels::{argmin, argmin_value};
 use lance_linalg::{distance::MetricType, MatrixView};
-use num_traits::Float;
+use num_traits::{AsPrimitive, Float};
 use rand::SeedableRng;
 use snafu::{location, Location};
 pub mod builder;
@@ -192,54 +192,32 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         data: &MatrixView<T>,
         metric_type: MetricType,
     ) -> Result<f64> {
-        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
-        debug_assert_eq!(sub_vectors.len(), self.num_sub_vectors);
-
-        let vectors = sub_vectors.to_vec();
-        let codebook = self.codebook.clone();
-        let dimension = self.dimension;
-        let num_bits = self.num_bits;
-        let num_sub_vectors = self.num_sub_vectors;
-        let distortion = stream::iter(vectors)
-            .zip(repeat_with(|| codebook.clone()))
-            .enumerate()
-            .map(|(sub_idx, (vec, codebook))| async move {
-                let cb = codebook.clone();
-                tokio::task::spawn_blocking(move || {
-                    let centroid = get_sub_vector_centroids(
-                        cb.as_slice(),
-                        dimension,
-                        num_bits,
-                        num_sub_vectors,
-                        sub_idx,
-                    );
-                    (0..vec.len())
-                        .map(|i| {
-                            let value = vec.value(i);
-                            let vector: &Float32Array = value.as_primitive();
-                            let distances = match metric_type {
-                                lance_linalg::distance::DistanceType::L2 => {
-                                    l2_distance_batch(vector.values(), centroid, dimension)
-                                }
-                                lance_linalg::distance::DistanceType::Cosine => {
-                                    cosine_distance_batch(vector.values(), centroid, dimension)
-                                }
-                                lance_linalg::distance::DistanceType::Dot => {
-                                    dot_distance_batch(vector.values(), centroid, dimension)
-                                }
-                            };
-                            distances.fold(f32::INFINITY, |a, b| a.min(b))
-                        })
-                        .sum::<f32>() as f64 // in case of overflow
-                })
-                .await
-            })
-            .buffered(num_cpus::get())
-            .try_collect::<Vec<_>>()
-            .await?
+        let sub_vector_width = self.dimension / self.num_sub_vectors;
+        let total_distortion = data
             .iter()
-            .sum::<f64>();
-        Ok(distortion / data.num_rows() as f64)
+            .map(|vector| {
+                vector
+                    .chunks_exact(sub_vector_width)
+                    .enumerate()
+                    .map(|(sub_vector_idx, sub_vec)| {
+                        let centroids = self.centroids(sub_vector_idx);
+                        let distances = match metric_type {
+                            lance_linalg::distance::DistanceType::L2 => {
+                                l2_distance_batch(sub_vec, centroids, sub_vector_width)
+                            }
+                            lance_linalg::distance::DistanceType::Cosine => {
+                                cosine_distance_batch(sub_vec, centroids, sub_vector_width)
+                            }
+                            lance_linalg::distance::DistanceType::Dot => {
+                                dot_distance_batch(sub_vec, centroids, sub_vector_width)
+                            }
+                        };
+                        argmin_value(distances).unwrap().1.as_()
+                    })
+                    .sum::<f64>()
+            })
+            .sum();
+        Ok(total_distortion / data.num_rows() as f64)
     }
 
     /// Train [`ProductQuantizer`] using vectors.
