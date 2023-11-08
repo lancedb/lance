@@ -60,6 +60,7 @@ rand.workspace = true
 tempfile.workspace = true
 lance-testing.workspace = true
 parquet.workspace = true
+proptest = "1.0.0"
 
 [build-dependencies]
 prost-build.workspace = true
