@@ -28,10 +28,12 @@ use futures::{stream, stream::repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{
-    cosine_distance_batch, dot_distance_batch, l2_distance_batch, norm_l2, Normalize,
+    cosine_distance_batch, dot_distance_batch, l2_distance_batch, norm_l2, Cosine, Dot, Normalize,
+    L2,
 };
 use lance_linalg::kernels::argmin;
 use lance_linalg::{distance::MetricType, MatrixView};
+use num_traits::Float;
 use rand::SeedableRng;
 use snafu::{location, Location};
 pub mod builder;
@@ -66,8 +68,10 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
 
 /// Product Quantization, optimized for [Apache Arrow] buffer memory layout.
 ///
+//
+// TODO: move this to be pub(crate) once we have a better way to test it.
 #[derive(Debug)]
-pub struct ProductQuantizerImpl {
+pub struct ProductQuantizerImpl<T: ArrowFloatType + Cosine + Dot + L2> {
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
@@ -99,25 +103,25 @@ pub struct ProductQuantizerImpl {
     /// // Centroids for a sub-vector.
     /// Codebook[sub_vector_id][pq_code]
     /// ```
-    pub codebook: Arc<Float32Array>,
+    pub codebook: Arc<T::ArrayType>,
 }
 
-fn get_sub_vector_centroids(
-    codebook: &Float32Array,
+fn get_sub_vector_centroids<T: Float>(
+    codebook: &[T],
     dimension: usize,
     num_bits: impl Into<u32>,
     num_sub_vectors: usize,
     sub_vector_idx: usize,
-) -> &[f32] {
+) -> &[T] {
     assert!(sub_vector_idx < num_sub_vectors);
 
     let num_centroids = ProductQuantizerImpl::num_centroids(num_bits.into());
     let sub_vector_width = dimension / num_sub_vectors;
-    &codebook.as_slice()[sub_vector_idx * num_centroids * sub_vector_width
+    &codebook[sub_vector_idx * num_centroids * sub_vector_width
         ..(sub_vector_idx + 1) * num_centroids * sub_vector_width]
 }
 
-impl ProductQuantizerImpl {
+impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
     /// Create a [`ProductQuantizer`] with pre-trained codebook.
     pub fn new(
         m: usize,
@@ -148,9 +152,9 @@ impl ProductQuantizerImpl {
     /// Get the centroids for one sub-vector.
     ///
     /// Returns a flatten `num_centroids * sub_vector_width` f32 array.
-    pub fn centroids(&self, sub_vector_idx: usize) -> &[f32] {
+    pub fn centroids(&self, sub_vector_idx: usize) -> &[T::Native] {
         get_sub_vector_centroids(
-            self.codebook.as_ref(),
+            self.codebook.as_slice(),
             self.dimension,
             self.num_bits,
             self.num_sub_vectors,
@@ -179,11 +183,7 @@ impl ProductQuantizerImpl {
     ///
     /// Quantization distortion is the difference between the centroids
     /// from the PQ code to the actual vector.
-    pub async fn distortion(
-        &self,
-        data: &MatrixView<Float32Type>,
-        metric_type: MetricType,
-    ) -> Result<f64> {
+    pub async fn distortion(&self, data: &MatrixView<T>, metric_type: MetricType) -> Result<f64> {
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
         debug_assert_eq!(sub_vectors.len(), self.num_sub_vectors);
 
@@ -199,7 +199,7 @@ impl ProductQuantizerImpl {
                 let cb = codebook.clone();
                 tokio::task::spawn_blocking(move || {
                     let centroid = get_sub_vector_centroids(
-                        cb.as_ref(),
+                        cb.as_slice(),
                         dimension,
                         num_bits,
                         num_sub_vectors,
@@ -479,7 +479,11 @@ impl ProductQuantizerImpl {
 }
 
 #[async_trait]
-impl ProductQuantizer for ProductQuantizerImpl {
+impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizer for ProductQuantizerImpl<T> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     async fn transform(&self, data: &dyn Array) -> Result<ArrayRef> {
         let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
             message: format!(
@@ -489,7 +493,7 @@ impl ProductQuantizer for ProductQuantizerImpl {
             location: location!(),
         })?;
 
-        let data = MatrixView::<Float32Type>::try_from(fsl)?;
+        let data = MatrixView::<T>::try_from(fsl)?;
         let flatten_data = data.data();
         let num_sub_vectors = self.num_sub_vectors;
         let dim = self.dimension;
@@ -501,7 +505,13 @@ impl ProductQuantizer for ProductQuantizerImpl {
         let values = tokio::task::spawn_blocking(move || {
             let all_centroids = (0..num_sub_vectors)
                 .map(|idx| {
-                    get_sub_vector_centroids(codebook.as_ref(), dim, num_bits, num_sub_vectors, idx)
+                    get_sub_vector_centroids(
+                        codebook.as_slice(),
+                        dim,
+                        num_bits,
+                        num_sub_vectors,
+                        idx,
+                    )
                 })
                 .collect::<Vec<_>>();
             let flatten_values = flatten_data.values();
@@ -561,10 +571,6 @@ impl ProductQuantizer for ProductQuantizerImpl {
     fn dimension(&self) -> usize {
         self.dimension
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 #[allow(clippy::fallible_impl_from)]
@@ -576,44 +582,12 @@ impl From<&dyn ProductQuantizer> for pb::Pq {
             dimension: pq.dimension() as u32,
             codebook: pq
                 .as_any()
-                .downcast_ref::<ProductQuantizerImpl>()
+                .downcast_ref::<ProductQuantizerImpl<Float32Type>>()
                 .unwrap()
                 .codebook
                 .values()
                 .to_vec(),
             codebook_tensor: None,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_divide_to_subvectors() {
-        let values = Float32Array::from_iter((0..320).map(|v| v as f32));
-        // A [10, 32] array.
-        let mat = MatrixView::new(values.into(), 32);
-        let sub_vectors = divide_to_subvectors(&mat, 4);
-        assert_eq!(sub_vectors.len(), 4);
-        assert_eq!(sub_vectors[0].len(), 10);
-        assert_eq!(sub_vectors[0].value_length(), 8);
-
-        assert_eq!(
-            sub_vectors[0].as_ref(),
-            &FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                (0..10)
-                    .map(|i| {
-                        Some(
-                            (i * 32..i * 32 + 8)
-                                .map(|v| Some(v as f32))
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-                8
-            )
-        );
     }
 }
