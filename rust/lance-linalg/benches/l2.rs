@@ -83,7 +83,7 @@ fn bench_distance(c: &mut Criterion) {
 
     let key: Float32Array = generate_random_array_with_seed(DIMENSION, [0; 32]);
     let target: Float32Array = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
-    c.bench_function(format!("L2(f32, simd)").as_str(), |b| {
+    c.bench_function("L2(f32, simd)", |b| {
         b.iter(|| {
             black_box(l2_distance_batch(key.values(), target.values(), DIMENSION).count());
         })

@@ -59,8 +59,7 @@ impl BenchmarkFixture {
     async fn train_scalar_index(index_store: &Arc<dyn IndexStore>) {
         let sub_index_trainer = FlatIndexTrainer::new(arrow_schema::DataType::UInt32);
 
-        let data =
-            stream::iter(Self::test_data().map(|batch| batch.map_err(|err| Error::from(err))));
+        let data = stream::iter(Self::test_data().map(|batch| batch.map_err(Error::from)));
         train_btree_index(data, &sub_index_trainer, index_store.as_ref())
             .await
             .unwrap();

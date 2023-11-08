@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 45
     defaults:
       run:
-        working-directory: ./rust/lance
+        working-directory: ./rust
     steps:
       - uses: actions/checkout@v3
       - uses: Swatinem/rust-cache@v2
@@ -98,7 +98,7 @@ jobs:
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Run clippy
-        run: cargo clippy --features cli,dynamodb,tensorflow,dynamodb_tests --tests -- -D warnings
+        run: cargo clippy --features cli,dynamodb,tensorflow,dynamodb_tests --tests --benches -- -D warnings
   mac-build:
     runs-on: macos-13
     timeout-minutes: 45
