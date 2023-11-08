@@ -253,6 +253,7 @@ fn get_string_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
     let mut min_value: Option<&str> = None;
     let mut max_value: Option<&str> = None;
     let mut null_count: i64 = 0;
+    let mut bounds_truncated = false;
 
     let array_iterator = arrays.iter().map(|x| x.as_string::<T>());
 
@@ -264,11 +265,9 @@ fn get_string_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
 
         array.iter().for_each(|value| {
             if let Some(mut val) = value {
-                // Truncate string to the longest length that is still a valid UTF8 string,
-                // while being of BINARY_PREFIX_LENGTH lenght or just greate. This is to avoid
-                // comparing potentially very long strings.
-                if val.len() > BINARY_PREFIX_LENGTH + 4 {
-                    val = truncate_utf8(val, BINARY_PREFIX_LENGTH + 4).unwrap();
+                if val.len() > BINARY_PREFIX_LENGTH {
+                    val = truncate_utf8(val, BINARY_PREFIX_LENGTH).unwrap();
+                    bounds_truncated = true;
                 }
 
                 if let Some(v) = min_value {
@@ -290,17 +289,13 @@ fn get_string_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
         });
     }
 
-    if let Some(v) = min_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            min_value = truncate_utf8(v, BINARY_PREFIX_LENGTH);
-        }
-    }
-
     let max_value_bound: Vec<u8>;
     if let Some(v) = max_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            max_value = truncate_utf8(v, BINARY_PREFIX_LENGTH);
-            max_value_bound = increment_utf8(max_value.unwrap().as_bytes().to_vec()).unwrap();
+        // If the bounds were truncated, then we need to increment the max_value,
+        // since shorter values are considered smaller than longer values if the
+        // short values are a prefix of the long ones.
+        if bounds_truncated {
+            max_value_bound = increment_utf8(v.as_bytes().to_vec()).unwrap();
             max_value = Some(str::from_utf8(&max_value_bound).unwrap());
         }
     }
@@ -329,6 +324,7 @@ fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
     let mut min_value: Option<&[u8]> = None;
     let mut max_value: Option<&[u8]> = None;
     let mut null_count: i64 = 0;
+    let mut bounds_truncated = false;
 
     let array_iterator = arrays.iter().map(|x| as_generic_binary_array::<T>(x));
 
@@ -342,9 +338,9 @@ fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
             if let Some(mut val) = value {
                 // Truncate binary buffer to BINARY_PREFIX_LENGTH to avoid comparing potentially
                 // very long buffers.
-                if val.len() > BINARY_PREFIX_LENGTH + 4 {
-                    // Truncate to longer length to have a valid comparison
-                    val = truncate_binary(val, BINARY_PREFIX_LENGTH + 4).unwrap();
+                if val.len() > BINARY_PREFIX_LENGTH {
+                    val = truncate_binary(val, BINARY_PREFIX_LENGTH).unwrap();
+                    bounds_truncated = true;
                 }
 
                 if let Some(v) = min_value {
@@ -366,16 +362,12 @@ fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
         });
     }
 
-    if let Some(v) = min_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            min_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
-        }
-    }
-
     let min_value = min_value.map(|x| x.to_vec());
+    // If the bounds were truncated, then we need to increment the max_value,
+    // since shorter values are considered smaller than longer values if the
+    // short values are a prefix of the long ones.
     let max_value = if let Some(v) = max_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            max_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
+        if bounds_truncated {
             increment(max_value.unwrap().to_vec())
         } else {
             Some(v.to_vec())
@@ -409,6 +401,8 @@ fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     let array_iterator = arrays.iter().map(|x| as_fixed_size_binary_array(x));
 
     let length = as_fixed_size_binary_array(arrays[0]).value_length() as usize;
+    // Truncate binary buffer to BINARY_PREFIX_LENGTH to avoid comparing potentially
+    // very long buffers.
     let do_truncate = length > BINARY_PREFIX_LENGTH;
 
     for array in array_iterator {
@@ -419,11 +413,8 @@ fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
         array.iter().for_each(|value| {
             if let Some(mut val) = value {
-                // Truncate binary buffer to BINARY_PREFIX_LENGTH to avoid comparing potentially
-                // very long buffers.
                 if do_truncate {
-                    // Truncate to longer length to have a valid comparison
-                    val = truncate_binary(val, BINARY_PREFIX_LENGTH + 4).unwrap();
+                    val = truncate_binary(val, BINARY_PREFIX_LENGTH).unwrap();
                 }
 
                 if let Some(v) = min_value {
@@ -445,16 +436,12 @@ fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         });
     }
 
-    if let Some(v) = min_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            min_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
-        }
-    }
-
     let min_value = min_value.map(|x| x.to_vec());
+    // If the bounds were truncated, then we need to increment the max_value,
+    // since shorter values are considered smaller than longer values if the
+    // short values are a prefix of the long ones.
     let max_value = if let Some(v) = max_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            max_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
+        if do_truncate {
             increment(max_value.unwrap().to_vec())
         } else {
             Some(v.to_vec())
