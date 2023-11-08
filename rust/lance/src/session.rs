@@ -63,7 +63,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::index::vector::pq::PQIndex;
-    use lance_index::vector::pq::ProductQuantizer;
+    use lance_index::vector::pq::ProductQuantizerImpl;
     use lance_linalg::distance::MetricType;
 
     #[test]
@@ -72,7 +72,7 @@ mod tests {
         assert!(no_cache.index_cache.get("abc").is_none());
         let no_cache = Arc::new(no_cache);
 
-        let pq = Arc::new(ProductQuantizer::new(
+        let pq = Arc::new(ProductQuantizerImpl::new(
             1,
             8,
             1,
@@ -91,7 +91,7 @@ mod tests {
         let session = Session::new(10, 1);
         let session = Arc::new(session);
 
-        let pq = Arc::new(ProductQuantizer::new(
+        let pq = Arc::new(ProductQuantizerImpl::new(
             1,
             8,
             1,
@@ -108,7 +108,7 @@ mod tests {
         assert_eq!(session.index_cache.len(), 1);
 
         for iter_idx in 0..100 {
-            let pq_other = Arc::new(ProductQuantizer::new(
+            let pq_other = Arc::new(ProductQuantizerImpl::new(
                 1,
                 8,
                 1,

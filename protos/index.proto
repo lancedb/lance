@@ -97,6 +97,8 @@ message PQ {
   // Codebook. `dimension * 2 ^ num_bits` of float32s.
   repeated float codebook = 4;
 
+  // Tensor of codebook. `2 ^ num_bits * dimension` of floats.
+  Tensor codebook_tensor = 5;
 }
 
 // Transform type

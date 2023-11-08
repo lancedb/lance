@@ -22,7 +22,7 @@ use futures::{stream::repeat_with, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::{io::Writer, ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{
-    pq::{transform::PQTransformer, ProductQuantizer},
+    pq::{transform::PQTransformer, ProductQuantizerImpl},
     residual::ResidualTransform,
     PART_ID_COLUMN, PQ_CODE_COLUMN,
 };
@@ -134,7 +134,7 @@ pub(super) async fn build_partitions(
     data: impl RecordBatchStream + Unpin,
     column: &str,
     ivf: &mut Ivf,
-    pq: Arc<ProductQuantizer>,
+    pq: Arc<ProductQuantizerImpl>,
     metric_type: MetricType,
     part_range: Range<u32>,
 ) -> Result<()> {

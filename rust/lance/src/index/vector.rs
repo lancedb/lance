@@ -15,7 +15,6 @@
 //! Vector Index for Fast Approximate Nearest Neighbor (ANN) Search
 //!
 
-use arrow_array::Float32Array;
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
@@ -30,7 +29,7 @@ mod traits;
 mod utils;
 
 use lance_core::io::{read_message, Reader};
-use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
+use lance_index::vector::pq::PQBuildParams;
 use lance_linalg::distance::*;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -371,15 +370,7 @@ pub(crate) async fn open_index(
                         location: location!(),
                     });
                 };
-                let pq = Arc::new(ProductQuantizer::new(
-                    pq_proto.num_sub_vectors as usize,
-                    pq_proto.num_bits,
-                    pq_proto.dimension as usize,
-                    Arc::new(Float32Array::from_iter_values(
-                        pq_proto.codebook.iter().copied(),
-                    )),
-                    metric_type,
-                ));
+                let pq = lance_index::vector::pq::builder::from_proto(pq_proto, metric_type)?;
                 last_stage = Some(Arc::new(PQIndex::new(pq, metric_type)));
             }
             Some(Stage::Diskann(diskann_proto)) => {

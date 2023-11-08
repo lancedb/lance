@@ -15,12 +15,11 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, types::Float32Type, Array, RecordBatch};
+use arrow_array::{cast::AsArray, Array, RecordBatch};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
-use lance_linalg::MatrixView;
 use snafu::{location, Location};
 
 use super::ProductQuantizer;
@@ -30,13 +29,17 @@ use crate::vector::transform::Transformer;
 ///
 /// It transforms a column of vectors into a column of PQ codes.
 pub struct PQTransformer {
-    quantizer: Arc<ProductQuantizer>,
+    quantizer: Arc<dyn ProductQuantizer>,
     input_column: String,
     output_column: String,
 }
 
 impl PQTransformer {
-    pub fn new(quantizer: Arc<ProductQuantizer>, input_column: &str, output_column: &str) -> Self {
+    pub fn new(
+        quantizer: Arc<dyn ProductQuantizer>,
+        input_column: &str,
+        output_column: &str,
+    ) -> Self {
         Self {
             quantizer,
             input_column: input_column.to_owned(),
@@ -67,17 +70,14 @@ impl Transformer for PQTransformer {
                 ),
                 location: location!(),
             })?;
-        let data: MatrixView<Float32Type> = input_arr
-            .as_fixed_size_list_opt()
-            .ok_or(Error::Index {
-                message: format!(
-                    "PQ Transform: column {} is not a fixed size list, got {}",
-                    self.input_column,
-                    input_arr.data_type(),
-                ),
-                location: location!(),
-            })?
-            .try_into()?;
+        let data = input_arr.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "PQ Transform: column {} is not a fixed size list, got {}",
+                self.input_column,
+                input_arr.data_type(),
+            ),
+            location: location!(),
+        })?;
         let pq_code = self.quantizer.transform(&data).await?;
         let pq_field = Field::new(&self.output_column, pq_code.data_type().clone(), false);
         let batch = batch.try_with_column(pq_field, Arc::new(pq_code))?;
@@ -90,12 +90,12 @@ impl Transformer for PQTransformer {
 mod tests {
     use super::*;
 
-    use arrow_array::{FixedSizeListArray, Float32Array, Int32Array};
+    use arrow_array::{types::Float32Type, FixedSizeListArray, Float32Array, Int32Array};
     use arrow_schema::{DataType, Schema};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_linalg::distance::MetricType;
+    use lance_linalg::{distance::MetricType, MatrixView};
 
-    use crate::vector::pq::PQBuildParams;
+    use crate::vector::pq::{PQBuildParams, ProductQuantizerImpl};
 
     #[tokio::test]
     async fn test_pq_transform() {
@@ -105,7 +105,7 @@ mod tests {
         let mat: MatrixView<Float32Type> = arr.as_ref().try_into().unwrap();
 
         let params = PQBuildParams::new(1, 8);
-        let pq = ProductQuantizer::train(&mat, MetricType::L2, &params)
+        let pq = ProductQuantizerImpl::train(&mat, MetricType::L2, &params)
             .await
             .unwrap();
 
@@ -123,7 +123,7 @@ mod tests {
         )
         .unwrap();
 
-        let transformer = PQTransformer::new(pq.into(), "vec", "pq_code");
+        let transformer = PQTransformer::new(Arc::new(pq), "vec", "pq_code");
         let batch = transformer.transform(&batch).await.unwrap();
         assert!(batch.column_by_name("vec").is_none());
         assert!(batch.column_by_name("pq_code").is_some());
