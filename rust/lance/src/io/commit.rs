@@ -415,13 +415,14 @@ mod tests {
         CommitError, CommitHandler, CommitLease, CommitLock, RenameCommitHandler,
         UnsafeCommitHandler,
     };
+    use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
 
     use super::*;
 
     use crate::dataset::{transaction::Operation, WriteMode, WriteParams};
-    use crate::index::{vector::VectorIndexParams, DatasetIndexExt, IndexType};
+    use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
     use crate::io::object_store::ObjectStoreParams;
     use crate::Dataset;
 

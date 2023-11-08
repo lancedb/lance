@@ -69,7 +69,7 @@ mod tests {
     #[test]
     fn test_disable_index_cache() {
         let no_cache = Session::new(0, 0);
-        assert!(no_cache.index_cache.get("abc").is_none());
+        assert!(no_cache.index_cache.get_vector("abc").is_none());
         let no_cache = Arc::new(no_cache);
 
         let pq = Arc::new(ProductQuantizerImpl::new(
@@ -80,10 +80,10 @@ mod tests {
             MetricType::L2,
         ));
         let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
-        no_cache.index_cache.insert("abc", idx);
+        no_cache.index_cache.insert_vector("abc", idx);
 
-        assert!(no_cache.index_cache.get("abc").is_none());
-        assert_eq!(no_cache.index_cache.len(), 0);
+        assert!(no_cache.index_cache.get_vector("abc").is_none());
+        assert_eq!(no_cache.index_cache.len_vector(), 0);
     }
 
     #[test]
@@ -99,13 +99,13 @@ mod tests {
             MetricType::L2,
         ));
         let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
-        session.index_cache.insert("abc", idx.clone());
+        session.index_cache.insert_vector("abc", idx.clone());
 
-        let found = session.index_cache.get("abc");
+        let found = session.index_cache.get_vector("abc");
         assert!(found.is_some());
         assert_eq!(format!("{:?}", found.unwrap()), format!("{:?}", idx));
-        assert!(session.index_cache.get("abc").is_some());
-        assert_eq!(session.index_cache.len(), 1);
+        assert!(session.index_cache.get_vector("abc").is_some());
+        assert_eq!(session.index_cache.len_vector(), 1);
 
         for iter_idx in 0..100 {
             let pq_other = Arc::new(ProductQuantizerImpl::new(
@@ -118,10 +118,10 @@ mod tests {
             let idx_other = Arc::new(PQIndex::new(pq_other, MetricType::L2));
             session
                 .index_cache
-                .insert(format!("{iter_idx}").as_str(), idx_other.clone());
+                .insert_vector(format!("{iter_idx}").as_str(), idx_other.clone());
         }
 
         // Capacity is 10 so there should be at most 10 items
-        assert_eq!(session.index_cache.len(), 10);
+        assert_eq!(session.index_cache.len_vector(), 10);
     }
 }

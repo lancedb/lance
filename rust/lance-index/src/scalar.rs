@@ -23,9 +23,11 @@ use datafusion_common::scalar::ScalarValue;
 
 use lance_core::Result;
 
+use crate::Index;
+
 pub mod btree;
 pub mod flat;
-pub mod lance;
+pub mod lance_format;
 
 /// Trait for storing an index (or parts of an index) into storage
 #[async_trait]
@@ -83,7 +85,7 @@ pub enum ScalarQuery {
 
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
-pub trait ScalarIndex: Send + Sync + std::fmt::Debug {
+pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index {
     /// Search the scalar index
     ///
     /// Returns all row ids that satisfy the query, these row ids are not neccesarily ordered

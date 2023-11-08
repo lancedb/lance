@@ -28,9 +28,10 @@ pub mod pq;
 mod traits;
 mod utils;
 
-use lance_core::io::{read_message, Reader};
+use lance_core::io::Reader;
 use lance_index::vector::pq::PQBuildParams;
 use lance_linalg::distance::*;
+use object_store::path::Path;
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
@@ -40,7 +41,7 @@ use self::{
     pq::PQIndex,
 };
 
-use super::{pb, IndexParams};
+use super::{pb, DatasetIndexInternalExt, IndexParams};
 #[cfg(feature = "opq")]
 use crate::index::vector::opq::{OPQIndex, OptimizedProductQuantizer};
 use crate::{
@@ -52,12 +53,9 @@ use crate::{
             ivf::Ivf,
         },
     },
-    io::{read_message_from_buf, read_metadata_offset},
     Error, Result,
 };
 pub use traits::*;
-
-const INDEX_FILE_NAME: &str = "index.idx";
 
 /// Parameters of each index stage.
 #[derive(Debug, Clone)]
@@ -232,7 +230,9 @@ pub(crate) async fn remap_vector_index(
     old_metadata: &crate::format::Index,
     mapping: &HashMap<u64, Option<u64>>,
 ) -> Result<()> {
-    let old_index = open_index(dataset.clone(), column, &old_uuid.to_string()).await?;
+    let old_index = dataset
+        .open_vector_index(column, &old_uuid.to_string())
+        .await?;
     old_index.check_can_remap()?;
     let ivf_index: &IVFIndex =
         old_index
@@ -262,56 +262,15 @@ pub(crate) async fn remap_vector_index(
 }
 
 /// Open the Vector index on dataset, specified by the `uuid`.
-#[instrument(level = "debug", skip(dataset))]
-pub(crate) async fn open_index(
+#[instrument(level = "debug", skip(dataset, vec_idx, index_dir, reader))]
+pub(crate) async fn open_vector_index(
     dataset: Arc<Dataset>,
     column: &str,
     uuid: &str,
+    vec_idx: &lance_index::pb::VectorIndex,
+    index_dir: Path,
+    reader: Arc<dyn Reader>,
 ) -> Result<Arc<dyn VectorIndex>> {
-    if let Some(index) = dataset.session.index_cache.get(uuid) {
-        return Ok(index);
-    }
-
-    let index_dir = dataset.indices_dir().child(uuid);
-    let index_file = index_dir.child(INDEX_FILE_NAME);
-
-    let object_store = dataset.object_store();
-    let reader: Arc<dyn Reader> = object_store.open(&index_file).await?.into();
-
-    let file_size = reader.size().await?;
-    let block_size = object_store.block_size();
-    let begin = if file_size < block_size {
-        0
-    } else {
-        file_size - block_size
-    };
-    let tail_bytes = reader.get_range(begin..file_size).await?;
-    let metadata_pos = read_metadata_offset(&tail_bytes)?;
-    let proto: pb::Index = if metadata_pos < file_size - tail_bytes.len() {
-        // We have not read the metadata bytes yet.
-        read_message(reader.as_ref(), metadata_pos).await?
-    } else {
-        let offset = tail_bytes.len() - (file_size - metadata_pos);
-        read_message_from_buf(&tail_bytes.slice(offset..))?
-    };
-
-    if proto.columns.len() != 1 {
-        return Err(Error::Index {
-            message: "VectorIndex only supports 1 column".to_string(),
-            location: location!(),
-        });
-    }
-    assert_eq!(proto.index_type, pb::IndexType::Vector as i32);
-
-    let Some(idx_impl) = proto.implementation.as_ref() else {
-        return Err(Error::Index {
-            message: "Invalid protobuf for VectorIndex metadata".to_string(),
-            location: location!(),
-        });
-    };
-
-    let pb::index::Implementation::VectorIndex(vec_idx) = idx_impl;
-
     let metric_type = pb::VectorMetricType::try_from(vec_idx.metric_type)?.into();
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
@@ -399,6 +358,6 @@ pub(crate) async fn open_index(
         });
     }
     let idx = last_stage.unwrap();
-    dataset.session.index_cache.insert(uuid, idx.clone());
+    dataset.session.index_cache.insert_vector(uuid, idx.clone());
     Ok(idx)
 }

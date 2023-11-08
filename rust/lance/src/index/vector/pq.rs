@@ -31,14 +31,17 @@ use lance_core::{
     ROW_ID_FIELD,
 };
 pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizerImpl};
-use lance_index::vector::{pq::ProductQuantizer, Query, DIST_COL};
+use lance_index::{
+    vector::{pq::ProductQuantizer, Query, DIST_COL},
+    Index, IndexType,
+};
 use lance_linalg::{distance::MetricType, matrix::MatrixView};
 use serde::Serialize;
 use snafu::{location, Location};
 use tracing::{instrument, Instrument};
 
 use super::VectorIndex;
-use crate::index::{prefilter::PreFilter, Index};
+use crate::index::prefilter::PreFilter;
 use crate::{arrow::*, utils::tokio::spawn_cpu};
 use crate::{Error, Result};
 
@@ -119,8 +122,16 @@ impl Index for PQIndex {
         self
     }
 
-    fn statistics(&self) -> Result<serde_json::Value> {
-        Ok(serde_json::to_value(PQIndexStatistics {
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::Vector
+    }
+
+    fn statistics(&self) -> Result<String> {
+        Ok(serde_json::to_string(&PQIndexStatistics {
             index_type: "PQ".to_string(),
             nbits: self.pq.num_bits(),
             num_sub_vectors: self.pq.num_sub_vectors(),

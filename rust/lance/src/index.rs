@@ -20,12 +20,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lance_core::io::{read_message, read_message_from_buf, read_metadata_offset, Reader};
+use lance_index::pb::index::Implementation;
+use lance_index::scalar::ScalarIndex;
+use lance_index::{pb, Index, IndexType, INDEX_FILE_NAME};
 use snafu::{location, Location};
 use uuid::Uuid;
 
 pub(crate) mod append;
 pub(crate) mod cache;
 pub(crate) mod prefilter;
+pub(crate) mod scalar;
 pub mod vector;
 
 use crate::dataset::transaction::{Operation, Transaction};
@@ -34,9 +39,9 @@ use crate::index::append::append_index;
 use crate::index::vector::remap_vector_index;
 use crate::io::commit::commit_transaction;
 use crate::{dataset::Dataset, Error, Result};
-pub use lance_index::{pb, Index, IndexType};
 
-use self::vector::{build_vector_index, VectorIndexParams};
+use self::scalar::build_scalar_index;
+use self::vector::{build_vector_index, VectorIndex, VectorIndexParams};
 
 /// Builds index.
 #[async_trait]
@@ -121,6 +126,28 @@ pub trait DatasetIndexExt {
     async fn optimize_indices(&mut self) -> Result<()>;
 }
 
+async fn open_index_proto(dataset: &Dataset, reader: &dyn Reader) -> Result<pb::Index> {
+    let object_store = dataset.object_store();
+
+    let file_size = reader.size().await?;
+    let block_size = object_store.block_size();
+    let begin = if file_size < block_size {
+        0
+    } else {
+        file_size - block_size
+    };
+    let tail_bytes = reader.get_range(begin..file_size).await?;
+    let metadata_pos = read_metadata_offset(&tail_bytes)?;
+    let proto: pb::Index = if metadata_pos < file_size - tail_bytes.len() {
+        // We have not read the metadata bytes yet.
+        read_message(reader, metadata_pos).await?
+    } else {
+        let offset = tail_bytes.len() - (file_size - metadata_pos);
+        read_message_from_buf(&tail_bytes.slice(offset..))?
+    };
+    Ok(proto)
+}
+
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     async fn create_index(
@@ -171,6 +198,9 @@ impl DatasetIndexExt for Dataset {
 
         let index_id = Uuid::new_v4();
         match index_type {
+            IndexType::Scalar => {
+                build_scalar_index(self, column, &index_id.to_string()).await?;
+            }
             IndexType::Vector => {
                 // Vector index params.
                 let vec_params = params
@@ -266,6 +296,88 @@ impl DatasetIndexExt for Dataset {
 
         self.manifest = Arc::new(new_manifest);
         Ok(())
+    }
+}
+
+/// A trait for internal dataset utilities
+#[async_trait]
+pub(crate) trait DatasetIndexInternalExt {
+    /// Opens an index (scalar or vector) as a generic index
+    async fn open_generic_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn Index>>;
+    /// Opens the requested scalar index
+    async fn open_scalar_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn ScalarIndex>>;
+    /// Opens the requested vector index
+    async fn open_vector_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn VectorIndex>>;
+}
+
+#[async_trait]
+impl DatasetIndexInternalExt for Dataset {
+    async fn open_generic_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn Index>> {
+        // Checking for cache existence is cheap so we just check both scalar and vector caches
+        if let Some(index) = self.session.index_cache.get_scalar(uuid) {
+            return Ok(index.as_index());
+        }
+        if let Some(index) = self.session.index_cache.get_vector(uuid) {
+            return Ok(index.as_index());
+        }
+
+        // Sometimes we want to open an index and we don't care if it is a scalar or vector index.
+        // For example, we might want to get statistics for an index, regardless of type.
+        //
+        // Currently, we solve this problem by checking for the existence of INDEX_FILE_NAME since
+        // only vector indices have this file.  In the future, once we support multiple kinds of
+        // scalar indices, we may start having this file with scalar indices too.  Once that happens
+        // we can just read this file and look at the `implementation` or `index_type` fields to
+        // determine what kind of index it is.
+        let index_dir = self.indices_dir().child(uuid);
+        let index_file = index_dir.child(INDEX_FILE_NAME);
+        if self.object_store.exists(&index_file).await? {
+            let index = self.open_vector_index(column, uuid).await?;
+            Ok(index.as_index())
+        } else {
+            let index = self.open_scalar_index(column, uuid).await?;
+            Ok(index.as_index())
+        }
+    }
+
+    async fn open_scalar_index(&self, _column: &str, uuid: &str) -> Result<Arc<dyn ScalarIndex>> {
+        if let Some(index) = self.session.index_cache.get_scalar(uuid) {
+            return Ok(index);
+        }
+
+        let index = crate::index::scalar::open_scalar_index(self, uuid).await?;
+        self.session.index_cache.insert_scalar(uuid, index.clone());
+        Ok(index)
+    }
+
+    async fn open_vector_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn VectorIndex>> {
+        if let Some(index) = self.session.index_cache.get_vector(uuid) {
+            return Ok(index);
+        }
+
+        let index_dir = self.indices_dir().child(uuid);
+        let index_file = index_dir.child(INDEX_FILE_NAME);
+        let reader: Arc<dyn Reader> = self.object_store.open(&index_file).await?.into();
+
+        let proto = open_index_proto(self, reader.as_ref()).await?;
+        match &proto.implementation {
+            Some(Implementation::VectorIndex(vector_index)) => {
+                let dataset = Arc::new(self.clone());
+                crate::index::vector::open_vector_index(
+                    dataset,
+                    column,
+                    uuid,
+                    vector_index,
+                    index_dir,
+                    reader,
+                )
+                .await
+            }
+            None => Err(Error::Internal {
+                message: "Index proto was missing implementation field".into(),
+                location: location!(),
+            }),
+        }
     }
 }
 

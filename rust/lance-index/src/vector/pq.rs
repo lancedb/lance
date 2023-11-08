@@ -430,7 +430,7 @@ impl ProductQuantizerImpl {
         //
         // xy table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
         // y_norm table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
-        let num_centroids = ProductQuantizerImpl::num_centroids(self.num_bits);
+        let num_centroids = Self::num_centroids(self.num_bits);
         let mut xy_table: Vec<f32> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
         let mut y2_table: Vec<f32> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
 

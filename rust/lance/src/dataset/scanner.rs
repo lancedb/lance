@@ -1011,6 +1011,7 @@ mod test {
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::vector::DIST_COL;
+    use lance_index::IndexType;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use tempfile::tempdir;
 
@@ -1018,10 +1019,7 @@ mod test {
     use crate::arrow::*;
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
-    use crate::index::{
-        DatasetIndexExt,
-        {vector::VectorIndexParams, IndexType},
-    };
+    use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
 
     #[tokio::test]
     async fn test_batch_size() {

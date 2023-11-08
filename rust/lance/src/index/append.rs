@@ -21,7 +21,9 @@ use uuid::Uuid;
 
 use crate::dataset::index::unindexed_fragments;
 use crate::dataset::Dataset;
-use crate::index::vector::{ivf::IVFIndex, open_index};
+use crate::index::vector::ivf::IVFIndex;
+
+use super::DatasetIndexInternalExt;
 
 /// Append new data to the index, without re-train.
 pub async fn append_index(
@@ -44,12 +46,9 @@ pub async fn append_index(
             location: location!(),
         })?;
 
-    let index = open_index(
-        dataset.clone(),
-        &column.name,
-        old_index.uuid.to_string().as_str(),
-    )
-    .await?;
+    let index = dataset
+        .open_vector_index(&column.name, old_index.uuid.to_string().as_str())
+        .await?;
 
     let Some(ivf_idx) = index.as_any().downcast_ref::<IVFIndex>() else {
         info!("Index type: {:?} does not support append", index);
@@ -181,7 +180,8 @@ mod tests {
         assert!(contained);
 
         // Check that the index has all 2000 rows.
-        let binding = open_index(Arc::new(dataset), "vector", index.uuid.to_string().as_str())
+        let binding = dataset
+            .open_vector_index("vector", index.uuid.to_string().as_str())
             .await
             .unwrap();
         let ivf_index = binding.as_any().downcast_ref::<IVFIndex>().unwrap();

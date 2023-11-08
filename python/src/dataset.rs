@@ -38,7 +38,8 @@ use lance::index::{
     DatasetIndexExt,
 };
 use lance::io::object_store::ObjectStoreParams;
-use lance_index::{vector::pq::PQBuildParams, IndexType};
+use lance_index::vector::pq::PQBuildParams;
+use lance_index::IndexType;
 use lance_linalg::distance::MetricType;
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;

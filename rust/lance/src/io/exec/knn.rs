@@ -39,7 +39,7 @@ use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
 use crate::format::Index;
 use crate::index::prefilter::{AllowListLoader, PreFilter};
-use crate::index::vector::open_index;
+use crate::index::DatasetIndexInternalExt;
 use crate::io::RecordBatchStream;
 use crate::{Error, Result};
 
@@ -286,8 +286,9 @@ impl KNNIndexStream {
         // An optional input containing a list of row ids to use as a prefilter
         allow_list_input: Option<datafusion::physical_plan::SendableRecordBatchStream>,
     ) -> Result<RecordBatch> {
-        let index =
-            open_index(dataset.clone(), &query.column, &index_meta.uuid.to_string()).await?;
+        let index = dataset
+            .open_vector_index(&query.column, &index_meta.uuid.to_string())
+            .await?;
         let allow_list_loader = allow_list_input.map(|allow_list_input| {
             Box::new(PreFilterBuilder(allow_list_input)) as Box<dyn AllowListLoader>
         });

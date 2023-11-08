@@ -13,22 +13,29 @@
 // limitations under the License.
 
 use std::{
+    any::Any,
     cmp::Ordering,
     collections::{BTreeMap, BinaryHeap},
-    fmt::Debug,
+    fmt::{Debug, Display},
     ops::Bound,
     sync::Arc,
 };
 
 use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion_common::ScalarValue;
 use datafusion_expr::Accumulator;
 use datafusion_physical_expr::expressions::{MaxAccumulator, MinAccumulator};
-use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::{
+    stream::{self, BoxStream},
+    FutureExt, StreamExt, TryStreamExt,
+};
 use lance_core::{Error, Result};
+use serde::{Serialize, Serializer};
 use snafu::{location, Location};
+
+use crate::{Index, IndexType};
 
 use super::{
     flat::FlatIndexLoader, IndexReader, IndexStore, IndexWriter, ScalarIndex, ScalarQuery,
@@ -38,8 +45,14 @@ const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
 
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct OrderableScalarValue(ScalarValue);
+
+impl Display for OrderableScalarValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
 
 impl PartialEq for OrderableScalarValue {
     fn eq(&self, other: &Self) -> bool {
@@ -719,6 +732,59 @@ fn wrap_bound(bound: &Bound<ScalarValue>) -> Bound<OrderableScalarValue> {
     }
 }
 
+fn serialize_with_display<T: Display, S: Serializer>(
+    value: &Option<T>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    if let Some(value) = value {
+        serializer.collect_str(value)
+    } else {
+        serializer.collect_str("N/A")
+    }
+}
+
+#[derive(Serialize)]
+struct BTreeStatistics {
+    #[serde(serialize_with = "serialize_with_display")]
+    min: Option<OrderableScalarValue>,
+    #[serde(serialize_with = "serialize_with_display")]
+    max: Option<OrderableScalarValue>,
+    num_pages: u32,
+}
+
+impl Index for BTreeIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::Scalar
+    }
+
+    fn statistics(&self) -> Result<String> {
+        let min = self
+            .page_lookup
+            .tree
+            .first_key_value()
+            .map(|(k, _)| k.clone());
+        let max = self
+            .page_lookup
+            .tree
+            .last_key_value()
+            .map(|(k, _)| k.clone());
+        serde_json::to_string(&BTreeStatistics {
+            num_pages: self.page_lookup.tree.len() as u32,
+            min,
+            max,
+        })
+        .map_err(|err| err.into())
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for BTreeIndex {
     async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
@@ -861,13 +927,28 @@ fn btree_stats_as_batch(stats: Vec<EncodedBatch>) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
+#[async_trait]
+pub trait BtreeTrainingSource: Send + Sync {
+    /// Returns a stream of batches, ordered by the value column (in ascending order)
+    ///
+    /// Each batch should have chunk_size rows
+    ///
+    /// The schema for the batch is slightly flexible.
+    /// The first column may have any name or type, these are the values to index
+    /// The second column must be the row ids which must be UInt64Type
+    async fn scan_ordered_chunks(
+        self: Box<Self>,
+        chunk_size: u32,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>>;
+}
+
 /// Train a btree index from a stream of sorted page-size batches of values and row ids
 ///
 /// Note: This is likely to change.  It is unreasonable to expect the caller to do the sorting
 /// and re-chunking into page-size batches.  This is left for simplicity as this feature is still
 /// a work in progress
-pub async fn train_btree_index<S: Stream<Item = Result<RecordBatch>> + Unpin>(
-    mut batches: S,
+pub async fn train_btree_index(
+    data_source: Box<dyn BtreeTrainingSource + Send>,
     sub_index_trainer: &dyn SubIndexTrainer,
     index_store: &dyn IndexStore,
 ) -> Result<()> {
@@ -876,7 +957,10 @@ pub async fn train_btree_index<S: Stream<Item = Result<RecordBatch>> + Unpin>(
         .await?;
     let mut encoded_batches = Vec::new();
     let mut batch_idx = 0;
-    while let Some(batch) = batches.try_next().await? {
+    let mut batches_source = data_source.scan_ordered_chunks(4096).await?;
+    while let Some(batch) = batches_source.try_next().await? {
+        debug_assert_eq!(batch.num_columns(), 2);
+        debug_assert_eq!(*batch.column(1).data_type(), DataType::UInt64);
         encoded_batches.push(
             train_btree_page(batch, batch_idx, sub_index_trainer, sub_index_file.as_mut()).await?,
         );
