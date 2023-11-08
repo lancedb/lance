@@ -90,24 +90,20 @@ impl Transformer for PQTransformer {
 mod tests {
     use super::*;
 
-    use arrow_array::{types::Float32Type, FixedSizeListArray, Float32Array, Int32Array};
+    use arrow_array::{FixedSizeListArray, Float32Array, Int32Array};
     use arrow_schema::{DataType, Schema};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_linalg::{distance::MetricType, MatrixView};
+    use lance_linalg::distance::MetricType;
 
-    use crate::vector::pq::{PQBuildParams, ProductQuantizerImpl};
+    use crate::vector::pq::PQBuildParams;
 
     #[tokio::test]
     async fn test_pq_transform() {
         let values = Float32Array::from_iter((0..16000).map(|v| v as f32));
         let dim = 16;
         let arr = Arc::new(FixedSizeListArray::try_new_from_values(values, 16).unwrap());
-        let mat: MatrixView<Float32Type> = arr.as_ref().try_into().unwrap();
-
         let params = PQBuildParams::new(1, 8);
-        let pq = ProductQuantizerImpl::train(&mat, MetricType::L2, &params)
-            .await
-            .unwrap();
+        let pq = params.build(arr.as_ref(), MetricType::L2).await.unwrap();
 
         let schema = Schema::new(vec![
             Field::new(
@@ -123,7 +119,7 @@ mod tests {
         )
         .unwrap();
 
-        let transformer = PQTransformer::new(Arc::new(pq), "vec", "pq_code");
+        let transformer = PQTransformer::new(pq, "vec", "pq_code");
         let batch = transformer.transform(&batch).await.unwrap();
         assert!(batch.column_by_name("vec").is_none());
         assert!(batch.column_by_name("pq_code").is_some());

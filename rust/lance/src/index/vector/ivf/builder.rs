@@ -21,10 +21,9 @@ use arrow_schema::{DataType, Field, Schema};
 use futures::{stream::repeat_with, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::{io::Writer, ROW_ID, ROW_ID_FIELD};
+use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::{
-    pq::{transform::PQTransformer, ProductQuantizerImpl},
-    residual::ResidualTransform,
-    PART_ID_COLUMN, PQ_CODE_COLUMN,
+    pq::transform::PQTransformer, residual::ResidualTransform, PART_ID_COLUMN, PQ_CODE_COLUMN,
 };
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
@@ -134,7 +133,7 @@ pub(super) async fn build_partitions(
     data: impl RecordBatchStream + Unpin,
     column: &str,
     ivf: &mut Ivf,
-    pq: Arc<ProductQuantizerImpl>,
+    pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
     part_range: Range<u32>,
 ) -> Result<()> {
@@ -170,7 +169,7 @@ pub(super) async fn build_partitions(
         ],
         part_range.clone(),
     );
-    let shuffler = shuffle_dataset(data, column, Arc::new(ivf_model), pq.num_sub_vectors).await?;
+    let shuffler = shuffle_dataset(data, column, Arc::new(ivf_model), pq.num_sub_vectors()).await?;
     write_index_partitions(writer, ivf, &shuffler, None).await?;
 
     Ok(())
