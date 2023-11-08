@@ -1567,7 +1567,7 @@ mod tests {
                     .as_primitive::<Float32Type>()
                     .values()
                     .iter()
-                    .all(|v| (-2.0 * DIM as f32..100.0).contains(v)));
+                    .all(|v| (-2.0 * DIM as f32..10.0).contains(v)));
             }
         }
     }
