@@ -231,7 +231,6 @@ impl Dataset {
     }
 
     /// Check out a version of the dataset with read params.
-    #[deprecated = "Use DatasetBuilder instead"]
     pub async fn checkout_with_params(
         uri: &str,
         version: u64,
