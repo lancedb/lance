@@ -17,7 +17,6 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -35,36 +34,11 @@ use crate::index::append::append_index;
 use crate::index::vector::remap_vector_index;
 use crate::io::commit::commit_transaction;
 use crate::{dataset::Dataset, Error, Result};
-pub use lance_index::pb;
+pub use lance_index::{pb, Index};
+use lance_index::IndexType;
 
 use self::vector::{build_vector_index, VectorIndexParams};
 
-/// Trait of a secondary index.
-pub(crate) trait Index: Send + Sync {
-    /// Cast to [Any].
-    fn as_any(&self) -> &dyn Any;
-
-    // TODO: if we ever make this public, do so in such a way that `serde_json`
-    // isn't exposed at the interface. That way mismatched versions isn't an issue.
-    fn statistics(&self) -> Result<serde_json::Value>;
-}
-
-/// Index Type
-pub enum IndexType {
-    // Preserve 0-100 for simple indices.
-
-    // 100+ and up for vector index.
-    /// Flat vector index.
-    Vector = 100,
-}
-
-impl fmt::Display for IndexType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Vector => write!(f, "Vector"),
-        }
-    }
-}
 
 /// Builds index.
 #[async_trait]

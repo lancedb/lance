@@ -14,10 +14,45 @@
 
 //! Lance secondary index library
 
+use std::any::Any;
+use std::fmt;
+
+use serde_json;
+
+use lance_core::Result;
+
 pub mod scalar;
 pub mod vector;
 
 pub mod pb {
     #![allow(clippy::use_self)]
     include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
+}
+
+
+/// Trait of a secondary index.
+pub trait Index: Send + Sync {
+    /// Cast to [Any].
+    fn as_any(&self) -> &dyn Any;
+
+    // TODO: if we ever make this public, do so in such a way that `serde_json`
+    // isn't exposed at the interface. That way mismatched versions isn't an issue.
+    fn statistics(&self) -> Result<serde_json::Value>;
+}
+
+/// Index Type
+pub enum IndexType {
+    // Preserve 0-100 for simple indices.
+
+    // 100+ and up for vector index.
+    /// Flat vector index.
+    Vector = 100,
+}
+
+impl fmt::Display for IndexType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Vector => write!(f, "Vector"),
+        }
+    }
 }
