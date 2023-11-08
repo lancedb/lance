@@ -14,11 +14,10 @@
 
 use std::sync::Arc;
 
-use arrow_array::FixedSizeListArray;
-use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt};
+use lance_arrow::ArrowFloatType;
 use lance_linalg::MatrixView;
 
-/// Divide a 2D vector in [`FixedSizeListArray`] to `m` sub-vectors.
+/// Divide a 2D vector in [`T::Array`] to `m` sub-vectors.
 ///
 /// For example, for a `[1024x1M]` matrix, when `n = 8`, this function divides
 /// the matrix into  `[128x1M; 8]` vector of matrix.

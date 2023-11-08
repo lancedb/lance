@@ -97,7 +97,7 @@ impl PQBuildParams {
         data: &MatrixView<T>,
         metric_type: MetricType,
     ) -> Result<Arc<dyn ProductQuantizer>> {
-        let sub_vectors = divide_to_subvectors(&data, self.num_sub_vectors);
+        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
         let num_centroids = 2_usize.pow(self.num_bits as u32);
         let dimension = data.num_columns();
         let sub_vector_dimension = dimension / self.num_sub_vectors;
@@ -108,7 +108,7 @@ impl PQBuildParams {
             .map(|sub_vec| async move {
                 let rng = rand::rngs::SmallRng::from_entropy();
                 train_kmeans::<T>(
-                    &sub_vec,
+                    sub_vec,
                     None,
                     sub_vector_dimension,
                     num_centroids,

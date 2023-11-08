@@ -21,7 +21,6 @@ use std::sync::Arc;
 use arrow_array::ArrayRef;
 use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, UInt8Array};
 use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt};
 use lance_arrow::floats::FloatArray;
 use lance_arrow::*;
 use lance_core::{Error, Result};
@@ -31,14 +30,11 @@ use lance_linalg::distance::{
 use lance_linalg::kernels::{argmin, argmin_value};
 use lance_linalg::{distance::MetricType, MatrixView};
 use num_traits::{AsPrimitive, Float, One};
-use rand::SeedableRng;
 use snafu::{location, Location};
 pub mod builder;
 pub mod transform;
 pub(crate) mod utils;
 
-use self::utils::divide_to_subvectors;
-use super::kmeans::train_kmeans;
 use super::pb;
 use crate::vector::pq::utils::num_centroids;
 pub use builder::PQBuildParams;
@@ -163,6 +159,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
     /// Reconstruct a vector from its PQ code.
     ///
     /// It only supports U8 PQ code for now.
+    #[allow(dead_code)]
     pub(crate) fn reconstruct(&self, code: &[u8]) -> Arc<T::ArrayType> {
         assert_eq!(code.len(), self.num_sub_vectors);
         let mut builder = Vec::with_capacity(self.dimension);
@@ -183,6 +180,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
     /// from the PQ code to the actual vector.
     ///
     /// This method is just for debugging purpose.
+    #[allow(dead_code)]
     pub(crate) async fn distortion(
         &self,
         data: &MatrixView<T>,
