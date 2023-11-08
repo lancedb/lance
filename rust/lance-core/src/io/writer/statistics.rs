@@ -342,7 +342,7 @@ fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
             if let Some(mut val) = value {
                 // Truncate binary buffer to BINARY_PREFIX_LENGTH to avoid comparing potentially
                 // very long buffers.
-                if val.len() > BINARY_PREFIX_LENGTH {
+                if val.len() > BINARY_PREFIX_LENGTH + 4 {
                     // Truncate to longer length to have a valid comparison
                     val = truncate_binary(val, BINARY_PREFIX_LENGTH + 4).unwrap();
                 }
