@@ -29,7 +29,7 @@ mod traits;
 mod utils;
 
 use lance_core::io::{read_message, Reader};
-use lance_index::vector::pq::{PQBuildParams};
+use lance_index::vector::pq::PQBuildParams;
 use lance_linalg::distance::*;
 use snafu::{location, Location};
 use tracing::instrument;

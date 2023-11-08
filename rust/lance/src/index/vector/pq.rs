@@ -32,10 +32,7 @@ use lance_core::{
 };
 pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizerImpl};
 use lance_index::vector::{pq::ProductQuantizer, Query, DIST_COL};
-use lance_linalg::{
-    distance::{MetricType},
-    matrix::MatrixView,
-};
+use lance_linalg::{distance::MetricType, matrix::MatrixView};
 use serde::Serialize;
 use snafu::{location, Location};
 use tracing::{instrument, Instrument};
