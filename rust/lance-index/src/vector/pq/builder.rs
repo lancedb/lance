@@ -133,7 +133,7 @@ impl PQBuildParams {
             codebook_builder.extend_from_slice(centroid.values());
         }
 
-        let pd_centroids = Float32Array::from(codebook_builder);
+        let pd_centroids = T::ArrayType::from(codebook_builder);
 
         Ok(Arc::new(ProductQuantizerImpl::<T>::new(
             self.num_sub_vectors,
@@ -194,7 +194,7 @@ pub fn from_proto(proto: &Pq, metric_type: MetricType) -> Result<Arc<dyn Product
             metric_type,
         )))
     } else {
-        Ok(Arc::new(ProductQuantizerImpl::new(
+        Ok(Arc::new(ProductQuantizerImpl::<Float32Type>::new(
             proto.num_sub_vectors as usize,
             proto.num_bits,
             proto.dimension as usize,

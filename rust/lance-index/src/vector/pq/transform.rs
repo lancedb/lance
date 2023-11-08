@@ -105,9 +105,7 @@ mod tests {
         let mat: MatrixView<Float32Type> = arr.as_ref().try_into().unwrap();
 
         let params = PQBuildParams::new(1, 8);
-        let pq = ProductQuantizerImpl::train(&mat, MetricType::L2, &params)
-            .await
-            .unwrap();
+        let pq = params.build(&mat, MetricType::L2).await.unwrap();
 
         let schema = Schema::new(vec![
             Field::new(
@@ -123,7 +121,7 @@ mod tests {
         )
         .unwrap();
 
-        let transformer = PQTransformer::new(Arc::new(pq), "vec", "pq_code");
+        let transformer = PQTransformer::new(pq, "vec", "pq_code");
         let batch = transformer.transform(&batch).await.unwrap();
         assert!(batch.column_by_name("vec").is_none());
         assert!(batch.column_by_name("pq_code").is_some());

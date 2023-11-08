@@ -252,8 +252,8 @@ pub(crate) async fn train_pq(
     data: &MatrixView<Float32Type>,
     metric_type: MetricType,
     params: &PQBuildParams,
-) -> Result<ProductQuantizerImpl> {
-    ProductQuantizerImpl::train(data, metric_type, params).await
+) -> Result<Arc<dyn ProductQuantizer>> {
+    params.build(data, metric_type).await
 }
 
 #[cfg(test)]

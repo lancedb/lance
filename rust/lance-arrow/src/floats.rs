@@ -25,7 +25,7 @@ use arrow_array::{
     Array, Float16Array, Float32Array, Float64Array,
 };
 use half::{bf16, f16};
-use num_traits::{AsPrimitive, Bounded, Float, FromPrimitive};
+use num_traits::{AsPrimitive, Bounded, Float, FromPrimitive, One, Zero};
 
 use super::bfloat16::{BFloat16Array, BFloat16Type};
 
@@ -69,7 +69,17 @@ pub trait ArrowFloatType: std::fmt::Debug {
 }
 
 pub trait FloatToArrayType:
-    Float + Bounded + Sum + AddAssign<Self> + AsPrimitive<f64> + DivAssign + Send + Sync + Copy
+    Float
+    + Bounded
+    + Sum
+    + AddAssign<Self>
+    + AsPrimitive<f64>
+    + DivAssign
+    + Send
+    + Sync
+    + Copy
+    + One
+    + Zero
 {
     type ArrowType: ArrowFloatType<Native = Self>;
 }
