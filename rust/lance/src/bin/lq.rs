@@ -23,7 +23,6 @@ use lance::dataset::Dataset;
 use lance::index::{vector::VectorIndexParams, DatasetIndexExt};
 use lance::{Error, Result};
 use lance_linalg::distance::MetricType;
-use lance_index::IndexType;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -203,7 +202,7 @@ async fn create_index(
     dataset
         .create_index(
             &[col],
-            IndexType::Vector,
+            lance_index::IndexType::Vector,
             name.clone(),
             &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors, use_opq, mt, 100),
             true,
