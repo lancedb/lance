@@ -90,10 +90,10 @@ impl Transformer for PQTransformer {
 mod tests {
     use super::*;
 
-    use arrow_array::{types::Float32Type, FixedSizeListArray, Float32Array, Int32Array};
+    use arrow_array::{FixedSizeListArray, Float32Array, Int32Array};
     use arrow_schema::{DataType, Schema};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_linalg::{distance::MetricType, MatrixView};
+    use lance_linalg::distance::MetricType;
 
     use crate::vector::pq::PQBuildParams;
 
