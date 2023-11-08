@@ -29,7 +29,7 @@ use lance_core::{
     io::{read_fixed_stride_array, Reader},
     ROW_ID_FIELD,
 };
-pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
+pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizerImpl};
 use lance_index::vector::{Query, DIST_COL};
 use lance_linalg::distance::dot_distance_batch;
 use lance_linalg::{
@@ -61,7 +61,7 @@ pub struct PQIndex {
     pub dimension: usize,
 
     /// Product quantizer.
-    pub pq: Arc<ProductQuantizer>,
+    pub pq: Arc<ProductQuantizerImpl>,
 
     /// PQ code
     pub code: Option<Arc<UInt8Array>>,
@@ -85,7 +85,7 @@ impl std::fmt::Debug for PQIndex {
 
 impl PQIndex {
     /// Load a PQ index (page) from the disk.
-    pub(crate) fn new(pq: Arc<ProductQuantizer>, metric_type: MetricType) -> Self {
+    pub(crate) fn new(pq: Arc<ProductQuantizerImpl>, metric_type: MetricType) -> Self {
         Self {
             nbits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors,
@@ -177,7 +177,7 @@ impl PQIndex {
         //
         // xy table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
         // y_norm table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
-        let num_centroids = ProductQuantizer::num_centroids(self.nbits);
+        let num_centroids = ProductQuantizerImpl::num_centroids(self.nbits);
         let mut xy_table: Vec<f32> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
         let mut y2_table: Vec<f32> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
 
@@ -390,8 +390,8 @@ pub(crate) async fn train_pq(
     data: &MatrixView<Float32Type>,
     metric_type: MetricType,
     params: &PQBuildParams,
-) -> Result<ProductQuantizer> {
-    ProductQuantizer::train(data, metric_type, params).await
+) -> Result<ProductQuantizerImpl> {
+    ProductQuantizerImpl::train(data, metric_type, params).await
 }
 
 #[cfg(test)]

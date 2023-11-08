@@ -38,7 +38,7 @@ use lance_core::{
     datatypes::Field, encodings::plain::PlainEncoder, format::Index as IndexMetadata, Error, Result,
 };
 use lance_index::vector::{
-    pq::{PQBuildParams, ProductQuantizer},
+    pq::{PQBuildParams, ProductQuantizerImpl},
     Query, DIST_COL, RESIDUAL_COLUMN,
 };
 use lance_linalg::matrix::MatrixView;
@@ -363,7 +363,7 @@ pub struct IvfPQIndexMetadata {
     pub(crate) ivf: Ivf,
 
     /// Product Quantizer
-    pub(crate) pq: Arc<ProductQuantizer>,
+    pub(crate) pq: Arc<ProductQuantizerImpl>,
 
     /// Transforms to be applied before search.
     transforms: Vec<pb::Transform>,
@@ -674,7 +674,7 @@ pub async fn build_ivf_pq_index(
     // Maximum to train 256 vectors per centroids, see Faiss.
     let sample_size_hint = std::cmp::max(
         ivf_params.num_partitions,
-        ProductQuantizer::num_centroids(pq_params.num_bits as u32),
+        ProductQuantizerImpl::num_centroids(pq_params.num_bits as u32),
     ) * 256;
     // TODO: only sample data if training is necessary.
     let mut training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
@@ -727,7 +727,7 @@ pub async fn build_ivf_pq_index(
 
     let start = std::time::Instant::now();
     let pq = if let Some(codebook) = &pq_params.codebook {
-        ProductQuantizer::new(
+        ProductQuantizerImpl::new(
             pq_params.num_sub_vectors,
             pq_params.num_bits as u32,
             dim,
@@ -741,7 +741,7 @@ pub async fn build_ivf_pq_index(
             pq_params.num_bits
         );
         let expected_sample_size =
-            ProductQuantizer::num_centroids(pq_params.num_bits as u32) * pq_params.sample_rate;
+            ProductQuantizerImpl::num_centroids(pq_params.num_bits as u32) * pq_params.sample_rate;
         let training_data = if training_data.num_rows() > expected_sample_size {
             training_data.sample(expected_sample_size)
         } else {
@@ -917,7 +917,7 @@ async fn write_index_file(
     uuid: &str,
     transformers: &[Box<dyn Transformer>],
     mut ivf: Ivf,
-    pq: Arc<ProductQuantizer>,
+    pq: Arc<ProductQuantizerImpl>,
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin,
 ) -> Result<()> {

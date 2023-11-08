@@ -30,7 +30,7 @@ mod traits;
 mod utils;
 
 use lance_core::io::{read_message, Reader};
-use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
+use lance_index::vector::pq::{PQBuildParams, ProductQuantizerImpl};
 use lance_linalg::distance::*;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -371,7 +371,7 @@ pub(crate) async fn open_index(
                         location: location!(),
                     });
                 };
-                let pq = Arc::new(ProductQuantizer::new(
+                let pq = Arc::new(ProductQuantizerImpl::new(
                     pq_proto.num_sub_vectors as usize,
                     pq_proto.num_bits,
                     pq_proto.dimension as usize,

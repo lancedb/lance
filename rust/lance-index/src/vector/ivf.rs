@@ -79,7 +79,7 @@ impl Ivf {
         centroids: MatrixView<Float32Type>,
         metric_type: MetricType,
         vector_column: &str,
-        pq: Arc<ProductQuantizer>,
+        pq: Arc<dyn ProductQuantizer>,
     ) -> Self {
         Self {
             centroids: centroids.clone(),

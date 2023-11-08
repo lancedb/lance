@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use arrow_array::ArrayRef;
 use arrow_array::{
     builder::Float32Builder, cast::AsArray, types::Float32Type, Array, FixedSizeListArray,
     Float32Array, UInt8Array,
@@ -30,6 +31,13 @@ pub mod transform;
 
 use super::kmeans::train_kmeans;
 use super::pb;
+
+/// Product Quantization
+
+#[async_trait::async_trait]
+pub trait ProductQuantizer: Send + Sync {
+    async fn transform(&self, data: &dyn Array) -> Result<ArrayRef>;
+}
 
 /// Parameters for building product quantization.
 #[derive(Debug, Clone)]
@@ -124,7 +132,7 @@ fn divide_to_subvectors(data: &MatrixView<Float32Type>, m: usize) -> Vec<Arc<Fix
 /// Product Quantization, optimized for [Apache Arrow] buffer memory layout.
 ///
 #[derive(Debug)]
-pub struct ProductQuantizer {
+pub struct ProductQuantizerImpl {
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
@@ -168,13 +176,13 @@ fn get_sub_vector_centroids(
 ) -> &[f32] {
     assert!(sub_vector_idx < num_sub_vectors);
 
-    let num_centroids = ProductQuantizer::num_centroids(num_bits.into());
+    let num_centroids = ProductQuantizerImpl::num_centroids(num_bits.into());
     let sub_vector_width = dimension / num_sub_vectors;
     &codebook.as_slice()[sub_vector_idx * num_centroids * sub_vector_width
         ..(sub_vector_idx + 1) * num_centroids * sub_vector_width]
 }
 
-impl ProductQuantizer {
+impl ProductQuantizerImpl {
     /// Create a [`ProductQuantizer`] with pre-trained codebook.
     pub fn new(
         m: usize,
@@ -467,8 +475,8 @@ impl ProductQuantizer {
 }
 
 #[allow(clippy::fallible_impl_from)]
-impl From<&ProductQuantizer> for pb::Pq {
-    fn from(pq: &ProductQuantizer) -> Self {
+impl From<&ProductQuantizerImpl> for pb::Pq {
+    fn from(pq: &ProductQuantizerImpl) -> Self {
         Self {
             num_bits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors as u32,
@@ -519,7 +527,7 @@ mod tests {
         // A 16-dim array.
         let dim = 16;
         let mat = MatrixView::new(values.into(), dim);
-        let pq = ProductQuantizer::train(&mat, MetricType::L2, &params)
+        let pq = ProductQuantizerImpl::train(&mat, MetricType::L2, &params)
             .await
             .unwrap();
 
@@ -527,7 +535,7 @@ mod tests {
         let centroids = pq.codebook.clone();
 
         // Keep training 10 times
-        let mut actual_pq = ProductQuantizer {
+        let mut actual_pq = ProductQuantizerImpl {
             num_bits: 8,
             num_sub_vectors: 2,
             dimension: dim,
@@ -539,7 +547,7 @@ mod tests {
             let code = actual_pq.transform(&mat).await.unwrap();
             actual_pq.reset_centroids(&mat, &code).unwrap();
             params.codebook = Some(actual_pq.codebook.clone());
-            actual_pq = ProductQuantizer::train(&mat, MetricType::L2, &params)
+            actual_pq = ProductQuantizerImpl::train(&mat, MetricType::L2, &params)
                 .await
                 .unwrap();
         }

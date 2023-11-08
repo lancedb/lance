@@ -30,13 +30,17 @@ use crate::vector::transform::Transformer;
 ///
 /// It transforms a column of vectors into a column of PQ codes.
 pub struct PQTransformer {
-    quantizer: Arc<ProductQuantizer>,
+    quantizer: Arc<dyn ProductQuantizer>,
     input_column: String,
     output_column: String,
 }
 
 impl PQTransformer {
-    pub fn new(quantizer: Arc<ProductQuantizer>, input_column: &str, output_column: &str) -> Self {
+    pub fn new(
+        quantizer: Arc<dyn ProductQuantizer>,
+        input_column: &str,
+        output_column: &str,
+    ) -> Self {
         Self {
             quantizer,
             input_column: input_column.to_owned(),
@@ -105,7 +109,7 @@ mod tests {
         let mat: MatrixView<Float32Type> = arr.as_ref().try_into().unwrap();
 
         let params = PQBuildParams::new(1, 8);
-        let pq = ProductQuantizer::train(&mat, MetricType::L2, &params)
+        let pq = ProductQuantizerImpl::train(&mat, MetricType::L2, &params)
             .await
             .unwrap();
 
