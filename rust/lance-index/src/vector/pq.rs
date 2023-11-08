@@ -33,7 +33,9 @@ use rand::SeedableRng;
 use snafu::{location, Location};
 pub mod transform;
 pub mod builder;
+pub(crate) mod utils;
 
+use self::utils::divide_to_subvectors;
 use super::kmeans::train_kmeans;
 use super::pb;
 pub use builder::PQBuildParams;
@@ -46,34 +48,6 @@ pub trait ProductQuantizer: Send + Sync {
     async fn transform(&self, data: &dyn Array) -> Result<ArrayRef>;
 }
 
-/// Divide a 2D vector in [`FixedSizeListArray`] to `m` sub-vectors.
-///
-/// For example, for a `[1024x1M]` matrix, when `n = 8`, this function divides
-/// the matrix into  `[128x1M; 8]` vector of matrix.
-fn divide_to_subvectors(data: &MatrixView<Float32Type>, m: usize) -> Vec<Arc<FixedSizeListArray>> {
-    assert!(!data.num_rows() > 0);
-
-    let sub_vector_length = data.num_columns() / m;
-    let capacity = data.num_rows() * sub_vector_length;
-    let mut subarrays = vec![];
-
-    // TODO: very intensive memory copy involved!!! But this is on the write path.
-    // Optimize for memory copy later.
-    for i in 0..m {
-        let mut builder = Float32Builder::with_capacity(capacity);
-        for j in 0..data.num_rows() {
-            let row = data.row(j).unwrap();
-            let start = i * sub_vector_length;
-            builder.append_slice(&row[start..start + sub_vector_length]);
-        }
-        let values = builder.finish();
-        let sub_array = Arc::new(
-            FixedSizeListArray::try_new_from_values(values, sub_vector_length as i32).unwrap(),
-        );
-        subarrays.push(sub_array);
-    }
-    subarrays
-}
 
 /// Product Quantization, optimized for [Apache Arrow] buffer memory layout.
 ///
