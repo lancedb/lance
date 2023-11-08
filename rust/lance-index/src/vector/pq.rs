@@ -35,8 +35,8 @@ pub mod builder;
 pub mod transform;
 pub(crate) mod utils;
 
+pub use self::utils::num_centroids;
 use super::pb;
-use crate::vector::pq::utils::num_centroids;
 pub use builder::PQBuildParams;
 
 /// Product Quantization

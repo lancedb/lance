@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use arrow_array::{
     cast::{as_primitive_array, AsArray},
-    types::Float32Type,
     Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
 };
 use arrow_ord::sort::sort_to_indices;
@@ -35,7 +34,7 @@ use lance_index::{
     vector::{pq::ProductQuantizer, Query, DIST_COL},
     Index, IndexType,
 };
-use lance_linalg::{distance::MetricType, matrix::MatrixView};
+use lance_linalg::distance::MetricType;
 use serde::Serialize;
 use snafu::{location, Location};
 use tracing::{instrument, Instrument};
@@ -245,15 +244,6 @@ impl VectorIndex for PQIndex {
         )));
         Ok(())
     }
-}
-
-/// Train product quantization over (OPQ-rotated) residual vectors.
-pub(crate) async fn train_pq(
-    data: &MatrixView<Float32Type>,
-    metric_type: MetricType,
-    params: &PQBuildParams,
-) -> Result<Arc<dyn ProductQuantizer>> {
-    params.build(data, metric_type).await
 }
 
 #[cfg(test)]

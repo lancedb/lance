@@ -44,7 +44,7 @@ use lance_index::{
     },
     Index, IndexType,
 };
-use lance_linalg::matrix::MatrixView;
+use lance_linalg::{distance::MetricType, matrix::MatrixView};
 use log::{debug, info, warn};
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
@@ -54,11 +54,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "opq")]
 use super::opq::train_opq;
-use super::{
-    pq::{train_pq, PQIndex},
-    utils::maybe_sample_training_data,
-    MetricType, VectorIndex,
-};
+use super::{pq::PQIndex, utils::maybe_sample_training_data, VectorIndex};
 use crate::{
     dataset::Dataset,
     index::{
@@ -688,7 +684,7 @@ pub async fn build_ivf_pq_index(
     // Maximum to train 256 vectors per centroids, see Faiss.
     let sample_size_hint = std::cmp::max(
         ivf_params.num_partitions,
-        ProductQuantizerImpl::num_centroids(pq_params.num_bits as u32),
+        lance_index::vector::pq::num_centroids(pq_params.num_bits as u32),
     ) * 256;
     // TODO: only sample data if training is necessary.
     let mut training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
@@ -740,14 +736,14 @@ pub async fn build_ivf_pq_index(
     );
 
     let start = std::time::Instant::now();
-    let pq = if let Some(codebook) = &pq_params.codebook {
-        ProductQuantizerImpl::new(
+    let pq: Arc<dyn ProductQuantizer> = if let Some(codebook) = &pq_params.codebook {
+        Arc::new(ProductQuantizerImpl::<Float32Type>::new(
             pq_params.num_sub_vectors,
             pq_params.num_bits as u32,
             dim,
             Arc::new(codebook.as_primitive().clone()),
             metric_type,
-        )
+        ))
     } else {
         log::info!(
             "Start to train PQ code: PQ{}, bits={}",
@@ -755,7 +751,8 @@ pub async fn build_ivf_pq_index(
             pq_params.num_bits
         );
         let expected_sample_size =
-            ProductQuantizerImpl::num_centroids(pq_params.num_bits as u32) * pq_params.sample_rate;
+            lance_index::vector::pq::num_centroids(pq_params.num_bits as u32)
+                * pq_params.sample_rate;
         let training_data = if training_data.num_rows() > expected_sample_size {
             training_data.sample(expected_sample_size)
         } else {
@@ -774,7 +771,7 @@ pub async fn build_ivf_pq_index(
         let residuals = span!(Level::INFO, "compute residual for PQ training")
             .in_scope(|| ivf_model.compute_residual(&training_data, &part_ids));
         info!("Start train PQ: params={:#?}", pq_params);
-        train_pq(&residuals, metric_type, pq_params).await?
+        pq_params.build_from_matrix(&residuals, metric_type).await?
     };
     info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
 
@@ -931,7 +928,7 @@ async fn write_index_file(
     uuid: &str,
     transformers: &[Box<dyn Transformer>],
     mut ivf: Ivf,
-    pq: Arc<ProductQuantizerImpl>,
+    pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin,
 ) -> Result<()> {
@@ -963,7 +960,7 @@ async fn write_index_file(
     let metadata = IvfPQIndexMetadata {
         name: index_name.to_string(),
         column: column.to_string(),
-        dimension: pq.dimension as u32,
+        dimension: pq.dimension() as u32,
         dataset_version: dataset.version().version,
         metric_type,
         ivf,
@@ -987,7 +984,7 @@ async fn train_ivf_model(
 ) -> Result<Ivf> {
     let rng = SmallRng::from_entropy();
     const REDOS: usize = 1;
-    let centroids = lance_index::vector::kmeans::train_kmeans(
+    let centroids = lance_index::vector::kmeans::train_kmeans::<Float32Type>(
         data.data().as_ref(),
         None,
         data.num_columns(),

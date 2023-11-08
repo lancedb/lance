@@ -44,6 +44,7 @@ pub async fn train_kmeans<T: ArrowFloatType + Dot + L2 + Cosine>(
             "KMeans: can not train {k} centroids with {num_rows} vectors, choose a smaller K (< {num_rows}) instead"
         ),location: location!()});
     }
+
     // Ony sample sample_rate * num_clusters. See Faiss
     let data = if num_rows > sample_rate * k {
         info!(

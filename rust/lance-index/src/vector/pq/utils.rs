@@ -47,7 +47,9 @@ pub(super) fn divide_to_subvectors<T: ArrowFloatType>(
 }
 
 /// Number of PQ centroids, for the corresponding number of PQ bits.
-pub(super) fn num_centroids(num_bits: impl Into<u32>) -> usize {
+///
+// TODO: pub(crate)
+pub fn num_centroids(num_bits: impl Into<u32>) -> usize {
     2_usize.pow(num_bits.into())
 }
 

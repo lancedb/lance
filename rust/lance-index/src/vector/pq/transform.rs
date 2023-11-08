@@ -95,15 +95,13 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_linalg::{distance::MetricType, MatrixView};
 
-    use crate::vector::pq::{PQBuildParams, ProductQuantizerImpl};
+    use crate::vector::pq::PQBuildParams;
 
     #[tokio::test]
     async fn test_pq_transform() {
         let values = Float32Array::from_iter((0..16000).map(|v| v as f32));
         let dim = 16;
         let arr = Arc::new(FixedSizeListArray::try_new_from_values(values, 16).unwrap());
-        let mat: MatrixView<Float32Type> = arr.as_ref().try_into().unwrap();
-
         let params = PQBuildParams::new(1, 8);
         let pq = params.build(arr.as_ref(), MetricType::L2).await.unwrap();
 

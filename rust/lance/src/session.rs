@@ -60,6 +60,7 @@ impl Default for Session {
 mod tests {
     use super::*;
 
+    use arrow_array::types::Float32Type;
     use std::sync::Arc;
 
     use crate::index::vector::pq::PQIndex;
@@ -72,7 +73,7 @@ mod tests {
         assert!(no_cache.index_cache.get_vector("abc").is_none());
         let no_cache = Arc::new(no_cache);
 
-        let pq = Arc::new(ProductQuantizerImpl::new(
+        let pq = Arc::new(ProductQuantizerImpl::<Float32Type>::new(
             1,
             8,
             1,
@@ -91,7 +92,7 @@ mod tests {
         let session = Session::new(10, 1);
         let session = Arc::new(session);
 
-        let pq = Arc::new(ProductQuantizerImpl::new(
+        let pq = Arc::new(ProductQuantizerImpl::<Float32Type>::new(
             1,
             8,
             1,
@@ -108,7 +109,7 @@ mod tests {
         assert_eq!(session.index_cache.len_vector(), 1);
 
         for iter_idx in 0..100 {
-            let pq_other = Arc::new(ProductQuantizerImpl::new(
+            let pq_other = Arc::new(ProductQuantizerImpl::<Float32Type>::new(
                 1,
                 8,
                 1,

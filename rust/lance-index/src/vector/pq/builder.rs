@@ -92,23 +92,23 @@ impl PQBuildParams {
         }
     }
 
-    async fn build_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
+    pub async fn build_from_matrix<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
         &self,
         data: &MatrixView<T>,
         metric_type: MetricType,
-    ) -> Result<Arc<dyn ProductQuantizer>> {
+    ) -> Result<Arc<dyn ProductQuantizer + 'static>> {
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
         let num_centroids = 2_usize.pow(self.num_bits as u32);
         let dimension = data.num_columns();
         let sub_vector_dimension = dimension / self.num_sub_vectors;
-
         const REDOS: usize = 1;
+
         // TODO: parallel training.
-        let d = stream::iter(sub_vectors.iter())
+        let d = stream::iter(sub_vectors.into_iter())
             .map(|sub_vec| async move {
                 let rng = rand::rngs::SmallRng::from_entropy();
                 train_kmeans::<T>(
-                    sub_vec,
+                    sub_vec.as_ref(),
                     None,
                     sub_vector_dimension,
                     num_centroids,
@@ -123,7 +123,6 @@ impl PQBuildParams {
             .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
-
         let mut codebook_builder = Vec::with_capacity(num_centroids * dimension);
         for centroid in d.iter() {
             codebook_builder.extend_from_slice(centroid.as_slice());
@@ -159,15 +158,15 @@ impl PQBuildParams {
         match fsl.value_type() {
             DataType::Float16 => {
                 let data = MatrixView::<Float16Type>::try_from(fsl)?;
-                self.build_impl(&data, metric_type).await
+                self.build_from_matrix(&data, metric_type).await
             }
             DataType::Float32 => {
                 let data = MatrixView::<Float32Type>::try_from(fsl)?;
-                self.build_impl(&data, metric_type).await
+                self.build_from_matrix(&data, metric_type).await
             }
             DataType::Float64 => {
                 let data = MatrixView::<Float64Type>::try_from(fsl)?;
-                self.build_impl(&data, metric_type).await
+                self.build_from_matrix(&data, metric_type).await
             }
             _ => Err(Error::Index {
                 message: format!("PQ builder: unsupported data type: {}", fsl.value_type()),
