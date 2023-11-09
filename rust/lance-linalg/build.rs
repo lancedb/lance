@@ -7,6 +7,7 @@ fn main() {
             .file("src/simd/f16.c")
             .flag("-mcpu=apple-m1")
             .flag("-O3")
+            .define("LANES", "4")
             .compile("f16");
     }
 
