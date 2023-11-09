@@ -19,6 +19,9 @@
 #endif
 
 /// Works on NEON + FP16 or AVX512FP16
+//
+// Please make sure run "cargo bench --bench norm_l2" on both Apple Silicon and
+// X86_64, before you change this function.
 _Float16 norm_l2_f16(_Float16* data, size_t dimension) {
   _Float16 sums[LANES];
 #pragma clang loop unroll(enable) vectorize(enable)
