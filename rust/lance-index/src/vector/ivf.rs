@@ -17,18 +17,16 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{
-    cast::AsArray,
-    types::{Float32Type, UInt32Type},
-    Array, Float32Array, RecordBatch, UInt32Array,
-};
+use arrow_array::{cast::AsArray, types::UInt32Type, Array, RecordBatch, UInt32Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::Field;
 use arrow_select::take::take;
-use lance_arrow::RecordBatchExt;
+use lance_arrow::{ArrowFloatType, FloatArray, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::{
-    distance::{cosine_distance_batch, dot_distance_batch, l2_distance_batch, MetricType},
+    distance::{
+        cosine_distance_batch, dot_distance_batch, l2_distance_batch, Cosine, Dot, MetricType, L2,
+    },
     MatrixView,
 };
 use snafu::{location, Location};
@@ -44,12 +42,12 @@ use crate::vector::{
 /// IVF - IVF file partition
 ///
 #[derive(Debug, Clone)]
-pub struct Ivf {
+pub struct Ivf<T: ArrowFloatType + Dot + L2 + Cosine> {
     /// KMean model of the IVF
     ///
     /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
     /// memory allocator.
-    centroids: MatrixView<Float32Type>,
+    centroids: MatrixView<T>,
 
     /// Transform applied to each partition.
     transforms: Vec<Arc<dyn Transformer>>,
@@ -61,9 +59,9 @@ pub struct Ivf {
     partition_range: Option<Range<u32>>,
 }
 
-impl Ivf {
+impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf<T> {
     pub fn new(
-        centroids: MatrixView<Float32Type>,
+        centroids: MatrixView<T>,
         metric_type: MetricType,
         transforms: Vec<Arc<dyn Transformer>>,
     ) -> Self {
@@ -76,7 +74,7 @@ impl Ivf {
     }
 
     pub fn new_with_pq(
-        centroids: MatrixView<Float32Type>,
+        centroids: MatrixView<T>,
         metric_type: MetricType,
         vector_column: &str,
         pq: Arc<dyn ProductQuantizer>,
@@ -101,7 +99,7 @@ impl Ivf {
     }
 
     pub fn new_with_range(
-        centroids: MatrixView<Float32Type>,
+        centroids: MatrixView<T>,
         metric_type: MetricType,
         transforms: Vec<Arc<dyn Transformer>>,
         range: Range<u32>,
@@ -119,7 +117,7 @@ impl Ivf {
     }
 
     /// Use the query vector to find `nprobes` closest partitions.
-    pub fn find_partitions(&self, query: &Float32Array, nprobes: usize) -> Result<UInt32Array> {
+    pub fn find_partitions(&self, query: &T::ArrayType, nprobes: usize) -> Result<UInt32Array> {
         if query.len() != self.dimension() {
             return Err(Error::IO {
                 message: format!(
@@ -131,20 +129,21 @@ impl Ivf {
             });
         }
         let centroid_values = self.centroids.data();
-        let centroids = centroid_values.values();
+        let centroids = centroid_values.as_slice();
         let dim = query.len();
-        let distances: Float32Array = match self.metric_type {
+        let distances: T::ArrayType = match self.metric_type {
             lance_linalg::distance::DistanceType::L2 => {
-                l2_distance_batch(query.values(), centroids, dim)
+                l2_distance_batch(query.as_slice(), centroids, dim)
             }
             lance_linalg::distance::DistanceType::Cosine => {
-                cosine_distance_batch(query.values(), centroids, dim)
+                cosine_distance_batch(query.as_slice(), centroids, dim)
             }
             lance_linalg::distance::DistanceType::Dot => {
-                dot_distance_batch(query.values(), centroids, dim)
+                dot_distance_batch(query.as_slice(), centroids, dim)
             }
         }
-        .collect();
+        .collect::<Vec<_>>()
+        .into();
         let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;
         Ok(top_k_partitions)
     }
@@ -174,7 +173,21 @@ impl Ivf {
             ),
             location: location!(),
         })?;
-        let matrix = MatrixView::<Float32Type>::try_from(data)?;
+
+        let flatten_data = data
+            .values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or(Error::Index {
+                message: format!(
+                    "Column {} is not a vector type: expect: {} got {}",
+                    column,
+                    T::FLOAT_TYPE,
+                    vector_arr.data_type()
+                ),
+                location: location!(),
+            })?;
+        let matrix = MatrixView::<T>::new(Arc::new(flatten_data.clone()), data.value_length());
         let part_ids = self.compute_partitions(&matrix).await;
 
         let (part_ids, batch) = if let Some(part_range) = self.partition_range.as_ref() {
@@ -208,7 +221,7 @@ impl Ivf {
     /// Compute the partition for each row in the input Matrix.
     ///
     #[instrument(level = "debug", skip(data))]
-    pub async fn compute_partitions(&self, data: &MatrixView<Float32Type>) -> UInt32Array {
+    pub async fn compute_partitions(&self, data: &MatrixView<T>) -> UInt32Array {
         use lance_linalg::kmeans::compute_partitions;
 
         let dimension = data.ndim();
@@ -217,9 +230,9 @@ impl Ivf {
         let metric_type = self.metric_type;
 
         tokio::task::spawn_blocking(move || {
-            compute_partitions::<Float32Type>(
-                centroids.values(),
-                data.values(),
+            compute_partitions::<T>(
+                centroids.as_slice(),
+                data.as_slice(),
                 dimension,
                 metric_type,
             )

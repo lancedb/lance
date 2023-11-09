@@ -13,12 +13,10 @@
 // limitations under the License.
 
 use arrow_array::types::UInt32Type;
-use arrow_array::{
-    cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array, RecordBatch,
-};
+use arrow_array::{cast::AsArray, Array, FixedSizeListArray, RecordBatch};
 use arrow_schema::Field;
 use async_trait::async_trait;
-use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::MatrixView;
 use snafu::{location, Location};
@@ -33,8 +31,8 @@ pub const RESIDUAL_COLUMN: &str = "__residual_vector";
 /// The residual vector is the difference between the original vector and the centroid.
 ///
 #[derive(Clone)]
-pub struct ResidualTransform {
-    centroids: MatrixView<Float32Type>,
+pub struct ResidualTransform<T: ArrowFloatType> {
+    centroids: MatrixView<T>,
 
     /// Partition Column
     part_col: String,
@@ -43,14 +41,14 @@ pub struct ResidualTransform {
     vec_col: String,
 }
 
-impl std::fmt::Debug for ResidualTransform {
+impl<T: ArrowFloatType> std::fmt::Debug for ResidualTransform<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ResidualTransform")
     }
 }
 
-impl ResidualTransform {
-    pub fn new(centroids: MatrixView<Float32Type>, part_col: &str, column: &str) -> Self {
+impl<T: ArrowFloatType> ResidualTransform<T> {
+    pub fn new(centroids: MatrixView<T>, part_col: &str, column: &str) -> Self {
         Self {
             centroids,
             part_col: part_col.to_owned(),
@@ -60,7 +58,7 @@ impl ResidualTransform {
 }
 
 #[async_trait]
-impl Transformer for ResidualTransform {
+impl<T: ArrowFloatType> Transformer for ResidualTransform<T> {
     /// Replace the original vector in the [`RecordBatch`] to residual vectors.
     ///
     /// The new [`RecordBatch`] will have a new column named [`RESIDUAL_COLUMN`].
@@ -87,11 +85,27 @@ impl Transformer for ResidualTransform {
             ),
             location: location!(),
         })?;
-        let original_matrix = MatrixView::<Float32Type>::try_from(original_vectors)?;
-        let mut residual_arr: Vec<f32> =
-            Vec::with_capacity(original_matrix.num_rows() * original_matrix.ndim());
-        original_matrix
-            .iter()
+
+        // BFloat16Array is not supported via `as_primitive()` cast yet, so we have to do
+        // `downcast_ref()` for now.
+        let flatten_data = original_vectors
+            .values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or(Error::Index {
+                message: format!(
+                    "Compute residual vector: original vector column {} is not expected type: expect: {}, got {}",
+                    self.vec_col,
+                    T::FLOAT_TYPE,
+                    original_vectors.value_type(),
+                ),
+                location: location!(),
+            })?;
+        let dim = original_vectors.value_length();
+        let mut residual_arr: Vec<T::Native> = Vec::with_capacity(flatten_data.len());
+        flatten_data
+            .as_slice()
+            .chunks_exact(dim as usize)
             .zip(part_ids.as_primitive::<UInt32Type>().values().iter())
             .for_each(|(vector, &part_id)| {
                 let centroid = self.centroids.row(part_id as usize).unwrap();
@@ -103,10 +117,8 @@ impl Transformer for ResidualTransform {
                         .map(|(v, cent)| *v - *cent),
                 );
             });
-        let residual_arr = FixedSizeListArray::try_new_from_values(
-            Float32Array::from(residual_arr),
-            original_matrix.ndim() as i32,
-        )?;
+        let residual_arr =
+            FixedSizeListArray::try_new_from_values(T::ArrayType::from(residual_arr), dim as i32)?;
 
         // Replace original column with residual column.
         let batch = batch.drop_column(&self.vec_col)?;
