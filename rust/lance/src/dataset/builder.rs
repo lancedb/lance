@@ -22,11 +22,6 @@ pub struct DatasetBuilder {
     /// Metadata cache size for the fragment metadata. If it is zero, metadata
     /// cache is disabled.
     metadata_cache_size: usize,
-
-    /// If present, dataset will use this shared [`Session`] instead creating a new one.
-    ///
-    /// This is useful for sharing the same session across multiple datasets.
-    session: Option<Arc<Session>>,
     options: ObjectStoreOptions,
     storage_options: Option<HashMap<String, String>>,
     version: Option<u64>,
@@ -38,7 +33,6 @@ impl DatasetBuilder {
         Self {
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
             metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
-            session: None,
             options: opts,
             storage_options: None,
             version: None,
@@ -48,7 +42,6 @@ impl DatasetBuilder {
 
 // Much of this builder is directly inspired from the to delta-rs table builder implementation
 // https://github.com/delta-io/delta-rs/main/crates/deltalake-core/src/table/builder.rs
-
 impl DatasetBuilder {
     /// Set the cache size for indices. Set to zero, to disable the cache.
     pub fn with_index_cache_size(mut self, cache_size: usize) -> Self {
@@ -62,15 +55,10 @@ impl DatasetBuilder {
         self
     }
 
-    /// Set a shared session for the datasets.
-    pub fn with_session(mut self, session: Arc<Session>) -> Self {
-        self.session = Some(session);
-        self
-    }
-
     /// The block size passed to the underlying Object Store reader.
     ///
     /// This is used to control the minimal request size.
+    /// Defaults to 4KB for local files and 64KB for others
     pub fn with_block_size(mut self, block_size: usize) -> Self {
         self.options.block_size = Some(block_size);
         self
@@ -120,6 +108,14 @@ impl DatasetBuilder {
         self
     }
 
+    /// Set a single option used to initialize storage backend
+    pub fn with_storage_option(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
+        let mut storage_options = self.storage_options.unwrap_or_default();
+        storage_options.insert(key.as_ref().to_string(), value.as_ref().to_string());
+        self.storage_options = Some(storage_options);
+        self
+    }
+
     /// Build a lance object store for the given config
     pub async fn build_object_store(self) -> Result<ObjectStore> {
         match &self.options.object_store {
@@ -140,12 +136,11 @@ impl DatasetBuilder {
     }
 
     pub async fn load(self) -> Result<Dataset> {
-        let session = self.session.clone().unwrap_or_else(|| {
-            Arc::new(Session::new(
-                self.index_cache_size,
-                self.metadata_cache_size,
-            ))
-        });
+        let session = Arc::new(Session::new(
+            self.index_cache_size,
+            self.metadata_cache_size,
+        ));
+
         let version = self.version;
 
         let object_store = self.build_object_store().await?;

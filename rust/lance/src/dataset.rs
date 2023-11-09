@@ -62,7 +62,6 @@ pub mod transaction;
 pub mod updater;
 mod write;
 
-use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
