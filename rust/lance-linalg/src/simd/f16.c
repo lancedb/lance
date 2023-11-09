@@ -26,12 +26,10 @@ _Float16 norm_l2_f16(_Float16* data, size_t dimension) {
     sums[i] = 0;
   }
 
-  for (size_t i = 0; i < dimension; i += LANES * 4) {
 #pragma clang loop unroll(enable) vectorize(enable) interleave(enable)
-    for (size_t k = 0; k < 4; k++) {
-      for (size_t j = 0; j < LANES; j++) {
-        sums[j] += data[i + k * LANES + j] * data[i + k * LANES + j];
-      }
+  for (size_t i = 0; i < dimension; i += LANES) {
+    for (size_t j = 0; j < LANES; j++) {
+      sums[j] += data[i + j] * data[i + j];
     }
   }
 
@@ -44,7 +42,7 @@ _Float16 norm_l2_f16(_Float16* data, size_t dimension) {
   }
 
   _Float16 sum = 0;
-#pragma clang loop unroll(enable) vectorize(enable)
+#pragma clang loop vectorize(enable)
   for (size_t i = 0; i < LANES; i++) {
     sum += sums[i];
   }
