@@ -112,7 +112,10 @@ impl Dot for Float16Type {
         unsafe {
             self::kernel::dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
         }
-        #[cfg(not(target_feature = "neon"))]
+        #[cfg(not(any(
+            all(target_os = "macos", target_feature = "neon"),
+            all(target_os = "linux", feature = "avx512fp16"))
+        ))]
         {
             dot_scalar::<f16, 16>(x, y)
         }
