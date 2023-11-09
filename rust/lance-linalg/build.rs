@@ -1,7 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/simd/f16.c");
 
-    if !cfg!(all(target_os = "macos",  target_feature = "neon")) {
+    if cfg!(all(target_os = "macos", target_feature = "neon")) {
         cc::Build::new()
             .compiler("clang")
             .file("src/simd/f16.c")
@@ -10,16 +10,16 @@ fn main() {
             .compile("f16");
     }
 
-    if !cfg!(target_os = "linux") {
-        let mut build = cc::Build::new();
-        build
+    if cfg!(all(target_os = "linux", target_feature = "avx512fp16")) {
+        // No fp16 without AVX512fp16
+        cc::Build::new()
             .compiler("clang")
             .file("src/simd/f16.c")
-            .flag("-O3");
-
-        if cfg!(target_feature = "avx512fp16") {
-            build.flag("-mavx512fp16");
-        }
-        build.compile("f16")
+            .flag("-march=icelake-server")
+            .flag("-mavx512fp16")
+            .flag("-mllvm")
+            .flag("-unroll-count=8")
+            .flag("-O3")
+            .compile("f16");
     }
 }

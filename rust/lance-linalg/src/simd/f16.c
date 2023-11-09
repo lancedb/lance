@@ -14,23 +14,31 @@
 
 #include <stddef.h>
 
-_Float16 neon_norm_l2_f16(_Float16* data, size_t dimension) {
+/// Works on NEON + FP16 or AVX512FP16
+_Float16 norm_l2_f16(_Float16* data, size_t dimension) {
+  _Float16 sum0 = 0;
+  _Float16 sum1 = 0;
+  _Float16 sum2 = 0;
+  _Float16 sum3 = 0;
+  _Float16 sum4 = 0;
+  _Float16 sum5 = 0;
+  _Float16 sum6 = 0;
+  _Float16 sum7 = 0;
 
-    _Float16 sum0 = 0;
-    _Float16 sum1 = 0;
-    _Float16 sum2 = 0;
-    _Float16 sum3 = 0;
-
-    #pragma clang loop unroll(enable) vectorize(enable) interleave(enable)
-    for (size_t i = 0; i < dimension; i +=4) {
-            _Float16 v = data[i];
-            sum0 += v * v;
-            sum1 += data[i + 1] * data[i + 1];
-            sum2 += data[i  + 2] * data[i + 2];
-            sum3 += data[i + 3] * data[i + 3];
-    }
-    for (size_t i = dimension / 4 * 4; i < dimension; i++) {
-        sum0 += data[i] * data[i];
-    }
-    return sum1 + sum2 + sum0 + sum3;
+#pragma clang loop unroll(enable) vectorize(enable) interleave(enable)
+  for (size_t i = 0; i < dimension; i += 8) {
+    sum0 += data[i] * data[i];
+    sum1 += data[i + 1] * data[i + 1];
+    sum2 += data[i + 2] * data[i + 2];
+    sum3 += data[i + 3] * data[i + 3];
+    sum4 += data[i + 4] * data[i + 4];
+    sum5 += data[i + 5] * data[i + 5];
+    sum6 += data[i + 6] * data[i + 6];
+    sum7 += data[i + 7] * data[i + 7];
+  }
+#pragma clang loop unroll(enable) interleave(enable)
+  for (size_t i = dimension / 4 * 4; i < dimension; i++) {
+    sum0 += data[i] * data[i];
+  }
+  return sum1 + sum2 + sum0 + sum3 + sum4 + sum5 + sum6 + sum7;
 }
