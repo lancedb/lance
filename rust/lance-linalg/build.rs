@@ -16,7 +16,7 @@ fn main() {
         cc::Build::new()
             .compiler("clang")
             .file("src/simd/f16.c")
-            .flag("-march=icelake-server")
+            .flag("-march=sapphirerapids")
             .flag("-mavx512fp16")
             .flag("-mllvm")
             .flag("-unroll-count=8")
