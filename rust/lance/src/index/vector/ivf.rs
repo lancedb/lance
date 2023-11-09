@@ -17,6 +17,7 @@
 use std::{any::Any, collections::HashMap, sync::Arc};
 
 use arrow_arith::numeric::sub;
+use arrow_array::types::{Float16Type, Float64Type};
 use arrow_array::{
     cast::{as_primitive_array, as_struct_array, AsArray},
     types::Float32Type,
@@ -45,7 +46,10 @@ use lance_index::{
     },
     Index, IndexType,
 };
-use lance_linalg::{distance::MetricType, matrix::MatrixView};
+use lance_linalg::{
+    distance::{Cosine, Dot, MetricType, L2},
+    matrix::MatrixView,
+};
 use log::{debug, info};
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
@@ -700,7 +704,7 @@ pub async fn build_ivf_pq_index(
         let expected_sample_size =
             lance_index::vector::pq::num_centroids(pq_params.num_bits as u32)
                 * pq_params.sample_rate;
-        let training_data = if training_data.num_rows() > expected_sample_size {
+        let training_data = if training_data.value_length() as usize > expected_sample_size {
             training_data.sample(expected_sample_size)
         } else {
             training_data
@@ -718,7 +722,7 @@ pub async fn build_ivf_pq_index(
         let part_ids = ivf2.compute_partitions(&training_data).await?;
 
         let residuals = span!(Level::INFO, "compute residual for PQ training")
-            .in_scope(|| ivf_model.compute_residual(&training_data, &part_ids));
+            .in_scope(|| ivf2.compute_residual(&training_data, &part_ids));
         info!("Start train PQ: params={:#?}", pq_params);
         pq_params.build_from_matrix(&residuals, metric_type).await?
     };
@@ -925,18 +929,18 @@ async fn write_index_file(
     Ok(())
 }
 
-/// Train IVF partitions using kmeans.
-async fn train_ivf_model(
-    data: &MatrixView<Float32Type>,
+async fn do_train_ivf_model<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
+    data: &T::ArrayType,
+    dimension: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
 ) -> Result<Ivf> {
     let rng = SmallRng::from_entropy();
     const REDOS: usize = 1;
-    let centroids = lance_index::vector::kmeans::train_kmeans::<Float32Type>(
-        data.data().as_ref(),
+    let centroids = lance_index::vector::kmeans::train_kmeans::<T>(
+        data,
         None,
-        data.num_columns(),
+        dimension,
         params.num_partitions,
         params.max_iters as u32,
         REDOS,
@@ -947,8 +951,33 @@ async fn train_ivf_model(
     .await?;
     Ok(Ivf::new(Arc::new(FixedSizeListArray::try_new_from_values(
         centroids,
-        data.num_columns() as i32,
+        dimension as i32,
     )?)))
+}
+
+/// Train IVF partitions using kmeans.
+async fn train_ivf_model(
+    data: &FixedSizeListArray,
+    metric_type: MetricType,
+    params: &IvfBuildParams,
+) -> Result<Ivf> {
+    let values = data.values();
+    let dim = data.value_length() as usize;
+    match values.data_type() {
+        DataType::Float16 => {
+            do_train_ivf_model::<Float16Type>(values.as_primitive(), dim, metric_type, params).await
+        }
+        DataType::Float32 => {
+            do_train_ivf_model::<Float32Type>(values.as_primitive(), dim, metric_type, params).await
+        }
+        DataType::Float64 => {
+            do_train_ivf_model::<Float64Type>(values.as_primitive(), dim, metric_type, params).await
+        }
+        _ => Err(Error::Index {
+            message: "Unsupported data type".to_string(),
+            location: location!(),
+        }),
+    }
 }
 
 #[cfg(test)]

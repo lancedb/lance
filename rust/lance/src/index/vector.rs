@@ -29,7 +29,7 @@ mod traits;
 mod utils;
 
 use lance_core::io::Reader;
-use lance_index::vector::pq::PQBuildParams;
+use lance_index::vector::{ivf::IvfBuildParams, pq::PQBuildParams};
 use lance_linalg::distance::*;
 use object_store::path::Path;
 use snafu::{location, Location};
@@ -37,7 +37,7 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use self::{
-    ivf::{build_ivf_pq_index, remap_index_file, IVFIndex, IvfBuildParams},
+    ivf::{build_ivf_pq_index, remap_index_file, IVFIndex},
     pq::PQIndex,
 };
 
