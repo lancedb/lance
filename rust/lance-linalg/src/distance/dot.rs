@@ -25,7 +25,6 @@ use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatToArrayType};
 use num_traits::real::Real;
 
-use crate::distance::dot::kernel::dot_f16;
 use crate::simd::{
     f32::{f32x16, f32x8},
     SIMD,
@@ -91,6 +90,10 @@ impl Dot for BFloat16Type {
     }
 }
 
+#[cfg(any(
+    all(target_os = "macos", target_feature = "neon"),
+    all(target_os = "linux", feature = "avx512fp16")
+))]
 mod kernel {
     use super::*;
 
@@ -107,7 +110,7 @@ impl Dot for Float16Type {
             all(target_os = "linux", feature = "avx512fp16")
         ))]
         unsafe {
-            dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            self::kernel::dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
         }
         #[cfg(not(target_feature = "neon"))]
         {
