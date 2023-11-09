@@ -17,9 +17,10 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{cast::AsArray, types::UInt32Type, Array, RecordBatch, UInt32Array};
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::Field;
+use arrow_schema::{DataType, Field};
 use arrow_select::take::take;
 use lance_arrow::{ArrowFloatType, FloatArray, RecordBatchExt};
 use lance_core::{Error, Result};
@@ -38,6 +39,119 @@ use crate::vector::{
     residual::ResidualTransform,
     transform::Transformer,
 };
+
+fn new_ivf_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
+    centroids: &T::ArrayType,
+    dimension: usize,
+    metric_type: MetricType,
+    transforms: Vec<Arc<dyn Transformer>>,
+    range: Option<Range<u32>>,
+) -> Arc<dyn Ivf> {
+    let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
+    Arc::new(IvfImpl::<T>::new(mat, metric_type, transforms, range))
+}
+
+/// Create an IVF from the flatten centroids.
+///
+/// Parameters
+/// ----------
+/// - *centroids*: a flatten floating number array of centroids.
+/// - *dimension*: dimension of the vector.
+/// - *metric_type*: metric type to compute pair-wise vector distance.
+/// - *transforms*: a list of transforms to apply to the vector column.
+/// - *range*: only covers a range of partitions. Default is None
+pub fn new_ivf(
+    centroids: &dyn Array,
+    dimension: usize,
+    metric_type: MetricType,
+    transforms: Vec<Arc<dyn Transformer>>,
+    range: Option<Range<u32>>,
+) -> Result<Arc<dyn Ivf>> {
+    match centroids.data_type() {
+        DataType::Float16 => Ok(new_ivf_impl::<Float16Type>(
+            centroids.as_primitive(),
+            dimension,
+            metric_type,
+            transforms,
+            range,
+        )),
+        DataType::Float32 => Ok(new_ivf_impl::<Float32Type>(
+            centroids.as_primitive(),
+            dimension,
+            metric_type,
+            transforms,
+            range,
+        )),
+        DataType::Float64 => Ok(new_ivf_impl::<Float64Type>(
+            centroids.as_primitive(),
+            dimension,
+            metric_type,
+            transforms,
+            range,
+        )),
+        _ => Err(Error::Index {
+            message: format!(
+                "new_ivf: centroids is not expected type: {}",
+                centroids.data_type()
+            ),
+            location: location!(),
+        }),
+    }
+}
+
+fn new_ivf_with_pq_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
+    centroids: &T::ArrayType,
+    dimension: usize,
+    metric_type: MetricType,
+    vector_column: &str,
+    pq: Arc<dyn ProductQuantizer>,
+) -> Arc<dyn Ivf> {
+    let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
+    Arc::new(IvfImpl::<T>::new_with_pq(
+        mat,
+        metric_type,
+        vector_column,
+        pq,
+    ))
+}
+pub fn new_ivf_with_pq(
+    centroids: &dyn Array,
+    dimension: usize,
+    metric_type: MetricType,
+    vector_column: &str,
+    pq: Arc<dyn ProductQuantizer>,
+) -> Result<Arc<dyn Ivf>> {
+    match centroids.data_type() {
+        DataType::Float16 => Ok(new_ivf_with_pq_impl::<Float16Type>(
+            centroids.as_primitive(),
+            dimension,
+            metric_type,
+            vector_column,
+            pq,
+        )),
+        DataType::Float32 => Ok(new_ivf_with_pq_impl::<Float32Type>(
+            centroids.as_primitive(),
+            dimension,
+            metric_type,
+            vector_column,
+            pq,
+        )),
+        DataType::Float64 => Ok(new_ivf_with_pq_impl::<Float64Type>(
+            centroids.as_primitive(),
+            dimension,
+            metric_type,
+            vector_column,
+            pq,
+        )),
+        _ => Err(Error::Index {
+            message: format!(
+                "new_ivf_with_pq: centroids is not expected type: {}",
+                centroids.data_type()
+            ),
+            location: location!(),
+        }),
+    }
+}
 
 /// IVF - IVF file partition
 ///
@@ -71,16 +185,17 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         centroids: MatrixView<T>,
         metric_type: MetricType,
         transforms: Vec<Arc<dyn Transformer>>,
+        range: Option<Range<u32>>,
     ) -> Self {
         Self {
             centroids,
             metric_type,
             transforms,
-            partition_range: None,
+            partition_range: range,
         }
     }
 
-    pub fn new_with_pq(
+    fn new_with_pq(
         centroids: MatrixView<T>,
         metric_type: MetricType,
         vector_column: &str,
@@ -102,20 +217,6 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
                 )),
             ],
             partition_range: None,
-        }
-    }
-
-    pub fn new_with_range(
-        centroids: MatrixView<T>,
-        metric_type: MetricType,
-        transforms: Vec<Arc<dyn Transformer>>,
-        range: Range<u32>,
-    ) -> Self {
-        Self {
-            centroids,
-            metric_type,
-            transforms,
-            partition_range: Some(range),
         }
     }
 

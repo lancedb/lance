@@ -151,9 +151,9 @@ pub(super) async fn build_partitions(
         });
     }
 
-    let centroids: MatrixView<Float32Type> = ivf.centroids.as_ref().try_into()?;
-    let ivf_model = lance_index::vector::ivf::IvfImpl::new_with_range(
-        centroids.clone(),
+    let ivf_model = lance_index::vector::ivf::new_ivf(
+        ivf.centroids.values(),
+        ivf.centroids.value_length() as usize,
         metric_type,
         vec![
             Arc::new(ResidualTransform::new(
@@ -167,8 +167,8 @@ pub(super) async fn build_partitions(
                 PQ_CODE_COLUMN,
             )),
         ],
-        part_range.clone(),
-    );
+        Some(part_range.clone()),
+    )?;
     let shuffler = shuffle_dataset(data, column, Arc::new(ivf_model), pq.num_sub_vectors()).await?;
     write_index_partitions(writer, ivf, &shuffler, None).await?;
 

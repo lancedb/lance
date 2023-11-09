@@ -184,12 +184,13 @@ impl IVFIndex {
             })?;
 
         // TODO: merge two IVF implementations.
-        let ivf = Arc::new(lance_index::vector::ivf::IvfImpl::new_with_pq(
-            self.ivf.centroids.as_ref().try_into()?,
+        let ivf = lance_index::vector::ivf::new_ivf_with_pq(
+            self.ivf.centroids.values(),
+            self.ivf.dimension(),
             self.metric_type,
             column,
             pq_index.pq.clone(),
-        ));
+        )?;
         let shuffler = shuffle_dataset(data, column, ivf, pq_index.pq.num_sub_vectors()).await?;
 
         let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
@@ -761,10 +762,12 @@ pub async fn build_ivf_pq_index(
         };
 
         // TODO: consolidate IVF models to `lance_index`.
-        let ivf2 = lance_index::vector::ivf::IvfImpl::new(
-            ivf_model.centroids.as_ref().try_into()?,
+        let ivf2 = lance_index::vector::ivf::new_ivf(
+            ivf_model.centroids.values(),
+            ivf_model.dimension(),
             metric_type,
             vec![],
+            None,
         );
         // Compute the residual vector to train Product Quantizer.
         let part_ids = ivf2.compute_partitions(&training_data).await;
