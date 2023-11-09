@@ -34,7 +34,7 @@
 
 #ifdef __ARM_NEON
 
-_Float16 norm_l2_f16(_Float16* data, uint32_t dimension) {
+_Float16 norm_l2_f16(const _Float16* data, uint32_t dimension) {
   _Float16 vsum[LANES] = {0};
 
 #pragma clang loop unroll_count(UNROLL_COUNT) interleave(enable)
@@ -60,11 +60,26 @@ _Float16 norm_l2_f16(_Float16* data, uint32_t dimension) {
 }
 
 _Float16 dot_f16(const _Float16* x, const _Float16* y, uint32_t dimension) {
-    _Float16 sum = 0;
-#pragma clang loop unroll_count(2) interleave(enable) vectorize_width(4)
-  for (uint32_t i = 0; i < dimension; i++) {
-      sum += x[i] * y[i];
+    _Float16 vsum[LANES] = {0};
+
+  uint32_t remaining_start = dimension / LANES * LANES;
+#pragma clang loop unroll_count(UNROLL_COUNT) interleave(enable)
+  for (uint32_t i = 0; i < remaining_start; i += LANES) {
+    #pragma clang loop vectorize(enable)
+    for (uint32_t j = 0; j < LANES; j++) {
+      vsum[j] += x[i + j] * y[i + j];
+    }
   }
+
+  _Float16 sum = 0;
+  #pragma clang loop vectorize(enable) interleave(enable)
+  for (size_t i = 0; i < LANES; i++) sum += vsum[i];
+
+  #pragma clang loop unroll(enable) interleave(enable)
+  for (uint32_t i = remaining_start; i < dimension; i++) {
+    sum += x[i] * y[i];
+  }
+
 
   return sum;
 }
@@ -72,7 +87,7 @@ _Float16 dot_f16(const _Float16* x, const _Float16* y, uint32_t dimension) {
 
 #ifdef __x86_64__
 
-_Float16 norm_l2_f16(_Float16* data, uint32_t dimension) {
+_Float16 norm_l2_f16(const _Float16* data, uint32_t dimension) {
   _Float16 sum = 0;
 
 #pragma clang loop unroll_count(UNROLL_COUNT) vectorize_width(LANES) interleave(enable)
