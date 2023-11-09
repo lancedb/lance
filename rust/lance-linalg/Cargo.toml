@@ -33,7 +33,6 @@ lance-testing = { path = "../lance-testing" }
 cc = "1"
 
 [features]
-#avx512 = []
 avx512fp16 = []
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

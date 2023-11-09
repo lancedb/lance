@@ -15,7 +15,7 @@
 #include <stddef.h>
 
 #ifndef LANES
-#define LANES 8
+#define LANES 64
 #endif
 
 /// Works on NEON + FP16 or AVX512FP16
@@ -23,31 +23,12 @@
 // Please make sure run "cargo bench --bench norm_l2" on both Apple Silicon and
 // X86_64, before you change this function.
 _Float16 norm_l2_f16(_Float16* data, size_t dimension) {
-  _Float16 sums[LANES];
-#pragma clang loop unroll(enable) vectorize(enable)
-  for (size_t i = 0; i < LANES; i++) {
-    sums[i] = 0;
-  }
-
-#pragma clang loop unroll(enable) vectorize(enable) interleave(enable)
-  for (size_t i = 0; i < dimension; i += LANES) {
-    for (size_t j = 0; j < LANES; j++) {
-      sums[j] += data[i + j] * data[i + j];
-    }
-  }
-
-  size_t remaining_start = dimension / (4 * LANES) * LANES * 4;
-  if (remaining_start < dimension) {
-    // [[unlikey]]
-    for (size_t i = dimension / (4 * LANES) * LANES * 4; i < dimension; i++) {
-      sums[0] += data[i] * data[i];
-    }
-  }
-
   _Float16 sum = 0;
-#pragma clang loop vectorize(enable)
-  for (size_t i = 0; i < LANES; i++) {
-    sum += sums[i];
+#pragma clang loop unroll_count(4) vectorize_width(LANES)
+  for (size_t i = 0; i < dimension; i++) {
+    _Float16 v = data[i];
+    sum += v * v;
   }
+
   return sum;
 }
