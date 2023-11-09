@@ -15,15 +15,22 @@
 #include <stddef.h>
 #include <stdint.h>
 
+
 #ifdef __ARM_NEON
 #define LANES 4
 #define UNROLL_COUNT 2
 #endif  // __ARM_NEON
 
-#ifdef __X86_64__
+#ifdef __x86_64__
 #define LANES 64
 #define UNROLL_COUNT 4
-#endif  // __X86_64__
+#endif  // X86_64
+
+
+/// Works on NEON + FP16 or AVX512FP16
+//
+// Please make sure run "cargo bench --bench norm_l2" on both Apple Silicon and
+// X86_64, before you change this function.
 
 #ifdef __ARM_NEON
 
@@ -53,20 +60,17 @@ _Float16 norm_l2_f16(_Float16* data, uint32_t dimension) {
 }
 #endif
 
-#ifdef __X86_64__
+#ifdef __x86_64__
 
-/// Works on NEON + FP16 or AVX512FP16
-//
-// Please make sure run "cargo bench --bench norm_l2" on both Apple Silicon and
-// X86_64, before you change this function.
 _Float16 norm_l2_f16(_Float16* data, uint32_t dimension) {
   _Float16 sum = 0;
 
 #pragma clang loop unroll_count(UNROLL_COUNT) vectorize_width(LANES) interleave(enable)
-  for (uint32_t i = 0; i < dimension; i += LANES) {
+  for (uint32_t i = 0; i < dimension; i++) {
+     _Float16 v = data[i];
     sum += v * v;
   }
   return sum;
 }
 
-#endif  // __X86_64__
+#endif  // X86_64
