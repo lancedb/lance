@@ -114,8 +114,8 @@ impl Dot for Float16Type {
         }
         #[cfg(not(any(
             all(target_os = "macos", target_feature = "neon"),
-            all(target_os = "linux", feature = "avx512fp16"))
-        ))]
+            all(target_os = "linux", feature = "avx512fp16")
+        )))]
         {
             dot_scalar::<f16, 16>(x, y)
         }
