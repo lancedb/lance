@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use lance_core::io::{
     commit::CommitHandler,
-    object_store::{ObjectStore, ObjectStoreOptions},
+    object_store::{ObjectStore, ObjectStoreParams},
 };
 use object_store::{aws::AwsCredentialProvider, DynObjectStore};
 use snafu::{location, Location};
@@ -22,18 +22,19 @@ pub struct DatasetBuilder {
     /// Metadata cache size for the fragment metadata. If it is zero, metadata
     /// cache is disabled.
     metadata_cache_size: usize,
-    options: ObjectStoreOptions,
+    options: ObjectStoreParams,
     storage_options: Option<HashMap<String, String>>,
     version: Option<u64>,
+    table_uri: String,
 }
 
 impl DatasetBuilder {
     pub fn from_uri<T: AsRef<str>>(table_uri: T) -> Self {
-        let opts = ObjectStoreOptions::new(table_uri.as_ref());
         Self {
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
             metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
-            options: opts,
+            table_uri: table_uri.as_ref().to_string(),
+            options: ObjectStoreParams::default(),
             storage_options: None,
             version: None,
         }
@@ -124,13 +125,10 @@ impl DatasetBuilder {
                 store.1.clone(),
                 self.options.block_size,
                 self.options.commit_handler,
+                self.options.object_store_wrapper,
             )),
             None => {
-                ObjectStore::try_new(
-                    self.options.table_uri,
-                    self.storage_options.unwrap_or_default(),
-                )
-                .await
+                ObjectStore::try_new(self.table_uri, self.storage_options.unwrap_or_default()).await
             }
         }
     }

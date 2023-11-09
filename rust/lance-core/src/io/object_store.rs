@@ -291,42 +291,28 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
 ///
 #[derive(Debug, Clone)]
 pub struct ObjectStoreParams {
-    pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
-
-    pub s3_credentials_refresh_offset: Duration,
-
-    // Custom AWS Credentials
-    pub aws_credentials: Option<AwsCredentialProvider>,
-    pub aws_region: Option<String>,
-
+    pub block_size: Option<usize>,
+    pub object_store: Option<(Arc<DynObjectStore>, Url)>,
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
+    pub s3_credentials_refresh_offset: Duration,
+    pub aws_credentials: Option<AwsCredentialProvider>,
+    pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
 }
 
-// Need this for setting a non-zero default duration
 impl Default for ObjectStoreParams {
     fn default() -> Self {
         Self {
-            object_store_wrapper: None,
+            object_store: None,
+            commit_handler: None,
+            block_size: None,
             s3_credentials_refresh_offset: Duration::from_secs(60),
             aws_credentials: None,
-            commit_handler: None,
-            aws_region: None,
+            object_store_wrapper: None,
         }
     }
 }
 
 impl ObjectStoreParams {
-    pub fn with_aws_credentials(
-        credentials: Option<AwsCredentialProvider>,
-        region: Option<String>,
-    ) -> Self {
-        Self {
-            aws_credentials: credentials,
-            aws_region: region,
-            ..Self::default()
-        }
-    }
-
     /// Set a commit lock for the object store.
     pub fn set_commit_lock<T: CommitLock + Send + Sync + 'static>(&mut self, lock: Arc<T>) {
         self.commit_handler = Some(Arc::new(lock));
@@ -443,7 +429,7 @@ impl ObjectStore {
 
     async fn new_from_url(url: Url, params: &ObjectStoreParams) -> Result<Self> {
         let mut storage_options = StorageOptions::default();
-        let mut options = ObjectStoreOptions::new(url.to_string());
+        let mut options = ObjectStoreParams::default();
         options.s3_credentials_refresh_offset = params.s3_credentials_refresh_offset;
         options.aws_credentials = params.aws_credentials.clone();
         options.commit_handler = params.commit_handler.clone();
@@ -717,7 +703,7 @@ impl From<HashMap<String, String>> for StorageOptions {
 async fn configure_store(
     url: &str,
     storage_options: &mut StorageOptions,
-    options: ObjectStoreOptions,
+    options: ObjectStoreParams,
 ) -> Result<ObjectStore> {
     let mut url = ensure_table_uri(url)?;
     // Block size: On local file systems, we use 4KB block size. On cloud
@@ -891,11 +877,18 @@ impl ObjectStore {
         location: Url,
         block_size: Option<usize>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
+        wrapper: Option<Arc<dyn WrappingObjectStore>>,
     ) -> Self {
         let scheme = location.scheme();
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
         let commit_handler = commit_handler
             .unwrap_or_else(|| Arc::new(RenameCommitHandler) as Arc<dyn CommitHandler>);
+
+        let store = match wrapper {
+            Some(wrapper) => wrapper.wrap(store),
+            None => store,
+        };
+
         Self {
             inner: store,
             scheme: scheme.into(),
@@ -909,7 +902,7 @@ impl ObjectStore {
         options: impl Into<StorageOptions> + Clone,
     ) -> Result<Self> {
         let mut storage_options = options.into();
-        let options = ObjectStoreOptions::new(location.as_ref());
+        let options = ObjectStoreParams::default();
         configure_store(location.as_ref(), &mut storage_options, options).await
     }
 }
@@ -1001,29 +994,6 @@ lazy_static::lazy_static! {
         "file",
         "memory"
       ]);
-}
-
-#[derive(Debug)]
-pub struct ObjectStoreOptions {
-    pub block_size: Option<usize>,
-    pub table_uri: String,
-    pub object_store: Option<(Arc<DynObjectStore>, Url)>,
-    pub commit_handler: Option<Arc<dyn CommitHandler>>,
-    pub s3_credentials_refresh_offset: Duration,
-    pub aws_credentials: Option<AwsCredentialProvider>,
-}
-
-impl ObjectStoreOptions {
-    pub fn new<T: Into<String>>(table_uri: T) -> Self {
-        Self {
-            table_uri: table_uri.into(),
-            object_store: None,
-            commit_handler: None,
-            block_size: None,
-            s3_credentials_refresh_offset: Duration::from_secs(60),
-            aws_credentials: None,
-        }
-    }
 }
 
 #[cfg(test)]
