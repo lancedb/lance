@@ -15,32 +15,38 @@
 #include <stddef.h>
 
 #ifndef LANES
-#define LANES 16
+#define LANES 8
 #endif
 
 /// Works on NEON + FP16 or AVX512FP16
 _Float16 norm_l2_f16(_Float16* data, size_t dimension) {
-    _Float16 sums[LANES];
-    #pragma clang loop unroll(enable) vectorize(enable)
-    for (size_t i = 0; i < LANES; i++) {
-        sums[i] = 0;
-    }
+  _Float16 sums[LANES];
+#pragma clang loop unroll(enable) vectorize(enable)
+  for (size_t i = 0; i < LANES; i++) {
+    sums[i] = 0;
+  }
 
+  for (size_t i = 0; i < dimension; i += LANES * 4) {
 #pragma clang loop unroll(enable) vectorize(enable) interleave(enable)
-  for (size_t i = 0; i < dimension; i += LANES) {
-    for (size_t j = 0; j < LANES; j++) {
-      sums[j] += data[i + j] * data[i + j];
+    for (size_t k = 0; k < 4; k++) {
+      for (size_t j = 0; j < LANES; j++) {
+        sums[j] += data[i + k * LANES + j] * data[i + k * LANES + j];
+      }
     }
-  }
-#pragma clang loop unroll(enable) interleave(enable)
-  for (size_t i = dimension / LANES * LANES; i < dimension; i++) {
-    sum0 += data[i] * data[i];
   }
 
-    _Float16 sum = 0;
-    #pragma clang loop unroll(enable) vectorize(enable)
-    for (size_t i = 0; i < LANES; i++) {
-        sum += sums[i];
+  size_t remaining_start = dimension / (4 * LANES) * LANES * 4;
+  if (remaining_start < dimension) {
+    // [[unlikey]]
+    for (size_t i = dimension / (4 * LANES) * LANES * 4; i < dimension; i++) {
+      sums[0] += data[i] * data[i];
     }
-    return sum;
+  }
+
+  _Float16 sum = 0;
+#pragma clang loop unroll(enable) vectorize(enable)
+  for (size_t i = 0; i < LANES; i++) {
+    sum += sums[i];
+  }
+  return sum;
 }

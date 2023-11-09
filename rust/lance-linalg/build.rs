@@ -11,7 +11,7 @@ fn main() {
             .compile("f16");
     }
 
-    if cfg!(all(target_os = "linux", target_feature = "avx512fp16")) {
+    if cfg!(all(target_os = "linux", feature = "avx512fp16")) {
         // No fp16 without AVX512fp16
         cc::Build::new()
             .compiler("clang")

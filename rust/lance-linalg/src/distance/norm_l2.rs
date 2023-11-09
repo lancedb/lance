@@ -30,7 +30,7 @@ pub trait Normalize<T: Float> {
     fn norm_l2(&self) -> Self::Output;
 }
 
-#[cfg(any(target_feature = "neon", target_feature = "avx512fp16"))]
+#[cfg(any(target_feature = "neon", feature = "avx512fp16"))]
 mod kernel {
     use super::*;
 
@@ -44,15 +44,15 @@ impl Normalize<f16> for &[f16] {
 
     // #[inline]
     fn norm_l2(&self) -> Self::Output {
-        #[cfg(any(target_feature = "neon", target_feature = "avx512fp16"))]
+        #[cfg(any(target_feature = "neon", feature = "avx512fp16"))]
         unsafe {
             kernel::norm_l2_f16(self.as_ptr(), self.len() as u64)
         }
-        #[cfg(not(any(target_feature = "neon", target_feature = "avx512fp16")))]
+        #[cfg(not(any(target_feature = "neon", feature = "avx512fp16")))]
         {
             // Please run `cargo bench --bench norm_l2" on Apple Silicon when
             // change the following code.
-            const LANES: usize = 4;
+            const LANES: usize = 16;
             let chunks = self.chunks_exact(LANES);
             let sum = if chunks.remainder().is_empty() {
                 0.0
