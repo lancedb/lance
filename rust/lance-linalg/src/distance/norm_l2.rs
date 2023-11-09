@@ -40,7 +40,7 @@ mod kernel {
     use super::*;
 
     extern "C" {
-        pub fn norm_l2_f16(ptr: *const f16, len: u64) -> f16;
+        pub fn norm_l2_f16(ptr: *const f16, len: u32) -> f16;
     }
 }
 
@@ -54,7 +54,7 @@ impl Normalize<f16> for &[f16] {
             feature = "avx512fp16"
         ))]
         unsafe {
-            kernel::norm_l2_f16(self.as_ptr(), self.len() as u64)
+            kernel::norm_l2_f16(self.as_ptr(), self.len() as u32)
         }
         #[cfg(not(any(
             all(target_os = "macos", target_feature = "neon"),

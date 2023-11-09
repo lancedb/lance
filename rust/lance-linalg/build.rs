@@ -12,7 +12,6 @@ fn main() {
             .flag("-Werror")
             .flag("-Wextra")
             .flag("-Wpedantic")
-            .define("LANES", "4")
             .compile("f16");
     }
 
