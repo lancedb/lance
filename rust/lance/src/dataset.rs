@@ -224,10 +224,8 @@ impl Dataset {
 
     /// Check out a version of the dataset.
     pub async fn checkout(uri: &str, version: u64) -> Result<Self> {
-        DatasetBuilder::from_uri(uri)
-            .with_version(version)
-            .load()
-            .await
+        let params = ReadParams::default();
+        Self::checkout_with_params(uri, version, &params).await
     }
 
     /// Check out a version of the dataset with read params.
