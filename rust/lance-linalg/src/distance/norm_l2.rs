@@ -46,11 +46,17 @@ impl Normalize<f16> for &[f16] {
 
     // #[inline]
     fn norm_l2(&self) -> Self::Output {
-        #[cfg(any(target_feature = "neon", feature = "avx512fp16"))]
+        #[cfg(any(
+            all(target_os = "macos", target_feature = "neon"),
+            feature = "avx512fp16"
+        ))]
         unsafe {
             kernel::norm_l2_f16(self.as_ptr(), self.len() as u64)
         }
-        #[cfg(not(any(target_feature = "neon", feature = "avx512fp16")))]
+        #[cfg(not(any(
+            all(target_os = "macos", target_feature = "neon"),
+            feature = "avx512fp16"
+        )))]
         {
             // Please run `cargo bench --bench norm_l2" on Apple Silicon when
             // change the following code.
