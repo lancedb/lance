@@ -25,6 +25,7 @@ use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatToArrayType};
 use num_traits::real::Real;
 
+use crate::distance::dot::kernel::dot_f16;
 use crate::simd::{
     f32::{f32x16, f32x8},
     SIMD,
@@ -90,10 +91,23 @@ impl Dot for BFloat16Type {
     }
 }
 
+mod kernel {
+    use super::*;
+
+    extern "C" {
+        pub fn dot_f16(ptr1: *const f16, ptr2: *const f16, len: u32) -> f16;
+    }
+}
+
 impl Dot for Float16Type {
     #[inline]
     fn dot(x: &[f16], y: &[f16]) -> f16 {
-        dot_scalar::<f16, 16>(x, y)
+        #[cfg(target_feature = "neon")] unsafe {
+            dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
+        }
+        #[cfg(not(target_feature = "neon"))] {
+            dot_scalar::<f16, 16>(x, y)
+        }
     }
 }
 

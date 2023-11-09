@@ -58,6 +58,16 @@ _Float16 norm_l2_f16(_Float16* data, uint32_t dimension) {
   }
   return sum;
 }
+
+_Float16 dot_f16(const _Float16* x, const _Float16* y, uint32_t dimension) {
+    _Float16 sum = 0;
+#pragma clang loop unroll_count(2) interleave(enable) vectorize_width(4)
+  for (uint32_t i = 0; i < dimension; i++) {
+      sum += x[i] * y[i];
+  }
+
+  return sum;
+}
 #endif
 
 #ifdef __x86_64__
