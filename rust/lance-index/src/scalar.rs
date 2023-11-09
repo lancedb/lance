@@ -14,7 +14,7 @@
 
 //! Scalar indices for metadata search & filtering
 
-use std::{ops::Bound, sync::Arc};
+use std::{collections::HashMap, ops::Bound, sync::Arc};
 
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::Schema;
@@ -139,4 +139,11 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index {
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
     where
         Self: Sized;
+
+    /// Remap the row ids, creating a new remapped version of this index in `dest_store`
+    async fn remap(
+        &self,
+        mapping: &HashMap<u64, Option<u64>>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<()>;
 }

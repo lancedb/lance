@@ -106,7 +106,7 @@ mod tests {
 
     use crate::scalar::{
         btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
-        flat::FlatIndexTrainer,
+        flat::FlatIndexMetadata,
         ScalarIndex, ScalarQuery,
     };
 
@@ -162,7 +162,7 @@ mod tests {
         data: impl RecordBatchReader + Send + Sync + 'static,
         value_type: DataType,
     ) {
-        let sub_index_trainer = FlatIndexTrainer::new(value_type);
+        let sub_index_trainer = FlatIndexMetadata::new(value_type);
 
         let data = Box::new(MockTrainingSource::new(data));
         train_btree_index(data, &sub_index_trainer, index_store.as_ref())
@@ -529,7 +529,7 @@ mod tests {
             Field::new("row_ids", DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
-        let sub_index_trainer = FlatIndexTrainer::new(DataType::Float32);
+        let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
 
         let data = Box::new(MockTrainingSource::new(data));
         // Until DF handles NaN reliably we need to make sure we reject input

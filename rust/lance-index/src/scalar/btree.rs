@@ -15,7 +15,7 @@
 use std::{
     any::Any,
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap},
+    collections::{BTreeMap, BinaryHeap, HashMap},
     fmt::{Debug, Display},
     ops::Bound,
     sync::Arc,
@@ -38,7 +38,7 @@ use snafu::{location, Location};
 use crate::{Index, IndexType};
 
 use super::{
-    flat::FlatIndexLoader, IndexReader, IndexStore, IndexWriter, ScalarIndex, ScalarQuery,
+    flat::FlatIndexMetadata, IndexReader, IndexStore, IndexWriter, ScalarIndex, ScalarQuery,
 };
 
 const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
@@ -527,6 +527,17 @@ impl BTreeLookup {
         Self { tree, null_pages }
     }
 
+    fn all_page_ids(&self) -> Vec<u32> {
+        let mut ids = self
+            .tree
+            .iter()
+            .flat_map(|(_, pages)| pages)
+            .map(|page| page.page_number)
+            .collect::<Vec<_>>();
+        ids.dedup();
+        ids
+    }
+
     // All pages that could have a value equal to val
     fn pages_eq(&self, query: &OrderableScalarValue) -> Vec<u32> {
         self.pages_between((Bound::Included(query), Bound::Excluded(query)))
@@ -609,19 +620,6 @@ impl BTreeLookup {
     }
 }
 
-/// A trait that must be implemented by a btree sub-index
-///
-/// A sub-index must be capable of indexing a single page of data.  We represent
-/// pages as a single record batch.
-#[async_trait]
-pub trait SubIndexLoader: std::fmt::Debug + Send + Sync {
-    async fn load_subindex(
-        &self,
-        page_number: u32,
-        index_reader: Arc<dyn IndexReader>,
-    ) -> Result<Arc<dyn ScalarIndex>>;
-}
-
 /// A btree index satisfies scalar queries using a b tree
 ///
 /// The upper layers of the btree are expected to be cached and, when unloaded,
@@ -641,7 +639,7 @@ pub trait SubIndexLoader: std::fmt::Debug + Send + Sync {
 pub struct BTreeIndex {
     page_lookup: BTreeLookup,
     store: Arc<dyn IndexStore>,
-    sub_index: Arc<dyn SubIndexLoader>,
+    sub_index: Arc<dyn BTreeSubIndex>,
 }
 
 impl BTreeIndex {
@@ -649,7 +647,7 @@ impl BTreeIndex {
         tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
         null_pages: Vec<u32>,
         store: Arc<dyn IndexStore>,
-        sub_index: Arc<dyn SubIndexLoader>,
+        sub_index: Arc<dyn BTreeSubIndex>,
     ) -> Self {
         let page_lookup = BTreeLookup::new(tree, null_pages);
         Self {
@@ -665,10 +663,8 @@ impl BTreeIndex {
         page_number: u32,
         index_reader: Arc<dyn IndexReader>,
     ) -> Result<UInt64Array> {
-        let subindex = self
-            .sub_index
-            .load_subindex(page_number, index_reader)
-            .await?;
+        let serialized_page = index_reader.read_record_batch(page_number).await?;
+        let subindex = self.sub_index.load_subindex(serialized_page).await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
         // 1 and 2 and three is in page 2 and seven is in pages 8 and 9 then when we search page 2 we only need
@@ -717,8 +713,10 @@ impl BTreeIndex {
         let last_max = ScalarValue::try_from_array(&maxs, data.num_rows() - 1)?;
         map.entry(OrderableScalarValue(last_max)).or_default();
 
+        let data_type = mins.data_type();
+
         // TODO: Support other page types?
-        let sub_index = Arc::new(FlatIndexLoader {});
+        let sub_index = Arc::new(FlatIndexMetadata::new(data_type.clone()));
 
         Ok(Self::new(map, null_pages, store, sub_index))
     }
@@ -831,6 +829,44 @@ impl ScalarIndex for BTreeIndex {
             store,
         )?))
     }
+
+    async fn remap(
+        &self,
+        mapping: &HashMap<u64, Option<u64>>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<()> {
+        // Remap and write the pages
+        let mut sub_index_file = dest_store
+            .new_index_file(BTREE_PAGES_NAME, self.sub_index.schema().clone())
+            .await?;
+
+        let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+
+        for page_number in self.page_lookup.all_page_ids() {
+            let old_serialized = sub_index_reader.read_record_batch(page_number).await?;
+            let remapped = self
+                .sub_index
+                .remap_subindex(old_serialized, mapping)
+                .await?;
+            sub_index_file.write_record_batch(remapped).await?;
+        }
+
+        sub_index_file.finish().await?;
+
+        // Copy the lookup file as-is
+        let lookup_reader = self.store.open_index_file(BTREE_LOOKUP_NAME).await?;
+        let lookup_as_batch = lookup_reader.read_record_batch(0).await?;
+
+        let mut new_lookup_writer = dest_store
+            .new_index_file(BTREE_LOOKUP_NAME, lookup_as_batch.schema())
+            .await?;
+        new_lookup_writer
+            .write_record_batch(lookup_as_batch)
+            .await?;
+        new_lookup_writer.finish().await?;
+
+        Ok(())
+    }
 }
 
 struct BatchStats {
@@ -879,10 +915,24 @@ fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
     })
 }
 
+/// A trait that must be implemented by anything that wishes to act as a btree subindex
 #[async_trait]
-pub trait SubIndexTrainer: Send + Sync {
+pub trait BTreeSubIndex: Debug + Send + Sync {
+    /// Trains the subindex on a single batch of data and serializes it to Arrow
+    async fn train(&self, batch: RecordBatch) -> Result<RecordBatch>;
+
+    /// Deserialize a subindex from Arrow
+    async fn load_subindex(&self, serialized: RecordBatch) -> Result<Arc<dyn ScalarIndex>>;
+
+    /// The schema of the subindex when serialized to Arrow
     fn schema(&self) -> &Arc<Schema>;
-    async fn train(&self, batch: RecordBatch, writer: &mut dyn IndexWriter) -> Result<u64>;
+
+    /// Given a serialized page, deserialize it, remap the row ids, and re-serialize it
+    async fn remap_subindex(
+        &self,
+        serialized: RecordBatch,
+        mapping: &HashMap<u64, Option<u64>>,
+    ) -> Result<RecordBatch>;
 }
 
 struct EncodedBatch {
@@ -893,11 +943,12 @@ struct EncodedBatch {
 async fn train_btree_page(
     batch: RecordBatch,
     batch_idx: u32,
-    sub_index_trainer: &dyn SubIndexTrainer,
+    sub_index_trainer: &dyn BTreeSubIndex,
     writer: &mut dyn IndexWriter,
 ) -> Result<EncodedBatch> {
     let stats = analyze_batch(&batch)?;
-    sub_index_trainer.train(batch, writer).await?;
+    let trained = sub_index_trainer.train(batch).await?;
+    writer.write_record_batch(trained).await?;
     Ok(EncodedBatch {
         stats,
         page_number: batch_idx,
@@ -949,7 +1000,7 @@ pub trait BtreeTrainingSource: Send + Sync {
 /// a work in progress
 pub async fn train_btree_index(
     data_source: Box<dyn BtreeTrainingSource + Send>,
-    sub_index_trainer: &dyn SubIndexTrainer,
+    sub_index_trainer: &dyn BTreeSubIndex,
     index_store: &dyn IndexStore,
 ) -> Result<()> {
     let mut sub_index_file = index_store

@@ -19,7 +19,7 @@ use lance_core::{Error, Result};
 use lance_datagen::{array, gen, BatchCount, RowCount};
 use lance_index::scalar::{
     btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
-    flat::FlatIndexTrainer,
+    flat::FlatIndexMetadata,
     lance_format::LanceIndexStore,
     IndexStore, ScalarIndex, ScalarQuery,
 };
@@ -75,7 +75,7 @@ impl BenchmarkFixture {
     }
 
     async fn train_scalar_index(index_store: &Arc<dyn IndexStore>) {
-        let sub_index_trainer = FlatIndexTrainer::new(arrow_schema::DataType::UInt32);
+        let sub_index_trainer = FlatIndexMetadata::new(arrow_schema::DataType::UInt32);
 
         train_btree_index(
             Box::new(BenchmarkDataSource {}),
