@@ -32,7 +32,10 @@ pub trait Normalize<T: Float> {
 
 // `avx512fp16` is not supported in rustc yet. Once it is supported, we can
 // move it to target_feture.
-#[cfg(any(target_feature = "neon", feature = "avx512fp16"))]
+#[cfg(any(
+    all(target_os = "macos", target_feature = "neon"),
+    feature = "avx512fp16"
+))]
 mod kernel {
     use super::*;
 
