@@ -17,7 +17,7 @@ use std::sync::Arc;
 use criterion::{criterion_group, criterion_main, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance_index::vector::ivf::Ivf;
+use lance_index::vector::ivf::IvfImpl;
 use lance_linalg::distance::MetricType;
 use lance_linalg::MatrixView;
 use lance_testing::datagen::generate_random_array_with_seed;
@@ -36,7 +36,7 @@ fn bench_partitions(c: &mut Criterion) {
         let matrix = MatrixView::new(centroids.clone(), DIMENSION);
 
         for k in &[1, 10, 50] {
-            let ivf = Ivf::new(matrix.clone(), MetricType::L2, vec![]);
+            let ivf = IvfImpl::new(matrix.clone(), MetricType::L2, vec![]);
 
             c.bench_function(format!("IVF{},k={},L2", num_centroids, k).as_str(), |b| {
                 b.iter(|| {
@@ -44,7 +44,7 @@ fn bench_partitions(c: &mut Criterion) {
                 })
             });
 
-            let ivf = Ivf::new(matrix.clone(), MetricType::Cosine, vec![]);
+            let ivf = IvfImpl::new(matrix.clone(), MetricType::Cosine, vec![]);
             c.bench_function(
                 format!("IVF{},k={},Cosine", num_centroids, k).as_str(),
                 |b| {

@@ -54,7 +54,7 @@ use super::RESIDUAL_COLUMN;
 pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin,
     column: &str,
-    ivf: Arc<lance_index::vector::ivf::Ivf>,
+    ivf: Arc<dyn lance_index::vector::ivf::Ivf>,
     // TODO: Once the transformer can generate schema automatically,
     // we can remove `num_sub_vectors`.
     num_sub_vectors: usize,
@@ -152,7 +152,7 @@ pub(super) async fn build_partitions(
     }
 
     let centroids: MatrixView<Float32Type> = ivf.centroids.as_ref().try_into()?;
-    let ivf_model = lance_index::vector::ivf::Ivf::new_with_range(
+    let ivf_model = lance_index::vector::ivf::IvfImpl::new_with_range(
         centroids.clone(),
         metric_type,
         vec![

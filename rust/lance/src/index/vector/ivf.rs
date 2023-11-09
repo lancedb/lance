@@ -45,7 +45,7 @@ use lance_index::{
     Index, IndexType,
 };
 use lance_linalg::{distance::MetricType, matrix::MatrixView};
-use log::{debug, info, warn};
+use log::{debug, info};
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
 use snafu::{location, Location};
@@ -184,7 +184,7 @@ impl IVFIndex {
             })?;
 
         // TODO: merge two IVF implementations.
-        let ivf = Arc::new(lance_index::vector::ivf::Ivf::new_with_pq(
+        let ivf = Arc::new(lance_index::vector::ivf::IvfImpl::new_with_pq(
             self.ivf.centroids.as_ref().try_into()?,
             self.metric_type,
             column,
@@ -466,7 +466,9 @@ impl Ivf {
         nprobes: usize,
         metric_type: MetricType,
     ) -> Result<UInt32Array> {
-        let ivf = lance_index::vector::ivf::Ivf::new(
+        use lance_index::vector::ivf::Ivf as IvfTrait;
+
+        let ivf = lance_index::vector::ivf::IvfImpl::<Float32Type>::new(
             MatrixView::try_from(self.centroids.as_ref())?,
             metric_type,
             vec![],
@@ -745,10 +747,9 @@ pub async fn build_ivf_pq_index(
             metric_type,
         ))
     } else {
-        log::info!(
+        info!(
             "Start to train PQ code: PQ{}, bits={}",
-            pq_params.num_sub_vectors,
-            pq_params.num_bits
+            pq_params.num_sub_vectors, pq_params.num_bits
         );
         let expected_sample_size =
             lance_index::vector::pq::num_centroids(pq_params.num_bits as u32)
@@ -760,7 +761,7 @@ pub async fn build_ivf_pq_index(
         };
 
         // TODO: consolidate IVF models to `lance_index`.
-        let ivf2 = lance_index::vector::ivf::Ivf::new(
+        let ivf2 = lance_index::vector::ivf::IvfImpl::new(
             ivf_model.centroids.as_ref().try_into()?,
             metric_type,
             vec![],

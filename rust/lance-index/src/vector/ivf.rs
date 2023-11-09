@@ -41,8 +41,15 @@ use crate::vector::{
 
 /// IVF - IVF file partition
 ///
+pub trait Ivf {
+    /// Find the closest partitions for the query vector.
+    fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array>;
+}
+
+/// IVF - IVF file partition
+///
 #[derive(Debug, Clone)]
-pub struct Ivf<T: ArrowFloatType + Dot + L2 + Cosine> {
+pub struct IvfImpl<T: ArrowFloatType + Dot + L2 + Cosine> {
     /// KMean model of the IVF
     ///
     /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
@@ -59,7 +66,7 @@ pub struct Ivf<T: ArrowFloatType + Dot + L2 + Cosine> {
     partition_range: Option<Range<u32>>,
 }
 
-impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf<T> {
+impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
     pub fn new(
         centroids: MatrixView<T>,
         metric_type: MetricType,
@@ -114,38 +121,6 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf<T> {
 
     fn dimension(&self) -> usize {
         self.centroids.ndim()
-    }
-
-    /// Use the query vector to find `nprobes` closest partitions.
-    pub fn find_partitions(&self, query: &T::ArrayType, nprobes: usize) -> Result<UInt32Array> {
-        if query.len() != self.dimension() {
-            return Err(Error::IO {
-                message: format!(
-                    "Ivf::find_partition: dimension mismatch: {} != {}",
-                    query.len(),
-                    self.dimension()
-                ),
-                location: location!(),
-            });
-        }
-        let centroid_values = self.centroids.data();
-        let centroids = centroid_values.as_slice();
-        let dim = query.len();
-        let distances: T::ArrayType = match self.metric_type {
-            lance_linalg::distance::DistanceType::L2 => {
-                l2_distance_batch(query.as_slice(), centroids, dim)
-            }
-            lance_linalg::distance::DistanceType::Cosine => {
-                cosine_distance_batch(query.as_slice(), centroids, dim)
-            }
-            lance_linalg::distance::DistanceType::Dot => {
-                dot_distance_batch(query.as_slice(), centroids, dim)
-            }
-        }
-        .collect::<Vec<_>>()
-        .into();
-        let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;
-        Ok(top_k_partitions)
     }
 
     /// Partition a batch of vectors into multiple batches, each batch contains vectors and other data.
@@ -240,5 +215,49 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf<T> {
         })
         .await
         .expect("compute_partitions: schedule CPU task")
+    }
+}
+
+impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
+    fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array> {
+        if query.len() != self.dimension() {
+            return Err(Error::IO {
+                message: format!(
+                    "Ivf::find_partition: dimension mismatch: {} != {}",
+                    query.len(),
+                    self.dimension()
+                ),
+                location: location!(),
+            });
+        }
+        let query = query
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or(Error::Index {
+                message: format!(
+                    "Ivf::find_partition: query is not expected type: {} got {}",
+                    T::FLOAT_TYPE,
+                    query.data_type()
+                ),
+                location: Default::default(),
+            })?;
+        let centroid_values = self.centroids.data();
+        let centroids = centroid_values.as_slice();
+        let dim = query.len();
+        let distances: T::ArrayType = match self.metric_type {
+            lance_linalg::distance::DistanceType::L2 => {
+                l2_distance_batch(query.as_slice(), centroids, dim)
+            }
+            lance_linalg::distance::DistanceType::Cosine => {
+                cosine_distance_batch(query.as_slice(), centroids, dim)
+            }
+            lance_linalg::distance::DistanceType::Dot => {
+                dot_distance_batch(query.as_slice(), centroids, dim)
+            }
+        }
+        .collect::<Vec<_>>()
+        .into();
+        let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;
+        Ok(top_k_partitions)
     }
 }
