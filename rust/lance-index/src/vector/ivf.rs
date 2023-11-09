@@ -36,12 +36,15 @@ use lance_linalg::{
 use snafu::{location, Location};
 use tracing::instrument;
 
+mod builder;
+
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 use crate::vector::{
     pq::{transform::PQTransformer, ProductQuantizer},
     residual::ResidualTransform,
     transform::Transformer,
 };
+pub use builder::IvfBuildParams;
 
 fn new_ivf_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
     centroids: &T::ArrayType,
@@ -176,6 +179,8 @@ pub trait Ivf: Send + Sync + std::fmt::Debug {
     /// Returns
     /// -------
     /// A 1-D array of partition id for each vector.
+    ///
+    /// Raises [Error] if the input data type does not match with the IVF model.
     ///
     async fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array>;
 

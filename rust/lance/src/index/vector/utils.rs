@@ -14,23 +14,24 @@
 
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, types::Float32Type};
+use arrow_array::{cast::AsArray, FixedSizeListArray};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat_batches;
 use futures::stream::TryStreamExt;
 use snafu::{location, Location};
 
-use lance_linalg::MatrixView;
-
 use crate::dataset::Dataset;
 use crate::{Error, Result};
 
 /// Maybe sample training data from dataset, specified by column name.
+///
+/// Returns a [FixedSizeListArray], containing the training dataset.
+///
 pub async fn maybe_sample_training_data(
     dataset: &Dataset,
     column: &str,
     sample_size_hint: usize,
-) -> Result<MatrixView<Float32Type>> {
+) -> Result<FixedSizeListArray> {
     let num_rows = dataset.count_rows().await?;
     let projection = dataset.schema().project(&[column])?;
     let batch = if num_rows > sample_size_hint {
@@ -53,5 +54,5 @@ pub async fn maybe_sample_training_data(
         ),
         location: location!(),
     })?;
-    Ok(array.as_fixed_size_list().try_into()?)
+    Ok(array.as_fixed_size_list().clone())
 }

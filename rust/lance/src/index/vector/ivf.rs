@@ -39,6 +39,7 @@ use lance_core::{
 };
 use lance_index::{
     vector::{
+        ivf::IvfBuildParams,
         pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
         Query, DIST_COL, RESIDUAL_COLUMN,
     },
@@ -595,65 +596,6 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
     Ok(field)
 }
 
-/// Parameters to build IVF partitions
-#[derive(Debug, Clone)]
-pub struct IvfBuildParams {
-    /// Number of partitions to build.
-    pub num_partitions: usize,
-
-    // ---- kmeans parameters
-    /// Max number of iterations to train kmeans.
-    pub max_iters: usize,
-
-    /// Use provided IVF centroids.
-    pub centroids: Option<Arc<FixedSizeListArray>>,
-
-    pub sample_rate: usize,
-}
-
-impl Default for IvfBuildParams {
-    fn default() -> Self {
-        Self {
-            num_partitions: 32,
-            max_iters: 50,
-            centroids: None,
-            sample_rate: 256, // See faiss
-        }
-    }
-}
-
-impl IvfBuildParams {
-    /// Create a new instance of `IvfBuildParams`.
-    pub fn new(num_partitions: usize) -> Self {
-        Self {
-            num_partitions,
-            ..Default::default()
-        }
-    }
-
-    /// Create a new instance of [`IvfBuildParams`] with centroids.
-    pub fn try_with_centroids(
-        num_partitions: usize,
-        centroids: Arc<FixedSizeListArray>,
-    ) -> Result<Self> {
-        if num_partitions != centroids.len() {
-            return Err(Error::Index {
-                message: format!(
-                    "IvfBuildParams::try_with_centroids: num_partitions {} != centroids.len() {}",
-                    num_partitions,
-                    centroids.len()
-                ),
-                location: location!(),
-            });
-        }
-        Ok(Self {
-            num_partitions,
-            centroids: Some(centroids),
-            ..Default::default()
-        })
-    }
-}
-
 /// Build IVF(PQ) index
 pub async fn build_ivf_pq_index(
     dataset: &Dataset,
@@ -685,13 +627,15 @@ pub async fn build_ivf_pq_index(
         });
     };
 
-    // Maximum to train 256 vectors per centroids, see Faiss.
+    // Maximum to train [IvfBuildParams::sample_size](default 256) vectors per centroid, see Faiss.
     let sample_size_hint = std::cmp::max(
         ivf_params.num_partitions,
         lance_index::vector::pq::num_centroids(pq_params.num_bits as u32),
-    ) * 256;
+    ) * ivf_params.sample_rate;
+
     // TODO: only sample data if training is necessary.
     let mut training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+
     #[cfg(feature = "opq")]
     let mut transforms: Vec<Box<dyn Transformer>> = vec![];
     #[cfg(not(feature = "opq"))]
