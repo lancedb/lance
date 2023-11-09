@@ -38,7 +38,7 @@ use arrow_array::{
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use datafusion_common::ScalarValue;
 use lance_arrow::as_fixed_size_binary_array;
-use num_traits::bounds::Bounded;
+use num_traits::{bounds::Bounded, Float, Zero};
 use std::str;
 
 /// Max number of bytes that are included in statistics for binary columns.
@@ -55,7 +55,7 @@ pub struct StatisticsRow {
     pub(crate) max_value: ScalarValue,
 }
 
-fn get_primitive_statistics<T: ArrowNumericType>(
+fn compute_primitive_statistics<T: ArrowNumericType>(
     arrays: &[&ArrayRef],
 ) -> (T::Native, T::Native, i64)
 where
@@ -97,57 +97,82 @@ where
     T::Native: Bounded,
     datafusion_common::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
 {
-    let (min_value, max_value, null_count) = get_primitive_statistics::<T>(arrays);
+    debug_assert!(!arrays.is_empty());
+    // Note: we take data_type off of arrays instead of using T::DATA_TYPE because
+    // there might be parameters like timezone for temporal types that need to
+    // be propagated.
+    let (min_value, max_value, null_count) = compute_primitive_statistics::<T>(arrays);
     StatisticsRow {
         null_count,
-        min_value: ScalarValue::from(min_value),
-        max_value: ScalarValue::from(max_value),
+        min_value: ScalarValue::new_primitive::<T>(Some(min_value), arrays[0].data_type()),
+        max_value: ScalarValue::new_primitive::<T>(Some(max_value), arrays[0].data_type()),
     }
+}
+
+fn compute_float_statistics<T: ArrowNumericType>(
+    arrays: &[&ArrayRef],
+) -> (T::Native, T::Native, i64)
+where
+    T::Native: Float,
+{
+    let mut min_value = T::Native::infinity();
+    let mut max_value = T::Native::neg_infinity();
+    let mut null_count: i64 = 0;
+    let arrays_iterator = arrays.iter().map(|x| as_primitive_array::<T>(x));
+
+    for array in arrays_iterator {
+        null_count += array.null_count() as i64;
+        if array.null_count() == array.len() {
+            continue;
+        }
+
+        array.iter().for_each(|value| {
+            if let Some(value) = value {
+                if let Some(Ordering::Greater) = value.partial_cmp(&max_value) {
+                    max_value = value;
+                }
+                if let Some(Ordering::Less) = value.partial_cmp(&min_value) {
+                    min_value = value;
+                }
+            };
+        });
+    }
+
+    // If all values are null or NaN, these might have never changed from initial values.
+    if min_value == T::Native::infinity() && max_value == T::Native::neg_infinity() {
+        min_value = T::Native::neg_infinity();
+        max_value = T::Native::infinity();
+    }
+    (min_value, max_value, null_count)
 }
 
 fn get_float_statistics<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> StatisticsRow
 where
-    T::Native: Bounded,
+    T::Native: Bounded + Float,
     datafusion_common::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
 {
-    let mut stats = get_statistics::<T>(arrays);
+    let (mut min_value, mut max_value, null_count) = compute_float_statistics::<T>(arrays);
 
-    match arrays[0].data_type() {
-        DataType::Float32 => {
-            if stats.min_value == ScalarValue::Float32(Some(0.0)) {
-                stats.min_value = ScalarValue::Float32(Some(-0.0));
-            }
-            if stats.max_value == ScalarValue::Float32(Some(-0.0)) {
-                stats.max_value = ScalarValue::Float32(Some(0.0));
-            }
-            if stats.min_value == ScalarValue::Float32(Some(f32::MAX)) {
-                stats.min_value = ScalarValue::Float32(Some(f32::MIN));
-            }
-            if stats.max_value == ScalarValue::Float32(Some(f32::MIN)) {
-                stats.max_value = ScalarValue::Float32(Some(f32::MAX));
-            }
-        }
-        DataType::Float64 => {
-            if stats.min_value == ScalarValue::Float64(Some(0.0)) {
-                stats.min_value = ScalarValue::Float64(Some(-0.0));
-            }
-            if stats.max_value == ScalarValue::Float64(Some(-0.0)) {
-                stats.max_value = ScalarValue::Float64(Some(0.0));
-            }
-            if stats.min_value == ScalarValue::Float64(Some(f64::MAX)) {
-                stats.min_value = ScalarValue::Float64(Some(f64::MIN));
-            }
-            if stats.max_value == ScalarValue::Float64(Some(f64::MIN)) {
-                stats.max_value = ScalarValue::Float64(Some(f64::MAX));
-            }
-        }
-        _ => {}
+    if min_value == T::Native::zero() {
+        min_value = T::Native::neg_zero();
     }
-    stats
+
+    if max_value == T::Native::neg_zero() {
+        max_value = T::Native::zero();
+    }
+
+    let min_value = ScalarValue::from(min_value);
+    let max_value = ScalarValue::from(max_value);
+
+    StatisticsRow {
+        null_count,
+        min_value,
+        max_value,
+    }
 }
 
 fn get_decimal_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
-    let (min_value, max_value, null_count) = get_primitive_statistics::<Decimal128Type>(arrays);
+    let (min_value, max_value, null_count) = compute_primitive_statistics::<Decimal128Type>(arrays);
     let array = as_primitive_array::<Decimal128Type>(arrays[0]);
     let precision = array.precision();
     let scale = array.scale();
@@ -228,6 +253,7 @@ fn get_string_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
     let mut min_value: Option<&str> = None;
     let mut max_value: Option<&str> = None;
     let mut null_count: i64 = 0;
+    let mut bounds_truncated = false;
 
     let array_iterator = arrays.iter().map(|x| x.as_string::<T>());
 
@@ -239,11 +265,9 @@ fn get_string_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
 
         array.iter().for_each(|value| {
             if let Some(mut val) = value {
-                // Truncate string to the longest length that is still a valid UTF8 string,
-                // while being of BINARY_PREFIX_LENGTH lenght or just greate. This is to avoid
-                // comparing potentially very long strings.
-                if val.len() > BINARY_PREFIX_LENGTH + 4 {
-                    val = truncate_utf8(val, BINARY_PREFIX_LENGTH + 4).unwrap();
+                if val.len() > BINARY_PREFIX_LENGTH {
+                    val = truncate_utf8(val, BINARY_PREFIX_LENGTH).unwrap();
+                    bounds_truncated = true;
                 }
 
                 if let Some(v) = min_value {
@@ -265,17 +289,13 @@ fn get_string_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
         });
     }
 
-    if let Some(v) = min_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            min_value = truncate_utf8(v, BINARY_PREFIX_LENGTH);
-        }
-    }
-
     let max_value_bound: Vec<u8>;
     if let Some(v) = max_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            max_value = truncate_utf8(v, BINARY_PREFIX_LENGTH);
-            max_value_bound = increment_utf8(max_value.unwrap().as_bytes().to_vec()).unwrap();
+        // If the bounds were truncated, then we need to increment the max_value,
+        // since shorter values are considered smaller than longer values if the
+        // short values are a prefix of the long ones.
+        if bounds_truncated {
+            max_value_bound = increment_utf8(v.as_bytes().to_vec()).unwrap();
             max_value = Some(str::from_utf8(&max_value_bound).unwrap());
         }
     }
@@ -304,6 +324,7 @@ fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
     let mut min_value: Option<&[u8]> = None;
     let mut max_value: Option<&[u8]> = None;
     let mut null_count: i64 = 0;
+    let mut bounds_truncated = false;
 
     let array_iterator = arrays.iter().map(|x| as_generic_binary_array::<T>(x));
 
@@ -318,8 +339,8 @@ fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
                 // Truncate binary buffer to BINARY_PREFIX_LENGTH to avoid comparing potentially
                 // very long buffers.
                 if val.len() > BINARY_PREFIX_LENGTH {
-                    // Truncate to longer length to have a valid comparison
-                    val = truncate_binary(val, BINARY_PREFIX_LENGTH + 4).unwrap();
+                    val = truncate_binary(val, BINARY_PREFIX_LENGTH).unwrap();
+                    bounds_truncated = true;
                 }
 
                 if let Some(v) = min_value {
@@ -341,16 +362,12 @@ fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
         });
     }
 
-    if let Some(v) = min_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            min_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
-        }
-    }
-
     let min_value = min_value.map(|x| x.to_vec());
+    // If the bounds were truncated, then we need to increment the max_value,
+    // since shorter values are considered smaller than longer values if the
+    // short values are a prefix of the long ones.
     let max_value = if let Some(v) = max_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            max_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
+        if bounds_truncated {
             increment(max_value.unwrap().to_vec())
         } else {
             Some(v.to_vec())
@@ -384,6 +401,8 @@ fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     let array_iterator = arrays.iter().map(|x| as_fixed_size_binary_array(x));
 
     let length = as_fixed_size_binary_array(arrays[0]).value_length() as usize;
+    // Truncate binary buffer to BINARY_PREFIX_LENGTH to avoid comparing potentially
+    // very long buffers.
     let do_truncate = length > BINARY_PREFIX_LENGTH;
 
     for array in array_iterator {
@@ -394,11 +413,8 @@ fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
         array.iter().for_each(|value| {
             if let Some(mut val) = value {
-                // Truncate binary buffer to BINARY_PREFIX_LENGTH to avoid comparing potentially
-                // very long buffers.
                 if do_truncate {
-                    // Truncate to longer length to have a valid comparison
-                    val = truncate_binary(val, BINARY_PREFIX_LENGTH + 4).unwrap();
+                    val = truncate_binary(val, BINARY_PREFIX_LENGTH).unwrap();
                 }
 
                 if let Some(v) = min_value {
@@ -420,16 +436,12 @@ fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         });
     }
 
-    if let Some(v) = min_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            min_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
-        }
-    }
-
     let min_value = min_value.map(|x| x.to_vec());
+    // If the bounds were truncated, then we need to increment the max_value,
+    // since shorter values are considered smaller than longer values if the
+    // short values are a prefix of the long ones.
     let max_value = if let Some(v) = max_value {
-        if v.len() > BINARY_PREFIX_LENGTH {
-            max_value = truncate_binary(v, BINARY_PREFIX_LENGTH);
+        if do_truncate {
             increment(max_value.unwrap().to_vec())
         } else {
             Some(v.to_vec())
@@ -512,130 +524,32 @@ fn get_dictionary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
 fn get_temporal_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     match arrays[0].data_type() {
-        DataType::Time32(TimeUnit::Second) => {
-            let (min_value, max_value, null_count) =
-                get_primitive_statistics::<Time32SecondType>(arrays);
-            StatisticsRow {
-                null_count,
-                min_value: ScalarValue::Time32Second(Some(min_value)),
-                max_value: ScalarValue::Time32Second(Some(max_value)),
-            }
+        DataType::Time32(TimeUnit::Second) => get_statistics::<Time32SecondType>(arrays),
+        DataType::Time32(TimeUnit::Millisecond) => get_statistics::<Time32MillisecondType>(arrays),
+        DataType::Date32 => get_statistics::<Date32Type>(arrays),
+        // Note: the tz is propagated through the data type in arrays within get_statistics()
+        DataType::Timestamp(TimeUnit::Second, _) => get_statistics::<TimestampSecondType>(arrays),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            get_statistics::<TimestampMillisecondType>(arrays)
         }
-        DataType::Time32(TimeUnit::Millisecond) => {
-            let (min_value, max_value, null_count) =
-                get_primitive_statistics::<Time32MillisecondType>(arrays);
-            StatisticsRow {
-                null_count,
-                min_value: ScalarValue::Time32Millisecond(Some(min_value)),
-                max_value: ScalarValue::Time32Millisecond(Some(max_value)),
-            }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            get_statistics::<TimestampMicrosecondType>(arrays)
         }
-        DataType::Date32 => {
-            let (min_value, max_value, null_count) = get_primitive_statistics::<Date32Type>(arrays);
-            StatisticsRow {
-                null_count,
-                min_value: ScalarValue::Date32(Some(min_value)),
-                max_value: ScalarValue::Date32(Some(max_value)),
-            }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            get_statistics::<TimestampNanosecondType>(arrays)
         }
-
-        DataType::Timestamp(TimeUnit::Second, tz) => {
-            let (min_value, max_value, null_count) =
-                get_primitive_statistics::<TimestampSecondType>(arrays);
-            StatisticsRow {
-                null_count,
-                min_value: ScalarValue::TimestampSecond(Some(min_value), tz.clone()),
-                max_value: ScalarValue::TimestampSecond(Some(max_value), tz.clone()),
-            }
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, tz) => {
-            let (min_value, max_value, null_count) =
-                get_primitive_statistics::<TimestampMillisecondType>(arrays);
-            StatisticsRow {
-                null_count,
-                min_value: ScalarValue::TimestampMillisecond(Some(min_value), tz.clone()),
-                max_value: ScalarValue::TimestampMillisecond(Some(max_value), tz.clone()),
-            }
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            let (min_value, max_value, null_count) =
-                get_primitive_statistics::<TimestampMicrosecondType>(arrays);
-            StatisticsRow {
-                null_count,
-                min_value: ScalarValue::TimestampMicrosecond(Some(min_value), tz.clone()),
-                max_value: ScalarValue::TimestampMicrosecond(Some(max_value), tz.clone()),
-            }
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
-            let (min_value, max_value, null_count) =
-                get_primitive_statistics::<TimestampNanosecondType>(arrays);
-            StatisticsRow {
-                null_count,
-                min_value: ScalarValue::TimestampNanosecond(Some(min_value), tz.clone()),
-                max_value: ScalarValue::TimestampNanosecond(Some(max_value), tz.clone()),
-            }
-        }
-        DataType::Time64(TimeUnit::Microsecond) => {
-            let (min_value, max_value, null_count) =
-                get_primitive_statistics::<Time64MicrosecondType>(arrays);
-            StatisticsRow {
-                null_count,
-                min_value: ScalarValue::Time64Microsecond(Some(min_value)),
-                max_value: ScalarValue::Time64Microsecond(Some(max_value)),
-            }
-        }
-        DataType::Time64(TimeUnit::Nanosecond) => {
-            let (min_value, max_value, null_count) =
-                get_primitive_statistics::<Time64NanosecondType>(arrays);
-            StatisticsRow {
-                null_count,
-                min_value: ScalarValue::Time64Nanosecond(Some(min_value)),
-                max_value: ScalarValue::Time64Nanosecond(Some(max_value)),
-            }
-        }
-        DataType::Date64 => {
-            let (min_value, max_value, null_count) = get_primitive_statistics::<Date64Type>(arrays);
-            StatisticsRow {
-                null_count,
-                min_value: ScalarValue::Date64(Some(min_value)),
-                max_value: ScalarValue::Date64(Some(max_value)),
-            }
-        }
-        DataType::Duration(TimeUnit::Second) => {
-            let (min_value, max_value, null_count) =
-                get_primitive_statistics::<DurationSecondType>(arrays);
-            StatisticsRow {
-                null_count,
-                min_value: ScalarValue::DurationSecond(Some(min_value)),
-                max_value: ScalarValue::DurationSecond(Some(max_value)),
-            }
-        }
+        DataType::Time64(TimeUnit::Microsecond) => get_statistics::<Time64MicrosecondType>(arrays),
+        DataType::Time64(TimeUnit::Nanosecond) => get_statistics::<Time64NanosecondType>(arrays),
+        DataType::Date64 => get_statistics::<Date64Type>(arrays),
+        DataType::Duration(TimeUnit::Second) => get_statistics::<DurationSecondType>(arrays),
         DataType::Duration(TimeUnit::Millisecond) => {
-            let (min_value, max_value, null_count) =
-                get_primitive_statistics::<DurationMillisecondType>(arrays);
-            StatisticsRow {
-                null_count,
-                min_value: ScalarValue::DurationMillisecond(Some(min_value)),
-                max_value: ScalarValue::DurationMillisecond(Some(max_value)),
-            }
+            get_statistics::<DurationMillisecondType>(arrays)
         }
         DataType::Duration(TimeUnit::Microsecond) => {
-            let (min_value, max_value, null_count) =
-                get_primitive_statistics::<DurationMicrosecondType>(arrays);
-            StatisticsRow {
-                null_count,
-                min_value: ScalarValue::DurationMicrosecond(Some(min_value)),
-                max_value: ScalarValue::DurationMicrosecond(Some(max_value)),
-            }
+            get_statistics::<DurationMicrosecondType>(arrays)
         }
         DataType::Duration(TimeUnit::Nanosecond) => {
-            let (min_value, max_value, null_count) =
-                get_primitive_statistics::<DurationNanosecondType>(arrays);
-            StatisticsRow {
-                null_count,
-                min_value: ScalarValue::DurationNanosecond(Some(min_value)),
-                max_value: ScalarValue::DurationNanosecond(Some(max_value)),
-            }
+            get_statistics::<DurationNanosecondType>(arrays)
         }
         _ => {
             unreachable!()
@@ -974,7 +888,8 @@ impl StatisticsBuilder {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        builder::StringDictionaryBuilder, BinaryArray, BooleanArray, Date32Array, Date64Array,
+        builder::StringDictionaryBuilder, make_array, new_empty_array, new_null_array,
+        types::ArrowPrimitiveType, BinaryArray, BooleanArray, Date32Array, Date64Array, Datum,
         Decimal128Array, DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
         DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, Float32Array,
         Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
@@ -983,6 +898,9 @@ mod tests {
         TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
         UInt32Array, UInt64Array, UInt8Array,
     };
+    use arrow_select::interleave::interleave;
+    use num_traits::One;
+    use proptest::{prop_assert, prop_assert_eq, strategy::Strategy, test_runner::TestCaseError};
 
     use super::*;
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
@@ -1368,8 +1286,8 @@ mod tests {
         // (Negative) Infinity can be min or max.
         let arrays: Vec<ArrayRef> = vec![Arc::new(Float64Array::from(vec![
             4.0f64,
-            f64::MAX,
-            f64::MIN,
+            f64::neg_infinity(),
+            f64::infinity(),
         ]))];
         let array_refs = arrays.iter().collect::<Vec<_>>();
         let stats = collect_statistics(&array_refs);
@@ -1377,8 +1295,8 @@ mod tests {
             stats,
             StatisticsRow {
                 null_count: 0,
-                min_value: ScalarValue::from(f64::MIN),
-                max_value: ScalarValue::from(f64::MAX),
+                min_value: ScalarValue::from(f64::neg_infinity()),
+                max_value: ScalarValue::from(f64::infinity()),
             }
         );
 
@@ -1408,8 +1326,8 @@ mod tests {
             stats,
             StatisticsRow {
                 null_count: 0,
-                min_value: ScalarValue::from(f64::MIN),
-                max_value: ScalarValue::from(f64::MAX),
+                min_value: ScalarValue::from(f64::neg_infinity()),
+                max_value: ScalarValue::from(f64::infinity()),
             }
         );
     }
@@ -1815,7 +1733,7 @@ mod tests {
 
         assert_eq!(batch, expected_batch);
 
-        // Check boolean, binary and string collectors return null for min/max if no
+        // Check binary and string collectors return null for min/max if no
         // values are supplied
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new("boolean", DataType::Boolean, true),
@@ -1993,5 +1911,259 @@ mod tests {
         let batch = collector.finish().unwrap();
         assert_eq!(batch.schema().as_ref(), &expected_schema);
         assert_eq!(batch, expected_batch);
+    }
+
+    // Property 1: for all values, if an array is entirely that value then it
+    // should become both the min and max. There are some exceptions:
+    // * NaN, null are ignored for min and max
+    // * string / binary more than 64 bytes are truncated.
+    fn assert_min_max_constant_property(
+        value: ScalarValue,
+        with_nulls: bool,
+    ) -> std::result::Result<(), TestCaseError> {
+        let array_scalar = value.to_scalar();
+        let (array, _) = array_scalar.get();
+        let array = make_array(array.to_data());
+
+        let array = if with_nulls {
+            let nulls = new_null_array(array.data_type(), 1);
+            interleave(&[&array, &nulls], &[(1, 0), (0, 0)]).unwrap()
+        } else {
+            array
+        };
+
+        let stats = collect_statistics(&[&array]);
+        prop_assert_eq!(
+            stats,
+            StatisticsRow {
+                null_count: if with_nulls { 1 } else { 0 },
+                min_value: value.clone(),
+                max_value: value,
+            },
+            "Statistics are wrong for input data: {:?}",
+            array
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_min_max_constant_property() {
+        let values = [
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(false)),
+            ScalarValue::Int8(Some(1)),
+            ScalarValue::Int16(Some(1)),
+            ScalarValue::Int32(Some(1)),
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::UInt8(Some(1)),
+            ScalarValue::UInt16(Some(1)),
+            ScalarValue::UInt32(Some(1)),
+            ScalarValue::UInt64(Some(1)),
+            ScalarValue::Float32(Some(1.0)),
+            ScalarValue::Float32(Some(std::f32::INFINITY)),
+            ScalarValue::Float32(Some(std::f32::NEG_INFINITY)),
+            ScalarValue::Float64(Some(1.0)),
+            ScalarValue::Float64(Some(std::f64::INFINITY)),
+            ScalarValue::Float64(Some(std::f64::NEG_INFINITY)),
+            ScalarValue::Utf8(Some("foo".to_string())),
+            ScalarValue::Utf8(Some("a".repeat(BINARY_PREFIX_LENGTH))),
+            ScalarValue::Binary(Some(vec![0_u8; BINARY_PREFIX_LENGTH])),
+        ];
+
+        for value in values {
+            assert_min_max_constant_property(value.clone(), false).unwrap();
+            assert_min_max_constant_property(value.clone(), true).unwrap();
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_min_max_constant_property_timestamp(
+            timezone_index in 0..3_usize,
+            timeunit_index in 0..4_usize,
+        ) {
+            let value = Some(42);
+            // Check different timezones to validate we propagate them.
+            let timezones = [None, Some("UTC".into()), Some("America/New_York".into())];
+            let timeunits = [TimeUnit::Second, TimeUnit::Millisecond, TimeUnit::Microsecond, TimeUnit::Nanosecond];
+
+            let timezone = timezones[timezone_index].clone();
+            let timeunit = timeunits[timeunit_index].clone();
+            let value = match timeunit {
+                TimeUnit::Second => ScalarValue::TimestampSecond(value, timezone),
+                TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(value, timezone),
+                TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(value, timezone),
+                TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(value, timezone),
+            };
+
+            assert_min_max_constant_property(value.clone(), false)?;
+            assert_min_max_constant_property(value.clone(), true)?;
+        }
+    }
+
+    // Property 2: The min and max should always be less than / greater than
+    // all values in the array respectively.
+    fn assert_min_max_ordering_float<F: ArrowPrimitiveType>(
+    ) -> std::result::Result<(), TestCaseError>
+    where
+        F::Native: Float,
+    {
+        let values = vec![
+            F::Native::neg_infinity(),
+            F::Native::infinity(),
+            F::Native::zero(),
+            F::Native::neg_zero(),
+            F::Native::one(),
+            F::Native::nan(),
+            F::Native::min_value(),
+            F::Native::max_value(),
+        ];
+
+        let mut runner = proptest::test_runner::TestRunner::default();
+
+        // Choose random subset of these values
+        let all_options = values.len();
+        let subset = proptest::sample::subsequence(values, (0, all_options));
+
+        // Turn into an array and compute statistics
+        let results = subset.prop_map(|subset| {
+            let array = Arc::new(PrimitiveArray::<F>::from_iter_values(subset.clone())) as ArrayRef;
+            let statistics = collect_statistics(&[&array]);
+            (subset, statistics)
+        });
+
+        runner.run(&results, |(subset, stats)| {
+            // Assert min is <= all values
+            prop_assert!(subset.iter().all(|val| val.is_nan()
+                || stats.min_value <= ScalarValue::new_primitive::<F>(Some(*val), &F::DATA_TYPE)));
+
+            // Assert max is >= all values
+            prop_assert!(subset.iter().all(|val| val.is_nan()
+                || stats.max_value >= ScalarValue::new_primitive::<F>(Some(*val), &F::DATA_TYPE)));
+
+            // If array is empty, assert min and max are -inf, +inf, respectively
+            if subset.is_empty() {
+                prop_assert_eq!(
+                    stats.min_value,
+                    ScalarValue::new_primitive::<F>(Some(F::Native::neg_infinity()), &F::DATA_TYPE)
+                );
+                prop_assert_eq!(
+                    stats.max_value,
+                    ScalarValue::new_primitive::<F>(Some(F::Native::infinity()), &F::DATA_TYPE)
+                );
+            }
+
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_min_max_ordering_float() {
+        assert_min_max_ordering_float::<Float32Type>().unwrap();
+        assert_min_max_ordering_float::<Float64Type>().unwrap();
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_min_max_ordering_string(values in proptest::collection::vec(".{0, 100}", 0..10)) {
+            let array = Arc::new(StringArray::from(values.clone())) as ArrayRef;
+            let statistics = collect_statistics(&[&array]);
+
+            // If array is empty, assert min and max are null
+            if array.is_empty() {
+                prop_assert_eq!(&statistics.min_value, &ScalarValue::Utf8(None));
+                prop_assert_eq!(&statistics.max_value, &ScalarValue::Utf8(None));
+            }
+
+            // Assert min is <= all values
+            prop_assert!(values.iter().all(|val| statistics.min_value <= ScalarValue::Utf8(Some(val.clone()))));
+
+            // Assert max is >= all values
+            prop_assert!(values.iter().all(|val| statistics.max_value >= ScalarValue::Utf8(Some(val.clone()))));
+
+            // Assert min and max are less than BINARY_PREFIX_LENGTH
+            match &statistics.min_value {
+                ScalarValue::Utf8(Some(min)) => prop_assert!(min.len() <= BINARY_PREFIX_LENGTH),
+                ScalarValue::Utf8(None) => (),
+                _ => unreachable!(),
+            }
+            match &statistics.max_value {
+                ScalarValue::Utf8(Some(max)) => prop_assert!(max.len() <= BINARY_PREFIX_LENGTH),
+                ScalarValue::Utf8(None) => (),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_min_max_ordering_binary(values in proptest::collection::vec(proptest::collection::vec(0..u8::MAX, 0..100), 0..10)) {
+            let array = Arc::new(BinaryArray::from_iter_values(values.clone())) as ArrayRef;
+            let statistics = collect_statistics(&[&array]);
+
+            // If array is empty, assert min and max are null
+            if array.is_empty() {
+                prop_assert_eq!(&statistics.min_value, &ScalarValue::Binary(None));
+                prop_assert_eq!(&statistics.max_value, &ScalarValue::Binary(None));
+            }
+
+            // Assert min is <= all values
+            prop_assert!(values.iter().all(|val| statistics.min_value <= ScalarValue::Binary(Some(val.clone()))));
+
+            // Assert max is >= all values
+            prop_assert!(values.iter().all(|val| statistics.max_value >= ScalarValue::Binary(Some(val.clone()))));
+
+            // Assert min and max are less than BINARY_PREFIX_LENGTH
+            match &statistics.min_value {
+                ScalarValue::Binary(Some(min)) => prop_assert!(min.len() <= BINARY_PREFIX_LENGTH),
+                ScalarValue::Binary(None) => (),
+                _ => unreachable!(),
+            }
+            match &statistics.max_value {
+                ScalarValue::Binary(Some(max)) => prop_assert!(max.len() <= BINARY_PREFIX_LENGTH),
+                ScalarValue::Binary(None) => (),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_min_max_ordering_fsb(values in proptest::collection::vec(proptest::collection::vec(0..u8::MAX, 100), 0..10)) {
+            let array = if values.is_empty() {
+                // FixedSizeBinary constructors doesn't handle empty inputs.
+                new_empty_array(&DataType::FixedSizeBinary(100))
+            } else {
+                Arc::new(FixedSizeBinaryArray::try_from_iter(values.iter()).unwrap()) as ArrayRef
+            };
+
+            let statistics = collect_statistics(&[&array]);
+
+            // If array is empty, assert min and max are null
+            if array.is_empty() {
+                prop_assert_eq!(&statistics.min_value, &ScalarValue::FixedSizeBinary(100, None));
+                prop_assert_eq!(&statistics.max_value, &ScalarValue::FixedSizeBinary(100, None));
+            }
+
+            // Assert min is <= all values
+            prop_assert!(values.iter().all(|val| statistics.min_value <= ScalarValue::FixedSizeBinary(100, Some(val.clone()))));
+
+            // Assert max is >= all values
+            prop_assert!(values.iter().all(|val| statistics.max_value >= ScalarValue::FixedSizeBinary(100, Some(val.clone()))));
+
+            // Assert min and max are less than BINARY_PREFIX_LENGTH
+            match &statistics.min_value {
+                ScalarValue::FixedSizeBinary(100, Some(min)) => prop_assert!(min.len() <= BINARY_PREFIX_LENGTH),
+                ScalarValue::FixedSizeBinary(100, None) => (),
+                _ => unreachable!(),
+            }
+            match &statistics.max_value {
+                ScalarValue::FixedSizeBinary(100, Some(max)) => prop_assert!(max.len() <= BINARY_PREFIX_LENGTH),
+                ScalarValue::FixedSizeBinary(100, None) => (),
+                _ => unreachable!(),
+            }
+        }
     }
 }
