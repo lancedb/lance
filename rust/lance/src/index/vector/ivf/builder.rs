@@ -16,17 +16,14 @@ use std::sync::Arc;
 use std::{collections::BTreeMap, ops::Range};
 
 use arrow_array::types::UInt32Type;
-use arrow_array::{cast::AsArray, types::Float32Type, UInt32Array};
+use arrow_array::{cast::AsArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
-use datafusion::prelude::col;
 use futures::{stream::repeat_with, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::{io::Writer, ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::pq::ProductQuantizer;
-use lance_index::vector::{
-    pq::transform::PQTransformer, residual::ResidualTransform, PART_ID_COLUMN, PQ_CODE_COLUMN,
-};
-use lance_linalg::{distance::MetricType, MatrixView};
+use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
+use lance_linalg::distance::MetricType;
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -36,8 +33,6 @@ use crate::index::vector::ivf::{
     Ivf,
 };
 use crate::{io::RecordBatchStream, Error, Result};
-
-use super::RESIDUAL_COLUMN;
 
 /// Disk-based shuffle a stream of [RecordBatch] into each IVF partition.
 /// Sub-quantizer will be applied if provided.
@@ -158,6 +153,7 @@ pub(super) async fn build_partitions(
         metric_type,
         column,
         pq.clone(),
+        Some(part_range),
     )?;
     let shuffler = shuffle_dataset(data, column, ivf_model, pq.num_sub_vectors()).await?;
     write_index_partitions(writer, ivf, &shuffler, None).await?;

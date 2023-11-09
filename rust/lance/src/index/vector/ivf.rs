@@ -42,7 +42,7 @@ use lance_index::{
     vector::{
         ivf::IvfBuildParams,
         pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
-        Query, DIST_COL, RESIDUAL_COLUMN,
+        Query, DIST_COL,
     },
     Index, IndexType,
 };
@@ -479,6 +479,7 @@ impl Ivf {
             MatrixView::try_from(self.centroids.as_ref())?,
             metric_type,
             vec![],
+            None,
         );
         ivf.find_partitions(query, nprobes)
     }
@@ -487,37 +488,6 @@ impl Ivf {
     fn add_partition(&mut self, offset: usize, len: u32) {
         self.offsets.push(offset);
         self.lengths.push(len);
-    }
-
-    /// Compute residual vector.
-    ///
-    /// A residual vector is `original vector - centroids`.
-    ///
-    /// Parameters:
-    ///  - *original*: original vector.
-    ///  - *partitions*: partition ID of each original vector.
-    #[instrument(level = "debug", skip_all)]
-    pub(super) fn compute_residual(
-        &self,
-        original: &MatrixView<Float32Type>,
-        partitions: &UInt32Array,
-    ) -> MatrixView<Float32Type> {
-        let mut residual_arr: Vec<f32> =
-            Vec::with_capacity(original.num_rows() * original.num_columns());
-        original
-            .iter()
-            .zip(partitions.values().iter())
-            .for_each(|(vector, &part_id)| {
-                let values = self.centroids.value(part_id as usize);
-                let centroid = values.as_primitive::<Float32Type>();
-                residual_arr.extend(
-                    vector
-                        .iter()
-                        .zip(centroid.values().iter())
-                        .map(|(v, cent)| *v - *cent),
-                );
-            });
-        MatrixView::new(Arc::new(residual_arr.into()), original.ndim())
     }
 }
 
@@ -705,7 +675,7 @@ pub async fn build_ivf_pq_index(
             lance_index::vector::pq::num_centroids(pq_params.num_bits as u32)
                 * pq_params.sample_rate;
         let training_data = if training_data.value_length() as usize > expected_sample_size {
-            training_data.sample(expected_sample_size)
+            training_data.sample(expected_sample_size)?
         } else {
             training_data
         };
@@ -722,9 +692,10 @@ pub async fn build_ivf_pq_index(
         let part_ids = ivf2.compute_partitions(&training_data).await?;
 
         let residuals = span!(Level::INFO, "compute residual for PQ training")
-            .in_scope(|| ivf2.compute_residual(&training_data, &part_ids));
+            .in_scope(|| ivf2.compute_residual(&training_data, Some(&part_ids)))
+            .await?;
         info!("Start train PQ: params={:#?}", pq_params);
-        pq_params.build_from_matrix(&residuals, metric_type).await?
+        pq_params.build(&residuals, metric_type).await?
     };
     info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
 

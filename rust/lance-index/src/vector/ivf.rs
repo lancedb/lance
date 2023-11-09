@@ -25,7 +25,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field};
 use arrow_select::take::take;
 use async_trait::async_trait;
-use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
+use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::{
     distance::{
@@ -184,6 +184,21 @@ pub trait Ivf: Send + Sync + std::fmt::Debug {
     ///
     async fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array>;
 
+    /// Compute residual vector.
+    ///
+    /// A residual vector is `original vector - centroids`.
+    ///
+    /// Parameters:
+    ///  - *original*: original vector.
+    ///  - *partitions*: partition ID of each original vector. If not provided, it will be computed
+    ///   on the flight.
+    ///
+    async fn compute_residual(
+        &self,
+        original: &FixedSizeListArray,
+        partitions: Option<&UInt32Array>,
+    ) -> Result<FixedSizeListArray>;
+
     /// Find the closest partitions for the query vector.
     fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array>;
 
@@ -305,6 +320,43 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
             })?;
         let mat = MatrixView::<T>::new(Arc::new(array.clone()), data.value_length());
         Ok(self.do_compute_partitions(&mat).await)
+    }
+
+    async fn compute_residual(
+        &self,
+        original: &FixedSizeListArray,
+        partitions: Option<&UInt32Array>,
+    ) -> Result<FixedSizeListArray> {
+        let flatten_arr = original
+            .values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or(Error::Index {
+                message: format!(
+                    "Ivf::compute_residual: original is not expected type: {} got {}",
+                    T::FLOAT_TYPE,
+                    original.values().data_type()
+                ),
+                location: Default::default(),
+            })?;
+
+        let part_ids = if let Some(part_ids) = partitions {
+            part_ids.clone()
+        } else {
+            self.compute_partitions(original).await?
+        };
+        let dim = original.value_length() as usize;
+        let mut residual_arr: Vec<T::Native> = Vec::with_capacity(original.values().len());
+        flatten_arr
+            .as_slice()
+            .chunks_exact(dim)
+            .zip(part_ids.values())
+            .for_each(|(vector, &part_id)| {
+                let centroid = self.centroids.row(part_id as usize).unwrap();
+                residual_arr.extend(vector.iter().zip(centroid.iter()).map(|(&v, &c)| v - c));
+            });
+        let arr = T::ArrayType::from(residual_arr);
+        Ok(FixedSizeListArray::try_new_from_values(arr, dim as i32)?)
     }
 
     fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array> {
