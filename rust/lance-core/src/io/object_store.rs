@@ -342,7 +342,7 @@ impl ObjectStore {
                 Self::from_path(uri, params)
             }
             Ok(url) => {
-                let store = Self::new_from_url(url.clone(), params).await?;
+                let store = Self::new_from_url(url.clone(), params.clone()).await?;
                 let path = Path::from(url.path());
                 Ok((store, path))
             }
@@ -427,14 +427,9 @@ impl ObjectStore {
         ))
     }
 
-    async fn new_from_url(url: Url, params: &ObjectStoreParams) -> Result<Self> {
+    async fn new_from_url(url: Url, params: ObjectStoreParams) -> Result<Self> {
         let mut storage_options = StorageOptions::default();
-        let mut options = ObjectStoreParams::default();
-        options.s3_credentials_refresh_offset = params.s3_credentials_refresh_offset;
-        options.aws_credentials = params.aws_credentials.clone();
-        options.commit_handler = params.commit_handler.clone();
-
-        configure_store(url.as_str(), &mut storage_options, options).await
+        configure_store(url.as_str(), &mut storage_options, params).await
     }
     /// Local object store.
     pub fn local() -> Self {
