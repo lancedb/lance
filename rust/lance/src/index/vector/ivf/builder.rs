@@ -18,6 +18,7 @@ use std::{collections::BTreeMap, ops::Range};
 use arrow_array::types::UInt32Type;
 use arrow_array::{cast::AsArray, types::Float32Type, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::col;
 use futures::{stream::repeat_with, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::{io::Writer, ROW_ID, ROW_ID_FIELD};
@@ -151,25 +152,14 @@ pub(super) async fn build_partitions(
         });
     }
 
-    let ivf_model = lance_index::vector::ivf::new_ivf(
+    let ivf_model = lance_index::vector::ivf::new_ivf_with_pq(
         ivf.centroids.values(),
         ivf.centroids.value_length() as usize,
         metric_type,
-        vec![
-            Arc::new(ResidualTransform::new(
-                ivf.centroids.as_ref().try_into()?,
-                PART_ID_COLUMN,
-                column,
-            )),
-            Arc::new(PQTransformer::new(
-                pq.clone(),
-                RESIDUAL_COLUMN,
-                PQ_CODE_COLUMN,
-            )),
-        ],
-        Some(part_range.clone()),
+        column,
+        pq.clone(),
     )?;
-    let shuffler = shuffle_dataset(data, column, Arc::new(ivf_model), pq.num_sub_vectors()).await?;
+    let shuffler = shuffle_dataset(data, column, ivf_model, pq.num_sub_vectors()).await?;
     write_index_partitions(writer, ivf, &shuffler, None).await?;
 
     Ok(())

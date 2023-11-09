@@ -18,11 +18,14 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
-use arrow_array::{cast::AsArray, types::UInt32Type, Array, RecordBatch, UInt32Array};
+use arrow_array::{
+    cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
+};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field};
 use arrow_select::take::take;
-use lance_arrow::{ArrowFloatType, FloatArray, RecordBatchExt};
+use async_trait::async_trait;
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::{
     distance::{
@@ -105,6 +108,7 @@ fn new_ivf_with_pq_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
     metric_type: MetricType,
     vector_column: &str,
     pq: Arc<dyn ProductQuantizer>,
+    range: Option<Range<u32>>,
 ) -> Arc<dyn Ivf> {
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
     Arc::new(IvfImpl::<T>::new_with_pq(
@@ -112,14 +116,17 @@ fn new_ivf_with_pq_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
         metric_type,
         vector_column,
         pq,
+        range,
     ))
 }
+
 pub fn new_ivf_with_pq(
     centroids: &dyn Array,
     dimension: usize,
     metric_type: MetricType,
     vector_column: &str,
     pq: Arc<dyn ProductQuantizer>,
+    range: Option<Range<u32>>,
 ) -> Result<Arc<dyn Ivf>> {
     match centroids.data_type() {
         DataType::Float16 => Ok(new_ivf_with_pq_impl::<Float16Type>(
@@ -128,6 +135,7 @@ pub fn new_ivf_with_pq(
             metric_type,
             vector_column,
             pq,
+            range,
         )),
         DataType::Float32 => Ok(new_ivf_with_pq_impl::<Float32Type>(
             centroids.as_primitive(),
@@ -135,6 +143,7 @@ pub fn new_ivf_with_pq(
             metric_type,
             vector_column,
             pq,
+            range,
         )),
         DataType::Float64 => Ok(new_ivf_with_pq_impl::<Float64Type>(
             centroids.as_primitive(),
@@ -142,6 +151,7 @@ pub fn new_ivf_with_pq(
             metric_type,
             vector_column,
             pq,
+            range,
         )),
         _ => Err(Error::Index {
             message: format!(
@@ -155,9 +165,32 @@ pub fn new_ivf_with_pq(
 
 /// IVF - IVF file partition
 ///
-pub trait Ivf {
+#[async_trait]
+pub trait Ivf: Send + Sync + std::fmt::Debug {
+    /// Compute the partitions for each vector in the input data.
+    ///
+    /// Parameters
+    /// ----------
+    /// *data*: a matrix of vectors.
+    ///
+    /// Returns
+    /// -------
+    /// A 1-D array of partition id for each vector.
+    ///
+    async fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array>;
+
     /// Find the closest partitions for the query vector.
     fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array>;
+
+    /// Partition a batch of vectors into multiple batches, each batch contains vectors and other data.
+    ///
+    /// It transform a [RecordBatch] that contains one vector column into a record batch with
+    /// schema `(PART_ID_COLUMN, ...)`, where [PART_ID_COLUMN] has the partition id for each vector.
+    ///
+    /// Note that the vector column might be transformed by the `transforms` in the IVF.
+    ///
+    /// **Warning**: unstable API.
+    async fn partition_transform(&self, batch: &RecordBatch, column: &str) -> Result<RecordBatch>;
 }
 
 /// IVF - IVF file partition
@@ -200,6 +233,7 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         metric_type: MetricType,
         vector_column: &str,
         pq: Arc<dyn ProductQuantizer>,
+        range: Option<Range<u32>>,
     ) -> Self {
         Self {
             centroids: centroids.clone(),
@@ -216,7 +250,7 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
                     PQ_CODE_COLUMN,
                 )),
             ],
-            partition_range: None,
+            partition_range: range,
         }
     }
 
@@ -224,80 +258,10 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         self.centroids.ndim()
     }
 
-    /// Partition a batch of vectors into multiple batches, each batch contains vectors and other data.
-    ///
-    /// It transform a [RecordBatch] that contains one vector column into a record batch with
-    /// schema `(PART_ID_COLUMN, ...)`, where [PART_ID_COLUMN] has the partition id for each vector.
-    ///
-    /// Note that the vector column might be transformed by the `transforms` in the IVF.
-    ///
-    /// **Warning**: unstable API.
-    pub async fn partition_transform(
-        &self,
-        batch: &RecordBatch,
-        column: &str,
-    ) -> Result<RecordBatch> {
-        let vector_arr = batch.column_by_name(column).ok_or(Error::Index {
-            message: format!("Column {} does not exist.", column),
-            location: location!(),
-        })?;
-        let data = vector_arr.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "Column {} is not a vector type: {}",
-                column,
-                vector_arr.data_type()
-            ),
-            location: location!(),
-        })?;
-
-        let flatten_data = data
-            .values()
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::Index {
-                message: format!(
-                    "Column {} is not a vector type: expect: {} got {}",
-                    column,
-                    T::FLOAT_TYPE,
-                    vector_arr.data_type()
-                ),
-                location: location!(),
-            })?;
-        let matrix = MatrixView::<T>::new(Arc::new(flatten_data.clone()), data.value_length());
-        let part_ids = self.compute_partitions(&matrix).await;
-
-        let (part_ids, batch) = if let Some(part_range) = self.partition_range.as_ref() {
-            let idx_in_range: UInt32Array = part_ids
-                .values()
-                .iter()
-                .enumerate()
-                .filter(|(_, part_id)| part_range.contains(*part_id))
-                .map(|(idx, _)| idx as u32)
-                .collect();
-            let part_ids = take(&part_ids, &idx_in_range, None)?
-                .as_primitive::<UInt32Type>()
-                .clone();
-            let batch = batch.take(&idx_in_range)?;
-            (part_ids, batch)
-        } else {
-            (part_ids, batch.clone())
-        };
-
-        let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), false);
-        let mut batch = batch.try_with_column(field, Arc::new(part_ids))?;
-
-        // Transform each batch
-        for transform in self.transforms.as_slice() {
-            batch = transform.transform(&batch).await?;
-        }
-
-        Ok(batch)
-    }
-
     /// Compute the partition for each row in the input Matrix.
     ///
     #[instrument(level = "debug", skip(data))]
-    pub async fn compute_partitions(&self, data: &MatrixView<T>) -> UInt32Array {
+    async fn do_compute_partitions(&self, data: &MatrixView<T>) -> UInt32Array {
         use lance_linalg::kmeans::compute_partitions;
 
         let dimension = data.ndim();
@@ -319,7 +283,25 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
     }
 }
 
+#[async_trait]
 impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
+    async fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
+        let array = data
+            .values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or(Error::Index {
+                message: format!(
+                    "Ivf::compute_partitions: data is not expected type: {} got {}",
+                    T::FLOAT_TYPE,
+                    data.values().data_type()
+                ),
+                location: Default::default(),
+            })?;
+        let mat = MatrixView::<T>::new(Arc::new(array.clone()), data.value_length());
+        Ok(self.do_compute_partitions(&mat).await)
+    }
+
     fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array> {
         if query.len() != self.dimension() {
             return Err(Error::IO {
@@ -360,5 +342,48 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
         .into();
         let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;
         Ok(top_k_partitions)
+    }
+
+    async fn partition_transform(&self, batch: &RecordBatch, column: &str) -> Result<RecordBatch> {
+        let vector_arr = batch.column_by_name(column).ok_or(Error::Index {
+            message: format!("Column {} does not exist.", column),
+            location: location!(),
+        })?;
+        let data = vector_arr.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "Column {} is not a vector type: {}",
+                column,
+                vector_arr.data_type()
+            ),
+            location: location!(),
+        })?;
+        let part_ids = self.compute_partitions(data).await?;
+
+        let (part_ids, batch) = if let Some(part_range) = self.partition_range.as_ref() {
+            let idx_in_range: UInt32Array = part_ids
+                .values()
+                .iter()
+                .enumerate()
+                .filter(|(_, part_id)| part_range.contains(*part_id))
+                .map(|(idx, _)| idx as u32)
+                .collect();
+            let part_ids = take(&part_ids, &idx_in_range, None)?
+                .as_primitive::<UInt32Type>()
+                .clone();
+            let batch = batch.take(&idx_in_range)?;
+            (part_ids, batch)
+        } else {
+            (part_ids, batch.clone())
+        };
+
+        let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), false);
+        let mut batch = batch.try_with_column(field, Arc::new(part_ids))?;
+
+        // Transform each batch
+        for transform in self.transforms.as_slice() {
+            batch = transform.transform(&batch).await?;
+        }
+
+        Ok(batch)
     }
 }

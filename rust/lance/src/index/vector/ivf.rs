@@ -190,6 +190,7 @@ impl IVFIndex {
             self.metric_type,
             column,
             pq_index.pq.clone(),
+            None,
         )?;
         let shuffler = shuffle_dataset(data, column, ivf, pq_index.pq.num_sub_vectors()).await?;
 
@@ -768,9 +769,9 @@ pub async fn build_ivf_pq_index(
             metric_type,
             vec![],
             None,
-        );
+        )?;
         // Compute the residual vector to train Product Quantizer.
-        let part_ids = ivf2.compute_partitions(&training_data).await;
+        let part_ids = ivf2.compute_partitions(&training_data).await?;
 
         let residuals = span!(Level::INFO, "compute residual for PQ training")
             .in_scope(|| ivf_model.compute_residual(&training_data, &part_ids));
