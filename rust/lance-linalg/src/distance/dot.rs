@@ -102,10 +102,12 @@ mod kernel {
 impl Dot for Float16Type {
     #[inline]
     fn dot(x: &[f16], y: &[f16]) -> f16 {
-        #[cfg(target_feature = "neon")] unsafe {
+        #[cfg(target_feature = "neon")]
+        unsafe {
             dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
         }
-        #[cfg(not(target_feature = "neon"))] {
+        #[cfg(not(target_feature = "neon"))]
+        {
             dot_scalar::<f16, 16>(x, y)
         }
     }

@@ -15,7 +15,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-
 #ifdef __ARM_NEON
 #define LANES 4
 #define UNROLL_COUNT 2
@@ -25,7 +24,6 @@
 #define LANES 64
 #define UNROLL_COUNT 4
 #endif  // X86_64
-
 
 /// Works on NEON + FP16 or AVX512FP16
 //
@@ -47,26 +45,16 @@ _Float16 norm_l2_f16(const _Float16* data, uint32_t dimension) {
   }
 
   _Float16 sum = 0;
-  #pragma clang loop vectorize(enable) interleave(enable)
+#pragma clang loop vectorize(enable) interleave(enable)
   for (size_t i = 0; i < LANES; i++) sum += vsum[i];
 
-  // Remaining
-  #pragma clang loop unroll(enable) interleave(enable)
+// Remaining
+#pragma clang loop unroll(enable) interleave(enable)
   for (uint32_t i = dimension / LANES * LANES; i < dimension; i++) {
     _Float16 v = data[i];
     sum += v * v;
   }
   return sum;
-}
-
-_Float16 dot_f16(const _Float16* x, const _Float16* y, uint32_t dimension) {
-    _Float16 sum = 0;
-
-#pragma clang loop unroll_count(UNROLL_COUNT) interleave(enable) vectorize_width(LANES)
-    for (uint32_t i = 0; i < dimension; i++) {
-      sum += x[i] * y[i];
-    }
-    return sum;
 }
 
 #endif
@@ -78,10 +66,25 @@ _Float16 norm_l2_f16(const _Float16* data, uint32_t dimension) {
 
 #pragma clang loop unroll_count(UNROLL_COUNT) vectorize_width(LANES) interleave(enable)
   for (uint32_t i = 0; i < dimension; i++) {
-     _Float16 v = data[i];
+    _Float16 v = data[i];
     sum += v * v;
   }
   return sum;
 }
 
 #endif  // X86_64
+
+/// @brief Dot product of two f16 vectors.
+/// @param x A f16 vector
+/// @param y A f16 vector
+/// @param dimension The dimension of the vectors
+/// @return The dot product of the two vectors.
+_Float16 dot_f16(const _Float16* x, const _Float16* y, uint32_t dimension) {
+  _Float16 sum = 0;
+
+#pragma clang loop unroll_count(UNROLL_COUNT) interleave(enable) vectorize_width(LANES)
+  for (uint32_t i = 0; i < dimension; i++) {
+    sum += x[i] * y[i];
+  }
+  return sum;
+}
