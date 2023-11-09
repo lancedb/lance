@@ -29,8 +29,11 @@ arrow-arith = { workspace = true }
 criterion = { workspace = true }
 lance-testing = { path = "../lance-testing" }
 
+[build-dependencies]
+cc = "1"
+
 [features]
-#avx512 = []
+avx512fp16 = []
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof = { workspace = true }

@@ -30,21 +30,40 @@ pub trait Normalize<T: Float> {
     fn norm_l2(&self) -> Self::Output;
 }
 
+// `avx512fp16` is not supported in rustc yet. Once it is supported, we can
+// move it to target_feture.
+#[cfg(any(
+    all(target_os = "macos", target_feature = "neon"),
+    feature = "avx512fp16"
+))]
+mod kernel {
+    use super::*;
+
+    extern "C" {
+        pub fn norm_l2_f16(ptr: *const f16, len: u32) -> f16;
+    }
+}
+
 impl Normalize<f16> for &[f16] {
     type Output = f16;
 
-    #[inline]
+    // #[inline]
     fn norm_l2(&self) -> Self::Output {
-        #[cfg(target_feature = "neon")]
+        #[cfg(any(
+            all(target_os = "macos", target_feature = "neon"),
+            feature = "avx512fp16"
+        ))]
+        unsafe {
+            kernel::norm_l2_f16(self.as_ptr(), self.len() as u32)
+        }
+        #[cfg(not(any(
+            all(target_os = "macos", target_feature = "neon"),
+            feature = "avx512fp16"
+        )))]
         {
-            // No explict f16c CVT instructions available in [std::arch::aarch64].
-            // So, we convert to f32 manually and then back to f16.
-            // This is about 40% faster than the scalar implementation on a M2 Macbook Pro.
-            // Sadly, more than half the time is doing element-wise load and cvt f16 -> f32.
-            //
             // Please run `cargo bench --bench norm_l2" on Apple Silicon when
             // change the following code.
-            const LANES: usize = 4;
+            const LANES: usize = 16;
             let chunks = self.chunks_exact(LANES);
             let sum = if chunks.remainder().is_empty() {
                 0.0
@@ -69,10 +88,6 @@ impl Normalize<f16> for &[f16] {
                 }
             }
             f16::from_f32((sums.iter().copied().sum::<f32>() + sum).sqrt())
-        }
-        #[cfg(not(target_feature = "neon"))]
-        {
-            norm_l2(self)
         }
     }
 }

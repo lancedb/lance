@@ -49,16 +49,13 @@ jobs:
       # split everything us so we know what's slow.
       - name: Build
         run: |
-          cargo build --all-features
-      - name: Build test
-        run: |
-          cargo test --all-features --no-run
+          cargo build --all-features --tests
       - name: Start DynamoDB local for tests
         run: |
           docker run -d -e AWS_ACCESS_KEY_ID=DUMMYKEY -e AWS_SECRET_ACCESS_KEY=DUMMYKEY -p 8000:8000 amazon/dynamodb-local
       - name: Run tests
         run: |
-          cargo test --all-features
+          cargo test --features dynamodb,tensorflow,dynamodb_tests,cli
       - name: Build benchmarks
         run: cargo build --benches
   linux-arm:

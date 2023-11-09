@@ -90,10 +90,35 @@ impl Dot for BFloat16Type {
     }
 }
 
+#[cfg(any(
+    all(target_os = "macos", target_feature = "neon"),
+    all(target_os = "linux", feature = "avx512fp16")
+))]
+mod kernel {
+    use super::*;
+
+    extern "C" {
+        pub fn dot_f16(ptr1: *const f16, ptr2: *const f16, len: u32) -> f16;
+    }
+}
+
 impl Dot for Float16Type {
     #[inline]
     fn dot(x: &[f16], y: &[f16]) -> f16 {
-        dot_scalar::<f16, 16>(x, y)
+        #[cfg(any(
+            all(target_os = "macos", target_feature = "neon"),
+            all(target_os = "linux", feature = "avx512fp16")
+        ))]
+        unsafe {
+            self::kernel::dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
+        }
+        #[cfg(not(any(
+            all(target_os = "macos", target_feature = "neon"),
+            all(target_os = "linux", feature = "avx512fp16")
+        )))]
+        {
+            dot_scalar::<f16, 16>(x, y)
+        }
     }
 }
 
