@@ -621,6 +621,32 @@ impl FileFragment {
 
         Ok(Some(self))
     }
+
+    pub(crate) async fn apply_deletions(
+        mut self,
+        new_deletions: impl IntoIterator<Item = u32>,
+    ) -> Result<Fragment> {
+        let mut deletion_vector = read_deletion_file(
+            &self.dataset.base,
+            &self.metadata,
+            self.dataset.object_store(),
+        )
+        .await?
+        .unwrap_or_default();
+
+        deletion_vector.extend(new_deletions);
+
+        self.metadata.deletion_file = write_deletion_file(
+            &self.dataset.base,
+            self.metadata.id,
+            self.dataset.version().version,
+            &deletion_vector,
+            self.dataset.object_store(),
+        )
+        .await?;
+
+        Ok(self.metadata.clone())
+    }
 }
 
 impl From<FileFragment> for Fragment {

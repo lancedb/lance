@@ -39,6 +39,8 @@ use uuid::Uuid;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::DATA_DIR;
 
+pub mod update;
+
 /// The mode to write dataset.
 #[derive(Debug, Clone, Copy)]
 pub enum WriteMode {

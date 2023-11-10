@@ -41,6 +41,7 @@ use lance_index::scalar::expression::{
 use snafu::{location, Location};
 
 use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
+use crate::utils::sql::parse_sql_expr;
 use crate::{
     datafusion::logical_expr::resolve_expr, datatypes::Schema, utils::sql::parse_sql_filter, Error,
     Result,
@@ -413,12 +414,23 @@ impl Planner {
     /// before being passed to [create_physical_expr()].
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
-
         let ast_expr = parse_sql_filter(filter)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
         let resolved = resolve_expr(&expr, &schema)?;
         coerce_filter_type_to_boolean(resolved)
+    }
+
+    /// Create Logical [Expr] from a SQL expression.
+    ///
+    /// Note: the returned expression must be passed through [optimize_filter()]
+    /// before being passed to [create_physical_expr()].
+    pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
+        let ast_expr = parse_sql_expr(expr)?;
+        let expr = self.parse_sql_expr(&ast_expr)?;
+        let schema = Schema::try_from(self.schema.as_ref())?;
+        let resolved = resolve_expr(&expr, &schema)?;
+        Ok(resolved)
     }
 
     /// Optimize the filter expression and coerce data types.
@@ -469,12 +481,11 @@ impl Planner {
     /// a refine portion that must be applied after the index search
     pub fn create_filter_plan(
         &self,
-        filter: &str,
+        filter: Expr,
         index_info: &dyn IndexInformationProvider,
         use_scalar_index: bool,
     ) -> Result<FilterPlan> {
-        let logical_expr = self.parse_filter(filter)?;
-        let logical_expr = self.optimize_expr(logical_expr)?;
+        let logical_expr = self.optimize_expr(filter)?;
         if use_scalar_index {
             let indexed_expr = apply_scalar_indices(logical_expr, index_info);
             Ok(FilterPlan {
