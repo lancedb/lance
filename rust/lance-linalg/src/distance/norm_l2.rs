@@ -83,7 +83,7 @@ impl Normalize<f16> for &[f16] {
                     sums[i] += f32_vals[i].powi(2);
                 }
             }
-            f16::from_f32((sums.iter().copied().sum::<f32>() + sum).sqrt())
+            (sums.iter().copied().sum::<f32>() + sum).sqrt()
         }
     }
 }
