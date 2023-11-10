@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::iter::repeat_with;
+
 use arrow_arith::{aggregate::sum, numeric::mul};
 use arrow_array::types::{Float16Type, Float64Type};
 use arrow_array::{
@@ -19,12 +21,14 @@ use arrow_array::{
     PrimitiveArray,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use lance_arrow::FloatToArrayType;
+use half::bf16;
 use num_traits::FromPrimitive;
+use rand::Rng;
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
+use lance_arrow::FloatToArrayType;
 use lance_linalg::distance::norm_l2::Normalize;
 use lance_testing::datagen::generate_random_array_with_seed;
 
@@ -74,6 +78,22 @@ where
 }
 
 fn bench_distance(c: &mut Criterion) {
+    let mut rng = rand::thread_rng();
+    let target = repeat_with(|| rng.gen::<f32>())
+        .map(bf16::from_f32)
+        .take(TOTAL * DIMENSION)
+        .collect::<Vec<_>>();
+    c.bench_function("norm_l2(bf16, auto-vectorization)", |b| {
+        b.iter(|| {
+            black_box(
+                target
+                    .chunks(DIMENSION)
+                    .map(|x| x.norm_l2())
+                    .collect::<Vec<_>>(),
+            )
+        });
+    });
+
     run_bench::<Float16Type>(c);
     run_bench::<Float32Type>(c);
 

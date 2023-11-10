@@ -47,7 +47,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::instrument;
 
+pub mod builder;
 pub(crate) mod chunker;
+
 pub mod cleanup;
 mod feature_flags;
 pub mod fragment;
@@ -92,7 +94,6 @@ pub struct Dataset {
     pub(crate) object_store: Arc<ObjectStore>,
     pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
-
     pub(crate) session: Arc<Session>,
 }
 
