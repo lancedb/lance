@@ -18,8 +18,7 @@ use arrow_array::{
     ArrowNumericType, Float32Array, NativeAdapter, PrimitiveArray,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-
-use num_traits::{Float, FromPrimitive};
+use num_traits::{AsPrimitive, Float, FromPrimitive};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
@@ -30,12 +29,12 @@ use lance_testing::datagen::generate_random_array_with_seed;
 const TOTAL: usize = 1024 * 1024; // 1M vectors
 
 #[inline]
-fn l2_arrow_arity<T: ArrowNumericType>(x: &PrimitiveArray<T>, y: &PrimitiveArray<T>) -> T::Native
+fn l2_arrow_arity<T: ArrowNumericType>(x: &PrimitiveArray<T>, y: &PrimitiveArray<T>) -> f32
 where
-    T::Native: Float,
+    T::Native: Float + AsPrimitive<f32>,
 {
     let m: PrimitiveArray<T> = binary(x, y, |a, b| (a - b).powi(2)).unwrap();
-    sum(&m).unwrap()
+    sum(&m).unwrap().as_()
 }
 
 fn run_bench<T: ArrowNumericType>(c: &mut Criterion)
@@ -55,7 +54,7 @@ where
 
     c.bench_function(format!("L2({type_name}, arrow_artiy)").as_str(), |b| {
         b.iter(|| unsafe {
-            PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let arr = target.slice(idx * DIMENSION, DIMENSION);
                 Some(l2_arrow_arity(&key, &arr))
             }));
@@ -67,7 +66,7 @@ where
         |b| {
             let x = &key.values()[..];
             b.iter(|| unsafe {
-                PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
+                Float32Array::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
                     let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
                     Some(black_box(l2(x, y)))
                 }));

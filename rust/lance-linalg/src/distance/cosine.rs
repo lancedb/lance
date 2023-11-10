@@ -304,16 +304,10 @@ pub fn cosine_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
 ) -> Result<Arc<Float32Array>> {
-    match from.data_type() {
-        &DataType::Float16 => {
-            do_cosine_distance_arrow_batch::<Float16Type>(from.as_primitive(), to)
-        }
-        &DataType::Float32 => {
-            do_cosine_distance_arrow_batch::<Float32Type>(from.as_primitive(), to)
-        }
-        &DataType::Float64 => {
-            do_cosine_distance_arrow_batch::<Float64Type>(from.as_primitive(), to)
-        }
+    match *from.data_type() {
+        DataType::Float16 => do_cosine_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
+        DataType::Float32 => do_cosine_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
+        DataType::Float64 => do_cosine_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
         _ => Err(Error::InvalidArgumentError(format!(
             "Unsupported data type {:?}",
             from.data_type()
