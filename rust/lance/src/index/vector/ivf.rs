@@ -17,10 +17,9 @@
 use std::{any::Any, collections::HashMap, sync::Arc};
 
 use arrow_arith::numeric::sub;
-use arrow_array::types::{Float16Type, Float64Type};
 use arrow_array::{
     cast::{as_primitive_array, as_struct_array, AsArray},
-    types::Float32Type,
+    types::{Float16Type, Float32Type, Float64Type},
     Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
@@ -469,7 +468,7 @@ impl Ivf {
     /// Use the query vector to find `nprobes` closest partitions.
     fn find_partitions(
         &self,
-        query: &Float32Array,
+        query: &dyn Array,
         nprobes: usize,
         metric_type: MetricType,
     ) -> Result<UInt32Array> {

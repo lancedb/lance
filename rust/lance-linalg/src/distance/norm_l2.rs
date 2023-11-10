@@ -173,7 +173,7 @@ mod tests {
 
         let result = data.as_slice().norm_l2();
         assert_relative_eq!(
-            result.as_(),
+            result as f64,
             (1..=37)
                 .map(|v| f64::from_i32(v * v).unwrap())
                 .sum::<f64>()
@@ -183,7 +183,7 @@ mod tests {
 
         let not_aligned = (&data[2..]).norm_l2();
         assert_relative_eq!(
-            not_aligned.as_(),
+            not_aligned as f64,
             (3..=37)
                 .map(|v| f64::from_i32(v * v).unwrap())
                 .sum::<f64>()

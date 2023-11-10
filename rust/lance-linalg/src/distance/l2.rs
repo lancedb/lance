@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use arrow_array::{
     cast::AsArray,
-    types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type},
-    Array, ArrowNumericType, FixedSizeListArray, Float32Array,
+    types::{Float16Type, Float32Type, Float64Type},
+    Array, FixedSizeListArray, Float32Array,
 };
 use arrow_schema::DataType;
 use half::{bf16, f16};

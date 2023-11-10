@@ -29,7 +29,6 @@ use lance_linalg::distance::{
 };
 use lance_linalg::kernels::{argmin, argmin_value_float};
 use lance_linalg::{distance::MetricType, MatrixView};
-use num_traits::{AsPrimitive, Float};
 use snafu::{location, Location};
 pub mod builder;
 pub mod transform;

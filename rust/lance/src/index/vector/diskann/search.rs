@@ -20,6 +20,7 @@ use std::{
 };
 
 use arrow_array::cast::AsArray;
+use arrow_array::types::Float32Type;
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
@@ -231,7 +232,7 @@ impl VectorIndex for DiskANNIndex {
         let state = greedy_search(
             &self.graph,
             0,
-            query.key.as_primitive().values(),
+            query.key.as_primitive::<Float32Type>().values(),
             query.k,
             query.k * 2,
         )

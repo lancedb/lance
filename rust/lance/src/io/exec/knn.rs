@@ -618,7 +618,7 @@ mod tests {
             stream,
             &Query {
                 column: "vector".to_string(),
-                key: Arc::new(as_primitive_array(&q).clone()),
+                key: q,
                 k: 10,
                 nprobes: 0,
                 refine_factor: None,

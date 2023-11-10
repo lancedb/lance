@@ -23,7 +23,7 @@ use std::sync::Arc;
 use arrow_array::{
     cast::AsArray,
     types::{Float16Type, Float32Type, Float64Type},
-    Array, ArrowNumericType, FixedSizeListArray, Float32Array,
+    Array, FixedSizeListArray, Float32Array,
 };
 use arrow_schema::DataType;
 use lance_arrow::bfloat16::BFloat16Type;

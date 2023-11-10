@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array};
+use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::ArrowError;
 
 pub mod cosine;
