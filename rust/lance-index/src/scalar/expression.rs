@@ -308,7 +308,7 @@ fn visit_between(
     let query = ScalarQuery::Range(Bound::Included(low.clone()), Bound::Included(high.clone()));
     let indexed_expr = IndexedExpression::index_query(column.to_string(), query);
     if between.negated {
-        Some(indexed_expr.maybe_not().unwrap())
+        indexed_expr.maybe_not()
     } else {
         Some(indexed_expr)
     }
@@ -324,7 +324,7 @@ fn visit_in_list(
     let query = ScalarQuery::IsIn(values);
     let indexed_expr = IndexedExpression::index_query(column.to_string(), query);
     if in_list.negated {
-        Some(indexed_expr.maybe_not().unwrap())
+        indexed_expr.maybe_not()
     } else {
         Some(indexed_expr)
     }
@@ -354,7 +354,7 @@ fn visit_is_null(
     let (column, _) = maybe_indexed_column(expr, index_info)?;
     let indexed_expr = IndexedExpression::index_query(column.to_string(), ScalarQuery::IsNull());
     if negated {
-        Some(indexed_expr.maybe_not().unwrap())
+        indexed_expr.maybe_not()
     } else {
         Some(indexed_expr)
     }
@@ -441,7 +441,7 @@ fn visit_binary_expr(
             visit_comparison(expr, index_info)
         }
         // visit_comparison will maybe create an Eq query which we negate
-        Operator::NotEq => visit_comparison(expr, index_info).map(|node| node.maybe_not().unwrap()),
+        Operator::NotEq => visit_comparison(expr, index_info).and_then(|node| node.maybe_not()),
         Operator::And => visit_and(expr, index_info),
         Operator::Or => visit_or(expr, index_info),
         _ => None,

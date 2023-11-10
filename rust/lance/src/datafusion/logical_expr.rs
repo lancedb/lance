@@ -17,8 +17,8 @@
 use arrow_schema::DataType;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{BuiltinScalarFunction, Operator};
-use datafusion::scalar::ScalarValue;
 use datafusion::{logical_expr::BinaryExpr, prelude::*};
+use lance_index::util::datafusion::safe_coerce_scalar;
 
 use crate::datatypes::Schema;
 use crate::{Error, Result};
@@ -26,43 +26,14 @@ use snafu::{location, Location};
 /// Resolve a Value
 fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
     match expr {
-        Expr::Literal(ScalarValue::Int64(v)) => match data_type {
-            DataType::Int8 => Ok(Expr::Literal(ScalarValue::Int8(v.map(|v| v as i8)))),
-            DataType::Int16 => Ok(Expr::Literal(ScalarValue::Int16(v.map(|v| v as i16)))),
-            DataType::Int32 => Ok(Expr::Literal(ScalarValue::Int32(v.map(|v| v as i32)))),
-            DataType::Int64 => Ok(Expr::Literal(ScalarValue::Int64(*v))),
-            DataType::UInt8 => Ok(Expr::Literal(ScalarValue::UInt8(v.map(|v| v as u8)))),
-            DataType::UInt16 => Ok(Expr::Literal(ScalarValue::UInt16(v.map(|v| v as u16)))),
-            DataType::UInt32 => Ok(Expr::Literal(ScalarValue::UInt32(v.map(|v| v as u32)))),
-            DataType::UInt64 => Ok(Expr::Literal(ScalarValue::UInt64(v.map(|v| v as u64)))),
-            DataType::Float32 => Ok(Expr::Literal(ScalarValue::Float32(v.map(|v| v as f32)))),
-            DataType::Float64 => Ok(Expr::Literal(ScalarValue::Float64(v.map(|v| v as f64)))),
-            _ => Err(Error::IO {
-                message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
+        Expr::Literal(scalar_value) => {
+            Ok(Expr::Literal(safe_coerce_scalar(scalar_value, data_type).ok_or_else(|| Error::IO {
+                message: format!("Received literal {expr} and could not convert to literal of type '{data_type:?}'"),
                 location: location!(),
-            }),
-        },
-        Expr::Literal(ScalarValue::Float64(v)) => match data_type {
-            DataType::Float32 => Ok(Expr::Literal(ScalarValue::Float32(v.map(|v| v as f32)))),
-            DataType::Float64 => Ok(Expr::Literal(ScalarValue::Float64(*v))),
-            _ => Err(Error::IO {
-                message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
-                location: location!(),
-            }),
-        },
-        Expr::Literal(ScalarValue::Utf8(v)) => match data_type {
-            DataType::Utf8 => Ok(expr.clone()),
-            DataType::LargeUtf8 => Ok(Expr::Literal(ScalarValue::LargeUtf8(v.clone()))),
-            _ => Err(Error::IO {
-                message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
-                location: location!(),
-            }),
-        },
-        Expr::Literal(ScalarValue::Boolean(_)) | Expr::Literal(ScalarValue::Null) => {
-            Ok(expr.clone())
+            })?))
         }
         _ => Err(Error::IO {
-            message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
+            message: format!("Expected a literal of type '{data_type:?}' but received: {expr}"),
             location: location!(),
         }),
     }
@@ -190,6 +161,7 @@ mod tests {
     use super::*;
 
     use arrow_schema::{Field, Schema as ArrowSchema};
+    use datafusion::scalar::ScalarValue;
 
     #[test]
     fn test_resolve_large_utf8() {

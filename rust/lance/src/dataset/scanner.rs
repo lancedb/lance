@@ -551,7 +551,8 @@ impl Scanner {
         }
     }
 
-    fn project_additional<S: AsRef<str>>(
+    /// Given a base schema and a list of desired fields figure out which fields, if any, still need loaded
+    fn calc_new_fields<S: AsRef<str>>(
         &self,
         base_schema: &Schema,
         columns: &[S],
@@ -642,10 +643,21 @@ impl Scanner {
                 } else {
                     self.dataset.fragments()
                 };
-                let has_new_data = fragments
-                    .iter()
-                    .any(|frag| !covered_frags.contains(frag.id as u32));
-                if has_new_data {
+                let mut has_new_data = false;
+                let mut has_missing_row_count = false;
+                for frag in fragments {
+                    if !covered_frags.contains(frag.id as u32) {
+                        has_new_data = true;
+                        break;
+                    }
+                    if frag.physical_rows.is_none() {
+                        has_missing_row_count = true;
+                        break;
+                    }
+                }
+                if has_new_data || has_missing_row_count {
+                    // We need row counts to use scalar indices.  If we don't have them then
+                    // fallback to a non-indexed filter
                     planner.create_filter_plan(filter, &index_info, false)?
                 } else {
                     filter_plan
@@ -692,13 +704,13 @@ impl Scanner {
         // Stage 1.5 load columns needed for stages 2 & 3
         let mut additional_schema = None;
         if filter_plan.has_refine() {
-            additional_schema = self.project_additional(
+            additional_schema = self.calc_new_fields(
                 &Schema::try_from(plan.schema().as_ref())?,
                 &filter_plan.refine_columns(),
             )?;
         }
         if let Some(ordering) = &self.ordering {
-            additional_schema = self.project_additional(
+            additional_schema = self.calc_new_fields(
                 &additional_schema
                     .map(Ok::<Schema, Error>)
                     .unwrap_or_else(|| Schema::try_from(plan.schema().as_ref()))?,

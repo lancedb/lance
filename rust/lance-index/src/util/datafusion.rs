@@ -19,7 +19,7 @@ use datafusion_common::ScalarValue;
 // datafusion expressions there is no type coercion that happens.  In other words "x = 7"
 // will always yield "x = 7_u64" regardless of the type of the column "x".  As a result, we
 // need to do that literal coercion ourselves.
-pub(crate) fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarValue> {
+pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarValue> {
     match value {
         ScalarValue::Int8(val) => match ty {
             DataType::Int8 => Some(value.clone()),
@@ -38,6 +38,8 @@ pub(crate) fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<S
             DataType::UInt64 => {
                 val.and_then(|v| u64::try_from(v).map(|v| ScalarValue::UInt64(Some(v))).ok())
             }
+            DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(f32::from(v)))),
+            DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(f64::from(v)))),
             _ => None,
         },
         ScalarValue::Int16(val) => match ty {
@@ -59,6 +61,8 @@ pub(crate) fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<S
             DataType::UInt64 => {
                 val.and_then(|v| u64::try_from(v).map(|v| ScalarValue::UInt64(Some(v))).ok())
             }
+            DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(f32::from(v)))),
+            DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(f64::from(v)))),
             _ => None,
         },
         ScalarValue::Int32(val) => match ty {
@@ -82,6 +86,11 @@ pub(crate) fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<S
             DataType::UInt64 => {
                 val.and_then(|v| u64::try_from(v).map(|v| ScalarValue::UInt64(Some(v))).ok())
             }
+            // These conversions are inherently lossy as the full range of i32 cannot
+            // be represented in f32.  However, there is no f32::TryFrom(i32) and its not
+            // clear users would want that anyways
+            DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v as f32))),
+            DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(v as f64))),
             _ => None,
         },
         ScalarValue::Int64(val) => match ty {
@@ -107,6 +116,9 @@ pub(crate) fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<S
             DataType::UInt64 => {
                 val.and_then(|v| u64::try_from(v).map(|v| ScalarValue::UInt64(Some(v))).ok())
             }
+            // See above warning about lossy float conversion
+            DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v as f32))),
+            DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(v as f64))),
             _ => None,
         },
         ScalarValue::UInt8(val) => match ty {
@@ -126,6 +138,8 @@ pub(crate) fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<S
             DataType::UInt16 => val.map(|v| ScalarValue::UInt16(Some(u16::from(v)))),
             DataType::UInt32 => val.map(|v| ScalarValue::UInt32(Some(u32::from(v)))),
             DataType::UInt64 => val.map(|v| ScalarValue::UInt64(Some(u64::from(v)))),
+            DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(f32::from(v)))),
+            DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(f64::from(v)))),
             _ => None,
         },
         ScalarValue::UInt16(val) => match ty {
@@ -147,6 +161,8 @@ pub(crate) fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<S
             DataType::UInt16 => Some(value.clone()),
             DataType::UInt32 => val.map(|v| ScalarValue::UInt32(Some(u32::from(v)))),
             DataType::UInt64 => val.map(|v| ScalarValue::UInt64(Some(u64::from(v)))),
+            DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(f32::from(v)))),
+            DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(f64::from(v)))),
             _ => None,
         },
         ScalarValue::UInt32(val) => match ty {
@@ -170,6 +186,9 @@ pub(crate) fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<S
             }
             DataType::UInt32 => Some(value.clone()),
             DataType::UInt64 => val.map(|v| ScalarValue::UInt64(Some(u64::from(v)))),
+            // See above warning about lossy float conversion
+            DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v as f32))),
+            DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(v as f64))),
             _ => None,
         },
         ScalarValue::UInt64(val) => match ty {
@@ -195,6 +214,9 @@ pub(crate) fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<S
                 val.and_then(|v| u32::try_from(v).map(|v| ScalarValue::UInt32(Some(v))).ok())
             }
             DataType::UInt64 => Some(value.clone()),
+            // See above warning about lossy float conversion
+            DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v as f32))),
+            DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(v as f64))),
             _ => None,
         },
         ScalarValue::Float32(val) => match ty {
@@ -207,14 +229,16 @@ pub(crate) fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<S
             DataType::Float64 => Some(value.clone()),
             _ => None,
         },
-        ScalarValue::Utf8(_) => match ty {
+        ScalarValue::Utf8(val) => match ty {
             DataType::Utf8 => Some(value.clone()),
+            DataType::LargeUtf8 => Some(ScalarValue::LargeUtf8(val.clone())),
             _ => None,
         },
         ScalarValue::Boolean(_) => match ty {
             DataType::Boolean => Some(value.clone()),
             _ => None,
         },
+        ScalarValue::Null => Some(value.clone()),
         _ => None,
     }
 }
