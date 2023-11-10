@@ -132,15 +132,6 @@ pub trait FloatArray<T: ArrowFloatType + ?Sized>:
     fn as_slice(&self) -> &[T::Native];
 }
 
-impl FloatArray<BFloat16Type> for BFloat16Array {
-    type FloatType = BFloat16Type;
-
-    fn as_slice(&self) -> &[<BFloat16Type as ArrowFloatType>::Native] {
-        // TODO: apache/arrow-rs#4820
-        todo!()
-    }
-}
-
 impl FloatArray<Float16Type> for Float16Array {
     type FloatType = Float16Type;
 

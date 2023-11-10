@@ -25,6 +25,8 @@ use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType};
 use half::bf16;
 
+use crate::{ArrowFloatType, FloatArray};
+
 #[derive(Debug)]
 pub struct BFloat16Type {}
 
@@ -270,6 +272,14 @@ mod from_arrow {
     }
 }
 
+impl FloatArray<BFloat16Type> for BFloat16Array {
+    type FloatType = BFloat16Type;
+
+    fn as_slice(&self) -> &[<BFloat16Type as ArrowFloatType>::Native] {
+        unsafe { std::mem::transmute(self.inner.value_data()) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +298,10 @@ mod tests {
         assert_eq!(expected_fmt, format!("{:?}", array));
 
         for (expected, value) in values.iter().zip(array.iter()) {
+            assert_eq!(Some(*expected), value);
+        }
+
+        for (expected, value) in values.as_slice().iter().zip(array2.iter()) {
             assert_eq!(Some(*expected), value);
         }
     }
