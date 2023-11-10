@@ -17,6 +17,7 @@
 use std::{any::Any, collections::HashMap, sync::Arc};
 
 use arrow_arith::numeric::sub;
+use arrow_array::types::{Float16Type, Float64Type};
 use arrow_array::{
     cast::{as_primitive_array, as_struct_array, AsArray},
     types::Float32Type,
@@ -39,13 +40,17 @@ use lance_core::{
 };
 use lance_index::{
     vector::{
+        ivf::IvfBuildParams,
         pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
-        Query, DIST_COL, RESIDUAL_COLUMN,
+        Query, DIST_COL,
     },
     Index, IndexType,
 };
-use lance_linalg::{distance::MetricType, matrix::MatrixView};
-use log::{debug, info, warn};
+use lance_linalg::{
+    distance::{Cosine, Dot, MetricType, L2},
+    matrix::MatrixView,
+};
+use log::{debug, info};
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
 use snafu::{location, Location};
@@ -184,12 +189,14 @@ impl IVFIndex {
             })?;
 
         // TODO: merge two IVF implementations.
-        let ivf = Arc::new(lance_index::vector::ivf::Ivf::new_with_pq(
-            self.ivf.centroids.as_ref().try_into()?,
+        let ivf = lance_index::vector::ivf::new_ivf_with_pq(
+            self.ivf.centroids.values(),
+            self.ivf.dimension(),
             self.metric_type,
             column,
             pq_index.pq.clone(),
-        ));
+            None,
+        )?;
         let shuffler = shuffle_dataset(data, column, ivf, pq_index.pq.num_sub_vectors()).await?;
 
         let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
@@ -466,10 +473,13 @@ impl Ivf {
         nprobes: usize,
         metric_type: MetricType,
     ) -> Result<UInt32Array> {
-        let ivf = lance_index::vector::ivf::Ivf::new(
+        use lance_index::vector::ivf::Ivf as IvfTrait;
+
+        let ivf = lance_index::vector::ivf::IvfImpl::<Float32Type>::new(
             MatrixView::try_from(self.centroids.as_ref())?,
             metric_type,
             vec![],
+            None,
         );
         ivf.find_partitions(query, nprobes)
     }
@@ -478,37 +488,6 @@ impl Ivf {
     fn add_partition(&mut self, offset: usize, len: u32) {
         self.offsets.push(offset);
         self.lengths.push(len);
-    }
-
-    /// Compute residual vector.
-    ///
-    /// A residual vector is `original vector - centroids`.
-    ///
-    /// Parameters:
-    ///  - *original*: original vector.
-    ///  - *partitions*: partition ID of each original vector.
-    #[instrument(level = "debug", skip_all)]
-    pub(super) fn compute_residual(
-        &self,
-        original: &MatrixView<Float32Type>,
-        partitions: &UInt32Array,
-    ) -> MatrixView<Float32Type> {
-        let mut residual_arr: Vec<f32> =
-            Vec::with_capacity(original.num_rows() * original.num_columns());
-        original
-            .iter()
-            .zip(partitions.values().iter())
-            .for_each(|(vector, &part_id)| {
-                let values = self.centroids.value(part_id as usize);
-                let centroid = values.as_primitive::<Float32Type>();
-                residual_arr.extend(
-                    vector
-                        .iter()
-                        .zip(centroid.values().iter())
-                        .map(|(v, cent)| *v - *cent),
-                );
-            });
-        MatrixView::new(Arc::new(residual_arr.into()), original.ndim())
     }
 }
 
@@ -591,65 +570,6 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
     Ok(field)
 }
 
-/// Parameters to build IVF partitions
-#[derive(Debug, Clone)]
-pub struct IvfBuildParams {
-    /// Number of partitions to build.
-    pub num_partitions: usize,
-
-    // ---- kmeans parameters
-    /// Max number of iterations to train kmeans.
-    pub max_iters: usize,
-
-    /// Use provided IVF centroids.
-    pub centroids: Option<Arc<FixedSizeListArray>>,
-
-    pub sample_rate: usize,
-}
-
-impl Default for IvfBuildParams {
-    fn default() -> Self {
-        Self {
-            num_partitions: 32,
-            max_iters: 50,
-            centroids: None,
-            sample_rate: 256, // See faiss
-        }
-    }
-}
-
-impl IvfBuildParams {
-    /// Create a new instance of `IvfBuildParams`.
-    pub fn new(num_partitions: usize) -> Self {
-        Self {
-            num_partitions,
-            ..Default::default()
-        }
-    }
-
-    /// Create a new instance of [`IvfBuildParams`] with centroids.
-    pub fn try_with_centroids(
-        num_partitions: usize,
-        centroids: Arc<FixedSizeListArray>,
-    ) -> Result<Self> {
-        if num_partitions != centroids.len() {
-            return Err(Error::Index {
-                message: format!(
-                    "IvfBuildParams::try_with_centroids: num_partitions {} != centroids.len() {}",
-                    num_partitions,
-                    centroids.len()
-                ),
-                location: location!(),
-            });
-        }
-        Ok(Self {
-            num_partitions,
-            centroids: Some(centroids),
-            ..Default::default()
-        })
-    }
-}
-
 /// Build IVF(PQ) index
 pub async fn build_ivf_pq_index(
     dataset: &Dataset,
@@ -681,13 +601,15 @@ pub async fn build_ivf_pq_index(
         });
     };
 
-    // Maximum to train 256 vectors per centroids, see Faiss.
+    // Maximum to train [IvfBuildParams::sample_size](default 256) vectors per centroid, see Faiss.
     let sample_size_hint = std::cmp::max(
         ivf_params.num_partitions,
         lance_index::vector::pq::num_centroids(pq_params.num_bits as u32),
-    ) * 256;
+    ) * ivf_params.sample_rate;
+
     // TODO: only sample data if training is necessary.
     let mut training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+
     #[cfg(feature = "opq")]
     let mut transforms: Vec<Box<dyn Transformer>> = vec![];
     #[cfg(not(feature = "opq"))]
@@ -745,33 +667,35 @@ pub async fn build_ivf_pq_index(
             metric_type,
         ))
     } else {
-        log::info!(
+        info!(
             "Start to train PQ code: PQ{}, bits={}",
-            pq_params.num_sub_vectors,
-            pq_params.num_bits
+            pq_params.num_sub_vectors, pq_params.num_bits
         );
         let expected_sample_size =
             lance_index::vector::pq::num_centroids(pq_params.num_bits as u32)
                 * pq_params.sample_rate;
-        let training_data = if training_data.num_rows() > expected_sample_size {
-            training_data.sample(expected_sample_size)
+        let training_data = if training_data.value_length() as usize > expected_sample_size {
+            training_data.sample(expected_sample_size)?
         } else {
             training_data
         };
 
         // TODO: consolidate IVF models to `lance_index`.
-        let ivf2 = lance_index::vector::ivf::Ivf::new(
-            ivf_model.centroids.as_ref().try_into()?,
+        let ivf2 = lance_index::vector::ivf::new_ivf(
+            ivf_model.centroids.values(),
+            ivf_model.dimension(),
             metric_type,
             vec![],
-        );
+            None,
+        )?;
         // Compute the residual vector to train Product Quantizer.
-        let part_ids = ivf2.compute_partitions(&training_data).await;
+        let part_ids = ivf2.compute_partitions(&training_data).await?;
 
         let residuals = span!(Level::INFO, "compute residual for PQ training")
-            .in_scope(|| ivf_model.compute_residual(&training_data, &part_ids));
+            .in_scope(|| ivf2.compute_residual(&training_data, Some(&part_ids)))
+            .await?;
         info!("Start train PQ: params={:#?}", pq_params);
-        pq_params.build_from_matrix(&residuals, metric_type).await?
+        pq_params.build(&residuals, metric_type).await?
     };
     info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
 
@@ -976,18 +900,18 @@ async fn write_index_file(
     Ok(())
 }
 
-/// Train IVF partitions using kmeans.
-async fn train_ivf_model(
-    data: &MatrixView<Float32Type>,
+async fn do_train_ivf_model<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
+    data: &T::ArrayType,
+    dimension: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
 ) -> Result<Ivf> {
     let rng = SmallRng::from_entropy();
     const REDOS: usize = 1;
-    let centroids = lance_index::vector::kmeans::train_kmeans::<Float32Type>(
-        data.data().as_ref(),
+    let centroids = lance_index::vector::kmeans::train_kmeans::<T>(
+        data,
         None,
-        data.num_columns(),
+        dimension,
         params.num_partitions,
         params.max_iters as u32,
         REDOS,
@@ -998,8 +922,33 @@ async fn train_ivf_model(
     .await?;
     Ok(Ivf::new(Arc::new(FixedSizeListArray::try_new_from_values(
         centroids,
-        data.num_columns() as i32,
+        dimension as i32,
     )?)))
+}
+
+/// Train IVF partitions using kmeans.
+async fn train_ivf_model(
+    data: &FixedSizeListArray,
+    metric_type: MetricType,
+    params: &IvfBuildParams,
+) -> Result<Ivf> {
+    let values = data.values();
+    let dim = data.value_length() as usize;
+    match values.data_type() {
+        DataType::Float16 => {
+            do_train_ivf_model::<Float16Type>(values.as_primitive(), dim, metric_type, params).await
+        }
+        DataType::Float32 => {
+            do_train_ivf_model::<Float32Type>(values.as_primitive(), dim, metric_type, params).await
+        }
+        DataType::Float64 => {
+            do_train_ivf_model::<Float64Type>(values.as_primitive(), dim, metric_type, params).await
+        }
+        _ => Err(Error::Index {
+            message: "Unsupported data type".to_string(),
+            location: location!(),
+        }),
+    }
 }
 
 #[cfg(test)]

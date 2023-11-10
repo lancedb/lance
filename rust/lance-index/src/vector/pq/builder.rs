@@ -146,7 +146,6 @@ impl PQBuildParams {
         metric_type: MetricType,
     ) -> Result<Arc<dyn ProductQuantizer>> {
         assert_eq!(data.null_count(), 0);
-
         let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
             message: format!(
                 "PQ builder: input is not a FixedSizeList: {}",

@@ -12,31 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use arrow_array::types::Float32Type;
+use arrow_array::Float32Array;
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
+#[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance_index::vector::ivf::Ivf;
-use lance_linalg::distance::MetricType;
-use lance_linalg::MatrixView;
+use lance_index::vector::ivf::{Ivf, IvfImpl};
+use lance_linalg::{distance::MetricType, MatrixView};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 fn bench_partitions(c: &mut Criterion) {
     const DIMENSION: usize = 1536;
     const SEED: [u8; 32] = [42; 32];
 
-    let query = generate_random_array_with_seed(DIMENSION, SEED);
+    let query: Float32Array = generate_random_array_with_seed(DIMENSION, SEED);
 
     for num_centroids in &[10240, 65536] {
-        let centroids = Arc::new(generate_random_array_with_seed(
+        let centroids = Arc::new(generate_random_array_with_seed::<Float32Type>(
             num_centroids * DIMENSION,
             SEED,
         ));
-        let matrix = MatrixView::new(centroids.clone(), DIMENSION);
+        let matrix = MatrixView::<Float32Type>::new(centroids.clone(), DIMENSION);
 
         for k in &[1, 10, 50] {
-            let ivf = Ivf::new(matrix.clone(), MetricType::L2, vec![]);
+            let ivf = IvfImpl::new(matrix.clone(), MetricType::L2, vec![], None);
 
             c.bench_function(format!("IVF{},k={},L2", num_centroids, k).as_str(), |b| {
                 b.iter(|| {
@@ -44,7 +46,7 @@ fn bench_partitions(c: &mut Criterion) {
                 })
             });
 
-            let ivf = Ivf::new(matrix.clone(), MetricType::Cosine, vec![]);
+            let ivf = IvfImpl::new(matrix.clone(), MetricType::Cosine, vec![], None);
             c.bench_function(
                 format!("IVF{},k={},Cosine", num_centroids, k).as_str(),
                 |b| {

@@ -17,7 +17,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{types::Float32Type, RecordBatch};
+use arrow_array::{types::Float32Type, FixedSizeListArray, RecordBatch};
 use async_trait::async_trait;
 
 use lance_core::{
@@ -92,7 +92,7 @@ pub trait Transformer: std::fmt::Debug + Sync + Send {
     /// Apply transform on the matrix `data`.
     ///
     /// Returns a new Matrix instead.
-    async fn transform(&self, data: &MatrixView<Float32Type>) -> Result<MatrixView<Float32Type>>;
+    async fn transform(&self, data: &FixedSizeListArray) -> Result<FixedSizeListArray>;
 
     async fn save(&self, writer: &mut ObjectWriter) -> Result<Transform>;
 }
