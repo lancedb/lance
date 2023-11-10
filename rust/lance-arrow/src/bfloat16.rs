@@ -16,7 +16,6 @@
 
 use std::fmt::Formatter;
 
-use crate::{ArrowFloatType, FloatArray};
 use arrow_array::{
     builder::BooleanBufferBuilder, iterator::ArrayIter, Array, ArrayAccessor, ArrayRef,
     FixedSizeBinaryArray,
@@ -25,6 +24,8 @@ use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType};
 use half::bf16;
+
+use crate::{ArrowFloatType, FloatArray};
 
 #[derive(Debug)]
 pub struct BFloat16Type {}
