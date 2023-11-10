@@ -30,7 +30,7 @@ use num_traits::Float;
 
 use crate::simd::{
     f32::{f32x16, f32x8},
-    FloatSimd, SIMD,
+    SIMD,
 };
 
 /// Calculate the L2 distance between two vectors.
@@ -136,37 +136,7 @@ impl L2 for Float16Type {
 impl L2 for Float32Type {
     #[inline]
     fn l2(x: &[f32], y: &[f32]) -> f32 {
-        let len = x.len();
-        if len % 16 == 0 {
-            // Likely
-            let dim = x.len();
-            let mut sum = f32x16::zeros();
-
-            for i in (0..dim).step_by(16) {
-                unsafe {
-                    let mut x = f32x16::load_unaligned(x.as_ptr().add(i));
-
-                    let y = f32x16::load_unaligned(y.as_ptr().add(i));
-                    x -= y;
-                    sum.multiply_add(x, x);
-                }
-            }
-            sum.reduce_sum()
-        } else if len % 8 == 0 {
-            let mut sum = f32x8::zeros();
-            for i in (0..len).step_by(8) {
-                unsafe {
-                    let mut x = f32x8::load_unaligned(x.as_ptr().add(i));
-                    let y = f32x8::load_unaligned(y.as_ptr().add(i));
-                    x -= y;
-                    sum.multiply_add(x, x);
-                }
-            }
-            sum.reduce_sum()
-        } else {
-            // Fallback to scalar
-            l2_scalar::<f32, 16>(x, y)
-        }
+        l2_scalar::<f32, 32>(x, y)
     }
 
     fn l2_batch<'a>(

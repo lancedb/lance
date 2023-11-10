@@ -48,19 +48,28 @@ _Float16 l2_f16(const _Float16* x, const _Float16* y, uint32_t dimension) {
 // #if defined(__AVX512F__) && defined(__AVX512BF16__)
 // __m512h x2 = _mm512_set_ph(0.0);
 // __m512h y2 = _mm512_set_ph(0.0);
-__m512h xy = _mm512_set1_ph(0.0);
+// __m512h xy = _mm512_set1_ph(0.0);
 
-  for (uint32_t i = 0; i < dimension / 32 * 32; i += 32) {
-    // _Float16 s = x[i] - y[i];
-    // xy += s * s;
-    __m512h xi = _mm512_loadu_ph(x + i);
-    __m512h yi = _mm512_loadu_ph(y + i);
-    __m512h s = _mm512_sub_ph(xi, yi);
-    __m512h s2 = _mm512_mul_ph(s, s);
-    xy = _mm512_add_ph(xy, s2);
-    // __m512i xy_vec = _mm512_dpbf16_ps(x_vec, y_vec, 0xFF);
+//   for (uint32_t i = 0; i < dimension / 32 * 32; i += 32) {
+//     // _Float16 s = x[i] - y[i];
+//     // xy += s * s;
+//     __m512h xi = _mm512_loadu_ph(x + i);
+//     __m512h yi = _mm512_loadu_ph(y + i);
+//     __m512h s = _mm512_sub_ph(xi, yi);
+//     __m512h s2 = _mm512_mul_ph(s, s);
+//     xy = _mm512_add_ph(xy, s2);
+//     // __m512i xy_vec = _mm512_dpbf16_ps(x_vec, y_vec, 0xFF);
 
+//   }
+
+//   return _mm512_reduce_add_ph(xy);
+
+_Float16 sum = 0.0;
+
+#pragma clang loop unroll(enable) interleave(enable) vectorize_width(32)
+  for (uint32_t i = 0; i < dimension; i++) {
+    _Float16 s = x[i] - y[i];
+    sum += s * s;
   }
-
-  return _mm512_reduce_add_ph(xy);
+  return sum;
 }
