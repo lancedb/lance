@@ -24,7 +24,7 @@ use num_traits::{Float, FromPrimitive};
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance_arrow::FloatToArrayType;
-use lance_linalg::distance::{l2_distance_batch, l2_scalar, L2};
+use lance_linalg::distance::{l2_distance_batch, l2::l2, L2};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 const TOTAL: usize = 1024 * 1024; // 1M vectors
@@ -69,7 +69,7 @@ where
             b.iter(|| unsafe {
                 PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
                     let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                    Some(black_box(l2_scalar::<T::Native, 16>(x, y)))
+                    Some(black_box(l2(x, y)))
                 }));
             });
         },

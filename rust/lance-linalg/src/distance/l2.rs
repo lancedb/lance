@@ -91,6 +91,8 @@ pub fn l2_scalar<T: Float + Sum + AddAssign, const LANES: usize>(from: &[T], to:
     s + sums.iter().copied().sum()
 }
 
+
+
 impl L2 for BFloat16Type {
     #[inline]
     fn l2(x: &[bf16], y: &[bf16]) -> bf16 {
@@ -99,11 +101,35 @@ impl L2 for BFloat16Type {
     }
 }
 
+#[cfg(any(
+    all(target_os = "macos", target_feature = "neon"),
+    all(target_os = "linux", feature = "avx512fp16")
+))]
+mod kernel {
+    use super::*;
+
+    extern "C" {
+        pub fn l2_f16(ptr1: *const f16, ptr2: *const f16, len: u32) -> f16;
+    }
+}
+
 impl L2 for Float16Type {
     #[inline]
     fn l2(x: &[f16], y: &[f16]) -> f16 {
-        // TODO: add SIMD support
-        l2_scalar::<f16, 16>(x, y)
+        #[cfg(any(
+            all(target_os = "macos", target_feature = "neon"),
+            all(target_os = "linux", feature = "avx512fp16")
+        ))]
+        unsafe {
+            self::kernel::l2_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
+        }
+        #[cfg(not(any(
+            all(target_os = "macos", target_feature = "neon"),
+            all(target_os = "linux", feature = "avx512fp16")
+        )))]
+        {
+            l2_scalar::<f16, 16>(x, y)
+        }
     }
 }
 
