@@ -16,6 +16,7 @@
 
 use std::fmt::Formatter;
 
+use crate::{ArrowFloatType, FloatArray};
 use arrow_array::{
     builder::BooleanBufferBuilder, iterator::ArrayIter, Array, ArrayAccessor, ArrayRef,
     FixedSizeBinaryArray,
@@ -270,6 +271,14 @@ mod from_arrow {
     }
 }
 
+impl FloatArray<BFloat16Type> for BFloat16Array {
+    type FloatType = BFloat16Type;
+
+    fn as_slice(&self) -> &[<BFloat16Type as ArrowFloatType>::Native] {
+        unsafe { std::mem::transmute(self.inner.value_data()) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +297,10 @@ mod tests {
         assert_eq!(expected_fmt, format!("{:?}", array));
 
         for (expected, value) in values.iter().zip(array.iter()) {
+            assert_eq!(Some(*expected), value);
+        }
+
+        for (expected, value) in values.as_slice().iter().zip(array2.iter()) {
             assert_eq!(Some(*expected), value);
         }
     }
