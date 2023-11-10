@@ -12,18 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod knn;
-mod planner;
-mod projection;
-mod scalar_index;
-mod scan;
-mod take;
-#[cfg(test)]
-pub mod testing;
-
-pub use knn::*;
-pub use planner::{FilterPlan, Planner};
-pub use projection::ProjectionExec;
-pub use scalar_index::{MaterializeIndexExec, ScalarIndexExec};
-pub use scan::LanceScanExec;
-pub use take::TakeExec;
+pub mod datafusion;

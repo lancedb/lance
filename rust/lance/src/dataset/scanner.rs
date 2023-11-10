@@ -18,6 +18,7 @@ use std::task::{Context, Poll};
 
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
+use async_recursion::async_recursion;
 use datafusion::execution::{
     context::SessionState,
     runtime_env::{RuntimeConfig, RuntimeEnv},
@@ -34,15 +35,17 @@ use datafusion::physical_plan::{
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
     union::UnionExec,
-    ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
+    ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use futures::stream::{Stream, StreamExt};
 use lance_core::ROW_ID_FIELD;
+use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::vector::{Query, DIST_COL};
 use lance_linalg::distance::MetricType;
 use log::debug;
+use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
@@ -50,6 +53,8 @@ use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::dataset::index::unindexed_fragments;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index};
+use crate::index::DatasetIndexInternalExt;
+use crate::io::exec::{FilterPlan, MaterializeIndexExec, PreFilterSource, ScalarIndexExec};
 use crate::io::{
     exec::{KNNFlatExec, KNNIndexExec, LanceScanExec, Planner, ProjectionExec, TakeExec},
     RecordBatchStream,
@@ -546,6 +551,30 @@ impl Scanner {
         }
     }
 
+    /// Given a base schema and a list of desired fields figure out which fields, if any, still need loaded
+    fn calc_new_fields<S: AsRef<str>>(
+        &self,
+        base_schema: &Schema,
+        columns: &[S],
+    ) -> Result<Option<Schema>> {
+        let new_schema = self.dataset.schema().project(columns)?;
+        let new_schema = new_schema.exclude(base_schema)?;
+        if new_schema.fields.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(new_schema))
+        }
+    }
+
+    fn need_to_handle_delete_files(&self) -> bool {
+        let fragments = if let Some(fragments) = self.fragments.as_ref() {
+            fragments
+        } else {
+            self.dataset.fragments()
+        };
+        fragments.iter().any(|frag| frag.deletion_file.is_some())
+    }
+
     /// Create [`ExecutionPlan`] for Scan.
     ///
     /// An ExecutionPlan is a graph of operators that can be executed.
@@ -592,53 +621,112 @@ impl Scanner {
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
     async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        // TODO: Currently, if any of the fragments have a deletion file, we
+        // cannot use scalar indices.  This is fixable, but deferring for a
+        // future PR.
+        let use_scalar_index = !self.need_to_handle_delete_files();
+
         // NOTE: we only support node that have one partition. So any nodes that
         // produce multiple need to be repartitioned to 1.
-        let mut filter_expr = if let Some(filter) = self.filter.as_ref() {
+        let mut filter_plan = if let Some(filter) = self.filter.as_ref() {
             let planner = Planner::new(Arc::new(self.dataset.schema().into()));
-            let logical_expr = planner.parse_filter(filter)?;
-            Some(planner.create_physical_expr(&logical_expr)?)
-        } else {
-            None
-        };
+            let index_info = self.dataset.scalar_index_info().await?;
+            let filter_plan = planner.create_filter_plan(filter, &index_info, use_scalar_index)?;
 
-        // Stage 1: source
-        let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() {
-            if self.prefilter {
-                let prefilter = filter_expr;
-                filter_expr = None;
-                self.knn(prefilter).await?
-            } else {
-                self.knn(None).await?
-            }
-        } else if let Some(expr) = filter_expr.as_ref() {
-            let columns_in_filter = column_names_in_expr(expr.as_ref());
-            let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
-            self.scan(true, false, filter_schema)
-        } else {
-            // Scan without filter or limits
-            self.scan(self.with_row_id, false, self.projections.clone().into())
-        };
-
-        // Stage 2: filter
-        if let Some(predicates) = filter_expr.as_ref() {
-            let mut columns_in_filter = column_names_in_expr(predicates.as_ref());
-            // If we are going to sort then grab the ordering column at the same time we grab
-            // the columns we need for filtering
-            if let Some(ordering) = &self.ordering {
-                for column in ordering {
-                    if !columns_in_filter.contains(&column.column_name) {
-                        columns_in_filter.push(column.column_name.clone())
+            // TODO: Remove this check once we handle indexed scans with new data
+            // This check is testing to see if we have an indexed query and new data
+            // and, if we do, falling back to a filter plan that does not use scalar indices
+            if let Some(index_query) = filter_plan.index_query.as_ref() {
+                let covered_frags = self.fragments_covered_by_index_query(index_query).await?;
+                let fragments = if let Some(fragments) = self.fragments.as_ref() {
+                    fragments
+                } else {
+                    self.dataset.fragments()
+                };
+                let mut has_new_data = false;
+                let mut has_missing_row_count = false;
+                for frag in fragments {
+                    if !covered_frags.contains(frag.id as u32) {
+                        has_new_data = true;
+                        break;
+                    }
+                    if frag.physical_rows.is_none() {
+                        has_missing_row_count = true;
+                        break;
                     }
                 }
+                if has_new_data || has_missing_row_count {
+                    // We need row counts to use scalar indices.  If we don't have them then
+                    // fallback to a non-indexed filter
+                    planner.create_filter_plan(filter, &index_info, false)?
+                } else {
+                    filter_plan
+                }
+            } else {
+                filter_plan
             }
-            let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
-            let remaining_schema = filter_schema.exclude(plan.schema().as_ref())?;
-            if !remaining_schema.fields.is_empty() {
-                // Not all columns for filter are ready, so we need to take them first
-                plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
+        } else {
+            FilterPlan::default()
+        };
+
+        // Stage 1: source (either an (K|A)NN search or a (full|indexed) scan)
+        let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() {
+            // The source is an nearest neighbor search
+            if self.prefilter {
+                // If we are prefiltering then the knn node will take care of the filter
+                let source = self.knn(&filter_plan).await?;
+                filter_plan = FilterPlan::default();
+                source
+            } else {
+                self.knn(&FilterPlan::default()).await?
             }
-            plan = Arc::new(FilterExec::try_new(predicates.clone(), plan)?);
+        } else {
+            // The source is a scan
+            let (with_row_id, schema) = if filter_plan.has_refine() {
+                // If there is a filter then just load the filter
+                // columns (we will `take` the remaining columns afterwards)
+                let columns = filter_plan.refine_columns();
+                let filter_schema = Arc::new(self.dataset.schema().project(&columns)?);
+                (true, filter_schema)
+            } else {
+                // If there is no filter then load the user's desired columns
+                (self.with_row_id, self.projections.clone().into())
+            };
+            if let Some(index_query) = &filter_plan.index_query {
+                // The source is an indexed scan
+                self.scalar_indexed_scan(&schema, index_query).await?
+            } else {
+                // The source is a full scan of the table
+                self.scan(with_row_id, false, schema)
+            }
+        };
+
+        // Stage 1.5 load columns needed for stages 2 & 3
+        let mut additional_schema = None;
+        if filter_plan.has_refine() {
+            additional_schema = self.calc_new_fields(
+                &Schema::try_from(plan.schema().as_ref())?,
+                &filter_plan.refine_columns(),
+            )?;
+        }
+        if let Some(ordering) = &self.ordering {
+            additional_schema = self.calc_new_fields(
+                &additional_schema
+                    .map(Ok::<Schema, Error>)
+                    .unwrap_or_else(|| Schema::try_from(plan.schema().as_ref()))?,
+                &ordering
+                    .iter()
+                    .map(|col| &col.column_name)
+                    .collect::<Vec<_>>(),
+            )?;
+        }
+        if let Some(additional_schema) = additional_schema {
+            plan = self.take(plan, &additional_schema, self.batch_readahead)?;
+        }
+
+        // Stage 2: filter
+        if let Some(refine_expr) = filter_plan.refine_expr {
+            plan = Arc::new(FilterExec::try_new(refine_expr.clone(), plan)?);
         }
 
         // Stage 3: sort
@@ -689,11 +777,9 @@ impl Scanner {
         Ok(plan)
     }
 
-    // KNN search execution node with optional prefilter
-    async fn knn(
-        &self,
-        prefilter: Option<Arc<dyn PhysicalExpr>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    // ANN/KNN search execution node with optional prefilter
+    async fn knn(&self, filter_plan: &FilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
+        dbg!("knn");
         let Some(q) = self.nearest.as_ref() else {
             return Err(Error::IO {
                 message: "No nearest query".to_string(),
@@ -744,11 +830,7 @@ impl Scanner {
                 }
             }
 
-            let ann_node = if let Some(prefilter) = prefilter {
-                self.prefilter_ann(q, index, prefilter)?
-            } else {
-                self.ann(q, index)?
-            }; // _distance, _rowid
+            let ann_node = self.ann(q, index, filter_plan).await?; // _distance, _rowid
 
             let with_vector = self.dataset.schema().project(&[&q.column])?;
             let knn_node_with_vector = self.take(ann_node, &with_vector, self.batch_readahead)?;
@@ -762,15 +844,20 @@ impl Scanner {
 
             Ok(knn_node)
         } else {
-            let mut columns = vec![q.column.clone()];
-            if let Some(prefilter) = prefilter.as_ref() {
-                columns.extend(column_names_in_expr(prefilter.as_ref()));
-            }
             // No index found. use flat search.
+            let mut columns = vec![q.column.clone()];
+            if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+                columns.extend(column_names_in_expr(refine_expr.as_ref()));
+            }
             let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
-            let mut plan = self.scan(true, true, vector_scan_projection);
-            if let Some(prefilter) = prefilter {
-                plan = Arc::new(FilterExec::try_new(prefilter.clone(), plan)?);
+            let mut plan = if let Some(index_query) = &filter_plan.index_query {
+                self.scalar_indexed_scan(&vector_scan_projection, index_query)
+                    .await?
+            } else {
+                self.scan(true, true, vector_scan_projection)
+            };
+            if let Some(refine_expr) = &filter_plan.refine_expr {
+                plan = Arc::new(FilterExec::try_new(refine_expr.clone(), plan)?);
             }
             Ok(self.flat_knn(plan, q)?)
         }
@@ -823,6 +910,85 @@ impl Scanner {
         }
 
         Ok(knn_node)
+    }
+
+    #[async_recursion]
+    async fn fragments_covered_by_index_query(
+        &self,
+        index_expr: &ScalarIndexExpr,
+    ) -> Result<RoaringBitmap> {
+        match index_expr {
+            ScalarIndexExpr::And(lhs, rhs) => {
+                Ok(self.fragments_covered_by_index_query(lhs).await?
+                    & self.fragments_covered_by_index_query(rhs).await?)
+            }
+            ScalarIndexExpr::Or(lhs, rhs) => Ok(self.fragments_covered_by_index_query(lhs).await?
+                & self.fragments_covered_by_index_query(rhs).await?),
+            ScalarIndexExpr::Not(expr) => self.fragments_covered_by_index_query(expr).await,
+            ScalarIndexExpr::Query(column, _) => {
+                let idx = self
+                    .dataset
+                    .load_scalar_index_for_column(column)
+                    .await?
+                    .expect("Index not found even though it must have been found earlier");
+                Ok(idx
+                    .fragment_bitmap
+                    .expect("scalar indices should always have a fragment bitmap"))
+            }
+        }
+    }
+
+    // First perform a lookup in a scalar index for ids and then perform a take on the
+    // target fragments with those ids
+    async fn scalar_indexed_scan(
+        &self,
+        projection: &Schema,
+        index_expr: &ScalarIndexExpr,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // One or more scalar indices cover this data and there is a filter which is
+        // compatible with the indices.  Use that filter to perform a take instead of
+        // a full scan.
+        let fragments = if let Some(fragment) = self.fragments.as_ref() {
+            fragment.clone()
+        } else {
+            (**self.dataset.fragments()).clone()
+        };
+
+        // Figure out which fragments are covered by ALL of the indices we are using
+        let covered_frags = self.fragments_covered_by_index_query(index_expr).await?;
+        let mut relevant_frags = Vec::with_capacity(fragments.len());
+        let mut missing_frags = Vec::with_capacity(fragments.len());
+        for fragment in fragments {
+            if covered_frags.contains(fragment.id as u32) {
+                relevant_frags.push(fragment);
+            } else {
+                missing_frags.push(fragment);
+            }
+        }
+
+        if !missing_frags.is_empty() {
+            // TODO: If there is new data then we need this:
+            //
+            // MaterializeIndexExec(old_frags) -> Take -> Union
+            // Scan(new_frags) -> Filter -> Project    -|
+            //
+            // The project is to drop any columns we had to include
+            // in the full scan merely for the sake of fulfilling the
+            // filter (there may not be any and project can be skipped).
+            //
+            // This is TODO because we need to go from:
+            //   ScalarIndexExpr -> Expr -> PhysicalExpr
+            // which is doable but complex enough to defer to a future PR.
+            panic!("Indexed scans including new data not yet supported (and we should not be able to reach this point)");
+        }
+
+        let plan = Arc::new(MaterializeIndexExec::new(
+            self.dataset.clone(),
+            index_expr.clone(),
+            Arc::new(relevant_frags),
+        ));
+
+        self.take(plan, projection, self.batch_readahead)
     }
 
     /// Create an Execution plan with a scan node
@@ -881,31 +1047,61 @@ impl Scanner {
         Ok(Arc::new(KNNFlatExec::try_new(input, q.clone())?))
     }
 
-    fn prefilter_ann(
+    /// Create an Execution plan to do indexed ANN search
+    async fn ann(
         &self,
         q: &Query,
         index: &Index,
-        prefilter: Arc<dyn PhysicalExpr>,
+        filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let columns_in_filter = column_names_in_expr(prefilter.as_ref());
-        let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
-        let filter_input = self.scan(true, true, filter_schema);
-        let filtered = Arc::new(FilterExec::try_new(prefilter, filter_input)?);
-        Ok(Arc::new(KNNIndexExec::try_new(
-            self.dataset.clone(),
-            index.clone(),
-            q,
-            Some(filtered),
-        )?))
-    }
+        let prefilter_source = match (
+            &filter_plan.index_query,
+            &filter_plan.refine_expr,
+            self.prefilter,
+        ) {
+            (Some(index_query), Some(refine_expr), _) => {
+                // The filter is only partially satisfied by the index.  We need
+                // to do an indexed scan and then refine the results to determine
+                // the row ids.
+                let columns_in_filter = column_names_in_expr(refine_expr.as_ref());
+                let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
+                let filter_input = self
+                    .scalar_indexed_scan(&filter_schema, index_query)
+                    .await?;
+                let filtered_row_ids =
+                    Arc::new(FilterExec::try_new(refine_expr.clone(), filter_input)?);
+                PreFilterSource::FilteredRowIds(filtered_row_ids)
+            } // Should be index_scan -> filter
+            (Some(index_query), None, true) => {
+                // The filter is completely satisfied by the index.  We
+                // only need to search the index to determine the valid row
+                // ids.
+                let index_query = Arc::new(ScalarIndexExec::new(
+                    self.dataset.clone(),
+                    index_query.clone(),
+                ));
+                PreFilterSource::ScalarIndexQuery(index_query)
+            }
+            (None, Some(refine_expr), true) => {
+                // No indices match the filter.  We need to do a full scan
+                // of the filter columns to determine the valid row ids.
+                let columns_in_filter = column_names_in_expr(refine_expr.as_ref());
+                let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
+                let filter_input = self.scan(true, true, filter_schema);
+                let filtered_row_ids =
+                    Arc::new(FilterExec::try_new(refine_expr.clone(), filter_input)?);
+                PreFilterSource::FilteredRowIds(filtered_row_ids)
+            }
+            // No prefilter
+            (None, None, true) => PreFilterSource::None,
+            (_, _, false) => PreFilterSource::None,
+        };
 
-    /// Create an Execution plan to do indexed ANN search
-    fn ann(&self, q: &Query, index: &Index) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(KNNIndexExec::try_new(
             self.dataset.clone(),
             index.clone(),
             q,
-            None,
+            prefilter_source,
         )?))
     }
 
@@ -1001,24 +1197,25 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray,
+        ArrayRef, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray, PrimitiveArray,
         RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
-    use arrow_schema::DataType;
+    use arrow_schema::{ArrowError, DataType};
     use arrow_select::take;
     use futures::TryStreamExt;
     use lance_core::ROW_ID;
-    use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_index::vector::DIST_COL;
     use lance_index::IndexType;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
     use super::*;
     use crate::arrow::*;
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
+    use crate::index::scalar::ScalarIndexParams;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
 
     #[tokio::test]
@@ -2521,5 +2718,416 @@ mod test {
                 .await
                 .unwrap()
         );
+    }
+
+    struct ScalarIndexTestFixture {
+        _test_dir: TempDir,
+        dataset: Dataset,
+        sample_query: Arc<dyn Array>,
+        delete_query: Arc<dyn Array>,
+        original_version: u64,
+        append_version: u64,
+        delete_version: u64,
+        append_then_delete_version: u64,
+    }
+
+    #[derive(Debug)]
+    struct ScalarTestParams {
+        use_index: bool,
+        use_projection: bool,
+        use_deleted_data: bool,
+        use_new_data: bool,
+        with_row_id: bool,
+    }
+
+    impl ScalarIndexTestFixture {
+        async fn new() -> Self {
+            let test_dir = tempdir().unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+
+            // Write 1000 rows.  Train indices.  Then write 1000 new rows with the same vector data.
+            // Then delete a row from the trained data.
+            //
+            // The first row where indexed == 50 is our sample query.
+            // The first row where indexed == 75 is our deleted row (and delete query)
+            let data = gen()
+                .col(
+                    Some("vector".to_string()),
+                    array::rand_vec::<Float32Type>(Dimension::from(32)),
+                )
+                .col(Some("indexed".to_string()), array::step::<Int32Type>())
+                .col(Some("not_indexed".to_string()), array::step::<Int32Type>())
+                .into_batch_rows(RowCount::from(1000))
+                .unwrap();
+
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(data.clone())], data.schema().clone()),
+                test_uri,
+                None,
+            )
+            .await
+            .unwrap();
+
+            dataset
+                .create_index(
+                    &["vector"],
+                    IndexType::Vector,
+                    None,
+                    &VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            dataset
+                .create_index(
+                    &["indexed"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            let original_version = dataset.version().version;
+            let sample_query = data["vector"].as_fixed_size_list().value(50);
+            let delete_query = data["vector"].as_fixed_size_list().value(75);
+
+            // Re-use the vector column in the new batch but add 1000 to the indexed/not_indexed columns so
+            // they are distinct.  This makes our checks easier.
+            let new_indexed =
+                arrow_arith::numeric::add(&data["indexed"], &Int32Array::new_scalar(1000)).unwrap();
+            let new_not_indexed =
+                arrow_arith::numeric::add(&data["indexed"], &Int32Array::new_scalar(1000)).unwrap();
+            let append_data = RecordBatch::try_new(
+                data.schema().clone(),
+                vec![data["vector"].clone(), new_indexed, new_not_indexed],
+            )
+            .unwrap();
+
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(append_data)], data.schema()),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let append_version = dataset.version().version;
+
+            dataset.delete("not_indexed = 75").await.unwrap();
+
+            let append_then_delete_version = dataset.version().version;
+
+            let mut dataset = dataset.checkout_version(original_version).await.unwrap();
+            dataset.restore(None).await.unwrap();
+
+            dataset.delete("not_indexed = 75").await.unwrap();
+
+            let delete_version = dataset.version().version;
+
+            Self {
+                _test_dir: test_dir,
+                dataset,
+                sample_query,
+                delete_query,
+                original_version,
+                append_version,
+                delete_version,
+                append_then_delete_version,
+            }
+        }
+
+        fn sample_query(&self) -> &PrimitiveArray<Float32Type> {
+            self.sample_query.as_primitive::<Float32Type>()
+        }
+
+        fn delete_query(&self) -> &PrimitiveArray<Float32Type> {
+            self.delete_query.as_primitive::<Float32Type>()
+        }
+
+        async fn get_dataset(&self, params: &ScalarTestParams) -> Dataset {
+            let version = match (params.use_new_data, params.use_deleted_data) {
+                (false, false) => self.original_version,
+                (false, true) => self.delete_version,
+                (true, false) => self.append_version,
+                (true, true) => self.append_then_delete_version,
+            };
+            self.dataset.checkout_version(version).await.unwrap()
+        }
+
+        async fn run_query(
+            &self,
+            query: &str,
+            vector: Option<&PrimitiveArray<Float32Type>>,
+            params: &ScalarTestParams,
+        ) -> (String, RecordBatch) {
+            let dataset = self.get_dataset(params).await;
+            let mut scan = dataset.scan();
+            if let Some(vector) = vector {
+                scan.nearest("vector", vector, 10).unwrap();
+            }
+            if params.use_projection {
+                scan.project(&["indexed"]).unwrap();
+            }
+            if params.with_row_id {
+                scan.with_row_id();
+            }
+            scan.scan_in_order(true);
+            scan.use_index(params.use_index);
+            scan.filter(query).unwrap();
+            scan.prefilter(true);
+
+            let plan = scan.explain_plan(true).await.unwrap();
+            let output_schema = scan.schema().unwrap();
+            let batches = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+
+            let batch = if batches.is_empty() {
+                RecordBatch::new_empty(output_schema)
+            } else {
+                concat_batches(&batches[0].schema(), batches.iter())
+                    .map_err(ArrowError::from)
+                    .unwrap()
+            };
+
+            if params.use_projection {
+                // 1 projected column
+                let mut expected_columns = 1;
+                if vector.is_some() {
+                    // vector column always included (TODO: should it be? #1565)
+                    // distance column included
+                    expected_columns += 2;
+                }
+                if params.with_row_id {
+                    expected_columns += 1;
+                }
+                assert_eq!(batch.num_columns(), expected_columns);
+            } else {
+                let mut expected_columns = 3;
+                if vector.is_some() {
+                    // distance column
+                    expected_columns += 1;
+                }
+                if params.with_row_id {
+                    expected_columns += 1;
+                }
+                // vector, indexed, not_indexed, _distance
+                assert_eq!(batch.num_columns(), expected_columns);
+            }
+
+            (plan, batch)
+        }
+
+        fn assert_none<F: Fn(i32) -> bool>(
+            &self,
+            batch: &RecordBatch,
+            predicate: F,
+            message: &str,
+        ) {
+            let indexed = batch["indexed"].as_primitive::<Int32Type>();
+            if indexed.iter().map(|val| val.unwrap()).any(predicate) {
+                panic!("{}", message);
+            }
+        }
+
+        fn assert_one<F: Fn(i32) -> bool>(&self, batch: &RecordBatch, predicate: F, message: &str) {
+            let indexed = batch["indexed"].as_primitive::<Int32Type>();
+            if !indexed.iter().map(|val| val.unwrap()).any(predicate) {
+                panic!("{}", message);
+            }
+        }
+
+        async fn check_vector_scalar_indexed_and_refine(&self, params: &ScalarTestParams) {
+            let (query_plan, batch) = self
+                .run_query(
+                    "indexed != 50 AND ((not_indexed < 100) OR (not_indexed >= 1000 AND not_indexed < 1100))",
+                    Some(self.sample_query()),
+                    params,
+                )
+                .await;
+            // TODO: Remove below check once we support new data in scalar index scan
+            if !params.use_new_data && !params.use_deleted_data {
+                // Materialization is always required if there is a refine
+                assert!(query_plan.contains("MaterializeIndex"));
+            }
+            // The result should not include the sample query
+            self.assert_none(
+                &batch,
+                |val| val == 50,
+                "The query contained 50 even though it was filtered",
+            );
+            // TODO: Remove this check once #1561 is addressed
+            if !params.use_index || !params.use_new_data {
+                // Refine should have been applied
+                self.assert_none(
+                    &batch,
+                    |val| (100..1000).contains(&val) || (val >= 1100),
+                    "The non-indexed refine filter was not applied",
+                );
+            }
+            // If there is new data then the dupe of row 50 should be in the results
+            if params.use_new_data {
+                self.assert_one(
+                    &batch,
+                    |val| val == 1050,
+                    "The query did not contain 1050 from the new data",
+                );
+            }
+        }
+
+        async fn check_vector_scalar_indexed_only(&self, params: &ScalarTestParams) {
+            let (query_plan, batch) = self
+                .run_query("indexed != 50", Some(self.sample_query()), params)
+                .await;
+            // TODO: Remove below check once we support new data in scalar index scan
+            if !params.use_new_data && !params.use_deleted_data {
+                if params.use_index {
+                    // An ANN search whose prefilter is fully satisfied by the index should be
+                    // able to use a ScalarIndexQuery
+                    assert!(query_plan.contains("ScalarIndexQuery"));
+                } else {
+                    assert!(query_plan.contains("MaterializeIndex"));
+                }
+            }
+            // The result should not include the sample query
+            self.assert_none(
+                &batch,
+                |val| val == 50,
+                "The query contained 50 even though it was filtered",
+            );
+            // If there is new data then the dupe of row 50 should be in the results
+            if params.use_new_data {
+                self.assert_one(
+                    &batch,
+                    |val| val == 1050,
+                    "The query did not contain 1050 from the new data",
+                );
+                // TODO: Remove this check once #1561 is addressed
+                if !params.use_index || !params.use_new_data {
+                    // Let's also make sure our filter can target something in the new data only
+                    let (_, batch) = self
+                        .run_query("indexed == 1050", Some(self.sample_query()), params)
+                        .await;
+                    assert_eq!(batch.num_rows(), 1);
+                }
+            }
+            if params.use_deleted_data {
+                let (_, batch) = self
+                    .run_query("indexed == 75", Some(self.delete_query()), params)
+                    .await;
+                // TODO: Remove this check once #1561 is addressed
+                if !params.use_index || !params.use_new_data {
+                    assert_eq!(batch.num_rows(), 0);
+                }
+            }
+        }
+
+        async fn check_vector_queries(&self, params: &ScalarTestParams) {
+            self.check_vector_scalar_indexed_only(params).await;
+            self.check_vector_scalar_indexed_and_refine(params).await;
+        }
+
+        async fn check_simple_indexed_only(&self, params: &ScalarTestParams) {
+            let (query_plan, batch) = self.run_query("indexed != 50", None, params).await;
+            // TODO: Remove below check once we support new data in scalar index scan
+            if !params.use_new_data && !params.use_deleted_data {
+                // Materialization is always required for non-vector search
+                assert!(query_plan.contains("MaterializeIndex"));
+            }
+            // The result should not include the targeted row
+            self.assert_none(
+                &batch,
+                |val| val == 50,
+                "The query contained 50 even though it was filtered",
+            );
+            let mut expected_num_rows = if params.use_new_data { 1999 } else { 999 };
+            if params.use_deleted_data {
+                expected_num_rows -= 1;
+            }
+            assert_eq!(batch.num_rows(), expected_num_rows);
+
+            // Let's also make sure our filter can target something in the new data only
+            if params.use_new_data {
+                let (_, batch) = self.run_query("indexed == 1050", None, params).await;
+                assert_eq!(batch.num_rows(), 1);
+            }
+
+            // Also make sure we don't return deleted data
+            if params.use_deleted_data {
+                let (_, batch) = self.run_query("indexed == 75", None, params).await;
+                assert_eq!(batch.num_rows(), 0);
+            }
+        }
+
+        async fn check_simple_indexed_and_refine(&self, params: &ScalarTestParams) {
+            let (query_plan, batch) = self.run_query(
+                "indexed != 50 AND ((not_indexed < 100) OR (not_indexed >= 1000 AND not_indexed < 1100))",
+                None,
+                params
+            ).await;
+            // TODO: Remove below check once we support new data in scalar index scan
+            if !params.use_new_data && !params.use_deleted_data {
+                // Materialization is always required for non-vector search
+                assert!(query_plan.contains("MaterializeIndex"));
+            }
+            // The result should not include the targeted row
+            self.assert_none(
+                &batch,
+                |val| val == 50,
+                "The query contained 50 even though it was filtered",
+            );
+            // The refine should be applied
+            self.assert_none(
+                &batch,
+                |val| (100..1000).contains(&val) || (val >= 1100),
+                "The non-indexed refine filter was not applied",
+            );
+
+            let mut expected_num_rows = if params.use_new_data { 199 } else { 99 };
+            if params.use_deleted_data {
+                expected_num_rows -= 1;
+            }
+            assert_eq!(batch.num_rows(), expected_num_rows);
+        }
+
+        async fn check_simple_queries(&self, params: &ScalarTestParams) {
+            self.check_simple_indexed_only(params).await;
+            self.check_simple_indexed_and_refine(params).await;
+        }
+    }
+
+    // There are many different ways that a query can be run and they all have slightly different
+    // effects on the plan that gets built.  This test attempts to run the same queries in various
+    // different configurations to ensure that we get consistent results
+    #[tokio::test]
+    async fn test_secondary_index_scans_vector() {
+        let fixture = ScalarIndexTestFixture::new().await;
+
+        for use_index in [false, true] {
+            for use_projection in [false, true] {
+                for use_deleted_data in [false, true] {
+                    for use_new_data in [false, true] {
+                        for with_row_id in [false, true] {
+                            let params = ScalarTestParams {
+                                use_index,
+                                use_projection,
+                                use_deleted_data,
+                                use_new_data,
+                                with_row_id,
+                            };
+                            fixture.check_vector_queries(&params).await;
+                            fixture.check_simple_queries(&params).await;
+                        }
+                    }
+                }
+            }
+        }
     }
 }

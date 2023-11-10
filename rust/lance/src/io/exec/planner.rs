@@ -39,13 +39,37 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
+use lance_index::scalar::expression::{
+    apply_scalar_indices, IndexInformationProvider, ScalarIndexExpr,
+};
 use snafu::{location, Location};
 
 use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
+use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::{
     datafusion::logical_expr::resolve_expr, datatypes::Schema, utils::sql::parse_sql_filter, Error,
     Result,
 };
+
+#[derive(Default)]
+pub struct FilterPlan {
+    pub index_query: Option<ScalarIndexExpr>,
+    pub refine_expr: Option<Arc<dyn PhysicalExpr>>,
+}
+
+impl FilterPlan {
+    pub fn refine_columns(&self) -> Vec<String> {
+        self.refine_expr
+            .as_ref()
+            .map(|expr| column_names_in_expr(expr.as_ref()))
+            .unwrap_or_default()
+    }
+
+    /// Return true if this has a refine step, regardless of the status of prefilter
+    pub fn has_refine(&self) -> bool {
+        self.refine_expr.is_some()
+    }
+}
 
 pub struct Planner {
     schema: SchemaRef,
@@ -513,6 +537,38 @@ impl Planner {
                 })
             }
         })
+    }
+
+    /// Determine how to apply a provided filter
+    ///
+    /// We parse the filter into a logical expression.  We then
+    /// split the logical expression into a portion that can be
+    /// satisfied by an index search (of one or more indices) and
+    /// a refine portion that must be applied after the index search
+    pub fn create_filter_plan(
+        &self,
+        filter: &str,
+        index_info: &dyn IndexInformationProvider,
+        use_scalar_index: bool,
+    ) -> Result<FilterPlan> {
+        let logical_expr = self.parse_filter(filter)?;
+        if use_scalar_index {
+            let indexed_expr = apply_scalar_indices(logical_expr, index_info);
+            let refine_expr = indexed_expr
+                .refine_expr
+                .map(|refine_expr| self.create_physical_expr(&refine_expr))
+                .transpose()?;
+            Ok(FilterPlan {
+                index_query: indexed_expr.scalar_query,
+                refine_expr,
+            })
+        } else {
+            let refine_expr = self.create_physical_expr(&logical_expr)?;
+            Ok(FilterPlan {
+                index_query: None,
+                refine_expr: Some(refine_expr),
+            })
+        }
     }
 }
 

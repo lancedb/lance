@@ -19,6 +19,7 @@ use std::{any::Any, sync::Arc};
 use lance_core::Result;
 
 pub mod scalar;
+pub mod util;
 pub mod vector;
 
 pub const INDEX_FILE_NAME: &str = "index.idx";
