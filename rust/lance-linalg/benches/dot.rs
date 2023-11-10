@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::iter::repeat_with;
+
 use arrow_arith::{aggregate::sum, numeric::mul};
 use arrow_array::{
     cast::AsArray,
@@ -19,6 +21,7 @@ use arrow_array::{
     ArrowNumericType, Float16Array, Float32Array, NativeAdapter, PrimitiveArray,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use half::bf16;
 use lance_arrow::FloatToArrayType;
 use num_traits::FromPrimitive;
 
@@ -27,6 +30,7 @@ use pprof::criterion::{Output, PProfProfiler};
 
 use lance_linalg::distance::dot::{dot, dot_distance, Dot};
 use lance_testing::datagen::generate_random_array_with_seed;
+use rand::Rng;
 
 #[inline]
 fn dot_arrow_artiy<T: ArrowNumericType>(x: &PrimitiveArray<T>, y: &PrimitiveArray<T>) -> T::Native {
@@ -89,6 +93,27 @@ fn bench_distance(c: &mut Criterion) {
                 let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
                 Some(dot_distance(x, y))
             }))
+        });
+    });
+
+    let mut rng = rand::thread_rng();
+    let key = repeat_with(|| rng.gen::<f32>())
+        .map(bf16::from_f32)
+        .take(DIMENSION)
+        .collect::<Vec<_>>();
+    let target = repeat_with(|| rng.gen::<f32>())
+        .map(bf16::from_f32)
+        .take(TOTAL * DIMENSION)
+        .collect::<Vec<_>>();
+    c.bench_function("Dot(bf16, auto-vectorization)", |b| {
+        b.iter(|| {
+            let x = key.as_slice();
+            black_box(
+                target
+                    .chunks(DIMENSION)
+                    .map(|y| dot_distance(x, y))
+                    .collect::<Vec<_>>(),
+            )
         });
     });
 

@@ -26,6 +26,7 @@ fn main() {
             .flag("-mavx512f")
             .flag("-mavx512vl")
             .flag("-mavx512bw")
+            .flag("-mavx512vnni")
             .flag("-mavx512fp16")
             .flag("-O3")
             .flag("-Wall")

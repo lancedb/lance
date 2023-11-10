@@ -86,7 +86,7 @@ pub trait Dot: ArrowFloatType {
 impl Dot for BFloat16Type {
     #[inline]
     fn dot(x: &[bf16], y: &[bf16]) -> bf16 {
-        dot_scalar::<bf16, 16>(x, y)
+        dot_scalar::<bf16, 32>(x, y)
     }
 }
 
