@@ -24,14 +24,16 @@ use arrow_array::{
     types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type},
     Array, ArrowNumericType, FixedSizeListArray, Float32Array,
 };
+use arrow_schema::DataType;
 use half::{bf16, f16};
-use lance_arrow::{bfloat16::BFloat16Type, ArrowFloatType, FloatToArrayType};
+use lance_arrow::{bfloat16::BFloat16Type, ArrowFloatType, FloatArray, FloatToArrayType};
 use num_traits::{AsPrimitive, Float};
 
 use crate::simd::{
     f32::{f32x16, f32x8},
     SIMD,
 };
+use crate::{Error, Result};
 
 /// Calculate the L2 distance between two vectors.
 ///
@@ -215,6 +217,31 @@ where
     Box::new(T::ArrowType::l2_batch(from, to, dimension))
 }
 
+fn do_l2_distance_arrow_batch<T: ArrowFloatType + L2>(
+    from: &T::ArrayType,
+    to: &FixedSizeListArray,
+) -> Result<Arc<Float32Array>> {
+    let dimension = to.value_length() as usize;
+    debug_assert_eq!(from.len(), dimension);
+
+    // TODO: if we detect there is a run of nulls, should we skip those?
+    let to_values =
+        to.values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or(Error::ComputeError(format!(
+                "Cannot downcast to the same type: {} != {}",
+                T::FLOAT_TYPE,
+                to.value_type()
+            )))?;
+    let dists = l2_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
+
+    Ok(Arc::new(Float32Array::new(
+        dists.collect(),
+        to.nulls().cloned(),
+    )))
+}
+
 /// Compute L2 distance between a vector and a batch of vectors.
 ///
 /// Null buffer of `to` is propagated to the returned array.
@@ -227,22 +254,19 @@ where
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
-pub fn l2_distance_arrow_batch<T: ArrowNumericType>(
-    from: &[<T as ArrowPrimitiveType>::Native],
+pub fn l2_distance_arrow_batch(
+    from: &dyn Array,
     to: &FixedSizeListArray,
-) -> Arc<Float32Array>
-where
-    <T as ArrowPrimitiveType>::Native: FloatToArrayType,
-    <<T as ArrowPrimitiveType>::Native as FloatToArrayType>::ArrowType: L2,
-{
-    let dimension = to.value_length() as usize;
-    debug_assert_eq!(from.len(), dimension);
-
-    // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values = to.values().as_primitive::<T>().values();
-    let dists = l2_distance_batch(from, to_values, dimension);
-
-    Arc::new(Float32Array::new(dists.collect(), to.nulls().cloned()))
+) -> Result<Arc<Float32Array>> {
+    match from.data_type() {
+        &DataType::Float16 => do_l2_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
+        &DataType::Float32 => do_l2_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
+        &DataType::Float64 => do_l2_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
+        _ => Err(Error::ComputeError(format!(
+            "Unsupported data type: {}",
+            from.data_type()
+        ))),
+    }
 }
 
 #[cfg(test)]

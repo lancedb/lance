@@ -23,11 +23,11 @@ use std::sync::Arc;
 use arrow_array::{
     cast::AsArray,
     types::{Float16Type, Float32Type, Float64Type},
-    Array, ArrowNumericType, FixedSizeListArray, Float32Array, PrimitiveArray,
+    Array, ArrowNumericType, FixedSizeListArray, Float32Array,
 };
+use arrow_schema::DataType;
 use lance_arrow::bfloat16::BFloat16Type;
-use lance_arrow::FloatType::Float16;
-use lance_arrow::{ArrowFloatType, FloatToArrayType};
+use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 use num_traits::{AsPrimitive, FromPrimitive};
 
 use super::dot::dot;
@@ -36,6 +36,7 @@ use crate::simd::{
     f32::{f32x16, f32x8},
     FloatSimd, SIMD,
 };
+use crate::{Error, Result};
 
 /// Cosine Distance
 pub trait Cosine: super::dot::Dot
@@ -263,6 +264,30 @@ where
     T::ArrowType::cosine_batch(from, batch, dimension)
 }
 
+fn do_cosine_distance_arrow_batch<T: ArrowFloatType + Cosine>(
+    from: &T::ArrayType,
+    to: &FixedSizeListArray,
+) -> Result<Arc<Float32Array>> {
+    let dimension = to.value_length() as usize;
+    debug_assert_eq!(from.len(), dimension);
+
+    // TODO: if we detect there is a run of nulls, should we skip those?
+    let to_values =
+        to.values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or(Error::InvalidArgumentError(format!(
+                "Unsupported data type {:?}",
+                to.values().data_type()
+            )))?;
+    let dists = cosine_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
+
+    Ok(Arc::new(Float32Array::new(
+        dists.collect(),
+        to.nulls().cloned(),
+    )))
+}
+
 /// Compute Cosine distance between a vector and a batch of vectors.
 ///
 /// Null buffer of `to` is propagated to the returned array.
@@ -275,22 +300,25 @@ where
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
-pub fn cosine_distance_arrow_batch<T: ArrowNumericType>(
-    from: &[T::Native],
+pub fn cosine_distance_arrow_batch(
+    from: &dyn Array,
     to: &FixedSizeListArray,
-) -> Arc<Float32Array>
-where
-    T::Native: FloatToArrayType,
-    <T::Native as FloatToArrayType>::ArrowType: Cosine,
-{
-    let dimension = to.value_length() as usize;
-    debug_assert_eq!(from.len(), dimension);
-
-    // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values = to.values().as_primitive::<T>().values();
-    let dists = cosine_distance_batch(from, &to_values[..], dimension);
-
-    Arc::new(Float32Array::new(dists.collect(), to.nulls().cloned()))
+) -> Result<Arc<Float32Array>> {
+    match from.data_type() {
+        &DataType::Float16 => {
+            do_cosine_distance_arrow_batch::<Float16Type>(from.as_primitive(), to)
+        }
+        &DataType::Float32 => {
+            do_cosine_distance_arrow_batch::<Float32Type>(from.as_primitive(), to)
+        }
+        &DataType::Float64 => {
+            do_cosine_distance_arrow_batch::<Float64Type>(from.as_primitive(), to)
+        }
+        _ => Err(Error::InvalidArgumentError(format!(
+            "Unsupported data type {:?}",
+            from.data_type()
+        ))),
+    }
 }
 
 #[cfg(test)]

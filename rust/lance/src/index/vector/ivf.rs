@@ -156,10 +156,10 @@ impl IVFIndex {
         let part_index = self.load_partition(partition_id).await?;
 
         let partition_centroids = self.ivf.centroids.value(partition_id);
-        let residual_key = sub(query.key.as_ref(), &partition_centroids)?;
+        let residual_key = sub(&query.key, &partition_centroids)?;
         // Query in partition.
         let mut part_query = query.clone();
-        part_query.key = as_primitive_array(&residual_key).clone().into();
+        part_query.key = residual_key;
         let batch = part_index.search(&part_query, pre_filter).await?;
         Ok(batch)
     }

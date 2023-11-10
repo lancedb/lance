@@ -19,7 +19,8 @@ use std::sync::Arc;
 
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{
-    cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
+    cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, Float32Array, RecordBatch,
+    UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field};
@@ -385,7 +386,7 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
         let centroid_values = self.centroids.data();
         let centroids = centroid_values.as_slice();
         let dim = query.len();
-        let distances: T::ArrayType = match self.metric_type {
+        let distances = Float32Array::from_iter_values(match self.metric_type {
             lance_linalg::distance::DistanceType::L2 => {
                 l2_distance_batch(query.as_slice(), centroids, dim)
             }
@@ -395,9 +396,8 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
             lance_linalg::distance::DistanceType::Dot => {
                 dot_distance_batch(query.as_slice(), centroids, dim)
             }
-        }
-        .collect::<Vec<_>>()
-        .into();
+        });
+
         let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;
         Ok(top_k_partitions)
     }
