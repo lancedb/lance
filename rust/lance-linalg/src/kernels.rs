@@ -42,12 +42,13 @@ pub fn argmax<T: Num + Bounded + PartialOrd>(iter: impl Iterator<Item = T>) -> O
     max_idx
 }
 
-pub fn argmax_opt<T: Num + Bounded + PartialOrd>(
+pub fn argmax_opt<T: Num + Bounded + PartialOrd + std::fmt::Debug>(
     iter: impl Iterator<Item = Option<T>>,
 ) -> Option<u32> {
     let mut max_idx: Option<u32> = None;
     let mut max_value = T::min_value();
     for (idx, value) in iter.enumerate() {
+        println!("Argmin_opt: idx={}, value={:?}", idx, value);
         if let Some(value) = value {
             if let Some(Ordering::Greater) = value.partial_cmp(&max_value) {
                 max_value = value;

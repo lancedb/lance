@@ -535,7 +535,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::RecordBatchIterator;
-    use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
+    use arrow_array::{FixedSizeListArray, Int32Array, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use lance_linalg::distance::MetricType;
@@ -602,7 +602,7 @@ mod tests {
         let dataset = Dataset::open(test_uri).await.unwrap();
         let stream = dataset
             .scan()
-            .nearest("vector", as_primitive_array(&q), 10)
+            .nearest("vector", q.clone(), 10)
             .unwrap()
             .try_into_stream()
             .await

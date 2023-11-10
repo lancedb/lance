@@ -407,7 +407,9 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                 )?)),
             },
             pb::VectorIndexStage {
-                stage: Some(pb::vector_index_stage::Stage::Pq(idx.pq.as_ref().into())),
+                stage: Some(pb::vector_index_stage::Stage::Pq(pb::Pq::try_from(
+                    idx.pq.as_ref(),
+                )?)),
             },
         ]);
 
@@ -465,8 +467,7 @@ impl Ivf {
         self.centroids.len()
     }
 
-    /// Use the query vector to find `nprobes` closest partitions.
-    fn find_partitions(
+    fn find_partitions_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
         &self,
         query: &dyn Array,
         nprobes: usize,
@@ -474,13 +475,53 @@ impl Ivf {
     ) -> Result<UInt32Array> {
         use lance_index::vector::ivf::Ivf as IvfTrait;
 
-        let ivf = lance_index::vector::ivf::IvfImpl::<Float32Type>::new(
-            MatrixView::try_from(self.centroids.as_ref())?,
+        let flat_centroids = self
+            .centroids
+            .values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or(Error::Index {
+                message: format!(
+                    "Centroids data type mismatch: expected {}, got {}",
+                    T::FLOAT_TYPE,
+                    self.centroids.values().data_type()
+                ),
+                location: location!(),
+            })?;
+        let ivf = lance_index::vector::ivf::IvfImpl::<T>::new(
+            MatrixView::new(
+                Arc::new(flat_centroids.clone()),
+                self.centroids.value_length(),
+            ),
             metric_type,
             vec![],
             None,
         );
         ivf.find_partitions(query, nprobes)
+    }
+
+    /// Use the query vector to find `nprobes` closest partitions.
+    fn find_partitions(
+        &self,
+        query: &dyn Array,
+        nprobes: usize,
+        metric_type: MetricType,
+    ) -> Result<UInt32Array> {
+        match *query.data_type() {
+            DataType::Float16 => {
+                self.find_partitions_impl::<Float16Type>(query, nprobes, metric_type)
+            }
+            DataType::Float32 => {
+                self.find_partitions_impl::<Float32Type>(query, nprobes, metric_type)
+            }
+            DataType::Float64 => {
+                self.find_partitions_impl::<Float64Type>(query, nprobes, metric_type)
+            }
+            _ => Err(Error::Index {
+                message: "Unsupported data type".to_string(),
+                location: location!(),
+            }),
+        }
     }
 
     /// Add the offset and length of one partition.
@@ -547,26 +588,18 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
             location: location!(),
         });
     };
-    if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
-        if !matches!(elem_type.data_type(), DataType::Float32) {
-            return Err(Error::Index{
-                message:format!(
-                    "VectorIndex requires the column data type to be fixed size list of float32s, got {}",
-                    elem_type.data_type()
-                ),
-                location: location!()
-            });
+    match field.data_type() {
+        DataType::FixedSizeList(elem_type, _) if elem_type.data_type().is_floating() => {
+            Ok(field)
         }
-    } else {
-        return Err(Error::Index {
+        _ => Err(Error::Index {
             message: format!(
-            "VectorIndex requires the column data type to be fixed size list of float32s, got {}",
-            field.data_type()
-        ),
+                "VectorIndex requires the column data type to be fixed size list of float16/32/64s, got {}",
+                field.data_type()
+            ),
             location: location!(),
-        });
+        })
     }
-    Ok(field)
 }
 
 /// Build IVF(PQ) index
@@ -1227,10 +1260,9 @@ mod tests {
             .unwrap();
 
         let sample_query = vector_array.value(10);
-        let query = sample_query.as_primitive::<Float32Type>();
         let results = dataset
             .scan()
-            .nearest("vector", query, 5)
+            .nearest("vector", sample_query, 5)
             .unwrap()
             .try_into_stream()
             .await
@@ -1443,10 +1475,9 @@ mod tests {
             .unwrap();
 
         let sample_query = vector_array.value(10);
-        let query = sample_query.as_primitive::<Float32Type>();
         let results = dataset
             .scan()
-            .nearest("vector", query, 5)
+            .nearest("vector", sample_query, 5)
             .unwrap()
             .try_into_stream()
             .await
@@ -1488,10 +1519,9 @@ mod tests {
             .unwrap();
 
         let sample_query = vector_array.value(10);
-        let query = sample_query.as_primitive::<Float32Type>();
         let results = dataset
             .scan()
-            .nearest("vector", query, 5)
+            .nearest("vector", sample_query, 5)
             .unwrap()
             .try_into_stream()
             .await

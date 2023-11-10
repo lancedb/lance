@@ -18,7 +18,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, UInt8Array};
+use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array};
 use async_trait::async_trait;
 use lance_arrow::floats::FloatArray;
@@ -36,6 +36,7 @@ pub(crate) mod utils;
 
 pub use self::utils::num_centroids;
 use super::pb;
+use crate::pb::Tensor;
 pub use builder::PQBuildParams;
 
 /// Product Quantization
@@ -57,6 +58,8 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
     fn num_sub_vectors(&self) -> usize;
 
     fn dimension(&self) -> usize;
+
+    fn codebook(&self) -> FixedSizeListArray;
 }
 
 /// Product Quantization, optimized for [Apache Arrow] buffer memory layout.
@@ -464,23 +467,27 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
     fn dimension(&self) -> usize {
         self.dimension
     }
+
+    fn codebook(&self) -> FixedSizeListArray {
+        FixedSizeListArray::try_new_from_values(
+            self.codebook.as_ref().clone(),
+            self.dimension as i32,
+        )
+        .unwrap()
+    }
 }
 
 #[allow(clippy::fallible_impl_from)]
-impl From<&dyn ProductQuantizer> for pb::Pq {
-    fn from(pq: &dyn ProductQuantizer) -> Self {
-        Self {
+impl TryFrom<&dyn ProductQuantizer> for pb::Pq {
+    type Error = Error;
+
+    fn try_from(pq: &dyn ProductQuantizer) -> Result<Self> {
+        Ok(Self {
             num_bits: pq.num_bits(),
             num_sub_vectors: pq.num_sub_vectors() as u32,
             dimension: pq.dimension() as u32,
-            codebook: pq
-                .as_any()
-                .downcast_ref::<ProductQuantizerImpl<Float32Type>>()
-                .unwrap()
-                .codebook
-                .values()
-                .to_vec(),
-            codebook_tensor: None,
-        }
+            codebook: vec![],
+            codebook_tensor: Some(Tensor::try_from(&pq.codebook())?),
+        })
     }
 }

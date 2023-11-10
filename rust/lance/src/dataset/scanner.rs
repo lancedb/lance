@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use async_recursion::async_recursion;
 use datafusion::execution::{
@@ -354,7 +354,7 @@ impl Scanner {
     }
 
     /// Find k-nearest neighbor within the vector column.
-    pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
+    pub fn nearest(&mut self, column: &str, q: ArrayRef, k: usize) -> Result<&mut Self> {
         self.ensure_not_fragment_scan()?;
 
         if k == 0 {
@@ -373,7 +373,7 @@ impl Scanner {
         self.dataset.schema().project(&[column])?;
         self.nearest = Some(Query {
             column: column.to_string(),
-            key: Arc::new(q.clone()),
+            key: q,
             k,
             nprobes: 1,
             refine_factor: None,
@@ -791,8 +791,7 @@ impl Scanner {
         let schema = self.dataset.schema();
         if let Some(field) = schema.field(&q.column) {
             match field.data_type() {
-                DataType::FixedSizeList(subfield, _)
-                    if matches!(subfield.data_type(), DataType::Float32) => {}
+                DataType::FixedSizeList(subfield, _) if subfield.data_type().is_floating() => {}
                 _ => {
                     return Err(Error::IO {
                         message: format!(
@@ -1197,7 +1196,7 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray, PrimitiveArray,
+        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeStringArray,
         RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
@@ -1448,8 +1447,8 @@ mod test {
             let test_uri = test_dir.path().to_str().unwrap();
             let dataset = create_vector_dataset(test_uri, *build_index).await;
             let mut scan = dataset.scan();
-            let key: Float32Array = (32..64).map(|v| v as f32).collect();
-            scan.nearest("vec", &key, 5).unwrap();
+            let key = Arc::new((32..64).map(|v| v as f32).collect::<Float32Array>());
+            scan.nearest("vec", key, 5).unwrap();
             scan.refine(5);
 
             let results = scan
@@ -1529,7 +1528,7 @@ mod test {
         .unwrap();
 
         // Create a bunch of queries
-        let key: Float32Array = [0f32; 32].into_iter().collect();
+        let key = Arc::new([0f32; 32].into_iter().collect::<Float32Array>());
         // Set as larger than the number of new rows that aren't in the index to
         // force result sets to be combined between index and flat scan.
         let k = 20;
@@ -1558,7 +1557,7 @@ mod test {
         for case in cases {
             let mut scanner = dataset.scan();
             scanner
-                .nearest("vec", &key, k)
+                .nearest("vec", key.clone(), k)
                 .unwrap()
                 .limit(case.limit, None)
                 .unwrap()
@@ -1610,7 +1609,7 @@ mod test {
         scan.filter("i > 100").unwrap();
         scan.prefilter(true);
         scan.project(&["i"]).unwrap();
-        scan.nearest("vec", &key, 5).unwrap();
+        scan.nearest("vec", Arc::new(key), 5).unwrap();
         scan.use_index(false);
 
         let results = scan
@@ -1662,7 +1661,7 @@ mod test {
         let dataset = create_vector_dataset(test_uri, true).await;
         let mut scan = dataset.scan();
         let key: Float32Array = (32..64).map(|v| v as f32).collect();
-        scan.nearest("vec", &key, 5).unwrap();
+        scan.nearest("vec", Arc::new(key), 5).unwrap();
         scan.filter("i > 100").unwrap();
         scan.project(&["i"]).unwrap();
         scan.refine(5);
@@ -1712,8 +1711,8 @@ mod test {
 
         let dataset = create_vector_dataset(test_uri, true).await;
         let mut scan = dataset.scan();
-        let key: Float32Array = (32..64).map(|v| v as f32).collect();
-        scan.nearest("vec", &key, 5).unwrap();
+        let key = Arc::new((32..64).map(|v| v as f32).collect::<Float32Array>());
+        scan.nearest("vec", key, 5).unwrap();
         scan.refine(5);
 
         let results = scan
@@ -2115,8 +2114,8 @@ mod test {
         let dataset = create_vector_dataset(test_uri, true).await;
 
         let mut scan = dataset.scan();
-        let key: Float32Array = (32..64).map(|v| v as f32).collect();
-        scan.nearest("vec", &key, 10).unwrap();
+        let key = Arc::new((32..64).map(|v| v as f32).collect::<Float32Array>());
+        scan.nearest("vec", key, 10).unwrap();
         scan.project(&["s"]).unwrap();
         scan.filter("i > 10 and i < 20").unwrap();
 
@@ -2198,8 +2197,8 @@ mod test {
         let dataset = create_vector_dataset(test_uri, true).await;
 
         let mut scan = dataset.scan();
-        let key: Float32Array = (32..64).map(|v| v as f32).collect();
-        scan.nearest("vec", &key, 10).unwrap();
+        let key = Arc::new((32..64).map(|v| v as f32).collect::<Float32Array>());
+        scan.nearest("vec", key, 10).unwrap();
         scan.refine(10);
         scan.project(&["s"]).unwrap();
         scan.filter("i > 10 and i < 20").unwrap();
@@ -2312,7 +2311,7 @@ mod test {
         let query_key = Arc::new(Float32Array::from_iter_values((0..2).map(|x| x as f32)));
         let mut scan = dataset.scan();
         scan.filter("filterable > 5").unwrap();
-        scan.nearest("vector", &query_key, 1).unwrap();
+        scan.nearest("vector", query_key, 1).unwrap();
         scan.with_row_id();
 
         let batches = scan
@@ -2578,8 +2577,8 @@ mod test {
 
             let mut scan = dataset.scan();
             // closest be i = 0..5
-            let key: Float32Array = (0..32).map(|_v| 1.0_f32).collect();
-            scan.nearest("vec", &key, 5).unwrap();
+            let key = Arc::new(Float32Array::from_iter_values((0..32).map(|_v| 1.0_f32)));
+            scan.nearest("vec", key.clone(), 5).unwrap();
             scan.refine(100);
             scan.nprobs(100);
 
@@ -2607,7 +2606,7 @@ mod test {
 
             dataset.delete("i = 1").await.unwrap();
             let mut scan = dataset.scan();
-            scan.nearest("vec", &key, 5).unwrap();
+            scan.nearest("vec", key.clone(), 5).unwrap();
             scan.refine(100);
             scan.nprobs(100);
 
@@ -2668,7 +2667,7 @@ mod test {
             dataset.delete("i < 512").await.unwrap();
 
             let mut scan = dataset.scan();
-            scan.nearest("vec", &key, 5).unwrap();
+            scan.nearest("vec", key.clone(), 5).unwrap();
             scan.refine(100);
             scan.nprobs(100);
 
@@ -2839,12 +2838,12 @@ mod test {
             }
         }
 
-        fn sample_query(&self) -> &PrimitiveArray<Float32Type> {
-            self.sample_query.as_primitive::<Float32Type>()
+        fn sample_query(&self) -> &ArrayRef {
+            &self.sample_query
         }
 
-        fn delete_query(&self) -> &PrimitiveArray<Float32Type> {
-            self.delete_query.as_primitive::<Float32Type>()
+        fn delete_query(&self) -> &ArrayRef {
+            &self.delete_query
         }
 
         async fn get_dataset(&self, params: &ScalarTestParams) -> Dataset {
@@ -2860,13 +2859,13 @@ mod test {
         async fn run_query(
             &self,
             query: &str,
-            vector: Option<&PrimitiveArray<Float32Type>>,
+            vector: Option<&ArrayRef>,
             params: &ScalarTestParams,
         ) -> (String, RecordBatch) {
             let dataset = self.get_dataset(params).await;
             let mut scan = dataset.scan();
             if let Some(vector) = vector {
-                scan.nearest("vector", vector, 10).unwrap();
+                scan.nearest("vector", vector.clone(), 10).unwrap();
             }
             if params.use_projection {
                 scan.project(&["indexed"]).unwrap();

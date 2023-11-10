@@ -381,7 +381,7 @@ impl Dataset {
             };
 
             scanner
-                .nearest(column.as_str(), &q, k)
+                .nearest(column.as_str(), Arc::new(q), k)
                 .map(|s| {
                     let mut s = s.nprobs(nprobes);
                     if let Some(factor) = refine_factor {

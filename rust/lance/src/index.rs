@@ -222,7 +222,6 @@ impl DatasetIndexExt for Dataset {
                         message: "Vector index type must take a VectorIndexParams".to_string(),
                         location: location!(),
                     })?;
-
                 build_vector_index(self, column, &index_name, &index_id.to_string(), vec_params)
                     .await?;
             }
@@ -416,11 +415,12 @@ impl DatasetIndexInternalExt for Dataset {
 mod tests {
     use super::*;
 
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
+    use arrow_array::{types::Float16Type, FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
+    use futures::TryStreamExt;
     use lance_arrow::*;
     use lance_linalg::distance::MetricType;
-    use lance_testing::datagen::generate_random_array;
+    use lance_testing::datagen::{generate_random_array, generate_random_array_with_seed};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -480,5 +480,55 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn create_f16_index() {
+        const DIM: i32 = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float16, true)), DIM),
+            true,
+        )]));
+        let data = generate_random_array_with_seed::<Float16Type>(2048 * DIM as usize, [23u8; 32]);
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                FixedSizeListArray::try_new_from_values(data.clone(), DIM).unwrap(),
+            )],
+        )
+        .unwrap()];
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 4);
+        dataset
+            .create_index(&["v"], IndexType::Vector, None, &params, true)
+            .await
+            .expect("Expect index create");
+
+        let query = generate_random_array_with_seed::<Float16Type>(DIM as usize, [23u8; 32]);
+        let results = dataset
+            .scan()
+            .nearest("v", Arc::new(query), 10)
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 10);
+        assert_eq!(
+            results[0].schema().as_ref(),
+            &Schema::try_merge(vec![
+                results[0].schema().as_ref().clone(),
+                Schema::new(vec![Field::new("_distance", DataType::Float32, true)]),
+            ])
+            .unwrap()
+        );
     }
 }

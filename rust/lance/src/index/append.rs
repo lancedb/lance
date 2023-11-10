@@ -137,7 +137,7 @@ mod tests {
 
         let q = array.value(5);
         let mut scanner = dataset.scan();
-        scanner.nearest("vector", q.as_primitive(), 10).unwrap();
+        scanner.nearest("vector", q.clone(), 10).unwrap();
         let results = scanner
             .try_into_stream()
             .await
@@ -166,7 +166,7 @@ mod tests {
         assert_eq!(index_dirs.len(), 2);
 
         let mut scanner = dataset.scan();
-        scanner.nearest("vector", q.as_primitive(), 10).unwrap();
+        scanner.nearest("vector", q, 10).unwrap();
         let results = scanner
             .try_into_stream()
             .await

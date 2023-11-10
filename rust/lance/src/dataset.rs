@@ -1503,6 +1503,7 @@ fn check_row_ids(row_ids: &[u64]) -> RowIdMeta {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::iter::repeat;
     use std::ops::Range;
     use std::vec;
 
@@ -2903,7 +2904,7 @@ mod tests {
             .scan()
             .nearest(
                 "vec",
-                &Float32Array::from_iter_values((0..128).map(|_| 0.1)),
+                Arc::new(Float32Array::from_iter_values((0..128).map(|_| 0.1))),
                 1,
             )
             .unwrap()
@@ -2961,7 +2962,7 @@ mod tests {
             .scan()
             .nearest(
                 "vec",
-                &Float32Array::from_iter_values((0..128).map(|_| 0.1)),
+                Arc::new(Float32Array::from_iter_values((0..128).map(|_| 0.1))),
                 1,
             )
             .unwrap()
@@ -2996,7 +2997,7 @@ mod tests {
             .scan()
             .nearest(
                 "vec",
-                &Float32Array::from_iter_values((0..128).map(|_| 0.1)),
+                Arc::new(Float32Array::from_iter_values(repeat(0.1_f32).take(128))),
                 1,
             )
             .unwrap()
