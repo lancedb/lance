@@ -118,7 +118,7 @@ impl<T: ArrowFloatType> Transformer for ResidualTransform<T> {
                 );
             });
         let residual_arr =
-            FixedSizeListArray::try_new_from_values(T::ArrayType::from(residual_arr), dim as i32)?;
+            FixedSizeListArray::try_new_from_values(T::ArrayType::from(residual_arr), dim)?;
 
         // Replace original column with residual column.
         let batch = batch.drop_column(&self.vec_col)?;
