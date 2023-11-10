@@ -14,6 +14,8 @@
 
 //! Extends logical expression.
 
+use std::collections::VecDeque;
+
 use arrow_schema::DataType;
 
 use datafusion::logical_expr::{
