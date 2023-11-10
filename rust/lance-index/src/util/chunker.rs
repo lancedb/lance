@@ -15,9 +15,11 @@
 use std::collections::VecDeque;
 use std::pin::Pin;
 
+use arrow::compute::kernels;
 use arrow_array::RecordBatch;
-use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::{Stream, StreamExt};
+use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
+use datafusion_common::DataFusionError;
+use futures::{Stream, StreamExt, TryStreamExt};
 
 use crate::Result;
 
@@ -121,4 +123,24 @@ pub fn chunk_stream(
         }
     })
     .boxed()
+}
+
+pub fn chunk_concat_stream(
+    stream: SendableRecordBatchStream,
+    chunk_size: usize,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema().clone();
+    let schema_copy = schema.clone();
+    let chunked = chunk_stream(stream, chunk_size);
+    let chunk_concat = chunked
+        .and_then(move |batches| {
+            std::future::ready(
+                // chunk_stream is zero-copy and so it gives us pieces of batches.  However, the btree
+                // index needs 1 batch-per-page and so we concatenate here.
+                kernels::concat::concat_batches(&schema, batches.iter()).map_err(|e| e.into()),
+            )
+        })
+        .map_err(DataFusionError::from)
+        .boxed();
+    Box::pin(RecordBatchStreamAdapter::new(schema_copy, chunk_concat))
 }

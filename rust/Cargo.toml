@@ -70,6 +70,9 @@ bytes = "1.4"
 byteorder = "1.5"
 chrono = "0.4.23"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
+datafusion = { version = "32.0.0", default-features = false, features = [
+    "regex_expressions",
+] }
 datafusion-common = "32.0"
 datafusion-sql = "32.0"
 either = "1.0"

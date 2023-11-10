@@ -19,6 +19,7 @@ use std::{any::Any, ops::Bound, sync::Arc};
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::scalar::ScalarValue;
 
 use lance_core::Result;
@@ -154,6 +155,13 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index {
     async fn remap(
         &self,
         mapping: &IntMap<u64, Option<u64>>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<()>;
+
+    /// Add the new data into the index, creating an updated version of the index in `dest_store`
+    async fn update(
+        &self,
+        new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()>;
 }
