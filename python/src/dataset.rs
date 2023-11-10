@@ -24,19 +24,21 @@ use async_trait::async_trait;
 use chrono::Duration;
 
 use futures::StreamExt;
-use lance_arrow::as_fixed_size_list_array;
-use lance_core::{datatypes::Schema, format::Fragment, io::object_store::ObjectStoreParams};
 use lance::dataset::{
-    progress::WriteFragmentProgress,
-    fragment::FileFragment as LanceFileFragment, scanner::Scanner as LanceScanner,
-    transaction::Operation as LanceOperation, Dataset as LanceDataset, ReadParams, Version,
-    WriteMode, WriteParams,
+    fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
+    scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
+    Dataset as LanceDataset, ReadParams, Version, WriteMode, WriteParams,
 };
 use lance::index::{
     vector::{diskann::DiskANNParams, VectorIndexParams},
     DatasetIndexExt,
 };
-use lance_index::{vector::{pq::PQBuildParams, ivf::IvfBuildParams}, IndexType};
+use lance_arrow::as_fixed_size_list_array;
+use lance_core::{datatypes::Schema, format::Fragment, io::object_store::ObjectStoreParams};
+use lance_index::{
+    vector::{ivf::IvfBuildParams, pq::PQBuildParams},
+    IndexType,
+};
 use lance_linalg::distance::MetricType;
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
