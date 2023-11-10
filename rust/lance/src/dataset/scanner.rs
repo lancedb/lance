@@ -694,7 +694,7 @@ impl Scanner {
             };
             if let Some(index_query) = &filter_plan.index_query {
                 // The source is an indexed scan
-                self.indexed_scan(&schema, index_query).await?
+                self.scalar_indexed_scan(&schema, index_query).await?
             } else {
                 // The source is a full scan of the table
                 self.scan(with_row_id, false, schema)
@@ -851,7 +851,7 @@ impl Scanner {
             }
             let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
             let mut plan = if let Some(index_query) = &filter_plan.index_query {
-                self.indexed_scan(&vector_scan_projection, index_query)
+                self.scalar_indexed_scan(&vector_scan_projection, index_query)
                     .await?
             } else {
                 self.scan(true, true, vector_scan_projection)
@@ -938,7 +938,9 @@ impl Scanner {
         }
     }
 
-    async fn indexed_scan(
+    // First perform a lookup in a scalar index for ids and then perform a take on the
+    // target fragments with those ids
+    async fn scalar_indexed_scan(
         &self,
         projection: &Schema,
         index_expr: &ScalarIndexExpr,
@@ -1063,7 +1065,9 @@ impl Scanner {
                 // the row ids.
                 let columns_in_filter = column_names_in_expr(refine_expr.as_ref());
                 let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
-                let filter_input = self.indexed_scan(&filter_schema, index_query).await?;
+                let filter_input = self
+                    .scalar_indexed_scan(&filter_schema, index_query)
+                    .await?;
                 let filtered_row_ids =
                     Arc::new(FilterExec::try_new(refine_expr.clone(), filter_input)?);
                 PreFilterSource::FilteredRowIds(filtered_row_ids)

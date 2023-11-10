@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
-use arrow_array::{cast::AsArray, Array, BinaryArray};
+use arrow_array::{Array, BinaryArray, GenericBinaryArray};
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use roaring::RoaringTreemap;
 
@@ -157,7 +155,7 @@ impl RowIdMask {
     ///
     /// We serialize this as a variable length binary array with two items.  The first item
     /// is the block list and the second item is the allow list.
-    pub fn into_arrow(&self) -> Result<Arc<dyn Array>> {
+    pub fn into_arrow(&self) -> Result<BinaryArray> {
         let block_list_length = self
             .block_list
             .as_ref()
@@ -182,16 +180,11 @@ impl RowIdMask {
         }
         let values = Buffer::from(value_bytes);
         let nulls = NullBuffer::from(validity);
-        Ok(Arc::new(BinaryArray::try_new(
-            offsets,
-            values,
-            Some(nulls),
-        )?))
+        Ok(BinaryArray::try_new(offsets, values, Some(nulls))?)
     }
 
     /// Deserialize a row id mask from Arrow
-    pub fn from_arrow(array: &dyn Array) -> Result<Self> {
-        let array = array.as_binary_opt::<i32>().unwrap();
+    pub fn from_arrow(array: &GenericBinaryArray<i32>) -> Result<Self> {
         let block_list = if array.is_null(0) {
             None
         } else {

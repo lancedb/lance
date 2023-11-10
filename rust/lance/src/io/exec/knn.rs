@@ -17,6 +17,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use arrow_array::cast::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
@@ -287,7 +288,15 @@ impl FilterLoader for SelectionVectorToPrefilter {
                 location: location!(),
             })
             .unwrap();
-        RowIdMask::from_arrow(&batch["result"])
+        RowIdMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
+            Error::Internal {
+                message: format!(
+                    "Expected selection vector input to yield binary arrays but got {}",
+                    batch["result"].data_type()
+                ),
+                location: location!(),
+            }
+        })?)
     }
 }
 

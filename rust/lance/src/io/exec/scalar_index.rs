@@ -85,7 +85,7 @@ impl ScalarIndexExec {
         let query_result_arr = query_result.into_arrow()?;
         Ok(RecordBatch::try_new(
             SCALAR_INDEX_SCHEMA.clone(),
-            vec![query_result_arr],
+            vec![Arc::new(query_result_arr)],
         )?)
     }
 }
