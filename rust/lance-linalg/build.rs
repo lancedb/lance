@@ -5,7 +5,7 @@ fn main() {
         cc::Build::new()
             .compiler("clang")
             .file("src/simd/f16.c")
-            .flag("-mcpu=apple-m1")
+            .flag("-mtune=apple-m1")
             .flag("-ffast-math")
             .flag("-O3")
             .flag("-Wall")

@@ -30,7 +30,7 @@ use num_traits::Float;
 
 use crate::simd::{
     f32::{f32x16, f32x8},
-    FloatSimd, SIMD,
+    SIMD,
 };
 
 /// Calculate the L2 distance between two vectors.
@@ -99,48 +99,42 @@ impl L2 for BFloat16Type {
     }
 }
 
+#[cfg(any(
+    all(target_os = "macos", target_feature = "neon"),
+    all(target_os = "linux", feature = "avx512fp16")
+))]
+mod kernel {
+    use super::*;
+
+    extern "C" {
+        pub fn l2_f16(ptr1: *const f16, ptr2: *const f16, len: u32) -> f16;
+    }
+}
+
 impl L2 for Float16Type {
     #[inline]
     fn l2(x: &[f16], y: &[f16]) -> f16 {
-        // TODO: add SIMD support
-        l2_scalar::<f16, 16>(x, y)
+        #[cfg(any(
+            all(target_os = "macos", target_feature = "neon"),
+            all(target_os = "linux", feature = "avx512fp16")
+        ))]
+        unsafe {
+            self::kernel::l2_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
+        }
+        #[cfg(not(any(
+            all(target_os = "macos", target_feature = "neon"),
+            all(target_os = "linux", feature = "avx512fp16")
+        )))]
+        {
+            l2_scalar::<f16, 16>(x, y)
+        }
     }
 }
 
 impl L2 for Float32Type {
     #[inline]
     fn l2(x: &[f32], y: &[f32]) -> f32 {
-        let len = x.len();
-        if len % 16 == 0 {
-            // Likely
-            let dim = x.len();
-            let mut sum = f32x16::zeros();
-
-            for i in (0..dim).step_by(16) {
-                unsafe {
-                    let mut x = f32x16::load_unaligned(x.as_ptr().add(i));
-
-                    let y = f32x16::load_unaligned(y.as_ptr().add(i));
-                    x -= y;
-                    sum.multiply_add(x, x);
-                }
-            }
-            sum.reduce_sum()
-        } else if len % 8 == 0 {
-            let mut sum = f32x8::zeros();
-            for i in (0..len).step_by(8) {
-                unsafe {
-                    let mut x = f32x8::load_unaligned(x.as_ptr().add(i));
-                    let y = f32x8::load_unaligned(y.as_ptr().add(i));
-                    x -= y;
-                    sum.multiply_add(x, x);
-                }
-            }
-            sum.reduce_sum()
-        } else {
-            // Fallback to scalar
-            l2_scalar::<f32, 16>(x, y)
-        }
+        l2_scalar::<f32, 32>(x, y)
     }
 
     fn l2_batch<'a>(
