@@ -100,12 +100,12 @@ fn bench_distance(c: &mut Criterion) {
     });
 
     let mut rng = rand::thread_rng();
-    let key = repeat_with(|| rng.gen::<f32>())
-        .map(bf16::from_f32)
+    let key = repeat_with(|| rng.gen::<u16>())
+        .map(bf16::from_bits)
         .take(DIMENSION)
         .collect::<Vec<_>>();
-    let target = repeat_with(|| rng.gen::<f32>())
-        .map(bf16::from_f32)
+    let target = repeat_with(|| rng.gen::<u16>())
+        .map(bf16::from_bits)
         .take(TOTAL * DIMENSION)
         .collect::<Vec<_>>();
     c.bench_function("Dot(bf16, auto-vectorization)", |b| {
