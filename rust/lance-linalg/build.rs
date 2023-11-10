@@ -6,12 +6,14 @@ fn main() {
             .compiler("clang")
             .file("src/simd/f16.c")
             .flag("-mcpu=apple-m1")
+            .flag("-mtune=apple-m1")
             .flag("-ffast-math")
             .flag("-O3")
             .flag("-Wall")
             .flag("-Werror")
             .flag("-Wextra")
             .flag("-Wpedantic")
+            // .flag("-mfp16")
             .compile("f16");
     }
 
