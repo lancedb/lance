@@ -55,7 +55,7 @@ impl std::fmt::Display for FloatType {
 /// Trait for float types used in Arrow Array.
 ///
 pub trait ArrowFloatType: std::fmt::Debug {
-    type Native: FromPrimitive + FloatToArrayType<ArrowType = Self>;
+    type Native: FromPrimitive + FloatToArrayType<ArrowType = Self> + AsPrimitive<f32>;
 
     const FLOAT_TYPE: FloatType;
 
@@ -69,7 +69,16 @@ pub trait ArrowFloatType: std::fmt::Debug {
 }
 
 pub trait FloatToArrayType:
-    Float + Bounded + Sum + AddAssign<Self> + AsPrimitive<f64> + DivAssign + Send + Sync + Copy
+    Float
+    + Bounded
+    + Sum
+    + AddAssign<Self>
+    + AsPrimitive<f64>
+    + AsPrimitive<f32>
+    + DivAssign
+    + Send
+    + Sync
+    + Copy
 {
     type ArrowType: ArrowFloatType<Native = Self>;
 }

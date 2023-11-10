@@ -15,7 +15,7 @@
 use std::iter::Sum;
 
 use half::{bf16, f16};
-use num_traits::Float;
+use num_traits::{AsPrimitive, Float};
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -24,10 +24,8 @@ use crate::simd::{
 
 /// L2 normalization
 pub trait Normalize<T: Float> {
-    type Output;
-
     /// L2 Normalization over a Vector.
-    fn norm_l2(&self) -> Self::Output;
+    fn norm_l2(&self) -> f32;
 }
 
 // `avx512fp16` is not supported in rustc yet. Once it is supported, we can
@@ -40,15 +38,13 @@ mod kernel {
     use super::*;
 
     extern "C" {
-        pub fn norm_l2_f16(ptr: *const f16, len: u32) -> f16;
+        pub fn norm_l2_f16(ptr: *const f16, len: u32) -> f32;
     }
 }
 
 impl Normalize<f16> for &[f16] {
-    type Output = f16;
-
     // #[inline]
-    fn norm_l2(&self) -> Self::Output {
+    fn norm_l2(&self) -> f32 {
         #[cfg(any(
             all(target_os = "macos", target_feature = "neon"),
             feature = "avx512fp16"
@@ -93,19 +89,15 @@ impl Normalize<f16> for &[f16] {
 }
 
 impl Normalize<bf16> for &[bf16] {
-    type Output = bf16;
-
     #[inline]
-    fn norm_l2(&self) -> Self::Output {
+    fn norm_l2(&self) -> f32 {
         norm_l2_impl::<bf16, 32>(self)
     }
 }
 
 impl Normalize<f32> for &[f32] {
-    type Output = f32;
-
     #[inline]
-    fn norm_l2(&self) -> Self::Output {
+    fn norm_l2(&self) -> f32 {
         let dim = self.len();
         if dim % 16 == 0 {
             let mut sum = f32x16::zeros();
@@ -129,16 +121,14 @@ impl Normalize<f32> for &[f32] {
 }
 
 impl Normalize<f64> for &[f64] {
-    type Output = f64;
-
     #[inline]
-    fn norm_l2(&self) -> Self::Output {
+    fn norm_l2(&self) -> f32 {
         norm_l2(self)
     }
 }
 
 #[inline]
-fn norm_l2_impl<T: Float + Sum, const LANES: usize>(vector: &[T]) -> T {
+fn norm_l2_impl<T: Float + Sum + AsPrimitive<f32>, const LANES: usize>(vector: &[T]) -> f32 {
     let chunks = vector.chunks_exact(LANES);
     let sum = if chunks.remainder().is_empty() {
         T::zero()
@@ -151,7 +141,7 @@ fn norm_l2_impl<T: Float + Sum, const LANES: usize>(vector: &[T]) -> T {
             sums[i] = sums[i].add(chunk[i].powi(2));
         }
     }
-    (sum + sums.iter().copied().sum::<T>()).sqrt()
+    (sum + sums.iter().copied().sum::<T>()).sqrt().as_()
 }
 
 /// Normalize a vector.
@@ -159,7 +149,7 @@ fn norm_l2_impl<T: Float + Sum, const LANES: usize>(vector: &[T]) -> T {
 /// The parameters must be cache line aligned. For example, from
 /// Arrow Arrays, i.e., Float32Array
 #[inline]
-pub fn norm_l2<T: Float + Sum>(vector: &[T]) -> T {
+pub fn norm_l2<T: Float + Sum + AsPrimitive<f32>>(vector: &[T]) -> f32 {
     const LANES: usize = 16;
     norm_l2_impl::<T, LANES>(vector)
 }
@@ -176,7 +166,6 @@ mod tests {
     fn do_norm_l2_test<T: Float + FromPrimitive + Sum + Debug>()
     where
         for<'a> &'a [T]: Normalize<T>,
-        for<'a> <&'a [T] as Normalize<T>>::Output: PartialEq<T> + Debug + AsPrimitive<f64>,
     {
         let data = (1..=37)
             .map(|v| T::from_i32(v).unwrap())

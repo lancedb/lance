@@ -24,6 +24,7 @@ use half::{bf16, f16};
 use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatToArrayType};
 use num_traits::real::Real;
+use num_traits::AsPrimitive;
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -36,7 +37,10 @@ use crate::simd::{
 // Please make sure run `cargo bench --bench dot` with and without AVX-512 before any change.
 // Tested `target-features`: avx512f,avx512vl,f16c
 #[inline]
-fn dot_scalar<T: Real + Sum + AddAssign, const LANES: usize>(from: &[T], to: &[T]) -> T {
+fn dot_scalar<T: Real + Sum + AddAssign + AsPrimitive<f32>, const LANES: usize>(
+    from: &[T],
+    to: &[T],
+) -> f32 {
     let x_chunks = to.chunks_exact(LANES);
     let y_chunks = from.chunks_exact(LANES);
     let sum = if x_chunks.remainder().is_empty() {
@@ -56,12 +60,12 @@ fn dot_scalar<T: Real + Sum + AddAssign, const LANES: usize>(from: &[T], to: &[T
             sums[i] += x[i] * y[i];
         }
     }
-    sum + sums.iter().copied().sum::<T>()
+    (sum + sums.iter().copied().sum::<T>()).as_()
 }
 
 /// Dot product.
 #[inline]
-pub fn dot<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> T
+pub fn dot<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> f32
 where
     T::ArrowType: Dot,
 {
@@ -70,7 +74,7 @@ where
 
 /// Negative dot distance.
 #[inline]
-pub fn dot_distance<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> T
+pub fn dot_distance<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> f32
 where
     T::ArrowType: Dot,
 {
@@ -80,12 +84,12 @@ where
 /// Dot product
 pub trait Dot: ArrowFloatType {
     /// Dot product.
-    fn dot(x: &[Self::Native], y: &[Self::Native]) -> Self::Native;
+    fn dot(x: &[Self::Native], y: &[Self::Native]) -> f32;
 }
 
 impl Dot for BFloat16Type {
     #[inline]
-    fn dot(x: &[bf16], y: &[bf16]) -> bf16 {
+    fn dot(x: &[bf16], y: &[bf16]) -> f32 {
         dot_scalar::<bf16, 32>(x, y)
     }
 }
@@ -98,19 +102,19 @@ mod kernel {
     use super::*;
 
     extern "C" {
-        pub fn dot_f16(ptr1: *const f16, ptr2: *const f16, len: u32) -> f16;
+        pub fn dot_f16(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
     }
 }
 
 impl Dot for Float16Type {
     #[inline]
-    fn dot(x: &[f16], y: &[f16]) -> f16 {
+    fn dot(x: &[f16], y: &[f16]) -> f32 {
         #[cfg(any(
             all(target_os = "macos", target_feature = "neon"),
             all(target_os = "linux", feature = "avx512fp16")
         ))]
         unsafe {
-            self::kernel::dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            kernel::dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
         }
         #[cfg(not(any(
             all(target_os = "macos", target_feature = "neon"),
@@ -180,7 +184,7 @@ impl Dot for Float32Type {
 
 impl Dot for Float64Type {
     #[inline]
-    fn dot(x: &[f64], y: &[f64]) -> f64 {
+    fn dot(x: &[f64], y: &[f64]) -> f32 {
         dot_scalar::<f64, 8>(x, y)
     }
 }
@@ -190,7 +194,7 @@ pub fn dot_distance_batch<'a, T: FloatToArrayType>(
     from: &'a [T],
     to: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = T> + 'a>
+) -> Box<dyn Iterator<Item = f32> + 'a>
 where
     T::ArrowType: Dot,
 {
