@@ -97,7 +97,7 @@ impl Normalize<bf16> for &[bf16] {
 
     #[inline]
     fn norm_l2(&self) -> Self::Output {
-        norm_l2(self)
+        norm_l2_impl::<bf16, 32>(self)
     }
 }
 
@@ -137,13 +137,8 @@ impl Normalize<f64> for &[f64] {
     }
 }
 
-/// Normalize a vector.
-///
-/// The parameters must be cache line aligned. For example, from
-/// Arrow Arrays, i.e., Float32Array
 #[inline]
-pub fn norm_l2<T: Float + Sum>(vector: &[T]) -> T {
-    const LANES: usize = 16;
+fn norm_l2_impl<T: Float + Sum, const LANES: usize>(vector: &[T]) -> T {
     let chunks = vector.chunks_exact(LANES);
     let sum = if chunks.remainder().is_empty() {
         T::zero()
@@ -157,6 +152,16 @@ pub fn norm_l2<T: Float + Sum>(vector: &[T]) -> T {
         }
     }
     (sum + sums.iter().copied().sum::<T>()).sqrt()
+}
+
+/// Normalize a vector.
+///
+/// The parameters must be cache line aligned. For example, from
+/// Arrow Arrays, i.e., Float32Array
+#[inline]
+pub fn norm_l2<T: Float + Sum>(vector: &[T]) -> T {
+    const LANES: usize = 16;
+    norm_l2_impl::<T, LANES>(vector)
 }
 
 #[cfg(test)]
