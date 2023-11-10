@@ -24,7 +24,7 @@ use num_traits::{Float, FromPrimitive};
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance_arrow::FloatToArrayType;
-use lance_linalg::distance::{l2_distance_batch, l2::l2, L2};
+use lance_linalg::distance::{l2::l2, l2_distance_batch, L2};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 const TOTAL: usize = 1024 * 1024; // 1M vectors

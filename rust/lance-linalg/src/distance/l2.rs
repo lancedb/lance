@@ -91,8 +91,6 @@ pub fn l2_scalar<T: Float + Sum + AddAssign, const LANES: usize>(from: &[T], to:
     s + sums.iter().copied().sum()
 }
 
-
-
 impl L2 for BFloat16Type {
     #[inline]
     fn l2(x: &[bf16], y: &[bf16]) -> bf16 {
