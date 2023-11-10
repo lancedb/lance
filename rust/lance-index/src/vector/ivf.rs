@@ -34,7 +34,7 @@ use lance_linalg::{
     MatrixView,
 };
 use snafu::{location, Location};
-use tracing::instrument;
+use tracing::{instrument, Instrument};
 
 mod builder;
 
@@ -298,6 +298,7 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
             )
             .into()
         })
+        .in_current_span()
         .await
         .expect("compute_partitions: schedule CPU task")
     }
