@@ -75,13 +75,16 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_index::vector::pq::PQBuildParams;
+    use lance_index::{
+        vector::{ivf::IvfBuildParams, pq::PQBuildParams},
+        IndexType,
+    };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
-    use crate::index::vector::{ivf::IvfBuildParams, pq::PQIndex, VectorIndexParams};
-    use crate::index::{DatasetIndexExt, IndexType};
+    use crate::index::vector::{pq::PQIndex, VectorIndexParams};
+    use crate::index::DatasetIndexExt;
 
     #[tokio::test]
     async fn test_append_index() {
