@@ -49,7 +49,6 @@ use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
-use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::dataset::index::unindexed_fragments;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index};
@@ -726,7 +725,12 @@ impl Scanner {
 
         // Stage 2: filter
         if let Some(refine_expr) = filter_plan.refine_expr {
-            plan = Arc::new(FilterExec::try_new(refine_expr.clone(), plan)?);
+            // We create a new planner specific to the node's schema, since
+            // physical expressions reference column by index rather than by name.
+            let planner = Planner::new(plan.schema());
+            let physical_refine_expr = planner.create_physical_expr(&refine_expr)?;
+
+            plan = Arc::new(FilterExec::try_new(physical_refine_expr, plan)?);
         }
 
         // Stage 3: sort
@@ -847,7 +851,7 @@ impl Scanner {
             // No index found. use flat search.
             let mut columns = vec![q.column.clone()];
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
-                columns.extend(column_names_in_expr(refine_expr.as_ref()));
+                columns.extend(Planner::column_names_in_expr(refine_expr));
             }
             let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
             let mut plan = if let Some(index_query) = &filter_plan.index_query {
@@ -857,7 +861,10 @@ impl Scanner {
                 self.scan(true, true, vector_scan_projection)
             };
             if let Some(refine_expr) = &filter_plan.refine_expr {
-                plan = Arc::new(FilterExec::try_new(refine_expr.clone(), plan)?);
+                let planner = Planner::new(plan.schema());
+                let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
+
+                plan = Arc::new(FilterExec::try_new(physical_refine_expr, plan)?);
             }
             Ok(self.flat_knn(plan, q)?)
         }
@@ -1063,13 +1070,15 @@ impl Scanner {
                 // The filter is only partially satisfied by the index.  We need
                 // to do an indexed scan and then refine the results to determine
                 // the row ids.
-                let columns_in_filter = column_names_in_expr(refine_expr.as_ref());
+                let columns_in_filter = Planner::column_names_in_expr(refine_expr);
                 let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
                 let filter_input = self
                     .scalar_indexed_scan(&filter_schema, index_query)
                     .await?;
+                let planner = Planner::new(filter_input.schema());
+                let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
                 let filtered_row_ids =
-                    Arc::new(FilterExec::try_new(refine_expr.clone(), filter_input)?);
+                    Arc::new(FilterExec::try_new(physical_refine_expr, filter_input)?);
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             } // Should be index_scan -> filter
             (Some(index_query), None, true) => {
@@ -1085,11 +1094,13 @@ impl Scanner {
             (None, Some(refine_expr), true) => {
                 // No indices match the filter.  We need to do a full scan
                 // of the filter columns to determine the valid row ids.
-                let columns_in_filter = column_names_in_expr(refine_expr.as_ref());
+                let columns_in_filter = Planner::column_names_in_expr(refine_expr);
                 let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
                 let filter_input = self.scan(true, true, filter_schema);
+                let planner = Planner::new(filter_input.schema());
+                let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
                 let filtered_row_ids =
-                    Arc::new(FilterExec::try_new(refine_expr.clone(), filter_input)?);
+                    Arc::new(FilterExec::try_new(physical_refine_expr, filter_input)?);
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             }
             // No prefilter
