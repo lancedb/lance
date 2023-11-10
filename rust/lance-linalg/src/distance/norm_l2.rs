@@ -159,7 +159,7 @@ mod tests {
     use std::fmt::Debug;
 
     use approx::assert_relative_eq;
-    use num_traits::{FromPrimitive};
+    use num_traits::FromPrimitive;
 
     use super::*;
 
