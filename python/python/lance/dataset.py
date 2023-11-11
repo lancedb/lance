@@ -618,6 +618,38 @@ class LanceDataset(pa.dataset.Dataset):
             predicate = str(predicate)
         self._ds.delete(predicate)
 
+    def update(
+        self,
+        updates: Dict[str, str],
+        where: Optional[str] = None,
+    ):
+        """
+        Update column values for rows matching where.
+
+        Parameters
+        ----------
+        updates : dict of str to str
+            A mapping of column names to a SQL expression.
+        where : str, optional
+            A SQL predicate indicating which rows should be updates.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.update(dict(a = 'a + 2'), where="b > 'a'")
+        >>> dataset.to_table().to_pandas()
+           a  b
+        0  1  a
+        1  4  b
+        2  5  c
+        """
+        if isinstance(where, pa.compute.Expression):
+            where = str(where)
+        self._ds.update(updates, where)
+
     def versions(self):
         """
         Return all versions in this dataset.

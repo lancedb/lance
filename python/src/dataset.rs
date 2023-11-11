@@ -25,6 +25,7 @@ use chrono::Duration;
 
 use futures::StreamExt;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::UpdateBuilder;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
@@ -520,6 +521,36 @@ impl Dataset {
         RT.block_on(None, new_self.delete(&predicate))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    fn update(&mut self, updates: &PyDict, predicate: Option<&str>) -> PyResult<()> {
+        let mut builder = UpdateBuilder::new(self.ds.clone());
+        if let Some(predicate) = predicate {
+            builder = builder
+                .update_where(predicate)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+
+        for (key, value) in updates {
+            let column: &str = key.extract()?;
+            let expr: &str = value.extract()?;
+
+            builder = builder
+                .set(column, expr)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+
+        let operation = builder
+            .build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let new_self = RT
+            .block_on(None, operation.execute())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        self.ds = new_self;
+
         Ok(())
     }
 
