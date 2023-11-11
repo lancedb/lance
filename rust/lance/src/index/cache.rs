@@ -19,6 +19,28 @@ use moka::sync::{Cache, ConcurrentCacheExt};
 
 use super::vector::VectorIndex;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Debug, Default)]
+pub struct CacheStats {
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl CacheStats {
+    pub fn record_hit(&self) {
+        self.hits.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn record_miss(&self) {
+        self.misses.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref CACHE_STATS: CacheStats = CacheStats::default();
+}
+
 #[derive(Clone)]
 pub struct IndexCache {
     scalar_cache: Arc<Cache<String, Arc<dyn ScalarIndex>>>,
@@ -51,6 +73,11 @@ impl IndexCache {
     }
 
     pub(crate) fn get_vector(&self, key: &str) -> Option<Arc<dyn VectorIndex>> {
+        if self.vector_cache.contains_key(key) {
+            CACHE_STATS.record_hit();
+        } else {
+            CACHE_STATS.record_miss();
+        }
         self.vector_cache.get(key)
     }
 
@@ -61,5 +88,14 @@ impl IndexCache {
 
     pub(crate) fn insert_vector(&self, key: &str, index: Arc<dyn VectorIndex>) {
         self.vector_cache.insert(key.to_string(), index);
+    }
+
+    /// Get cache hit ratio.
+    #[allow(dead_code)]
+    pub(crate) fn hit_rate(&self) -> f32 {
+        let hits = CACHE_STATS.hits.load(Ordering::Relaxed) as f32;
+        let misses = CACHE_STATS.misses.load(Ordering::Relaxed) as f32;
+        // Returns NaN if hits + misses == 0
+        hits / (hits + misses)
     }
 }

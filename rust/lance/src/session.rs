@@ -101,11 +101,16 @@ mod tests {
         ));
         let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
         assert_eq!(session.index_cache.get_size(), 0);
+
+        assert!(session.index_cache.hit_rate().is_nan());
         session.index_cache.insert_vector("abc", idx.clone());
 
         let found = session.index_cache.get_vector("abc");
+        assert_eq!(session.index_cache.hit_rate(), 1.0);
         assert!(found.is_some());
         assert_eq!(format!("{:?}", found.unwrap()), format!("{:?}", idx));
+        assert!(session.index_cache.get_vector("def").is_none());
+        assert_eq!(session.index_cache.hit_rate(), 0.5);
         assert!(session.index_cache.get_vector("abc").is_some());
         assert_eq!(session.index_cache.len_vector(), 1);
         assert_eq!(session.index_cache.get_size(), 1);
