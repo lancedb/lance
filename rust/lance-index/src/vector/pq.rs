@@ -18,8 +18,8 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow_array::ArrayRef;
 use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, UInt8Array};
+use arrow_array::{ArrayRef, Float32Array};
 use async_trait::async_trait;
 use lance_arrow::floats::FloatArray;
 use lance_arrow::*;
@@ -27,9 +27,8 @@ use lance_core::{Error, Result};
 use lance_linalg::distance::{
     cosine_distance_batch, dot_distance_batch, l2_distance_batch, norm_l2, Cosine, Dot, L2,
 };
-use lance_linalg::kernels::{argmin, argmin_value};
+use lance_linalg::kernels::{argmin, argmin_value_float};
 use lance_linalg::{distance::MetricType, MatrixView};
-use num_traits::{AsPrimitive, Float, One};
 use snafu::{location, Location};
 pub mod builder;
 pub mod transform;
@@ -206,9 +205,9 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                                 dot_distance_batch(sub_vec, centroids, sub_vector_width)
                             }
                         };
-                        argmin_value(distances).unwrap().1.as_()
+                        argmin_value_float(distances).1
                     })
-                    .sum::<f64>()
+                    .sum::<f32>() as f64
             })
             .sum::<f64>();
         Ok(total_distortion / data.num_rows() as f64)
@@ -226,7 +225,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         // Build distance table for each sub-centroid to the query key.
         //
         // Distance table: `[T::Native: num_sub_vectors(row) * num_centroids(column)]`.
-        let mut distance_table: Vec<T::Native> = vec![];
+        let mut distance_table = vec![];
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         key.as_slice()
@@ -238,18 +237,15 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                 distance_table.extend(distances);
             });
 
-        Ok(Arc::new(T::ArrayType::from(
-            code.values()
-                .chunks_exact(self.num_sub_vectors)
-                .map(|c| {
-                    c.iter()
-                        .enumerate()
-                        .map(|(sub_vec_idx, centroid)| {
-                            distance_table[sub_vec_idx * 256 + *centroid as usize]
-                        })
-                        .sum::<T::Native>()
-                })
-                .collect::<Vec<_>>(),
+        Ok(Arc::new(Float32Array::from_iter_values(
+            code.values().chunks_exact(self.num_sub_vectors).map(|c| {
+                c.iter()
+                    .enumerate()
+                    .map(|(sub_vec_idx, centroid)| {
+                        distance_table[sub_vec_idx * 256 + *centroid as usize]
+                    })
+                    .sum()
+            }),
         )))
     }
 
@@ -269,7 +265,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
 
         // Distance table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
         let capacity = self.num_sub_vectors * num_centroids(self.num_bits);
-        let mut distance_table = Vec::<T::Native>::with_capacity(capacity);
+        let mut distance_table = Vec::with_capacity(capacity);
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         key.as_slice()
@@ -282,18 +278,15 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
             });
 
         // Compute distance from the pre-compute table.
-        Ok(Arc::new(T::ArrayType::from(
-            code.values()
-                .chunks_exact(self.num_sub_vectors)
-                .map(|c| {
-                    c.iter()
-                        .enumerate()
-                        .map(|(sub_vec_idx, centroid)| {
-                            distance_table[sub_vec_idx * 256 + *centroid as usize]
-                        })
-                        .sum::<T::Native>()
-                })
-                .collect(),
+        Ok(Arc::new(Float32Array::from_iter_values(
+            code.values().chunks_exact(self.num_sub_vectors).map(|c| {
+                c.iter()
+                    .enumerate()
+                    .map(|(sub_vec_idx, centroid)| {
+                        distance_table[sub_vec_idx * 256 + *centroid as usize]
+                    })
+                    .sum::<f32>()
+            }),
         )))
     }
 
@@ -317,8 +310,8 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         // xy table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
         // y_norm table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
         let num_centroids = num_centroids(self.num_bits);
-        let mut xy_table: Vec<T::Native> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
-        let mut y2_table: Vec<T::Native> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
+        let mut xy_table: Vec<f32> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
+        let mut y2_table: Vec<f32> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
 
         let x_norm = norm_l2(query.as_slice());
         let sub_vector_length = self.dimension / self.num_sub_vectors;
@@ -341,29 +334,26 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
             });
 
         // Compute distance from the pre-compute table.
-        Ok(Arc::new(T::ArrayType::from(
-            code.values()
-                .chunks_exact(self.num_sub_vectors)
-                .map(|c| {
-                    let xy = c
-                        .iter()
-                        .enumerate()
-                        .map(|(sub_vec_idx, centroid)| {
-                            let idx = sub_vec_idx * num_centroids + *centroid as usize;
-                            xy_table[idx]
-                        })
-                        .sum::<T::Native>();
-                    let y2 = c
-                        .iter()
-                        .enumerate()
-                        .map(|(sub_vec_idx, centroid)| {
-                            let idx = sub_vec_idx * num_centroids + *centroid as usize;
-                            y2_table[idx]
-                        })
-                        .sum::<T::Native>();
-                    T::Native::one() - xy / (x_norm * y2.sqrt())
-                })
-                .collect::<Vec<_>>(),
+        Ok(Arc::new(Float32Array::from_iter_values(
+            code.values().chunks_exact(self.num_sub_vectors).map(|c| {
+                let xy = c
+                    .iter()
+                    .enumerate()
+                    .map(|(sub_vec_idx, centroid)| {
+                        let idx = sub_vec_idx * num_centroids + *centroid as usize;
+                        xy_table[idx]
+                    })
+                    .sum::<f32>();
+                let y2 = c
+                    .iter()
+                    .enumerate()
+                    .map(|(sub_vec_idx, centroid)| {
+                        let idx = sub_vec_idx * num_centroids + *centroid as usize;
+                        y2_table[idx]
+                    })
+                    .sum::<f32>();
+                1.0 - xy / (x_norm * y2.sqrt())
+            }),
         )))
     }
 }

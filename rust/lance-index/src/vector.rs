@@ -15,9 +15,7 @@
 //! Vector Index
 //!
 
-use std::sync::Arc;
-
-use arrow_array::Float32Array;
+use arrow_array::ArrayRef;
 use lance_linalg::distance::MetricType;
 
 pub mod flat;
@@ -43,7 +41,7 @@ pub struct Query {
     pub column: String,
 
     /// The vector to be searched.
-    pub key: Arc<Float32Array>,
+    pub key: ArrayRef,
 
     /// Top k results to return.
     pub k: usize,

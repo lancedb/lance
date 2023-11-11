@@ -23,10 +23,11 @@ use std::sync::Arc;
 use arrow_array::{
     cast::AsArray,
     types::{Float16Type, Float32Type, Float64Type},
-    Array, ArrowNumericType, FixedSizeListArray, PrimitiveArray,
+    Array, FixedSizeListArray, Float32Array,
 };
+use arrow_schema::DataType;
 use lance_arrow::bfloat16::BFloat16Type;
-use lance_arrow::{ArrowFloatType, FloatToArrayType};
+use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 use num_traits::{AsPrimitive, FromPrimitive};
 
 use super::dot::dot;
@@ -35,16 +36,17 @@ use crate::simd::{
     f32::{f32x16, f32x8},
     FloatSimd, SIMD,
 };
+use crate::{Error, Result};
 
 /// Cosine Distance
 pub trait Cosine: super::dot::Dot
 where
-    Self::Native: AsPrimitive<f64>,
+    Self::Native: AsPrimitive<f64> + AsPrimitive<f32>,
     <Self::Native as FloatToArrayType>::ArrowType: Cosine + super::dot::Dot,
 {
     /// Cosine distance between two vectors.
     #[inline]
-    fn cosine(x: &[Self::Native], other: &[Self::Native]) -> Self::Native
+    fn cosine(x: &[Self::Native], other: &[Self::Native]) -> f32
     where
         <<Self as ArrowFloatType>::Native as FloatToArrayType>::ArrowType: super::dot::Dot,
     {
@@ -54,7 +56,7 @@ where
 
     /// Fast cosine function, that assumes that the norm of the first vector is already known.
     #[inline]
-    fn cosine_fast(x: &[Self::Native], x_norm: Self::Native, y: &[Self::Native]) -> Self::Native
+    fn cosine_fast(x: &[Self::Native], x_norm: f32, y: &[Self::Native]) -> f32
     where
         <<Self as ArrowFloatType>::Native as FloatToArrayType>::ArrowType: super::dot::Dot,
     {
@@ -63,12 +65,7 @@ where
 
     /// Cosine between two vectors, with the L2 norms of both vectors already known.
     #[inline]
-    fn cosine_with_norms(
-        x: &[Self::Native],
-        x_norm: Self::Native,
-        y_norm: Self::Native,
-        y: &[Self::Native],
-    ) -> Self::Native
+    fn cosine_with_norms(x: &[Self::Native], x_norm: f32, y_norm: f32, y: &[Self::Native]) -> f32
     where
         <<Self as ArrowFloatType>::Native as FloatToArrayType>::ArrowType: Cosine,
     {
@@ -79,7 +76,7 @@ where
         x: &'a [Self::Native],
         batch: &'a [Self::Native],
         dimension: usize,
-    ) -> Box<dyn Iterator<Item = Self::Native> + 'a> {
+    ) -> Box<dyn Iterator<Item = f32> + 'a> {
         let x_norm = norm_l2(x);
 
         Box::new(
@@ -205,37 +202,36 @@ impl Cosine for Float64Type {}
 #[inline]
 fn cosine_scalar<T: AsPrimitive<f64> + FromPrimitive + FloatToArrayType>(
     x: &[T],
-    x_norm: T,
+    x_norm: f32,
     y: &[T],
-) -> T
+) -> f32
 where
     <T as FloatToArrayType>::ArrowType: super::dot::Dot,
 {
     let y_sq = dot(y, y);
     let xy = dot(x, y);
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
-    // use f64 for overflow protection.
-    T::from_f64(1.0 - (xy.as_() / (x_norm.as_() * (y_sq.sqrt()).as_()))).unwrap()
+    1.0 - xy / x_norm * y_sq.sqrt()
 }
 
 #[inline]
-pub(crate) fn cosine_scalar_fast<T: FloatToArrayType + FromPrimitive>(
+pub(crate) fn cosine_scalar_fast<T: FloatToArrayType>(
     x: &[T],
-    x_norm: T,
+    x_norm: f32,
     y: &[T],
-    y_norm: T,
-) -> T
+    y_norm: f32,
+) -> f32
 where
     T::ArrowType: Cosine,
 {
     let xy = dot(x, y);
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
     // use f64 for overflow protection.
-    T::from_f64(1.0 - (xy.as_() / (x_norm.as_() * y_norm.as_()))).unwrap()
+    1.0 - (xy / x_norm * y_norm)
 }
 
 /// Cosine distance function between two vectors.
-pub fn cosine_distance<T: FloatToArrayType>(from: &[T], to: &[T]) -> T
+pub fn cosine_distance<T: FloatToArrayType>(from: &[T], to: &[T]) -> f32
 where
     T::ArrowType: Cosine,
 {
@@ -261,11 +257,35 @@ pub fn cosine_distance_batch<'a, T: FloatToArrayType>(
     from: &'a [T],
     batch: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = T> + 'a>
+) -> Box<dyn Iterator<Item = f32> + 'a>
 where
     T::ArrowType: Cosine,
 {
     T::ArrowType::cosine_batch(from, batch, dimension)
+}
+
+fn do_cosine_distance_arrow_batch<T: ArrowFloatType + Cosine>(
+    from: &T::ArrayType,
+    to: &FixedSizeListArray,
+) -> Result<Arc<Float32Array>> {
+    let dimension = to.value_length() as usize;
+    debug_assert_eq!(from.len(), dimension);
+
+    // TODO: if we detect there is a run of nulls, should we skip those?
+    let to_values =
+        to.values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or(Error::InvalidArgumentError(format!(
+                "Unsupported data type {:?}",
+                to.values().data_type()
+            )))?;
+    let dists = cosine_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
+
+    Ok(Arc::new(Float32Array::new(
+        dists.collect(),
+        to.nulls().cloned(),
+    )))
 }
 
 /// Compute Cosine distance between a vector and a batch of vectors.
@@ -280,25 +300,19 @@ where
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
-pub fn cosine_distance_arrow_batch<T: ArrowNumericType>(
-    from: &[T::Native],
+pub fn cosine_distance_arrow_batch(
+    from: &dyn Array,
     to: &FixedSizeListArray,
-) -> Arc<PrimitiveArray<T>>
-where
-    T::Native: FloatToArrayType,
-    <T::Native as FloatToArrayType>::ArrowType: Cosine,
-{
-    let dimension = to.value_length() as usize;
-    debug_assert_eq!(from.len(), dimension);
-
-    // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values = to.values().as_primitive::<T>().values();
-    let dists = cosine_distance_batch(from, &to_values[..], dimension);
-
-    Arc::new(PrimitiveArray::<T>::new(
-        dists.collect(),
-        to.nulls().cloned(),
-    ))
+) -> Result<Arc<Float32Array>> {
+    match *from.data_type() {
+        DataType::Float16 => do_cosine_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
+        DataType::Float32 => do_cosine_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
+        DataType::Float64 => do_cosine_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
+        _ => Err(Error::InvalidArgumentError(format!(
+            "Unsupported data type {:?}",
+            from.data_type()
+        ))),
+    }
 }
 
 #[cfg(test)]

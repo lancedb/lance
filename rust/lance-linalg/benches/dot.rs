@@ -23,7 +23,7 @@ use arrow_array::{
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use half::bf16;
 use lance_arrow::FloatToArrayType;
-use num_traits::FromPrimitive;
+use num_traits::{AsPrimitive, FromPrimitive};
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -33,9 +33,12 @@ use lance_testing::datagen::generate_random_array_with_seed;
 use rand::Rng;
 
 #[inline]
-fn dot_arrow_artiy<T: ArrowNumericType>(x: &PrimitiveArray<T>, y: &PrimitiveArray<T>) -> T::Native {
+fn dot_arrow_artiy<T: ArrowNumericType>(x: &PrimitiveArray<T>, y: &PrimitiveArray<T>) -> f32
+where
+    T::Native: AsPrimitive<f32>,
+{
     let m = mul(x, y).unwrap();
-    sum(m.as_primitive::<T>()).unwrap()
+    sum(m.as_primitive::<T>()).unwrap().as_()
 }
 
 fn run_bench<T: ArrowNumericType>(c: &mut Criterion)
@@ -55,7 +58,7 @@ where
 
     c.bench_function(format!("Dot({type_name}, arrow_artiy)").as_str(), |b| {
         b.iter(|| unsafe {
-            PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let arr = target.slice(idx * DIMENSION, DIMENSION);
                 Some(dot_arrow_artiy(&key, &arr))
             }));
@@ -67,7 +70,7 @@ where
         |b| {
             let x = &key.values()[..];
             b.iter(|| unsafe {
-                PrimitiveArray::<T>::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
+                Float32Array::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
                     let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
                     Some(black_box(dot(x, y)))
                 }));
@@ -89,7 +92,7 @@ fn bench_distance(c: &mut Criterion) {
         let target: Float16Array = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
         b.iter(|| unsafe {
             let x = key.values().as_ref();
-            Float16Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
                 Some(dot_distance(x, y))
             }))

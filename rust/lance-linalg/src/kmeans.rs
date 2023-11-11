@@ -16,7 +16,7 @@ use std::cmp::min;
 use std::sync::Arc;
 use std::vec;
 
-use arrow_array::{Array, FixedSizeListArray};
+use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::ArrowError;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
@@ -111,7 +111,10 @@ async fn kmeans_random_init<T: ArrowFloatType + Dot + Cosine + L2>(
     k: usize,
     mut rng: impl Rng,
     metric_type: MetricType,
-) -> Result<KMeans<T>> {
+) -> Result<KMeans<T>>
+where
+    T::Native: AsPrimitive<f32>,
+{
     assert!(data.len() >= k * dimension);
     let chosen = (0..data.len() / dimension)
         .choose_multiple(&mut rng, k)
@@ -135,7 +138,7 @@ where
     dimension: usize,
 
     /// Cluster Id and distances for each vector.
-    pub cluster_id_and_distances: Vec<(u32, T::Native)>,
+    pub cluster_id_and_distances: Vec<(u32, f32)>,
 
     /// Number of centroids.
     k: usize,
@@ -187,7 +190,7 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
     fn distance_sum(&self) -> f64 {
         self.cluster_id_and_distances
             .iter()
-            .map(|(_, d)| d.as_())
+            .map(|(_, d)| *d as f64)
             .sum::<f64>()
     }
 
@@ -221,6 +224,7 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
 impl<T: ArrowFloatType> KMeans<T>
 where
     T: L2 + Dot + Cosine,
+    T::Native: AsPrimitive<f32>,
 {
     fn empty(k: usize, dimension: usize, metric_type: MetricType) -> Self {
         Self {
@@ -405,7 +409,7 @@ where
     pub async fn compute_membership(
         &self,
         data: Arc<T::ArrayType>,
-        norm_data: Option<Arc<T::ArrayType>>,
+        norm_data: Option<Arc<Float32Array>>,
     ) -> KMeanMembership<T> {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
@@ -523,12 +527,12 @@ fn compute_partitions_l2_small<'a, T: FloatToArrayType>(
     centroids: &'a [T],
     data: &'a [T],
     dim: usize,
-) -> impl Iterator<Item = (u32, T)> + 'a
+) -> impl Iterator<Item = (u32, f32)> + 'a
 where
     T::ArrowType: L2,
 {
     data.chunks(dim)
-        .map(move |row| argmin_value_float(l2_distance_batch::<T>(row, centroids, dim)))
+        .map(move |row| argmin_value_float(l2_distance_batch(row, centroids, dim)))
 }
 
 /// Fast partition computation for L2 distance.
@@ -536,7 +540,7 @@ fn compute_partitions_l2<'a, T: FloatToArrayType>(
     centroids: &'a [T],
     data: &'a [T],
     dim: usize,
-) -> Box<dyn Iterator<Item = (u32, T)> + 'a>
+) -> Box<dyn Iterator<Item = (u32, f32)> + 'a>
 where
     T::ArrowType: L2,
 {
@@ -556,12 +560,12 @@ where
         // Loop over each strip.
         // s is the index of value in each vector.
         let num_rows_in_tile = data_tile.len() / dim;
-        let mut min_dists = vec![<T as Float>::max_value(); num_rows_in_tile];
+        let mut min_dists = vec![f32::infinity(); num_rows_in_tile];
         let mut partitions = vec![0_u32; num_rows_in_tile];
 
         for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
             // 4B * 16 * 16 = 1 KB
-            let mut dists = [T::zero(); TILE_SIZE * TILE_SIZE];
+            let mut dists = [0.0; TILE_SIZE * TILE_SIZE];
             let num_centroids_in_tile = min(TILE_SIZE, num_centroids - centroid_start);
             for s in (0..dim).step_by(STRIPE_SIZE) {
                 // Calculate L2 within each TILE * STRIP

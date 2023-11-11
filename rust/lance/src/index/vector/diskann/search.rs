@@ -19,6 +19,8 @@ use std::{
     sync::Arc,
 };
 
+use arrow_array::cast::AsArray;
+use arrow_array::types::Float32Type;
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
@@ -227,7 +229,14 @@ impl Index for DiskANNIndex {
 impl VectorIndex for DiskANNIndex {
     #[instrument(level = "debug", skip_all, name = "DiskANNIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
-        let state = greedy_search(&self.graph, 0, query.key.values(), query.k, query.k * 2).await?;
+        let state = greedy_search(
+            &self.graph,
+            0,
+            query.key.as_primitive::<Float32Type>().values(),
+            query.k,
+            query.k * 2,
+        )
+        .await?;
         let schema = Arc::new(Schema::new(vec![
             ROW_ID_FIELD.clone(),
             Field::new(DIST_COL, DataType::Float32, true),

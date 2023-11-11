@@ -21,35 +21,37 @@ use std::sync::Arc;
 
 use arrow_array::{
     cast::AsArray,
-    types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type},
-    Array, ArrowNumericType, FixedSizeListArray, PrimitiveArray,
+    types::{Float16Type, Float32Type, Float64Type},
+    Array, FixedSizeListArray, Float32Array,
 };
+use arrow_schema::DataType;
 use half::{bf16, f16};
-use lance_arrow::{bfloat16::BFloat16Type, ArrowFloatType, FloatToArrayType};
-use num_traits::Float;
+use lance_arrow::{bfloat16::BFloat16Type, ArrowFloatType, FloatArray, FloatToArrayType};
+use num_traits::{AsPrimitive, Float};
 
 use crate::simd::{
     f32::{f32x16, f32x8},
     SIMD,
 };
+use crate::{Error, Result};
 
 /// Calculate the L2 distance between two vectors.
 ///
 pub trait L2: ArrowFloatType {
     /// Calculate the L2 distance between two vectors.
-    fn l2(x: &[Self::Native], y: &[Self::Native]) -> Self::Native;
+    fn l2(x: &[Self::Native], y: &[Self::Native]) -> f32;
 
     fn l2_batch<'a>(
         x: &'a [Self::Native],
         y: &'a [Self::Native],
         dimension: usize,
-    ) -> Box<dyn Iterator<Item = Self::Native> + 'a> {
+    ) -> Box<dyn Iterator<Item = f32> + 'a> {
         Box::new(y.chunks_exact(dimension).map(|v| Self::l2(x, v)))
     }
 }
 
 #[inline]
-pub fn l2<T: FloatToArrayType>(from: &[T], to: &[T]) -> T
+pub fn l2<T: FloatToArrayType>(from: &[T], to: &[T]) -> f32
 where
     T::ArrowType: L2,
 {
@@ -62,7 +64,10 @@ where
 ///
 /// This is pub for test/benchmark only. use [l2] instead.
 #[inline]
-pub fn l2_scalar<T: Float + Sum + AddAssign, const LANES: usize>(from: &[T], to: &[T]) -> T {
+pub fn l2_scalar<T: Float + Sum + AddAssign + AsPrimitive<f32>, const LANES: usize>(
+    from: &[T],
+    to: &[T],
+) -> f32 {
     let x_chunks = from.chunks_exact(LANES);
     let y_chunks = to.chunks_exact(LANES);
 
@@ -88,12 +93,12 @@ pub fn l2_scalar<T: Float + Sum + AddAssign, const LANES: usize>(from: &[T], to:
         }
     }
 
-    s + sums.iter().copied().sum()
+    (s + sums.iter().copied().sum()).as_()
 }
 
 impl L2 for BFloat16Type {
     #[inline]
-    fn l2(x: &[bf16], y: &[bf16]) -> bf16 {
+    fn l2(x: &[bf16], y: &[bf16]) -> f32 {
         // TODO: add SIMD support
         l2_scalar::<bf16, 16>(x, y)
     }
@@ -107,19 +112,19 @@ mod kernel {
     use super::*;
 
     extern "C" {
-        pub fn l2_f16(ptr1: *const f16, ptr2: *const f16, len: u32) -> f16;
+        pub fn l2_f16(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
     }
 }
 
 impl L2 for Float16Type {
     #[inline]
-    fn l2(x: &[f16], y: &[f16]) -> f16 {
+    fn l2(x: &[f16], y: &[f16]) -> f32 {
         #[cfg(any(
             all(target_os = "macos", target_feature = "neon"),
             all(target_os = "linux", feature = "avx512fp16")
         ))]
         unsafe {
-            self::kernel::l2_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            kernel::l2_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
         }
         #[cfg(not(any(
             all(target_os = "macos", target_feature = "neon"),
@@ -160,7 +165,7 @@ impl L2 for Float32Type {
 
 impl L2 for Float64Type {
     #[inline]
-    fn l2(x: &[f64], y: &[f64]) -> f64 {
+    fn l2(x: &[f64], y: &[f64]) -> f32 {
         // TODO: add SIMD support
         l2_scalar::<f64, 8>(x, y)
     }
@@ -202,7 +207,7 @@ pub fn l2_distance_batch<'a, T: FloatToArrayType>(
     from: &'a [T],
     to: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = T> + 'a>
+) -> Box<dyn Iterator<Item = f32> + 'a>
 where
     T::ArrowType: L2,
 {
@@ -210,6 +215,31 @@ where
     debug_assert_eq!(to.len() % dimension, 0);
 
     Box::new(T::ArrowType::l2_batch(from, to, dimension))
+}
+
+fn do_l2_distance_arrow_batch<T: ArrowFloatType + L2>(
+    from: &T::ArrayType,
+    to: &FixedSizeListArray,
+) -> Result<Arc<Float32Array>> {
+    let dimension = to.value_length() as usize;
+    debug_assert_eq!(from.len(), dimension);
+
+    // TODO: if we detect there is a run of nulls, should we skip those?
+    let to_values =
+        to.values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or(Error::ComputeError(format!(
+                "Cannot downcast to the same type: {} != {}",
+                T::FLOAT_TYPE,
+                to.value_type()
+            )))?;
+    let dists = l2_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
+
+    Ok(Arc::new(Float32Array::new(
+        dists.collect(),
+        to.nulls().cloned(),
+    )))
 }
 
 /// Compute L2 distance between a vector and a batch of vectors.
@@ -224,25 +254,19 @@ where
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
-pub fn l2_distance_arrow_batch<T: ArrowNumericType>(
-    from: &[<T as ArrowPrimitiveType>::Native],
+pub fn l2_distance_arrow_batch(
+    from: &dyn Array,
     to: &FixedSizeListArray,
-) -> Arc<PrimitiveArray<T>>
-where
-    <T as ArrowPrimitiveType>::Native: FloatToArrayType,
-    <<T as ArrowPrimitiveType>::Native as FloatToArrayType>::ArrowType: L2,
-{
-    let dimension = to.value_length() as usize;
-    debug_assert_eq!(from.len(), dimension);
-
-    // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values = to.values().as_primitive::<T>().values();
-    let dists = l2_distance_batch(from, to_values, dimension);
-
-    Arc::new(PrimitiveArray::<T>::new(
-        dists.collect(),
-        to.nulls().cloned(),
-    ))
+) -> Result<Arc<Float32Array>> {
+    match *from.data_type() {
+        DataType::Float16 => do_l2_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
+        DataType::Float32 => do_l2_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
+        DataType::Float64 => do_l2_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
+        _ => Err(Error::ComputeError(format!(
+            "Unsupported data type: {}",
+            from.data_type()
+        ))),
+    }
 }
 
 #[cfg(test)]

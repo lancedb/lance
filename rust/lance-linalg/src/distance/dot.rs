@@ -18,17 +18,21 @@ use std::iter::Sum;
 use std::ops::{AddAssign, Neg};
 use std::sync::Arc;
 
+use crate::Error;
 use arrow_array::types::{Float16Type, Float64Type};
 use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
+use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::bfloat16::BFloat16Type;
-use lance_arrow::{ArrowFloatType, FloatToArrayType};
+use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 use num_traits::real::Real;
+use num_traits::AsPrimitive;
 
 use crate::simd::{
     f32::{f32x16, f32x8},
     SIMD,
 };
+use crate::Result;
 
 /// Default implementation of dot product.
 ///
@@ -36,7 +40,10 @@ use crate::simd::{
 // Please make sure run `cargo bench --bench dot` with and without AVX-512 before any change.
 // Tested `target-features`: avx512f,avx512vl,f16c
 #[inline]
-fn dot_scalar<T: Real + Sum + AddAssign, const LANES: usize>(from: &[T], to: &[T]) -> T {
+fn dot_scalar<T: Real + Sum + AddAssign + AsPrimitive<f32>, const LANES: usize>(
+    from: &[T],
+    to: &[T],
+) -> f32 {
     let x_chunks = to.chunks_exact(LANES);
     let y_chunks = from.chunks_exact(LANES);
     let sum = if x_chunks.remainder().is_empty() {
@@ -56,12 +63,12 @@ fn dot_scalar<T: Real + Sum + AddAssign, const LANES: usize>(from: &[T], to: &[T
             sums[i] += x[i] * y[i];
         }
     }
-    sum + sums.iter().copied().sum::<T>()
+    (sum + sums.iter().copied().sum::<T>()).as_()
 }
 
 /// Dot product.
 #[inline]
-pub fn dot<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> T
+pub fn dot<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> f32
 where
     T::ArrowType: Dot,
 {
@@ -70,7 +77,7 @@ where
 
 /// Negative dot distance.
 #[inline]
-pub fn dot_distance<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> T
+pub fn dot_distance<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> f32
 where
     T::ArrowType: Dot,
 {
@@ -80,12 +87,12 @@ where
 /// Dot product
 pub trait Dot: ArrowFloatType {
     /// Dot product.
-    fn dot(x: &[Self::Native], y: &[Self::Native]) -> Self::Native;
+    fn dot(x: &[Self::Native], y: &[Self::Native]) -> f32;
 }
 
 impl Dot for BFloat16Type {
     #[inline]
-    fn dot(x: &[bf16], y: &[bf16]) -> bf16 {
+    fn dot(x: &[bf16], y: &[bf16]) -> f32 {
         dot_scalar::<bf16, 32>(x, y)
     }
 }
@@ -98,19 +105,19 @@ mod kernel {
     use super::*;
 
     extern "C" {
-        pub fn dot_f16(ptr1: *const f16, ptr2: *const f16, len: u32) -> f16;
+        pub fn dot_f16(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
     }
 }
 
 impl Dot for Float16Type {
     #[inline]
-    fn dot(x: &[f16], y: &[f16]) -> f16 {
+    fn dot(x: &[f16], y: &[f16]) -> f32 {
         #[cfg(any(
             all(target_os = "macos", target_feature = "neon"),
             all(target_os = "linux", feature = "avx512fp16")
         ))]
         unsafe {
-            self::kernel::dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            kernel::dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
         }
         #[cfg(not(any(
             all(target_os = "macos", target_feature = "neon"),
@@ -180,7 +187,7 @@ impl Dot for Float32Type {
 
 impl Dot for Float64Type {
     #[inline]
-    fn dot(x: &[f64], y: &[f64]) -> f64 {
+    fn dot(x: &[f64], y: &[f64]) -> f32 {
         dot_scalar::<f64, 8>(x, y)
     }
 }
@@ -190,13 +197,42 @@ pub fn dot_distance_batch<'a, T: FloatToArrayType>(
     from: &'a [T],
     to: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = T> + 'a>
+) -> Box<dyn Iterator<Item = f32> + 'a>
 where
     T::ArrowType: Dot,
 {
     debug_assert_eq!(from.len(), dimension);
     debug_assert_eq!(to.len() % dimension, 0);
     Box::new(to.chunks_exact(dimension).map(|v| dot_distance(from, v)))
+}
+
+fn do_dot_distance_arrow_batch<T: ArrowFloatType + Dot>(
+    from: &T::ArrayType,
+    to: &FixedSizeListArray,
+) -> Result<Arc<Float32Array>> {
+    let dimension = to.value_length() as usize;
+    debug_assert_eq!(from.len(), dimension);
+
+    // TODO: if we detect there is a run of nulls, should we skip those?
+    let to_values =
+        to.values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or(Error::InvalidArgumentError(format!(
+                "Invalid type: expect {:?} got {:?}",
+                from.data_type(),
+                to.value_type()
+            )))?;
+
+    let dists = to_values
+        .as_slice()
+        .chunks_exact(dimension)
+        .map(|v| dot_distance(from.as_slice(), v));
+
+    Ok(Arc::new(Float32Array::new(
+        dists.collect(),
+        to.nulls().cloned(),
+    )))
 }
 
 /// Compute negative dot product distance between a vector and a batch of vectors.
@@ -211,17 +247,22 @@ where
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
-pub fn dot_distance_arrow_batch(from: &[f32], to: &FixedSizeListArray) -> Arc<Float32Array> {
+pub fn dot_distance_arrow_batch(
+    from: &dyn Array,
+    to: &FixedSizeListArray,
+) -> Result<Arc<Float32Array>> {
     let dimension = to.value_length() as usize;
     debug_assert_eq!(from.len(), dimension);
 
-    // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values = to.values().as_primitive::<Float32Type>().values();
-    let dists = to_values
-        .chunks_exact(dimension)
-        .map(|v| dot_distance(from, v));
-
-    Arc::new(Float32Array::new(dists.collect(), to.nulls().cloned()))
+    match *from.data_type() {
+        DataType::Float16 => do_dot_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
+        DataType::Float32 => do_dot_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
+        DataType::Float64 => do_dot_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
+        _ => Err(Error::InvalidArgumentError(format!(
+            "Unsupported data type: {:?}",
+            from.data_type()
+        ))),
+    }
 }
 
 #[cfg(test)]
