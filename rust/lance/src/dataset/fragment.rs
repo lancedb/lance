@@ -533,7 +533,7 @@ impl FileFragment {
     /// If all rows are deleted, returns `Ok(None)`. Otherwise, returns a new
     /// fragment with the updated deletion vector. This must be persisted to
     /// the manifest.
-    pub async fn delete(mut self, predicate: &str) -> Result<Option<Self>> {
+    pub async fn delete(self, predicate: &str) -> Result<Option<Self>> {
         // Load existing deletion vector
         let mut deletion_vector = read_deletion_file(
             &self.dataset.base,
@@ -585,8 +585,27 @@ impl FileFragment {
             return Ok(Some(self));
         }
 
-        // TODO: could we keep the number of rows in memory when we first get
-        // the fragment metadata?
+        self.write_deletions(deletion_vector).await
+    }
+
+    pub(crate) async fn apply_deletions(
+        self,
+        new_deletions: impl IntoIterator<Item = u32>,
+    ) -> Result<Option<Self>> {
+        let mut deletion_vector = read_deletion_file(
+            &self.dataset.base,
+            &self.metadata,
+            self.dataset.object_store(),
+        )
+        .await?
+        .unwrap_or_default();
+
+        deletion_vector.extend(new_deletions);
+
+        self.write_deletions(deletion_vector).await
+    }
+
+    async fn write_deletions(mut self, deletion_vector: DeletionVector) -> Result<Option<Self>> {
         let physical_rows = self.physical_rows().await?;
         if deletion_vector.len() == physical_rows
             && deletion_vector.contains_range(0..physical_rows as u32)
@@ -620,32 +639,6 @@ impl FileFragment {
         .await?;
 
         Ok(Some(self))
-    }
-
-    pub(crate) async fn apply_deletions(
-        mut self,
-        new_deletions: impl IntoIterator<Item = u32>,
-    ) -> Result<Fragment> {
-        let mut deletion_vector = read_deletion_file(
-            &self.dataset.base,
-            &self.metadata,
-            self.dataset.object_store(),
-        )
-        .await?
-        .unwrap_or_default();
-
-        deletion_vector.extend(new_deletions);
-
-        self.metadata.deletion_file = write_deletion_file(
-            &self.dataset.base,
-            self.metadata.id,
-            self.dataset.version().version,
-            &deletion_vector,
-            self.dataset.object_store(),
-        )
-        .await?;
-
-        Ok(self.metadata.clone())
     }
 }
 

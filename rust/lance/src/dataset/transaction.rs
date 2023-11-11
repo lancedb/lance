@@ -133,8 +133,13 @@ pub enum Operation {
 
     /// Updates values in the dataset.
     Update {
+        /// The columns that have been updated
         columns_updated: Vec<String>,
+        /// Ids of fragments that have been moved
+        removed_fragment_ids: Vec<u64>,
+        /// Fragments that have been updated
         updated_fragments: Vec<Fragment>,
+        /// Fragments that have been added
         new_fragments: Vec<Fragment>,
     },
 }
@@ -180,8 +185,15 @@ impl Operation {
             ),
             Self::Merge { fragments, .. } => Box::new(fragments.iter().map(|f| f.id)),
             Self::Update {
-                updated_fragments, ..
-            } => Box::new(updated_fragments.iter().map(|f| f.id)),
+                updated_fragments,
+                removed_fragment_ids,
+                ..
+            } => Box::new(
+                updated_fragments
+                    .iter()
+                    .map(|f| f.id)
+                    .chain(removed_fragment_ids.iter().copied()),
+            ),
         }
     }
 
@@ -400,16 +412,20 @@ impl Transaction {
             }
             Operation::Update {
                 columns_updated: _,
+                removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
             } => {
-                final_fragments.iter_mut().for_each(|f| {
-                    for updated in updated_fragments {
-                        if updated.id == f.id {
-                            *f = updated.clone();
-                        }
+                final_fragments.extend(maybe_existing_fragments?.iter().filter_map(|f| {
+                    if removed_fragment_ids.contains(&f.id) {
+                        return None;
                     }
-                });
+                    if let Some(updated) = updated_fragments.iter().find(|uf| uf.id == f.id) {
+                        Some(updated.clone())
+                    } else {
+                        Some(f.clone())
+                    }
+                }));
                 final_fragments.extend(Self::fragments_with_ids(
                     new_fragments.clone(),
                     &mut fragment_id,
@@ -687,10 +703,12 @@ impl TryFrom<&pb::Transaction> for Transaction {
             }
             Some(pb::transaction::Operation::Update(pb::transaction::Update {
                 columns_updated,
+                removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
             })) => Operation::Update {
                 columns_updated: columns_updated.clone(),
+                removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments.iter().map(Fragment::from).collect(),
                 new_fragments: new_fragments.iter().map(Fragment::from).collect(),
             },
@@ -815,10 +833,12 @@ impl From<&Transaction> for pb::Transaction {
             }
             Operation::Update {
                 columns_updated,
+                removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 columns_updated: columns_updated.clone(),
+                removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments
                     .iter()
                     .map(pb::DataFragment::from)

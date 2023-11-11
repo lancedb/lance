@@ -22,11 +22,12 @@ use datafusion::error::Result as DFResult;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::Expr;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
+use lance_core::error::{box_error, InvalidInputSnafu};
 use lance_core::format::Fragment;
 use roaring::RoaringTreemap;
-use snafu::{location, Location};
+use snafu::{location, Location, ResultExt};
 
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::io::commit::commit_transaction;
@@ -63,8 +64,16 @@ impl UpdateBuilder {
 
     pub fn update_where(mut self, filter: &str) -> Result<Self> {
         let planner = Planner::new(Arc::new(self.dataset.schema().into()));
-        let expr = planner.parse_filter(filter)?;
-        self.condition = Some(planner.optimize_expr(expr)?);
+        let expr = planner
+            .parse_filter(filter)
+            .map_err(box_error)
+            .context(InvalidInputSnafu)?;
+        self.condition = Some(
+            planner
+                .optimize_expr(expr)
+                .map_err(box_error)
+                .context(InvalidInputSnafu)?,
+        );
         Ok(self)
     }
 
@@ -81,8 +90,14 @@ impl UpdateBuilder {
         }
 
         let planner = Planner::new(Arc::new(self.dataset.schema().into()));
-        let expr = planner.parse_expr(value)?;
-        let expr = planner.optimize_expr(expr)?;
+        let expr = planner
+            .parse_expr(value)
+            .map_err(box_error)
+            .context(InvalidInputSnafu)?;
+        let expr = planner
+            .optimize_expr(expr)
+            .map_err(box_error)
+            .context(InvalidInputSnafu)?;
         self.updates.insert(column.as_ref().to_string(), expr);
         Ok(self)
     }
@@ -101,6 +116,10 @@ impl UpdateBuilder {
         for (column, expr) in self.updates {
             let physical_expr = planner.create_physical_expr(&expr)?;
             updates.insert(column, physical_expr);
+        }
+
+        if updates.is_empty() {
+            return Err(Error::invalid_input("No updates provided", location!()));
         }
 
         let updates = Arc::new(updates);
@@ -167,10 +186,11 @@ impl UpdateJob {
             .unwrap()
             .into_inner()
             .unwrap();
-        let old_fragments = self.apply_deletions(&removed_row_ids).await?;
+        let (old_fragments, removed_fragment_ids) = self.apply_deletions(&removed_row_ids).await?;
 
         // Commit updated and new fragments
-        self.commit(old_fragments, new_fragments).await
+        self.commit(removed_fragment_ids, old_fragments, new_fragments)
+            .await
     }
 
     fn apply_updates(
@@ -187,35 +207,63 @@ impl UpdateJob {
 
     /// Use previous found rows ids to delete rows from existing fragments.
     ///
-    /// Returns the set of modified fragments, if any.
-    async fn apply_deletions(&self, removed_row_ids: &RoaringTreemap) -> Result<Vec<Fragment>> {
+    /// Returns the set of modified fragments and removed fragments, if any.
+    async fn apply_deletions(
+        &self,
+        removed_row_ids: &RoaringTreemap,
+    ) -> Result<(Vec<Fragment>, Vec<u64>)> {
         let bitmaps = Arc::new(removed_row_ids.bitmaps().collect::<BTreeMap<_, _>>());
 
-        futures::stream::iter(self.dataset.get_fragments())
+        enum FragmentChange {
+            Unchanged,
+            Modified(Fragment),
+            Removed(u64),
+        }
+
+        let mut updated_fragments = Vec::new();
+        let mut removed_fragments = Vec::new();
+
+        let mut stream = futures::stream::iter(self.dataset.get_fragments())
             .map(move |fragment| {
                 let bitmaps_ref = bitmaps.clone();
                 async move {
-                    if let Some(bitmap) = bitmaps_ref.get(&(fragment.id() as u32)) {
-                        fragment.apply_deletions(*bitmap).await.map(Some)
+                    let fragment_id = fragment.id();
+                    if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
+                        match fragment.apply_deletions(*bitmap).await {
+                            Ok(Some(new_fragment)) => {
+                                Ok(FragmentChange::Modified(new_fragment.metadata))
+                            }
+                            Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
+                            Err(e) => Err(e),
+                        }
                     } else {
-                        Ok(None)
+                        Ok(FragmentChange::Unchanged)
                     }
                 }
             })
-            .buffer_unordered(num_cpus::get() * 4)
-            .try_filter_map(|f| futures::future::ready(Ok(f)))
-            .try_collect::<Vec<Fragment>>()
-            .await
+            .buffer_unordered(num_cpus::get() * 4);
+
+        while let Some(res) = stream.next().await.transpose()? {
+            match res {
+                FragmentChange::Unchanged => {}
+                FragmentChange::Modified(fragment) => updated_fragments.push(fragment),
+                FragmentChange::Removed(fragment_id) => removed_fragments.push(fragment_id),
+            }
+        }
+
+        Ok((updated_fragments, removed_fragments))
     }
 
     async fn commit(
         &self,
+        removed_fragment_ids: Vec<u64>,
         updated_fragments: Vec<Fragment>,
         new_fragments: Vec<Fragment>,
     ) -> Result<Arc<Dataset>> {
         let columns_updated = self.updates.keys().cloned().collect::<Vec<_>>();
         let operation = Operation::Update {
             columns_updated,
+            removed_fragment_ids,
             updated_fragments,
             new_fragments,
         };
@@ -239,29 +287,189 @@ impl UpdateJob {
 
 #[cfg(test)]
 mod tests {
+    use crate::dataset::WriteParams;
+
     use super::*;
 
-    async fn make_test_dataset() {
-        todo!()
+    use arrow_array::{Int64Array, RecordBatchIterator, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_select::concat::concat_batches;
+    use futures::TryStreamExt;
+    use tempfile::{tempdir, TempDir};
+
+    /// Returns a dataset with 3 fragments, each with 10 rows.
+    ///
+    /// Also returns the TempDir, which should be kept alive as long as the
+    /// dataset is being accessed. Once that is dropped, the temp directory is
+    /// deleted.
+    async fn make_test_dataset() -> (Arc<Dataset>, TempDir) {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..30)),
+                Arc::new(StringArray::from_iter_values(
+                    std::iter::repeat("foo").take(30),
+                )),
+            ],
+        )
+        .unwrap();
+
+        let write_params = WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        let ds = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        (Arc::new(ds), test_dir)
     }
 
     #[tokio::test]
     async fn test_update_validation() {
-        todo!()
+        let (dataset, _test_dir) = make_test_dataset().await;
 
-        // 1. Validates condition columns exist
-        // 2. Validates update key columns exist
-        // 3. Validate update expressions reference valid columns
-        // 4. Validates there is at least one update expression
+        let builder = UpdateBuilder::new(dataset.clone());
+
+        assert!(
+            matches!(
+                builder.clone().update_where("foo = 10"),
+                Err(Error::InvalidInput { .. })
+            ),
+            "Should return error if condition references non-existent column"
+        );
+
+        assert!(
+            matches!(
+                builder.clone().set("foo", "1"),
+                Err(Error::InvalidInput { .. })
+            ),
+            "Should return error if update key references non-existent column"
+        );
+
+        assert!(
+            matches!(
+                builder.clone().set("id", "id2 + 1"),
+                Err(Error::InvalidInput { .. })
+            ),
+            "Should return error if update expression references non-existent column"
+        );
+
+        assert!(
+            matches!(builder.clone().build(), Err(Error::InvalidInput { .. })),
+            "Should return error if no update expressions are provided"
+        );
     }
 
     #[tokio::test]
     async fn test_update_all() {
-        todo!()
+        let (dataset, _test_dir) = make_test_dataset().await;
+
+        let dataset = UpdateBuilder::new(dataset)
+            .set("name", "'bar' || cast(id as string)")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        let actual_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual_batch = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+
+        let expected = RecordBatch::try_new(
+            Arc::new(dataset.schema().into()),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..30)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..30).map(|i| format!("bar{}", i)),
+                )),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(actual_batch, expected);
+
+        assert_eq!(dataset.get_fragments().len(), 1);
     }
 
     #[tokio::test]
     async fn test_update_conditional() {
-        todo!()
+        let (dataset, _test_dir) = make_test_dataset().await;
+
+        let original_fragments = dataset.get_fragments();
+
+        let dataset = UpdateBuilder::new(dataset)
+            .update_where("id >= 15")
+            .unwrap()
+            .set("name", "'bar' || cast(id as string)")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        let actual_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual_batch = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+
+        let expected = RecordBatch::try_new(
+            Arc::new(dataset.schema().into()),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..30)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..15)
+                        .map(|_| "foo".to_string())
+                        .chain((15..30).map(|i| format!("bar{}", i))),
+                )),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(actual_batch, expected);
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 3);
+
+        // One fragment not touched (id = 0..10)
+        assert_eq!(fragments[0].metadata, original_fragments[0].metadata,);
+        // One fragment partially modified (id = 10..15)
+        assert_eq!(
+            fragments[1].metadata.files,
+            original_fragments[1].metadata.files,
+        );
+        assert_eq!(
+            fragments[1]
+                .metadata
+                .deletion_file
+                .as_ref()
+                .and_then(|f| f.num_deleted_rows),
+            Some(5)
+        );
+        // One fragment fully modified
+        assert_eq!(fragments[2].metadata.physical_rows, Some(15));
     }
 }
