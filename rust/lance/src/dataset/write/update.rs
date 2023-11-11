@@ -40,6 +40,8 @@ use crate::{Error, Result};
 /// let dataset = UpdateBuilder::new()
 ///     .update_where("region_id = 10")
 ///     .set("region_name", "New York")
+///     .build?
+///     .execute()
 ///     .await?;
 /// ```
 ///
@@ -87,6 +89,17 @@ impl UpdateBuilder {
                 ),
                 location!(),
             ));
+        }
+
+        if column.as_ref().contains('.') {
+            return Err(Error::NotSupported {
+                source: format!(
+                    "Nested column references are not yet supported. Referenced: {}",
+                    column.as_ref(),
+                )
+                .into(),
+                location: location!(),
+            });
         }
 
         let planner = Planner::new(Arc::new(self.dataset.schema().into()));
