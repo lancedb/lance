@@ -100,6 +100,7 @@ mod tests {
             MetricType::L2,
         ));
         let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
+        assert_eq!(session.index_cache.get_size(), 0);
         session.index_cache.insert_vector("abc", idx.clone());
 
         let found = session.index_cache.get_vector("abc");
@@ -107,6 +108,7 @@ mod tests {
         assert_eq!(format!("{:?}", found.unwrap()), format!("{:?}", idx));
         assert!(session.index_cache.get_vector("abc").is_some());
         assert_eq!(session.index_cache.len_vector(), 1);
+        assert_eq!(session.index_cache.get_size(), 1);
 
         for iter_idx in 0..100 {
             let pq_other = Arc::new(ProductQuantizerImpl::<Float32Type>::new(

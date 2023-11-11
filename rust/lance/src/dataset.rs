@@ -2527,7 +2527,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(dataset.index_cache_size(), 0);
 
         let index = dataset.load_index_by_name(&index_name).await.unwrap();
 

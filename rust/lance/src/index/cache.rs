@@ -39,6 +39,12 @@ impl IndexCache {
         self.vector_cache.entry_count() as usize
     }
 
+    pub(crate) fn get_size(&self) -> usize {
+        self.scalar_cache.sync();
+        self.vector_cache.sync();
+        self.scalar_cache.entry_count() as usize + self.vector_cache.entry_count() as usize
+    }
+
     /// Get an Index if present. Otherwise returns [None].
     pub(crate) fn get_scalar(&self, key: &str) -> Option<Arc<dyn ScalarIndex>> {
         self.scalar_cache.get(key)
@@ -55,11 +61,5 @@ impl IndexCache {
 
     pub(crate) fn insert_vector(&self, key: &str, index: Arc<dyn VectorIndex>) {
         self.vector_cache.insert(key.to_string(), index);
-    }
-
-    pub(crate) fn get_size(&self) -> usize {
-        self.scalar_cache.sync();
-        self.vector_cache.sync();
-        self.scalar_cache.entry_count() as usize + self.vector_cache.entry_count() as usize
     }
 }
