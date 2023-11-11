@@ -465,3 +465,21 @@ def test_knn_with_deletions(tmp_path):
     assert len(results) == 10
 
     assert expected == [r.as_py() for r in results]
+
+
+def test_index_cache_size(dataset, tmp_path):
+    dataset_uri = tmp_path / "dataset.lance"
+    assert not dataset.has_index
+    ds = lance.write_dataset(dataset.to_table(), dataset_uri)
+    assert ds.index_cache_size == 0
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=2,
+    )
+    assert ds.index_cache_size == 0
+
+    tbl = create_table(nvec=200)
+    ds = lance.write_dataset(tbl, dataset_uri, mode="append")
+    assert ds.index_cache_size == 0

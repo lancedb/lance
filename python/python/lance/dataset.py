@@ -641,6 +641,13 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.version()
 
     @property
+    def index_cache_size(self) -> int:
+        """
+        Returns the index cache size of the dataset
+        """
+        return self._ds.index_cache_size()
+
+    @property
     def latest_version(self) -> int:
         """
         Returns the lastest version of the dataset

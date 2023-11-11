@@ -56,4 +56,10 @@ impl IndexCache {
     pub(crate) fn insert_vector(&self, key: &str, index: Arc<dyn VectorIndex>) {
         self.vector_cache.insert(key.to_string(), index);
     }
+
+    pub(crate) fn get_size(&self) -> usize {
+        self.scalar_cache.sync();
+        self.vector_cache.sync();
+        self.scalar_cache.entry_count() as usize + self.vector_cache.entry_count() as usize
+    }
 }

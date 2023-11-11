@@ -771,6 +771,10 @@ impl Dataset {
         }
     }
 
+    fn index_cache_size(&self) -> PyResult<usize> {
+        Ok(self.ds.index_cache_size())
+    }
+
     #[staticmethod]
     fn commit(
         dataset_uri: &str,

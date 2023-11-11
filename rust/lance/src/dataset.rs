@@ -1210,6 +1210,10 @@ impl Dataset {
         Version::from(self.manifest.as_ref())
     }
 
+    pub fn index_cache_size(&self) -> usize {
+        self.session.index_cache.get_size()
+    }
+
     /// Get all versions.
     pub async fn versions(&self) -> Result<Vec<Version>> {
         let mut versions: Vec<Version> = self
@@ -2523,6 +2527,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(dataset.index_cache_size(), 0);
 
         let index = dataset.load_index_by_name(&index_name).await.unwrap();
 
