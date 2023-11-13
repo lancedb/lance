@@ -18,7 +18,7 @@
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Union, Iterable
+from typing import TYPE_CHECKING, Iterable, Optional, Union
 
 import numpy as np
 import pyarrow as pa
