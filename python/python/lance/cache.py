@@ -25,7 +25,7 @@ class CachedDataset:
         stream: Iterable[pa.RecordBatch],
         cache: Optional[Union[str, Path]] = None,
     ):
-        if cache is None:
+        if cache is None or cache is True:
             self.cache_dir = TemporaryDirectory(
                 prefix="lance-torch-dataset", ignore_cleanup_errors=True
             )
@@ -50,7 +50,7 @@ class CachedDataset:
             writer: pa.ipc.RecordBatchFileWriter = None
             for batch in self.stream:
                 if writer is None:
-                    self.cache_file = self.cache_dir / "cache.arrow"
+                    self.cache_file = Path(self.cache_dir.name) / "cache.arrow"
                     writer = pa.ipc.new_stream(str(self.cache_file), batch.schema)
                 writer.write(batch)
                 yield batch

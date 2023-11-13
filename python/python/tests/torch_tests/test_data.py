@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import shutil
 
 import lance
 import numpy as np
@@ -30,9 +31,19 @@ def test_iter_over_dataset(tmp_path):
 
     ds = lance.write_dataset(tbl, tmp_path / "data.lance")
 
-    torch_ds = LanceDataset(ds, batch_size=256, samples=2048, columns=["ids", "vec"])
+    torch_ds = LanceDataset(
+        ds, batch_size=256, samples=2048, columns=["ids", "vec"], cache=True
+    )
 
     for batch in torch_ds:
         assert set(batch.keys()) == {"ids", "vec"}
         assert batch["ids"].dtype == torch.int32
-        assert batch["vec"].shape[0] == 32
+        assert batch["vec"].shape[1] == 32
+
+    shutil.rmtree(tmp_path / "data.lance")
+
+    # it should read from cache this time.
+    for batch in torch_ds:
+        assert set(batch.keys()) == {"ids", "vec"}
+        assert batch["ids"].dtype == torch.int32
+        assert batch["vec"].shape[1] == 32
