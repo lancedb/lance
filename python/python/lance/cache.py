@@ -39,6 +39,7 @@ class CachedDataset:
             raise ValueError(f"Unsupported cache type: {type(cache)}")
         self.cache_file = None
         self.stream = stream
+        self.finished_origin_stream = False
 
     def __del__(self):
         if self.cache_dir is not None:
@@ -56,8 +57,13 @@ class CachedDataset:
                 writer.write(batch)
                 yield batch
             writer.close()
+            self.finished_origin_stream = True
         else:
             # Follow up iteration
+            if not self.finished_origin_stream:
+                raise RuntimeError(
+                    "CachedDataset: the iteration over original data has not finished"
+                )
             reader = pa.ipc.open_stream(self.cache_file)
             for batch in reader:
                 yield batch
