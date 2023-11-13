@@ -37,7 +37,9 @@ def _to_tensor(batch: pa.RecordBatch) -> dict[str, torch.Tensor]:
     ret = {}
     for col in batch.column_names:
         arr: pa.Array = batch[col]
-        if pa.types.is_fixed_size_list(arr.type):
+        if pa.types.is_fixed_size_list(arr.type) and pa.types.is_floating(
+            arr.type.value_type
+        ):
             tensor = torch.tensor(np.stack(arr.to_numpy(zero_copy_only=False)))
         elif (
             pa.types.is_integer(arr.type)
@@ -55,6 +57,8 @@ def _to_tensor(batch: pa.RecordBatch) -> dict[str, torch.Tensor]:
 
 
 class LanceDataLoader(IterDataPipe):
+    """PyTorch data pipeline."""
+
     def __init__(
         self,
         dataset: LanceDataset,

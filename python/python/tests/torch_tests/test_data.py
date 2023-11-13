@@ -32,4 +32,11 @@ def test_iter_over_dataset(tmp_path):
     ds = lance.write_dataset(tbl, tmp_path / "data.lance")
 
     loader = LanceDataLoader(ds, batch_size=256, samples=2048, columns=["ids", "vec"])
-    print(list(loader.__iter__()))
+
+    cache_file = tmp_path / "cache.data"
+    def _filepath_fn(data):
+        return str(cache_file)
+
+    dp = loader.on_disk_cache(filepath_fn=_filepath_fn).end_caching()
+    for a in dp:
+        print(a)
