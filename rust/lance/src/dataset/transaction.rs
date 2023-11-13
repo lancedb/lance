@@ -133,8 +133,6 @@ pub enum Operation {
 
     /// Updates values in the dataset.
     Update {
-        /// The columns that have been updated
-        columns_updated: Vec<String>,
         /// Ids of fragments that have been moved
         removed_fragment_ids: Vec<u64>,
         /// Fragments that have been updated
@@ -411,7 +409,6 @@ impl Transaction {
                 });
             }
             Operation::Update {
-                columns_updated: _,
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
@@ -702,12 +699,10 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 Operation::Restore { version: *version }
             }
             Some(pb::transaction::Operation::Update(pb::transaction::Update {
-                columns_updated,
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
             })) => Operation::Update {
-                columns_updated: columns_updated.clone(),
                 removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments.iter().map(Fragment::from).collect(),
                 new_fragments: new_fragments.iter().map(Fragment::from).collect(),
@@ -832,12 +827,10 @@ impl From<&Transaction> for pb::Transaction {
                 pb::transaction::Operation::Restore(pb::transaction::Restore { version: *version })
             }
             Operation::Update {
-                columns_updated,
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
-                columns_updated: columns_updated.clone(),
                 removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments
                     .iter()

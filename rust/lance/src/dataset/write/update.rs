@@ -273,9 +273,7 @@ impl UpdateJob {
         updated_fragments: Vec<Fragment>,
         new_fragments: Vec<Fragment>,
     ) -> Result<Arc<Dataset>> {
-        let columns_updated = self.updates.keys().cloned().collect::<Vec<_>>();
         let operation = Operation::Update {
-            columns_updated,
             removed_fragment_ids,
             updated_fragments,
             new_fragments,

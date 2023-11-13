@@ -156,16 +156,13 @@ message Transaction {
 
   // An operation that updates rows but does not add or remove rows.
   message Update {
-    // The columns that have been updated. This can be used to determine whether
-    // relevant indices need to be updated.
-    repeated string columns_updated = 1;
     // The fragments that have been removed. These are fragments where all rows
     // have been updated and moved to a new fragment.
-    repeated uint64 removed_fragment_ids = 2;
+    repeated uint64 removed_fragment_ids = 1;
     // The fragments that have been updated.
-    repeated DataFragment updated_fragments = 3;
+    repeated DataFragment updated_fragments = 2;
     // The new fragments where updated rows have been moved to.
-    repeated DataFragment new_fragments = 4;
+    repeated DataFragment new_fragments = 3;
   }
 
   // The operation of this transaction.
