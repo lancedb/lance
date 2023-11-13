@@ -25,6 +25,7 @@ class CachedDataset:
         stream: Iterable[pa.RecordBatch],
         cache: Optional[Union[str, Path]] = None,
     ):
+        self.cache_dir: Optional[TemporaryDirectory] = None
         if cache is None or cache is True:
             self.cache_dir = TemporaryDirectory(
                 prefix="lance-torch-dataset", ignore_cleanup_errors=True
@@ -41,8 +42,9 @@ class CachedDataset:
         self.stream = stream
 
     def __del__(self):
-        if self.cache_dir:
+        if self.cache_dir is not None:
             self.cache_dir.cleanup()
+            self.cache_dir = None
 
     def __iter__(self):
         if self.cache_file is None:
