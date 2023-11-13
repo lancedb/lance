@@ -36,7 +36,7 @@ def _efficient_sample(
     columns: list[str],
     batch_size: int,
     max_takes: int,
-) -> Generator[pa.RecordBatch]:
+) -> Generator[pa.RecordBatch, None, None]:
     """Sample n records from the dataset.
 
     Parameters
@@ -90,7 +90,7 @@ def maybe_sample(
     columns: Union[list[str], str],
     batch_size: int = 10240,
     max_takes: int = 8194,
-) -> Generator[pa.RecordBatch]:
+) -> Generator[pa.RecordBatch, None, None]:
     """Sample n records from the dataset.
 
     Parameters

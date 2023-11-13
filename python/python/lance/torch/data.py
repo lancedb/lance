@@ -65,7 +65,7 @@ class LanceDataset(IterableDataset):
         dataset: Dataset,
         batch_size: int,
         *args,
-        columns: list[str] = None,
+        columns: Optional[list[str]] = None,
         filter: Optional[str] = None,
         samples: Optional[int] = 0,
         cache: Optional[Union[str, bool]] = None,
