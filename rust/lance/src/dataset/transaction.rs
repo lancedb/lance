@@ -921,6 +921,11 @@ mod tests {
                 rewritten_indices: vec![],
             },
             Operation::ReserveFragments { num_fragments: 3 },
+            Operation::Update {
+                removed_fragment_ids: vec![1],
+                updated_fragments: vec![fragment0.clone()],
+                new_fragments: vec![fragment2.clone()],
+            },
         ];
         let other_transactions = other_operations
             .iter()
@@ -934,7 +939,7 @@ mod tests {
                 Operation::Append {
                     fragments: vec![fragment0.clone()],
                 },
-                [false, false, false, true, true, false, false],
+                [false, false, false, true, true, false, false, false],
             ),
             (
                 Operation::Delete {
@@ -943,7 +948,7 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [true, false, false, true, true, false, false],
+                [true, false, false, true, true, false, false, true],
             ),
             (
                 Operation::Delete {
@@ -952,7 +957,7 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [true, false, true, true, true, true, false],
+                [true, false, true, true, true, true, false, true],
             ),
             (
                 Operation::Overwrite {
@@ -961,7 +966,7 @@ mod tests {
                 },
                 // No conflicts: overwrite can always happen since it doesn't
                 // depend on previous state of the table.
-                [false, false, false, false, false, false, false],
+                [false, false, false, false, false, false, false, false],
             ),
             (
                 Operation::CreateIndex {
@@ -969,7 +974,7 @@ mod tests {
                     removed_indices: vec![index0.clone()],
                 },
                 // Will only conflict with operations that modify row ids.
-                [false, false, false, false, true, true, false],
+                [false, false, false, false, true, true, false, false],
             ),
             (
                 // Rewrite that affects different fragments
@@ -980,7 +985,7 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                 },
-                [false, true, false, true, true, false, false],
+                [false, true, false, true, true, false, false, true],
             ),
             (
                 // Rewrite that affects the same fragments
@@ -991,7 +996,7 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                 },
-                [false, true, true, true, true, true, false],
+                [false, true, true, true, true, true, false, true],
             ),
             (
                 Operation::Merge {
@@ -999,12 +1004,21 @@ mod tests {
                     schema: Schema::default(),
                 },
                 // Merge conflicts with everything except CreateIndex and ReserveFragments.
-                [true, false, true, true, true, true, false],
+                [true, false, true, true, true, true, false, true],
             ),
             (
                 Operation::ReserveFragments { num_fragments: 2 },
                 // ReserveFragments only conflicts with Overwrite and Restore.
-                [false, false, false, false, true, false, false],
+                [false, false, false, false, true, false, false, false],
+            ),
+            (
+                Operation::Update {
+                    // Delete that affects same fragments as other transactions
+                    updated_fragments: vec![fragment0.clone()],
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![fragment2.clone()],
+                },
+                [true, false, true, true, true, true, false, true],
             ),
         ];
 
