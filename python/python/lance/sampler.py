@@ -64,6 +64,7 @@ def _efficient_sample(
     chunk_size = total_records // max_takes
     chunk_sample_size = n // max_takes
     for i in range(0, total_records, chunk_size):
+        # Add more randomness within each chunk.
         offset = i + np.random.randint(0, chunk_size - chunk_sample_size)
         buf.extend(
             dataset.to_batches(
@@ -121,7 +122,7 @@ def maybe_sample(
 
     if n >= len(dataset):
         # Dont have enough data in the dataset. Just do a full scan
-        dataset.to_batches(columns=columns, batch_size=batch_size)
+        yield from dataset.to_batches(columns=columns, batch_size=batch_size)
     else:
         if n > max_takes:
             yield from _efficient_sample(dataset, n, columns, batch_size, max_takes)

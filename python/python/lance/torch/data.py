@@ -21,16 +21,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-import torch
-from torchdata.datapipes.iter import IterDataPipe
 import pyarrow as pa
+import torch
+from torch.utils.data import IterableDataset
 
 from ..sampler import maybe_sample
 
 if TYPE_CHECKING:
-    from .. import LanceDataset
+    from .. import LanceDataset as Dataset
 
-__all__ = ["LanceDataLoader"]
+__all__ = ["LanceDataset"]
 
 
 def _to_tensor(batch: pa.RecordBatch) -> dict[str, torch.Tensor]:
@@ -56,15 +56,17 @@ def _to_tensor(batch: pa.RecordBatch) -> dict[str, torch.Tensor]:
     return ret
 
 
-class LanceDataLoader(IterDataPipe):
-    """PyTorch data pipeline."""
+class LanceDataset(IterableDataset):
+    """PyTorch IterableDataset over LanceDataset.
+    """
 
     def __init__(
         self,
-        dataset: LanceDataset,
+        dataset: Dataset,
         batch_size: int,
         *args,
         columns: list[str] = None,
+        filter: Optional[str] = None,
         samples: Optional[int] = 0,
         **kwargs,
     ):
@@ -74,14 +76,19 @@ class LanceDataLoader(IterDataPipe):
         self.batch_size = batch_size
         self.samples: Optional[int] = samples
 
+        if samples is not None and filter is not None:
+            raise ValueError("Does not support sampling over filtered dataset")
+
     def __iter__(self):
         if self.samples:
+            # Support samples
             for batch in maybe_sample(
                 self.dataset, n=self.samples, columns=self.columns
             ):
                 yield _to_tensor(batch)
         else:
+            # Normal scan
             for batch in self.dataset.to_batches(
-                columns=self.columns, batch_size=self.batch_size
+                columns=self.columns, batch_size=self.batch_size, filter=filter,
             ):
                 yield _to_tensor(batch)
