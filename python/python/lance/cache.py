@@ -28,12 +28,11 @@ class CachedDataset:
         self.cache_dir: Optional[TemporaryDirectory] = None
         if cache is None or cache is True:
             self.cache_dir = TemporaryDirectory(
-                prefix="lance-torch-dataset", ignore_cleanup_errors=True
+                prefix="lance-torch-dataset",
             )
         elif isinstance(cache, (str, Path)):
             self.cache_dir = TemporaryDirectory(
                 prefix="lance-torch-dataset",
-                ignore_cleanup_errors=True,
                 dir=cache,
             )
         else:
