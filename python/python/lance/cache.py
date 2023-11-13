@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import atexit
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Iterable, Optional, Union
@@ -41,10 +42,24 @@ class CachedDataset:
         self.stream = stream
         self.finished_origin_stream = False
 
-    def __del__(self):
+        atexit.register(lambda x: x.close(), self)
+
+    def close(self):
+        """Close the dataset and delete tmp files"""
         if self.cache_dir is not None:
             self.cache_dir.cleanup()
             self.cache_dir = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        if exc_type is not None:
+            raise
+
+    def __del__(self):
+        self.close()
 
     def __iter__(self):
         if self.cache_file is None:
