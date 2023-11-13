@@ -53,8 +53,12 @@ def _efficient_sample(
         The maximum number of takes to perform. This is used to limit the number of
         random reads. Large enough value can give a good random sample without
         having to issue too much random reads.
+
+    Returns
+    -------
+    Generator of a RecordBatch.
     """
-    buf: list[pa.Table] = []
+    buf: list[pa.RecordBatch] = []
     total_records = len(dataset)
     assert total_records > n
     chunk_size = total_records // max_takes
@@ -70,10 +74,13 @@ def _efficient_sample(
             )
         )
         if sum([len(b) for b in buf]) >= batch_size:
-            yield pa.Table.from_batches(buf)
+            tbl = pa.Table.from_batches(buf)
             buf.clear()
+            tbl = tbl.combine_chunks()
+            yield tbl.to_batches()[0]
     if buf:
-        yield pa.Table.from_batches(buf)
+        tbl = pa.Table.from_batches(buf).combine_chunks()
+        yield tbl.to_batches()[0]
 
 
 def maybe_sample(
@@ -120,4 +127,5 @@ def maybe_sample(
             yield from _efficient_sample(dataset, n, columns, batch_size, max_takes)
         else:
             choices = np.random.choice(len(dataset), n, replace=False)
-            yield dataset.take_rows(choices, columns=columns)
+            tbl = dataset._take_rows(choices, columns=columns).combine_chunks()
+            yield tbl.to_batches()[0]

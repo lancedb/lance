@@ -14,3 +14,21 @@
 
 """Read Lance dataset as torch DataPipe.
 """
+
+# PEP-585. Can be removed after deprecating python 3.8 support.
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from torchdata.datapipes.iter import IterDataPipe
+
+if TYPE_CHECKING:
+    from .. import LanceDataset
+
+
+class LanceDataLoader(IterDataPipe):
+    def __init__(self, dataset: LanceDataset, batch_size: int, *args, **kwargs):
+        super().__init__(**kwargs)
+        self.dataset = dataset
+        self.batch_size = batch_size
+

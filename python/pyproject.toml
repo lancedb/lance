@@ -62,6 +62,10 @@ tests = [
 benchmarks = [
     "pytest-benchmark",
 ]
+torch = [
+    "torch",
+    "torchdata",
+]
 
 [tool.ruff]
 select = ["F", "E", "W", "I", "G", "TCH", "PERF"]
