@@ -49,7 +49,7 @@ class CachedDataset:
     def __iter__(self):
         if self.cache_file is None:
             # First iteration.
-            writer: pa.ipc.RecordBatchFileWriter = None
+            writer: Optional[pa.ipc.RecordBatchFileWriter] = None
             for batch in self.stream:
                 if writer is None:
                     self.cache_file = Path(self.cache_dir.name) / "cache.arrow"

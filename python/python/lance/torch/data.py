@@ -18,7 +18,7 @@
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Union, Iterable
 
 import numpy as np
 import pyarrow as pa
@@ -84,6 +84,7 @@ class LanceDataset(IterableDataset):
         self.cached_ds: Optional[CachedDataset] = None
 
     def __iter__(self):
+        stream: Iterable[pa.RecordBatch]
         if self.cached_ds:
             stream = self.cached_ds
         else:
