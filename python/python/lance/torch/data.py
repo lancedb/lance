@@ -86,22 +86,21 @@ class LanceDataset(IterableDataset):
     def __iter__(self):
         if self.cached_ds:
             stream = self.cached_ds
-        elif self.samples:
-            stream = maybe_sample(
-                self.dataset,
-                n=self.samples,
-                columns=self.columns,
-                batch_size=self.batch_size,
-            )
-            if self.cache:
-                self.cached_ds = CachedDataset(stream, cache=self.cache)
-                stream = self.cached_ds
         else:
-            stream = self.dataset.to_batches(
-                columns=self.columns,
-                batch_size=self.batch_size,
-                filter=filter,
-            )
+            if self.samples:
+                stream = maybe_sample(
+                    self.dataset,
+                    n=self.samples,
+                    columns=self.columns,
+                    batch_size=self.batch_size,
+                )
+            else:
+                stream = self.dataset.to_batches(
+                    columns=self.columns,
+                    batch_size=self.batch_size,
+                    filter=filter,
+                )
+
             if self.cache:
                 self.cached_ds = CachedDataset(stream, cache=self.cache)
                 stream = self.cached_ds
