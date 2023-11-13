@@ -33,5 +33,3 @@ def test_iter_over_dataset(tmp_path):
 
     loader = LanceDataLoader(ds, batch_size=256, samples=2048, columns=["ids", "vec"])
     print(list(loader.__iter__()))
-
-

@@ -43,4 +43,3 @@ def test_sample_dataset(tmp_path: Path):
     assert isinstance(large_scan[0], pa.RecordBatch)
     assert large_scan[0].schema == pa.schema([pa.field("vec", fsl.type)])
     assert large_scan[0].num_rows == 128
-

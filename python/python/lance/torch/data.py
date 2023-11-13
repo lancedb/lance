@@ -39,16 +39,32 @@ def _to_tensor(batch: pa.RecordBatch) -> dict[str, torch.Tensor]:
         arr: pa.Array = batch[col]
         if pa.types.is_fixed_size_list(arr.type):
             tensor = torch.tensor(np.stack(arr.to_numpy(zero_copy_only=False)))
-        else:
+        elif (
+            pa.types.is_integer(arr.type)
+            or pa.types.is_floating(arr.type)
+            or pa.types.is_boolean(arr.type)
+        ):
             tensor = torch.from_numpy(arr.to_numpy(zero_copy_only=False))
+        else:
+            raise ValueError(
+                "Only support FixedSizeList<f16/f32/f64> or "
+                + f"numeric values, got: {arr.type}"
+            )
         ret[col] = tensor
     return ret
 
 
 class LanceDataLoader(IterDataPipe):
-    def __init__(self, dataset: LanceDataset, batch_size: int, *args, columns: list[str] = None,
-                 samples: Optional[int] = 0, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(
+        self,
+        dataset: LanceDataset,
+        batch_size: int,
+        *args,
+        columns: list[str] = None,
+        samples: Optional[int] = 0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
         self.dataset = dataset
         self.columns = columns
         self.batch_size = batch_size
@@ -56,8 +72,12 @@ class LanceDataLoader(IterDataPipe):
 
     def __iter__(self):
         if self.samples:
-            for batch in maybe_sample(self.dataset, n=self.samples, columns=self.columns):
+            for batch in maybe_sample(
+                self.dataset, n=self.samples, columns=self.columns
+            ):
                 yield _to_tensor(batch)
         else:
-            for batch in self.dataset.to_batches(columns=self.columns, batch_size=self.batch_size):
+            for batch in self.dataset.to_batches(
+                columns=self.columns, batch_size=self.batch_size
+            ):
                 yield _to_tensor(batch)
