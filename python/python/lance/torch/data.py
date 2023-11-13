@@ -18,13 +18,14 @@
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
 import pyarrow as pa
 import torch
 from torch.utils.data import IterableDataset
 
+from ..cache import CachedDataset
 from ..sampler import maybe_sample
 
 if TYPE_CHECKING:
@@ -57,8 +58,7 @@ def _to_tensor(batch: pa.RecordBatch) -> dict[str, torch.Tensor]:
 
 
 class LanceDataset(IterableDataset):
-    """PyTorch IterableDataset over LanceDataset.
-    """
+    """PyTorch IterableDataset over LanceDataset."""
 
     def __init__(
         self,
@@ -68,6 +68,7 @@ class LanceDataset(IterableDataset):
         columns: list[str] = None,
         filter: Optional[str] = None,
         samples: Optional[int] = 0,
+        cache: Optional[Union[str, bool]] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -79,16 +80,31 @@ class LanceDataset(IterableDataset):
         if samples is not None and filter is not None:
             raise ValueError("Does not support sampling over filtered dataset")
 
+        self.cache = cache
+        self.cached_ds: Optional[CachedDataset] = None
+
     def __iter__(self):
-        if self.samples:
-            # Support samples
-            for batch in maybe_sample(
-                self.dataset, n=self.samples, columns=self.columns
-            ):
-                yield _to_tensor(batch)
+        if self.cached_ds:
+            stream = self.cached_ds
+        elif self.samples:
+            stream = maybe_sample(
+                self.dataset,
+                n=self.samples,
+                columns=self.columns,
+                batch_size=self.batch_size,
+            )
+            if self.cache:
+                self.cached_ds = CachedDataset(stream, cache=self.cache)
+                stream = self.cached_ds
         else:
-            # Normal scan
-            for batch in self.dataset.to_batches(
-                columns=self.columns, batch_size=self.batch_size, filter=filter,
-            ):
-                yield _to_tensor(batch)
+            stream = self.dataset.to_batches(
+                columns=self.columns,
+                batch_size=self.batch_size,
+                filter=filter,
+            )
+            if self.cache:
+                self.cached_ds = CachedDataset(stream, cache=self.cache)
+                stream = self.cached_ds
+
+        for batch in stream:
+            yield _to_tensor(batch)

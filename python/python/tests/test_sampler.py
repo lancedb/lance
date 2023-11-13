@@ -14,10 +14,9 @@
 
 from pathlib import Path
 
+import lance
 import numpy as np
 import pyarrow as pa
-
-import lance
 from lance.sampler import maybe_sample
 
 

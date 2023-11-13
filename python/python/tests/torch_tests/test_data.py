@@ -13,11 +13,10 @@
 #  limitations under the License.
 
 
-import torch
-import torchdata.datapipes.iter.util
+import lance
 import numpy as np
 import pyarrow as pa
-import lance
+import torch
 from lance.torch.data import LanceDataset
 
 
@@ -26,13 +25,14 @@ def test_iter_over_dataset(tmp_path):
     data = np.random.random(10240 * 32).astype("f")
 
     fsl = pa.FixedSizeListArray.from_arrays(data, 32)
-    ids = pa.array(range(0, 10240))
+    ids = pa.array(range(0, 10240), type=pa.int32())
     tbl = pa.Table.from_arrays([ids, fsl], ["ids", "vec"])
 
     ds = lance.write_dataset(tbl, tmp_path / "data.lance")
 
     torch_ds = LanceDataset(ds, batch_size=256, samples=2048, columns=["ids", "vec"])
 
-    for a in torch_ds:
-        assert a.keys() == ["ids", "vec"]
-        print(a)
+    for batch in torch_ds:
+        assert set(batch.keys()) == {"ids", "vec"}
+        assert batch["ids"].dtype == torch.int32
+        assert batch["vec"].shape[0] == 32
