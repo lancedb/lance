@@ -23,7 +23,7 @@ class CachedDataset:
     def __init__(
         self,
         stream: Iterable[pa.RecordBatch],
-        cache: Optional[Union[str, Path]] = None,
+        cache: Optional[Union[str, Path, bool]] = None,
     ):
         self.cache_dir: Optional[TemporaryDirectory] = None
         if cache is None or cache is True:
