@@ -93,12 +93,19 @@ will provide debug symbols for profiling.)
 Then you can run the benchmarks with
 
 ```shell
-pytest python/benchmarks
+pytest python/benchmarks -m "not slow"
 ```
 
 Note: the first time you run the benchmarks, they may take a while, since they
 will write out test datasets and build vector indices. Once these are built,
 they are re-used between benchmark runs.
+
+Some benchmarks are especially slow, so they are skipped `-m "not slow"`. To run
+the slow benchmarks, use:
+
+```shell
+pytest python/benchmarks
+```
 
 ### Run a particular benchmark
 
@@ -145,11 +152,11 @@ the benchmarks again with `--benchmark-compare`.
 CURRENT_BRANCH=$(git branch --show-current)
 git checkout main
 maturin develop --profile release-with-debug  --features datagen
-pytest --benchmark-save=baseline python/benchmarks
+pytest --benchmark-save=baseline python/benchmarks -m "not slow"
 COMPARE_ID=$(ls .benchmarks/*/ | tail -1 | cut -c1-4)
 git checkout $CURRENT_BRANCH
 maturin develop --profile release-with-debug  --features datagen
-pytest --benchmark-compare=$COMPARE_ID python/benchmarks
+pytest --benchmark-compare=$COMPARE_ID python/benchmarks -m "not slow"
 ```
 
 ## Tracing

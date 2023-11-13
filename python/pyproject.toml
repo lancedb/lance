@@ -76,4 +76,4 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 
 [tool.pytest.ini_options]
-markers = ["cuda"]
+markers = ["cuda", "slow"]
