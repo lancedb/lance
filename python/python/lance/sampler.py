@@ -74,7 +74,7 @@ def _efficient_sample(
                 limit=chunk_sample_size,
             )
         )
-        if sum([len(b) for b in buf]) >= batch_size:
+        if sum(len(b) for b in buf) >= batch_size:
             tbl = pa.Table.from_batches(buf)
             buf.clear()
             tbl = tbl.combine_chunks()
