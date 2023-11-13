@@ -14,8 +14,6 @@
 
 //! Extends logical expression.
 
-use std::collections::VecDeque;
-
 use arrow_schema::DataType;
 
 use datafusion::logical_expr::{
@@ -52,13 +50,13 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
 /// If the column is not found in the schema, return None. If the expression is
 /// not a field reference, also returns None.
 pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
-    let mut field_path = VecDeque::new();
+    let mut field_path = Vec::new();
     let mut current_expr = expr;
     // We are looping from outer-most reference to inner-most.
     loop {
         match current_expr {
             Expr::Column(c) => {
-                field_path.push_front(c.name.as_str());
+                field_path.push(c.name.as_str());
                 break;
             }
             Expr::GetIndexedField(GetIndexedField { expr, field }) => {
@@ -66,7 +64,7 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
                     name: ScalarValue::Utf8(Some(name)),
                 } = field
                 {
-                    field_path.push_front(name);
+                    field_path.push(name);
                 } else {
                     // We don't support other kinds of access right now.
                     return None;
@@ -77,7 +75,7 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
         }
     }
 
-    let mut path_iter = field_path.iter();
+    let mut path_iter = field_path.iter().rev();
     let mut field = schema.field(path_iter.next()?)?;
     for name in path_iter {
         if field.data_type().is_struct() {
