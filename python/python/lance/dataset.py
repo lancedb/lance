@@ -694,6 +694,83 @@ class LanceDataset(pa.dataset.Dataset):
             td_to_micros(older_than), delete_unverified
         )
 
+    def create_scalar_index(
+        self,
+        column: Union[str, List[str]],
+        index_type: str,
+        name: Optional[str] = None,
+        replace: bool = True,
+    ) -> LanceDataset:
+        """Create scalar index on column.
+
+        **Experimental API**
+
+        Parameters
+        ----------
+        column : str
+            The column to be indexed.  Must be a boolean, integer, float,
+            or string column.
+        index_type : str
+            The type of the index.  Only ``"BTREE"`` is supported now.
+        name : str, optional
+            The index name. If not provided, it will be generated from the
+            column name.
+        replace : bool, default True
+            Replace the existing index if it exists.
+
+        Examples
+        --------
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/images.lance")
+            dataset.create_index(
+                "category",
+                "BTREE"
+            )
+
+        Experimental Status:
+
+        Scalar indices are experimental and only utilized if there is no new or deleted
+        data that has been uploaded since the index was created.  This limitation should
+        be addressed soon.  In the meantime, ``compact_files`` can be used to remove
+        deletion files and ``optimize_indices`` can be used to catch up the index with
+        new data.
+        """
+        if isinstance(column, str):
+            column = [column]
+
+        if len(column) > 1:
+            raise NotImplementedError(
+                "Scalar indices currently only support a single column"
+            )
+
+        column = column[0]
+        if column not in self.schema.names:
+            raise KeyError(f"{column} not found in schema")
+
+        field = self.schema.field(column)
+        if (
+            not pa.types.is_integer(field.type)
+            and not pa.types.is_floating(field.type)
+            and not pa.types.is_boolean(field.type)
+            and not pa.types.is_string(field.type)
+        ):
+            raise TypeError(
+                f"Scalar index column {column} must be int, float, bool, or str"
+            )
+
+        index_type = index_type.upper()
+        if index_type != "BTREE":
+            raise NotImplementedError(
+                f"Only 'BTREE' is supported for index_type.  Received {index_type}"
+            )
+
+        self._ds.create_index([column], index_type, name, replace)
+        return LanceDataset(self.uri)
+
     def create_index(
         self,
         column: Union[str, List[str]],
@@ -832,6 +909,9 @@ class LanceDataset(pa.dataset.Dataset):
             "dot",
         ]:
             raise ValueError(f"Metric {metric} not supported.")
+
+        kwargs["metric_type"] = metric
+
         index_type = index_type.upper()
         if index_type not in ["IVF_PQ", "DISKANN"]:
             raise NotImplementedError(
@@ -877,9 +957,7 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 kwargs["ivf_centroids"] = ivf_centroids_batch
 
-        kwargs["replace"] = replace
-
-        self._ds.create_index(column, index_type, name, metric, kwargs)
+        self._ds.create_index(column, index_type, name, replace, kwargs)
         return LanceDataset(self.uri)
 
     @staticmethod
