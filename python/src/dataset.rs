@@ -614,7 +614,7 @@ impl Dataset {
 
         // Only VectorParams are supported.
         let params: Box<dyn IndexParams> = match index_type.to_uppercase().as_str() {
-            "BTREE" => Box::new(ScalarIndexParams::default()),
+            "BTREE" => Box::<ScalarIndexParams>::default(),
             "IVF_PQ" => {
                 let mut ivf_params = IvfBuildParams::default();
                 let mut pq_params = PQBuildParams::default();
