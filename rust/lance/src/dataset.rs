@@ -47,7 +47,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::instrument;
 
-mod chunker;
+pub mod builder;
+pub(crate) mod chunker;
+
 pub mod cleanup;
 mod feature_flags;
 pub mod fragment;
@@ -70,7 +72,7 @@ use crate::dataset::index::unindexed_fragments;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{Fragment, Index, Manifest};
-use crate::index::vector::open_index;
+use crate::index::DatasetIndexInternalExt;
 use crate::io::commit::{commit_new_dataset, commit_transaction};
 use crate::session::Session;
 
@@ -92,7 +94,6 @@ pub struct Dataset {
     pub(crate) object_store: Arc<ObjectStore>,
     pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
-
     pub(crate) session: Arc<Session>,
 }
 
@@ -1180,15 +1181,12 @@ impl Dataset {
         Ok(())
     }
 
-    pub fn count_deleted_rows(&self) -> usize {
-        self.manifest
-            .fragments
-            .iter()
-            .map(|f| match f.deletion_file.as_ref() {
-                Some(d) => d.num_deleted_rows,
-                None => 0,
-            })
-            .sum()
+    pub async fn count_deleted_rows(&self) -> Result<usize> {
+        futures::stream::iter(self.get_fragments())
+            .map(|f| async move { f.count_deletions().await })
+            .buffer_unordered(num_cpus::get() * 4)
+            .try_fold(0, |acc, x| futures::future::ready(Ok(acc + x)))
+            .await
     }
 
     pub(crate) fn object_store(&self) -> &ObjectStore {
@@ -1303,6 +1301,22 @@ impl Dataset {
             .find(|idx| idx.name == name)
     }
 
+    pub(crate) async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<Index>> {
+        Ok(self
+            .load_indices()
+            .await?
+            .into_iter()
+            .filter(|idx| idx.fields.len() == 1)
+            .find(|idx| {
+                let field = self.schema().field_by_id(idx.fields[0]);
+                if let Some(field) = field {
+                    field.name == col
+                } else {
+                    false
+                }
+            }))
+    }
+
     /// Find index with a given index_name and return its serialized statistics.
     pub async fn index_statistics(&self, index_name: &str) -> Result<Option<String>> {
         let index_uuid = self
@@ -1311,11 +1325,12 @@ impl Dataset {
             .map(|idx| idx.uuid.to_string());
 
         if let Some(index_uuid) = index_uuid {
-            let index_statistics = open_index(Arc::new(self.clone()), "vector", &index_uuid)
+            let index_statistics = self
+                .open_generic_index("vector", &index_uuid)
                 .await?
                 .statistics()
                 .unwrap();
-            Ok(Some(serde_json::to_string(&index_statistics).unwrap()))
+            Ok(Some(index_statistics))
         } else {
             Ok(None)
         }
@@ -1351,11 +1366,17 @@ impl Dataset {
         }
     }
 
-    pub fn num_small_files(&self, max_rows_per_group: usize) -> usize {
-        self.fragments()
-            .iter()
-            .filter(|f| f.physical_rows < max_rows_per_group)
+    /// Gets the number of files that are so small they don't even have a full
+    /// group. These are considered too small because reading many of them is
+    /// much less efficient than reading a single file because the separate files
+    /// split up what would otherwise be single IO requests into multiple.
+    pub async fn num_small_files(&self, max_rows_per_group: usize) -> usize {
+        futures::stream::iter(self.get_fragments())
+            .map(|f| async move { f.physical_rows().await })
+            .buffered(num_cpus::get() * 4)
+            .try_filter(|row_count| futures::future::ready(*row_count < max_rows_per_group))
             .count()
+            .await
     }
 
     pub async fn validate(&self) -> Result<()> {
@@ -1489,7 +1510,8 @@ mod tests {
     use crate::arrow::FixedSizeListArrayExt;
     use crate::dataset::WriteMode::Overwrite;
     use crate::datatypes::Schema;
-    use crate::index::{vector::VectorIndexParams, DatasetIndexExt, IndexType};
+    use crate::index::scalar::ScalarIndexParams;
+    use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
     use crate::io::deletion::read_deletion_file;
 
     use arrow_array::{
@@ -1504,10 +1526,13 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
+    use lance_core::format::WriterVersion;
+    use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::vector::DIST_COL;
+    use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
@@ -1558,6 +1583,10 @@ mod tests {
 
         let actual_ds = Dataset::open(test_uri).await.unwrap();
         assert_eq!(actual_ds.version().version, 1);
+        assert_eq!(
+            actual_ds.manifest.writer_version,
+            Some(WriterVersion::default())
+        );
         let actual_schema = ArrowSchema::from(actual_ds.schema());
         assert_eq!(&actual_schema, schema.as_ref());
 
@@ -2430,14 +2459,18 @@ mod tests {
         assert_eq!(fragment_bitmap.len(), 1);
         assert!(fragment_bitmap.contains(0));
 
-        let expected_statistics =
-            "{\"index_type\":\"IVF\",\"metric_type\":\"l2\",\"num_partitions\":10";
-        let actual_statistics = dataset
-            .index_statistics("embeddings_idx")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(actual_statistics.starts_with(expected_statistics));
+        let actual_statistics: serde_json::value::Value = serde_json::from_str(
+            &dataset
+                .index_statistics("embeddings_idx")
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let actual_statistics = actual_statistics.as_object().unwrap();
+        assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF");
+        assert_eq!(actual_statistics["metric_type"].as_str().unwrap(), "l2");
+        assert_eq!(actual_statistics["num_partitions"].as_i64().unwrap(), 10);
 
         assert_eq!(
             dataset.index_statistics("non-existent_idx").await.unwrap(),
@@ -2462,6 +2495,43 @@ mod tests {
         let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
         assert_eq!(fragment_bitmap.len(), 1);
         assert!(fragment_bitmap.contains(0));
+    }
+
+    #[tokio::test]
+    async fn test_create_scalar_index() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = gen().col(Some("int".to_string()), array::step::<Int32Type>());
+        // Write 64Ki rows.  We should get 16 4Ki pages
+        let mut dataset = Dataset::write(
+            data.into_reader_rows(RowCount::from(16 * 1024), BatchCount::from(4)),
+            test_uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let index_name = "my_index".to_string();
+
+        dataset
+            .create_index(
+                &["int"],
+                IndexType::Scalar,
+                Some(index_name.clone()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let index = dataset.load_index_by_name(&index_name).await.unwrap();
+
+        assert_eq!(index.dataset_version, 1);
+        assert_eq!(index.fields, vec![0]);
+        assert_eq!(index.name, index_name);
+
+        dataset.index_statistics(&index_name).await.unwrap();
     }
 
     async fn create_bad_file() -> Result<Dataset> {
@@ -2652,7 +2722,7 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
         assert_eq!(dataset.count_fragments(), 2);
-        assert_eq!(dataset.count_deleted_rows(), 0);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 0);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
         assert!(fragments[0].metadata.deletion_file.is_none());
         assert!(fragments[1].metadata.deletion_file.is_none());
@@ -2670,7 +2740,7 @@ mod tests {
         assert!(fragments[1].metadata.deletion_file.is_some());
 
         // The deletion file should contain 20 rows
-        assert_eq!(dataset.count_deleted_rows(), 20);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 20);
         let store = dataset.object_store().clone();
         let path = Path::from_filesystem_path(test_uri).unwrap();
         // First fragment has 0..10 deleted
@@ -2701,7 +2771,7 @@ mod tests {
         dataset.validate().await.unwrap();
 
         // Verify result
-        assert_eq!(dataset.count_deleted_rows(), 30);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 30);
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
         assert!(fragments[0].metadata.deletion_file.is_some());
@@ -2732,7 +2802,7 @@ mod tests {
 
         // Verify the count_deleted_rows only contains the rows from the first fragment
         // i.e. - deleted_rows from the fragment that has been deleted are not counted
-        assert_eq!(dataset.count_deleted_rows(), 20);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 20);
 
         // Append after delete
         let data = sequence_data(0..100);
@@ -2885,8 +2955,42 @@ mod tests {
         let data = RecordBatch::try_new(schema.clone(), vec![vectors]);
         let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
-        dataset.delete("vec IS NOT NULL").await.unwrap();
-        let dataset = Dataset::open(test_uri).await.unwrap();
+        dataset.delete("true").await.unwrap();
+
+        let mut stream = dataset
+            .scan()
+            .nearest(
+                "vec",
+                &Float32Array::from_iter_values((0..128).map(|_| 0.1)),
+                1,
+            )
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+
+        while let Some(batch) = stream.next().await {
+            let schema = batch.unwrap().schema();
+            assert_eq!(schema.fields.len(), 2);
+            assert_eq!(
+                schema.field_with_name("vec").unwrap(),
+                &Field::new(
+                    "vec",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        128
+                    ),
+                    false,
+                )
+            );
+            assert_eq!(
+                schema.field_with_name(DIST_COL).unwrap(),
+                &Field::new(DIST_COL, DataType::Float32, true)
+            );
+        }
+
+        // predicate with redundant whitespace
+        dataset.delete(" True").await.unwrap();
 
         let mut stream = dataset
             .scan()
@@ -3031,8 +3135,8 @@ mod tests {
         let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
         dataset.validate().await.unwrap();
 
-        assert!(dataset.num_small_files(1024) > 0);
-        assert!(dataset.num_small_files(512) == 0);
+        assert!(dataset.num_small_files(1024).await > 0);
+        assert!(dataset.num_small_files(512).await == 0);
     }
 
     #[tokio::test]
@@ -3150,5 +3254,187 @@ mod tests {
             results[2].column(0).as_primitive::<Int32Type>().values(),
             &[1],
         );
+    }
+
+    fn copy_dir_all(
+        src: impl AsRef<std::path::Path>,
+        dst: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<()> {
+        use std::fs;
+        fs::create_dir_all(&dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            if ty.is_dir() {
+                copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+            } else {
+                fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copies a test dataset into a temporary directory, returning the tmpdir.
+    ///
+    /// The `table_path` should be relative to `test_data/` at the root of the
+    /// repo.
+    fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
+        use std::path::PathBuf;
+
+        let mut src = PathBuf::new();
+        src.push(env!("CARGO_MANIFEST_DIR"));
+        src.push("../../test_data");
+        src.push(table_path);
+
+        let test_dir = tempdir().unwrap();
+
+        copy_dir_all(src.as_path(), test_dir.path())?;
+
+        Ok(test_dir)
+    }
+
+    #[tokio::test]
+    async fn test_v0_7_5_migration() {
+        // We migrate to add Fragment.physical_rows and DeletionFile.num_deletions
+        // after this version.
+
+        // Copy over table
+        let test_dir = copy_test_data_to_tmp("v0.7.5/with_deletions").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Assert num rows, deletions, and physical rows are all correct.
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.count_rows().await.unwrap(), 90);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
+        let total_physical_rows = futures::stream::iter(dataset.get_fragments())
+            .then(|f| async move { f.physical_rows().await })
+            .try_fold(0, |acc, x| async move { Ok(acc + x) })
+            .await
+            .unwrap();
+        assert_eq!(total_physical_rows, 100);
+
+        // Append 5 rows
+        let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(100..105))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Assert num rows, deletions, and physical rows are all correct.
+        assert_eq!(dataset.count_rows().await.unwrap(), 95);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
+        let total_physical_rows = futures::stream::iter(dataset.get_fragments())
+            .then(|f| async move { f.physical_rows().await })
+            .try_fold(0, |acc, x| async move { Ok(acc + x) })
+            .await
+            .unwrap();
+        assert_eq!(total_physical_rows, 105);
+
+        dataset.validate().await.unwrap();
+
+        // Scan data and assert it is as expected.
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(
+                (0..10).chain(20..105),
+            ))],
+        )
+        .unwrap();
+        let actual_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_fix_v0_8_0_broken_migration() {
+        // The migration from v0.7.5 was broken in 0.8.0. This validates we can
+        // automatically fix tables that have this problem.
+
+        // Copy over table
+        let test_dir = copy_test_data_to_tmp("v0.8.0/migrated_from_v0.7.5").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Assert num rows, deletions, and physical rows are all correct, even
+        // though stats are bad.
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.count_rows().await.unwrap(), 92);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 10);
+        let total_physical_rows = futures::stream::iter(dataset.get_fragments())
+            .then(|f| async move { f.physical_rows().await })
+            .try_fold(0, |acc, x| async move { Ok(acc + x) })
+            .await
+            .unwrap();
+        assert_eq!(total_physical_rows, 102);
+
+        // Append 5 rows to table.
+        let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(100..105))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Assert statistics are all now correct.
+        let physical_rows: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata.physical_rows)
+            .collect();
+        assert_eq!(physical_rows, vec![Some(100), Some(2), Some(5)]);
+        let num_deletions: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| {
+                f.metadata
+                    .deletion_file
+                    .as_ref()
+                    .and_then(|df| df.num_deleted_rows)
+            })
+            .collect();
+        assert_eq!(num_deletions, vec![Some(10), None, None]);
+        assert_eq!(dataset.count_rows().await.unwrap(), 97);
+
+        // Scan data and assert it is as expected.
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(
+                (0..10).chain(20..100).chain(0..2).chain(100..105),
+            ))],
+        )
+        .unwrap();
+        let actual_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+        assert_eq!(actual, expected);
     }
 }

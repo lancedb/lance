@@ -17,13 +17,16 @@
 //! Based on the query, we might have information about which fragment ids and
 //! row ids can be excluded from the search.
 
+use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use futures::future;
 use futures::stream;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::utils::mask::RowIdMask;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use tracing::instrument;
 use tracing::Instrument;
@@ -34,29 +37,28 @@ use crate::format::RowAddress;
 use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
 
+/// A trait to be implemented by anything supplying a prefilter row id mask
 #[async_trait]
-pub trait AllowListLoader: Send + 'static {
-    async fn load(self: Box<Self>) -> Result<Arc<RoaringTreemap>>;
+pub trait FilterLoader: Send + 'static {
+    async fn load(self: Box<Self>) -> Result<RowIdMask>;
 }
 
 /// Filter out row ids that we know are not relevant to the query.
 ///
-/// This could be both rows that are deleted (block_list) or a prefilter
-/// that should be applied to the search (allow_list)
+/// This could be both rows that are deleted or a prefilter
+/// that should be applied to the search
 pub struct PreFilter {
     // Expressing these as tasks allows us to start calculating the block list
     // and allow list at the same time we start searching the query.  We will await
     // these tasks only when we've done as much work as we can without them.
-    block_list: Option<Arc<SharedPrerequisite<Arc<RoaringTreemap>>>>,
-    allow_list: Option<Arc<SharedPrerequisite<Arc<RoaringTreemap>>>>,
+    deleted_ids: Option<Arc<SharedPrerequisite<Arc<RoaringTreemap>>>>,
+    filtered_ids: Option<Arc<SharedPrerequisite<RowIdMask>>>,
+    // When the tasks are finished this is the combined filter
+    final_mask: Mutex<OnceCell<RowIdMask>>,
 }
 
 impl PreFilter {
-    pub fn new(
-        dataset: Arc<Dataset>,
-        index: Index,
-        allow_list: Option<Box<dyn AllowListLoader>>,
-    ) -> Self {
+    pub fn new(dataset: Arc<Dataset>, index: Index, filter: Option<Box<dyn FilterLoader>>) -> Self {
         let dataset_ref = dataset.as_ref();
         let mut has_fragment = Vec::new();
         let mut has_deletion_vectors = false;
@@ -74,49 +76,37 @@ impl PreFilter {
         }
         let has_missing_fragments = has_fragment.iter().any(|&x| !x);
         let dataset_clone = dataset.clone();
-        let block_list = if has_missing_fragments || has_deletion_vectors {
+        let deleted_ids = if has_missing_fragments || has_deletion_vectors {
             Some(SharedPrerequisite::spawn(
-                Self::load_block_list(dataset_clone, index).in_current_span(),
+                Self::load_deleted_ids(dataset_clone, index).in_current_span(),
             ))
         } else {
             None
         };
-        let allow_list = allow_list
-            .map(|allow_list| SharedPrerequisite::spawn(allow_list.load().in_current_span()));
+        let filtered_ids = filter
+            .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
         Self {
-            block_list,
-            allow_list,
+            deleted_ids,
+            filtered_ids,
+            final_mask: Mutex::new(OnceCell::new()),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.block_list.is_none() && self.allow_list.is_none()
+        self.deleted_ids.is_none() && self.filtered_ids.is_none()
     }
 
     /// Check whether a single row id should be included in the query.
     pub fn check_one(&self, row_id: u64) -> bool {
-        match (&self.block_list, &self.allow_list) {
-            (Some(block_list), Some(allow_list)) => {
-                let block_list = block_list.get_ready();
-                let allow_list = allow_list.get_ready();
-                allow_list.contains(row_id) && !block_list.contains(row_id)
-            }
-            (Some(block_list), None) => {
-                let block_list = block_list.get_ready();
-                !block_list.contains(row_id)
-            }
-            (None, Some(allow_list)) => {
-                let allow_list = allow_list.get_ready();
-                allow_list.contains(row_id)
-            }
-            (None, None) => {
-                panic!("PreFilter::check_one called but prefilter has nothing to filter with")
-            }
-        }
+        let final_mask = self.final_mask.lock().unwrap();
+        final_mask
+            .get()
+            .expect("check_one called before wait_ready")
+            .selected(row_id)
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn load_block_list(dataset: Arc<Dataset>, index: Index) -> Result<Arc<RoaringTreemap>> {
+    async fn load_deleted_ids(dataset: Arc<Dataset>, index: Index) -> Result<Arc<RoaringTreemap>> {
         let fragments = dataset.get_fragments();
         let frag_id_deletion_vectors = stream::iter(fragments.iter())
             .map(|frag| async move {
@@ -140,7 +130,7 @@ impl PreFilter {
             })
             .try_collect::<Vec<_>>()
             .await?;
-        let mut block_list = RoaringTreemap::from_bitmaps(frag_id_deletion_vectors);
+        let mut deleted_ids = RoaringTreemap::from_bitmaps(frag_id_deletion_vectors);
 
         let frag_ids_in_dataset: HashSet<u32> =
             HashSet::from_iter(fragments.iter().map(|frag| frag.id() as u32));
@@ -148,11 +138,11 @@ impl PreFilter {
             for frag_id in fragment_bitmap.into_iter() {
                 if !frag_ids_in_dataset.contains(&frag_id) {
                     // Entire fragment has been deleted
-                    block_list.insert_range(RowAddress::fragment_range(frag_id));
+                    deleted_ids.insert_range(RowAddress::fragment_range(frag_id));
                 }
             }
         }
-        Ok(Arc::new(block_list))
+        Ok(Arc::new(deleted_ids))
     }
 
     /// Waits for the prefilter to be fully loaded
@@ -162,12 +152,23 @@ impl PreFilter {
     /// must first call this method to ensure it is fully loaded.  This
     /// allows `filter_row_ids` to be a synchronous method.
     pub async fn wait_for_ready(&self) -> Result<()> {
-        if let Some(block_list) = &self.block_list {
-            block_list.wait_ready().await?;
+        if let Some(filtered_ids) = &self.filtered_ids {
+            filtered_ids.wait_ready().await?;
         }
-        if let Some(allow_list) = &self.allow_list {
-            allow_list.wait_ready().await?;
+        if let Some(deleted_ids) = &self.deleted_ids {
+            deleted_ids.wait_ready().await?;
         }
+        let final_mask = self.final_mask.lock().unwrap();
+        final_mask.get_or_init(|| {
+            let mut combined = RowIdMask::default();
+            if let Some(filtered_ids) = &self.filtered_ids {
+                combined = combined & filtered_ids.get_ready();
+            }
+            if let Some(deleted_ids) = &self.deleted_ids {
+                combined = combined.also_block((*deleted_ids.get_ready()).clone());
+            }
+            combined
+        });
         Ok(())
     }
 
@@ -179,40 +180,10 @@ impl PreFilter {
     /// This method must be called after `wait_for_ready`
     #[instrument(level = "debug", skip_all)]
     pub fn filter_row_ids(&self, row_ids: &[u64]) -> Vec<u64> {
-        let enumerated_ids = row_ids.iter().enumerate();
-        match (&self.block_list, &self.allow_list) {
-            (Some(block_list), Some(allow_list)) => {
-                // Only take rows that are both in the allow list and not in the block list
-                let block_list = block_list.get_ready();
-                let allow_list = allow_list.get_ready();
-                enumerated_ids
-                    .filter(|(_, row_id)| {
-                        !block_list.contains(**row_id) && allow_list.contains(**row_id)
-                    })
-                    .map(|(idx, _)| idx as u64)
-                    .collect()
-            }
-            (Some(block_list), None) => {
-                // Take rows that are not in the block list
-                let block_list = block_list.get_ready();
-                enumerated_ids
-                    .filter(|(_, row_id)| !block_list.contains(**row_id))
-                    .map(|(idx, _)| idx as u64)
-                    .collect()
-            }
-            (None, Some(allow_list)) => {
-                // Take rows that are in the allow list
-                let allow_list = allow_list.get_ready();
-                enumerated_ids
-                    .filter(|(_, row_id)| allow_list.contains(**row_id))
-                    .map(|(idx, _)| idx as u64)
-                    .collect()
-            }
-            (None, None) => {
-                // We should not encounter this case because callers should
-                // check is_empty first.
-                panic!("filter_row_ids called but prefilter has nothing to filter with")
-            }
-        }
+        let final_mask = self.final_mask.lock().unwrap();
+        final_mask
+            .get()
+            .expect("filter_row_ids called without call to wait_for_ready")
+            .selected_indices(row_ids)
     }
 }

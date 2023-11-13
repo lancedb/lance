@@ -1,4 +1,4 @@
-use arrow_array::FixedSizeListArray;
+use arrow_array::{types::Float32Type, FixedSizeListArray};
 // Copyright 2023 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,7 +31,10 @@ fn bench_train(c: &mut Criterion) {
 
     c.bench_function("train_128d_4k", |b| {
         b.to_async(&rt).iter(|| async {
-            KMeans::new(&array, 25, 50).await.ok().unwrap();
+            KMeans::<Float32Type>::new(&array, 25, 50)
+                .await
+                .ok()
+                .unwrap();
         })
     });
 
@@ -51,7 +54,10 @@ fn bench_train(c: &mut Criterion) {
     let array = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
     c.bench_function("train_128d_65535", |b| {
         b.to_async(&rt).iter(|| async {
-            KMeans::new(&array, 25, 50).await.ok().unwrap();
+            KMeans::<Float32Type>::new(&array, 25, 50)
+                .await
+                .ok()
+                .unwrap();
         })
     });
 
@@ -72,7 +78,10 @@ fn bench_train(c: &mut Criterion) {
     let array = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
     c.bench_function("train_8d_65535", |b| {
         b.to_async(&rt).iter(|| async {
-            KMeans::new(&array, 25, 50).await.ok().unwrap();
+            KMeans::<Float32Type>::new(&array, 25, 50)
+                .await
+                .ok()
+                .unwrap();
         })
     });
 }

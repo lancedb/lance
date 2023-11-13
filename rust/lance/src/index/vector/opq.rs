@@ -288,8 +288,12 @@ impl Index for OPQIndex {
         self
     }
 
-    fn statistics(&self) -> Result<serde_json::Value> {
-        Ok(serde_json::to_value(OPQIndexStatistics {
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+
+    fn statistics(&self) -> Result<String> {
+        Ok(serde_json::to_string(&OPQIndexStatistics {
             index_type: "OPQIndex".to_string(),
             dim: self
                 .opq
@@ -368,7 +372,7 @@ mod tests {
     use crate::dataset::{Dataset, ROW_ID};
     use crate::index::DatasetIndexExt;
     use crate::index::{
-        vector::{ivf::IVFIndex, open_index, opq::OPQIndex, VectorIndexParams},
+        vector::{ivf::IVFIndex, open_vector_index, opq::OPQIndex, VectorIndexParams},
         IndexType,
     };
 
@@ -424,7 +428,9 @@ mod tests {
         let uuid = index_file.file_name().to_str().unwrap().to_string();
 
         let dataset = Arc::new(dataset);
-        let index = open_index(dataset.clone(), "vector", &uuid).await.unwrap();
+        let index = open_vector_index(dataset.clone(), "vector", &uuid)
+            .await
+            .unwrap();
 
         if with_opq {
             let opq_idx = index.as_any().downcast_ref::<OPQIndex>().unwrap();

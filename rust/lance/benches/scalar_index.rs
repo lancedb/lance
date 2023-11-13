@@ -2,55 +2,73 @@ use std::sync::Arc;
 
 use arrow_array::{
     types::{UInt32Type, UInt64Type},
-    RecordBatchReader,
+    RecordBatch, RecordBatchReader,
 };
+use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, Criterion};
-use datafusion_common::ScalarValue;
-use futures::{stream, TryStreamExt};
+use datafusion::scalar::ScalarValue;
+use futures::{
+    stream::{self, BoxStream},
+    StreamExt, TryStreamExt,
+};
 use lance::{
     io::{object_store::ObjectStoreParams, ObjectStore},
     Dataset,
 };
-use lance_core::Error;
+use lance_core::{Error, Result};
 use lance_datagen::{array, gen, BatchCount, RowCount};
 use lance_index::scalar::{
-    btree::{train_btree_index, BTreeIndex},
+    btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
     flat::FlatIndexTrainer,
-    lance::LanceIndexStore,
+    lance_format::LanceIndexStore,
     IndexStore, ScalarIndex, ScalarQuery,
 };
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use tempfile::TempDir;
 
-pub struct BenchmarkFixture {
+struct BenchmarkFixture {
     _datadir: TempDir,
     index_store: Arc<dyn IndexStore>,
     baseline_dataset: Arc<Dataset>,
 }
 
-impl BenchmarkFixture {
+struct BenchmarkDataSource {}
+
+impl BenchmarkDataSource {
     fn test_data() -> impl RecordBatchReader {
         gen()
             .col(Some("values".to_string()), array::step::<UInt32Type>())
             .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(1024), BatchCount::from(100 * 1024))
     }
+}
 
+#[async_trait]
+impl BtreeTrainingSource for BenchmarkDataSource {
+    async fn scan_ordered_chunks(
+        self: Box<Self>,
+        _chunk_size: u32,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        Ok(stream::iter(Self::test_data().map(|batch| batch.map_err(Error::from))).boxed())
+    }
+}
+
+impl BenchmarkFixture {
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.path();
-        let (object_store, _) = ObjectStore::from_path(
+        let (object_store, test_path) = ObjectStore::from_path(
             test_path.as_os_str().to_str().unwrap(),
             &ObjectStoreParams::default(),
         )
         .unwrap();
-        Arc::new(LanceIndexStore::new(object_store, test_path.to_owned()))
+        Arc::new(LanceIndexStore::new(object_store, test_path))
     }
 
     async fn write_baseline_data(tempdir: &TempDir) -> Arc<Dataset> {
         let test_path = tempdir.path().as_os_str().to_str().unwrap();
         Arc::new(
-            Dataset::write(Self::test_data(), test_path, None)
+            Dataset::write(BenchmarkDataSource::test_data(), test_path, None)
                 .await
                 .unwrap(),
         )
@@ -59,11 +77,13 @@ impl BenchmarkFixture {
     async fn train_scalar_index(index_store: &Arc<dyn IndexStore>) {
         let sub_index_trainer = FlatIndexTrainer::new(arrow_schema::DataType::UInt32);
 
-        let data =
-            stream::iter(Self::test_data().map(|batch| batch.map_err(|err| Error::from(err))));
-        train_btree_index(data, &sub_index_trainer, index_store.as_ref())
-            .await
-            .unwrap();
+        train_btree_index(
+            Box::new(BenchmarkDataSource {}),
+            &sub_index_trainer,
+            index_store.as_ref(),
+        )
+        .await
+        .unwrap();
     }
 
     async fn open() -> Self {

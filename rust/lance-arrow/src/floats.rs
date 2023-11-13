@@ -14,14 +14,18 @@
 
 //! Floats Array
 
-use std::fmt::Formatter;
+use std::iter::Sum;
+use std::{
+    fmt::Formatter,
+    ops::{AddAssign, DivAssign},
+};
 
 use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
     Array, Float16Array, Float32Array, Float64Array,
 };
 use half::{bf16, f16};
-use num_traits::{Float, FromPrimitive};
+use num_traits::{AsPrimitive, Bounded, Float, FromPrimitive};
 
 use super::bfloat16::{BFloat16Array, BFloat16Type};
 
@@ -50,13 +54,49 @@ impl std::fmt::Display for FloatType {
 
 /// Trait for float types used in Arrow Array.
 ///
-pub trait ArrowFloatType {
-    type Native: Float + FromPrimitive;
+pub trait ArrowFloatType: std::fmt::Debug {
+    type Native: FromPrimitive + FloatToArrayType<ArrowType = Self> + AsPrimitive<f32>;
 
     const FLOAT_TYPE: FloatType;
 
     /// Arrow Float Array Type.
     type ArrayType: FloatArray<Self>;
+
+    /// Returns empty array of this type.
+    fn empty_array() -> Self::ArrayType {
+        Vec::<Self::Native>::new().into()
+    }
+}
+
+pub trait FloatToArrayType:
+    Float
+    + Bounded
+    + Sum
+    + AddAssign<Self>
+    + AsPrimitive<f64>
+    + AsPrimitive<f32>
+    + DivAssign
+    + Send
+    + Sync
+    + Copy
+{
+    type ArrowType: ArrowFloatType<Native = Self>;
+}
+
+impl FloatToArrayType for bf16 {
+    type ArrowType = BFloat16Type;
+}
+
+impl FloatToArrayType for f16 {
+    type ArrowType = Float16Type;
+}
+
+impl FloatToArrayType for f32 {
+    type ArrowType = Float32Type;
+}
+
+impl FloatToArrayType for f64 {
+    type ArrowType = Float64Type;
 }
 
 impl ArrowFloatType for BFloat16Type {
@@ -99,15 +139,6 @@ pub trait FloatArray<T: ArrowFloatType + ?Sized>:
 
     /// Returns a reference to the underlying data as a slice.
     fn as_slice(&self) -> &[T::Native];
-}
-
-impl FloatArray<BFloat16Type> for BFloat16Array {
-    type FloatType = BFloat16Type;
-
-    fn as_slice(&self) -> &[<BFloat16Type as ArrowFloatType>::Native] {
-        // TODO: apache/arrow-rs#4820
-        todo!()
-    }
 }
 
 impl FloatArray<Float16Type> for Float16Array {

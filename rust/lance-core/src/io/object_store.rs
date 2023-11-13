@@ -16,7 +16,8 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::Path as StdPath;
+use std::path::{Path as StdPath, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -26,13 +27,16 @@ use aws_credential_types::provider::error::CredentialsError;
 use aws_credential_types::provider::ProvideCredentials;
 use chrono::{DateTime, Utc};
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
-use http::header::{HeaderMap, CACHE_CONTROL};
-use object_store::aws::AwsCredential as ObjectStoreAwsCredential;
+use object_store::aws::{
+    AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
+};
+use object_store::azure::AzureConfigKey;
+use object_store::gcp::GoogleConfigKey;
 use object_store::{
-    aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
-    local::LocalFileSystem, memory::InMemory, ClientOptions, CredentialProvider,
+    aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory, CredentialProvider,
     Error as ObjectStoreError, Result as ObjectStoreResult,
 };
+use object_store::{parse_url_opts, DynObjectStore};
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use shellexpand::tilde;
 use snafu::{location, Location};
@@ -136,9 +140,7 @@ impl AwsCredentialAdapter {
 
 /// Adapt an object_store credentials into AWS SDK creds
 #[derive(Debug)]
-struct OSObjectStoreToAwsCredAdaptor(
-    Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>,
-);
+struct OSObjectStoreToAwsCredAdaptor(AwsCredentialProvider);
 
 impl ProvideCredentials for OSObjectStoreToAwsCredAdaptor {
     fn provide_credentials<'a>(
@@ -224,12 +226,9 @@ impl CredentialProvider for AwsCredentialAdapter {
 /// `credentials_refresh_offset` is the amount of time before expiry to refresh credentials.
 async fn build_aws_credential(
     credentials_refresh_offset: Duration,
-    credentials: Option<Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>>,
+    credentials: Option<AwsCredentialProvider>,
     region: Option<String>,
-) -> Result<(
-    Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>,
-    String,
-)> {
+) -> Result<(AwsCredentialProvider, String)> {
     use aws_config::meta::region::RegionProviderChain;
     const DEFAULT_REGION: &str = "us-west-2";
     let region_provider = RegionProviderChain::default_provider().or_else(DEFAULT_REGION);
@@ -259,26 +258,10 @@ async fn build_aws_credential(
     Ok((creds, region))
 }
 
-/// Build S3 ObjectStore using default credential chain.
-async fn build_s3_object_store(
-    uri: &str,
-    creds: Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>,
-    region: &str,
-) -> Result<Arc<dyn OSObjectStore>> {
-    Ok(Arc::new(
-        AmazonS3Builder::from_env() // from_env to capture AWS_ENDPOINT env var
-            .with_url(uri)
-            .with_credentials(creds)
-            .with_region(region)
-            .with_allow_http(true)
-            .build()?,
-    ))
-}
-
 #[cfg(feature = "dynamodb")]
 async fn build_dynamodb_external_store(
     table_name: &str,
-    creds: Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>,
+    creds: AwsCredentialProvider,
     region: &str,
     app_name: &str,
 ) -> Result<Arc<dyn ExternalManifestStore>> {
@@ -300,24 +283,6 @@ async fn build_dynamodb_external_store(
     DynamoDBExternalManifestStore::new_external_store(client.into(), table_name, app_name).await
 }
 
-async fn build_gcs_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
-    // GCS enables cache for public buckets, we disable to improve consistency
-    let mut headers = HeaderMap::new();
-    headers.insert(CACHE_CONTROL, "no-cache".parse().unwrap());
-    Ok(Arc::new(
-        GoogleCloudStorageBuilder::from_env()
-            .with_url(uri)
-            .with_client_options(ClientOptions::new().with_default_headers(headers))
-            .build()?,
-    ))
-}
-
-async fn build_azure_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
-    Ok(Arc::new(
-        MicrosoftAzureBuilder::from_env().with_url(uri).build()?,
-    ))
-}
-
 pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
 }
@@ -326,42 +291,28 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
 ///
 #[derive(Debug, Clone)]
 pub struct ObjectStoreParams {
-    pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
-
-    pub s3_credentials_refresh_offset: Duration,
-
-    // Custom AWS Credentials
-    pub aws_credentials: Option<Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>>,
-    pub aws_region: Option<String>,
-
+    pub block_size: Option<usize>,
+    pub object_store: Option<(Arc<DynObjectStore>, Url)>,
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
+    pub s3_credentials_refresh_offset: Duration,
+    pub aws_credentials: Option<AwsCredentialProvider>,
+    pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
 }
 
-// Need this for setting a non-zero default duration
 impl Default for ObjectStoreParams {
     fn default() -> Self {
         Self {
-            object_store_wrapper: None,
+            object_store: None,
+            commit_handler: None,
+            block_size: None,
             s3_credentials_refresh_offset: Duration::from_secs(60),
             aws_credentials: None,
-            commit_handler: None,
-            aws_region: None,
+            object_store_wrapper: None,
         }
     }
 }
 
 impl ObjectStoreParams {
-    pub fn with_aws_credentials(
-        credentials: Option<Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>>,
-        region: Option<String>,
-    ) -> Self {
-        Self {
-            aws_credentials: credentials,
-            aws_region: region,
-            ..Self::default()
-        }
-    }
-
     /// Set a commit lock for the object store.
     pub fn set_commit_lock<T: CommitLock + Send + Sync + 'static>(&mut self, lock: Arc<T>) {
         self.commit_handler = Some(Arc::new(lock));
@@ -391,7 +342,7 @@ impl ObjectStore {
                 Self::from_path(uri, params)
             }
             Ok(url) => {
-                let store = Self::new_from_url(url.clone(), params).await?;
+                let store = Self::new_from_url(url.clone(), params.clone()).await?;
                 let path = Path::from(url.path());
                 Ok((store, path))
             }
@@ -451,146 +402,35 @@ impl ObjectStore {
         ))
     }
 
-    async fn new_from_url(mut url: Url, params: &ObjectStoreParams) -> Result<Self> {
-        // Block size: On local file systems, we use 4KB block size. On cloud
-        // object stores, we use 64KB block size. This is generally the largest
-        // block size where we don't see a latency penalty.
-        match url.scheme() {
-            "s3" | "s3+ddb" => {
-                if url.scheme() == "s3+ddb" && params.commit_handler.is_some() {
-                    return Err(Error::InvalidInput {
-                        source:
-                            "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
-                                .into(),
-                        location: location!(),
-                    });
-                }
+    fn new_from_path(
+        str_path: &str,
+        commit_handler: Option<Arc<dyn CommitHandler>>,
+    ) -> Result<(Self, Path)> {
+        let expanded = tilde(str_path).to_string();
+        let expanded_path = StdPath::new(&expanded);
 
-                let ddb_table_name = if url.scheme() == "s3" {
-                    None
-                } else {
-                    if url.query_pairs().count() != 1 {
-                        return Err(Error::InvalidInput {
-                            source:
-                                "`s3+ddb://` scheme and expects exactly one query `ddbTableName`"
-                                    .into(),
-                            location: location!(),
-                        });
-                    }
-                    match url.query_pairs().next() {
-                        Some((Cow::Borrowed(key), Cow::Borrowed(table_name)))
-                            if key == DDB_URL_QUERY_KEY =>
-                        {
-                            if table_name.is_empty() {
-                                return Err(Error::InvalidInput {
-                                    source:
-                                        "`s3+ddb://` scheme requires non empty dynamodb table name"
-                                            .into(),
-                                    location: location!(),
-                                });
-                            }
-                            Some(table_name)
-                        }
-                        _ => {
-                            return Err(Error::InvalidInput {
-                                source: "`s3+ddb://` scheme and expects exactly one query `ddbTableName`".into(),
-                                location: location!(),
-                            });
-                        }
-                    }
-                };
-
-                let (aws_creds, region) = build_aws_credential(
-                    params.s3_credentials_refresh_offset,
-                    params.aws_credentials.clone(),
-                    params.aws_region.clone(),
-                )
-                .await?;
-
-                let commit_handler = match ddb_table_name {
-                    #[cfg(feature = "dynamodb")]
-                    Some(table_name) => Arc::new(ExternalManifestCommitHandler {
-                        external_manifest_store: build_dynamodb_external_store(
-                            table_name,
-                            aws_creds.clone(),
-                            &region,
-                            "lancedb",
-                        )
-                        .await?,
-                    }),
-                    #[cfg(not(feature = "dynamodb"))]
-                    Some(_) => {
-                        return Err(Error::InvalidInput {
-                            source: "`s3+ddb://` scheme requires `dynamodb` feature to be enabled"
-                                .into(),
-                            location: location!(),
-                        });
-                    }
-                    None => params
-                        .commit_handler
-                        .clone()
-                        .unwrap_or_else(|| Arc::new(UnsafeCommitHandler)),
-                };
-
-                // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
-                url.set_scheme("s3").map_err(|()| Error::Internal {
-                    message: "could not set scheme".into(),
-                    location: location!(),
-                })?;
-                url.set_query(None);
-
-                Ok(Self {
-                    inner: build_s3_object_store(url.to_string().as_str(), aws_creds, &region)
-                        .await?
-                        .traced(),
-                    scheme: String::from(url.scheme()),
-                    base_path: Path::from(url.path()),
-                    block_size: 64 * 1024,
-                    commit_handler,
-                })
-            }
-            "gs" => Ok(Self {
-                inner: build_gcs_object_store(url.to_string().as_str())
-                    .await?
-                    .traced(),
-                scheme: String::from("gs"),
-                base_path: Path::from(url.path()),
-                block_size: 64 * 1024,
-                commit_handler: params
-                    .commit_handler
-                    .clone()
-                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
-            }),
-            "az" => Ok(Self {
-                inner: build_azure_object_store(url.to_string().as_str())
-                    .await?
-                    .traced(),
-                scheme: String::from("az"),
-                base_path: Path::from(url.path()),
-                block_size: 64 * 1024,
-                commit_handler: params
-                    .commit_handler
-                    .clone()
-                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
-            }),
-            "file" => Ok(Self::from_path(url.path(), params)?.0),
-            "memory" => Ok(Self {
-                inner: Arc::new(InMemory::new()).traced(),
-                scheme: String::from("memory"),
-                base_path: Path::from(url.path()),
-                block_size: 64 * 1024,
-                commit_handler: params
-                    .commit_handler
-                    .clone()
-                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
-            }),
-            s => Err(Error::IO {
-                message: format!("Unsupported URI scheme: {}", s),
-                location: location!(),
-            }),
+        if !expanded_path.try_exists()? {
+            std::fs::create_dir_all(expanded_path)?;
         }
+
+        let expanded_path = expanded_path.canonicalize()?;
+
+        Ok((
+            Self {
+                inner: Arc::new(LocalFileSystem::new()).traced(),
+                scheme: String::from("file"),
+                base_path: Path::from_absolute_path(&expanded_path)?,
+                block_size: 4 * 1024, // 4KB block size
+                commit_handler: commit_handler.unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+            },
+            Path::from_filesystem_path(&expanded_path)?,
+        ))
     }
 
+    async fn new_from_url(url: Url, params: ObjectStoreParams) -> Result<Self> {
+        let mut storage_options = StorageOptions::default();
+        configure_store(url.as_str(), &mut storage_options, params).await
+    }
     /// Local object store.
     pub fn local() -> Self {
         Self {
@@ -746,6 +586,409 @@ impl ObjectStore {
     pub async fn size(&self, path: &Path) -> Result<usize> {
         Ok(self.inner.head(path).await?.size)
     }
+}
+#[derive(Clone, Debug, Default)]
+pub struct StorageOptions(pub HashMap<String, String>);
+
+impl StorageOptions {
+    /// Create a new instance of [`StorageOptions`]
+    pub fn new(options: HashMap<String, String>) -> Self {
+        let mut options = options;
+        if let Ok(value) = std::env::var("AZURE_STORAGE_ALLOW_HTTP") {
+            options.insert("allow_http".into(), value);
+        }
+        if let Ok(value) = std::env::var("AZURE_STORAGE_USE_HTTP") {
+            options.insert("allow_http".into(), value);
+        }
+        if let Ok(value) = std::env::var("AWS_ALLOW_HTTP") {
+            options.insert("allow_http".into(), value);
+        }
+        Self(options)
+    }
+
+    /// Add values from the environment to storage options
+    pub fn with_env_azure(&mut self) {
+        for (os_key, os_value) in std::env::vars_os() {
+            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
+                if let Ok(config_key) = AzureConfigKey::from_str(&key.to_ascii_lowercase()) {
+                    if !self.0.contains_key(config_key.as_ref()) {
+                        self.0
+                            .insert(config_key.as_ref().to_string(), value.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Add values from the environment to storage options
+    pub fn with_env_gcs(&mut self) {
+        for (os_key, os_value) in std::env::vars_os() {
+            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
+                if let Ok(config_key) = GoogleConfigKey::from_str(&key.to_ascii_lowercase()) {
+                    if !self.0.contains_key(config_key.as_ref()) {
+                        self.0
+                            .insert(config_key.as_ref().to_string(), value.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Add values from the environment to storage options
+    pub fn with_env_s3(&mut self) {
+        for (os_key, os_value) in std::env::vars_os() {
+            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
+                if let Ok(config_key) = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()) {
+                    if !self.0.contains_key(config_key.as_ref()) {
+                        self.0
+                            .insert(config_key.as_ref().to_string(), value.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Denotes if unsecure connections via http are allowed
+    pub fn allow_http(&self) -> bool {
+        self.0.iter().any(|(key, value)| {
+            key.to_ascii_lowercase().contains("allow_http") & str_is_truthy(value)
+        })
+    }
+
+    /// Subset of options relevant for azure storage
+    pub fn as_azure_options(&self) -> HashMap<AzureConfigKey, String> {
+        self.0
+            .iter()
+            .filter_map(|(key, value)| {
+                let az_key = AzureConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
+                Some((az_key, value.clone()))
+            })
+            .collect()
+    }
+
+    /// Subset of options relevant for s3 storage
+    pub fn as_s3_options(&self) -> HashMap<AmazonS3ConfigKey, String> {
+        self.0
+            .iter()
+            .filter_map(|(key, value)| {
+                let s3_key = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
+                Some((s3_key, value.clone()))
+            })
+            .collect()
+    }
+
+    /// Subset of options relevant for gcs storage
+    pub fn as_gcs_options(&self) -> HashMap<GoogleConfigKey, String> {
+        self.0
+            .iter()
+            .filter_map(|(key, value)| {
+                let gcs_key = GoogleConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
+                Some((gcs_key, value.clone()))
+            })
+            .collect()
+    }
+}
+
+impl From<HashMap<String, String>> for StorageOptions {
+    fn from(value: HashMap<String, String>) -> Self {
+        Self::new(value)
+    }
+}
+
+async fn configure_store(
+    url: &str,
+    storage_options: &mut StorageOptions,
+    options: ObjectStoreParams,
+) -> Result<ObjectStore> {
+    let mut url = ensure_table_uri(url)?;
+    // Block size: On local file systems, we use 4KB block size. On cloud
+    // object stores, we use 64KB block size. This is generally the largest
+    // block size where we don't see a latency penalty.
+    match url.scheme() {
+        "s3" | "s3+ddb" => {
+            storage_options.with_env_s3();
+
+            if url.scheme() == "s3+ddb" && options.commit_handler.is_some() {
+                return Err(Error::InvalidInput {
+                    source: "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
+                        .into(),
+                    location: location!(),
+                });
+            }
+
+            let ddb_table_name = if url.scheme() == "s3" {
+                None
+            } else {
+                if url.query_pairs().count() != 1 {
+                    return Err(Error::InvalidInput {
+                        source: "`s3+ddb://` scheme and expects exactly one query `ddbTableName`"
+                            .into(),
+                        location: location!(),
+                    });
+                }
+                match url.query_pairs().next() {
+                    Some((Cow::Borrowed(key), Cow::Borrowed(table_name)))
+                        if key == DDB_URL_QUERY_KEY =>
+                    {
+                        if table_name.is_empty() {
+                            return Err(Error::InvalidInput {
+                                source: "`s3+ddb://` scheme requires non empty dynamodb table name"
+                                    .into(),
+                                location: location!(),
+                            });
+                        }
+                        Some(table_name)
+                    }
+                    _ => {
+                        return Err(Error::InvalidInput {
+                            source:
+                                "`s3+ddb://` scheme and expects exactly one query `ddbTableName`"
+                                    .into(),
+                            location: location!(),
+                        });
+                    }
+                }
+            };
+            let storage_options = storage_options.as_s3_options();
+            let region = storage_options
+                .get(&AmazonS3ConfigKey::Region)
+                .map(|s| s.to_string());
+
+            let (aws_creds, region) = build_aws_credential(
+                options.s3_credentials_refresh_offset,
+                options.aws_credentials.clone(),
+                region,
+            )
+            .await?;
+
+            let commit_handler = match ddb_table_name {
+                #[cfg(feature = "dynamodb")]
+                Some(table_name) => Arc::new(ExternalManifestCommitHandler {
+                    external_manifest_store: build_dynamodb_external_store(
+                        table_name,
+                        aws_creds.clone(),
+                        &region,
+                        "lancedb",
+                    )
+                    .await?,
+                }),
+                #[cfg(not(feature = "dynamodb"))]
+                Some(_) => {
+                    return Err(Error::InvalidInput {
+                        source: "`s3+ddb://` scheme requires `dynamodb` feature to be enabled"
+                            .into(),
+                        location: location!(),
+                    });
+                }
+                None => options
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(UnsafeCommitHandler)),
+            };
+
+            // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
+            url.set_scheme("s3").map_err(|()| Error::Internal {
+                message: "could not set scheme".into(),
+                location: location!(),
+            })?;
+
+            url.set_query(None);
+
+            // we can't use parse_url_opts here because we need to manually set the credentials provider
+            let mut builder = AmazonS3Builder::new();
+            for (key, value) in storage_options {
+                builder = builder.with_config(key, value);
+            }
+            builder = builder
+                .with_url(url.as_ref())
+                .with_credentials(aws_creds)
+                .with_region(region)
+                .with_allow_http(true);
+            let store = builder.build()?;
+
+            Ok(ObjectStore {
+                inner: Arc::new(store),
+                scheme: String::from(url.scheme()),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+                commit_handler,
+            })
+        }
+
+        "gs" => {
+            storage_options.with_env_gcs();
+
+            let (store, _) = parse_url_opts(&url, storage_options.as_azure_options())?;
+            let store = Arc::new(store);
+            Ok(ObjectStore {
+                inner: store,
+                scheme: String::from("gs"),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+                commit_handler: options
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+            })
+        }
+        "az" => {
+            storage_options.with_env_azure();
+
+            let (store, _) = parse_url_opts(&url, storage_options.as_azure_options())?;
+            let store = Arc::new(store);
+
+            Ok(ObjectStore {
+                inner: store,
+                scheme: String::from("az"),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+                commit_handler: options
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+            })
+        }
+        "file" => Ok(ObjectStore::new_from_path(url.path(), options.commit_handler)?.0),
+        "memory" => Ok(ObjectStore {
+            inner: Arc::new(InMemory::new()).traced(),
+            scheme: String::from("memory"),
+            base_path: Path::from(url.path()),
+            block_size: 64 * 1024,
+            commit_handler: options
+                .commit_handler
+                .clone()
+                .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+        }),
+        s => Err(Error::IO {
+            message: format!("Unsupported URI scheme: {}", s),
+            location: location!(),
+        }),
+    }
+}
+
+impl ObjectStore {
+    pub fn new(
+        store: Arc<DynObjectStore>,
+        location: Url,
+        block_size: Option<usize>,
+        commit_handler: Option<Arc<dyn CommitHandler>>,
+        wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    ) -> Self {
+        let scheme = location.scheme();
+        let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
+        let commit_handler = commit_handler
+            .unwrap_or_else(|| Arc::new(RenameCommitHandler) as Arc<dyn CommitHandler>);
+
+        let store = match wrapper {
+            Some(wrapper) => wrapper.wrap(store),
+            None => store,
+        };
+
+        Self {
+            inner: store,
+            scheme: scheme.into(),
+            base_path: location.path().into(),
+            block_size,
+            commit_handler,
+        }
+    }
+    pub async fn try_new<T: AsRef<str>>(
+        location: T,
+        options: impl Into<StorageOptions> + Clone,
+    ) -> Result<Self> {
+        let mut storage_options = options.into();
+        let options = ObjectStoreParams::default();
+        configure_store(location.as_ref(), &mut storage_options, options).await
+    }
+}
+
+fn infer_block_size(scheme: &str) -> usize {
+    // Block size: On local file systems, we use 4KB block size. On cloud
+    // object stores, we use 64KB block size. This is generally the largest
+    // block size where we don't see a latency penalty.
+    match scheme {
+        "file" => 4 * 1024,
+        _ => 64 * 1024,
+    }
+}
+
+fn str_is_truthy(val: &str) -> bool {
+    val.eq_ignore_ascii_case("1")
+        | val.eq_ignore_ascii_case("true")
+        | val.eq_ignore_ascii_case("on")
+        | val.eq_ignore_ascii_case("yes")
+        | val.eq_ignore_ascii_case("y")
+}
+
+/// Attempt to create a Url from given table location.
+///
+/// The location could be:
+///  * A valid URL, which will be parsed and returned
+///  * A path to a directory, which will be created and then converted to a URL.
+///
+/// If it is a local path, it will be created if it doesn't exist.
+///
+/// Extra slashes will be removed from the end path as well.
+///
+/// Will return an error if the location is not valid. For example,
+pub fn ensure_table_uri(table_uri: impl AsRef<str>) -> Result<Url> {
+    let table_uri = table_uri.as_ref();
+
+    enum UriType {
+        LocalPath(PathBuf),
+        Url(Url),
+    }
+    let uri_type: UriType = if let Ok(url) = Url::parse(table_uri) {
+        if url.scheme() == "file" {
+            UriType::LocalPath(url.to_file_path().map_err(|err| {
+                let msg = format!("Invalid table location: {}\nError: {:?}", table_uri, err);
+                Error::InvalidTableLocation { message: msg }
+            })?)
+        // NOTE this check is required to support absolute windows paths which may properly parse as url
+        } else if KNOWN_SCHEMES.contains(&url.scheme()) {
+            UriType::Url(url)
+        } else {
+            UriType::LocalPath(PathBuf::from(table_uri))
+        }
+    } else {
+        UriType::LocalPath(PathBuf::from(table_uri))
+    };
+
+    // If it is a local path, we need to create it if it does not exist.
+    let mut url = match uri_type {
+        UriType::LocalPath(path) => {
+            let path = std::fs::canonicalize(path).map_err(|err| Error::DatasetNotFound {
+                path: table_uri.to_string(),
+                source: Box::new(err),
+                location: location!(),
+            })?;
+            Url::from_directory_path(path).map_err(|_| {
+                let msg = format!(
+                    "Could not construct a URL from canonicalized path: {}.\n\
+                  Something must be very wrong with the table path.",
+                    table_uri
+                );
+                Error::InvalidTableLocation { message: msg }
+            })?
+        }
+        UriType::Url(url) => url,
+    };
+
+    let trimmed_path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(&trimmed_path);
+    Ok(url)
+}
+
+lazy_static::lazy_static! {
+  static ref KNOWN_SCHEMES: Vec<&'static str> =
+      Vec::from([
+        "s3",
+        "s3+ddb",
+        "gs",
+        "az",
+        "file",
+        "memory"
+      ]);
 }
 
 #[cfg(test)]
@@ -945,8 +1188,7 @@ mod tests {
         let mock_provider = Arc::new(MockAwsCredentialsProvider::default());
 
         let params = ObjectStoreParams {
-            aws_credentials: Some(mock_provider.clone()
-                as Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>),
+            aws_credentials: Some(mock_provider.clone() as AwsCredentialProvider),
             ..ObjectStoreParams::default()
         };
 

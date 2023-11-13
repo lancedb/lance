@@ -147,6 +147,7 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
         )?)
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

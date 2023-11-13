@@ -45,8 +45,6 @@ pub struct Index {
     pub fragment_bitmap: Option<RoaringBitmap>,
 }
 
-impl Index {}
-
 impl TryFrom<&pb::IndexMetadata> for Index {
     type Error = Error;
 

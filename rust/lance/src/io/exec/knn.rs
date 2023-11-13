@@ -17,6 +17,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use arrow_array::cast::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
@@ -26,7 +27,8 @@ use datafusion::physical_plan::{
     RecordBatchStream as DFRecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 use futures::stream::Stream;
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
+use lance_core::utils::mask::RowIdMask;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{flat::flat_search, Query, DIST_COL};
 use roaring::RoaringTreemap;
@@ -38,8 +40,8 @@ use tracing::{instrument, Instrument};
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
 use crate::format::Index;
-use crate::index::prefilter::{AllowListLoader, PreFilter};
-use crate::index::vector::open_index;
+use crate::index::prefilter::{FilterLoader, PreFilter};
+use crate::index::DatasetIndexInternalExt;
 use crate::io::RecordBatchStream;
 use crate::{Error, Result};
 
@@ -249,13 +251,12 @@ impl ExecutionPlan for KNNFlatExec {
     }
 }
 
-// Utilities to convert an input (containing row ids) into an allow
-// list to be used for prefiltering
-pub struct PreFilterBuilder(SendableRecordBatchStream);
+// Utility to convert an input (containing row ids) into a prefilter
+struct FilteredRowIdsToPrefilter(SendableRecordBatchStream);
 
 #[async_trait]
-impl AllowListLoader for PreFilterBuilder {
-    async fn load(mut self: Box<Self>) -> Result<Arc<RoaringTreemap>> {
+impl FilterLoader for FilteredRowIdsToPrefilter {
+    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
         let mut allow_list = RoaringTreemap::new();
         while let Some(batch) = self.0.next().await {
             let batch = batch?;
@@ -268,7 +269,34 @@ impl AllowListLoader for PreFilterBuilder {
                 .expect("row id column in input batch had incorrect type");
             allow_list.extend(row_ids.iter().flatten())
         }
-        Ok(Arc::new(allow_list))
+        Ok(RowIdMask::from_allowed(allow_list))
+    }
+}
+
+// Utility to convert a serialized selection vector into a prefilter
+struct SelectionVectorToPrefilter(SendableRecordBatchStream);
+
+#[async_trait]
+impl FilterLoader for SelectionVectorToPrefilter {
+    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
+        let batch = self
+            .0
+            .try_next()
+            .await?
+            .ok_or_else(|| Error::Internal {
+                message: "Selection vector source for prefilter did not yield any batches".into(),
+                location: location!(),
+            })
+            .unwrap();
+        RowIdMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
+            Error::Internal {
+                message: format!(
+                    "Expected selection vector input to yield binary arrays but got {}",
+                    batch["result"].data_type()
+                ),
+                location: location!(),
+            }
+        })?)
     }
 }
 
@@ -283,15 +311,12 @@ impl KNNIndexStream {
         query: Query,
         dataset: Arc<Dataset>,
         index_meta: Index,
-        // An optional input containing a list of row ids to use as a prefilter
-        allow_list_input: Option<datafusion::physical_plan::SendableRecordBatchStream>,
+        allow_list_input: Option<Box<dyn FilterLoader>>,
     ) -> Result<RecordBatch> {
-        let index =
-            open_index(dataset.clone(), &query.column, &index_meta.uuid.to_string()).await?;
-        let allow_list_loader = allow_list_input.map(|allow_list_input| {
-            Box::new(PreFilterBuilder(allow_list_input)) as Box<dyn AllowListLoader>
-        });
-        let pre_filter = Arc::new(PreFilter::new(dataset, index_meta, allow_list_loader));
+        let index = dataset
+            .open_vector_index(&query.column, &index_meta.uuid.to_string())
+            .await?;
+        let pre_filter = Arc::new(PreFilter::new(dataset, index_meta, allow_list_input));
         index.search(&query, pre_filter).await
     }
 
@@ -300,7 +325,7 @@ impl KNNIndexStream {
         dataset: Arc<Dataset>,
         index: &Index,
         query: &Query,
-        allow_list: Option<datafusion::physical_plan::SendableRecordBatchStream>,
+        allow_list: Option<Box<dyn FilterLoader>>,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         let q = query.clone();
@@ -374,13 +399,23 @@ impl Stream for KNNIndexStream {
     }
 }
 
+#[derive(Debug)]
+pub enum PreFilterSource {
+    /// The prefilter input is an array of row ids that match the filter condition
+    FilteredRowIds(Arc<dyn ExecutionPlan>),
+    /// The prefilter input is a selection vector from an index query
+    ScalarIndexQuery(Arc<dyn ExecutionPlan>),
+    /// There is no prefilter
+    None,
+}
+
 /// [ExecutionPlan] for KNNIndex node.
 #[derive(Debug)]
 pub struct KNNIndexExec {
     /// Dataset to read from.
     dataset: Arc<Dataset>,
-    /// Optional input of valid row ids, used for prefiltering
-    allow_list: Option<Arc<dyn ExecutionPlan>>,
+    /// Prefiltering input
+    prefilter_source: PreFilterSource,
     /// The index metadata
     index: Index,
     /// The vector query to execute.
@@ -403,7 +438,7 @@ impl KNNIndexExec {
         dataset: Arc<Dataset>,
         index: Index,
         query: &Query,
-        allow_list: Option<Arc<dyn ExecutionPlan>>,
+        prefilter_source: PreFilterSource,
     ) -> Result<Self> {
         let schema = dataset.schema();
         if schema.field(query.column.as_str()).is_none() {
@@ -420,7 +455,7 @@ impl KNNIndexExec {
             dataset,
             index,
             query: query.clone(),
-            allow_list,
+            prefilter_source,
         })
     }
 }
@@ -445,9 +480,12 @@ impl ExecutionPlan for KNNIndexExec {
         None
     }
 
-    /// KNNIndex is a leaf node, so returns zero children.
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![]
+        match &self.prefilter_source {
+            PreFilterSource::None => vec![],
+            PreFilterSource::FilteredRowIds(src) => vec![src.clone()],
+            PreFilterSource::ScalarIndexQuery(src) => vec![src.clone()],
+        }
     }
 
     fn with_new_children(
@@ -462,17 +500,23 @@ impl ExecutionPlan for KNNIndexExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
-        let allow_list = self
-            .allow_list
-            .as_ref()
-            .map(|allow_list| allow_list.execute(partition, context))
-            .transpose()?;
+        let prefilter_loader = match &self.prefilter_source {
+            PreFilterSource::FilteredRowIds(src_node) => {
+                let stream = src_node.execute(partition, context)?;
+                Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+            }
+            PreFilterSource::ScalarIndexQuery(src_node) => {
+                let stream = src_node.execute(partition, context)?;
+                Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
+            }
+            PreFilterSource::None => None,
+        };
 
         Ok(Box::pin(KNNIndexStream::new(
             self.dataset.clone(),
             &self.index,
             &self.query,
-            allow_list,
+            prefilter_loader,
         )))
     }
 
@@ -574,7 +618,7 @@ mod tests {
             stream,
             &Query {
                 column: "vector".to_string(),
-                key: Arc::new(as_primitive_array(&q).clone()),
+                key: q,
                 k: 10,
                 nprobes: 0,
                 refine_factor: None,

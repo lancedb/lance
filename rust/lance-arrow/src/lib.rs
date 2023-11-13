@@ -26,6 +26,7 @@ use arrow_array::{
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema};
 use arrow_select::take::take;
+use rand::{prelude::*, rngs::SmallRng, SeedableRng};
 
 pub mod schema;
 pub use schema::*;
@@ -209,6 +210,21 @@ pub trait FixedSizeListArrayExt {
         values: T,
         list_size: i32,
     ) -> Result<FixedSizeListArray>;
+
+    /// Sample `n` rows from the [FixedSizeListArray]
+    ///
+    /// ```
+    /// use arrow_array::{Int64Array, FixedSizeListArray, Array};
+    /// use lance_arrow::FixedSizeListArrayExt;
+    ///
+    /// let int_values = Int64Array::from_iter(0..256);
+    /// let fixed_size_list_arr = FixedSizeListArray::try_new_from_values(int_values, 16).unwrap();
+    /// let sampled = fixed_size_list_arr.sample(10).unwrap();
+    /// assert_eq!(sampled.len(), 10);
+    /// assert_eq!(sampled.value_length(), 16);
+    /// assert_eq!(sampled.values().len(), 160);
+    /// ```
+    fn sample(&self, n: usize) -> Result<FixedSizeListArray>;
 }
 
 impl FixedSizeListArrayExt for FixedSizeListArray {
@@ -217,6 +233,15 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
         let values = Arc::new(values);
 
         Self::try_new(field, list_size, values, None)
+    }
+
+    fn sample(&self, n: usize) -> Result<FixedSizeListArray> {
+        if n >= self.len() {
+            return Ok(self.clone());
+        }
+        let mut rng = SmallRng::from_entropy();
+        let chosen = (0..self.len() as u32).choose_multiple(&mut rng, n);
+        take(self, &UInt32Array::from(chosen), None).map(|arr| arr.as_fixed_size_list().clone())
     }
 }
 
@@ -446,9 +471,7 @@ fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
             )));
         }
     }
-    Ok(StructArray::from(
-        fields.iter().cloned().zip(columns).collect::<Vec<_>>(),
-    ))
+    StructArray::try_new(fields.clone(), columns, None)
 }
 
 /// Merge the fields and columns of two RecordBatch's recursively

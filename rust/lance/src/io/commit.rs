@@ -154,41 +154,67 @@ pub(crate) async fn commit_new_dataset(
 ///
 /// Fields such as `physical_rows` and `num_deleted_rows` may not have been
 /// in older datasets. To bring these old manifests up-to-date, we add them here.
-async fn migrate_manifest(dataset: &Dataset, manifest: &mut Manifest) -> Result<()> {
-    if manifest.fragments.iter().all(|f| {
-        f.physical_rows > 0
-            && (f.deletion_file.is_none()
-                || f.deletion_file
+async fn migrate_manifest(
+    dataset: &Dataset,
+    manifest: &mut Manifest,
+    recompute_stats: bool,
+) -> Result<()> {
+    if !recompute_stats
+        && manifest.fragments.iter().all(|f| {
+            f.physical_rows.is_some()
+                && (f
+                    .deletion_file
                     .as_ref()
-                    .map(|d| d.num_deleted_rows)
-                    .unwrap_or_default()
-                    > 0)
-    }) {
+                    .map(|d| d.num_deleted_rows.is_some())
+                    .unwrap_or(true))
+        })
+    {
         return Ok(());
     }
 
-    let dataset = Arc::new(dataset.clone());
+    manifest.fragments =
+        Arc::new(migrate_fragments(dataset, &manifest.fragments, recompute_stats).await?);
 
-    let new_fragments = futures::stream::iter(manifest.fragments.as_ref())
+    Ok(())
+}
+
+/// Get updated vector of fragments that has `physical_rows` and `num_deleted_rows`
+/// filled in. This is no-op for newer tables, but may do IO for tables written
+/// with older versions of Lance.
+pub(crate) async fn migrate_fragments(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+    recompute_stats: bool,
+) -> Result<Vec<Fragment>> {
+    let dataset = Arc::new(dataset.clone());
+    let new_fragments = futures::stream::iter(fragments)
         .map(|fragment| async {
-            let physical_rows = if fragment.physical_rows == 0 {
-                let file_fragment = FileFragment::new(dataset.clone(), fragment.clone());
-                Either::Left(async move { file_fragment.count_rows().await })
+            let physical_rows = if recompute_stats {
+                None
             } else {
-                Either::Right(futures::future::ready(Ok(fragment.physical_rows)))
+                fragment.physical_rows
+            };
+            let physical_rows = if let Some(physical_rows) = physical_rows {
+                Either::Right(futures::future::ready(Ok(physical_rows)))
+            } else {
+                let file_fragment = FileFragment::new(dataset.clone(), fragment.clone());
+                Either::Left(async move { file_fragment.physical_rows().await })
             };
             let num_deleted_rows = match &fragment.deletion_file {
-                None => Either::Left(futures::future::ready(Ok(0))),
-                Some(deletion_file) if deletion_file.num_deleted_rows > 0 => {
-                    Either::Left(futures::future::ready(Ok(deletion_file.num_deleted_rows)))
+                None => Either::Left(futures::future::ready(Ok(None))),
+                Some(DeletionFile {
+                    num_deleted_rows: Some(deleted_rows),
+                    ..
+                }) if !recompute_stats => {
+                    Either::Left(futures::future::ready(Ok(Some(*deleted_rows))))
                 }
                 Some(_) => Either::Right(async {
                     let deletion_vector =
                         read_deletion_file(&dataset.base, fragment, dataset.object_store()).await?;
                     if let Some(deletion_vector) = deletion_vector {
-                        Ok(deletion_vector.len())
+                        Ok(Some(deletion_vector.len()))
                     } else {
-                        Ok(0)
+                        Ok(None)
                     }
                 }),
             };
@@ -205,7 +231,7 @@ async fn migrate_manifest(dataset: &Dataset, manifest: &mut Manifest) -> Result<
                 });
 
             Ok::<_, Error>(Fragment {
-                physical_rows,
+                physical_rows: Some(physical_rows),
                 deletion_file,
                 ..fragment.clone()
             })
@@ -213,9 +239,7 @@ async fn migrate_manifest(dataset: &Dataset, manifest: &mut Manifest) -> Result<
         .buffered(num_cpus::get() * 2)
         .boxed();
 
-    manifest.fragments = Arc::new(new_fragments.try_collect().await?);
-
-    Ok(())
+    new_fragments.try_collect().await
 }
 
 /// Update indices with new fields.
@@ -318,7 +342,14 @@ pub(crate) async fn commit_transaction(
 
         manifest.version = target_version;
 
-        migrate_manifest(&dataset, &mut manifest).await?;
+        let previous_writer_version = &dataset.manifest.writer_version;
+        // The versions of Lance prior to when we started writing the writer version
+        // sometimes wrote incorrect `Fragment.phyiscal_rows` values, so we should
+        // make sure to recompute them.
+        // See: https://github.com/lancedb/lance/issues/1531
+        let recompute_stats = previous_writer_version.is_none();
+
+        migrate_manifest(&dataset, &mut manifest, recompute_stats).await?;
 
         migrate_indices(&dataset, &mut indices).await?;
 
@@ -384,13 +415,14 @@ mod tests {
         CommitError, CommitHandler, CommitLease, CommitLock, RenameCommitHandler,
         UnsafeCommitHandler,
     };
+    use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
 
     use super::*;
 
     use crate::dataset::{transaction::Operation, WriteMode, WriteParams};
-    use crate::index::{vector::VectorIndexParams, DatasetIndexExt, IndexType};
+    use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
     use crate::io::object_store::ObjectStoreParams;
     use crate::Dataset;
 

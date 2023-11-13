@@ -16,17 +16,14 @@ use std::sync::Arc;
 use std::{collections::BTreeMap, ops::Range};
 
 use arrow_array::types::UInt32Type;
-use arrow_array::{cast::AsArray, types::Float32Type, UInt32Array};
+use arrow_array::{cast::AsArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
 use futures::{stream::repeat_with, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::{io::Writer, ROW_ID, ROW_ID_FIELD};
-use lance_index::vector::{
-    pq::{transform::PQTransformer, ProductQuantizer},
-    residual::ResidualTransform,
-    PART_ID_COLUMN, PQ_CODE_COLUMN,
-};
-use lance_linalg::{distance::MetricType, MatrixView};
+use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
+use lance_linalg::distance::MetricType;
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -36,8 +33,6 @@ use crate::index::vector::ivf::{
     Ivf,
 };
 use crate::{io::RecordBatchStream, Error, Result};
-
-use super::RESIDUAL_COLUMN;
 
 /// Disk-based shuffle a stream of [RecordBatch] into each IVF partition.
 /// Sub-quantizer will be applied if provided.
@@ -55,7 +50,7 @@ use super::RESIDUAL_COLUMN;
 pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin,
     column: &str,
-    ivf: Arc<lance_index::vector::ivf::Ivf>,
+    ivf: Arc<dyn lance_index::vector::ivf::Ivf>,
     // TODO: Once the transformer can generate schema automatically,
     // we can remove `num_sub_vectors`.
     num_sub_vectors: usize,
@@ -135,7 +130,7 @@ pub(super) async fn build_partitions(
     data: impl RecordBatchStream + Unpin,
     column: &str,
     ivf: &mut Ivf,
-    pq: Arc<ProductQuantizer>,
+    pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
     part_range: Range<u32>,
 ) -> Result<()> {
@@ -153,25 +148,15 @@ pub(super) async fn build_partitions(
         });
     }
 
-    let centroids: MatrixView<Float32Type> = ivf.centroids.as_ref().try_into()?;
-    let ivf_model = lance_index::vector::ivf::Ivf::new_with_range(
-        centroids.clone(),
+    let ivf_model = lance_index::vector::ivf::new_ivf_with_pq(
+        ivf.centroids.values(),
+        ivf.centroids.value_length() as usize,
         metric_type,
-        vec![
-            Arc::new(ResidualTransform::new(
-                ivf.centroids.as_ref().try_into()?,
-                PART_ID_COLUMN,
-                column,
-            )),
-            Arc::new(PQTransformer::new(
-                pq.clone(),
-                RESIDUAL_COLUMN,
-                PQ_CODE_COLUMN,
-            )),
-        ],
-        part_range.clone(),
-    );
-    let shuffler = shuffle_dataset(data, column, Arc::new(ivf_model), pq.num_sub_vectors).await?;
+        column,
+        pq.clone(),
+        Some(part_range),
+    )?;
+    let shuffler = shuffle_dataset(data, column, ivf_model, pq.num_sub_vectors()).await?;
     write_index_partitions(writer, ivf, &shuffler, None).await?;
 
     Ok(())

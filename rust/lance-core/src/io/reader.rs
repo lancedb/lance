@@ -899,6 +899,7 @@ async fn read_struct_array(
 ) -> Result<ArrayRef> {
     // TODO: use tokio to make the reads in parallel.
     let mut sub_arrays: Vec<(FieldRef, ArrayRef)> = vec![];
+
     for child in field.children.as_slice() {
         let arr = read_array(reader, child, batch_id, page_table, params).await?;
         sub_arrays.push((Arc::new(child.into()), arr));

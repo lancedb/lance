@@ -18,8 +18,11 @@ arrow-ord.workspace = true
 arrow-schema.workspace = true
 arrow-arith.workspace = true
 arrow-select.workspace = true
+async-recursion.workspace = true
 async-trait.workspace = true
 datafusion-common.workspace = true
+datafusion-expr = "32.0.0"
+datafusion-physical-expr = { version = "32.0.0", default-features = false }
 futures.workspace = true
 half.workspace = true
 lance-arrow.workspace = true
@@ -28,26 +31,29 @@ lance-linalg.workspace = true
 log.workspace = true
 num_cpus.workspace = true
 num-traits.workspace = true
+object_store.workspace = true
 prost.workspace = true
 rand.workspace = true
+roaring.workspace = true
+serde_json.workspace = true
+serde.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-datafusion-physical-expr = { version = "32.0.0", default-features = false }
-datafusion-expr = "32.0.0"
-object_store.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
 criterion.workspace = true
 lance-datagen.workspace = true
-lance.workspace = true
+lance-testing.workspace = true
 pprof.workspace = true
 tempfile.workspace = true
+sqlparser = "0.39.0"
+datafusion-sql = "32.0.0"
 
 [build-dependencies]
 prost-build.workspace = true
 
 [[bench]]
-name = "scalar_index"
+name = "find_partitions"
 harness = false

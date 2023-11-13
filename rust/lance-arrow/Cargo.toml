@@ -16,6 +16,7 @@ arrow-buffer = { workspace = true }
 arrow-data = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
-serde = { workspace = true }
 half = { workspace = true }
 num-traits = { workspace = true }
+rand.workspace = true
+serde = { workspace = true }

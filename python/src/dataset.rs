@@ -24,21 +24,21 @@ use async_trait::async_trait;
 use chrono::Duration;
 
 use futures::StreamExt;
-use lance::arrow::as_fixed_size_list_array;
-use lance::dataset::progress::WriteFragmentProgress;
 use lance::dataset::{
-    fragment::FileFragment as LanceFileFragment, scanner::Scanner as LanceScanner,
-    transaction::Operation as LanceOperation, Dataset as LanceDataset, ReadParams, Version,
-    WriteMode, WriteParams,
+    fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
+    scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
+    Dataset as LanceDataset, ReadParams, Version, WriteMode, WriteParams,
 };
-use lance::datatypes::Schema;
-use lance::format::Fragment;
 use lance::index::{
-    vector::{diskann::DiskANNParams, ivf::IvfBuildParams, VectorIndexParams},
-    DatasetIndexExt, IndexType,
+    vector::{diskann::DiskANNParams, VectorIndexParams},
+    DatasetIndexExt,
 };
-use lance::io::object_store::ObjectStoreParams;
-use lance_index::vector::pq::PQBuildParams;
+use lance_arrow::as_fixed_size_list_array;
+use lance_core::{datatypes::Schema, format::Fragment, io::object_store::ObjectStoreParams};
+use lance_index::{
+    vector::{ivf::IvfBuildParams, pq::PQBuildParams},
+    IndexType,
+};
 use lance_linalg::distance::MetricType;
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
@@ -515,8 +515,9 @@ impl Dataset {
         Ok(())
     }
 
-    fn count_deleted_rows(&self) -> usize {
-        self.ds.count_deleted_rows()
+    fn count_deleted_rows(&self) -> PyResult<usize> {
+        RT.block_on(None, self.ds.count_deleted_rows())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
     fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
@@ -704,8 +705,9 @@ impl Dataset {
         self.ds.count_fragments()
     }
 
-    fn num_small_files(&self, max_rows_per_group: usize) -> usize {
-        self.ds.num_small_files(max_rows_per_group)
+    fn num_small_files(&self, max_rows_per_group: usize) -> PyResult<usize> {
+        RT.block_on(None, self.ds.num_small_files(max_rows_per_group))
+            .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
     fn get_fragments(self_: PyRef<'_, Self>) -> PyResult<Vec<FileFragment>> {
@@ -786,6 +788,11 @@ impl Dataset {
             ds: Arc::new(ds),
             uri: dataset_uri.to_string(),
         })
+    }
+
+    fn validate(&self) -> PyResult<()> {
+        RT.block_on(None, self.ds.validate())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 }
 

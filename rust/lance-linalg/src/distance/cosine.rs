@@ -18,226 +18,80 @@
 //!
 //! `bf16, f16, f32, f64` types are supported.
 
-use std::iter::Sum;
 use std::sync::Arc;
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::Float32Type;
-use arrow_array::{Array, FixedSizeListArray, Float32Array};
-use half::{bf16, f16};
-use num_traits::real::Real;
+use arrow_array::{
+    cast::AsArray,
+    types::{Float16Type, Float32Type, Float64Type},
+    Array, FixedSizeListArray, Float32Array,
+};
+use arrow_schema::DataType;
+use lance_arrow::bfloat16::BFloat16Type;
+use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 use num_traits::{AsPrimitive, FromPrimitive};
 
 use super::dot::dot;
-use super::norm_l2::{norm_l2, Normalize};
+use super::norm_l2::norm_l2;
 use crate::simd::{
     f32::{f32x16, f32x8},
     FloatSimd, SIMD,
 };
+use crate::{Error, Result};
 
 /// Cosine Distance
-pub trait Cosine {
-    type Output;
-
+pub trait Cosine: super::dot::Dot
+where
+    Self::Native: AsPrimitive<f64> + AsPrimitive<f32>,
+    <Self::Native as FloatToArrayType>::ArrowType: Cosine + super::dot::Dot,
+{
     /// Cosine distance between two vectors.
-    fn cosine(&self, other: &Self) -> Self::Output;
+    #[inline]
+    fn cosine(x: &[Self::Native], other: &[Self::Native]) -> f32
+    where
+        <<Self as ArrowFloatType>::Native as FloatToArrayType>::ArrowType: super::dot::Dot,
+    {
+        let x_norm = norm_l2(x);
+        Self::cosine_fast(x, x_norm, other)
+    }
 
     /// Fast cosine function, that assumes that the norm of the first vector is already known.
-    fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output;
+    #[inline]
+    fn cosine_fast(x: &[Self::Native], x_norm: f32, y: &[Self::Native]) -> f32
+    where
+        <<Self as ArrowFloatType>::Native as FloatToArrayType>::ArrowType: super::dot::Dot,
+    {
+        cosine_scalar(x, x_norm, y)
+    }
 
     /// Cosine between two vectors, with the L2 norms of both vectors already known.
-    fn cosine_with_norms(
-        &self,
-        x_norm: Self::Output,
-        y_norm: Self::Output,
-        y: &Self,
-    ) -> Self::Output;
-}
-
-impl Cosine for [bf16] {
-    type Output = bf16;
-
     #[inline]
-    fn cosine(&self, other: &Self) -> Self::Output {
-        let x_norm = self.norm_l2();
-        self.cosine_fast(x_norm, other)
+    fn cosine_with_norms(x: &[Self::Native], x_norm: f32, y_norm: f32, y: &[Self::Native]) -> f32
+    where
+        <<Self as ArrowFloatType>::Native as FloatToArrayType>::ArrowType: Cosine,
+    {
+        cosine_scalar_fast(x, x_norm, y, y_norm)
     }
 
-    #[inline]
-    fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output {
-        // TODO: Implement SIMD
-        cosine_scalar(self, x_norm, other)
-    }
+    fn cosine_batch<'a>(
+        x: &'a [Self::Native],
+        batch: &'a [Self::Native],
+        dimension: usize,
+    ) -> Box<dyn Iterator<Item = f32> + 'a> {
+        let x_norm = norm_l2(x);
 
-    #[inline]
-    fn cosine_with_norms(
-        &self,
-        x_norm: Self::Output,
-        y_norm: Self::Output,
-        y: &Self,
-    ) -> Self::Output {
-        cosine_scalar_fast(self, x_norm, y, y_norm)
+        Box::new(
+            batch
+                .chunks_exact(dimension)
+                .map(move |y| Self::cosine_fast(x, x_norm, y)),
+        )
     }
 }
 
-impl Cosine for [f16] {
-    type Output = f16;
+impl Cosine for BFloat16Type {}
 
-    #[inline]
-    fn cosine(&self, other: &Self) -> Self::Output {
-        let x_norm = self.norm_l2();
-        self.cosine_fast(x_norm, other)
-    }
+impl Cosine for Float16Type {}
 
-    #[inline]
-    fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output {
-        // TODO: Implement SIMD
-        cosine_scalar(self, x_norm, other)
-    }
-
-    #[inline]
-    fn cosine_with_norms(
-        &self,
-        x_norm: Self::Output,
-        y_norm: Self::Output,
-        y: &Self,
-    ) -> Self::Output {
-        cosine_scalar_fast(self, x_norm, y, y_norm)
-    }
-}
-
-impl Cosine for [f32] {
-    type Output = f32;
-
-    #[inline]
-    fn cosine(&self, other: &[f32]) -> f32 {
-        let x_norm = norm_l2(self);
-        self.cosine_fast(x_norm, other)
-    }
-
-    #[inline]
-    fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output {
-        let dim = self.len();
-        let unrolled_len = dim / 16 * 16;
-        let mut y_norm16 = f32x16::zeros();
-        let mut xy16 = f32x16::zeros();
-        for i in (0..unrolled_len).step_by(16) {
-            unsafe {
-                let x = f32x16::load_unaligned(self.as_ptr().add(i));
-                let y = f32x16::load_unaligned(other.as_ptr().add(i));
-                xy16.multiply_add(x, y);
-                y_norm16.multiply_add(y, y);
-            }
-        }
-        let aligned_len = dim / 8 * 8;
-        let mut y_norm8 = f32x8::zeros();
-        let mut xy8 = f32x8::zeros();
-        for i in (unrolled_len..aligned_len).step_by(8) {
-            unsafe {
-                let x = f32x8::load_unaligned(self.as_ptr().add(i));
-                let y = f32x8::load_unaligned(other.as_ptr().add(i));
-                xy8.multiply_add(x, y);
-                y_norm8.multiply_add(y, y);
-            }
-        }
-        let y_norm =
-            y_norm16.reduce_sum() + y_norm8.reduce_sum() + norm_l2(&other[aligned_len..]).powi(2);
-        let xy =
-            xy16.reduce_sum() + xy8.reduce_sum() + dot(&self[aligned_len..], &other[aligned_len..]);
-        1.0 - xy / x_norm / y_norm.sqrt()
-    }
-
-    #[inline]
-    fn cosine_with_norms(
-        &self,
-        x_norm: Self::Output,
-        y_norm: Self::Output,
-        y: &Self,
-    ) -> Self::Output {
-        let dim = self.len();
-        let unrolled_len = dim / 16 * 16;
-        let mut xy16 = f32x16::zeros();
-        for i in (0..unrolled_len).step_by(16) {
-            unsafe {
-                let x = f32x16::load_unaligned(self.as_ptr().add(i));
-                let y = f32x16::load_unaligned(y.as_ptr().add(i));
-                xy16.multiply_add(x, y);
-            }
-        }
-        let aligned_len = dim / 8 * 8;
-        let mut xy8 = f32x8::zeros();
-        for i in (unrolled_len..aligned_len).step_by(8) {
-            unsafe {
-                let x = f32x8::load_unaligned(self.as_ptr().add(i));
-                let y = f32x8::load_unaligned(y.as_ptr().add(i));
-                xy8.multiply_add(x, y);
-            }
-        }
-        let xy =
-            xy16.reduce_sum() + xy8.reduce_sum() + dot(&self[aligned_len..], &y[aligned_len..]);
-        1.0 - xy / x_norm / y_norm
-    }
-}
-
-impl Cosine for [f64] {
-    type Output = f64;
-
-    #[inline]
-    fn cosine(&self, other: &Self) -> Self::Output {
-        let x_norm = self.norm_l2();
-        self.cosine_fast(x_norm, other)
-    }
-
-    #[inline]
-    fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output {
-        // TODO: Implement SIMD
-        cosine_scalar(self, x_norm, other)
-    }
-
-    #[inline]
-    fn cosine_with_norms(
-        &self,
-        x_norm: Self::Output,
-        y_norm: Self::Output,
-        y: &Self,
-    ) -> Self::Output {
-        cosine_scalar_fast(self, x_norm, y, y_norm)
-    }
-}
-
-/// Fallback non-SIMD implementation
-#[allow(dead_code)] // Does not fallback on aarch64.
-#[inline]
-fn cosine_scalar<T: Real + Sum + AsPrimitive<f64> + FromPrimitive>(
-    x: &[T],
-    x_norm: T,
-    y: &[T],
-) -> T {
-    let y_sq = dot(y, y);
-    let xy = dot(x, y);
-    // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
-    // use f64 for overflow protection.
-    T::from_f64(1.0 - (xy.as_() / (x_norm.as_() * (y_sq.sqrt()).as_()))).unwrap()
-}
-
-#[inline]
-fn cosine_scalar_fast<T: Real + Sum + AsPrimitive<f64> + FromPrimitive>(
-    x: &[T],
-    x_norm: T,
-    y: &[T],
-    y_norm: T,
-) -> T {
-    let xy = dot(x, y);
-    // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
-    // use f64 for overflow protection.
-    T::from_f64(1.0 - (xy.as_() / (x_norm.as_() * y_norm.as_()))).unwrap()
-}
-
-/// Cosine distance function between two vectors.
-pub fn cosine_distance<T: Cosine + ?Sized>(from: &T, to: &T) -> T::Output {
-    from.cosine(to)
-}
-
+/// f32 kernels for Cosine
 mod f32 {
     use super::*;
 
@@ -256,6 +110,134 @@ mod f32 {
     }
 }
 
+impl Cosine for Float32Type {
+    #[inline]
+    fn cosine_fast(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
+        let dim = x.len();
+        let unrolled_len = dim / 16 * 16;
+        let mut y_norm16 = f32x16::zeros();
+        let mut xy16 = f32x16::zeros();
+        for i in (0..unrolled_len).step_by(16) {
+            unsafe {
+                let x = f32x16::load_unaligned(x.as_ptr().add(i));
+                let y = f32x16::load_unaligned(other.as_ptr().add(i));
+                xy16.multiply_add(x, y);
+                y_norm16.multiply_add(y, y);
+            }
+        }
+        let aligned_len = dim / 8 * 8;
+        let mut y_norm8 = f32x8::zeros();
+        let mut xy8 = f32x8::zeros();
+        for i in (unrolled_len..aligned_len).step_by(8) {
+            unsafe {
+                let x = f32x8::load_unaligned(x.as_ptr().add(i));
+                let y = f32x8::load_unaligned(other.as_ptr().add(i));
+                xy8.multiply_add(x, y);
+                y_norm8.multiply_add(y, y);
+            }
+        }
+        let y_norm =
+            y_norm16.reduce_sum() + y_norm8.reduce_sum() + norm_l2(&other[aligned_len..]).powi(2);
+        let xy =
+            xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &other[aligned_len..]);
+        1.0 - xy / x_norm / y_norm.sqrt()
+    }
+
+    #[inline]
+    fn cosine_with_norms(x: &[f32], x_norm: f32, y_norm: f32, y: &[f32]) -> Self::Native {
+        let dim = x.len();
+        let unrolled_len = dim / 16 * 16;
+        let mut xy16 = f32x16::zeros();
+        for i in (0..unrolled_len).step_by(16) {
+            unsafe {
+                let x = f32x16::load_unaligned(x.as_ptr().add(i));
+                let y = f32x16::load_unaligned(y.as_ptr().add(i));
+                xy16.multiply_add(x, y);
+            }
+        }
+        let aligned_len = dim / 8 * 8;
+        let mut xy8 = f32x8::zeros();
+        for i in (unrolled_len..aligned_len).step_by(8) {
+            unsafe {
+                let x = f32x8::load_unaligned(x.as_ptr().add(i));
+                let y = f32x8::load_unaligned(y.as_ptr().add(i));
+                xy8.multiply_add(x, y);
+            }
+        }
+        let xy = xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &y[aligned_len..]);
+        1.0 - xy / x_norm / y_norm
+    }
+
+    fn cosine_batch<'a>(
+        x: &'a [Self::Native],
+        batch: &'a [Self::Native],
+        dimension: usize,
+    ) -> Box<dyn Iterator<Item = Self::Native> + 'a> {
+        let x_norm = norm_l2(x);
+
+        match dimension {
+            8 => Box::new(
+                batch
+                    .chunks_exact(dimension)
+                    .map(move |y| f32::cosine_once::<f32x8, 8>(x, x_norm, y)),
+            ),
+            16 => Box::new(
+                batch
+                    .chunks_exact(dimension)
+                    .map(move |y| f32::cosine_once::<f32x16, 16>(x, x_norm, y)),
+            ),
+            _ => Box::new(
+                batch
+                    .chunks_exact(dimension)
+                    .map(move |y| Self::cosine_fast(x, x_norm, y)),
+            ),
+        }
+    }
+}
+
+impl Cosine for Float64Type {}
+
+/// Fallback non-SIMD implementation
+#[allow(dead_code)] // Does not fallback on aarch64.
+#[inline]
+fn cosine_scalar<T: AsPrimitive<f64> + FromPrimitive + FloatToArrayType>(
+    x: &[T],
+    x_norm: f32,
+    y: &[T],
+) -> f32
+where
+    <T as FloatToArrayType>::ArrowType: super::dot::Dot,
+{
+    let y_sq = dot(y, y);
+    let xy = dot(x, y);
+    // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
+    1.0 - xy / x_norm * y_sq.sqrt()
+}
+
+#[inline]
+pub(crate) fn cosine_scalar_fast<T: FloatToArrayType>(
+    x: &[T],
+    x_norm: f32,
+    y: &[T],
+    y_norm: f32,
+) -> f32
+where
+    T::ArrowType: Cosine,
+{
+    let xy = dot(x, y);
+    // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
+    // use f64 for overflow protection.
+    1.0 - (xy / x_norm * y_norm)
+}
+
+/// Cosine distance function between two vectors.
+pub fn cosine_distance<T: FloatToArrayType>(from: &[T], to: &[T]) -> f32
+where
+    T::ArrowType: Cosine,
+{
+    T::ArrowType::cosine(from, to)
+}
+
 /// Cosine Distance
 ///
 /// <https://en.wikipedia.org/wiki/Cosine_similarity>
@@ -271,30 +253,39 @@ mod f32 {
 /// -------
 /// An iterator of pair-wise cosine distance between from vector to each vector in the batch.
 ///
-pub fn cosine_distance_batch<'a>(
-    from: &'a [f32],
-    batch: &'a [f32],
+pub fn cosine_distance_batch<'a, T: FloatToArrayType>(
+    from: &'a [T],
+    batch: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = f32> + 'a> {
-    let x_norm = norm_l2(from);
+) -> Box<dyn Iterator<Item = f32> + 'a>
+where
+    T::ArrowType: Cosine,
+{
+    T::ArrowType::cosine_batch(from, batch, dimension)
+}
 
-    match dimension {
-        8 => Box::new(
-            batch
-                .chunks_exact(dimension)
-                .map(move |y| f32::cosine_once::<f32x8, 8>(from, x_norm, y)),
-        ),
-        16 => Box::new(
-            batch
-                .chunks_exact(dimension)
-                .map(move |y| f32::cosine_once::<f32x16, 16>(from, x_norm, y)),
-        ),
-        _ => Box::new(
-            batch
-                .chunks_exact(dimension)
-                .map(move |y| from.cosine_fast(x_norm, y)),
-        ),
-    }
+fn do_cosine_distance_arrow_batch<T: ArrowFloatType + Cosine>(
+    from: &T::ArrayType,
+    to: &FixedSizeListArray,
+) -> Result<Arc<Float32Array>> {
+    let dimension = to.value_length() as usize;
+    debug_assert_eq!(from.len(), dimension);
+
+    // TODO: if we detect there is a run of nulls, should we skip those?
+    let to_values =
+        to.values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or(Error::InvalidArgumentError(format!(
+                "Unsupported data type {:?}",
+                to.values().data_type()
+            )))?;
+    let dists = cosine_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
+
+    Ok(Arc::new(Float32Array::new(
+        dists.collect(),
+        to.nulls().cloned(),
+    )))
 }
 
 /// Compute Cosine distance between a vector and a batch of vectors.
@@ -309,19 +300,19 @@ pub fn cosine_distance_batch<'a>(
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
-pub fn cosine_distance_arrow_batch(from: &[f32], to: &FixedSizeListArray) -> Arc<Float32Array> {
-    let dimension = to.value_length() as usize;
-    debug_assert_eq!(from.len(), dimension);
-
-    let x_norm = norm_l2(from);
-
-    // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values = to.values().as_primitive::<Float32Type>().values();
-    let dists = to_values
-        .chunks_exact(dimension)
-        .map(|v| from.cosine_fast(x_norm, v));
-
-    Arc::new(Float32Array::new(dists.collect(), to.nulls().cloned()))
+pub fn cosine_distance_arrow_batch(
+    from: &dyn Array,
+    to: &FixedSizeListArray,
+) -> Result<Arc<Float32Array>> {
+    match *from.data_type() {
+        DataType::Float16 => do_cosine_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
+        DataType::Float32 => do_cosine_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
+        DataType::Float64 => do_cosine_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
+        _ => Err(Error::InvalidArgumentError(format!(
+            "Unsupported data type {:?}",
+            from.data_type()
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -329,6 +320,18 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
+    use arrow_array::Float32Array;
+
+    fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
+        let xy = x
+            .iter()
+            .zip(y.iter())
+            .map(|(&xi, &yi)| xi * yi)
+            .sum::<f32>();
+        let x_sq = x.iter().map(|&xi| xi * xi).sum::<f32>().sqrt();
+        let y_sq = y.iter().map(|&yi| yi * yi).sum::<f32>().sqrt();
+        1.0 - xy / x_sq / y_sq
+    }
 
     #[test]
     fn test_cosine() {
@@ -343,6 +346,15 @@ mod tests {
         let d = cosine_distance_batch(x.values(), y.values(), 8).collect::<Vec<_>>();
         // from sklearn.metrics.pairwise import cosine_similarity
         assert_relative_eq!(d[0], 1.0 - 0.873_580_63);
+    }
+
+    #[test]
+    fn test_cosine_large() {
+        let total = 1024;
+        let x = (0..total).map(|v| v as f32).collect::<Vec<_>>();
+        let y = (1024..1024 + total).map(|v| v as f32).collect::<Vec<_>>();
+        let d = cosine_distance_batch(&x, &y, total).collect::<Vec<_>>();
+        assert_relative_eq!(d[0], cosine_dist_brute_force(&x, &y));
     }
 
     #[test]

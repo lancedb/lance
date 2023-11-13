@@ -17,22 +17,22 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{types::Float32Type, RecordBatch};
+use arrow_array::{types::Float32Type, FixedSizeListArray, RecordBatch};
 use async_trait::async_trait;
 
 use lance_core::{
     io::{object_writer::ObjectWriter, Reader},
     Result,
 };
-use lance_index::vector::Query;
+use lance_index::{vector::Query, Index};
 use lance_linalg::MatrixView;
 
-use crate::index::{pb::Transform, prefilter::PreFilter, Index};
+use crate::index::{pb::Transform, prefilter::PreFilter};
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
 #[async_trait]
 #[allow(clippy::redundant_pub_crate)]
-pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
+pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// Search the vector for nearest neighbors.
     ///
     /// It returns a [RecordBatch] with Schema of:
@@ -92,7 +92,7 @@ pub trait Transformer: std::fmt::Debug + Sync + Send {
     /// Apply transform on the matrix `data`.
     ///
     /// Returns a new Matrix instead.
-    async fn transform(&self, data: &MatrixView<Float32Type>) -> Result<MatrixView<Float32Type>>;
+    async fn transform(&self, data: &FixedSizeListArray) -> Result<FixedSizeListArray>;
 
     async fn save(&self, writer: &mut ObjectWriter) -> Result<Transform>;
 }

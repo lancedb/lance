@@ -651,7 +651,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def cleanup_old_versions(
         self,
-        older_than: timedelta = None,
+        older_than: Optional[timedelta] = None,
         *,
         delete_unverified: bool = False,
     ) -> CleanupStats:
@@ -691,7 +691,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def create_index(
         self,
-        column: str,
+        column: Union[str, List[str]],
         index_type: str,
         name: Optional[str] = None,
         metric: str = "L2",
@@ -970,6 +970,15 @@ class LanceDataset(pa.dataset.Dataset):
 
         _Dataset.commit(base_uri, operation._to_inner(), read_version, commit_lock)
         return LanceDataset(base_uri)
+
+    def validate(self):
+        """
+        Validate the dataset.
+
+        This checks the integrity of the dataset and will raise an exception if
+        the dataset is corrupted.
+        """
+        self._ds.validate()
 
     @property
     def optimize(self) -> "DatasetOptimizer":
@@ -1276,9 +1285,9 @@ class ScannerBuilder:
         self._offset = None
         self._columns = None
         self._nearest = None
-        self._batch_size = None
-        self._batch_readahead = None
-        self._fragment_readahead = None
+        self._batch_size: Optional[int] = None
+        self._batch_readahead: Optional[int] = None
+        self._fragment_readahead: Optional[int] = None
         self._scan_in_order = True
         self._fragments = None
         self._with_row_id = False

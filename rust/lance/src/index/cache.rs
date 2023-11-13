@@ -14,35 +14,46 @@
 
 use std::sync::Arc;
 
+use lance_index::scalar::ScalarIndex;
 use moka::sync::{Cache, ConcurrentCacheExt};
 
 use super::vector::VectorIndex;
 
 #[derive(Clone)]
 pub struct IndexCache {
-    cache: Arc<Cache<String, Arc<dyn VectorIndex>>>,
+    scalar_cache: Arc<Cache<String, Arc<dyn ScalarIndex>>>,
+    vector_cache: Arc<Cache<String, Arc<dyn VectorIndex>>>,
 }
 
 impl IndexCache {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
-            cache: Arc::new(Cache::new(capacity as u64)),
+            scalar_cache: Arc::new(Cache::new(capacity as u64)),
+            vector_cache: Arc::new(Cache::new(capacity as u64)),
         }
     }
 
     #[allow(dead_code)]
-    pub(crate) fn len(&self) -> usize {
-        self.cache.sync();
-        self.cache.entry_count() as usize
+    pub(crate) fn len_vector(&self) -> usize {
+        self.vector_cache.sync();
+        self.vector_cache.entry_count() as usize
     }
 
     /// Get an Index if present. Otherwise returns [None].
-    pub(crate) fn get(&self, key: &str) -> Option<Arc<dyn VectorIndex>> {
-        self.cache.get(key)
+    pub(crate) fn get_scalar(&self, key: &str) -> Option<Arc<dyn ScalarIndex>> {
+        self.scalar_cache.get(key)
+    }
+
+    pub(crate) fn get_vector(&self, key: &str) -> Option<Arc<dyn VectorIndex>> {
+        self.vector_cache.get(key)
     }
 
     /// Insert a new entry into the cache.
-    pub(crate) fn insert(&self, key: &str, index: Arc<dyn VectorIndex>) {
-        self.cache.insert(key.to_string(), index);
+    pub(crate) fn insert_scalar(&self, key: &str, index: Arc<dyn ScalarIndex>) {
+        self.scalar_cache.insert(key.to_string(), index);
+    }
+
+    pub(crate) fn insert_vector(&self, key: &str, index: Arc<dyn VectorIndex>) {
+        self.vector_cache.insert(key.to_string(), index);
     }
 }

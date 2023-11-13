@@ -106,7 +106,7 @@ async fn flat_search_batch(
     let vectors = as_fixed_size_list_array(vectors.as_ref()).clone();
 
     tokio::task::spawn_blocking(move || {
-        let distances = mt.arrow_batch_func()(key.values(), &vectors) as ArrayRef;
+        let distances = mt.arrow_batch_func()(key.as_ref(), &vectors)? as ArrayRef;
 
         // We don't want any nulls in result, so limit to k or the number of valid values.
         let k = std::cmp::min(k, distances.len() - distances.null_count());

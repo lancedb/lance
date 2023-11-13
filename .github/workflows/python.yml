@@ -136,7 +136,10 @@ jobs:
       run: sudo rm -rf target/wheels
   mac:
     timeout-minutes: 45
-    runs-on: macos-13
+    strategy:
+      matrix:
+        mac-runner: [ "macos-13", "macos-13-xlarge" ]
+    runs-on: "${{ matrix.mac-runner }}"
     defaults:
       run:
         shell: bash

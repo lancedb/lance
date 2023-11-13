@@ -85,8 +85,8 @@ pub struct DeletionFile {
     pub read_version: u64,
     pub id: u64,
     pub file_type: DeletionFileType,
-    /// Number of deleted rows in this file. If 0, this is unknown.
-    pub num_deleted_rows: usize,
+    /// Number of deleted rows in this file. If None, this is unknown.
+    pub num_deleted_rows: Option<usize>,
 }
 
 // TODO: should we convert this to TryFrom and surface the error?
@@ -98,11 +98,16 @@ impl From<&pb::DeletionFile> for DeletionFile {
             1 => DeletionFileType::Bitmap,
             _ => panic!("Invalid deletion file type"),
         };
+        let num_deleted_rows = if value.num_deleted_rows == 0 {
+            None
+        } else {
+            Some(value.num_deleted_rows as usize)
+        };
         Self {
             read_version: value.read_version,
             id: value.id,
             file_type,
-            num_deleted_rows: value.num_deleted_rows as usize,
+            num_deleted_rows,
         }
     }
 }
@@ -123,9 +128,10 @@ pub struct Fragment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deletion_file: Option<DeletionFile>,
 
-    /// Original number of rows in the fragment. If this is zero, then it is
-    /// unknown.
-    pub physical_rows: usize,
+    /// Original number of rows in the fragment. If this is None, then it is
+    /// unknown. This is only optional for legacy reasons. All new tables should
+    /// have this set.
+    pub physical_rows: Option<usize>,
 }
 
 impl Fragment {
@@ -134,19 +140,23 @@ impl Fragment {
             id,
             files: vec![],
             deletion_file: None,
-            physical_rows: 0,
+            physical_rows: None,
         }
     }
 
     pub fn num_rows(&self) -> Option<usize> {
         match (self.physical_rows, &self.deletion_file) {
-            // Unknown fragment length
-            (0, _) => None,
             // Known fragment length, no deletion file.
-            (len, None) => Some(len),
+            (Some(len), None) => Some(len),
             // Known fragment length, but don't know deletion file size.
-            (_, Some(deletion_file)) if deletion_file.num_deleted_rows == 0 => None,
-            (len, Some(deletion_file)) => Some(len - deletion_file.num_deleted_rows),
+            (
+                Some(len),
+                Some(DeletionFile {
+                    num_deleted_rows: Some(num_deleted_rows),
+                    ..
+                }),
+            ) => Some(len - num_deleted_rows),
+            _ => None,
         }
     }
 
@@ -156,7 +166,7 @@ impl Fragment {
     }
 
     /// Create a `Fragment` with one DataFile
-    pub fn with_file(id: u64, path: &str, schema: &Schema, physical_rows: usize) -> Self {
+    pub fn with_file(id: u64, path: &str, schema: &Schema, physical_rows: Option<usize>) -> Self {
         Self {
             id,
             files: vec![DataFile::new(path, schema)],
@@ -180,11 +190,16 @@ impl Fragment {
 
 impl From<&pb::DataFragment> for Fragment {
     fn from(p: &pb::DataFragment) -> Self {
+        let physical_rows = if p.physical_rows > 0 {
+            Some(p.physical_rows as usize)
+        } else {
+            None
+        };
         Self {
             id: p.id,
             files: p.files.iter().map(DataFile::from).collect(),
             deletion_file: p.deletion_file.as_ref().map(DeletionFile::from),
-            physical_rows: p.physical_rows as usize,
+            physical_rows,
         }
     }
 }
@@ -200,14 +215,14 @@ impl From<&Fragment> for pb::DataFragment {
                 read_version: f.read_version,
                 id: f.id,
                 file_type: file_type.into(),
-                num_deleted_rows: f.num_deleted_rows as u64,
+                num_deleted_rows: f.num_deleted_rows.unwrap_or_default() as u64,
             }
         });
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
             deletion_file,
-            physical_rows: f.physical_rows as u64,
+            physical_rows: f.physical_rows.unwrap_or_default() as u64,
         }
     }
 }
@@ -288,7 +303,7 @@ mod tests {
             ArrowField::new("bool", DataType::Boolean, true),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let fragment = Fragment::with_file(123, path, &schema, 10);
+        let fragment = Fragment::with_file(123, path, &schema, Some(10));
 
         assert_eq!(123, fragment.id);
         assert_eq!(fragment.field_ids(), [0, 1, 2, 3]);
@@ -310,7 +325,7 @@ mod tests {
             read_version: 123,
             id: 456,
             file_type: DeletionFileType::Array,
-            num_deleted_rows: 10,
+            num_deleted_rows: Some(10),
         });
 
         let proto = pb::DataFragment::from(&fragment);
@@ -332,7 +347,7 @@ mod tests {
             read_version: 123,
             id: 456,
             file_type: DeletionFileType::Array,
-            num_deleted_rows: 10,
+            num_deleted_rows: Some(10),
         });
 
         let json = serde_json::to_string(&fragment).unwrap();
@@ -346,7 +361,7 @@ mod tests {
                     {"path": "foobar.lance", "fields": [0]}],
                      "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
                                        "num_deleted_rows": 10},
-                "physical_rows": 0}),
+                "physical_rows": None::<usize>}),
         );
 
         let frag2 = Fragment::from_json(&json).unwrap();
