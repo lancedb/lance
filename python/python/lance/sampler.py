@@ -16,9 +16,11 @@
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
 
+import gc
 from heapq import heappush, heappushpop
 from dataclasses import dataclass, field
 from pathlib import Path
+import logging
 import time
 from typing import TYPE_CHECKING, Iterable, TypeVar, Union
 
@@ -66,27 +68,27 @@ def _efficient_sample(
     assert total_records > n
     chunk_size = total_records // max_takes
     chunk_sample_size = n // max_takes
-    for i in range(0, total_records, chunk_size):
+    for idx, i in enumerate(range(0, total_records, chunk_size)):
         # Add more randomness within each chunk.
         offset = i + np.random.randint(0, chunk_size - chunk_sample_size)
-        start = time.time()
         buf.extend(
             dataset.take(
                 list(range(offset, offset + chunk_sample_size)),
                 columns=columns,
             ).to_batches()
         )
-        print(
-            f"Read batch (offset={i}, limit={chunk_sample_size}): {time.time() - start:0.2f}s"
-        )
+        if idx % 50 == 0:
+            logging.info("Sampled at offset=%s, len=%s", offset, chunk_sample_size)
         if sum(len(b) for b in buf) >= batch_size:
             tbl = pa.Table.from_batches(buf)
             buf.clear()
             tbl = tbl.combine_chunks()
             yield tbl.to_batches()[0]
+            del tbl
     if buf:
         tbl = pa.Table.from_batches(buf).combine_chunks()
         yield tbl.to_batches()[0]
+        del tbl
 
 
 def maybe_sample(
@@ -157,5 +159,10 @@ def reservoir_sampling(stream: Iterable[T], k: int) -> list[T]:
         if len(heap) < k:
             heappush(heap, entry)
         else:
-            heappushpop(heap, entry)
-    return [i.item for i in heap]
+            vic = heappushpop(heap, entry)
+            del vic
+        if idx % 10240 == 0:
+            gc.collect()
+    samples = [i.item for i in heap]
+    del heap
+    return samples

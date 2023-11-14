@@ -53,7 +53,16 @@ def test_kmeans_torch(benchmark):
     )
 
     def _f():
-        kmeans = KMeans(CLUSTERS, metric="cosine", device=preferred_device())
-        kmeans.fit(loader)
+        import tracemalloc
+        tracemalloc.start()
+        try:
+            kmeans = KMeans(CLUSTERS, metric="cosine", device=preferred_device())
+            kmeans.fit(loader)
+        except:
+            snapshot = tracemalloc.take_snapshot()
+            top_stats = snapshot.statistics('lineno')
+            for stat in top_stats[:10]:
+                print(stat)
+            raise
 
     benchmark(_f)

@@ -22,6 +22,7 @@ import torch
 from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
+import lance
 from ..sampler import reservoir_sampling
 from . import preferred_device
 from .distance import cosine_distance, dot_distance, l2_distance
@@ -29,19 +30,25 @@ from .distance import cosine_distance, dot_distance, l2_distance
 __all__ = ["KMeans"]
 
 # @torch.jit.script
-def _random_init(data: IterableDataset, n: int) -> torch.Tensor:
+# def _random_init(data: IterableDataset, n: int) -> torch.Tensor:
+def _random_init(data: lance.LanceDataset, n: int) -> torch.Tensor:
     print("Random init on : ", data)
 
     def iter_over_batches() -> Generator[torch.Tensor, None, None]:
         for batch in data:
             for row in batch:
                 yield row.cpu()
+                del row
             del batch
 
+    choices = np.random.choice(range(0, len(data)), size=n)
     start = time.time()
-    centroids = reservoir_sampling(iter_over_batches(), n)
-    print("Random init finished in ", time.time() - start)
-    return torch.stack(centroids)
+    # centroids = reservoir_sampling(iter_over_batches(), n)
+    tbl =data.take(sorted(choices), columns=["vec"]).combine_chunks()
+    fsl = tbl.to_batches()[0]["vec"]
+    centroids = np.stack(fsl.to_numpy(zero_copy_only=False))
+
+    return torch.tensor(centroids)
 
 
 class _BatchTensorDataset(IterableDataset):
@@ -175,10 +182,11 @@ class KMeans:
             )
 
         if self.init == "random":
-            self.centroids = self._to_tensor(_random_init(data, self.k))
+            self.centroids = self._to_tensor(_random_init(data.dataset, self.k))
         else:
             raise ValueError("KMeans::fit: only random initialization is supported.")
 
+        print("Start to train")
         self.total_distance = 0
         for i in tqdm(range(self.max_iters)):
             try:

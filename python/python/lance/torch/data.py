@@ -41,7 +41,11 @@ def _to_tensor(batch: pa.RecordBatch) -> Union[dict[str, torch.Tensor], torch.Te
         if pa.types.is_fixed_size_list(arr.type) and pa.types.is_floating(
             arr.type.value_type
         ):
-            tensor = torch.tensor(np.stack(arr.to_numpy(zero_copy_only=False)))
+            np_arrs = arr.to_numpy(zero_copy_only=False)
+            np_tensor = np.stack(np_arrs)
+            del np_arrs
+            tensor = torch.tensor(np_tensor)
+            del np_tensor
         elif (
             pa.types.is_integer(arr.type)
             or pa.types.is_floating(arr.type)
@@ -53,10 +57,13 @@ def _to_tensor(batch: pa.RecordBatch) -> Union[dict[str, torch.Tensor], torch.Te
                 "Only support FixedSizeList<f16/f32/f64> or "
                 + f"numeric values, got: {arr.type}"
             )
+        del arr
         ret[col] = tensor
     del batch
     if len(ret) == 1:
-        return next(iter(ret.values()))
+        t = next(iter(ret.values()))
+        del ret
+        return t
     return ret
 
 
