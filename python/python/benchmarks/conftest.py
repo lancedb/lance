@@ -11,6 +11,11 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+"""
+pytest configurations for benchmarks.
+
+For configuration that is shared between tests and benchmarks, see ../conftest.py
+"""
 from pathlib import Path
 
 import pytest

@@ -53,11 +53,6 @@ def test_create_ivf_pq(test_dataset, benchmark):
 @pytest.mark.benchmark(group="create_index")
 @pytest.mark.cuda
 def test_create_ivf_pq_cuda(test_dataset, benchmark):
-    import torch
-
-    if not torch.cuda.is_available():
-        pytest.skip("No CUDA device available")
-
     benchmark(
         test_dataset.create_index,
         column="vector",

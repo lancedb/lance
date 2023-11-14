@@ -76,4 +76,10 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 
 [tool.pytest.ini_options]
-markers = ["cuda", "slow"]
+markers = [
+    "cuda: tests which rely on having a CUDA-capable GPU",
+    "integration: mark test to run only on named environment",
+    "gpu: tests which rely on pytorch and some kind of gpu",
+    "slow",
+    "torch: tests which rely on pytorch being installed",
+]
