@@ -456,14 +456,8 @@ def test_cleanup_old_versions(tmp_path):
     # Ok, can accept timedelta
     dataset.cleanup_old_versions(older_than=timedelta(days=14))
 
-    print(tmp_path)
-    for root, dirnames, filenames in os.walk(tmp_path):
-        for filename in filenames:
-            print(root + "/" + filename)
-
     # Now this call will actually delete the old version
     stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
-    print(stats)
     assert stats.bytes_removed > 0
     assert stats.old_versions == 1
 
@@ -600,7 +594,6 @@ def test_deletion_file(tmp_path: Path):
     # New fragment has deletion file
     assert new_fragment.deletion_file() is not None
     assert re.match("_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file())
-    print(type(new_fragment), new_fragment)
     operation = lance.LanceOperation.Overwrite(table.schema, [new_fragment])
     dataset = lance.LanceDataset.commit(base_dir, operation)
     assert dataset.count_rows() == 90
@@ -924,7 +917,7 @@ def test_count_index_rows(tmp_path: Path):
 
     # create index and assert no rows are uncounted
     dataset.create_index(
-        "a", "IVF_PQ", name=index_name, num_partitions=2, num_sub_vectors=1
+        "a", "IVF_PQ", name=index_name, num_partitions=2, num_sub_vectors=4
     )
     assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 0
     assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512

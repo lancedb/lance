@@ -168,9 +168,10 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
                     *old += new;
                 }
             });
+        let mut empty_count = 0;
         cluster_cnts.iter().enumerate().for_each(|(i, &cnt)| {
             if cnt == 0 {
-                warn!("KMeans: cluster {} is empty", i);
+                empty_count += 1;
             } else {
                 // TODO: simd
                 new_centroids[i * dimension..(i + 1) * dimension]
@@ -178,6 +179,15 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
                     .for_each(|v| *v /= T::Native::from_u64(cnt).unwrap());
             }
         });
+
+        if empty_count as f32 / self.k as f32 > 0.5 {
+            // TODO: describe what user should do in response to this message.
+            // This seems to be very common in PQ.
+            warn!(
+                "KMeans: more than half of clusters are empty: {} of {}",
+                empty_count, self.k
+            );
+        }
 
         Ok(KMeans {
             centroids: Arc::new(new_centroids.into()),

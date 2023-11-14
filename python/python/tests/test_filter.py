@@ -81,7 +81,6 @@ def test_simple_predicates(dataset):
 
 
 def test_sql_predicates(dataset):
-    print(dataset.to_table())
     # Predicate and expected number of rows
     predicates_nrows = [
         ("int >= 50", 50),
