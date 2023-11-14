@@ -43,6 +43,14 @@ def _cosine_distance(
     return torch.cat(partitions).reshape(-1), torch.cat(distances).reshape(-1)
 
 
+def _suggest_batch_size(tensor: torch.Tensor) -> int:
+    if torch.cuda.is_available():
+        (free_mem, total_mem) = torch.cuda.mem_get_info()
+        return free_mem // tensor.shape[0] // 4  # TODO: support bf16/f16
+    else:
+        return 1024 * 128
+
+
 def cosine_distance(
     vectors: torch.Tensor, centroids: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -63,7 +71,7 @@ def cosine_distance(
 
     A 2-D [N, M] tensor of cosine distances between x and y
     """
-    split = 1024 * 128
+    split = _suggest_batch_size(centroids)
     while split >= 256:
         try:
             return _cosine_distance(vectors, centroids, split_size=split)
@@ -120,7 +128,7 @@ def l2_distance(
     -------
     A tuple of Tensors, for centroids id, and distance to the centroids.
     """
-    split = 1024 * 128
+    split = _suggest_batch_size(centroids)
     while split >= 256:
         try:
             return _l2_distance(vectors, centroids, split_size=split)

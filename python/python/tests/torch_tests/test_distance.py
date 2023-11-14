@@ -64,12 +64,11 @@ def test_l2_distance():
     expect_dists = np.take_along_axis(
         expect_arr, expect_part_ids.reshape((-1, 1)), axis=1
     ).reshape(-1)
-    print(expect_dists, dist)
     assert np.allclose(dist.cpu(), expect_dists)
     assert np.allclose(part_ids.cpu(), expect_part_ids)
 
 
-@pytest.mark.skip()
+# @pytest.mark.skip()
 def test_large_cosine_distance():
     """Test CUDA Out of memory"""
     from lance.torch.distance import cosine_distance
