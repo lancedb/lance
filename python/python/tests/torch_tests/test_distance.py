@@ -70,19 +70,24 @@ def test_l2_distance():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.cuda is not available")
 def test_large_cosine_distance_cuda():
-    """Test CUDA Out of memory"""
+    """Test CUDA Out of memory.
+
+    Cosine will generate a X*Y matrix as intermediate result. \
+    For x=[M, D], y=[N, D], x*y^T = [M, N] float32 matrix.
+    If M = 65K, N = 100K, X*Y^T of float32 = 25 GB.
+    """
     from lance.torch.distance import cosine_distance
 
     rng = np.random.default_rng()
 
-    x = rng.random((1024 * 40, 1536), dtype="float32")
+    x = rng.random((1024 * 100, 1536), dtype="float32")
     y = rng.random((1024 * 64, 1536), dtype="float32")
 
     (part_ids, dist) = cosine_distance(
         torch.from_numpy(x).to("cuda"), torch.from_numpy(y).to("cuda")
     )
-    assert part_ids.shape == (1024 * 40,)
-    assert dist.shape == (1024 * 40,)
+    assert part_ids.shape == (1024 * 100,)
+    assert dist.shape == (1024 * 100,)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.cuda is not available")
@@ -92,11 +97,11 @@ def test_large_l2_distance_cuda():
 
     rng = np.random.default_rng()
 
-    x = rng.random((1024 * 40, 1536), dtype="float32")
+    x = rng.random((1024 * 100, 1536), dtype="float32")
     y = rng.random((1024 * 64, 1536), dtype="float32")
 
     (part_ids, dist) = l2_distance(
         torch.from_numpy(x).to("cuda"), torch.from_numpy(y).to("cuda")
     )
-    assert part_ids.shape == (1024 * 40,)
-    assert dist.shape == (1024 * 40,)
+    assert part_ids.shape == (1024 * 100,)
+    assert dist.shape == (1024 * 100,)
