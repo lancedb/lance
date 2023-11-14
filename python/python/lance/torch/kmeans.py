@@ -31,10 +31,8 @@ __all__ = ["KMeans"]
 
 
 def _random_init(
-    data: IterableDataset, n: int, seed: Optional[int] = None
+    data: IterableDataset, n: int
 ) -> torch.Tensor:
-    rng = numpy.random.default_rng(seed)
-
     def iter_over_batches() -> Generator[torch.Tensor, None, None]:
         for batch in data:
             for row in batch:
@@ -201,13 +199,6 @@ class KMeans:
             self.centroids = self._to_tensor(_random_init(data, self.k, self.seed))
         else:
             raise ValueError("KMeans::fit: only random initialization is supported.")
-
-        chunks = [
-            torch.from_numpy(c).to(self.device)
-            for c in np.vsplit(arr, int(np.ceil(arr.shape[0] / 65536)))
-        ]
-        del arr
-        del data
 
         self.total_distance = 0
         for i in tqdm(range(self.max_iters)):
