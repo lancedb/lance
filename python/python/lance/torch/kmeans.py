@@ -29,6 +29,7 @@ from .distance import cosine_distance, dot_distance, l2_distance
 
 __all__ = ["KMeans"]
 
+
 # @torch.jit.script
 # def _random_init(data: IterableDataset, n: int) -> torch.Tensor:
 def _random_init(data: lance.LanceDataset, n: int) -> torch.Tensor:
@@ -44,7 +45,7 @@ def _random_init(data: lance.LanceDataset, n: int) -> torch.Tensor:
     choices = np.random.choice(range(0, len(data)), size=n)
     start = time.time()
     # centroids = reservoir_sampling(iter_over_batches(), n)
-    tbl =data.take(sorted(choices), columns=["vec"]).combine_chunks()
+    tbl = data.take(sorted(choices), columns=["vec"]).combine_chunks()
     fsl = tbl.to_batches()[0]["vec"]
     centroids = np.stack(fsl.to_numpy(zero_copy_only=False))
 
