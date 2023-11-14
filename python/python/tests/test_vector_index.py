@@ -472,10 +472,11 @@ def test_index_cache_size(tmp_path):
     tbl = create_table(nvec=1024, ndim=ndim)
     dataset = lance.write_dataset(tbl, tmp_path, index_cache_size=10)
     indexed_dataset = dataset.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=256, num_sub_vectors=2, index_cache_size=10,
+        "vector", index_type="IVF_PQ", num_partitions=256,
+        num_sub_vectors=2, index_cache_size=10,
     )
     indexed_dataset = lance.LanceDataset(indexed_dataset.uri, index_cache_size=10)
-    # dataset = lance.write_dataset(tbl, tmp_path, index_cache_size=10)
+    # indexed_dataset = lance.write_dataset(tbl, tmp_path, index_cache_size=10)
 
     assert indexed_dataset.index_cache_size == 0
 

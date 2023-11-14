@@ -846,6 +846,7 @@ class LanceDataset(pa.dataset.Dataset):
         ivf_centroids: Optional[Union[np.ndarray, pa.FixedSizeListArray]] = None,
         num_sub_vectors: Optional[int] = None,
         accelerator: Optional[Union[str, "torch.Device"]] = None,
+        index_cache_size: Optional[int] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
