@@ -68,8 +68,8 @@ def test_l2_distance():
     assert np.allclose(part_ids.cpu(), expect_part_ids)
 
 
-# @pytest.mark.skip()
-def test_large_cosine_distance():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.cuda is not available")
+def test_large_cosine_distance_cuda():
     """Test CUDA Out of memory"""
     from lance.torch.distance import cosine_distance
 
@@ -85,8 +85,8 @@ def test_large_cosine_distance():
     assert dist.shape == (1024 * 40,)
 
 
-@pytest.mark.skip()
-def test_large_l2_distance():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.cuda is not available")
+def test_large_l2_distance_cuda():
     """Test CUDA Out of memory"""
     from lance.torch.distance import l2_distance
 
