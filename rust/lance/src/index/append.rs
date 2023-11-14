@@ -129,6 +129,7 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
+    use crate::dataset::WriteParams;
     use crate::index::vector::{pq::PQIndex, VectorIndexParams};
     use crate::index::DatasetIndexExt;
 
@@ -154,7 +155,8 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let write_params = WriteParams{index_cache_size: 1, ..Default::default()};
+        let mut dataset = Dataset::write(batches, test_uri, Some(write_params.clone())).await.unwrap();
 
         let ivf_params = IvfBuildParams::new(IVF_PARTITIONS);
         let pq_params = PQBuildParams {
@@ -173,7 +175,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        dataset.append(batches, None).await.unwrap();
+        dataset.append(batches, Some(write_params)).await.unwrap();
 
         let index = &dataset.load_indices().await.unwrap()[0];
         assert!(!unindexed_fragments(index, &dataset)
@@ -246,5 +248,6 @@ mod tests {
             .iter()
             .sum::<usize>();
         assert_eq!(row_in_index, 2000);
+        assert_eq!(dataset.index_cache_size(), 6)
     }
 }

@@ -1823,6 +1823,7 @@ def write_dataset(
     schema: Optional[pa.Schema] = None,
     mode: str = "create",
     *,
+    index_cache_size: int = 256,
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
@@ -1846,6 +1847,8 @@ def write_dataset(
         **overwrite** - create a new snapshot version
         **append** - create a new version that is the concat of the input the
         latest version (raises if uri does not exist)
+    index_cache_size: int, default 256
+        The number of index entries to cache in memory.
     max_rows_per_file: int, default 1024 * 1024
         The max number of rows to write before starting a new file
     max_rows_per_group: int, default 1024
@@ -1870,6 +1873,7 @@ def write_dataset(
 
     params = {
         "mode": mode,
+        "index_cache_size": index_cache_size,
         "max_rows_per_file": max_rows_per_file,
         "max_rows_per_group": max_rows_per_group,
         "max_bytes_per_file": max_bytes_per_file,

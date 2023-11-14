@@ -467,10 +467,19 @@ def test_knn_with_deletions(tmp_path):
     assert expected == [r.as_py() for r in results]
 
 
-def test_index_cache_size(indexed_dataset):
+def test_index_cache_size(tmp_path):
+    ndim = 16
+    tbl = create_table(nvec=1024, ndim=ndim)
+    dataset = lance.write_dataset(tbl, tmp_path, index_cache_size=10)
+    indexed_dataset = dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=256, num_sub_vectors=2, index_cache_size=10,
+    )
+    indexed_dataset = lance.LanceDataset(indexed_dataset.uri, index_cache_size=10)
+    # dataset = lance.write_dataset(tbl, tmp_path, index_cache_size=10)
+
     assert indexed_dataset.index_cache_size == 0
 
-    q = np.random.randn(128)
+    q = np.random.randn(ndim)
 
     indexed_dataset.to_table(
         nearest={
@@ -487,3 +496,12 @@ def test_index_cache_size(indexed_dataset):
         },
     )
     assert indexed_dataset.index_cache_size == 2
+
+    for _ in range(128):
+        indexed_dataset.to_table(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(ndim),
+            },
+        )
+    assert indexed_dataset.index_cache_size == 10
