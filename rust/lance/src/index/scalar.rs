@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use futures::{stream::BoxStream, StreamExt, TryStreamExt};
 use lance_index::scalar::{
     btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
-    flat::FlatIndexTrainer,
+    flat::FlatIndexMetadata,
     lance_format::LanceIndexStore,
     ScalarIndex,
 };
@@ -101,7 +101,7 @@ pub async fn build_scalar_index(dataset: &Dataset, column: &str, uuid: &str) -> 
             location: location!(),
         });
     }
-    let flat_index_trainer = FlatIndexTrainer::new(field.data_type());
+    let flat_index_trainer = FlatIndexMetadata::new(field.data_type());
     let index_dir = dataset.indices_dir().child(uuid);
     let index_store = LanceIndexStore::new((*dataset.object_store).clone(), index_dir);
     train_btree_index(training_request, &flat_index_trainer, &index_store).await

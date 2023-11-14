@@ -14,6 +14,7 @@
 
 mod statistics;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
@@ -21,7 +22,7 @@ use arrow_array::cast::{as_large_list_array, as_list_array, as_struct_array};
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_buffer::ArrowNativeType;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_recursion::async_recursion;
 use lance_arrow::*;
 
@@ -55,6 +56,7 @@ use crate::{
 pub struct FileWriter {
     object_writer: ObjectWriter,
     schema: Schema,
+    arrow_schema: ArrowSchema,
     batch_id: i32,
     page_table: PageTable,
     metadata: Metadata,
@@ -94,9 +96,14 @@ impl FileWriter {
             None
         };
 
+        // This is used for validation. We clear the metadata because we don't
+        // care about mismatches in metadata.
+        let arrow_schema = ArrowSchema::from(&schema).with_metadata(HashMap::new());
+
         Ok(Self {
             object_writer,
             schema,
+            arrow_schema,
             batch_id: 0,
             page_table: PageTable::default(),
             metadata: Metadata::default(),
@@ -110,6 +117,24 @@ impl FileWriter {
     ///
     /// Returns [Err] if the schema does not match with the batch.
     pub async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
+        for batch in batches {
+            // Compare with metadata reset
+            let schema = batch
+                .schema()
+                .as_ref()
+                .clone()
+                .with_metadata(HashMap::new());
+            if self.arrow_schema != schema {
+                return Err(Error::Schema {
+                    message: format!(
+                        "FileWriter::write: schema mismatch: expected: {:?}, actual: {:?}",
+                        self.arrow_schema, schema
+                    ),
+                    location: location!(),
+                });
+            }
+        }
+
         // Copy a list of fields to avoid borrow checker error.
         let fields = self.schema.fields.clone();
         for field in fields.iter() {

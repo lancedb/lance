@@ -14,18 +14,19 @@
 
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use snafu::{location, Location};
 
 use lance_core::{
     io::{
         object_store::ObjectStore, writer::FileWriterOptions, FileReader, FileWriter,
         ReadBatchParams,
     },
-    Result,
+    Error, Result,
 };
 use object_store::path::Path;
 
@@ -71,10 +72,18 @@ impl IndexReader for FileReader {
         self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
             .await
     }
+
+    async fn num_batches(&self) -> u32 {
+        self.num_batches() as u32
+    }
 }
 
 #[async_trait]
 impl IndexStore for LanceIndexStore {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     async fn new_index_file(
         &self,
         name: &str,
@@ -97,6 +106,41 @@ impl IndexStore for LanceIndexStore {
         let file_reader = FileReader::try_new(&self.object_store, &path).await?;
         Ok(Arc::new(file_reader))
     }
+
+    async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()> {
+        let path = self.index_dir.child(name);
+
+        let other_store = dest_store.as_any().downcast_ref::<Self>();
+        if let Some(dest_lance_store) = other_store {
+            // If both this store and the destination are lance stores we can use object_store's copy
+            // This does blindly assume that both stores are using the same underlying object_store
+            // but there is no easy way to verify this and it happens to always be true at the moment
+            let dest_path = dest_lance_store.index_dir.child(name);
+            self.object_store.copy(&path, &dest_path).await
+        } else {
+            let reader = self.open_index_file(name).await?;
+            let num_batches = reader.num_batches().await;
+            if num_batches == 0 {
+                return Err(Error::Internal {
+                    message:
+                        "Cannot copy an empty index file because the schema cannot be determined"
+                            .into(),
+                    location: location!(),
+                });
+            }
+            let first_batch = reader.read_record_batch(0).await?;
+            let schema = first_batch.schema();
+            let mut writer = dest_store.new_index_file(name, schema).await?;
+            writer.write_record_batch(first_batch).await?;
+            for batch_index in 1..num_batches {
+                writer
+                    .write_record_batch(reader.read_record_batch(batch_index).await?)
+                    .await?;
+            }
+            writer.finish().await?;
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -106,7 +150,7 @@ mod tests {
 
     use crate::scalar::{
         btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
-        flat::FlatIndexTrainer,
+        flat::FlatIndexMetadata,
         ScalarIndex, ScalarQuery,
     };
 
@@ -162,7 +206,7 @@ mod tests {
         data: impl RecordBatchReader + Send + Sync + 'static,
         value_type: DataType,
     ) {
-        let sub_index_trainer = FlatIndexTrainer::new(value_type);
+        let sub_index_trainer = FlatIndexMetadata::new(value_type);
 
         let data = Box::new(MockTrainingSource::new(data));
         train_btree_index(data, &sub_index_trainer, index_store.as_ref())
@@ -529,7 +573,7 @@ mod tests {
             Field::new("row_ids", DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
-        let sub_index_trainer = FlatIndexTrainer::new(DataType::Float32);
+        let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
 
         let data = Box::new(MockTrainingSource::new(data));
         // Until DF handles NaN reliably we need to make sure we reject input

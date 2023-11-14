@@ -14,7 +14,7 @@
 
 //! Scalar indices for metadata search & filtering
 
-use std::{ops::Bound, sync::Arc};
+use std::{any::Any, ops::Bound, sync::Arc};
 
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::Schema;
@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use datafusion_common::scalar::ScalarValue;
 
 use lance_core::Result;
+use nohash_hasher::IntMap;
 
 use crate::Index;
 
@@ -46,6 +47,8 @@ pub trait IndexWriter: Send {
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u32) -> Result<RecordBatch>;
+    /// Return the number of batches in the file
+    async fn num_batches(&self) -> u32;
 }
 
 /// Trait abstracting I/O away from index logic
@@ -55,12 +58,19 @@ pub trait IndexReader: Send + Sync {
 /// these batches into file data (e.g. as .lance files or .parquet files, etc.)
 #[async_trait]
 pub trait IndexStore: std::fmt::Debug + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+
     /// Create a new file and return a writer to store data in the file
     async fn new_index_file(&self, name: &str, schema: Arc<Schema>)
         -> Result<Box<dyn IndexWriter>>;
 
     /// Open an existing file for retrieval
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>>;
+
+    /// Copy a range of batches from an index file from this store to another
+    ///
+    /// This is often useful when remapping or updating
+    async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()>;
 }
 
 /// A query that a scalar index can satisfy
@@ -139,4 +149,11 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index {
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
     where
         Self: Sized;
+
+    /// Remap the row ids, creating a new remapped version of this index in `dest_store`
+    async fn remap(
+        &self,
+        mapping: &IntMap<u64, Option<u64>>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<()>;
 }
