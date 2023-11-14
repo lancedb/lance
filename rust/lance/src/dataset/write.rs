@@ -31,7 +31,7 @@ use lance_core::{
     },
     Error, Result,
 };
-use lance_index::util::chunker::chunk_stream;
+use lance_datafusion::chunker::chunk_stream;
 use object_store::path::Path;
 use tracing::instrument;
 use uuid::Uuid;

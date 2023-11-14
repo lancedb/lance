@@ -13,15 +13,13 @@ use lance::{
     Dataset,
 };
 use lance_core::Result;
+use lance_datafusion::exec::reader_to_stream;
 use lance_datagen::{array, gen, BatchCount, RowCount};
-use lance_index::{
-    scalar::{
-        btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
-        flat::FlatIndexMetadata,
-        lance_format::LanceIndexStore,
-        IndexStore, ScalarIndex, ScalarQuery,
-    },
-    util::datafusion::reader_to_stream,
+use lance_index::scalar::{
+    btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
+    flat::FlatIndexMetadata,
+    lance_format::LanceIndexStore,
+    IndexStore, ScalarIndex, ScalarQuery,
 };
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -50,7 +48,7 @@ impl BtreeTrainingSource for BenchmarkDataSource {
         self: Box<Self>,
         _chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
-        Ok(reader_to_stream(Box::new(Self::test_data())))
+        Ok(reader_to_stream(Box::new(Self::test_data()))?.0)
     }
 }
 

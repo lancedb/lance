@@ -91,6 +91,7 @@ pub async fn append_index(
             let mut scanner = dataset.scan();
             scanner.with_fragments(unindexed);
             scanner.with_row_id();
+            scanner.project(&[&column.name])?;
             let new_data_stream = scanner.try_into_stream().await?;
 
             let index = dataset

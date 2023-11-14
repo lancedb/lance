@@ -21,7 +21,7 @@ use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecord
 use datafusion_common::DataFusionError;
 use futures::{Stream, StreamExt, TryStreamExt};
 
-use crate::Result;
+use lance_core::Result;
 
 /// Wraps a [`SendableRecordBatchStream`] into a stream of RecordBatch chunks of
 /// a given size.  This slices but does not copy any buffers.

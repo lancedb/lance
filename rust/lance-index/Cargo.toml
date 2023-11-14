@@ -28,6 +28,7 @@ futures.workspace = true
 half.workspace = true
 lance-arrow.workspace = true
 lance-core.workspace = true
+lance-datafusion.workspace = true
 lance-linalg.workspace = true
 log.workspace = true
 nohash-hasher.workspace = true

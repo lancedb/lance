@@ -40,18 +40,16 @@ use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{Error, Result};
+use lance_datafusion::{
+    chunker::chunk_concat_stream,
+    exec::{execute_plan, OneShotExec},
+};
 use nohash_hasher::IntMap;
 use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
 use snafu::{location, Location};
 
-use crate::{
-    util::{
-        chunker::chunk_concat_stream,
-        datafusion::{execute_plan, OneShotExec},
-    },
-    Index, IndexType,
-};
+use crate::{Index, IndexType};
 
 use super::{
     flat::FlatIndexMetadata, IndexReader, IndexStore, IndexWriter, ScalarIndex, ScalarQuery,

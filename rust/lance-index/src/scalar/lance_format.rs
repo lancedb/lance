@@ -148,13 +148,10 @@ mod tests {
 
     use std::{ops::Bound, path::Path};
 
-    use crate::{
-        scalar::{
-            btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
-            flat::FlatIndexMetadata,
-            ScalarIndex, ScalarQuery,
-        },
-        util::datafusion::reader_to_stream,
+    use crate::scalar::{
+        btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
+        flat::FlatIndexMetadata,
+        ScalarIndex, ScalarQuery,
     };
 
     use super::*;
@@ -168,6 +165,7 @@ mod tests {
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
     use lance_core::io::object_store::ObjectStoreParams;
+    use lance_datafusion::exec::reader_to_stream;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
@@ -188,7 +186,7 @@ mod tests {
     impl MockTrainingSource {
         fn new(data: impl RecordBatchReader + Send + 'static) -> Self {
             Self {
-                data: reader_to_stream(Box::new(data)),
+                data: reader_to_stream(Box::new(data)).unwrap().0,
             }
         }
     }
@@ -276,7 +274,7 @@ mod tests {
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
-                reader_to_stream(Box::new(data)),
+                reader_to_stream(Box::new(data)).unwrap().0,
                 updated_index_store.as_ref(),
             )
             .await

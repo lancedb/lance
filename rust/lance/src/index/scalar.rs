@@ -19,14 +19,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use lance_index::{
-    scalar::{
-        btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
-        flat::FlatIndexMetadata,
-        lance_format::LanceIndexStore,
-        ScalarIndex,
-    },
-    util::chunker::chunk_concat_stream,
+use lance_datafusion::chunker::chunk_concat_stream;
+use lance_index::scalar::{
+    btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
+    flat::FlatIndexMetadata,
+    lance_format::LanceIndexStore,
+    ScalarIndex,
 };
 use snafu::{location, Location};
 use tracing::instrument;

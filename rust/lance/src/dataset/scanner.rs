@@ -36,8 +36,8 @@ use datafusion::physical_plan::{
 use datafusion::scalar::ScalarValue;
 use futures::stream::{Stream, StreamExt};
 use lance_core::ROW_ID_FIELD;
+use lance_datafusion::exec::execute_plan;
 use lance_index::scalar::expression::ScalarIndexExpr;
-use lance_index::util::datafusion::execute_plan;
 use lance_index::vector::{Query, DIST_COL};
 use lance_linalg::distance::MetricType;
 use log::debug;
