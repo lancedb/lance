@@ -14,7 +14,7 @@
 
 import logging
 import time
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -241,11 +241,8 @@ class KMeans:
         self.centroids = self._split_centroids(new_centroids, num_rows)
         return total_dist
 
-    def _transform(self, data: torch.Tensor) -> torch.Tensor:
-        dists = self.dist_func(data, self.centroids)
-        min_idx = torch.argmin(dists, dim=1, keepdim=True)
-        dists = dists.take_along_dim(min_idx, dim=1)
-        return min_idx.reshape((-1)), dists.reshape(-1)
+    def _transform(self, data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.dist_func(data, self.centroids)
 
     def transform(
         self, data: Union[pa.Array, np.ndarray, torch.Tensor]

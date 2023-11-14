@@ -24,7 +24,8 @@ def _cosine_distance(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if len(vectors.shape) != 2 or len(centroids.shape) != 2:
         raise ValueError(
-            f"x and y must be 2-D matrix, got: vectors.shape={vectors.shape}, centroids.shape={centroids.shape}"
+            f"x and y must be 2-D matrix, got: vectors.shape={vectors.shape}"
+            f", centroids.shape={centroids.shape}"
         )
 
     y2 = torch.linalg.norm(centroids.T, dim=0, keepdim=True)
@@ -39,7 +40,7 @@ def _cosine_distance(
         partitions.append(part_ids)
         distances.append(dists.take_along_dim(part_ids, dim=1))
 
-    return torch.cat(partitions), torch.cat(distances)
+    return torch.cat(partitions).reshape(-1), torch.cat(distances).reshape(-1)
 
 
 def cosine_distance(
@@ -62,11 +63,11 @@ def cosine_distance(
 
     A 2-D [N, M] tensor of cosine distances between x and y
     """
-    split = 1024 * 80
-    while split > 256:
+    split = 1024 * 128
+    while split >= 256:
         try:
             return _cosine_distance(vectors, centroids, split_size=split)
-        except RuntimeError as e:
+        except RuntimeError as e:  # noqa: PERF203
             if "CUDA out of memory" in str(e):
                 split //= 2
                 continue
@@ -76,37 +77,64 @@ def cosine_distance(
 
 
 @torch.jit.script
-def l2_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Pair-wise L2 / Euclidean distance between two 2-D Tensors.
-
-    Parameters
-    ----------
-    x : torch.Tensor
-        A 2-D [N, D] tensor
-    y : torch.Tensor
-        A 2-D [M, D] tensor
-
-    Returns
-    -------
-    A 2-D [N, M] tensor of L2 distances between x and y.
-    """
+def _l2_distance(
+    x: torch.Tensor, y: torch.Tensor, split_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
     if len(x.shape) != 2 or len(y.shape) != 2:
         raise ValueError(
             f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
         )
-    # (x - y)^2 = x^2 + y^2 - 2xy
-    x2 = (x * x).sum(dim=1)
+
+    part_ids = []
+    distances = []
+
     y2 = (y * y).sum(dim=1)
-    xy = x @ y.T
-    return (
-        x2.broadcast_to(y2.shape[0], x2.shape[0]).T
-        + y2.broadcast_to(x2.shape[0], y2.shape[0])
-        - 2 * xy
-    )
+    for sub_vectors in x.split(split_size):
+        x2 = (sub_vectors * sub_vectors).sum(dim=1)
+        xy = sub_vectors @ y.T
+        dists = (
+            x2.broadcast_to(y2.shape[0], x2.shape[0]).T
+            + y2.broadcast_to(x2.shape[0], y2.shape[0])
+            - 2 * xy
+        )
+        idx = torch.argmin(dists, dim=1, keepdim=True)
+        part_ids.append(idx)
+        distances.append(dists.take_along_dim(idx, dim=1))
+
+    return torch.cat(part_ids).reshape(-1), torch.cat(distances).reshape(-1)
+
+
+def l2_distance(
+    vectors: torch.Tensor, centroids: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pair-wise L2 / Euclidean distance between two 2-D Tensors.
+
+    Parameters
+    ----------
+    vectors : torch.Tensor
+       A 2-D [N, D] tensor
+    centroids : torch.Tensor
+       A 2-D [M, D] tensor
+
+    Returns
+    -------
+    A tuple of Tensors, for centroids id, and distance to the centroids.
+    """
+    split = 1024 * 128
+    while split >= 256:
+        try:
+            return _l2_distance(vectors, centroids, split_size=split)
+        except RuntimeError as e:  # noqa: PERF203
+            if "CUDA out of memory" in str(e):
+                split //= 2
+                continue
+            raise
+
+    raise RuntimeError("L2 distance out of memory")
 
 
 @torch.jit.script
-def dot_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def dot_distance(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pair-wise dot distance between two 2-D Tensors.
 
     Parameters
@@ -125,4 +153,7 @@ def dot_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
         )
 
-    return 1 - x @ y.T
+    dists = 1 - x @ y.T
+    idx = torch.argmin(dists, dim=1, keepdim=True)
+    dists = dists.take_along_dim(idx, dim=1).reshape(-1)
+    return idx.reshape(-1), dists.reshape(-1)
