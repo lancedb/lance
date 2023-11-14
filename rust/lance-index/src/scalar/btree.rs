@@ -855,18 +855,9 @@ impl ScalarIndex for BTreeIndex {
         sub_index_file.finish().await?;
 
         // Copy the lookup file as-is
-        let lookup_reader = self.store.open_index_file(BTREE_LOOKUP_NAME).await?;
-        let lookup_as_batch = lookup_reader.read_record_batch(0).await?;
-
-        let mut new_lookup_writer = dest_store
-            .new_index_file(BTREE_LOOKUP_NAME, lookup_as_batch.schema())
-            .await?;
-        new_lookup_writer
-            .write_record_batch(lookup_as_batch)
-            .await?;
-        new_lookup_writer.finish().await?;
-
-        Ok(())
+        self.store
+            .copy_index_file(BTREE_LOOKUP_NAME, dest_store)
+            .await
     }
 }
 

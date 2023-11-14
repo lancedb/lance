@@ -517,6 +517,10 @@ impl ObjectStore {
         Ok(())
     }
 
+    pub async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+        Ok(self.inner.copy(from, to).await?)
+    }
+
     /// Read a directory (start from base directory) and returns all sub-paths in the directory.
     pub async fn read_dir(&self, dir_path: impl Into<Path>) -> Result<Vec<String>> {
         let path = dir_path.into();
