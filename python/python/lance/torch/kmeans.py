@@ -14,7 +14,7 @@
 
 import logging
 import time
-from typing import List, Optional, Tuple, Union, Generator
+from typing import Generator, List, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -31,22 +31,11 @@ __all__ = ["KMeans"]
 
 
 # @torch.jit.script
-# def _random_init(data: IterableDataset, n: int) -> torch.Tensor:
-def _random_init(data: lance.LanceDataset, n: int) -> torch.Tensor:
-    print("Random init on : ", data)
-
-    def iter_over_batches() -> Generator[torch.Tensor, None, None]:
-        for batch in data:
-            for row in batch:
-                yield row.cpu()
-                del row
-            del batch
-
+def _random_init(data: lance.LanceDataset, n: int, column: str) -> torch.Tensor:
+    logging.info("Random init on: %s", data)
     choices = np.random.choice(range(0, len(data)), size=n)
-    start = time.time()
-    # centroids = reservoir_sampling(iter_over_batches(), n)
-    tbl = data.take(sorted(choices), columns=["vec"]).combine_chunks()
-    fsl = tbl.to_batches()[0]["vec"]
+    tbl = data.take(sorted(choices), columns=[column]).combine_chunks()
+    fsl = tbl.to_batches()[0][column]
     centroids = np.stack(fsl.to_numpy(zero_copy_only=False))
 
     return torch.tensor(centroids)
@@ -187,11 +176,15 @@ class KMeans:
         else:
             raise ValueError("KMeans::fit: only random initialization is supported.")
 
-        print("Start to train")
+        logging.info(
+            "Start kmean training, metric: %s, iters: %s", self.metric, self.max_iters
+        )
         self.total_distance = 0
         for i in tqdm(range(self.max_iters)):
             try:
-                self.total_distance = self._fit_once(data, self.total_distance)
+                self.total_distance = self._fit_once(
+                    data, i, last_dist=self.total_distance
+                )
             except StopIteration:
                 break
             if i % 10 == 0:
@@ -218,7 +211,7 @@ class KMeans:
             num_rows.scatter_add_(0, part_id, ones)
         return num_rows
 
-    def _fit_once(self, data: IterableDataset, last_dist=0) -> float:
+    def _fit_once(self, data: IterableDataset, epoch: int, last_dist=0) -> float:
         """Train KMean once and return the total distance.
 
         Parameters
@@ -235,8 +228,9 @@ class KMeans:
 
         new_centroids = torch.zeros_like(self.centroids, device=self.device)
         counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
-        for chunk in data:
-            print("Chunk shape: {}", chunk.shape)
+        for idx, chunk in enumerate(data):
+            if idx % 50 == 0:
+                logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
             chunk = chunk.to(self.device)
             ids, dists = self._transform(chunk)
             total_dist += dists.sum().item()

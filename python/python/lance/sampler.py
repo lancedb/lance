@@ -140,8 +140,6 @@ def maybe_sample(
 
 T = TypeVar("T")
 
-import torch
-
 
 @dataclass(order=True)
 class PrioritizedItem:
@@ -149,7 +147,6 @@ class PrioritizedItem:
     item: T = field(compare=False)
 
 
-@torch.compile
 def reservoir_sampling(stream: Iterable[T], k: int) -> list[T]:
     rng = np.random.default_rng()
     heap = []
@@ -161,6 +158,7 @@ def reservoir_sampling(stream: Iterable[T], k: int) -> list[T]:
             vic = heappushpop(heap, entry)
             del vic
         if idx % 10240 == 0:
+            logging.info("Force Python GC")
             gc.collect()
     samples = [i.item for i in heap]
     del heap
