@@ -22,6 +22,7 @@ rustflags = [
     "-Wclippy::string_to_string",
     "-Wclippy::use_self",
     "-Dclippy::cargo",
+    "-Dclippy::dbg_macro",
     # not too much we can do to avoid multiple crate versions
     "-Aclippy::multiple-crate-versions",
 ]

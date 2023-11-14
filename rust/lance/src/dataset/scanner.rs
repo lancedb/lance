@@ -779,7 +779,6 @@ impl Scanner {
 
     // ANN/KNN search execution node with optional prefilter
     async fn knn(&self, filter_plan: &FilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
-        dbg!("knn");
         let Some(q) = self.nearest.as_ref() else {
             return Err(Error::IO {
                 message: "No nearest query".to_string(),
