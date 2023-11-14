@@ -35,7 +35,7 @@ def _cosine_distance(
 
     for sub_vectors in torch.split(vectors, split_size):
         x2 = torch.linalg.norm(sub_vectors, dim=1, keepdim=True)
-        dists = 1 - sub_vectors @ centroids.T / (x2 * y2)
+        dists = 1 - (sub_vectors @ centroids.T).div_(x2 * y2)
         part_ids = torch.argmin(dists, dim=1, keepdim=True)
         partitions.append(part_ids)
         distances.append(dists.take_along_dim(part_ids, dim=1))
