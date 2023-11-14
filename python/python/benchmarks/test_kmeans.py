@@ -57,7 +57,7 @@ def test_kmeans_torch(benchmark):
 
         tracemalloc.start()
         try:
-            kmeans = KMeans(CLUSTERS, metric="cosine", device=preferred_device())
+            kmeans = KMeans(CLUSTERS, metric="l2", device=preferred_device())
             kmeans.fit(loader)
         except:
             snapshot = tracemalloc.take_snapshot()
