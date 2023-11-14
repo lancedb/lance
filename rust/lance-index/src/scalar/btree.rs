@@ -15,7 +15,7 @@
 use std::{
     any::Any,
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, HashMap},
+    collections::{BTreeMap, BinaryHeap},
     fmt::{Debug, Display},
     ops::Bound,
     sync::Arc,
@@ -32,6 +32,7 @@ use futures::{
     FutureExt, StreamExt, TryStreamExt,
 };
 use lance_core::{Error, Result};
+use nohash_hasher::IntMap;
 use serde::{Serialize, Serializer};
 use snafu::{location, Location};
 
@@ -832,7 +833,7 @@ impl ScalarIndex for BTreeIndex {
 
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &IntMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
         // Remap and write the pages
@@ -931,7 +932,7 @@ pub trait BTreeSubIndex: Debug + Send + Sync {
     async fn remap_subindex(
         &self,
         serialized: RecordBatch,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &IntMap<u64, Option<u64>>,
     ) -> Result<RecordBatch>;
 }
 

@@ -14,7 +14,7 @@
 
 //! IVF - Inverted File index.
 
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{any::Any, sync::Arc};
 
 use arrow_arith::numeric::sub;
 use arrow_array::{
@@ -50,6 +50,7 @@ use lance_linalg::{
     matrix::MatrixView,
 };
 use log::{debug, info};
+use nohash_hasher::IntMap;
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::Serialize;
 use snafu::{location, Location};
@@ -341,7 +342,7 @@ impl VectorIndex for IVFIndex {
         Ok(())
     }
 
-    fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    fn remap(&mut self, _mapping: &IntMap<u64, Option<u64>>) -> Result<()> {
         // This will be needed if we want to clean up IVF to allow more than just
         // one layer (e.g. IVF -> IVF -> PQ).  We need to pass on the call to
         // remap to the lower layers.
@@ -743,7 +744,7 @@ impl RemapPageTask {
         mut self,
         reader: &dyn Reader,
         index: &IVFIndex,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &IntMap<u64, Option<u64>>,
     ) -> Result<Self> {
         let mut page = index
             .sub_index
@@ -786,7 +787,7 @@ pub(crate) async fn remap_index_file(
     new_uuid: &str,
     old_version: u64,
     index: &IVFIndex,
-    mapping: &HashMap<u64, Option<u64>>,
+    mapping: &IntMap<u64, Option<u64>>,
     name: String,
     column: String,
     transforms: Vec<pb::Transform>,
@@ -1276,7 +1277,7 @@ mod tests {
         row_ids_to_modify: &[u64],
         row_ids_to_remove: &[u64],
         max_id: u64,
-    ) -> HashMap<u64, Option<u64>> {
+    ) -> IntMap<u64, Option<u64>> {
         // Some big number we can add to row ids so they are remapped but don't intersect with anything
         if max_id > BIG_OFFSET {
             panic!("This logic will only work if the max row id is less than BIG_OFFSET");

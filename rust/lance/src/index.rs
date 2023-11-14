@@ -27,6 +27,7 @@ use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
 use lance_index::{pb, Index, IndexType, INDEX_FILE_NAME};
+use nohash_hasher::IntMap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
@@ -61,7 +62,7 @@ pub trait IndexParams: Send + Sync {
 pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
-    row_id_map: &HashMap<u64, Option<u64>>,
+    row_id_map: &IntMap<u64, Option<u64>>,
 ) -> Result<Uuid> {
     // Load indices from the disk.
     let indices = dataset.load_indices().await?;
