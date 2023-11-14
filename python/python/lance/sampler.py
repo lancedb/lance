@@ -17,11 +17,10 @@
 from __future__ import annotations
 
 import gc
-from heapq import heappush, heappushpop
-from dataclasses import dataclass, field
-from pathlib import Path
 import logging
-import time
+from dataclasses import dataclass, field
+from heapq import heappush, heappushpop
+from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, TypeVar, Union
 
 import numpy as np

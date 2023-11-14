@@ -23,7 +23,7 @@ from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
 import lance
-from ..sampler import reservoir_sampling
+
 from . import preferred_device
 from .distance import cosine_distance, dot_distance, l2_distance
 
