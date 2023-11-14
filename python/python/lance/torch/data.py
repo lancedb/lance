@@ -76,6 +76,7 @@ class LanceDataset(IterableDataset):
         self.columns = columns
         self.batch_size = batch_size
         self.samples: Optional[int] = samples
+        self.filter = filter
 
         if samples is not None and filter is not None:
             raise ValueError("Does not support sampling over filtered dataset")
@@ -99,7 +100,7 @@ class LanceDataset(IterableDataset):
                 stream = self.dataset.to_batches(
                     columns=self.columns,
                     batch_size=self.batch_size,
-                    filter=filter,
+                    filter=self.filter,
                 )
 
             if self.cache:
@@ -108,3 +109,10 @@ class LanceDataset(IterableDataset):
 
         for batch in stream:
             yield _to_tensor(batch)
+
+    def __len__(self):
+        total_rows = self.dataset.count_rows(filter=filter)
+        if self.samples:
+            return min(self.samples, total_rows)
+        else:
+            return total_rows

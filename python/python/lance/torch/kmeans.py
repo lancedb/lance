@@ -14,25 +14,35 @@
 
 import logging
 import time
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Generator
 
 import numpy as np
+import numpy.random
 import pyarrow as pa
 import torch
+from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
+from ..sampler import reservoir_sampling
 from . import preferred_device
 from .distance import cosine_distance, dot_distance, l2_distance
 
 __all__ = ["KMeans"]
 
 
-def _random_init(data: np.ndarray, n: int, seed: Optional[int] = None) -> torch.Tensor:
-    if seed is not None:
-        np.random.seed(seed)
-    sample_idx = np.random.randint(0, data.shape[0], (n,))
-    samples = data[sample_idx]
-    return samples
+def _random_init(
+    data: IterableDataset, n: int, seed: Optional[int] = None
+) -> torch.Tensor:
+    rng = numpy.random.default_rng(seed)
+
+    def iter_over_batches() -> Generator[torch.Tensor, None, None]:
+        for batch in data:
+            for row in batch:
+                yield row.numpy()
+            del batch
+
+    centroids = reservoir_sampling(iter_over_batches(), n)
+    return torch.stack(centroids)
 
 
 @torch.jit.script
@@ -55,6 +65,30 @@ def _new_centroids_mps(
             new_centroids[idx, :] = new_centroids[idx, :].div(cnt)
 
     return new_centroids.to(data[0].device)
+
+
+class _BatchTensorDataset(IterableDataset):
+    def __init__(
+        self,
+        tensor: Union[pa.FixedSizeListArray, torch.Tensor, np.ndarray],
+        batch_size: int,
+    ):
+        super().__init__()
+        if isinstance(tensor, pa.FixedSizeListArray):
+            tensor = tensor.to_numpy(zero_copy_only=False)
+        if isinstance(tensor, np.ndarray):
+            tensor = torch.from_numpy(tensor)
+
+        self.tensor = tensor.cpu()
+        self._batch_size = batch_size
+
+    def __iter__(self):
+        total_rows = self.tensor.shape[0]
+        for i in range(0, total_rows, self._batch_size):
+            yield self.tensor[i : min(total_rows - i, self._batch_size)]
+
+    def __len__(self):
+        return self.tensor.shape[0]
 
 
 class KMeans:
@@ -138,7 +172,10 @@ class KMeans:
         data = data.to(self.device)
         return data
 
-    def fit(self, data: Union[pa.FixedSizeListArray, np.ndarray, torch.Tensor]):
+    def fit(
+        self,
+        data: Union[IterableDataset, pa.FixedSizeListArray, torch.Tensor, np.ndarray],
+    ):
         """Fit - Train the kmeans models.
 
         Parameters
@@ -150,20 +187,18 @@ class KMeans:
         start = time.time()
         assert self.centroids is None
 
-        if isinstance(data, pa.FixedSizeListArray):
-            arr = np.stack(data.to_numpy(zero_copy_only=False))
-        elif isinstance(data, torch.Tensor):
-            arr = data.cpu().numpy()
-        elif isinstance(data, np.ndarray):
-            arr = data
+        if isinstance(data, (pa.FixedSizeListArray, torch.Tensor, np.ndarray)):
+            data = _BatchTensorDataset(data, 20480)
+        elif isinstance(data, IterableDataset):
+            data = data
         else:
             raise ValueError(
                 "Input data can only be FixedSizeListArray"
-                + f" or numpy ndarray: got {type(data)}"
+                + f" or numpy ndarray, or torch.Dataset: got {type(data)}"
             )
 
         if self.init == "random":
-            self.centroids = self._to_tensor(_random_init(arr, self.k, self.seed))
+            self.centroids = self._to_tensor(_random_init(data, self.k, self.seed))
         else:
             raise ValueError("KMeans::fit: only random initialization is supported.")
 

@@ -16,8 +16,9 @@
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
 
+from heapq import heappush, heappushpop
 from pathlib import Path
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Iterable, TypeVar, Union
 
 import numpy as np
 import pyarrow as pa
@@ -130,3 +131,18 @@ def maybe_sample(
             choices = np.random.choice(len(dataset), n, replace=False)
             tbl = dataset._take_rows(choices, columns=columns).combine_chunks()
             yield tbl.to_batches()[0]
+
+
+T = TypeVar("T")
+
+
+def reservoir_sampling(stream: Iterable[T], k: int) -> list[T]:
+    rng = np.random.default_rng()
+    heap = []
+    for item in stream:
+        key = rng.integers(0, k**2)
+        if len(heap) < k:
+            heappush(heap, (key, item))
+        else:
+            heappushpop(heap, (key, item))
+    return [i[1] for i in heap]
