@@ -60,8 +60,8 @@ pub struct FlatIndexTrainer {
 impl FlatIndexTrainer {
     pub fn new(value_type: DataType) -> Self {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", value_type, false),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new("values", value_type, true),
+            Field::new("row_ids", DataType::UInt64, true),
         ]));
         Self { schema }
     }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -63,6 +63,9 @@ pub struct ShufflerBuilder {
     /// work with a NamedTempFile.
     temp_dir: Arc<TempDir>,
 
+    /// Schema we are writing. Used for validation.
+    schema: ArrowSchema,
+
     writer: Arc<Mutex<FileWriter>>,
 }
 
@@ -81,12 +84,14 @@ impl ShufflerBuilder {
         let object_store = ObjectStore::local();
         let path = lance_buffer_path(&temp_dir)?;
         let writer = object_store.create(&path).await?;
-        let lance_schema = Schema::try_from(schema)?;
+        let schema = schema.clone();
+        let lance_schema = Schema::try_from(&schema)?;
         Ok(Self {
             buffer: DashMap::new(),
             flush_size: flush_threshold, // TODO: change to parameterized value later.
             temp_dir,
             parted_groups: DashMap::new(),
+            schema,
             writer: Arc::new(Mutex::new(FileWriter::with_object_writer(
                 writer,
                 lance_schema,
@@ -97,6 +102,15 @@ impl ShufflerBuilder {
 
     /// Insert a [RecordBatch] with the same key (Partition ID).
     pub async fn insert(&self, key: u32, batch: RecordBatch) -> Result<()> {
+        // Compare with metadata reset
+        debug_assert_eq!(
+            &batch
+                .schema()
+                .as_ref()
+                .clone()
+                .with_metadata(HashMap::new()),
+            &self.schema
+        );
         let mut batches = self.buffer.entry(key).or_default();
         batches.push(batch);
         let total = batches.iter().map(|b| b.num_rows()).sum::<usize>();
