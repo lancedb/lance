@@ -13,34 +13,66 @@
 #  limitations under the License.
 
 
+from typing import Tuple
+
 import torch
 
 
 @torch.jit.script
-def cosine_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def _cosine_distance(
+    vectors: torch.Tensor, centroids: torch.Tensor, split_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if len(vectors.shape) != 2 or len(centroids.shape) != 2:
+        raise ValueError(
+            f"x and y must be 2-D matrix, got: vectors.shape={vectors.shape}, centroids.shape={centroids.shape}"
+        )
+
+    y2 = torch.linalg.norm(centroids.T, dim=0, keepdim=True)
+
+    partitions = []
+    distances = []
+
+    for sub_vectors in torch.split(vectors, split_size):
+        x2 = torch.linalg.norm(sub_vectors, dim=1, keepdim=True)
+        dists = 1 - sub_vectors @ centroids.T / (x2 * y2)
+        part_ids = torch.argmin(dists, dim=1, keepdim=True)
+        partitions.append(part_ids)
+        distances.append(dists.take_along_dim(part_ids, dim=1))
+
+    return torch.cat(partitions), torch.cat(distances)
+
+
+def cosine_distance(
+    vectors: torch.Tensor, centroids: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Cosine pair-wise distances between two 2-D Tensors.
 
     Cosine distance = 1 - |xy| / ||x|| * ||y||
 
     Parameters
     ----------
-    x : torch.Tensor
+    vectors : torch.Tensor
         A 2-D [N, D] tensor
-    y : torch.Tensor
+    centroids : torch.Tensor
         A 2-D [M, D] tensor
 
     Returns
     -------
+    A tuple of Tensors, for centroids id, and distance to the centroid.
+
     A 2-D [N, M] tensor of cosine distances between x and y
     """
-    if len(x.shape) != 2 or len(y.shape) != 2:
-        raise ValueError(
-            f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
-        )
+    split = 1024 * 80
+    while split > 256:
+        try:
+            return _cosine_distance(vectors, centroids, split_size=split)
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                split //= 2
+                continue
+            raise
 
-    x2 = torch.linalg.norm(x, dim=1, keepdim=True)
-    y2 = torch.linalg.norm(y.T, dim=0, keepdim=True)
-    return 1 - x @ y.T / (x2 * y2)
+    raise RuntimeError("Cosine distance out of memory")
 
 
 @torch.jit.script

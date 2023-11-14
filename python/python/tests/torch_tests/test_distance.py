@@ -52,3 +52,19 @@ def test_l2_distance():
         .reshape(20, 100)
     )
     assert np.allclose(dist.cpu(), expect_arr)
+
+
+@pytest.skip
+def test_large_cosine_distance():
+    from lance.torch.distance import cosine_distance
+
+    rng = np.random.default_rng()
+
+    x = rng.random((1024 * 40, 1536), dtype="float32")
+    y = rng.random((1024 * 64, 1536), dtype="float32")
+
+    (part_ids, dist) = cosine_distance(
+        torch.from_numpy(x).to("cuda"), torch.from_numpy(y).to("cuda")
+    )
+    assert part_ids.shape == (1024 * 40, 1)
+    assert dist.shape == (1024 * 40, 1)
