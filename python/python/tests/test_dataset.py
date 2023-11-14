@@ -702,20 +702,35 @@ def test_delete_data(tmp_path: Path):
 
 
 def test_update_dataset(tmp_path: Path):
-    tab = pa.table({"a": range(100), "b": range(100)})
+    nrows = 100
+    vecs = pa.FixedSizeListArray.from_arrays(
+        pa.array(range(2 * nrows), type=pa.float32()), 2
+    )
+    tab = pa.table({"a": range(nrows), "b": range(nrows), "vec": vecs})
     lance.write_dataset(tab, tmp_path / "dataset", mode="append")
 
     dataset = lance.dataset(tmp_path / "dataset")
 
     dataset.update(dict(b="b + 1"))
     expected = pa.table({"a": range(100), "b": range(1, 101)})
-    assert dataset.to_table() == expected
+    assert dataset.to_table(columns=["a", "b"]) == expected
 
     dataset.update(dict(a="a * 2"), where="a < 50")
     expected = pa.table(
         {"a": [x * 2 if x < 50 else x for x in range(100)], "b": range(1, 101)}
     )
-    assert dataset.to_table().sort_by("b") == expected
+    assert dataset.to_table(columns=["a", "b"]).sort_by("b") == expected
+
+    dataset.update(dict(vec="[42.0, 43.0]"))
+    expected = pa.table(
+        {
+            "b": range(1, 101),
+            "vec": pa.array(
+                [[42.0, 43.0] for _ in range(100)], pa.list_(pa.float32(), 2)
+            ),
+        }
+    )
+    assert dataset.to_table(columns=["b", "vec"]).sort_by("b") == expected
 
 
 def test_create_update_empty_dataset(tmp_path: Path, provide_pandas: bool):

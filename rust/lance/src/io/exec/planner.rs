@@ -17,15 +17,15 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use arrow_schema::{DataType as ArrowDataType, SchemaRef, TimeUnit};
-use datafusion::common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion};
+use arrow_schema::{ArrowError, DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRewriter, TreeNodeVisitor, VisitRecursion};
 use datafusion::common::DFSchema;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{GetFieldAccess, GetIndexedField};
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::sqlparser::ast::{
-    BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr, Function,
-    FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
+    Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr,
+    Function, FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
 };
 use datafusion::{
     common::Column,
@@ -38,9 +38,10 @@ use datafusion::{
 use lance_index::scalar::expression::{
     apply_scalar_indices, IndexInformationProvider, ScalarIndexExpr,
 };
+use lance_index::util::datafusion::safe_coerce_scalar;
 use snafu::{location, Location};
 
-use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
+use crate::datafusion::logical_expr::{coerce_filter_type_to_boolean, resolve_column_type};
 use crate::utils::sql::parse_sql_expr;
 use crate::{
     datafusion::logical_expr::resolve_expr, datatypes::Schema, utils::sql::parse_sql_filter, Error,
@@ -346,6 +347,48 @@ impl Planner {
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
             SQLExpr::Value(value) => self.value(value),
+            SQLExpr::Array(SQLArray { elem, .. }) => {
+                let mut values = vec![];
+
+                for expr in elem {
+                    if let SQLExpr::Value(value) = expr {
+                        if let Expr::Literal(value) = self.value(value)? {
+                            values.push(value);
+                        } else {
+                            return Err(Error::Internal {
+                                message: "Expected a literal value in array.".into(),
+                                location: location!(),
+                            });
+                        }
+                    } else {
+                        return Err(Error::IO {
+                            message: "Only arrays of literals are supported in lance.".into(),
+                            location: location!(),
+                        });
+                    }
+                }
+
+                let field = if !values.is_empty() {
+                    let data_type = values[0].data_type();
+
+                    for value in &mut values {
+                        if value.data_type() != data_type {
+                            *value = safe_coerce_scalar(value, &data_type).ok_or_else(|| Error::IO {
+                                message: format!("Array expressions must have a consistent datatype. Expected: {}, got: {}", data_type, value.data_type()),
+                                location: location!()
+                            })?;
+                        }
+                    }
+                    Field::new("item", data_type, true)
+                } else {
+                    Field::new("item", ArrowDataType::Null, true)
+                };
+
+                Ok(Expr::Literal(ScalarValue::List(
+                    Some(values),
+                    Arc::new(field),
+                )))
+            }
             // For example, DATE '2020-01-01'
             SQLExpr::TypedString { data_type, value } => {
                 Ok(Expr::Cast(datafusion::logical_expr::Cast {
@@ -402,7 +445,7 @@ impl Planner {
                 data_type: self.parse_type(data_type)?,
             })),
             _ => Err(Error::IO {
-                message: format!("Expression '{expr}' is not supported as filter in lance"),
+                message: format!("Expression '{expr}' is not supported SQL in lance"),
                 location: location!(),
             }),
         }
@@ -436,6 +479,11 @@ impl Planner {
     /// Optimize the filter expression and coerce data types.
     pub fn optimize_expr(&self, expr: Expr) -> Result<Expr> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
+
+        let mut rewriter = ListRewriter {
+            schema: Schema::try_from(self.schema.as_ref())?,
+        };
+        let expr = expr.rewrite(&mut rewriter)?;
 
         // DataFusion needs the simplify and coerce passes to be applied before
         // expressions can be handled by the physical planner.
@@ -533,6 +581,47 @@ impl TreeNodeVisitor for ColumnCapturingVisitor {
         }
 
         Ok(VisitRecursion::Continue)
+    }
+}
+
+// TODO: remove me once DataFusion can cast List -> FSL
+struct ListRewriter {
+    schema: Schema,
+}
+
+impl TreeNodeRewriter for ListRewriter {
+    type N = Expr;
+
+    fn mutate(&mut self, node: Expr) -> DFResult<Expr> {
+        fn is_list_literal(expr: &Expr) -> bool {
+            matches!(expr, Expr::Literal(ScalarValue::List(_, _)))
+        }
+
+        match node {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_list_literal(right.as_ref()) => {
+                let (left, right) = match resolve_column_type(&left, &self.schema) {
+                    Some(out_type @ ArrowDataType::FixedSizeList(_, _)) => {
+                        let right_ref = if let Expr::Literal(val) = *right {
+                            safe_coerce_scalar(&val, &out_type).ok_or_else(|| {
+                                ArrowError::CastError(format!(
+                                    "Failed to cast {} to {} during planning",
+                                    val.data_type(),
+                                    out_type
+                                ))
+                            })?
+                        } else {
+                            unreachable!()
+                        };
+
+                        (left, Box::new(Expr::Literal(right_ref)))
+                    }
+                    _ => (left, right),
+                };
+
+                Ok(Expr::BinaryExpr(BinaryExpr { left, op, right }))
+            }
+            _ => Ok(node),
+        }
     }
 }
 
@@ -1003,6 +1092,44 @@ mod tests {
                         assert_eq!(data_type, expected_data_type);
                     }
                     _ => panic!("Expected right to be a cast"),
+                },
+                _ => panic!("Expected binary expression"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_sql_array_literals() {
+        let cases = [
+            (
+                "x = [1, 2, 3]",
+                ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Int64, true))),
+            ),
+            (
+                "x = [1, 2, 3]",
+                ArrowDataType::FixedSizeList(
+                    Arc::new(Field::new("item", ArrowDataType::Int64, true)),
+                    3,
+                ),
+            ),
+        ];
+
+        for (sql, expected_data_type) in cases {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "x",
+                expected_data_type.clone(),
+                true,
+            )]));
+            let planner = Planner::new(schema.clone());
+            let expr = planner.parse_filter(sql).unwrap();
+            let expr = planner.optimize_expr(expr).unwrap();
+
+            match expr {
+                Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
+                    Expr::Literal(value) => {
+                        assert_eq!(&value.data_type(), &expected_data_type);
+                    }
+                    _ => panic!("Expected right to be a literal"),
                 },
                 _ => panic!("Expected binary expression"),
             }
