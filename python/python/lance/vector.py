@@ -142,30 +142,25 @@ def train_ivf_centroids_on_accelerator(
     ):
         raise ValueError(
             "Train ivf centroids on accelerator: "
-            + f"only support 'cuda' as accelerator, got '{accelerator}'."
+            + f"only support 'cuda' or 'mps' as accelerator, got '{accelerator}'."
         )
 
-    total_size = dataset.count_rows()
     sample_size = k * sample_rate
 
-    if total_size <= sample_size:
-        samples = dataset.to_table(columns=[column])[column].combine_chunks()
-    else:
-        samples = dataset.sample(sample_size, columns=[column])[column].combine_chunks()
+    from lance.torch.data import LanceDataset as TorchDataset
 
-    import torch
+    ds = TorchDataset(
+        dataset,
+        batch_size=sample_size,
+        columns=[column],
+        samples=sample_rate,
+        cache=True,
+    )
 
     # Pytorch installation warning will be raised here.
     from .torch.kmeans import KMeans
 
-    if (
-        isinstance(accelerator, torch.device)
-        or CUDA_REGEX.match(accelerator)
-        or accelerator == "mps"
-    ):
-        logging.info("Training IVF partitions using GPU(%s)", accelerator)
-        kmeans = KMeans(k, metric=metric_type, device=accelerator)
-        kmeans.fit(samples)
-        return kmeans.centroids.cpu().numpy()
-    else:
-        raise ValueError(f"unsupported accelerator type: {accelerator}")
+    logging.info("Training IVF partitions using GPU(%s)", accelerator)
+    kmeans = KMeans(k, metric=metric_type, device=accelerator)
+    kmeans.fit(ds)
+    return kmeans.centroids.cpu().numpy()

@@ -14,7 +14,7 @@
 
 import logging
 import time
-from typing import Generator, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -148,7 +148,7 @@ class KMeans:
 
     def fit(
         self,
-        data: Union[IterableDataset, pa.FixedSizeListArray, torch.Tensor, np.ndarray],
+        data: IterableDataset,
     ):
         """Fit - Train the kmeans models.
 
@@ -160,16 +160,6 @@ class KMeans:
         """
         start = time.time()
         assert self.centroids is None
-
-        if isinstance(data, (pa.FixedSizeListArray, torch.Tensor, np.ndarray)):
-            data = _BatchTensorDataset(data, 20480)
-        elif isinstance(data, IterableDataset):
-            data = data
-        else:
-            raise ValueError(
-                "Input data can only be FixedSizeListArray"
-                + f" or numpy ndarray, or torch.Dataset: got {type(data)}"
-            )
 
         if self.init == "random":
             self.centroids = self._to_tensor(_random_init(data.dataset, self.k))
