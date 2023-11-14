@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 from heapq import heappush, heappushpop
+from dataclasses import dataclass, field
 from pathlib import Path
+import time
 from typing import TYPE_CHECKING, Iterable, TypeVar, Union
 
 import numpy as np
@@ -67,13 +69,15 @@ def _efficient_sample(
     for i in range(0, total_records, chunk_size):
         # Add more randomness within each chunk.
         offset = i + np.random.randint(0, chunk_size - chunk_sample_size)
+        start = time.time()
         buf.extend(
-            dataset.to_batches(
+            dataset.take(
+                list(range(offset, offset + chunk_sample_size)),
                 columns=columns,
-                batch_size=chunk_size,
-                offset=offset,
-                limit=chunk_sample_size,
-            )
+            ).to_batches()
+        )
+        print(
+            f"Read batch (offset={i}, limit={chunk_sample_size}): {time.time() - start:0.2f}s"
         )
         if sum(len(b) for b in buf) >= batch_size:
             tbl = pa.Table.from_batches(buf)
@@ -90,7 +94,7 @@ def maybe_sample(
     n: int,
     columns: Union[list[str], str],
     batch_size: int = 10240,
-    max_takes: int = 8194,
+    max_takes: int = 512,
 ) -> Generator[pa.RecordBatch, None, None]:
     """Sample n records from the dataset.
 
@@ -135,14 +139,23 @@ def maybe_sample(
 
 T = TypeVar("T")
 
+import torch
 
+
+@dataclass(order=True)
+class PrioritizedItem:
+    priority: int
+    item: T = field(compare=False)
+
+
+@torch.compile
 def reservoir_sampling(stream: Iterable[T], k: int) -> list[T]:
     rng = np.random.default_rng()
     heap = []
-    for item in stream:
-        key = rng.integers(0, k**2)
+    for idx, item in enumerate(stream):
+        entry = PrioritizedItem(rng.integers(0, k * 2), item)
         if len(heap) < k:
-            heappush(heap, (key, item))
+            heappush(heap, entry)
         else:
-            heappushpop(heap, (key, item))
-    return [i[1] for i in heap]
+            heappushpop(heap, entry)
+    return [i.item for i in heap]

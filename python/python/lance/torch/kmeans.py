@@ -17,7 +17,6 @@ import time
 from typing import List, Optional, Tuple, Union, Generator
 
 import numpy as np
-import numpy.random
 import pyarrow as pa
 import torch
 from torch.utils.data import IterableDataset
@@ -29,40 +28,20 @@ from .distance import cosine_distance, dot_distance, l2_distance
 
 __all__ = ["KMeans"]
 
+# @torch.jit.script
+def _random_init(data: IterableDataset, n: int) -> torch.Tensor:
+    print("Random init on : ", data)
 
-def _random_init(
-    data: IterableDataset, n: int
-) -> torch.Tensor:
     def iter_over_batches() -> Generator[torch.Tensor, None, None]:
         for batch in data:
             for row in batch:
-                yield row.numpy()
+                yield row.cpu()
             del batch
 
+    start = time.time()
     centroids = reservoir_sampling(iter_over_batches(), n)
+    print("Random init finished in ", time.time() - start)
     return torch.stack(centroids)
-
-
-@torch.jit.script
-def _new_centroids_mps(
-    part_ids: List[torch.Tensor],
-    k: int,
-    data: List[torch.Tensor],
-    cnts: torch.Tensor,
-) -> torch.Tensor:
-    # MPS does not have Torch.index_reduce_()
-    # See https://github.com/pytorch/pytorch/issues/77764
-
-    new_centroids = torch.zeros((k, data[0].shape[1]), device=data[0].device)
-    for ids, chunk in zip(part_ids, data):
-        new_centroids.index_add_(0, ids, chunk)
-    for idx, cnt in enumerate(cnts.cpu()):
-        if cnt == 0:
-            new_centroids[idx, :] = torch.nan
-        else:
-            new_centroids[idx, :] = new_centroids[idx, :].div(cnt)
-
-    return new_centroids.to(data[0].device)
 
 
 class _BatchTensorDataset(IterableDataset):
@@ -196,14 +175,14 @@ class KMeans:
             )
 
         if self.init == "random":
-            self.centroids = self._to_tensor(_random_init(data, self.k, self.seed))
+            self.centroids = self._to_tensor(_random_init(data, self.k))
         else:
             raise ValueError("KMeans::fit: only random initialization is supported.")
 
         self.total_distance = 0
         for i in tqdm(range(self.max_iters)):
             try:
-                self.total_distance = self._fit_once(chunks, self.total_distance)
+                self.total_distance = self._fit_once(data, self.total_distance)
             except StopIteration:
                 break
             if i % 10 == 0:
@@ -230,7 +209,7 @@ class KMeans:
             num_rows.scatter_add_(0, part_id, ones)
         return num_rows
 
-    def _fit_once(self, chunks: List[torch.Tensor], last_dist=0) -> float:
+    def _fit_once(self, data: IterableDataset, last_dist=0) -> float:
         """Train KMean once and return the total distance.
 
         Parameters
@@ -243,28 +222,27 @@ class KMeans:
         float
             The total distance of the current centroids and the input data.
         """
-        device = chunks[0].device
-        part_ids = []
         total_dist = 0
-        for chunk in chunks:
+
+        new_centroids = torch.zeros_like(self.centroids, device=self.device)
+        counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
+        for chunk in data:
+            print("Chunk shape: {}", chunk.shape)
+            chunk = chunk.to(self.device)
             ids, dists = self._transform(chunk)
             total_dist += dists.sum().item()
-            part_ids.append(ids)
+            ones = torch.ones(len(ids), device=self.device)
+
+            new_centroids.index_add_(0, ids, chunk)
+            counts_per_part.index_add_(0, ids, ones)
+            del ids
+            del dists
+            del chunk
 
         if abs(total_dist - last_dist) / total_dist < self.tolerance:
             raise StopIteration("kmeans: converged")
 
-        num_rows = self._count_rows_in_clusters(part_ids, self.k)
-        if self.device.type == "cuda":
-            new_centroids = torch.zeros_like(self.centroids, device=device)
-            for ids, chunk in zip(part_ids, chunks):
-                new_centroids.index_reduce_(
-                    0, ids, chunk, reduce="mean", include_self=False
-                )
-        else:
-            new_centroids = _new_centroids_mps(part_ids, self.k, chunks, num_rows)
-
-        self.centroids = self._split_centroids(new_centroids, num_rows)
+        self.centroids = self._split_centroids(new_centroids, counts_per_part)
         return total_dist
 
     def _transform(self, data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

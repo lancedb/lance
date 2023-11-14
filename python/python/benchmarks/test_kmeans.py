@@ -21,7 +21,7 @@ from lance.util import KMeans
 # the GPU can be significant. Only once the problem size is large enough does
 # the benefit of GPU computation outweigh the overhead of copying data. Therefore,
 # these tests are marked as slow, and are opt-in.
-CLUSTERS = 1024
+CLUSTERS = 1024 * 64
 NUM_VECTORS = CLUSTERS * 256
 
 
@@ -38,16 +38,22 @@ def test_kmeans(benchmark):
 
 
 @pytest.mark.benchmark(group="kmeans")
-@pytest.mark.slow
-@pytest.mark.gpu
+# @pytest.mark.slow
+# @pytest.mark.gpu
 def test_kmeans_torch(benchmark):
-    data = np.random.random((NUM_VECTORS, 1536)).astype("f")
-
+    import lance
     from lance.torch import preferred_device
+    from lance.torch.data import LanceDataset
     from lance.torch.kmeans import KMeans
+
+    ds = lance.dataset("/tmp/testdata")
+
+    loader = LanceDataset(
+        ds, columns=["vec"], batch_size=40960, cache=True, samples=NUM_VECTORS
+    )
 
     def _f():
         kmeans = KMeans(CLUSTERS, metric="cosine", device=preferred_device())
-        kmeans.fit(data)
+        kmeans.fit(loader)
 
     benchmark(_f)

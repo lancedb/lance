@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 __all__ = ["LanceDataset"]
 
 
-def _to_tensor(batch: pa.RecordBatch) -> dict[str, torch.Tensor]:
+def _to_tensor(batch: pa.RecordBatch) -> Union[dict[str, torch.Tensor], torch.Tensor]:
     ret = {}
     for col in batch.column_names:
         arr: pa.Array = batch[col]
@@ -54,6 +54,9 @@ def _to_tensor(batch: pa.RecordBatch) -> dict[str, torch.Tensor]:
                 + f"numeric values, got: {arr.type}"
             )
         ret[col] = tensor
+    del batch
+    if len(ret) == 1:
+        return next(iter(ret.values()))
     return ret
 
 
@@ -109,6 +112,7 @@ class LanceDataset(IterableDataset):
 
         for batch in stream:
             yield _to_tensor(batch)
+            del batch
 
     def __len__(self):
         total_rows = self.dataset.count_rows(filter=filter)
