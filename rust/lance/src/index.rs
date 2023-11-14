@@ -24,8 +24,10 @@ use async_trait::async_trait;
 use lance_core::io::{read_message, read_message_from_buf, read_metadata_offset, Reader};
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::IndexInformationProvider;
+use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
 use lance_index::{pb, Index, IndexType, INDEX_FILE_NAME};
+use nohash_hasher::IntMap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
@@ -60,7 +62,7 @@ pub trait IndexParams: Send + Sync {
 pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
-    row_id_map: &HashMap<u64, Option<u64>>,
+    row_id_map: &IntMap<u64, Option<u64>>,
 ) -> Result<Uuid> {
     // Load indices from the disk.
     let indices = dataset.load_indices().await?;
@@ -87,15 +89,32 @@ pub(crate) async fn remap_index(
 
     let new_id = Uuid::new_v4();
 
-    remap_vector_index(
-        Arc::new(dataset.clone()),
-        &field.name,
-        index_id,
-        &new_id,
-        matched,
-        row_id_map,
-    )
-    .await?;
+    let generic = dataset
+        .open_generic_index(&field.name, &index_id.to_string())
+        .await?;
+
+    match generic.index_type() {
+        IndexType::Scalar => {
+            let index_dir = dataset.indices_dir().child(new_id.to_string());
+            let new_store = LanceIndexStore::new((*dataset.object_store).clone(), index_dir);
+
+            let scalar_index = dataset
+                .open_scalar_index(&field.name, &index_id.to_string())
+                .await?;
+            scalar_index.remap(row_id_map, &new_store).await?;
+        }
+        IndexType::Vector => {
+            remap_vector_index(
+                Arc::new(dataset.clone()),
+                &field.name,
+                index_id,
+                &new_id,
+                matched,
+                row_id_map,
+            )
+            .await?;
+        }
+    }
 
     Ok(new_id)
 }

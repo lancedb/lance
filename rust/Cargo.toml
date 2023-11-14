@@ -63,7 +63,8 @@ aws-config = "0.56"
 aws-credential-types = "0.56"
 aws-sdk-dynamodb = "0.34"
 half = { "version" = "=2.3.1", default-features = false, features = [
-    "num-traits", "std",
+    "num-traits",
+    "std",
 ] }
 bytes = "1.4"
 byteorder = "1.5"
@@ -78,6 +79,7 @@ lazy_static = "1"
 log = "0.4"
 mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = "0.11"
+nohash-hasher = { version = "0.2.0" }
 num_cpus = "1.0"
 num-traits = "0.2"
 object_store = { version = "0.7.1", features = ["aws", "gcp", "azure"] }

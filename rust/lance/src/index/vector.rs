@@ -15,8 +15,8 @@
 //! Vector Index for Fast Approximate Nearest Neighbor (ANN) Search
 //!
 
+use std::any::Any;
 use std::sync::Arc;
-use std::{any::Any, collections::HashMap};
 
 pub mod diskann;
 #[allow(dead_code)]
@@ -31,6 +31,7 @@ mod utils;
 use lance_core::io::Reader;
 use lance_index::vector::{ivf::IvfBuildParams, pq::PQBuildParams};
 use lance_linalg::distance::*;
+use nohash_hasher::IntMap;
 use object_store::path::Path;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -228,7 +229,7 @@ pub(crate) async fn remap_vector_index(
     old_uuid: &Uuid,
     new_uuid: &Uuid,
     old_metadata: &crate::format::Index,
-    mapping: &HashMap<u64, Option<u64>>,
+    mapping: &IntMap<u64, Option<u64>>,
 ) -> Result<()> {
     let old_index = dataset
         .open_vector_index(column, &old_uuid.to_string())

@@ -1212,6 +1212,7 @@ mod test {
 
     use super::*;
     use crate::arrow::*;
+    use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
     use crate::index::scalar::ScalarIndexParams;
@@ -2725,6 +2726,7 @@ mod test {
         sample_query: Arc<dyn Array>,
         delete_query: Arc<dyn Array>,
         original_version: u64,
+        compact_version: u64,
         append_version: u64,
         delete_version: u64,
         append_then_delete_version: u64,
@@ -2737,6 +2739,7 @@ mod test {
         use_deleted_data: bool,
         use_new_data: bool,
         with_row_id: bool,
+        use_compaction: bool,
     }
 
     impl ScalarIndexTestFixture {
@@ -2759,10 +2762,14 @@ mod test {
                 .into_batch_rows(RowCount::from(1000))
                 .unwrap();
 
+            // Write as two batches so we can later compact
             let mut dataset = Dataset::write(
                 RecordBatchIterator::new(vec![Ok(data.clone())], data.schema().clone()),
                 test_uri,
-                None,
+                Some(WriteParams {
+                    max_rows_per_file: 500,
+                    ..Default::default()
+                }),
             )
             .await
             .unwrap();
@@ -2793,6 +2800,8 @@ mod test {
             let sample_query = data["vector"].as_fixed_size_list().value(50);
             let delete_query = data["vector"].as_fixed_size_list().value(75);
 
+            // APPEND DATA
+
             // Re-use the vector column in the new batch but add 1000 to the indexed/not_indexed columns so
             // they are distinct.  This makes our checks easier.
             let new_indexed =
@@ -2815,9 +2824,13 @@ mod test {
 
             let append_version = dataset.version().version;
 
+            // APPEND -> DELETE
+
             dataset.delete("not_indexed = 75").await.unwrap();
 
             let append_then_delete_version = dataset.version().version;
+
+            // DELETE
 
             let mut dataset = dataset.checkout_version(original_version).await.unwrap();
             dataset.restore(None).await.unwrap();
@@ -2826,12 +2839,22 @@ mod test {
 
             let delete_version = dataset.version().version;
 
+            // COMPACT (this should materialize the deletion)
+
+            compact_files(&mut dataset, CompactionOptions::default(), None)
+                .await
+                .unwrap();
+            let compact_version = dataset.version().version;
+            dataset.checkout_version(original_version).await.unwrap();
+            dataset.restore(None).await.unwrap();
+
             Self {
                 _test_dir: test_dir,
                 dataset,
                 sample_query,
                 delete_query,
                 original_version,
+                compact_version,
                 append_version,
                 delete_version,
                 append_then_delete_version,
@@ -2847,11 +2870,19 @@ mod test {
         }
 
         async fn get_dataset(&self, params: &ScalarTestParams) -> Dataset {
-            let version = match (params.use_new_data, params.use_deleted_data) {
-                (false, false) => self.original_version,
-                (false, true) => self.delete_version,
-                (true, false) => self.append_version,
-                (true, true) => self.append_then_delete_version,
+            let version = if params.use_compaction {
+                if params.use_deleted_data || params.use_new_data {
+                    panic!("There is no test data combining new/deleted data with compaction");
+                } else {
+                    self.compact_version
+                }
+            } else {
+                match (params.use_new_data, params.use_deleted_data) {
+                    (false, false) => self.original_version,
+                    (false, true) => self.delete_version,
+                    (true, false) => self.append_version,
+                    (true, true) => self.append_then_delete_version,
+                }
             };
             self.dataset.checkout_version(version).await.unwrap()
         }
@@ -3047,7 +3078,7 @@ mod test {
                 "The query contained 50 even though it was filtered",
             );
             let mut expected_num_rows = if params.use_new_data { 1999 } else { 999 };
-            if params.use_deleted_data {
+            if params.use_deleted_data || params.use_compaction {
                 expected_num_rows -= 1;
             }
             assert_eq!(batch.num_rows(), expected_num_rows);
@@ -3059,7 +3090,7 @@ mod test {
             }
 
             // Also make sure we don't return deleted data
-            if params.use_deleted_data {
+            if params.use_deleted_data || params.use_compaction {
                 let (_, batch) = self.run_query("indexed == 75", None, params).await;
                 assert_eq!(batch.num_rows(), 0);
             }
@@ -3090,7 +3121,7 @@ mod test {
             );
 
             let mut expected_num_rows = if params.use_new_data { 199 } else { 99 };
-            if params.use_deleted_data {
+            if params.use_deleted_data || params.use_compaction {
                 expected_num_rows -= 1;
             }
             assert_eq!(batch.num_rows(), expected_num_rows);
@@ -3106,23 +3137,34 @@ mod test {
     // effects on the plan that gets built.  This test attempts to run the same queries in various
     // different configurations to ensure that we get consistent results
     #[tokio::test]
-    async fn test_secondary_index_scans_vector() {
+    async fn test_secondary_index_scans() {
         let fixture = ScalarIndexTestFixture::new().await;
 
         for use_index in [false, true] {
             for use_projection in [false, true] {
                 for use_deleted_data in [false, true] {
                     for use_new_data in [false, true] {
-                        for with_row_id in [false, true] {
-                            let params = ScalarTestParams {
-                                use_index,
-                                use_projection,
-                                use_deleted_data,
-                                use_new_data,
-                                with_row_id,
-                            };
-                            fixture.check_vector_queries(&params).await;
-                            fixture.check_simple_queries(&params).await;
+                        // Don't test compaction in conjuction with deletion and new data, it's too
+                        // many combinations with no clear benefit.  Feel free to update if there is
+                        // a need
+                        let compaction_choices = if use_deleted_data || use_new_data {
+                            vec![false]
+                        } else {
+                            vec![false, true]
+                        };
+                        for use_compaction in compaction_choices {
+                            for with_row_id in [false, true] {
+                                let params = ScalarTestParams {
+                                    use_index,
+                                    use_projection,
+                                    use_deleted_data,
+                                    use_new_data,
+                                    with_row_id,
+                                    use_compaction,
+                                };
+                                fixture.check_vector_queries(&params).await;
+                                fixture.check_simple_queries(&params).await;
+                            }
                         }
                     }
                 }

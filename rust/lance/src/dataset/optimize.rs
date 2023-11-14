@@ -102,7 +102,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
-use nohash_hasher::BuildNoHashHasher;
+use nohash_hasher::{BuildNoHashHasher, IntMap};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -138,7 +138,7 @@ impl RemappedIndex {
 pub trait IndexRemapper: Send + Sync {
     async fn remap_indices(
         &self,
-        index_map: HashMap<u64, Option<u64>>,
+        index_map: IntMap<u64, Option<u64>>,
         affected_fragment_ids: &[u64],
     ) -> Result<Vec<RemappedIndex>>;
 }
@@ -197,7 +197,7 @@ pub struct IgnoreRemap {}
 impl IndexRemapper for IgnoreRemap {
     async fn remap_indices(
         &self,
-        _: HashMap<u64, Option<u64>>,
+        _: IntMap<u64, Option<u64>>,
         _: &[u64],
     ) -> Result<Vec<RemappedIndex>> {
         Ok(Vec::new())
@@ -616,7 +616,7 @@ pub struct RewriteResult {
     pub read_version: u64,
     /// The original fragments being replaced
     pub original_fragments: Vec<Fragment>,
-    pub row_id_map: HashMap<u64, Option<u64>, BuildNoHashHasher<u64>>,
+    pub row_id_map: IntMap<u64, Option<u64>>,
 }
 
 fn extract_row_ids(
@@ -754,7 +754,7 @@ fn transpose_row_ids(
     row_ids: RoaringTreemap,
     old_fragments: &Vec<Fragment>,
     new_fragments: &[Fragment],
-) -> HashMap<u64, Option<u64>, BuildNoHashHasher<u64>> {
+) -> IntMap<u64, Option<u64>> {
     let new_ids = new_fragments.iter().flat_map(|frag| {
         (0..frag.physical_rows.unwrap() as u32).map(|offset| {
             Some(u64::from(RowAddress::new_from_parts(
@@ -778,7 +778,7 @@ fn transpose_row_ids(
     // We expect row ids to be unique, so we should already not get many collisions.
     // The default hasher is designed to be resistance to DoS attacks, which is
     // more than we need for this use case.
-    let mut mapping: HashMap<u64, Option<u64>, BuildNoHashHasher<u64>> =
+    let mut mapping: IntMap<u64, Option<u64>> =
         HashMap::with_capacity_and_hasher(expected_size, BuildNoHashHasher::default());
     mapping.extend(row_ids.iter().zip(new_ids));
     MissingIds::new(row_ids.into_iter(), old_fragments).for_each(|id| {
@@ -876,7 +876,7 @@ async fn rewrite_files(
 
     reserve_fragment_ids(&dataset, &mut new_fragments).await?;
 
-    let row_id_map: HashMap<u64, Option<u64>, _> =
+    let row_id_map: IntMap<u64, Option<u64>> =
         transpose_row_ids(row_ids, &fragments, &new_fragments);
 
     metrics.files_removed = task
@@ -918,7 +918,7 @@ pub async fn commit_compaction(
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
     let mut metrics = CompactionMetrics::default();
 
-    let mut row_id_map: HashMap<u64, Option<u64>> = HashMap::new();
+    let mut row_id_map: IntMap<u64, Option<u64>> = IntMap::default();
 
     for task in completed_tasks {
         metrics += task.metrics;
@@ -1018,7 +1018,7 @@ mod tests {
     impl IndexRemapper for IgnoreRemap {
         async fn remap_indices(
             &self,
-            _: HashMap<u64, Option<u64>>,
+            _: IntMap<u64, Option<u64>>,
             _: &[u64],
         ) -> Result<Vec<RemappedIndex>> {
             Ok(Vec::new())
@@ -1033,7 +1033,7 @@ mod tests {
 
     #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
     struct MockIndexRemapperExpectation {
-        expected: HashMap<u64, Option<u64>>,
+        expected: IntMap<u64, Option<u64>>,
         answer: Vec<RemappedIndex>,
     }
 
@@ -1043,7 +1043,7 @@ mod tests {
     }
 
     impl MockIndexRemapper {
-        fn stringify_map(map: &HashMap<u64, Option<u64>>) -> String {
+        fn stringify_map(map: &IntMap<u64, Option<u64>>) -> String {
             let mut sorted_keys = map.keys().collect::<Vec<_>>();
             sorted_keys.sort();
             let mut first_keys = sorted_keys
@@ -1079,7 +1079,7 @@ mod tests {
     impl IndexRemapper for MockIndexRemapper {
         async fn remap_indices(
             &self,
-            index_map: HashMap<u64, Option<u64>>,
+            index_map: IntMap<u64, Option<u64>>,
             _: &[u64],
         ) -> Result<Vec<RemappedIndex>> {
             for expectation in &self.expectations {
@@ -1250,7 +1250,7 @@ mod tests {
         ranges: &[Vec<(Range<u64>, bool)>],
         starting_new_frag_idx: u32,
     ) -> MockIndexRemapper {
-        let mut expected_remap: HashMap<u64, Option<u64>> = HashMap::new();
+        let mut expected_remap: IntMap<u64, Option<u64>> = IntMap::default();
         expected_remap.reserve(ranges.iter().map(|r| r.len()).sum());
         for (new_frag_offset, new_frag_ranges) in ranges.iter().enumerate() {
             let new_frag_idx = starting_new_frag_idx + new_frag_offset as u32;

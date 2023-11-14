@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -35,6 +34,7 @@ use lance_index::{
     Index, IndexType,
 };
 use lance_linalg::distance::MetricType;
+use nohash_hasher::IntMap;
 use serde::Serialize;
 use snafu::{location, Location};
 use tracing::{instrument, Instrument};
@@ -218,7 +218,7 @@ impl VectorIndex for PQIndex {
         Ok(())
     }
 
-    fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    fn remap(&mut self, mapping: &IntMap<u64, Option<u64>>) -> Result<()> {
         let code = self
             .code
             .as_ref()

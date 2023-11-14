@@ -14,20 +14,20 @@
 
 use std::{any::Any, ops::Bound, sync::Arc};
 
-use arrow_array::{ArrayRef, BooleanArray, RecordBatch, UInt64Array};
+use arrow_array::{
+    cast::AsArray, types::UInt64Type, ArrayRef, BooleanArray, RecordBatch, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use lance_core::Result;
+use nohash_hasher::IntMap;
 use serde::Serialize;
 
 use crate::{Index, IndexType};
 
-use super::{
-    btree::{SubIndexLoader, SubIndexTrainer},
-    IndexReader, IndexStore, IndexWriter, ScalarIndex, ScalarQuery,
-};
+use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex, ScalarQuery};
 
 /// A flat index is just a batch of value/row-id pairs
 ///
@@ -50,14 +50,44 @@ impl FlatIndex {
     }
 }
 
+fn remap_batch(batch: RecordBatch, mapping: &IntMap<u64, Option<u64>>) -> Result<RecordBatch> {
+    let row_ids = batch.column(1).as_primitive::<UInt64Type>();
+    let val_idx_and_new_id = row_ids
+        .values()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, old_id)| {
+            mapping
+                .get(old_id)
+                .copied()
+                .unwrap_or(Some(*old_id))
+                .map(|new_id| (idx, new_id))
+        })
+        .collect::<Vec<_>>();
+    let new_ids = Arc::new(UInt64Array::from_iter_values(
+        val_idx_and_new_id.iter().copied().map(|(_, new_id)| new_id),
+    ));
+    let new_val_indices = UInt64Array::from_iter_values(
+        val_idx_and_new_id
+            .into_iter()
+            .map(|(val_idx, _)| val_idx as u64),
+    );
+    let new_vals = arrow_select::take::take(batch.column(0), &new_val_indices, None)?;
+    Ok(RecordBatch::try_new(
+        batch.schema().clone(),
+        vec![new_vals, new_ids],
+    )?)
+}
+
 /// Trains a flat index from a record batch of values & ids by simply storing the batch
 ///
 /// This allows the flat index to be used as a sub-index
-pub struct FlatIndexTrainer {
+#[derive(Debug)]
+pub struct FlatIndexMetadata {
     schema: Arc<Schema>,
 }
 
-impl FlatIndexTrainer {
+impl FlatIndexMetadata {
     pub fn new(value_type: DataType) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("values", value_type, true),
@@ -67,40 +97,33 @@ impl FlatIndexTrainer {
     }
 }
 
-/// Loads a flat index from a serialized record batch by simply loading the batch
-///
-/// This allows the flat index to be used as a sub-index
-#[derive(Debug)]
-pub struct FlatIndexLoader {}
-
 #[async_trait]
-impl SubIndexLoader for FlatIndexLoader {
-    async fn load_subindex(
-        &self,
-        offset: u32,
-        index_reader: Arc<dyn IndexReader>,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        let batch = index_reader.read_record_batch(offset).await?;
-        Ok(Arc::new(FlatIndex {
-            data: Arc::new(batch),
-        }))
-    }
-}
-
-#[async_trait]
-impl SubIndexTrainer for FlatIndexTrainer {
+impl BTreeSubIndex for FlatIndexMetadata {
     fn schema(&self) -> &Arc<Schema> {
         &self.schema
     }
 
-    async fn train(&self, batch: RecordBatch, writer: &mut dyn IndexWriter) -> Result<u64> {
+    async fn train(&self, batch: RecordBatch) -> Result<RecordBatch> {
         // The data source may not call the columns "values" and "row_ids" so we need to replace
         // the schema
-        let batch = RecordBatch::try_new(
+        Ok(RecordBatch::try_new(
             self.schema.clone(),
             vec![batch.column(0).clone(), batch.column(1).clone()],
-        )?;
-        writer.write_record_batch(batch).await
+        )?)
+    }
+
+    async fn load_subindex(&self, serialized: RecordBatch) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(Arc::new(FlatIndex {
+            data: Arc::new(serialized),
+        }))
+    }
+
+    async fn remap_subindex(
+        &self,
+        serialized: RecordBatch,
+        mapping: &IntMap<u64, Option<u64>>,
+    ) -> Result<RecordBatch> {
+        remap_batch(serialized, mapping)
     }
 }
 
@@ -208,6 +231,21 @@ impl ScalarIndex for FlatIndex {
             data: Arc::new(batch),
         }))
     }
+
+    // Same as above, this is dead code at the moment but should work
+    async fn remap(
+        &self,
+        mapping: &IntMap<u64, Option<u64>>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<()> {
+        let remapped = remap_batch((*self.data).clone(), mapping)?;
+        let mut writer = dest_store
+            .new_index_file("data.lance", remapped.schema())
+            .await?;
+        writer.write_record_batch(remapped).await?;
+        writer.finish().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -288,5 +326,51 @@ mod tests {
             &[0, 100],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_remap() {
+        let index = example_index();
+        // 0 -> 2000
+        // 3 -> delete
+        // Keep remaining as is
+        let mapping = IntMap::<u64, Option<u64>>::from_iter(vec![(0, Some(2000)), (3, None)]);
+        let metadata = FlatIndexMetadata::new(DataType::Int32);
+        let remapped = metadata
+            .remap_subindex((*index.data).clone(), &mapping)
+            .await
+            .unwrap();
+
+        let expected = gen()
+            .col(
+                Some("values".to_string()),
+                array::cycle::<Int32Type>(vec![10, 100, 1234]),
+            )
+            .col(
+                Some("ids".to_string()),
+                array::cycle::<UInt64Type>(vec![5, 2000, 100]),
+            )
+            .into_batch_rows(RowCount::from(3))
+            .unwrap();
+        assert_eq!(remapped, expected);
+    }
+
+    // It's possible, during compaction, that an entire page of values is deleted.  We just serialize
+    // it as an empty record batch.
+    #[tokio::test]
+    async fn test_remap_to_nothing() {
+        let index = example_index();
+        let mapping = IntMap::<u64, Option<u64>>::from_iter(vec![
+            (5, None),
+            (0, None),
+            (3, None),
+            (100, None),
+        ]);
+        let metadata = FlatIndexMetadata::new(DataType::Int32);
+        let remapped = metadata
+            .remap_subindex((*index.data).clone(), &mapping)
+            .await
+            .unwrap();
+        assert_eq!(remapped.num_rows(), 0);
     }
 }

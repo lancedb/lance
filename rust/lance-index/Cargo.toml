@@ -29,6 +29,7 @@ lance-arrow.workspace = true
 lance-core.workspace = true
 lance-linalg.workspace = true
 log.workspace = true
+nohash-hasher.workspace = true
 num_cpus.workspace = true
 num-traits.workspace = true
 object_store.workspace = true
