@@ -147,20 +147,27 @@ def train_ivf_centroids_on_accelerator(
 
     sample_size = k * sample_rate
 
+    # Pytorch installation warning will be raised here.
     from lance.torch.data import LanceDataset as TorchDataset
+    from .torch.kmeans import KMeans
+
+    import torch
+
+    logging.info("Randomly centroids %s centroids from %s", k, dataset)
+    samples = dataset.sample(k, [column]).combine_chunks()
+    fsl = samples.to_batches()[0][column]
+    init_centroids = torch.from_numpy(np.stack(fsl.to_numpy(zero_copy_only=False)))
+    logging.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
     ds = TorchDataset(
         dataset,
-        batch_size=sample_size,
+        batch_size=20480,
         columns=[column],
-        samples=sample_rate,
+        samples=sample_size,
         cache=True,
     )
 
-    # Pytorch installation warning will be raised here.
-    from .torch.kmeans import KMeans
-
     logging.info("Training IVF partitions using GPU(%s)", accelerator)
-    kmeans = KMeans(k, metric=metric_type, device=accelerator)
+    kmeans = KMeans(k, metric=metric_type, device=accelerator, centroids=init_centroids)
     kmeans.fit(ds)
     return kmeans.centroids.cpu().numpy()

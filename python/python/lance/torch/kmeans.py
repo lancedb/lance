@@ -22,52 +22,10 @@ import torch
 from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
-import lance
-
 from . import preferred_device
 from .distance import cosine_distance, dot_distance, l2_distance
 
 __all__ = ["KMeans"]
-
-
-# @torch.jit.script
-def _random_init(data: lance.LanceDataset, n: int) -> torch.Tensor:
-    logging.info("Random init on: %s", data)
-    choices = np.random.choice(range(0, len(data)), size=n)
-
-    schema = data.schema
-    if len(schema.names) != 1:
-        raise ValueError(f"Only support one column in the dataset, got: {schema.names}")
-    column = schema.names[0]
-    tbl = data.take(sorted(choices), columns=[column]).combine_chunks()
-    fsl = tbl.to_batches()[0][column]
-    centroids = np.stack(fsl.to_numpy(zero_copy_only=False))
-
-    return torch.tensor(centroids)
-
-
-class _BatchTensorDataset(IterableDataset):
-    def __init__(
-        self,
-        tensor: Union[pa.FixedSizeListArray, torch.Tensor, np.ndarray],
-        batch_size: int,
-    ):
-        super().__init__()
-        if isinstance(tensor, pa.FixedSizeListArray):
-            tensor = tensor.to_numpy(zero_copy_only=False)
-        if isinstance(tensor, np.ndarray):
-            tensor = torch.from_numpy(tensor)
-
-        self.tensor = tensor.cpu()
-        self._batch_size = batch_size
-
-    def __iter__(self):
-        total_rows = self.tensor.shape[0]
-        for i in range(0, total_rows, self._batch_size):
-            yield self.tensor[i : min(total_rows - i, self._batch_size)]
-
-    def __len__(self):
-        return self.tensor.shape[0]
 
 
 class KMeans:
@@ -103,6 +61,7 @@ class KMeans:
         init: str = "random",
         max_iters: int = 50,
         tolerance: float = 1e-4,
+        centroids: Optional[torch.Tensor] = None,
         seed: Optional[int] = None,
         device: Optional[str] = None,
     ):
@@ -123,7 +82,7 @@ class KMeans:
             )
 
         self.total_distance = 0
-        self.centroids: Optional[torch.Tensor] = None
+        self.centroids: Optional[torch.Tensor] = centroids
         self.init = init
         self.device = preferred_device(device)
         self.tolerance = tolerance
@@ -164,12 +123,8 @@ class KMeans:
 
         """
         start = time.time()
-        assert self.centroids is None
-
-        if self.init == "random":
-            self.centroids = self._to_tensor(_random_init(data.dataset, self.k))
-        else:
-            raise ValueError("KMeans::fit: only random initialization is supported.")
+        assert self.centroids is not None
+        self.centroids = self.centroids.to(self.device)
 
         logging.info(
             "Start kmean training, metric: %s, iters: %s", self.metric, self.max_iters
@@ -184,7 +139,7 @@ class KMeans:
                 break
             if i % 10 == 0:
                 logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
-        logging.info("Finish KMean training in %{}s", time.time() - start)
+        logging.info("Finish KMean training in %s", time.time() - start)
 
     @staticmethod
     def _split_centroids(centroids: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
@@ -227,6 +182,7 @@ class KMeans:
             if idx % 50 == 0:
                 logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
             chunk = chunk.to(self.device)
+            logging.info("i=%s, chunk=%s", idx, chunk.shape)
             ids, dists = self._transform(chunk)
             total_dist += dists.sum().item()
             ones = torch.ones(len(ids), device=self.device)

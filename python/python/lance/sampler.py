@@ -134,7 +134,7 @@ def maybe_sample(
             yield from _efficient_sample(dataset, n, columns, batch_size, max_takes)
         else:
             choices = np.random.choice(len(dataset), n, replace=False)
-            tbl = dataset._take_rows(choices, columns=columns).combine_chunks()
+            tbl = dataset.take(choices, columns=columns).combine_chunks()
             yield tbl.to_batches()[0]
 
 

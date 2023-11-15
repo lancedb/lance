@@ -21,7 +21,7 @@ from lance.util import KMeans
 # the GPU can be significant. Only once the problem size is large enough does
 # the benefit of GPU computation outweigh the overhead of copying data. Therefore,
 # these tests are marked as slow, and are opt-in.
-CLUSTERS = 1024 * 64
+CLUSTERS = 1024 * 10
 NUM_VECTORS = CLUSTERS * 256
 
 
