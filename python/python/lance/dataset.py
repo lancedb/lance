@@ -641,13 +641,6 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.version()
 
     @property
-    def index_cache_size(self) -> int:
-        """
-        Returns the index cache size of the dataset
-        """
-        return self._ds.index_cache_size()
-
-    @property
     def latest_version(self) -> int:
         """
         Returns the lastest version of the dataset
@@ -1022,8 +1015,7 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 kwargs["ivf_centroids"] = ivf_centroids_batch
 
-        self._ds.create_index(column, index_type, name, replace, kwargs)
-        return LanceDataset(self.uri)
+        return LanceDataset(self.uri, index_cache_size=index_cache_size)
 
     @staticmethod
     def _commit(
@@ -1815,6 +1807,7 @@ class LanceStats:
         index_stats = json.loads(self._ds.index_statistics(index_name))
         index_stats["num_indexed_rows"] = self._ds.count_indexed_rows(index_name)
         index_stats["num_unindexed_rows"] = self._ds.count_unindexed_rows(index_name)
+        index_stats["index_cache_size"] = self._ds.index_cache_size()
         return index_stats
 
 
@@ -1824,7 +1817,6 @@ def write_dataset(
     schema: Optional[pa.Schema] = None,
     mode: str = "create",
     *,
-    index_cache_size: int = 256,
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
@@ -1848,8 +1840,6 @@ def write_dataset(
         **overwrite** - create a new snapshot version
         **append** - create a new version that is the concat of the input the
         latest version (raises if uri does not exist)
-    index_cache_size: int, default 256
-        The number of index entries to cache in memory.
     max_rows_per_file: int, default 1024 * 1024
         The max number of rows to write before starting a new file
     max_rows_per_group: int, default 1024
@@ -1874,7 +1864,6 @@ def write_dataset(
 
     params = {
         "mode": mode,
-        "index_cache_size": index_cache_size,
         "max_rows_per_file": max_rows_per_file,
         "max_rows_per_group": max_rows_per_group,
         "max_bytes_per_file": max_bytes_per_file,

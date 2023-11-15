@@ -468,41 +468,30 @@ def test_knn_with_deletions(tmp_path):
 
 
 def test_index_cache_size(tmp_path):
-    ndim = 16
-    tbl = create_table(nvec=1024, ndim=ndim)
-    dataset = lance.write_dataset(tbl, tmp_path, index_cache_size=10)
+    def query_index(ds, ntimes):
+        ndim = ds.schema[0].type.list_size
+        for _ in range(ntimes):
+            ds.to_table(
+                nearest={
+                    "column": "vector",
+                    "q": np.random.randn(ndim),
+                },
+            )
+
+    tbl = create_table(nvec=1024, ndim=16)
+    dataset = lance.write_dataset(tbl, tmp_path / "test")
+
     indexed_dataset = dataset.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=256,
+        "vector", index_type="IVF_PQ", num_partitions=128,
         num_sub_vectors=2, index_cache_size=10,
     )
-    indexed_dataset = lance.LanceDataset(indexed_dataset.uri, index_cache_size=10)
-    # indexed_dataset = lance.write_dataset(tbl, tmp_path, index_cache_size=10)
 
-    assert indexed_dataset.index_cache_size == 0
+    assert indexed_dataset.stats.index_stats("vector_idx")["index_cache_size"] == 1
+    query_index(indexed_dataset, 1)
+    assert indexed_dataset.stats.index_stats("vector_idx")["index_cache_size"] == 2
+    query_index(indexed_dataset, 128)
+    assert indexed_dataset.stats.index_stats("vector_idx")["index_cache_size"] == 10
 
-    q = np.random.randn(ndim)
-
-    indexed_dataset.to_table(
-        nearest={
-            "column": "vector",
-            "q": q,
-        },
-    )
-    assert indexed_dataset.index_cache_size == 2
-
-    indexed_dataset.to_table(
-        nearest={
-            "column": "vector",
-            "q": q,
-        },
-    )
-    assert indexed_dataset.index_cache_size == 2
-
-    for _ in range(128):
-        indexed_dataset.to_table(
-            nearest={
-                "column": "vector",
-                "q": np.random.randn(ndim),
-            },
-        )
-    assert indexed_dataset.index_cache_size == 10
+    indexed_dataset = lance.LanceDataset(indexed_dataset.uri, index_cache_size=50)
+    query_index(indexed_dataset, 256)
+    assert indexed_dataset.stats.index_stats("vector_idx")["index_cache_size"] == 50

@@ -601,7 +601,6 @@ impl Dataset {
         name: Option<String>,
         replace: Option<bool>,
         metric_type: Option<&str>,
-        index_cache_size: Option<usize>,
         kwargs: Option<&PyDict>,
     ) -> PyResult<()> {
         let idx_type = match index_type.to_uppercase().as_str() {
@@ -867,9 +866,6 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         if let Some(mode) = options.get_item("mode") {
             p.mode = parse_write_mode(mode.extract::<String>()?.as_str())?;
         };
-        if let Some(index_cache_size) = options.get_item("index_cache_size") {
-            p.index_cache_size = usize::extract(index_cache_size)?;
-        }
         if let Some(maybe_nrows) = options.get_item("max_rows_per_file") {
             p.max_rows_per_file = usize::extract(maybe_nrows)?;
         }

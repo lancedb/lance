@@ -53,9 +53,6 @@ pub enum WriteMode {
 /// Dataset Write Parameters
 #[derive(Debug, Clone)]
 pub struct WriteParams {
-    /// Index cache size
-    pub index_cache_size: usize,
-
     /// Max number of records per file.
     pub max_rows_per_file: usize,
 
@@ -86,7 +83,6 @@ pub struct WriteParams {
 impl Default for WriteParams {
     fn default() -> Self {
         Self {
-            index_cache_size: 256,
             max_rows_per_file: 1024 * 1024, // 1 million
             max_rows_per_group: 1024,
             // object-store has a 100GB limit, so we should at least make sure
@@ -353,7 +349,6 @@ mod tests {
         .unwrap();
 
         let write_params = WriteParams {
-            index_cache_size: 256,
             max_rows_per_file: 1024 * 10, // Won't be limited by this
             max_rows_per_group: 512,
             max_bytes_per_file: 2 * 1024,
