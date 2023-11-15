@@ -29,11 +29,11 @@ pub struct CacheStats {
 
 impl CacheStats {
     pub fn record_hit(&self) {
-        self.hits.fetch_add(1, Ordering::AcqRel);
+        self.hits.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn record_miss(&self) {
-        self.misses.fetch_add(1, Ordering::AcqRel);
+        self.misses.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -93,8 +93,8 @@ impl IndexCache {
     /// Get cache hit ratio.
     #[allow(dead_code)]
     pub(crate) fn hit_rate(&self) -> f32 {
-        let hits = CACHE_STATS.hits.load(Ordering::Acquire) as f32;
-        let misses = CACHE_STATS.misses.load(Ordering::Acquire) as f32;
+        let hits = CACHE_STATS.hits.load(Ordering::SeqCst) as f32;
+        let misses = CACHE_STATS.misses.load(Ordering::SeqCst) as f32;
         // Returns 1.0 if hits + misses == 0 to avoid division by zero.
         if hits + misses == 0.0 {
             return 1.0;
