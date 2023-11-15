@@ -297,6 +297,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     if platform.system() == "Windows":
         expected_filepath = expected_filepath.replace("\\", "/")
     expected_statistics = {
+        "index_cache_size": 1,
         "index_type": "IVF",
         "uuid": index_uuid,
         "uri": expected_filepath,
@@ -482,8 +483,11 @@ def test_index_cache_size(tmp_path):
     dataset = lance.write_dataset(tbl, tmp_path / "test")
 
     indexed_dataset = dataset.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=128,
-        num_sub_vectors=2, index_cache_size=10,
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=128,
+        num_sub_vectors=2,
+        index_cache_size=10,
     )
 
     assert indexed_dataset.stats.index_stats("vector_idx")["index_cache_size"] == 1
