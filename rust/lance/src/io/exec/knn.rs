@@ -105,7 +105,7 @@ impl Stream for KNNFlatStream {
                 Poll::Ready(Ok(())) => true,
                 Poll::Ready(Err(join_error)) => {
                     return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
-                        "ExecNode(Projection): thread panicked: {}",
+                        "ExecNode(KNNFlatStream): thread panicked: {}",
                         join_error
                     )))));
                 }
@@ -381,7 +381,7 @@ impl Stream for KNNIndexStream {
                 Poll::Ready(Ok(())) => true,
                 Poll::Ready(Err(join_error)) => {
                     return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
-                        "ExecNode(Projection): thread panicked: {}",
+                        "ExecNode(KNNIndexStream): thread panicked: {}",
                         join_error
                     )))));
                 }

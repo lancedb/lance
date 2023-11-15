@@ -145,7 +145,7 @@ impl Stream for Take {
                 Poll::Ready(Ok(())) => true,
                 Poll::Ready(Err(join_error)) => {
                     return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
-                        "ExecNode(Projection): thread panicked: {}",
+                        "ExecNode(Take): thread panicked: {}",
                         join_error
                     )))));
                 }
