@@ -418,6 +418,8 @@ class LanceDataset(pa.dataset.Dataset):
         table : Table
         """
         total_num_rows = self.count_rows()
+        # Sort the indices to increase the locality and thus reduce
+        # the number of random reads.
         indices = sorted(random.sample(range(total_num_rows), num_rows))
         return self.take(indices, columns, **kwargs)
 
