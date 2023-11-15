@@ -95,10 +95,10 @@ impl IndexCache {
     pub(crate) fn hit_rate(&self) -> f32 {
         let hits = CACHE_STATS.hits.load(Ordering::Relaxed) as f32;
         let misses = CACHE_STATS.misses.load(Ordering::Relaxed) as f32;
+        // Returns 1.0 if hits + misses == 0 to avoid division by zero.
         if hits + misses == 0.0 {
             return 1.0;
         }
-        // Returns NaN if hits + misses == 0
         hits / (hits + misses)
     }
 }
