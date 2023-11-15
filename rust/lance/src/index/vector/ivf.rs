@@ -14,7 +14,10 @@
 
 //! IVF - Inverted File index.
 
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    sync::{Arc, Weak},
+};
 
 use arrow_arith::numeric::sub;
 use arrow_array::{
@@ -92,7 +95,10 @@ pub struct IVFIndex {
 
     metric_type: MetricType,
 
-    session: Arc<Session>,
+    // The session cache holds an Arc to this object so we need to
+    // hold a weak pointer to avoid cycles
+    /// The session cache, used when fetching pages
+    session: Weak<Session>,
 }
 
 impl IVFIndex {
@@ -113,7 +119,7 @@ impl IVFIndex {
         }
         Ok(Self {
             uuid: uuid.to_owned(),
-            session,
+            session: Arc::downgrade(&session),
             ivf,
             reader,
             sub_index,
@@ -129,7 +135,11 @@ impl IVFIndex {
     #[instrument(level = "debug", skip(self))]
     pub(crate) async fn load_partition(&self, partition_id: usize) -> Result<Arc<dyn VectorIndex>> {
         let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
-        let part_index = if let Some(part_idx) = self.session.index_cache.get_vector(&cache_key) {
+        let session = self.session.upgrade().ok_or(Error::Internal {
+            message: "attempt to use index after dataset was destroyed".into(),
+            location: location!(),
+        })?;
+        let part_index = if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
             part_idx
         } else {
             let offset = self.ivf.offsets[partition_id];
@@ -139,9 +149,7 @@ impl IVFIndex {
                 .load(self.reader.as_ref(), offset, length)
                 .await?;
             let idx: Arc<dyn VectorIndex> = idx.into();
-            self.session
-                .index_cache
-                .insert_vector(&cache_key, idx.clone());
+            session.index_cache.insert_vector(&cache_key, idx.clone());
             idx
         };
         Ok(part_index)
