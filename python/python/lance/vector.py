@@ -154,8 +154,8 @@ def train_ivf_centroids_on_accelerator(
 
     from .torch.kmeans import KMeans
 
-    logging.info("Randomly centroids %s centroids from %s", k, dataset)
-    samples = dataset.sample(k, [column]).combine_chunks()
+    logging.info("Randomly select %s centroids from %s", k, dataset)
+    samples = dataset.sample(k, [column], sorted=True).combine_chunks()
     fsl = samples.to_batches()[0][column]
     init_centroids = torch.from_numpy(np.stack(fsl.to_numpy(zero_copy_only=False)))
     logging.info("Done sampling: centroids shape: %s", init_centroids.shape)

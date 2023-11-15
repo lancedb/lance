@@ -97,7 +97,6 @@ class LanceDataset(IterableDataset):
         return f"LanceTorchDataset({self.dataset.uri}, size={self.samples})"
 
     def __iter__(self):
-        print("LanceDataset::__iter__: samples=", self.samples)
         stream: Iterable[pa.RecordBatch]
         if self.cached_ds:
             stream = self.cached_ds

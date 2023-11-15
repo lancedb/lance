@@ -56,7 +56,7 @@ def _efficient_sample(
     max_takes : int
         The maximum number of takes to perform. This is used to limit the number of
         random reads. Large enough value can give a good random sample without
-        having to issue too much random reads.
+        having to issue too many random reads.
 
     Returns
     -------
