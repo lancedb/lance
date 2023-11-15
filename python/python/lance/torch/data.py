@@ -59,7 +59,6 @@ def _to_tensor(batch: pa.RecordBatch) -> Union[dict[str, torch.Tensor], torch.Te
             )
         del arr
         ret[col] = tensor
-    del batch
     if len(ret) == 1:
         t = next(iter(ret.values()))
         del ret
@@ -120,10 +119,3 @@ class LanceDataset(IterableDataset):
         for batch in stream:
             yield _to_tensor(batch)
             del batch
-
-    def __len__(self):
-        total_rows = self.dataset.count_rows(filter=filter)
-        if self.samples:
-            return min(self.samples, total_rows)
-        else:
-            return total_rows
