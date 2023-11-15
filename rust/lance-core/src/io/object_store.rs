@@ -821,8 +821,7 @@ async fn configure_store(
 
         "gs" => {
             storage_options.with_env_gcs();
-
-            let (store, _) = parse_url_opts(&url, storage_options.as_azure_options())?;
+            let (store, _) = parse_url_opts(&url, storage_options.as_gcs_options())?;
             let store = Arc::new(store);
             Ok(ObjectStore {
                 inner: store,
