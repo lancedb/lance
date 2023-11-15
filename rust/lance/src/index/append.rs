@@ -20,7 +20,7 @@ use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
-use crate::dataset::index::{indexed_fragment_ids, unindexed_fragments};
+use crate::dataset::index::unindexed_fragments;
 use crate::dataset::Dataset;
 use crate::index::vector::ivf::IVFIndex;
 
@@ -32,14 +32,17 @@ use super::DatasetIndexInternalExt;
 pub async fn append_index(
     dataset: Arc<Dataset>,
     old_index: &IndexMetadata,
-) -> Result<Option<(Uuid, RoaringBitmap)>> {
+) -> Result<Option<(Uuid, Option<RoaringBitmap>)>> {
     let unindexed = unindexed_fragments(old_index, dataset.as_ref()).await?;
     if unindexed.is_empty() {
         return Ok(None);
     };
 
-    let mut frag_bitmap = indexed_fragment_ids(old_index, &dataset).await?;
-    frag_bitmap.extend(unindexed.iter().map(|frag| frag.id as u32));
+    let frag_bitmap = old_index.fragment_bitmap.as_ref().map(|bitmap| {
+        let mut bitmap = bitmap.clone();
+        bitmap.extend(unindexed.iter().map(|frag| frag.id as u32));
+        bitmap
+    });
 
     let column = dataset
         .schema()
@@ -198,7 +201,7 @@ mod tests {
         let ivf_index = binding.as_any().downcast_ref::<IVFIndex>().unwrap();
         let row_in_index = stream::iter(0..IVF_PARTITIONS)
             .map(|part_id| async move {
-                let part = ivf_index.load_partition(part_id).await.unwrap();
+                let part = ivf_index.load_partition(part_id, true).await.unwrap();
                 let pq_idx = part.as_any().downcast_ref::<PQIndex>().unwrap();
                 pq_idx.row_ids.as_ref().unwrap().len()
             })

@@ -53,6 +53,7 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig};
 use crate::format::{DeletionFile, Fragment};
+use crate::index::DatasetIndexInternalExt;
 use crate::Dataset;
 
 #[cfg(all(target_feature = "dynamodb", tests))]
@@ -253,21 +254,13 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()>
 
     for index in indices {
         if index.fragment_bitmap.is_none() {
-            // Load the read version of the index
-            let old_version = match dataset.checkout_version(index.dataset_version).await {
-                Ok(dataset) => dataset,
-                // If the version doesn't exist anymore, skip it.
-                Err(crate::Error::DatasetNotFound { .. }) => continue,
-                // Any other error we return.
-                Err(e) => return Err(e),
-            };
-            index.fragment_bitmap = Some(
-                old_version
-                    .get_fragments()
-                    .iter()
-                    .map(|f| f.id() as u32)
-                    .collect(),
-            );
+            debug_assert_eq!(index.fields.len(), 1);
+            let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;
+            // We need to calculate the fragments covered by the index
+            let idx = dataset
+                .open_generic_index(&idx_field.name, &index.uuid.to_string())
+                .await?;
+            index.fragment_bitmap = Some(idx.calculate_included_frags().await?);
         }
     }
 

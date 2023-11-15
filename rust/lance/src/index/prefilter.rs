@@ -51,7 +51,7 @@ pub struct PreFilter {
     // Expressing these as tasks allows us to start calculating the block list
     // and allow list at the same time we start searching the query.  We will await
     // these tasks only when we've done as much work as we can without them.
-    deleted_ids: Option<Arc<SharedPrerequisite<Arc<RoaringTreemap>>>>,
+    deleted_ids: Option<Arc<SharedPrerequisite<RowIdMask>>>,
     filtered_ids: Option<Arc<SharedPrerequisite<RowIdMask>>>,
     // When the tasks are finished this is the combined filter
     final_mask: Mutex<OnceCell<RowIdMask>>,
@@ -106,7 +106,7 @@ impl PreFilter {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn load_deleted_ids(dataset: Arc<Dataset>, index: Index) -> Result<Arc<RoaringTreemap>> {
+    async fn load_deleted_ids(dataset: Arc<Dataset>, index: Index) -> Result<RowIdMask> {
         let fragments = dataset.get_fragments();
         let frag_id_deletion_vectors = stream::iter(fragments.iter())
             .map(|frag| async move {
@@ -141,8 +141,20 @@ impl PreFilter {
                     deleted_ids.insert_range(RowAddress::fragment_range(frag_id));
                 }
             }
+            Ok(RowIdMask::from_block(deleted_ids))
+        } else {
+            // If the index doesn't have a fragment bitmap then instead of blocking missing
+            // fragments we need to only allow valid fragments
+            let allow_list = RoaringTreemap::from_bitmaps(
+                frag_ids_in_dataset
+                    .iter()
+                    .map(|&frag_id| (frag_id, RoaringBitmap::full())),
+            );
+            Ok(RowIdMask {
+                block_list: Some(deleted_ids),
+                allow_list: Some(allow_list),
+            })
         }
-        Ok(Arc::new(deleted_ids))
     }
 
     /// Waits for the prefilter to be fully loaded
@@ -165,7 +177,7 @@ impl PreFilter {
                 combined = combined & filtered_ids.get_ready();
             }
             if let Some(deleted_ids) = &self.deleted_ids {
-                combined = combined.also_block((*deleted_ids.get_ready()).clone());
+                combined = combined & deleted_ids.get_ready();
             }
             combined
         });

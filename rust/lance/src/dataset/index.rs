@@ -21,7 +21,6 @@ use lance_core::{
     Error, Result,
 };
 use nohash_hasher::IntMap;
-use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
@@ -81,17 +80,6 @@ impl IndexRemapper for DatasetIndexRemapper {
             }
         }
         Ok(remapped)
-    }
-}
-
-pub async fn indexed_fragment_ids(index: &Index, dataset: &Dataset) -> Result<RoaringBitmap> {
-    if let Some(bitmap) = &index.fragment_bitmap {
-        Ok(bitmap.clone())
-    } else {
-        let ds = dataset.checkout_version(index.dataset_version).await?;
-        Ok(RoaringBitmap::from_iter(
-            ds.fragments().iter().map(|frag| frag.id as u32),
-        ))
     }
 }
 

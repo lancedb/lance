@@ -25,6 +25,7 @@ use arrow_select::take::take;
 use async_trait::async_trait;
 // Re-export
 use lance_core::{
+    format::RowAddress,
     io::{read_fixed_stride_array, Reader},
     ROW_ID_FIELD,
 };
@@ -35,6 +36,7 @@ use lance_index::{
 };
 use lance_linalg::distance::MetricType;
 use nohash_hasher::IntMap;
+use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::{location, Location};
 use tracing::{instrument, Instrument};
@@ -116,6 +118,7 @@ pub struct PQIndexStatistics {
     metric_type: String,
 }
 
+#[async_trait]
 impl Index for PQIndex {
     fn as_any(&self) -> &dyn Any {
         self
@@ -137,6 +140,24 @@ impl Index for PQIndex {
             dimension: self.pq.dimension(),
             metric_type: self.metric_type.to_string(),
         })?)
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        if let Some(row_ids) = &self.row_ids {
+            let mut frag_ids = row_ids
+                .values()
+                .iter()
+                .map(|&row_id| RowAddress::new_from_id(row_id).fragment_id())
+                .collect::<Vec<_>>();
+            frag_ids.sort();
+            frag_ids.dedup();
+            Ok(RoaringBitmap::from_sorted_iter(frag_ids).unwrap())
+        } else {
+            Err(Error::Index {
+                message: "PQIndex::caclulate_included_frags: PQ is not initialized".to_string(),
+                location: location!(),
+            })
+        }
     }
 }
 

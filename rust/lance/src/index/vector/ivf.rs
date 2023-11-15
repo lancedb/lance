@@ -55,6 +55,7 @@ use lance_linalg::{
 use log::{debug, info};
 use nohash_hasher::IntMap;
 use rand::{rngs::SmallRng, SeedableRng};
+use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::{location, Location};
 use tracing::{instrument, span, Level};
@@ -133,7 +134,11 @@ impl IVFIndex {
     /// ----------
     ///  - partition_id: partition ID.
     #[instrument(level = "debug", skip(self))]
-    pub(crate) async fn load_partition(&self, partition_id: usize) -> Result<Arc<dyn VectorIndex>> {
+    pub(crate) async fn load_partition(
+        &self,
+        partition_id: usize,
+        write_cache: bool,
+    ) -> Result<Arc<dyn VectorIndex>> {
         let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
         let session = self.session.upgrade().ok_or(Error::Internal {
             message: "attempt to use index after dataset was destroyed".into(),
@@ -149,7 +154,9 @@ impl IVFIndex {
                 .load(self.reader.as_ref(), offset, length)
                 .await?;
             let idx: Arc<dyn VectorIndex> = idx.into();
-            session.index_cache.insert_vector(&cache_key, idx.clone());
+            if write_cache {
+                session.index_cache.insert_vector(&cache_key, idx.clone());
+            }
             idx
         };
         Ok(part_index)
@@ -161,7 +168,7 @@ impl IVFIndex {
         query: &Query,
         pre_filter: Arc<PreFilter>,
     ) -> Result<RecordBatch> {
-        let part_index = self.load_partition(partition_id).await?;
+        let part_index = self.load_partition(partition_id, true).await?;
 
         let partition_centroids = self.ivf.centroids.value(partition_id);
         let residual_key = sub(&query.key, &partition_centroids)?;
@@ -254,6 +261,7 @@ pub struct IvfIndexStatistics {
     partitions: Vec<IvfIndexPartitionStatistics>,
 }
 
+#[async_trait]
 impl Index for IVFIndex {
     fn as_any(&self) -> &dyn Any {
         self
@@ -295,6 +303,16 @@ impl Index for IVFIndex {
             sub_index: serde_json::from_str(&self.sub_index.statistics()?)?,
             partitions: partitions_statistics,
         })?)
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        let mut frag_ids = RoaringBitmap::default();
+        let part_ids = 0..self.ivf.num_partitions();
+        for part_id in part_ids {
+            let part = self.load_partition(part_id, false).await?;
+            frag_ids = frag_ids | part.calculate_included_frags().await?;
+        }
+        Ok(frag_ids)
     }
 }
 

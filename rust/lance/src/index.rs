@@ -297,7 +297,7 @@ impl DatasetIndexExt for Dataset {
                 name: idx.name.clone(),
                 fields: idx.fields.clone(),
                 dataset_version: self.manifest.version,
-                fragment_bitmap: Some(new_frag_ids),
+                fragment_bitmap: new_frag_ids,
             };
             removed_indices.push(idx.clone());
             new_indices.push(new_idx);

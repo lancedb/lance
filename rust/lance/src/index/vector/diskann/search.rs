@@ -32,6 +32,7 @@ use lance_index::{
 use nohash_hasher::IntMap;
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
+use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -205,6 +206,7 @@ pub struct DiskANNIndexStatistics {
     length: usize,
 }
 
+#[async_trait]
 impl Index for DiskANNIndex {
     fn as_any(&self) -> &dyn Any {
         self
@@ -223,6 +225,13 @@ impl Index for DiskANNIndex {
             index_type: "DiskANNIndex".to_string(),
             length: self.graph.len(),
         })?)
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        Err(Error::NotSupported {
+            source: "DiskANNIndex does not yet support calculate_included_frags".into(),
+            location: location!(),
+        })
     }
 }
 

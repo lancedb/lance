@@ -25,6 +25,7 @@ mod page_table;
 
 pub use fragment::*;
 pub use index::Index;
+pub(crate) use manifest::set_default_writer_version;
 pub use manifest::{Manifest, WriterVersion};
 pub use metadata::{Metadata, StatisticsMetadata};
 pub use page_table::{PageInfo, PageTable};

@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use chrono::prelude::*;
 use prost_types::Timestamp;
@@ -193,13 +193,32 @@ impl WriterVersion {
         let tag = parts.next();
         Some((major, minor, patch, tag))
     }
+
+    /// Return true if self is older than the given major/minor/patch
+    pub fn older_than(&self, major: u32, minor: u32, patch: u32) -> bool {
+        let version = self
+            .semver()
+            .expect(&format!("Invalid writer version: {}", self.version));
+        return (version.0, version.1, version.2) < (major, minor, patch);
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref DEFAULT_WRITER_VER: RwLock<String> =
+    RwLock::new(env!("CARGO_PKG_VERSION").to_string());
+}
+
+// Allows us to adjust the default writer version (useful for testing)
+pub(crate) fn set_default_writer_version(value: String) {
+    let mut default_val = DEFAULT_WRITER_VER.write().unwrap();
+    *default_val = value;
 }
 
 impl Default for WriterVersion {
     fn default() -> Self {
         Self {
             library: "lance".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: DEFAULT_WRITER_VER.read().unwrap().clone(),
         }
     }
 }

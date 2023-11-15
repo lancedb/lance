@@ -1527,6 +1527,7 @@ mod tests {
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
     use lance_core::format::WriterVersion;
+    use lance_core::utils::testing::with_next_version;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::vector::DIST_COL;
     use lance_index::IndexType;
@@ -3436,5 +3437,66 @@ mod tests {
             .unwrap();
         let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_v0_8_14_invalid_index_fragment_bitmap() {
+        // Old versions of lance could create an index whose fragment bitmap was
+        // invalid because it did not include fragments that were part of the index
+        //
+        // We need to make sure we do not rely on the fragment bitmap in these older
+        // versions and instead fall back to a slower legacy behavior
+        let test_dir = copy_test_data_to_tmp("v0.8.14/corrupt_index").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+
+        for idx in dataset.load_indices().await.unwrap() {
+            assert!(idx.fragment_bitmap.is_none());
+        }
+
+        let mut scan = dataset.scan();
+        let query_vec = Float32Array::from(vec![0_f32; 128]);
+        let batches = scan
+            .nearest("vector", &query_vec, 2000)
+            .unwrap()
+            .nprobs(4)
+            .prefilter(true)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let total_count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_count, 1900);
+
+        // Add some data and recalculate the index, forcing a migration
+        let mut scan = dataset.scan();
+        let data = scan
+            .limit(Some(10), None)
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let schema = data[0].schema();
+        let data = RecordBatchIterator::new(data.into_iter().map(arrow::error::Result::Ok), schema);
+        dataset.append(data, None).await.unwrap();
+
+        with_next_version(async {
+            // This will trigger a migration and write out the calculated fragment bitmap
+            dataset.optimize_indices().await.unwrap();
+
+            for idx in dataset.load_indices().await.unwrap() {
+                // The corrupt fragment_bitmap does not contain 0 but the
+                // restored one should
+                assert!(idx.fragment_bitmap.unwrap().contains(0));
+            }
+        })
+        .await;
     }
 }

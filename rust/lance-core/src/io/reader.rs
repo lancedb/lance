@@ -138,11 +138,25 @@ pub async fn read_manifest_indexes(
         let reader = object_store.open(path).await?;
         let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
 
-        Ok(section
+        let mut indices = section
             .indices
             .iter()
             .map(Index::try_from)
-            .collect::<Result<Vec<_>>>()?)
+            .collect::<Result<Vec<_>>>()?;
+
+        let can_trust_frag_bitmap = if let Some(writer_version) = &manifest.writer_version {
+            !writer_version.older_than(0, 8, 15)
+        } else {
+            false
+        };
+
+        if !can_trust_frag_bitmap {
+            for idx in &mut indices {
+                idx.fragment_bitmap = None
+            }
+        }
+
+        Ok(indices)
     } else {
         Ok(vec![])
     }
