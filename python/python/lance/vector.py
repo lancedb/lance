@@ -148,10 +148,11 @@ def train_ivf_centroids_on_accelerator(
     sample_size = k * sample_rate
 
     # Pytorch installation warning will be raised here.
-    from lance.torch.data import LanceDataset as TorchDataset
-    from .torch.kmeans import KMeans
-
     import torch
+
+    from lance.torch.data import LanceDataset as TorchDataset
+
+    from .torch.kmeans import KMeans
 
     logging.info("Randomly centroids %s centroids from %s", k, dataset)
     samples = dataset.sample(k, [column]).combine_chunks()
