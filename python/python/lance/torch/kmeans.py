@@ -182,7 +182,6 @@ class KMeans:
             if idx % 50 == 0:
                 logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
             chunk = chunk.to(self.device)
-            logging.info("i=%s, chunk=%s", idx, chunk.shape)
             ids, dists = self._transform(chunk)
             total_dist += dists.sum().item()
             ones = torch.ones(len(ids), device=self.device)
