@@ -37,9 +37,7 @@ def _random_init(data: lance.LanceDataset, n: int) -> torch.Tensor:
 
     schema = data.schema
     if len(schema.names) != 1:
-        raise ValueError(
-            f"Only support one column in the dataset, got: {schema.names}"
-        )
+        raise ValueError(f"Only support one column in the dataset, got: {schema.names}")
     column = schema.names[0]
     tbl = data.take(sorted(choices), columns=[column]).combine_chunks()
     fsl = tbl.to_batches()[0][column]

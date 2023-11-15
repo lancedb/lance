@@ -41,17 +41,6 @@ def _cosine_distance(
         distances.append(dists.take_along_dim(part_ids, dim=1))
 
     return torch.cat(partitions).reshape(-1), torch.cat(distances).reshape(-1)
-<<<<<<< HEAD
-
-
-def _suggest_batch_size(tensor: torch.Tensor) -> int:
-    if torch.cuda.is_available():
-        (free_mem, total_mem) = torch.cuda.mem_get_info()
-        return free_mem // tensor.shape[0] // 4  # TODO: support bf16/f16
-    else:
-        return 1024 * 128
-=======
->>>>>>> 8676a05 (adaptive cuda memory allocation)
 
 
 def _suggest_batch_size(tensor: torch.Tensor) -> int:
