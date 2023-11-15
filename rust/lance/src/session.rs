@@ -102,8 +102,8 @@ mod tests {
         let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
         assert_eq!(session.index_cache.get_size(), 0);
 
-        assert!(0.8 < session.index_cache.hit_rate() && session.index_cache.hit_rate() <= 1);
-        assert_eq!(session.index_cache.hit_rate() == 1);
+        assert!(0.8 < session.index_cache.hit_rate() && session.index_cache.hit_rate() <= 1.0);
+        assert_eq!(session.index_cache.hit_rate(), 1.0);
         session.index_cache.insert_vector("abc", idx.clone());
 
         let found = session.index_cache.get_vector("abc");
