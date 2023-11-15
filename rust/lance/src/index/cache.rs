@@ -19,12 +19,12 @@ use moka::sync::{Cache, ConcurrentCacheExt};
 
 use super::vector::VectorIndex;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Default)]
 pub struct CacheStats {
-    hits: AtomicU64,
-    misses: AtomicU64,
+    hits: AtomicUsize,
+    misses: AtomicUsize,
 }
 
 impl CacheStats {
@@ -50,8 +50,8 @@ pub struct IndexCache {
 impl IndexCache {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
-            scalar_cache: Arc::new(Cache::new(capacity as u64)),
-            vector_cache: Arc::new(Cache::new(capacity as u64)),
+            scalar_cache: Arc::new(Cache::new(capacity as usize)),
+            vector_cache: Arc::new(Cache::new(capacity as usize)),
         }
     }
 
@@ -93,12 +93,12 @@ impl IndexCache {
     /// Get cache hit ratio.
     #[allow(dead_code)]
     pub(crate) fn hit_rate(&self) -> f32 {
-        let hits = CACHE_STATS.hits.load(Ordering::SeqCst) as f32;
-        let misses = CACHE_STATS.misses.load(Ordering::SeqCst) as f32;
+        let hits = CACHE_STATS.hits.load(Ordering::SeqCst);
+        let misses = CACHE_STATS.misses.load(Ordering::SeqCst);
         // Returns 1.0 if hits + misses == 0 to avoid division by zero.
-        if hits + misses == 0.0 {
+        if hits + miss {
             return 1.0;
         }
-        hits / (hits + misses)
+        hits / (hits + misses) as f32
     }
 }
