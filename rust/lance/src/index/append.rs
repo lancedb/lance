@@ -16,24 +16,30 @@ use std::sync::Arc;
 
 use lance_core::{format::Index as IndexMetadata, Error, Result};
 use log::info;
+use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
-use crate::dataset::index::unindexed_fragments;
+use crate::dataset::index::{indexed_fragment_ids, unindexed_fragments};
 use crate::dataset::Dataset;
 use crate::index::vector::ivf::IVFIndex;
 
 use super::DatasetIndexInternalExt;
 
 /// Append new data to the index, without re-train.
+///
+/// Returns the UUID of the new index along with a vector of newly indexed fragment ids
 pub async fn append_index(
     dataset: Arc<Dataset>,
     old_index: &IndexMetadata,
-) -> Result<Option<Uuid>> {
+) -> Result<Option<(Uuid, RoaringBitmap)>> {
     let unindexed = unindexed_fragments(old_index, dataset.as_ref()).await?;
     if unindexed.is_empty() {
         return Ok(None);
     };
+
+    let mut frag_bitmap = indexed_fragment_ids(old_index, &dataset).await?;
+    frag_bitmap.extend(unindexed.iter().map(|frag| frag.id as u32));
 
     let column = dataset
         .schema()
@@ -64,7 +70,8 @@ pub async fn append_index(
     let new_index = ivf_idx
         .append(dataset.as_ref(), stream, old_index, &column.name)
         .await?;
-    Ok(Some(new_index))
+
+    Ok(Some((new_index, frag_bitmap)))
 }
 
 #[cfg(test)]
