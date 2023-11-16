@@ -17,3 +17,8 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   **incorrectly** migrated from v0.7.5. The `Fragment.physical_rows` field is
   incorrect, as it was filled in with the row count (after deletions). Readers
   should know to ignore these stats. Writers should correct the statistics.
+* `v0.8.14/corrupt_index`: This dataset has a vector index whose fragment
+  bitmap is incorrect and cannot be trusted.  If the writer version is 0.8.14
+  or older then bugs may occur when searching this kind of dataset.  There is
+  no good workaround for readers.  Writers should make sure to recompute the
+  fragment bitmap when updating indices that were sourced from old versions.
