@@ -3485,9 +3485,6 @@ mod tests {
         // Any transaction, no matter how simple, should trigger the fragment bitmap to be recalculated
         dataset.append(data, None).await.unwrap();
 
-        // // This will trigger a migration and write out the calculated fragment bitmap
-        // dataset.optimize_indices().await.unwrap();
-
         for idx in dataset.load_indices().await.unwrap() {
             // The corrupt fragment_bitmap does not contain 0 but the
             // restored one should
