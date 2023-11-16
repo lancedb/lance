@@ -71,6 +71,7 @@ class CachedDataset:
                     writer = pa.ipc.new_stream(str(self.cache_file), batch.schema)
                 writer.write(batch)
                 yield batch
+                del batch
             writer.close()
             self.finished_origin_stream = True
         else:
@@ -82,3 +83,4 @@ class CachedDataset:
             reader = pa.ipc.open_stream(self.cache_file)
             for batch in reader:
                 yield batch
+                del batch

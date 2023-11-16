@@ -399,6 +399,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         num_rows: int,
         columns: Optional[List[str]] = None,
+        randomize_order: bool = True,
         **kwargs,
     ) -> pa.Table:
         """Select a random sample of data
@@ -419,6 +420,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         total_num_rows = self.count_rows()
         indices = random.sample(range(total_num_rows), num_rows)
+        if not randomize_order:
+            # Sort the indices in order to increase the locality and thus reduce
+            # the number of random reads.
+            indices = sorted(indices)
         return self.take(indices, columns, **kwargs)
 
     def take(
