@@ -25,8 +25,11 @@ use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::{
-    repartition::RepartitionExec, sorts::sort::SortExec, stream::RecordBatchStreamAdapter,
-    union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+    repartition::RepartitionExec,
+    sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
+    stream::RecordBatchStreamAdapter,
+    union::UnionExec,
+    ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::Accumulator;
@@ -735,7 +738,8 @@ impl BTreeIndex {
         Ok(Self::new(map, null_pages, store, sub_index))
     }
 
-    async fn into_old_data(self) -> Result<impl RecordBatchStream> {
+    /// Create a stream of all the data in the index, in the same format used to train the index
+    async fn into_data_stream(self) -> Result<impl RecordBatchStream> {
         let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
         let pages = self.page_lookup.all_page_ids();
         let schema = self.sub_index.schema().clone();
@@ -907,6 +911,7 @@ impl ScalarIndex for BTreeIndex {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
+        // Merge the existing index data with the new data and then retrain the index on the merged stream
         let merged_data_source = Box::new(BTreeUpdater::new(self.clone(), new_data));
         train_btree_index(merged_data_source, self.sub_index.as_ref(), dest_store).await
     }
@@ -1078,6 +1083,7 @@ pub async fn train_btree_index(
     Ok(())
 }
 
+/// A source of training data created by merging existing data with new data
 struct BTreeUpdater {
     index: BTreeIndex,
     new_data: SendableRecordBatchStream,
@@ -1092,7 +1098,7 @@ impl BTreeUpdater {
 impl BTreeUpdater {
     fn into_old_input(index: BTreeIndex) -> Arc<dyn ExecutionPlan> {
         let schema = index.sub_index.schema().clone();
-        let batches = index.into_old_data().into_stream().try_flatten().boxed();
+        let batches = index.into_data_stream().into_stream().try_flatten().boxed();
         let stream = Box::pin(RecordBatchStreamAdapter::new(schema, batches));
         Arc::new(OneShotExec::new(stream))
     }
@@ -1117,19 +1123,18 @@ impl BtreeTrainingSource for BTreeUpdater {
                 nulls_first: true,
             },
         };
-        // TODO: Use SortPreservingMergeExec here
+        // The UnionExec creates multiple partitions but the SortPreservingMergeExec merges
+        // them back into a single partition.
         let all_data = Arc::new(UnionExec::new(vec![old_input, new_input]));
-        // Squash back into one partition
-        let all_data = Arc::new(RepartitionExec::try_new(
-            all_data,
-            datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
-        )?);
-        let ordered = Arc::new(SortExec::new(vec![sort_expr], all_data));
+        let ordered = Arc::new(SortPreservingMergeExec::new(vec![sort_expr], all_data));
         let unchunked = execute_plan(ordered)?;
         Ok(chunk_concat_stream(unchunked, chunk_size as usize))
     }
 }
 
+/// A stream that reads the original training data back out of the index
+///
+/// This is used for updating the index
 struct IndexReaderStream {
     reader: Arc<dyn IndexReader>,
     pages: Vec<u32>,

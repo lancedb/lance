@@ -38,6 +38,41 @@ use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
 use lance_core::{datatypes::Schema, Error, Result};
 
+/// Convert reader to a stream and a schema.
+///
+/// Will peek the first batch to get the dictionaries for dictionary columns.
+///
+/// NOTE: this does not validate the schema. For example, for appends the schema
+/// should be checked to make sure it matches the existing dataset schema before
+/// writing.
+pub fn reader_to_stream(
+    batches: Box<dyn RecordBatchReader + Send>,
+) -> Result<(SendableRecordBatchStream, Schema)> {
+    let arrow_schema = batches.schema();
+    let mut schema: Schema = Schema::try_from(batches.schema().as_ref())?;
+    let mut peekable = batches.peekable();
+    if let Some(batch) = peekable.peek() {
+        if let Ok(b) = batch {
+            schema.set_dictionary(b)?;
+        } else {
+            return Err(Error::from(batch.as_ref().unwrap_err()));
+        }
+    }
+    schema.validate()?;
+
+    let stream = RecordBatchStreamAdapter::new(
+        arrow_schema,
+        futures::stream::iter(peekable).map_err(DataFusionError::from),
+    );
+    let stream = Box::pin(stream) as SendableRecordBatchStream;
+
+    Ok((stream, schema))
+}
+
+/// An source execution node created from an existing stream
+///
+/// It can only be used once, and will return the stream.  After that the node
+/// is exhuasted.
 pub struct OneShotExec {
     stream: Mutex<RefCell<Option<SendableRecordBatchStream>>>,
     // We save off a copy of the schema to speed up formatting and so ExecutionPlan::schema & display_as
@@ -46,6 +81,7 @@ pub struct OneShotExec {
 }
 
 impl OneShotExec {
+    /// Create a new instance from a given stream
     pub fn new(stream: SendableRecordBatchStream) -> Self {
         let schema = stream.schema().clone();
         Self {
@@ -76,7 +112,7 @@ impl DisplayAs for OneShotExec {
         let stream = val_guard.borrow();
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let exhausted = if stream.is_some() { "" } else { "EXHUASTED" };
+                let exhausted = if stream.is_some() { "" } else { "EXHUASTED " };
                 let columns = self
                     .schema
                     .field_names()
@@ -85,44 +121,13 @@ impl DisplayAs for OneShotExec {
                     .collect::<Vec<_>>();
                 write!(
                     f,
-                    "OneShotStream: {} columns=[{}]",
+                    "OneShotStream: {}columns=[{}]",
                     exhausted,
                     columns.join(",")
                 )
             }
         }
     }
-}
-
-/// Convert reader to a stream and a schema.
-///
-/// Will peek the first batch to get the dictionaries for dictionary columns.
-///
-/// NOTE: this does not validate the schema. For example, for appends the schema
-/// should be checked to make sure it matches the existing dataset schema before
-/// writing.
-pub fn reader_to_stream(
-    batches: Box<dyn RecordBatchReader + Send>,
-) -> Result<(SendableRecordBatchStream, Schema)> {
-    let arrow_schema = batches.schema();
-    let mut schema: Schema = Schema::try_from(batches.schema().as_ref())?;
-    let mut peekable = batches.peekable();
-    if let Some(batch) = peekable.peek() {
-        if let Ok(b) = batch {
-            schema.set_dictionary(b)?;
-        } else {
-            return Err(Error::from(batch.as_ref().unwrap_err()));
-        }
-    }
-    schema.validate()?;
-
-    let stream = RecordBatchStreamAdapter::new(
-        arrow_schema,
-        futures::stream::iter(peekable).map_err(DataFusionError::from),
-    );
-    let stream = Box::pin(stream) as SendableRecordBatchStream;
-
-    Ok((stream, schema))
 }
 
 impl ExecutionPlan for OneShotExec {
@@ -173,6 +178,9 @@ impl ExecutionPlan for OneShotExec {
     }
 }
 
+/// Executes a plan using default session & runtime configuration
+///
+/// Only executes a single partition.  Panics if the plan has more than one partition.
 pub fn execute_plan(plan: Arc<dyn ExecutionPlan>) -> Result<SendableRecordBatchStream> {
     let session_config = SessionConfig::new();
     let runtime_config = RuntimeConfig::new();
