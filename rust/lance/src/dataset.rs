@@ -1508,6 +1508,7 @@ mod tests {
 
     use super::*;
     use crate::arrow::FixedSizeListArrayExt;
+    use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::WriteMode::Overwrite;
     use crate::datatypes::Schema;
     use crate::index::scalar::ScalarIndexParams;
@@ -1527,7 +1528,6 @@ mod tests {
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
     use lance_core::format::WriterVersion;
-    use lance_core::utils::testing::with_next_version;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::vector::DIST_COL;
     use lance_index::IndexType;
@@ -3485,18 +3485,30 @@ mod tests {
             .unwrap();
         let schema = data[0].schema();
         let data = RecordBatchIterator::new(data.into_iter().map(arrow::error::Result::Ok), schema);
+
+        let broken_version = dataset.version().version;
+
         dataset.append(data, None).await.unwrap();
 
-        with_next_version(async {
-            // This will trigger a migration and write out the calculated fragment bitmap
-            dataset.optimize_indices().await.unwrap();
+        // This will trigger a migration and write out the calculated fragment bitmap
+        dataset.optimize_indices().await.unwrap();
 
-            for idx in dataset.load_indices().await.unwrap() {
-                // The corrupt fragment_bitmap does not contain 0 but the
-                // restored one should
-                assert!(idx.fragment_bitmap.unwrap().contains(0));
-            }
-        })
-        .await;
+        for idx in dataset.load_indices().await.unwrap() {
+            // The corrupt fragment_bitmap does not contain 0 but the
+            // restored one should
+            assert!(idx.fragment_bitmap.unwrap().contains(0));
+        }
+
+        let mut dataset = dataset.checkout_version(broken_version).await.unwrap();
+        dataset.restore(None).await.unwrap();
+
+        // Running compaction should also properly migrate the index
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        for idx in dataset.load_indices().await.unwrap() {
+            assert!(idx.fragment_bitmap.unwrap().contains(0));
+        }
     }
 }

@@ -310,7 +310,7 @@ impl Index for IVFIndex {
         let part_ids = 0..self.ivf.num_partitions();
         for part_id in part_ids {
             let part = self.load_partition(part_id, false).await?;
-            frag_ids = frag_ids | part.calculate_included_frags().await?;
+            frag_ids |= part.calculate_included_frags().await?;
         }
         Ok(frag_ids)
     }

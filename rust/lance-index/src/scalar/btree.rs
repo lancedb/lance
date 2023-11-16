@@ -792,7 +792,7 @@ impl Index for BTreeIndex {
         for page_number in self.page_lookup.all_page_ids() {
             let serialized = sub_index_reader.read_record_batch(page_number).await?;
             let page = self.sub_index.load_subindex(serialized).await?;
-            frag_ids = frag_ids | page.calculate_included_frags().await?;
+            frag_ids |= page.calculate_included_frags().await?;
         }
 
         Ok(frag_ids)

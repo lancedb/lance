@@ -14,13 +14,12 @@
 
 //! Testing utilities
 
-use crate::format::{set_default_writer_version, WriterVersion};
 use crate::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Duration;
 use futures::stream::BoxStream;
-use futures::{Future, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{
     Error as OSError, GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore,
@@ -253,16 +252,4 @@ impl<'a> Drop for MockClock<'a> {
         // Reset the clock to the epoch
         mock_instant::MockClock::set_system_time(Duration::days(0).to_std().unwrap());
     }
-}
-
-/// Run the provided future in a world where the writer version has already been bumped
-///
-/// This is useful when testing/simulating migration scenarios
-pub async fn with_next_version<Fut: Future<Output = ()>>(func: Fut) -> () {
-    let current = WriterVersion::default();
-    let cur_ver = current.semver().unwrap();
-    let next = format!("{}.{}.{}", cur_ver.0, cur_ver.1, cur_ver.2 + 1);
-    set_default_writer_version(next);
-    func.await;
-    set_default_writer_version(current.version);
 }

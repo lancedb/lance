@@ -102,13 +102,16 @@ use datafusion::error::Result as DFResult;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::Error;
 use nohash_hasher::{BuildNoHashHasher, IntMap};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
+use snafu::{location, Location};
 use uuid::Uuid;
 
 use crate::dataset::ROW_ID;
 use crate::format::RowAddress;
+use crate::index::DatasetIndexInternalExt;
 use crate::io::commit::{commit_transaction, migrate_fragments};
 use crate::Result;
 use crate::{format::Fragment, Dataset};
@@ -481,9 +484,18 @@ async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
         if let Some(fragment_bitmap) = index.fragment_bitmap {
             index_fragmaps.push(fragment_bitmap.clone());
         } else {
-            let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
-            let frags = 0..dataset_at_index.manifest.max_fragment_id;
-            index_fragmaps.push(RoaringBitmap::from_sorted_iter(frags).unwrap());
+            debug_assert_eq!(index.fields.len(), 1);
+            let index_column = dataset
+                .schema()
+                .field_by_id(index.fields[0])
+                .ok_or_else(|| Error::Internal {
+                    location: location!(),
+                    message: format!("Index with uuid {} referred to field with id {} which does not exist in the dataset", index.uuid, index.fields[0])
+                })?;
+            let ds_index = dataset
+                .open_generic_index(&index_column.name, &index.uuid.to_string())
+                .await?;
+            index_fragmaps.push(ds_index.calculate_included_frags().await?);
         }
     }
     Ok(index_fragmaps)
