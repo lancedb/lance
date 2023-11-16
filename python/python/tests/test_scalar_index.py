@@ -18,6 +18,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from lance.dataset import ScalarIndexType
 from lance.vector import vec_to_table
 
 
@@ -54,7 +55,8 @@ def indexed_dataset(tmp_path):
         num_partitions=4,
         num_sub_vectors=2,
     )
-    yield dataset.create_scalar_index("meta", index_type="BTREE")
+    dataset.create_scalar_index("meta", index_type=ScalarIndexType.BTREE)
+    return dataset
 
 
 @pytest.fixture()

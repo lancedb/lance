@@ -22,6 +22,7 @@ import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import (
@@ -75,6 +76,10 @@ if TYPE_CHECKING:
 
     from .commit import CommitLock
     from .progress import FragmentWriteProgress
+
+
+class ScalarIndexType(Enum):
+    BTREE = 0
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -696,12 +701,66 @@ class LanceDataset(pa.dataset.Dataset):
 
     def create_scalar_index(
         self,
-        column: Union[str, List[str]],
-        index_type: str,
+        column: str,
+        index_type: ScalarIndexType,
         name: Optional[str] = None,
+        *,
         replace: bool = True,
-    ) -> LanceDataset:
-        """Create scalar index on column.
+    ):
+        """Create a scalar index on a column.
+
+        Scalar indices, like vector indices, can be used to speed up scans.  A scalar
+        index can speed up scans that contain filter expressions on the indexed column.
+        For example, the following scan will be faster if the column ``my_col`` has
+        a scalar index:
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/images.lance")
+            my_table = dataset.scanner(filter="my_col != 7").to_table()
+
+        Scalar indices can also speed up scans containing a vector search and a
+        prefilter:
+
+        .. code-block::python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/images.lance")
+            my_table = dataset.scanner(
+                nearest=dict(
+                   column="vector",
+                   q=[1, 2, 3, 4],
+                   k=10,
+                )
+                filter="my_col != 7",
+                prefilter=True
+            )
+
+        Scalar indices can only speed up scans for basic filters using
+        equality, comparison, range (e.g. ``my_col BETWEEN 0 AND 100``), and set
+        membership (e.g. `my_col IN (0, 1, 2)`)
+
+        Scalar indices can be used if the filter contains multiple indexed columns and
+        the filter criteria are AND'd or OR'd together
+        (e.g. ``my_col < 0 AND other_col> 100``)
+
+        Scalar indices may be used if the filter contains non-indexed columns but,
+        depending on the structure of the filter, they may not be usable.  For example,
+        if the column ``not_indexed`` does not have a scalar index then the filter
+        ``my_col = 0 OR not_indexed = 1`` will not be able to use any scalar index on
+        ``my_col``.
+
+        To determine if a scan is making use of a scalar index you can use
+        ``explain_plan`` to look at the query plan that lance has created.  Queries
+        that use scalar indices will either have a ``ScalarIndexQuery`` relation or a
+        ``MaterializeIndex`` operator.
+
+        Currently, the only type of scalar index available is ``BTREE``. This index
+        combines is inspired by the btree data structure although only the first few
+        layers of the btree are cached in memory.
 
         **Experimental API**
 
@@ -724,11 +783,12 @@ class LanceDataset(pa.dataset.Dataset):
         .. code-block:: python
 
             import lance
+            from lance.dataset import ScalarIndexType
 
             dataset = lance.dataset("/tmp/images.lance")
             dataset.create_index(
                 "category",
-                "BTREE"
+                ScalarIndexType.BTREE,
             )
 
         Experimental Status:
@@ -762,14 +822,15 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Scalar index column {column} must be int, float, bool, or str"
             )
 
-        index_type = index_type.upper()
-        if index_type != "BTREE":
+        if index_type != ScalarIndexType.BTREE:
             raise NotImplementedError(
-                f"Only 'BTREE' is supported for index_type.  Received {index_type}"
+                (
+                    "Only 'ScalarIndexType.BTREE' is supported for ",
+                    f"index_type.  Received {index_type}",
+                )
             )
 
-        self._ds.create_index([column], index_type, name, replace)
-        return LanceDataset(self.uri)
+        self._ds.create_index([column], index_type.name, name, replace)
 
     def create_index(
         self,
