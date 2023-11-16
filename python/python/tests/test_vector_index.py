@@ -504,8 +504,8 @@ def test_index_cache_size(tmp_path):
         indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 10
     )
 
-    indexed_dataset = lance.LanceDataset(indexed_dataset.uri, index_cache_size=50)
-    query_index(indexed_dataset, 256)
+    indexed_dataset = lance.LanceDataset(indexed_dataset.uri, index_cache_size=5)
+    query_index(indexed_dataset, 128)
     assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 50
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 5
     )
