@@ -3451,26 +3451,20 @@ mod tests {
 
         let mut dataset = Dataset::open(test_uri).await.unwrap();
 
-        for idx in dataset.load_indices().await.unwrap() {
-            assert!(idx.fragment_bitmap.is_none());
-        }
-
-        let mut scan = dataset.scan();
-        let query_vec = Float32Array::from(vec![0_f32; 128]);
-        let batches = scan
-            .nearest("vector", &query_vec, 2000)
-            .unwrap()
-            .nprobs(4)
-            .prefilter(true)
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        let total_count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
-        assert_eq!(total_count, 1900);
+        // Uncomment to reproduce the issue.  The below query will panic
+        // let mut scan = dataset.scan();
+        // let query_vec = Float32Array::from(vec![0_f32; 128]);
+        // let scan_fut = scan
+        //     .nearest("vector", &query_vec, 2000)
+        //     .unwrap()
+        //     .nprobs(4)
+        //     .prefilter(true)
+        //     .try_into_stream()
+        //     .await
+        //     .unwrap()
+        //     .try_collect::<Vec<_>>()
+        //     .await
+        //     .unwrap();
 
         // Add some data and recalculate the index, forcing a migration
         let mut scan = dataset.scan();
@@ -3510,5 +3504,22 @@ mod tests {
         for idx in dataset.load_indices().await.unwrap() {
             assert!(idx.fragment_bitmap.unwrap().contains(0));
         }
+
+        let mut scan = dataset.scan();
+        let query_vec = Float32Array::from(vec![0_f32; 128]);
+        let batches = scan
+            .nearest("vector", &query_vec, 2000)
+            .unwrap()
+            .nprobs(4)
+            .prefilter(true)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let row_count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+        assert_eq!(row_count, 1900);
     }
 }

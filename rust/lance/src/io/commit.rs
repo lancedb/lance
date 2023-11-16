@@ -247,13 +247,18 @@ pub(crate) async fn migrate_fragments(
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()> {
-    // Early return so we have a fast path if they are already migrated.
-    if indices.iter().all(|i| i.fragment_bitmap.is_some()) {
-        return Ok(());
-    }
-
     for index in indices {
-        if index.fragment_bitmap.is_none() {
+        let mut must_recalculate_fragment_bitmap = index.fragment_bitmap.is_none();
+        if !must_recalculate_fragment_bitmap {
+            let dataset_version = dataset.checkout_version(index.dataset_version).await?;
+            must_recalculate_fragment_bitmap |=
+                if let Some(writer_version) = &dataset_version.manifest.writer_version {
+                    writer_version.older_than(0, 8, 15)
+                } else {
+                    true
+                }
+        }
+        if must_recalculate_fragment_bitmap {
             debug_assert_eq!(index.fields.len(), 1);
             let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;
             // We need to calculate the fragments covered by the index
