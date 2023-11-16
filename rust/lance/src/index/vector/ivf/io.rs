@@ -40,7 +40,7 @@ pub(super) async fn write_index_partitions(
         let mut row_id_array = Vec::<Arc<dyn Array>>::new();
 
         if let Some(existing_idx) = existing_partitions.as_ref() {
-            let part = existing_idx.load_partition(part_id as usize).await?;
+            let part = existing_idx.load_partition(part_id as usize, true).await?;
             let pq_idx = part.as_any().downcast_ref::<PQIndex>().unwrap();
             if pq_idx.code.is_some() {
                 let pq_code_arr = pq_idx.code.as_ref().unwrap().clone();

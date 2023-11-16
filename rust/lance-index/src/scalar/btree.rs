@@ -33,6 +33,7 @@ use futures::{
 };
 use lance_core::{Error, Result};
 use nohash_hasher::IntMap;
+use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
 use snafu::{location, Location};
 
@@ -751,6 +752,7 @@ struct BTreeStatistics {
     num_pages: u32,
 }
 
+#[async_trait]
 impl Index for BTreeIndex {
     fn as_any(&self) -> &dyn Any {
         self
@@ -781,6 +783,19 @@ impl Index for BTreeIndex {
             max,
         })
         .map_err(|err| err.into())
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        let mut frag_ids = RoaringBitmap::default();
+
+        let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+        for page_number in self.page_lookup.all_page_ids() {
+            let serialized = sub_index_reader.read_record_batch(page_number).await?;
+            let page = self.sub_index.load_subindex(serialized).await?;
+            frag_ids |= page.calculate_included_frags().await?;
+        }
+
+        Ok(frag_ids)
     }
 }
 

@@ -1508,6 +1508,7 @@ mod tests {
 
     use super::*;
     use crate::arrow::FixedSizeListArrayExt;
+    use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::WriteMode::Overwrite;
     use crate::datatypes::Schema;
     use crate::index::scalar::ScalarIndexParams;
@@ -3436,5 +3437,88 @@ mod tests {
             .unwrap();
         let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_v0_8_14_invalid_index_fragment_bitmap() {
+        // Old versions of lance could create an index whose fragment bitmap was
+        // invalid because it did not include fragments that were part of the index
+        //
+        // We need to make sure we do not rely on the fragment bitmap in these older
+        // versions and instead fall back to a slower legacy behavior
+        let test_dir = copy_test_data_to_tmp("v0.8.14/corrupt_index").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+
+        // Uncomment to reproduce the issue.  The below query will panic
+        // let mut scan = dataset.scan();
+        // let query_vec = Float32Array::from(vec![0_f32; 128]);
+        // let scan_fut = scan
+        //     .nearest("vector", &query_vec, 2000)
+        //     .unwrap()
+        //     .nprobs(4)
+        //     .prefilter(true)
+        //     .try_into_stream()
+        //     .await
+        //     .unwrap()
+        //     .try_collect::<Vec<_>>()
+        //     .await
+        //     .unwrap();
+
+        // Add some data and recalculate the index, forcing a migration
+        let mut scan = dataset.scan();
+        let data = scan
+            .limit(Some(10), None)
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let schema = data[0].schema();
+        let data = RecordBatchIterator::new(data.into_iter().map(arrow::error::Result::Ok), schema);
+
+        let broken_version = dataset.version().version;
+
+        // Any transaction, no matter how simple, should trigger the fragment bitmap to be recalculated
+        dataset.append(data, None).await.unwrap();
+
+        for idx in dataset.load_indices().await.unwrap() {
+            // The corrupt fragment_bitmap does not contain 0 but the
+            // restored one should
+            assert!(idx.fragment_bitmap.unwrap().contains(0));
+        }
+
+        let mut dataset = dataset.checkout_version(broken_version).await.unwrap();
+        dataset.restore(None).await.unwrap();
+
+        // Running compaction right away should work (this is verifying compaction
+        // is not broken by the potentially malformed fragment bitmaps)
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        for idx in dataset.load_indices().await.unwrap() {
+            assert!(idx.fragment_bitmap.unwrap().contains(0));
+        }
+
+        let mut scan = dataset.scan();
+        let query_vec = Float32Array::from(vec![0_f32; 128]);
+        let batches = scan
+            .nearest("vector", &query_vec, 2000)
+            .unwrap()
+            .nprobs(4)
+            .prefilter(true)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let row_count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+        assert_eq!(row_count, 1900);
     }
 }

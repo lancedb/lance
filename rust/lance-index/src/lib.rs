@@ -16,7 +16,9 @@
 
 use std::{any::Any, sync::Arc};
 
+use async_trait::async_trait;
 use lance_core::Result;
+use roaring::RoaringBitmap;
 
 pub mod scalar;
 pub mod util;
@@ -30,6 +32,7 @@ pub mod pb {
 }
 
 /// Generic methods common across all types of secondary indices
+#[async_trait]
 pub trait Index: Send + Sync {
     /// Cast to [Any].
     fn as_any(&self) -> &dyn Any;
@@ -39,6 +42,11 @@ pub trait Index: Send + Sync {
     fn statistics(&self) -> Result<String>;
     /// Get the type of the index
     fn index_type(&self) -> IndexType;
+    /// Read through the index and determine which fragment ids are covered by the index
+    ///
+    /// This is a kind of slow operation.  It's better to use the fragment_bitmap.  This
+    /// only exists for cases where the fragment_bitmap has become corrupted or missing.
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap>;
 }
 
 /// Index Type
