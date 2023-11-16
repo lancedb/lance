@@ -22,7 +22,6 @@ import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import (
@@ -32,6 +31,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     TypedDict,
     Union,
@@ -76,10 +76,6 @@ if TYPE_CHECKING:
 
     from .commit import CommitLock
     from .progress import FragmentWriteProgress
-
-
-class ScalarIndexType(Enum):
-    BTREE = 0
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -702,7 +698,7 @@ class LanceDataset(pa.dataset.Dataset):
     def create_scalar_index(
         self,
         column: str,
-        index_type: ScalarIndexType,
+        index_type: Literal["BTREE"],
         name: Optional[str] = None,
         *,
         replace: bool = True,
@@ -783,12 +779,11 @@ class LanceDataset(pa.dataset.Dataset):
         .. code-block:: python
 
             import lance
-            from lance.dataset import ScalarIndexType
 
             dataset = lance.dataset("/tmp/images.lance")
             dataset.create_index(
                 "category",
-                ScalarIndexType.BTREE,
+                "BTREE",
             )
 
         Experimental Status:
@@ -822,15 +817,16 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Scalar index column {column} must be int, float, bool, or str"
             )
 
-        if index_type != ScalarIndexType.BTREE:
+        index_type = index_type.upper()
+        if index_type != "BTREE":
             raise NotImplementedError(
                 (
-                    "Only 'ScalarIndexType.BTREE' is supported for ",
+                    'Only "BTREE" is supported for ',
                     f"index_type.  Received {index_type}",
                 )
             )
 
-        self._ds.create_index([column], index_type.name, name, replace)
+        self._ds.create_index([column], index_type, name, replace)
 
     def create_index(
         self,
