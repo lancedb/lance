@@ -23,6 +23,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from lance.vector import vec_to_table
+from numpy.random import PCG64, Generator
 
 
 def create_table(nvec=1000, ndim=128):
@@ -297,7 +298,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     if platform.system() == "Windows":
         expected_filepath = expected_filepath.replace("\\", "/")
     expected_statistics = {
-        "index_cache_size": 1,
+        "index_cache_entry_count": 1,
         "index_type": "IVF",
         "uuid": index_uuid,
         "uri": expected_filepath,
@@ -469,13 +470,15 @@ def test_knn_with_deletions(tmp_path):
 
 
 def test_index_cache_size(tmp_path):
+    rng = Generator(PCG64())
+
     def query_index(ds, ntimes):
         ndim = ds.schema[0].type.list_size
         for _ in range(ntimes):
             ds.to_table(
                 nearest={
                     "column": "vector",
-                    "q": np.random.randn(ndim),
+                    "q": rng.standard_normal(ndim),
                 },
             )
 
@@ -490,12 +493,20 @@ def test_index_cache_size(tmp_path):
         index_cache_size=10,
     )
 
-    assert indexed_dataset.stats.index_stats("vector_idx")["index_cache_size"] == 1
+    assert (
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 1
+    )
     query_index(indexed_dataset, 1)
-    assert indexed_dataset.stats.index_stats("vector_idx")["index_cache_size"] == 2
+    assert (
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 2
+    )
     query_index(indexed_dataset, 128)
-    assert indexed_dataset.stats.index_stats("vector_idx")["index_cache_size"] == 10
+    assert (
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 10
+    )
 
     indexed_dataset = lance.LanceDataset(indexed_dataset.uri, index_cache_size=50)
     query_index(indexed_dataset, 256)
-    assert indexed_dataset.stats.index_stats("vector_idx")["index_cache_size"] == 50
+    assert (
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 50
+    )

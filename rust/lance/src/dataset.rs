@@ -1210,7 +1210,8 @@ impl Dataset {
         Version::from(self.manifest.as_ref())
     }
 
-    pub fn index_cache_size(&self) -> usize {
+    /// Get the number of entries currently in the index cache.
+    pub fn index_cache_entry_count(&self) -> usize {
         self.session.index_cache.get_size()
     }
 

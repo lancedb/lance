@@ -89,7 +89,13 @@ def dataset(
         Approximately, ``n = Total Rows / number of IVF partitions``.
         ``pq = number of PQ sub-vectors``.
     """
-    ds = LanceDataset(uri, version, block_size, commit_lock=commit_lock)
+    ds = LanceDataset(
+        uri,
+        version,
+        block_size,
+        commit_lock=commit_lock,
+        index_cache_size=index_cache_size,
+    )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
         ver_cutoff = max(

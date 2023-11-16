@@ -2566,7 +2566,7 @@ mod test {
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
             let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
-            assert_eq!(dataset.index_cache_size(), 0);
+            assert_eq!(dataset.index_cache_entry_count(), 0);
             dataset
                 .create_index(
                     &["vec"],
@@ -2585,7 +2585,7 @@ mod test {
             scan.refine(100);
             scan.nprobs(100);
 
-            assert_eq!(dataset.index_cache_size(), 0);
+            assert_eq!(dataset.index_cache_entry_count(), 0);
             let results = scan
                 .try_into_stream()
                 .await
@@ -2594,7 +2594,7 @@ mod test {
                 .await
                 .unwrap();
 
-            assert_eq!(dataset.index_cache_size(), 5);
+            assert_eq!(dataset.index_cache_entry_count(), 5);
             assert_eq!(results.len(), 1);
             let batch = &results[0];
 

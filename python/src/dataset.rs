@@ -772,8 +772,8 @@ impl Dataset {
         }
     }
 
-    fn index_cache_size(&self) -> PyResult<usize> {
-        Ok(self.ds.index_cache_size())
+    fn index_cache_entry_count(&self) -> PyResult<usize> {
+        Ok(self.ds.index_cache_entry_count())
     }
 
     #[staticmethod]
