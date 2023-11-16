@@ -3482,10 +3482,11 @@ mod tests {
 
         let broken_version = dataset.version().version;
 
+        // Any transaction, no matter how simple, should trigger the fragment bitmap to be recalculated
         dataset.append(data, None).await.unwrap();
 
-        // This will trigger a migration and write out the calculated fragment bitmap
-        dataset.optimize_indices().await.unwrap();
+        // // This will trigger a migration and write out the calculated fragment bitmap
+        // dataset.optimize_indices().await.unwrap();
 
         for idx in dataset.load_indices().await.unwrap() {
             // The corrupt fragment_bitmap does not contain 0 but the
@@ -3496,7 +3497,8 @@ mod tests {
         let mut dataset = dataset.checkout_version(broken_version).await.unwrap();
         dataset.restore(None).await.unwrap();
 
-        // Running compaction should also properly migrate the index
+        // Running compaction right away should work (this is verifying compaction
+        // is not broken by the potentially malformed fragment bitmaps)
         compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap();

@@ -248,25 +248,16 @@ pub(crate) async fn migrate_fragments(
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()> {
     for index in indices {
+        // If the fragment bitmap is missing we need to recalculate it
         let mut must_recalculate_fragment_bitmap = index.fragment_bitmap.is_none();
-        if !must_recalculate_fragment_bitmap {
-            match dataset.checkout_version(index.dataset_version).await {
-                Ok(old_dataset) => {
-                    must_recalculate_fragment_bitmap |=
-                        if let Some(writer_version) = &old_dataset.manifest.writer_version {
-                            writer_version.older_than(0, 8, 15)
-                        } else {
-                            true
-                        };
-                }
-                Err(crate::Error::NotFound { .. }) | Err(crate::Error::DatasetNotFound { .. }) => {
-                    must_recalculate_fragment_bitmap = true;
-                }
-                Err(e) => {
-                    return Err(e);
-                }
+        // If the fragment bitmap was written by an old version of lance then we need to recalculate
+        // it because it could be corrupt due to a bug in versions < 0.8.15
+        must_recalculate_fragment_bitmap |=
+            if let Some(writer_version) = &dataset.manifest.writer_version {
+                writer_version.older_than(0, 8, 15)
+            } else {
+                true
             };
-        }
         if must_recalculate_fragment_bitmap {
             debug_assert_eq!(index.fields.len(), 1);
             let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;
