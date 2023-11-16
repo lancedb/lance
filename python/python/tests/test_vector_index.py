@@ -23,7 +23,6 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from lance.vector import vec_to_table
-from numpy.random import PCG64, Generator
 
 
 def create_table(nvec=1000, ndim=128):
@@ -470,7 +469,7 @@ def test_knn_with_deletions(tmp_path):
 
 
 def test_index_cache_size(tmp_path):
-    rng = Generator(PCG64())
+    rng = np.random.default_rng(seed=42)
 
     def query_index(ds, ntimes):
         ndim = ds.schema[0].type.list_size
