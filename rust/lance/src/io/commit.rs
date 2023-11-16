@@ -250,13 +250,22 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()>
     for index in indices {
         let mut must_recalculate_fragment_bitmap = index.fragment_bitmap.is_none();
         if !must_recalculate_fragment_bitmap {
-            let dataset_version = dataset.checkout_version(index.dataset_version).await?;
-            must_recalculate_fragment_bitmap |=
-                if let Some(writer_version) = &dataset_version.manifest.writer_version {
-                    writer_version.older_than(0, 8, 15)
-                } else {
-                    true
+            match dataset.checkout_version(index.dataset_version).await {
+                Ok(old_dataset) => {
+                    must_recalculate_fragment_bitmap |=
+                        if let Some(writer_version) = &old_dataset.manifest.writer_version {
+                            writer_version.older_than(0, 8, 15)
+                        } else {
+                            true
+                        };
                 }
+                Err(crate::Error::NotFound { .. }) | Err(crate::Error::DatasetNotFound { .. }) => {
+                    must_recalculate_fragment_bitmap = true;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            };
         }
         if must_recalculate_fragment_bitmap {
             debug_assert_eq!(index.fields.len(), 1);
