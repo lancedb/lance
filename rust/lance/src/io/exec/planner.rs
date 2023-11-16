@@ -17,8 +17,8 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use arrow_schema::{ArrowError, DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
-use datafusion::common::tree_node::{TreeNode, TreeNodeRewriter, TreeNodeVisitor, VisitRecursion};
+use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
+use datafusion::common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion};
 use datafusion::common::DFSchema;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{GetFieldAccess, GetIndexedField};
@@ -41,7 +41,7 @@ use lance_index::scalar::expression::{
 use lance_index::util::datafusion::safe_coerce_scalar;
 use snafu::{location, Location};
 
-use crate::datafusion::logical_expr::{coerce_filter_type_to_boolean, resolve_column_type};
+use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
 use crate::utils::sql::parse_sql_expr;
 use crate::{
     datafusion::logical_expr::resolve_expr, datatypes::Schema, utils::sql::parse_sql_filter, Error,
@@ -480,17 +480,13 @@ impl Planner {
     pub fn optimize_expr(&self, expr: Expr) -> Result<Expr> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
 
-        let mut rewriter = ListRewriter {
-            schema: Schema::try_from(self.schema.as_ref())?,
-        };
-        let expr = expr.rewrite(&mut rewriter)?;
-
         // DataFusion needs the simplify and coerce passes to be applied before
         // expressions can be handled by the physical planner.
         let props = ExecutionProps::default();
         let simplify_context = SimplifyContext::new(&props).with_schema(df_schema.clone());
         let simplifier =
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
+
         let expr = simplifier.simplify(expr.clone())?;
         let expr = simplifier.coerce(expr, df_schema.clone())?;
 
@@ -581,47 +577,6 @@ impl TreeNodeVisitor for ColumnCapturingVisitor {
         }
 
         Ok(VisitRecursion::Continue)
-    }
-}
-
-// TODO: remove me once DataFusion can cast List -> FSL
-struct ListRewriter {
-    schema: Schema,
-}
-
-impl TreeNodeRewriter for ListRewriter {
-    type N = Expr;
-
-    fn mutate(&mut self, node: Expr) -> DFResult<Expr> {
-        fn is_list_literal(expr: &Expr) -> bool {
-            matches!(expr, Expr::Literal(ScalarValue::List(_, _)))
-        }
-
-        match node {
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_list_literal(right.as_ref()) => {
-                let (left, right) = match resolve_column_type(&left, &self.schema) {
-                    Some(out_type @ ArrowDataType::FixedSizeList(_, _)) => {
-                        let right_ref = if let Expr::Literal(val) = *right {
-                            safe_coerce_scalar(&val, &out_type).ok_or_else(|| {
-                                ArrowError::CastError(format!(
-                                    "Failed to cast {} to {} during planning",
-                                    val.data_type(),
-                                    out_type
-                                ))
-                            })?
-                        } else {
-                            unreachable!()
-                        };
-
-                        (left, Box::new(Expr::Literal(right_ref)))
-                    }
-                    _ => (left, right),
-                };
-
-                Ok(Expr::BinaryExpr(BinaryExpr { left, op, right }))
-            }
-            _ => Ok(node),
-        }
     }
 }
 

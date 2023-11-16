@@ -19,7 +19,7 @@ import platform
 import re
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -731,6 +731,65 @@ def test_update_dataset(tmp_path: Path):
         }
     )
     assert dataset.to_table(columns=["b", "vec"]).sort_by("b") == expected
+
+
+def test_update_dataset_all_types(tmp_path: Path):
+    table = pa.table(
+        {
+            "int32": pa.array([1], pa.int32()),
+            "int64": pa.array([1], pa.int64()),
+            "uint32": pa.array([1], pa.uint32()),
+            "string": pa.array(["foo"], pa.string()),
+            "large_string": pa.array(["foo"], pa.large_string()),
+            "float32": pa.array([1.0], pa.float32()),
+            "float64": pa.array([1.0], pa.float64()),
+            "bool": pa.array([True], pa.bool_()),
+            "date32": pa.array([date(2021, 1, 1)], pa.date32()),
+            "timestamp_ns": pa.array([datetime(2021, 1, 1)], pa.timestamp("ns")),
+            "timestamp_ms": pa.array([datetime(2021, 1, 1)], pa.timestamp("ms")),
+            "vec_f32": pa.array([[1.0, 2.0]], pa.list_(pa.float32(), 2)),
+            "vec_f64": pa.array([[1.0, 2.0]], pa.list_(pa.float64(), 2)),
+        }
+    )
+
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # One update with all matching types
+    dataset.update(
+        dict(
+            int32="2",
+            int64="2",
+            uint32="2",
+            string="'bar'",
+            large_string="'bar'",
+            float32="2.0",
+            float64="2.0",
+            bool="false",
+            date32="DATE '2021-01-02'",
+            timestamp_ns='TIMESTAMP "2021-01-02 00:00:00"',
+            timestamp_ms='TIMESTAMP "2021-01-02 00:00:00"',
+            vec_f32="[3.0, 4.0]",
+            vec_f64="[3.0, 4.0]",
+        )
+    )
+    expected = pa.table(
+        {
+            "int32": pa.array([2], pa.int32()),
+            "int64": pa.array([2], pa.int64()),
+            "uint32": pa.array([2], pa.uint32()),
+            "string": pa.array(["bar"], pa.string()),
+            "large_string": pa.array(["bar"], pa.large_string()),
+            "float32": pa.array([2.0], pa.float32()),
+            "float64": pa.array([2.0], pa.float64()),
+            "bool": pa.array([False], pa.bool_()),
+            "date32": pa.array([date(2021, 1, 2)], pa.date32()),
+            "timestamp_ns": pa.array([datetime(2021, 1, 2)], pa.timestamp("ns")),
+            "timestamp_ms": pa.array([datetime(2021, 1, 2)], pa.timestamp("ms")),
+            "vec_f32": pa.array([[3.0, 4.0]], pa.list_(pa.float32(), 2)),
+            "vec_f64": pa.array([[3.0, 4.0]], pa.list_(pa.float64(), 2)),
+        }
+    )
+    assert dataset.to_table() == expected
 
 
 def test_create_update_empty_dataset(tmp_path: Path, provide_pandas: bool):

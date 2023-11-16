@@ -18,10 +18,11 @@ use std::sync::{Arc, RwLock};
 use super::super::utils::make_rowid_capture_stream;
 use super::write_fragments_internal;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch};
-use arrow_schema::DataType;
+use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
 use arrow_select::concat::concat;
+use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::logical_expr::{col, BinaryExpr};
+use datafusion::logical_expr::ExprSchemable;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{ColumnarValue, PhysicalExpr};
 use datafusion::prelude::Expr;
@@ -30,6 +31,7 @@ use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::error::{box_error, InvalidInputSnafu};
 use lance_core::format::Fragment;
+use lance_index::util::datafusion::safe_coerce_scalar;
 use roaring::RoaringTreemap;
 use snafu::{location, Location, ResultExt};
 
@@ -84,17 +86,23 @@ impl UpdateBuilder {
     }
 
     pub fn set(mut self, column: impl AsRef<str>, value: &str) -> Result<Self> {
-        if self.dataset.schema().field(column.as_ref()).is_none() {
-            return Err(Error::invalid_input(
-                format!(
-                    "Column '{}' does not exist in dataset schema: {:?}",
-                    column.as_ref(),
-                    self.dataset.schema()
-                ),
-                location!(),
-            ));
-        }
+        let field = self
+            .dataset
+            .schema()
+            .field(column.as_ref())
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    format!(
+                        "Column '{}' does not exist in dataset schema: {:?}",
+                        column.as_ref(),
+                        self.dataset.schema()
+                    ),
+                    location!(),
+                )
+            })?;
 
+        // TODO: support nested column references. This is mostly blocked on the
+        // ability to insert them into the RecordBatch properly.
         if column.as_ref().contains('.') {
             return Err(Error::NotSupported {
                 source: format!(
@@ -106,23 +114,48 @@ impl UpdateBuilder {
             });
         }
 
-        let planner = Planner::new(Arc::new(self.dataset.schema().into()));
-        let expr = planner
+        let schema: Arc<ArrowSchema> = Arc::new(self.dataset.schema().into());
+        let planner = Planner::new(schema.clone());
+        let mut expr = planner
             .parse_expr(value)
             .map_err(box_error)
             .context(InvalidInputSnafu)?;
-        // We optimize with expression `col = expr` to ensure that the output
-        // expression is coerced to the correct data type.
-        let tmp_expr = col(column.as_ref()).eq(expr);
-        let expr = planner
-            .optimize_expr(tmp_expr)
+
+        // Cast expression to the column's data type if necessary.
+        let dest_type = field.data_type();
+        let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
+        let src_type = expr
+            .get_type(&df_schema)
             .map_err(box_error)
             .context(InvalidInputSnafu)?;
-        let expr = if let Expr::BinaryExpr(BinaryExpr { right, .. }) = expr {
-            *right
-        } else {
-            unreachable!()
-        };
+        if dest_type != src_type {
+            // TODO: remove this once DataFusion supports casting List to FSL
+            expr = match expr {
+                Expr::Literal(value @ ScalarValue::List(_, _))
+                    if matches!(dest_type, DataType::FixedSizeList(_, _)) =>
+                {
+                    Expr::Literal(safe_coerce_scalar(&value, &dest_type).ok_or_else(|| {
+                        ArrowError::CastError(format!(
+                            "Failed to cast {} to {} during planning",
+                            value.data_type(),
+                            dest_type
+                        ))
+                    })?)
+                }
+                _ => expr
+                    .cast_to(&dest_type, &df_schema)
+                    .map_err(box_error)
+                    .context(InvalidInputSnafu)?,
+            };
+        }
+
+        // Optimize the expression. For example, this might apply the cast on
+        // literals.
+        let expr = planner
+            .optimize_expr(expr)
+            .map_err(box_error)
+            .context(InvalidInputSnafu)?;
+
         self.updates.insert(column.as_ref().to_string(), expr);
         Ok(self)
     }
