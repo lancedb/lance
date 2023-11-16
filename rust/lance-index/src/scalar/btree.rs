@@ -25,11 +25,8 @@ use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::{
-    repartition::RepartitionExec,
-    sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
-    stream::RecordBatchStreamAdapter,
-    union::UnionExec,
-    ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+    sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
+    union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::Accumulator;
