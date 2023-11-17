@@ -467,6 +467,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
     fn dimension(&self) -> usize {
         self.dimension
     }
+
     fn codebook_as_fsl(&self) -> FixedSizeListArray {
         FixedSizeListArray::try_new_from_values(
             self.codebook.as_ref().clone(),
