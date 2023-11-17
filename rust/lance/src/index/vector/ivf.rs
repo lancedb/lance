@@ -503,13 +503,14 @@ impl Ivf {
     ) -> Result<UInt32Array> {
         use lance_index::vector::ivf::Ivf as IvfTrait;
 
-        let ivf = lance_index::vector::ivf::IvfImpl::<Float32Type>::new(
-            MatrixView::try_from(self.centroids.as_ref())?,
+        let internal = lance_index::vector::ivf::new_ivf(
+            self.centroids.values(),
+            self.dimension(),
             metric_type,
             vec![],
             None,
-        );
-        ivf.find_partitions(query, nprobes)
+        )?;
+        internal.find_partitions(query, nprobes)
     }
 
     /// Add the offset and length of one partition.
