@@ -17,9 +17,12 @@
 
 use std::sync::Arc;
 
+use crate::pb;
 use arrow_array::types::{Float16Type, Float64Type};
-use arrow_array::FixedSizeListArray;
-use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef, Float32Array};
+use arrow_array::{
+    cast::AsArray, types::Float32Type, Array, ArrayRef, Float32Array, PrimitiveArray,
+};
+use arrow_array::{ArrowNumericType, FixedSizeListArray};
 use arrow_schema::DataType;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FloatArray};
@@ -175,18 +178,51 @@ impl PQBuildParams {
     }
 }
 
+fn create_typed_pq<
+    T: ArrowFloatType<ArrayType = PrimitiveArray<T>> + ArrowNumericType + L2 + Cosine + Dot,
+>(
+    proto: &Pq,
+    metric_type: MetricType,
+    array: &dyn Array,
+) -> Arc<dyn ProductQuantizer> {
+    Arc::new(ProductQuantizerImpl::<T>::new(
+        proto.num_sub_vectors as usize,
+        proto.num_bits,
+        proto.dimension as usize,
+        Arc::new(array.as_primitive::<T>().clone()),
+        metric_type,
+    ))
+}
+
 /// Load ProductQuantizer from Protobuf
 pub fn from_proto(proto: &Pq, metric_type: MetricType) -> Result<Arc<dyn ProductQuantizer>> {
     if let Some(tensor) = &proto.codebook_tensor {
         let fsl = FixedSizeListArray::try_from(tensor)?;
 
-        Ok(Arc::new(ProductQuantizerImpl::<Float32Type>::new(
-            proto.num_sub_vectors as usize,
-            proto.num_bits,
-            proto.dimension as usize,
-            Arc::new(fsl.values().as_primitive().clone()), // Support multi-data type later.
-            metric_type,
-        )))
+        match pb::tensor::DataType::try_from(tensor.data_type)? {
+            pb::tensor::DataType::Bfloat16 => {
+                unimplemented!()
+            }
+            pb::tensor::DataType::Float16 => Ok(create_typed_pq::<Float16Type>(
+                &proto,
+                metric_type,
+                fsl.values(),
+            )),
+            pb::tensor::DataType::Float32 => Ok(create_typed_pq::<Float32Type>(
+                &proto,
+                metric_type,
+                fsl.values(),
+            )),
+            pb::tensor::DataType::Float64 => Ok(create_typed_pq::<Float64Type>(
+                &proto,
+                metric_type,
+                fsl.values(),
+            )),
+            _ => Err(Error::Index {
+                message: format!("PQ builder: unsupported data type: {:?}", tensor.data_type),
+                location: location!(),
+            }),
+        }
     } else {
         Ok(Arc::new(ProductQuantizerImpl::<Float32Type>::new(
             proto.num_sub_vectors as usize,

@@ -815,8 +815,7 @@ impl Scanner {
         let schema = self.dataset.schema();
         if let Some(field) = schema.field(&q.column) {
             match field.data_type() {
-                DataType::FixedSizeList(subfield, _)
-                    if matches!(subfield.data_type(), DataType::Float32) => {}
+                DataType::FixedSizeList(subfield, _) if subfield.data_type().is_floating() => {}
                 _ => {
                     return Err(Error::IO {
                         message: format!(

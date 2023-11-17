@@ -984,6 +984,7 @@ mod tests {
     use super::*;
 
     use std::collections::HashMap;
+    use std::iter::repeat;
 
     use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
@@ -1568,10 +1569,26 @@ mod tests {
             IvfBuildParams::new(2),
             PQBuildParams::new(4, 8),
         );
-        let result = dataset
+        dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await;
-        println!("Results: {:?}", result);
-        // .expect("Create index successfully");
+            .await
+            .unwrap();
+
+        let results = dataset
+            .scan()
+            .nearest(
+                "vector",
+                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                5,
+            )
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 5);
     }
 }
