@@ -564,3 +564,17 @@ def test_index_cache_size(tmp_path):
     assert (
         indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 5
     )
+
+def test_f16_index(tmp_path: Path):
+    DIM = 64
+    uri = tmp_path / "f16data.lance"
+    f16_data = np.random.uniform(0, 1, 2048 * DIM).astype(np.float16)
+    fsl = pa.FixedSizeListArray.from_arrays(f16_data, DIM)
+    tbl = pa.Table.from_pydict({"vector": fsl})
+    print(tbl)
+    dataset = lance.write_dataset(tbl, uri)
+    dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=2
+    )
+
+    q = np.random.uniform(0, 1, DIM).astype(np.float16)
