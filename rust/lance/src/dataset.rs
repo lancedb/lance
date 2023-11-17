@@ -78,7 +78,9 @@ use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
-
+pub use write::merge_insert::{
+    MergeInsertBuilder, MergeInsertJob, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+};
 pub use write::update::{UpdateBuilder, UpdateJob};
 pub use write::{write_fragments, WriteMode, WriteParams};
 

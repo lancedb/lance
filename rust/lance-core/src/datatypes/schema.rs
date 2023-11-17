@@ -409,6 +409,17 @@ impl Schema {
         self.fields.iter_mut().for_each(|f| f.reset_id());
     }
 
+    /// Create a new schema by adding fields to the end of this schema
+    pub fn extend(&mut self, fields: &[ArrowField]) -> Result<()> {
+        let fields = fields
+            .iter()
+            .map(Field::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        self.fields.extend(fields);
+        self.set_field_id();
+        Ok(())
+    }
+
     /// Merge this schema from the other schema.
     ///
     /// After merging, the field IDs from `other` schema will be reassigned,
