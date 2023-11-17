@@ -172,12 +172,14 @@ impl Dataset {
     /// Open an existing dataset.
     ///
     /// See also [DatasetBuilder].
+    #[instrument]
     pub async fn open(uri: &str) -> Result<Self> {
         DatasetBuilder::from_uri(uri).load().await
     }
 
     /// Open a dataset with read params.
     #[deprecated(since = "0.8.17", note = "Please use `DatasetBuilder` instead.")]
+    #[instrument(skip(params))]
     pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
         let (mut object_store, base_path) = match params.store_options.as_ref() {
             Some(store_options) => ObjectStore::from_uri_and_params(uri, store_options).await?,
@@ -839,6 +841,7 @@ impl Dataset {
         Ok(counts.iter().sum())
     }
 
+    #[instrument(skip_all, fields(num_rows=row_indices.len()))]
     pub async fn take(&self, row_indices: &[u64], projection: &Schema) -> Result<RecordBatch> {
         if row_indices.is_empty() {
             let schema = Arc::new(projection.into());
