@@ -204,17 +204,17 @@ pub fn from_proto(proto: &Pq, metric_type: MetricType) -> Result<Arc<dyn Product
                 unimplemented!()
             }
             pb::tensor::DataType::Float16 => Ok(create_typed_pq::<Float16Type>(
-                &proto,
+                proto,
                 metric_type,
                 fsl.values(),
             )),
             pb::tensor::DataType::Float32 => Ok(create_typed_pq::<Float32Type>(
-                &proto,
+                proto,
                 metric_type,
                 fsl.values(),
             )),
             pb::tensor::DataType::Float64 => Ok(create_typed_pq::<Float64Type>(
-                &proto,
+                proto,
                 metric_type,
                 fsl.values(),
             )),

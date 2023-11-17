@@ -48,10 +48,7 @@ use lance_index::{
     },
     Index, IndexType,
 };
-use lance_linalg::{
-    distance::{Cosine, Dot, MetricType, L2},
-    matrix::MatrixView,
-};
+use lance_linalg::distance::{Cosine, Dot, MetricType, L2};
 use log::{debug, info};
 use nohash_hasher::IntMap;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -501,8 +498,6 @@ impl Ivf {
         nprobes: usize,
         metric_type: MetricType,
     ) -> Result<UInt32Array> {
-        use lance_index::vector::ivf::Ivf as IvfTrait;
-
         let internal = lance_index::vector::ivf::new_ivf(
             self.centroids.values(),
             self.dimension(),
@@ -1591,5 +1586,20 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].num_rows(), 5);
+        let batch = &results[0];
+        assert_eq!(
+            batch.schema(),
+            Arc::new(Schema::new(vec![
+                Field::new(
+                    "vector",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float16, true)),
+                        DIM as i32,
+                    ),
+                    true,
+                ),
+                Field::new("_distance", DataType::Float32, true)
+            ]))
+        );
     }
 }
