@@ -35,6 +35,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::scalar::ScalarValue;
 use futures::stream::{Stream, StreamExt};
+use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::ROW_ID_FIELD;
 use lance_datafusion::exec::execute_plan;
 use lance_index::scalar::expression::ScalarIndexExpr;
@@ -365,10 +366,40 @@ impl Scanner {
             });
         }
         // make sure the field exists
-        self.dataset.schema().project(&[column])?;
+        let field = self.dataset.schema().field(column).ok_or(Error::IO {
+            message: format!("Column {} not found", column),
+            location: location!(),
+        })?;
+        let key = match field.data_type() {
+            DataType::FixedSizeList(dt, _) => {
+                if dt.data_type().is_floating() {
+                    coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?
+                } else {
+                    return Err(Error::IO {
+                        message: format!(
+                            "Column {} is not a vector column (type: {})",
+                            column,
+                            field.data_type()
+                        ),
+                        location: location!(),
+                    });
+                }
+            }
+            _ => {
+                return Err(Error::IO {
+                    message: format!(
+                        "Column {} is not a vector column (type: {})",
+                        column,
+                        field.data_type()
+                    ),
+                    location: location!(),
+                })
+            }
+        };
+
         self.nearest = Some(Query {
             column: column.to_string(),
-            key: Arc::new(q.clone()),
+            key: key.into(),
             k,
             nprobes: 1,
             refine_factor: None,
