@@ -434,7 +434,9 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                 )?)),
             },
             pb::VectorIndexStage {
-                stage: Some(pb::vector_index_stage::Stage::Pq(idx.pq.as_ref().into())),
+                stage: Some(pb::vector_index_stage::Stage::Pq(
+                    idx.pq.as_ref().try_into()?,
+                )),
             },
         ]);
 
