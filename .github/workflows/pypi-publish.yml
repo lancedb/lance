@@ -34,11 +34,15 @@ jobs:
         repo: "pypi"
   mac:
     timeout-minutes: 60
-    runs-on: "macos-13"
+    runs-on: ${{ matrix.config.runner }}
     strategy:
       matrix:
         python-minor-version: ["8"]
-        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+        config:
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-13-xlarge
     env:
       MACOSX_DEPLOYMENT_TARGET: 10.15
     steps:
@@ -50,11 +54,11 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: 3.${{ matrix.python-minor-version }}
+        python-version: 3.11
     - uses: ./.github/workflows/build_mac_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release --strip --target ${{ matrix.target }}"
+        args: "--release --strip --target ${{ matrix.config.target }}"
     - uses: ./.github/workflows/upload_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
