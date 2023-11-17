@@ -289,14 +289,18 @@ fn get_string_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
         });
     }
 
-    let max_value_bound: Vec<u8>;
+    let max_value_bound: Option<Vec<u8>>;
     if let Some(v) = max_value {
         // If the bounds were truncated, then we need to increment the max_value,
         // since shorter values are considered smaller than longer values if the
         // short values are a prefix of the long ones.
         if bounds_truncated {
-            max_value_bound = increment_utf8(v.as_bytes().to_vec()).unwrap();
-            max_value = Some(str::from_utf8(&max_value_bound).unwrap());
+            max_value_bound = increment_utf8(v.as_bytes().to_vec());
+            // We can safely unwrap because increment_utf8 will only return
+            // Some() if the bound is valid UTF-8 bytes.
+            max_value = max_value_bound
+                .as_ref()
+                .map(|bound| str::from_utf8(bound).unwrap());
         }
     }
 
@@ -368,7 +372,7 @@ fn get_binary_statistics<T: OffsetSizeTrait>(arrays: &[&ArrayRef]) -> Statistics
     // short values are a prefix of the long ones.
     let max_value = if let Some(v) = max_value {
         if bounds_truncated {
-            increment(max_value.unwrap().to_vec())
+            increment(v.to_vec())
         } else {
             Some(v.to_vec())
         }
@@ -442,7 +446,7 @@ fn get_fixed_size_binary_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
     // short values are a prefix of the long ones.
     let max_value = if let Some(v) = max_value {
         if do_truncate {
-            increment(max_value.unwrap().to_vec())
+            increment(v.to_vec())
         } else {
             Some(v.to_vec())
         }
@@ -2080,8 +2084,8 @@ mod tests {
             // Assert min is <= all values
             prop_assert!(values.iter().all(|val| statistics.min_value <= ScalarValue::Utf8(Some(val.clone()))));
 
-            // Assert max is >= all values
-            prop_assert!(values.iter().all(|val| statistics.max_value >= ScalarValue::Utf8(Some(val.clone()))));
+            // Assert max is >= all values, or is null
+            prop_assert!(statistics.max_value.is_null() || values.iter().all(|val| statistics.max_value >= ScalarValue::Utf8(Some(val.clone()))));
 
             // Assert min and max are less than BINARY_PREFIX_LENGTH
             match &statistics.min_value {
@@ -2113,7 +2117,7 @@ mod tests {
             prop_assert!(values.iter().all(|val| statistics.min_value <= ScalarValue::Binary(Some(val.clone()))));
 
             // Assert max is >= all values
-            prop_assert!(values.iter().all(|val| statistics.max_value >= ScalarValue::Binary(Some(val.clone()))));
+            prop_assert!(statistics.max_value.is_null() || values.iter().all(|val| statistics.max_value >= ScalarValue::Binary(Some(val.clone()))));
 
             // Assert min and max are less than BINARY_PREFIX_LENGTH
             match &statistics.min_value {
@@ -2151,7 +2155,7 @@ mod tests {
             prop_assert!(values.iter().all(|val| statistics.min_value <= ScalarValue::FixedSizeBinary(100, Some(val.clone()))));
 
             // Assert max is >= all values
-            prop_assert!(values.iter().all(|val| statistics.max_value >= ScalarValue::FixedSizeBinary(100, Some(val.clone()))));
+            prop_assert!(statistics.max_value.is_null() || values.iter().all(|val| statistics.max_value >= ScalarValue::FixedSizeBinary(100, Some(val.clone()))));
 
             // Assert min and max are less than BINARY_PREFIX_LENGTH
             match &statistics.min_value {
