@@ -871,6 +871,8 @@ class LanceDataset(pa.dataset.Dataset):
             If set, use an accelerator to speed up the training process.
             Accepted accelerator: "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU).
             If not set, use the CPU.
+        index_cache_size : int, optional
+            The size of the index cache in number of entries. Default value is 256.
         kwargs :
             Parameters passed to the index building process.
 
