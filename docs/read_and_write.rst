@@ -120,10 +120,10 @@ that with:
     import lance
 
     dataset = lance.dataset("./alice_and_bob.lance")
-    dataset.update(dict(name = "'Bob'"), where="name = 'Blob'")
+    dataset.update({"name": "'Bob'"}), where="name = 'Blob'")
 
 The update values are SQL expressions, which is why ``'Bob'`` is wrapped in single
-quotes. This means we use complex expressions that reference existing columns if
+quotes. This means we can use complex expressions that reference existing columns if
 we wish. For example, if two years have passed and we wish to update the ages
 of Alice and Bob in the same example, we could write:
 
@@ -131,7 +131,7 @@ of Alice and Bob in the same example, we could write:
     import lance
 
     dataset = lance.dataset("./alice_and_bob.lance")
-    dataset.update(dict(age = "age + 2"))
+    dataset.update({"age": "age + 2"})
 
 .. TODO: Once we implement MERGE, we should make a note that this method shouldn't be used 
 ..       for updating single rows in a loop, and users should instead do bulk updates

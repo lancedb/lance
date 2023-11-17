@@ -639,7 +639,7 @@ class LanceDataset(pa.dataset.Dataset):
         >>> import pyarrow as pa
         >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
         >>> dataset = lance.write_dataset(table, "example")
-        >>> dataset.update(dict(a = 'a + 2'), where="b > 'a'")
+        >>> dataset.update(dict(a = 'a + 2'), where="b != 'a'")
         >>> dataset.to_table().to_pandas()
            a  b
         0  1  a

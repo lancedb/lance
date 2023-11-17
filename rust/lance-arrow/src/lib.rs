@@ -366,7 +366,7 @@ pub trait RecordBatchExt {
     /// If the named column does not exist, it returns a copy of this [`RecordBatch`].
     fn drop_column(&self, name: &str) -> Result<RecordBatch>;
 
-    /// Replace the column specified with the name and return the new [`RecordBatch`].
+    /// Replace a column (specified by name) and return the new [`RecordBatch`].
     fn replace_column_by_name(&self, name: &str, column: Arc<dyn Array>) -> Result<RecordBatch>;
 
     /// Get (potentially nested) column by qualified name.
