@@ -26,6 +26,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field};
 use arrow_select::take::take;
 use async_trait::async_trait;
+use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::{
@@ -34,6 +35,7 @@ use lance_linalg::{
     },
     MatrixView,
 };
+use log::info;
 use snafu::{location, Location};
 use tracing::{instrument, Instrument};
 
@@ -290,18 +292,41 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         let data = data.data();
         let metric_type = self.metric_type;
 
-        tokio::task::spawn_blocking(move || {
-            compute_partitions::<T>(
-                centroids.as_slice(),
-                data.as_slice(),
-                dimension,
-                metric_type,
-            )
-            .into()
-        })
-        .in_current_span()
-        .await
-        .expect("compute_partitions: schedule CPU task")
+        let num_centroids = centroids.len() / dimension;
+        let num_rows = data.len() / dimension;
+
+        let chunks = std::cmp::min(num_cpus::get(), num_rows);
+
+        info!(
+            "computing partition on {} chunks, out of {} centroids, and {} vectors",
+            chunks, num_centroids, num_rows,
+        );
+        let chunk_size = (num_rows as f32 / chunks as f32).ceil() as usize;
+        let stride = chunk_size * dimension;
+
+        let result: Vec<Vec<u32>> = stream::iter(0..chunks)
+            .map(|chunk_id| {
+                let centroids = centroids.clone();
+                let data = data.clone();
+                tokio::task::spawn_blocking(move || {
+                    let range =
+                        stride * chunk_id..std::cmp::min(stride * (chunk_id + 1), data.len());
+
+                    compute_partitions::<T>(
+                        centroids.as_slice(),
+                        &data.as_slice()[range],
+                        dimension,
+                        metric_type,
+                    )
+                })
+                .in_current_span()
+            })
+            .buffered(chunks)
+            .try_collect()
+            .await
+            .expect("compute_partitions: schedule CPU task");
+
+        UInt32Array::from_iter(result.iter().flatten().copied())
     }
 }
 

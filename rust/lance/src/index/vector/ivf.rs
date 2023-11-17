@@ -712,6 +712,11 @@ pub async fn build_ivf_pq_index(
             vec![],
             None,
         )?;
+
+        info!(
+            "starting to compute partitions for PQ training, sample size: {}",
+            training_data.value_length()
+        );
         // Compute the residual vector to train Product Quantizer.
         let part_ids = ivf2.compute_partitions(&training_data).await?;
 
