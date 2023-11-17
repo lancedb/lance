@@ -132,6 +132,11 @@ impl DatasetBuilder {
         if let Some(options) = read_params.store_options {
             self.options = options;
         }
+
+        if let Some(session) = read_params.session {
+            self.session = Some(session);
+        }
+
         self
     }
 
@@ -156,11 +161,9 @@ impl DatasetBuilder {
                 self.options.object_store_wrapper,
             )),
             None => {
-                ObjectStore::try_new(
-                    self.table_uri,
-                    self.options.storage_options.unwrap_or_default(),
-                )
-                .await
+                let (store, _path) =
+                    ObjectStore::from_uri_and_params(&self.table_uri, &self.options).await?;
+                Ok(store)
             }
         }
     }
