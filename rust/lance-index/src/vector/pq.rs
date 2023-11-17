@@ -514,7 +514,7 @@ mod tests {
             )),
             metric_type: MetricType::L2,
         };
-        let proto: pb::Pq = pb::Pq::try_from(&pq as &dyn ProductQuantizerExt).unwrap();
+        let proto: pb::Pq = pb::Pq::try_from(&pq as &dyn ProductQuantizer).unwrap();
         assert_eq!(proto.num_bits, 8);
         assert_eq!(proto.num_sub_vectors, 4);
         assert_eq!(proto.dimension, 16);
