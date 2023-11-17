@@ -571,10 +571,17 @@ def test_f16_index(tmp_path: Path):
     f16_data = np.random.uniform(0, 1, 2048 * DIM).astype(np.float16)
     fsl = pa.FixedSizeListArray.from_arrays(f16_data, DIM)
     tbl = pa.Table.from_pydict({"vector": fsl})
-    print(tbl)
     dataset = lance.write_dataset(tbl, uri)
     dataset.create_index(
         "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=2
     )
 
     q = np.random.uniform(0, 1, DIM).astype(np.float16)
+    rst = dataset.to_table(nearest={
+        "column": "vector",
+        "q": q,
+        "k": 10,
+    })
+
+    assert rst.schema.field("vector").type.value_type == pa.float16()
+    assert len(rst) == 10
