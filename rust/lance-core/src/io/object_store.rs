@@ -297,6 +297,7 @@ pub struct ObjectStoreParams {
     pub s3_credentials_refresh_offset: Duration,
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    pub storage_options: Option<HashMap<String, String>>,
 }
 
 impl Default for ObjectStoreParams {
@@ -308,6 +309,7 @@ impl Default for ObjectStoreParams {
             s3_credentials_refresh_offset: Duration::from_secs(60),
             aws_credentials: None,
             object_store_wrapper: None,
+            storage_options: None,
         }
     }
 }
@@ -316,6 +318,19 @@ impl ObjectStoreParams {
     /// Set a commit lock for the object store.
     pub fn set_commit_lock<T: CommitLock + Send + Sync + 'static>(&mut self, lock: Arc<T>) {
         self.commit_handler = Some(Arc::new(lock));
+    }
+
+    /// Create a new instance of [`ObjectStoreParams`] based on the AWS credentials.
+    pub fn with_aws_credentials(
+        aws_credentials: Option<AwsCredentialProvider>,
+        region: Option<String>,
+    ) -> Self {
+        Self {
+            aws_credentials,
+            storage_options: region
+                .map(|region| [("region".into(), region)].iter().cloned().collect()),
+            ..Default::default()
+        }
     }
 }
 

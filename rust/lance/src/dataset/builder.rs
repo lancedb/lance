@@ -8,22 +8,22 @@ use object_store::{aws::AwsCredentialProvider, DynObjectStore};
 use snafu::{location, Location};
 use url::Url;
 
-use super::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
+use super::{ReadParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::{
     error::{Error, Result},
     session::Session,
     Dataset,
 };
 /// builder for loading a [`Dataset`].
+#[derive(Debug, Clone)]
 pub struct DatasetBuilder {
     /// Cache size for index cache. If it is zero, index cache is disabled.
     index_cache_size: usize,
-
     /// Metadata cache size for the fragment metadata. If it is zero, metadata
     /// cache is disabled.
     metadata_cache_size: usize,
+    session: Option<Arc<Session>>,
     options: ObjectStoreParams,
-    storage_options: Option<HashMap<String, String>>,
     version: Option<u64>,
     table_uri: String,
 }
@@ -35,7 +35,7 @@ impl DatasetBuilder {
             metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
             table_uri: table_uri.as_ref().to_string(),
             options: ObjectStoreParams::default(),
-            storage_options: None,
+            session: None,
             version: None,
         }
     }
@@ -105,15 +105,43 @@ impl DatasetBuilder {
     /// - [S3 options](https://docs.rs/object_store/latest/object_store/aws/enum.AmazonS3ConfigKey.html#variants)
     /// - [Google options](https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html#variants)
     pub fn with_storage_options(mut self, storage_options: HashMap<String, String>) -> Self {
-        self.storage_options = Some(storage_options);
+        self.options.storage_options = Some(storage_options);
         self
     }
 
     /// Set a single option used to initialize storage backend
+    /// For example, to set the region for S3, you can use:
+    ///
+    /// ```ignore
+    /// let builder = DatasetBuilder::from_uri("s3://bucket/path")
+    ///     .with_storage_option("region", "us-east-1");
+    /// ```
     pub fn with_storage_option(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
-        let mut storage_options = self.storage_options.unwrap_or_default();
+        let mut storage_options = self.options.storage_options.unwrap_or_default();
         storage_options.insert(key.as_ref().to_string(), value.as_ref().to_string());
-        self.storage_options = Some(storage_options);
+        self.options.storage_options = Some(storage_options);
+        self
+    }
+
+    /// Set options based on [ReadParams].
+    pub fn with_read_params(mut self, read_params: ReadParams) -> Self {
+        self = self
+            .with_index_cache_size(read_params.index_cache_size)
+            .with_metadata_cache_size(read_params.metadata_cache_size);
+
+        if let Some(options) = read_params.store_options {
+            self.options = options;
+        }
+        self
+    }
+
+    /// Re-use an existing session.
+    ///
+    /// The session holds caches for index and metadata.
+    ///
+    /// If this is set, then `with_index_cache_size` and `with_metadata_cache_size` are ignored.
+    pub fn with_session(mut self, session: Arc<Session>) -> Self {
+        self.session = Some(session);
         self
     }
 
@@ -128,16 +156,23 @@ impl DatasetBuilder {
                 self.options.object_store_wrapper,
             )),
             None => {
-                ObjectStore::try_new(self.table_uri, self.storage_options.unwrap_or_default()).await
+                ObjectStore::try_new(
+                    self.table_uri,
+                    self.options.storage_options.unwrap_or_default(),
+                )
+                .await
             }
         }
     }
 
-    pub async fn load(self) -> Result<Dataset> {
-        let session = Arc::new(Session::new(
-            self.index_cache_size,
-            self.metadata_cache_size,
-        ));
+    pub async fn load(mut self) -> Result<Dataset> {
+        let session = match self.session.take() {
+            Some(session) => session,
+            None => Arc::new(Session::new(
+                self.index_cache_size,
+                self.metadata_cache_size,
+            )),
+        };
 
         let version = self.version;
 
