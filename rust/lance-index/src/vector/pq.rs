@@ -18,7 +18,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, UInt8Array};
+use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array};
 use async_trait::async_trait;
 use lance_arrow::floats::FloatArray;
@@ -57,6 +57,9 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
     fn num_sub_vectors(&self) -> usize;
 
     fn dimension(&self) -> usize;
+
+    // TODO: move to pub(crate) once the refactor of lance::index to lance-index is done.
+    fn codebook_as_fsl(&self) -> FixedSizeListArray;
 }
 
 /// Product Quantization, optimized for [Apache Arrow] buffer memory layout.
@@ -464,23 +467,62 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
     fn dimension(&self) -> usize {
         self.dimension
     }
+    fn codebook_as_fsl(&self) -> FixedSizeListArray {
+        FixedSizeListArray::try_new_from_values(
+            self.codebook.as_ref().clone(),
+            self.dimension as i32,
+        )
+        .unwrap()
+    }
 }
 
 #[allow(clippy::fallible_impl_from)]
-impl From<&dyn ProductQuantizer> for pb::Pq {
-    fn from(pq: &dyn ProductQuantizer) -> Self {
-        Self {
+impl TryFrom<&dyn ProductQuantizer> for pb::Pq {
+    type Error = Error;
+
+    fn try_from(pq: &dyn ProductQuantizer) -> Result<Self> {
+        let fsl = pq.codebook_as_fsl();
+        let tensor = pb::Tensor::try_from(&fsl)?;
+        Ok(Self {
             num_bits: pq.num_bits(),
             num_sub_vectors: pq.num_sub_vectors() as u32,
             dimension: pq.dimension() as u32,
-            codebook: pq
-                .as_any()
-                .downcast_ref::<ProductQuantizerImpl<Float32Type>>()
-                .unwrap()
-                .codebook
-                .values()
-                .to_vec(),
-            codebook_tensor: None,
-        }
+            codebook: vec![],
+            codebook_tensor: Some(tensor),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::iter::repeat;
+
+    use arrow_array::{types::Float16Type, Float16Array};
+    use half::f16;
+    use num_traits::Zero;
+
+    #[test]
+    fn test_f16_pq_to_protobuf() {
+        let pq = ProductQuantizerImpl::<Float16Type> {
+            num_bits: 8,
+            num_sub_vectors: 4,
+            dimension: 16,
+            codebook: Arc::new(Float16Array::from_iter_values(
+                repeat(f16::zero()).take(256 * 16),
+            )),
+            metric_type: MetricType::L2,
+        };
+        let proto: pb::Pq = pb::Pq::try_from(&pq as &dyn ProductQuantizerExt).unwrap();
+        assert_eq!(proto.num_bits, 8);
+        assert_eq!(proto.num_sub_vectors, 4);
+        assert_eq!(proto.dimension, 16);
+        assert!(proto.codebook.is_empty());
+        assert!(proto.codebook_tensor.is_some());
+
+        let tensor = proto.codebook_tensor.as_ref().unwrap();
+        assert_eq!(tensor.data_type, pb::tensor::DataType::Float16 as i32);
+        assert_eq!(tensor.shape, vec![256, 16]);
     }
 }
