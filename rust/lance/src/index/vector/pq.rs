@@ -39,7 +39,7 @@ use nohash_hasher::IntMap;
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::{location, Location};
-use tracing::{instrument, Instrument};
+use tracing::instrument;
 
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
