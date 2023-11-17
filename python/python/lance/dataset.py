@@ -31,6 +31,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     TypedDict,
     Union,
@@ -694,6 +695,139 @@ class LanceDataset(pa.dataset.Dataset):
             td_to_micros(older_than), delete_unverified
         )
 
+    def create_scalar_index(
+        self,
+        column: str,
+        index_type: Literal["BTREE"],
+        name: Optional[str] = None,
+        *,
+        replace: bool = True,
+    ):
+        """Create a scalar index on a column.
+
+        Scalar indices, like vector indices, can be used to speed up scans.  A scalar
+        index can speed up scans that contain filter expressions on the indexed column.
+        For example, the following scan will be faster if the column ``my_col`` has
+        a scalar index:
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/images.lance")
+            my_table = dataset.scanner(filter="my_col != 7").to_table()
+
+        Scalar indices can also speed up scans containing a vector search and a
+        prefilter:
+
+        .. code-block::python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/images.lance")
+            my_table = dataset.scanner(
+                nearest=dict(
+                   column="vector",
+                   q=[1, 2, 3, 4],
+                   k=10,
+                )
+                filter="my_col != 7",
+                prefilter=True
+            )
+
+        Scalar indices can only speed up scans for basic filters using
+        equality, comparison, range (e.g. ``my_col BETWEEN 0 AND 100``), and set
+        membership (e.g. `my_col IN (0, 1, 2)`)
+
+        Scalar indices can be used if the filter contains multiple indexed columns and
+        the filter criteria are AND'd or OR'd together
+        (e.g. ``my_col < 0 AND other_col> 100``)
+
+        Scalar indices may be used if the filter contains non-indexed columns but,
+        depending on the structure of the filter, they may not be usable.  For example,
+        if the column ``not_indexed`` does not have a scalar index then the filter
+        ``my_col = 0 OR not_indexed = 1`` will not be able to use any scalar index on
+        ``my_col``.
+
+        To determine if a scan is making use of a scalar index you can use
+        ``explain_plan`` to look at the query plan that lance has created.  Queries
+        that use scalar indices will either have a ``ScalarIndexQuery`` relation or a
+        ``MaterializeIndex`` operator.
+
+        Currently, the only type of scalar index available is ``BTREE``. This index
+        combines is inspired by the btree data structure although only the first few
+        layers of the btree are cached in memory.
+
+        **Experimental API**
+
+        Parameters
+        ----------
+        column : str
+            The column to be indexed.  Must be a boolean, integer, float,
+            or string column.
+        index_type : str
+            The type of the index.  Only ``"BTREE"`` is supported now.
+        name : str, optional
+            The index name. If not provided, it will be generated from the
+            column name.
+        replace : bool, default True
+            Replace the existing index if it exists.
+
+        Examples
+        --------
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/images.lance")
+            dataset.create_index(
+                "category",
+                "BTREE",
+            )
+
+        Experimental Status:
+
+        Scalar indices are experimental and only utilized if there is no new or deleted
+        data that has been uploaded since the index was created.  This limitation should
+        be addressed soon.  In the meantime, ``compact_files`` can be used to remove
+        deletion files and ``optimize_indices`` can be used to catch up the index with
+        new data.
+        """
+        if isinstance(column, str):
+            column = [column]
+
+        if len(column) > 1:
+            raise NotImplementedError(
+                "Scalar indices currently only support a single column"
+            )
+
+        column = column[0]
+        if column not in self.schema.names:
+            raise KeyError(f"{column} not found in schema")
+
+        field = self.schema.field(column)
+        if (
+            not pa.types.is_integer(field.type)
+            and not pa.types.is_floating(field.type)
+            and not pa.types.is_boolean(field.type)
+            and not pa.types.is_string(field.type)
+        ):
+            raise TypeError(
+                f"Scalar index column {column} must be int, float, bool, or str"
+            )
+
+        index_type = index_type.upper()
+        if index_type != "BTREE":
+            raise NotImplementedError(
+                (
+                    'Only "BTREE" is supported for ',
+                    f"index_type.  Received {index_type}",
+                )
+            )
+
+        self._ds.create_index([column], index_type, name, replace)
+
     def create_index(
         self,
         column: Union[str, List[str]],
@@ -832,6 +966,9 @@ class LanceDataset(pa.dataset.Dataset):
             "dot",
         ]:
             raise ValueError(f"Metric {metric} not supported.")
+
+        kwargs["metric_type"] = metric
+
         index_type = index_type.upper()
         if index_type not in ["IVF_PQ", "DISKANN"]:
             raise NotImplementedError(
@@ -877,9 +1014,7 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 kwargs["ivf_centroids"] = ivf_centroids_batch
 
-        kwargs["replace"] = replace
-
-        self._ds.create_index(column, index_type, name, metric, kwargs)
+        self._ds.create_index(column, index_type, name, replace, kwargs)
         return LanceDataset(self.uri)
 
     @staticmethod

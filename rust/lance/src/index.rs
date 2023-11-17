@@ -34,7 +34,7 @@ use uuid::Uuid;
 pub(crate) mod append;
 pub(crate) mod cache;
 pub(crate) mod prefilter;
-pub(crate) mod scalar;
+pub mod scalar;
 pub mod vector;
 
 use crate::dataset::transaction::{Operation, Transaction};
