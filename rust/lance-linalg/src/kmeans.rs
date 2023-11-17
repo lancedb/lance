@@ -180,11 +180,11 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
             }
         });
 
-        if empty_count as f32 / self.k as f32 > 0.5 {
+        if empty_count as f32 / self.k as f32 > 0.1 {
             // TODO: describe what user should do in response to this message.
             // This seems to be very common in PQ.
             warn!(
-                "KMeans: more than half of clusters are empty: {} of {}",
+                "KMeans: more than 10% of clusters are empty: {} of {}",
                 empty_count, self.k
             );
         }
