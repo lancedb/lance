@@ -839,6 +839,7 @@ class LanceDataset(pa.dataset.Dataset):
         ivf_centroids: Optional[Union[np.ndarray, pa.FixedSizeListArray]] = None,
         num_sub_vectors: Optional[int] = None,
         accelerator: Optional[Union[str, "torch.Device"]] = None,
+        index_cache_size: Optional[int] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -870,6 +871,8 @@ class LanceDataset(pa.dataset.Dataset):
             If set, use an accelerator to speed up the training process.
             Accepted accelerator: "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU).
             If not set, use the CPU.
+        index_cache_size : int, optional
+            The size of the index cache in number of entries. Default value is 256.
         kwargs :
             Parameters passed to the index building process.
 
@@ -1015,7 +1018,7 @@ class LanceDataset(pa.dataset.Dataset):
                 kwargs["ivf_centroids"] = ivf_centroids_batch
 
         self._ds.create_index(column, index_type, name, replace, kwargs)
-        return LanceDataset(self.uri)
+        return LanceDataset(self.uri, index_cache_size=index_cache_size)
 
     @staticmethod
     def _commit(
@@ -1807,6 +1810,7 @@ class LanceStats:
         index_stats = json.loads(self._ds.index_statistics(index_name))
         index_stats["num_indexed_rows"] = self._ds.count_indexed_rows(index_name)
         index_stats["num_unindexed_rows"] = self._ds.count_unindexed_rows(index_name)
+        index_stats["index_cache_entry_count"] = self._ds.index_cache_entry_count()
         return index_stats
 
 
