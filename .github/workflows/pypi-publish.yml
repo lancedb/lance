@@ -39,7 +39,7 @@ jobs:
       matrix:
         python-minor-version: ["8"]
         config:
-          - target: x86_64-apple-darwin,
+          - target: x86_64-apple-darwin
             runner: macos-13
           - target: aarch64-apple-darwin
             runner: macos-13-xlarge
@@ -54,7 +54,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: 3.${{ matrix.python-minor-version }}
+        python-version: 3.11
     - uses: ./.github/workflows/build_mac_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}

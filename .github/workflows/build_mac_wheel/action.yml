@@ -22,4 +22,4 @@ runs:
         command: build
         args: ${{ inputs.args }}
         working-directory: python
-
+        interpreter: 3.${{ inputs.python-minor-version }}
