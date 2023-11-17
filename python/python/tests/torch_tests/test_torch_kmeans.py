@@ -19,7 +19,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-torch = pytest.importorskip("pytorch")
+torch = pytest.importorskip("torch")
 
 from lance.vector import train_ivf_centroids_on_accelerator  # noqa: E402
 
@@ -37,13 +37,15 @@ def test_kmeans():
     assert len(cnts) == 4  # all cluster has data
 
 
-def test_torch_kmean_accept_torch_device(tmp_path: Path):
+@pytest.mark.parametrize("dt", [np.float16, np.float32, np.float64])
+def test_torch_kmean_accept_torch_device(tmp_path: Path, dt):
     from lance.torch import preferred_device
 
-    arr = np.array(range(128)).reshape(-1, 8).astype(np.float32)
-    tbl = pa.Table.from_arrays([arr], ["vector"])
-    ds = lance.write(tbl, tmp_path)
+    arr = np.array(range(256)).astype(dt)
+    fsl = pa.FixedSizeListArray.from_arrays(arr.ravel(), list_size=8)
+    tbl = pa.Table.from_arrays([fsl], ["vector"])
+    ds = lance.write_dataset(tbl, tmp_path)
     # Not raising exception if pass a `torch.device()` directly
     train_ivf_centroids_on_accelerator(
-        ds, "vector", "L2", accelerator=preferred_device()
+        ds, "vector", 4, "L2", accelerator=preferred_device()
     )

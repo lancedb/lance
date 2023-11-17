@@ -158,6 +158,7 @@ def train_ivf_centroids_on_accelerator(
     samples = dataset.sample(k, [column], sorted=True).combine_chunks()
     fsl = samples.to_batches()[0][column]
     init_centroids = torch.from_numpy(np.stack(fsl.to_numpy(zero_copy_only=False)))
+    print(init_centroids.shape)
     logging.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
     ds = TorchDataset(
