@@ -71,7 +71,7 @@ impl IndexCache {
     }
 
     pub(crate) fn get_vector(&self, key: &str) -> Option<Arc<dyn VectorIndex>> {
-        if self.vector_cache.contains_key(key) {
+        if self.vector_cache.contains_key(key) || self.scalar_cache.contains_key(key) {
             self.cache_stats.record_hit();
         } else {
             self.cache_stats.record_miss();
