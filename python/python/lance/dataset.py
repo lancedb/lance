@@ -1015,6 +1015,7 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 kwargs["ivf_centroids"] = ivf_centroids_batch
 
+        self._ds.create_index(column, index_type, name, replace, kwargs)
         return LanceDataset(self.uri, index_cache_size=index_cache_size)
 
     @staticmethod

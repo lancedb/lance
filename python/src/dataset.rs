@@ -600,7 +600,6 @@ impl Dataset {
         index_type: &str,
         name: Option<String>,
         replace: Option<bool>,
-        metric_type: Option<&str>,
         kwargs: Option<&PyDict>,
     ) -> PyResult<()> {
         let idx_type = match index_type.to_uppercase().as_str() {
