@@ -577,10 +577,10 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
         });
     };
     if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
-        if !matches!(elem_type.data_type(), DataType::Float32) {
+        if !elem_type.data_type().is_floating() {
             return Err(Error::Index{
                 message:format!(
-                    "VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+                    "VectorIndex requires the column data type to be fixed size list of f16/f32/f64, got {}",
                     elem_type.data_type()
                 ),
                 location: location!()
