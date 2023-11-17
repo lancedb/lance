@@ -204,7 +204,6 @@ impl VectorIndex for PQIndex {
             ]));
             Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
         })
-        .in_current_span()
         .await
     }
 
