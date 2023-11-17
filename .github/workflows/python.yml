@@ -161,33 +161,6 @@ jobs:
     # Make sure wheels are not included in the Rust cache
     - name: Delete wheels
       run: rm -rf target/wheels
-  mac-validate-job:
-    timeout-minutes: 60
-    runs-on: ${{ matrix.config.runner }}
-    strategy:
-      matrix:
-        python-minor-version: ["8"]
-        config:
-          - target: x86_64-apple-darwin
-            runner: macos-13
-          - target: aarch64-apple-darwin
-            runner: macos-13-xlarge
-    env:
-      MACOSX_DEPLOYMENT_TARGET: 10.15
-    steps:
-    - uses: actions/checkout@v3
-      with:
-        ref: ${{ inputs.ref }}
-        fetch-depth: 0
-        lfs: true
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: 3.11
-    - uses: ./.github/workflows/build_mac_wheel
-      with:
-        python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release --strip --target ${{ matrix.config.target }}"
   windows:
     runs-on: windows-latest
     timeout-minutes: 90
