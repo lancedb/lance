@@ -181,10 +181,8 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
         });
 
         if empty_count as f32 / self.k as f32 > 0.1 {
-            // TODO: describe what user should do in response to this message.
-            // This seems to be very common in PQ.
             warn!(
-                "KMeans: more than 10% of clusters are empty: {} of {}",
+                "KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset is too small to have a meaningful index (less than 5000 vectors) or that the random initialization was bad and indexing should be re-reun.",
                 empty_count, self.k
             );
         }
