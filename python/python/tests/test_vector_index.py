@@ -510,6 +510,7 @@ def test_index_cache_size(tmp_path):
         indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 5
     )
 
+
 def test_f16_index(tmp_path: Path):
     DIM = 64
     uri = tmp_path / "f16data.lance"
