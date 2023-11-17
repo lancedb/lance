@@ -19,7 +19,7 @@ use std::task::{Context, Poll};
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use async_recursion::async_recursion;
-use datafusion::logical_expr::AggregateFunction;
+use datafusion::logical_expr::{AggregateFunction, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -1238,6 +1238,7 @@ mod test {
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{ArrowError, DataType};
     use arrow_select::take;
+    use datafusion::logical_expr::{col, lit};
     use futures::TryStreamExt;
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};

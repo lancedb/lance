@@ -267,12 +267,10 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             };
 
             match ty {
-                DataType::List(_) => {
-                    new_values.map(|new_values| ScalarValue::List(Some(new_values), field.clone()))
+                DataType::List(_) => Some(ScalarValue::List(new_values, field.clone())),
+                DataType::FixedSizeList(_, size) => {
+                    Some(ScalarValue::Fixedsizelist(new_values, field.clone(), *size))
                 }
-                DataType::FixedSizeList(_, size) => new_values.map(|new_values| {
-                    ScalarValue::Fixedsizelist(Some(new_values), field.clone(), *size)
-                }),
                 _ => None,
             }
         }

@@ -35,10 +35,10 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
+use lance_datafusion::expr::safe_coerce_scalar;
 use lance_index::scalar::expression::{
     apply_scalar_indices, IndexInformationProvider, ScalarIndexExpr,
 };
-use lance_index::util::datafusion::safe_coerce_scalar;
 use snafu::{location, Location};
 
 use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;

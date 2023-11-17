@@ -31,7 +31,7 @@ use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::error::{box_error, InvalidInputSnafu};
 use lance_core::format::Fragment;
-use lance_index::util::datafusion::safe_coerce_scalar;
+use lance_datafusion::expr::safe_coerce_scalar;
 use roaring::RoaringTreemap;
 use snafu::{location, Location, ResultExt};
 
@@ -40,7 +40,12 @@ use crate::io::commit::commit_transaction;
 use crate::{io::exec::Planner, Dataset};
 use crate::{Error, Result};
 
-/// Update a dataset
+/// Build an update operation.
+///
+/// This operation is similar to SQL's UPDATE statement. It allows you to change
+/// the values of all or a subset of columns with SQL expresions.
+///
+/// Use the [UpdateBuilder] to construct an update job. For example:
 ///
 /// ```ignore
 /// let dataset = UpdateBuilder::new()
@@ -129,8 +134,8 @@ impl UpdateBuilder {
             .map_err(box_error)
             .context(InvalidInputSnafu)?;
         if dest_type != src_type {
-            // TODO: remove this once DataFusion supports casting List to FSL
             expr = match expr {
+                // TODO: remove this branch once DataFusion supports casting List to FSL
                 Expr::Literal(value @ ScalarValue::List(_, _))
                     if matches!(dest_type, DataType::FixedSizeList(_, _)) =>
                 {
@@ -150,7 +155,8 @@ impl UpdateBuilder {
         }
 
         // Optimize the expression. For example, this might apply the cast on
-        // literals.
+        // literals. (Expr.cast_to() only wraps the expression in a Cast node,
+        // it doesn't actually apply the cast to the literals.)
         let expr = planner
             .optimize_expr(expr)
             .map_err(box_error)
@@ -159,9 +165,6 @@ impl UpdateBuilder {
         self.updates.insert(column.as_ref().to_string(), expr);
         Ok(self)
     }
-
-    // TODO: should we support Expr for value instead of &str?
-    // pub fn set_expr(mut self, column: &str, value: Expr) -> Result<Self> { ... }
 
     // TODO: set write params
     // pub fn with_write_params(mut self, params: WriteParams) -> Self { ... }
@@ -226,8 +229,17 @@ impl UpdateJob {
         }
 
         let updates_ref = self.updates.clone();
-        // TODO: consider CPU parallelism for this map in the stream.
-        let stream = stream.map(move |batch| Self::apply_updates(batch?, updates_ref.clone()));
+        let stream = stream
+            .map(move |batch| {
+                let updates = updates_ref.clone();
+                tokio::task::spawn_blocking(move || Self::apply_updates(batch?, updates))
+            })
+            .buffered(num_cpus::get())
+            .map(|res| match res {
+                Ok(Ok(batch)) => Ok(batch),
+                Ok(Err(err)) => Err(err),
+                Err(e) => Err(DataFusionError::Execution(e.to_string())),
+            });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
         let new_fragments = write_fragments_internal(
@@ -322,7 +334,7 @@ impl UpdateJob {
                 async move {
                     let fragment_id = fragment.id();
                     if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
-                        match fragment.apply_deletions(*bitmap).await {
+                        match fragment.extend_deletions(*bitmap).await {
                             Ok(Some(new_fragment)) => {
                                 Ok(FragmentChange::Modified(new_fragment.metadata))
                             }
