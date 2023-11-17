@@ -116,6 +116,7 @@ env_logger = "0.10.0"
 tracing-chrome = "0.7.1"
 
 [features]
+avx512fp16 = ["lance-linalg/avx512fp16"]
 cli = ["clap"]
 # opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
 tensorflow = ["tfrecord"]
