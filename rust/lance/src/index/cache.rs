@@ -29,22 +29,19 @@ pub struct CacheStats {
 
 impl CacheStats {
     pub fn record_hit(&self) {
-        self.hits.fetch_add(1, Ordering::SeqCst);
+        self.hits.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_miss(&self) {
-        self.misses.fetch_add(1, Ordering::SeqCst);
+        self.misses.fetch_add(1, Ordering::Relaxed);
     }
-}
-
-lazy_static::lazy_static! {
-    static ref CACHE_STATS: CacheStats = CacheStats::default();
 }
 
 #[derive(Clone)]
 pub struct IndexCache {
     scalar_cache: Arc<Cache<String, Arc<dyn ScalarIndex>>>,
     vector_cache: Arc<Cache<String, Arc<dyn VectorIndex>>>,
+    cache_stats: Arc<CacheStats>,
 }
 
 impl IndexCache {
@@ -52,6 +49,7 @@ impl IndexCache {
         Self {
             scalar_cache: Arc::new(Cache::new(capacity as u64)),
             vector_cache: Arc::new(Cache::new(capacity as u64)),
+            cache_stats: Arc::new(CacheStats::default()),
         }
     }
 
@@ -74,9 +72,9 @@ impl IndexCache {
 
     pub(crate) fn get_vector(&self, key: &str) -> Option<Arc<dyn VectorIndex>> {
         if self.vector_cache.contains_key(key) {
-            CACHE_STATS.record_hit();
+            self.cache_stats.record_hit();
         } else {
-            CACHE_STATS.record_miss();
+            self.cache_stats.record_miss();
         }
         self.vector_cache.get(key)
     }
@@ -93,10 +91,10 @@ impl IndexCache {
     /// Get cache hit ratio.
     #[allow(dead_code)]
     pub(crate) fn hit_rate(&self) -> f32 {
-        let hits = CACHE_STATS.hits.load(Ordering::SeqCst) as f32;
-        let misses = CACHE_STATS.misses.load(Ordering::SeqCst) as f32;
-        // Returns 1.0 if hits + misses == 0 to avoid division by zero.
-        if hits + misses == 0.0 {
+        let hits = self.cache_stats.hits.load(Ordering::Relaxed) as f32;
+        let misses = self.cache_stats.misses.load(Ordering::Relaxed) as f32;
+        // Returns 1.0 if hits + misses == 0 and avoids division by zero.
+        if (hits + misses) == 0.0 {
             return 1.0;
         }
         hits / (hits + misses)
