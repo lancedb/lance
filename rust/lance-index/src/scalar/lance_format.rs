@@ -162,12 +162,10 @@ mod tests {
     };
     use arrow_schema::{DataType, Field};
     use arrow_select::take::TakeOptions;
+    use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
-    use futures::{
-        stream::{self, BoxStream},
-        StreamExt,
-    };
-    use lance_core::{io::object_store::ObjectStoreParams, Error};
+    use lance_core::io::object_store::ObjectStoreParams;
+    use lance_datafusion::exec::reader_to_stream;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
@@ -181,23 +179,25 @@ mod tests {
         Arc::new(LanceIndexStore::new(object_store, test_path.to_owned()))
     }
 
-    struct MockTrainingSource<R: RecordBatchReader + Send + Sync + 'static> {
-        data: R,
+    struct MockTrainingSource {
+        data: SendableRecordBatchStream,
     }
 
-    impl<R: RecordBatchReader + Send + Sync + 'static> MockTrainingSource<R> {
-        fn new(data: R) -> Self {
-            Self { data }
+    impl MockTrainingSource {
+        fn new(data: impl RecordBatchReader + Send + 'static) -> Self {
+            Self {
+                data: reader_to_stream(Box::new(data)).unwrap().0,
+            }
         }
     }
 
     #[async_trait]
-    impl<R: RecordBatchReader + Send + Sync + 'static> BtreeTrainingSource for MockTrainingSource<R> {
+    impl BtreeTrainingSource for MockTrainingSource {
         async fn scan_ordered_chunks(
             self: Box<Self>,
             _chunk_size: u32,
-        ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-            Ok(stream::iter(self.data.map(|batch| batch.map_err(Error::from))).boxed())
+        ) -> Result<SendableRecordBatchStream> {
+            Ok(self.data)
         }
     }
 
@@ -252,6 +252,45 @@ mod tests {
             .unwrap();
 
         assert_eq!(100, row_ids.len());
+    }
+
+    #[tokio::test]
+    async fn test_btree_update() {
+        let index_dir = tempdir().unwrap();
+        let index_store = test_store(&index_dir);
+        let data = gen()
+            .col(Some("values".to_string()), array::step::<Int32Type>())
+            .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
+        train_index(&index_store, data, DataType::Int32).await;
+        let index = BTreeIndex::load(index_store).await.unwrap();
+
+        let data = gen()
+            .col(Some("values".to_string()), array::step::<Int32Type>())
+            .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
+
+        let updated_index_dir = tempdir().unwrap();
+        let updated_index_store = test_store(&updated_index_dir);
+        index
+            .update(
+                reader_to_stream(Box::new(data)).unwrap().0,
+                updated_index_store.as_ref(),
+            )
+            .await
+            .unwrap();
+        let updated_index = BTreeIndex::load(updated_index_store).await.unwrap();
+
+        let row_ids = updated_index
+            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(10000))))
+            .await
+            .unwrap();
+
+        assert_eq!(2, row_ids.len());
+        assert_eq!(
+            vec![10000, 10000],
+            row_ids.values().into_iter().copied().collect::<Vec<_>>()
+        );
     }
 
     async fn check(index: &BTreeIndex, query: ScalarQuery, expected: &[u64]) {

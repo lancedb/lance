@@ -23,7 +23,7 @@ use datafusion::logical_expr::{
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use lance_arrow::DataTypeExt;
-use lance_index::util::datafusion::safe_coerce_scalar;
+use lance_datafusion::expr::safe_coerce_scalar;
 
 use crate::datatypes::Schema;
 use crate::{Error, Result};

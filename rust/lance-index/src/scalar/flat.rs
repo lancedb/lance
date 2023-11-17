@@ -20,6 +20,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 
+use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use lance_core::{format::RowAddress, Result};
 use nohash_hasher::IntMap;
@@ -125,6 +126,10 @@ impl BTreeSubIndex for FlatIndexMetadata {
         mapping: &IntMap<u64, Option<u64>>,
     ) -> Result<RecordBatch> {
         remap_batch(serialized, mapping)
+    }
+
+    async fn retrieve_data(&self, serialized: RecordBatch) -> Result<RecordBatch> {
+        Ok(serialized)
     }
 }
 
@@ -259,6 +264,15 @@ impl ScalarIndex for FlatIndex {
         writer.write_record_batch(remapped).await?;
         writer.finish().await?;
         Ok(())
+    }
+
+    async fn update(
+        &self,
+        _new_data: SendableRecordBatchStream,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<()> {
+        // If this was desired, then you would need to merge new_data and data and write it back out
+        todo!()
     }
 }
 

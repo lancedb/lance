@@ -22,9 +22,8 @@ use datafusion_expr::{expr::InList, Between, BinaryExpr, Expr, Operator};
 
 use futures::join;
 use lance_core::{utils::mask::RowIdMask, Result};
+use lance_datafusion::expr::safe_coerce_scalar;
 use roaring::RoaringTreemap;
-
-use crate::util::datafusion::safe_coerce_scalar;
 
 use super::{ScalarIndex, ScalarQuery};
 

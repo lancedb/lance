@@ -48,8 +48,6 @@ use std::sync::Arc;
 use tracing::instrument;
 
 pub mod builder;
-pub(crate) mod chunker;
-
 pub mod cleanup;
 mod feature_flags;
 pub mod fragment;

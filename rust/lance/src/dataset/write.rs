@@ -31,12 +31,13 @@ use lance_core::{
     },
     Error, Result,
 };
+use lance_datafusion::chunker::chunk_stream;
 use object_store::path::Path;
 use tracing::instrument;
 use uuid::Uuid;
 
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
-use super::{chunker::chunk_stream, DATA_DIR};
+use super::DATA_DIR;
 
 /// The mode to write dataset.
 #[derive(Debug, Clone, Copy)]

@@ -15,12 +15,15 @@
 use std::sync::Arc;
 
 use lance_core::{format::Index as IndexMetadata, Error, Result};
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::IndexType;
 use log::info;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
 use crate::dataset::index::unindexed_fragments;
+use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::Dataset;
 use crate::index::vector::ivf::IVFIndex;
 
@@ -56,25 +59,57 @@ pub async fn append_index(
         })?;
 
     let index = dataset
-        .open_vector_index(&column.name, old_index.uuid.to_string().as_str())
+        .open_generic_index(&column.name, &old_index.uuid.to_string())
         .await?;
 
-    let Some(ivf_idx) = index.as_any().downcast_ref::<IVFIndex>() else {
-        info!("Index type: {:?} does not support append", index);
-        return Ok(None);
-    };
+    match index.index_type() {
+        IndexType::Scalar => {
+            let index = dataset
+                .open_scalar_index(&column.name, &old_index.uuid.to_string())
+                .await?;
 
-    let mut scanner = dataset.scan();
-    scanner.with_fragments(unindexed);
-    scanner.with_row_id();
-    scanner.project(&[&column.name])?;
-    let stream = scanner.try_into_stream().await?;
+            let mut scanner = dataset.scan();
+            scanner
+                .with_fragments(unindexed)
+                .with_row_id()
+                .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                    column.name.clone(),
+                )]))?
+                .project(&[&column.name])?;
+            let new_data_stream = scanner.try_into_stream().await?;
 
-    let new_index = ivf_idx
-        .append(dataset.as_ref(), stream, old_index, &column.name)
-        .await?;
+            let new_uuid = Uuid::new_v4();
 
-    Ok(Some((new_index, frag_bitmap)))
+            let index_dir = dataset.indices_dir().child(new_uuid.to_string());
+            let new_store = LanceIndexStore::new((*dataset.object_store).clone(), index_dir);
+
+            index.update(new_data_stream.into(), &new_store).await?;
+
+            Ok(Some((new_uuid, frag_bitmap)))
+        }
+        IndexType::Vector => {
+            let mut scanner = dataset.scan();
+            scanner.with_fragments(unindexed);
+            scanner.with_row_id();
+            scanner.project(&[&column.name])?;
+            let new_data_stream = scanner.try_into_stream().await?;
+
+            let index = dataset
+                .open_vector_index(&column.name, old_index.uuid.to_string().as_str())
+                .await?;
+
+            let Some(ivf_idx) = index.as_any().downcast_ref::<IVFIndex>() else {
+                info!("Index type: {:?} does not support append", index);
+                return Ok(None);
+            };
+
+            let new_index = ivf_idx
+                .append(dataset.as_ref(), new_data_stream, old_index, &column.name)
+                .await?;
+
+            Ok(Some((new_index, frag_bitmap)))
+        }
+    }
 }
 
 #[cfg(test)]

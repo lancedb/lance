@@ -21,7 +21,6 @@ use lance_core::Result;
 use roaring::RoaringBitmap;
 
 pub mod scalar;
-pub mod util;
 pub mod vector;
 
 pub const INDEX_FILE_NAME: &str = "index.idx";

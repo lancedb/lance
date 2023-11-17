@@ -2,20 +2,18 @@ use std::sync::Arc;
 
 use arrow_array::{
     types::{UInt32Type, UInt64Type},
-    RecordBatch, RecordBatchReader,
+    RecordBatchReader,
 };
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, Criterion};
-use datafusion::scalar::ScalarValue;
-use futures::{
-    stream::{self, BoxStream},
-    StreamExt, TryStreamExt,
-};
+use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
+use futures::TryStreamExt;
 use lance::{
     io::{object_store::ObjectStoreParams, ObjectStore},
     Dataset,
 };
-use lance_core::{Error, Result};
+use lance_core::Result;
+use lance_datafusion::exec::reader_to_stream;
 use lance_datagen::{array, gen, BatchCount, RowCount};
 use lance_index::scalar::{
     btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
@@ -49,8 +47,8 @@ impl BtreeTrainingSource for BenchmarkDataSource {
     async fn scan_ordered_chunks(
         self: Box<Self>,
         _chunk_size: u32,
-    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        Ok(stream::iter(Self::test_data().map(|batch| batch.map_err(Error::from))).boxed())
+    ) -> Result<SendableRecordBatchStream> {
+        Ok(reader_to_stream(Box::new(Self::test_data()))?.0)
     }
 }
 

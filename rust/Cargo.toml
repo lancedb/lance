@@ -39,6 +39,7 @@ rust-version = "1.70"
 lance = { version = "=0.8.16", path = "./lance" }
 lance-arrow = { version = "=0.8.16", path = "./lance-arrow" }
 lance-core = { version = "=0.8.16", path = "./lance-core" }
+lance-datafusion = { version = "=0.8.16", path = "./lance-datafusion" }
 lance-datagen = { version = "=0.8.16", path = "./lance-datagen" }
 lance-index = { version = "=0.8.16", path = "./lance-index" }
 lance-linalg = { version = "=0.8.16", path = "./lance-linalg" }
@@ -70,6 +71,9 @@ bytes = "1.4"
 byteorder = "1.5"
 chrono = "0.4.23"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
+datafusion = { version = "32.0.0", default-features = false, features = [
+    "regex_expressions",
+] }
 datafusion-common = "32.0"
 datafusion-sql = "32.0"
 either = "1.0"

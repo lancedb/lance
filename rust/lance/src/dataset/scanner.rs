@@ -19,10 +19,6 @@ use std::task::{Context, Poll};
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use async_recursion::async_recursion;
-use datafusion::execution::{
-    context::SessionState,
-    runtime_env::{RuntimeConfig, RuntimeEnv},
-};
 use datafusion::logical_expr::AggregateFunction;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::expressions;
@@ -37,10 +33,10 @@ use datafusion::physical_plan::{
     union::UnionExec,
     ExecutionPlan, SendableRecordBatchStream,
 };
-use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use futures::stream::{Stream, StreamExt};
 use lance_core::ROW_ID_FIELD;
+use lance_datafusion::exec::execute_plan;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::vector::{Query, DIST_COL};
 use lance_linalg::distance::MetricType;
@@ -489,22 +485,16 @@ impl Scanner {
         Ok(Arc::new(schema))
     }
 
-    fn execute_plan(&self, plan: Arc<dyn ExecutionPlan>) -> Result<SendableRecordBatchStream> {
-        let session_config = SessionConfig::new();
-        let runtime_config = RuntimeConfig::new();
-        let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
-        let session_state = SessionState::new_with_config_rt(session_config, runtime_env);
-        // NOTE: we are only executing the first partition here. Therefore, if
-        // the plan has more than one partition, we will be missing data.
-        assert_eq!(plan.output_partitioning().partition_count(), 1);
-        Ok(plan.execute(0, session_state.task_ctx())?)
-    }
-
     /// Create a stream from the Scanner.
     #[instrument(skip_all)]
     pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
         let plan = self.create_plan().await?;
-        Ok(DatasetRecordBatchStream::new(self.execute_plan(plan)?))
+        Ok(DatasetRecordBatchStream::new(execute_plan(plan)?))
+    }
+
+    pub(crate) async fn try_into_dfstream(&self) -> Result<SendableRecordBatchStream> {
+        let plan = self.create_plan().await?;
+        execute_plan(plan)
     }
 
     /// Scan and return the number of matching rows
@@ -531,7 +521,7 @@ impl Scanner {
             plan,
             plan_schema,
         )?);
-        let mut stream = self.execute_plan(count_plan)?;
+        let mut stream = execute_plan(count_plan)?;
 
         // A count plan will always return a single batch with a single row.
         if let Some(first_batch) = stream.next().await {
@@ -2736,10 +2726,17 @@ mod test {
         dataset: Dataset,
         sample_query: Arc<dyn Array>,
         delete_query: Arc<dyn Array>,
+        // The original version of the data, two fragments, rows 0-1000
         original_version: u64,
+        // The original version of the data, 1 row deleted, compacted to a single fragment
         compact_version: u64,
+        // The original version of the data + an extra 1000 unindexed
         append_version: u64,
+        // The original version of the data + an extra 1000 rows, with indices updated so all rows indexed
+        updated_version: u64,
+        // The original version of the data with 1 deleted row
         delete_version: u64,
+        // The original version of the data + an extra 1000 uindexed + 1 deleted row
         append_then_delete_version: u64,
     }
 
@@ -2751,6 +2748,7 @@ mod test {
         use_new_data: bool,
         with_row_id: bool,
         use_compaction: bool,
+        use_updated: bool,
     }
 
     impl ScalarIndexTestFixture {
@@ -2835,7 +2833,15 @@ mod test {
 
             let append_version = dataset.version().version;
 
+            // UPDATE
+
+            dataset.optimize_indices().await.unwrap();
+            let updated_version = dataset.version().version;
+
             // APPEND -> DELETE
+
+            dataset.checkout_version(append_version).await.unwrap();
+            dataset.restore(None).await.unwrap();
 
             dataset.delete("not_indexed = 75").await.unwrap();
 
@@ -2867,6 +2873,7 @@ mod test {
                 original_version,
                 compact_version,
                 append_version,
+                updated_version,
                 delete_version,
                 append_then_delete_version,
             }
@@ -2882,10 +2889,22 @@ mod test {
 
         async fn get_dataset(&self, params: &ScalarTestParams) -> Dataset {
             let version = if params.use_compaction {
-                if params.use_deleted_data || params.use_new_data {
-                    panic!("There is no test data combining new/deleted data with compaction");
+                // These combinations should not be possible
+                if params.use_deleted_data || params.use_new_data || params.use_updated {
+                    panic!(
+                        "There is no test data combining new/deleted/updated data with compaction"
+                    );
                 } else {
                     self.compact_version
+                }
+            } else if params.use_updated {
+                // These combinations should not be possible
+                if params.use_deleted_data || params.use_new_data || params.use_compaction {
+                    panic!(
+                        "There is no test data combining updated data with new/deleted/compaction"
+                    );
+                } else {
+                    self.updated_version
                 }
             } else {
                 match (params.use_new_data, params.use_deleted_data) {
@@ -3014,7 +3033,7 @@ mod test {
                 );
             }
             // If there is new data then the dupe of row 50 should be in the results
-            if params.use_new_data {
+            if params.use_new_data || params.use_updated {
                 self.assert_one(
                     &batch,
                     |val| val == 1050,
@@ -3088,14 +3107,18 @@ mod test {
                 |val| val == 50,
                 "The query contained 50 even though it was filtered",
             );
-            let mut expected_num_rows = if params.use_new_data { 1999 } else { 999 };
+            let mut expected_num_rows = if params.use_new_data || params.use_updated {
+                1999
+            } else {
+                999
+            };
             if params.use_deleted_data || params.use_compaction {
                 expected_num_rows -= 1;
             }
             assert_eq!(batch.num_rows(), expected_num_rows);
 
             // Let's also make sure our filter can target something in the new data only
-            if params.use_new_data {
+            if params.use_new_data || params.use_updated {
                 let (_, batch) = self.run_query("indexed == 1050", None, params).await;
                 assert_eq!(batch.num_rows(), 1);
             }
@@ -3131,7 +3154,11 @@ mod test {
                 "The non-indexed refine filter was not applied",
             );
 
-            let mut expected_num_rows = if params.use_new_data { 199 } else { 99 };
+            let mut expected_num_rows = if params.use_new_data || params.use_updated {
+                199
+            } else {
+                99
+            };
             if params.use_deleted_data || params.use_compaction {
                 expected_num_rows -= 1;
             }
@@ -3164,17 +3191,26 @@ mod test {
                             vec![false, true]
                         };
                         for use_compaction in compaction_choices {
-                            for with_row_id in [false, true] {
-                                let params = ScalarTestParams {
-                                    use_index,
-                                    use_projection,
-                                    use_deleted_data,
-                                    use_new_data,
-                                    with_row_id,
-                                    use_compaction,
+                            let updated_choices =
+                                if use_deleted_data || use_new_data || use_compaction {
+                                    vec![false]
+                                } else {
+                                    vec![false, true]
                                 };
-                                fixture.check_vector_queries(&params).await;
-                                fixture.check_simple_queries(&params).await;
+                            for use_updated in updated_choices {
+                                for with_row_id in [false, true] {
+                                    let params = ScalarTestParams {
+                                        use_index,
+                                        use_projection,
+                                        use_deleted_data,
+                                        use_new_data,
+                                        with_row_id,
+                                        use_compaction,
+                                        use_updated,
+                                    };
+                                    fixture.check_vector_queries(&params).await;
+                                    fixture.check_simple_queries(&params).await;
+                                }
                             }
                         }
                     }
