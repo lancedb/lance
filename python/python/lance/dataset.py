@@ -956,9 +956,9 @@ class LanceDataset(pa.dataset.Dataset):
                     f"Vector column {c} must be FixedSizeListArray "
                     f"1-dimensional FixedShapeTensorArray, got {field.type}"
                 )
-            if not pa.types.is_float32(field.type.value_type):
+            if not pa.types.is_floating(field.type.value_type):
                 raise TypeError(
-                    f"Vector column {c} must have float32 value type, "
+                    f"Vector column {c} must have floating value type, "
                     f"got {field.type.value_type}"
                 )
 

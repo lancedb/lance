@@ -48,10 +48,7 @@ use lance_index::{
     },
     Index, IndexType,
 };
-use lance_linalg::{
-    distance::{Cosine, Dot, MetricType, L2},
-    matrix::MatrixView,
-};
+use lance_linalg::distance::{Cosine, Dot, MetricType, L2};
 use log::{debug, info};
 use nohash_hasher::IntMap;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -501,15 +498,14 @@ impl Ivf {
         nprobes: usize,
         metric_type: MetricType,
     ) -> Result<UInt32Array> {
-        use lance_index::vector::ivf::Ivf as IvfTrait;
-
-        let ivf = lance_index::vector::ivf::IvfImpl::<Float32Type>::new(
-            MatrixView::try_from(self.centroids.as_ref())?,
+        let internal = lance_index::vector::ivf::new_ivf(
+            self.centroids.values(),
+            self.dimension(),
             metric_type,
             vec![],
             None,
-        );
-        ivf.find_partitions(query, nprobes)
+        )?;
+        internal.find_partitions(query, nprobes)
     }
 
     /// Add the offset and length of one partition.
@@ -577,10 +573,10 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
         });
     };
     if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
-        if !matches!(elem_type.data_type(), DataType::Float32) {
+        if !elem_type.data_type().is_floating() {
             return Err(Error::Index{
                 message:format!(
-                    "VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+                    "VectorIndex requires the column data type to be fixed size list of f16/f32/f64, got {}",
                     elem_type.data_type()
                 ),
                 location: location!()
@@ -984,12 +980,14 @@ mod tests {
     use super::*;
 
     use std::collections::HashMap;
+    use std::iter::repeat;
 
     use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
-        generate_random_array, generate_scaled_random_array, sample_without_replacement,
+        generate_random_array, generate_random_array_with_seed, generate_scaled_random_array,
+        sample_without_replacement,
     };
     use rand::{seq::SliceRandom, thread_rng};
     use tempfile::tempdir;
@@ -1539,5 +1537,69 @@ mod tests {
                 .iter()
                 .all(|v| (-2.0 * DIM as f32..0.0).contains(v)));
         }
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_pq_f16() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        const DIM: usize = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float16, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            PQBuildParams::new(4, 8),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let results = dataset
+            .scan()
+            .nearest(
+                "vector",
+                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                5,
+            )
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 5);
+        let batch = &results[0];
+        assert_eq!(
+            batch.schema(),
+            Arc::new(Schema::new(vec![
+                Field::new(
+                    "vector",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float16, true)),
+                        DIM as i32,
+                    ),
+                    true,
+                ),
+                Field::new("_distance", DataType::Float32, true)
+            ]))
+        );
     }
 }

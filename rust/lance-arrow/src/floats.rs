@@ -24,10 +24,12 @@ use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
     Array, Float16Array, Float32Array, Float64Array,
 };
+use arrow_schema::DataType;
 use half::{bf16, f16};
 use num_traits::{AsPrimitive, Bounded, Float, FromPrimitive};
 
 use super::bfloat16::{BFloat16Array, BFloat16Type};
+use crate::Result;
 
 /// Float data type.
 ///
@@ -48,6 +50,22 @@ impl std::fmt::Display for FloatType {
             Self::Float16 => write!(f, "float16"),
             Self::Float32 => write!(f, "float32"),
             Self::Float64 => write!(f, "float64"),
+        }
+    }
+}
+
+impl TryFrom<&DataType> for FloatType {
+    type Error = crate::ArrowError;
+
+    fn try_from(value: &DataType) -> Result<Self> {
+        match *value {
+            DataType::Float16 => Ok(Self::Float16),
+            DataType::Float32 => Ok(Self::Float32),
+            DataType::Float64 => Ok(Self::Float64),
+            _ => Err(crate::ArrowError::InvalidArgumentError(format!(
+                "{:?} is not a floating type",
+                value
+            ))),
         }
     }
 }
@@ -162,5 +180,21 @@ impl FloatArray<Float64Type> for Float64Array {
 
     fn as_slice(&self) -> &[<Float64Type as ArrowFloatType>::Native] {
         self.values()
+    }
+}
+
+/// Convert a float32 array to another float array.
+pub fn coerce_float_vector(input: &Float32Array, float_type: FloatType) -> Result<Box<dyn Array>> {
+    match float_type {
+        FloatType::BFloat16 => Ok(Box::new(BFloat16Array::from_iter_values(
+            input.values().iter().map(|v| bf16::from_f32(*v)),
+        ))),
+        FloatType::Float16 => Ok(Box::new(Float16Array::from_iter_values(
+            input.values().iter().map(|v| f16::from_f32(*v)),
+        ))),
+        FloatType::Float32 => Ok(Box::new(input.clone())),
+        FloatType::Float64 => Ok(Box::new(Float64Array::from_iter_values(
+            input.values().iter().map(|v| *v as f64),
+        ))),
     }
 }
