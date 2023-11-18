@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use lance_index::scalar::ScalarIndex;
-use moka::sync::{Cache, ConcurrentCacheExt};
+use moka::sync::{Cache, CacheBuilder, ConcurrentCacheExt};
 
 use super::vector::VectorIndex;
 
@@ -46,9 +46,21 @@ pub struct IndexCache {
 
 impl IndexCache {
     pub(crate) fn new(capacity: usize) -> Self {
+        // Element size is the size of the u32 key (4 bytes) + the size of the uuid (16 bytes)
+        let element_size : u32 = 20;
+
+
+        let vector_cache = CacheBuilder::new(capacity as u64)
+            .weigher(move |&_,&_| -> u32 { element_size })
+            .max_capacity(capacity as u64)
+            .build();
+
+        let scalar_cache = Arc::new(Cache::new(capacity as u64));
+        // let vector_cahce = Arc::new(Cache::new(capacity as u64));
+
         Self {
-            scalar_cache: Arc::new(Cache::new(capacity as u64)),
-            vector_cache: Arc::new(Cache::new(capacity as u64)),
+            scalar_cache: scalar_cache,
+            vector_cache: Arc::new(vector_cache),
             cache_stats: Arc::new(CacheStats::default()),
         }
     }
@@ -63,6 +75,12 @@ impl IndexCache {
         self.scalar_cache.sync();
         self.vector_cache.sync();
         self.scalar_cache.entry_count() as usize + self.vector_cache.entry_count() as usize
+    }
+
+    pub(crate) fn get_byte_size(&self) {
+        self.scalar_cache.sync();
+        self.vector_cache.sync();
+        self.vector_cache.weighted_size();
     }
 
     /// Get an Index if present. Otherwise returns [None].
