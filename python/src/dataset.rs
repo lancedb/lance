@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use chrono::Duration;
 
 use futures::StreamExt;
+use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
@@ -163,11 +164,13 @@ impl Dataset {
         commit_handler: Option<PyObject>,
     ) -> PyResult<Self> {
         let mut params = ReadParams {
-            block_size,
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
             metadata_cache_size: metadata_cache_size.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
             session: None,
-            store_options: None,
+            store_options: Some(ObjectStoreParams {
+                block_size,
+                ..Default::default()
+            }),
         };
 
         if let Some(commit_handler) = commit_handler {
@@ -180,8 +183,11 @@ impl Dataset {
             RT.runtime
                 .block_on(LanceDataset::checkout_with_params(&uri, ver, &params))
         } else {
-            RT.runtime
-                .block_on(LanceDataset::open_with_params(&uri, &params))
+            RT.runtime.block_on(
+                DatasetBuilder::from_uri(&uri)
+                    .with_read_params(params)
+                    .load(),
+            )
         };
         match dataset {
             Ok(ds) => Ok(Self {

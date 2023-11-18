@@ -297,6 +297,7 @@ pub struct ObjectStoreParams {
     pub s3_credentials_refresh_offset: Duration,
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    pub storage_options: Option<HashMap<String, String>>,
 }
 
 impl Default for ObjectStoreParams {
@@ -308,6 +309,7 @@ impl Default for ObjectStoreParams {
             s3_credentials_refresh_offset: Duration::from_secs(60),
             aws_credentials: None,
             object_store_wrapper: None,
+            storage_options: None,
         }
     }
 }
@@ -316,6 +318,19 @@ impl ObjectStoreParams {
     /// Set a commit lock for the object store.
     pub fn set_commit_lock<T: CommitLock + Send + Sync + 'static>(&mut self, lock: Arc<T>) {
         self.commit_handler = Some(Arc::new(lock));
+    }
+
+    /// Create a new instance of [`ObjectStoreParams`] based on the AWS credentials.
+    pub fn with_aws_credentials(
+        aws_credentials: Option<AwsCredentialProvider>,
+        region: Option<String>,
+    ) -> Self {
+        Self {
+            aws_credentials,
+            storage_options: region
+                .map(|region| [("region".into(), region)].iter().cloned().collect()),
+            ..Default::default()
+        }
     }
 }
 
@@ -428,8 +443,7 @@ impl ObjectStore {
     }
 
     async fn new_from_url(url: Url, params: ObjectStoreParams) -> Result<Self> {
-        let mut storage_options = StorageOptions::default();
-        configure_store(url.as_str(), &mut storage_options, params).await
+        configure_store(url.as_str(), params).await
     }
     /// Local object store.
     pub fn local() -> Self {
@@ -699,11 +713,8 @@ impl From<HashMap<String, String>> for StorageOptions {
     }
 }
 
-async fn configure_store(
-    url: &str,
-    storage_options: &mut StorageOptions,
-    options: ObjectStoreParams,
-) -> Result<ObjectStore> {
+async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<ObjectStore> {
+    let mut storage_options = StorageOptions(options.storage_options.unwrap_or_default());
     let mut url = ensure_table_uri(url)?;
     // Block size: On local file systems, we use 4KB block size. On cloud
     // object stores, we use 64KB block size. This is generally the largest
@@ -894,14 +905,6 @@ impl ObjectStore {
             block_size,
             commit_handler,
         }
-    }
-    pub async fn try_new<T: AsRef<str>>(
-        location: T,
-        options: impl Into<StorageOptions> + Clone,
-    ) -> Result<Self> {
-        let mut storage_options = options.into();
-        let options = ObjectStoreParams::default();
-        configure_store(location.as_ref(), &mut storage_options, options).await
     }
 }
 

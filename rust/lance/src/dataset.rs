@@ -60,6 +60,7 @@ pub mod transaction;
 pub mod updater;
 mod write;
 
+use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
@@ -120,11 +121,6 @@ impl From<&Manifest> for Version {
 
 /// Customize read behavior of a dataset.
 pub struct ReadParams {
-    /// The block size passed to the underlying Object Store reader.
-    ///
-    /// This is used to control the minimal request size.
-    pub block_size: Option<usize>,
-
     /// Cache size for index cache. If it is zero, index cache is disabled.
     ///
     pub index_cache_size: usize,
@@ -164,7 +160,6 @@ impl ReadParams {
 impl Default for ReadParams {
     fn default() -> Self {
         Self {
-            block_size: None,
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
             metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
             session: None,
@@ -175,19 +170,25 @@ impl Default for ReadParams {
 
 impl Dataset {
     /// Open an existing dataset.
+    ///
+    /// See also [DatasetBuilder].
     pub async fn open(uri: &str) -> Result<Self> {
-        let params = ReadParams::default();
-        Self::open_with_params(uri, &params).await
+        DatasetBuilder::from_uri(uri).load().await
     }
 
     /// Open a dataset with read params.
+    #[deprecated(since = "0.8.17", note = "Please use `DatasetBuilder` instead.")]
     pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
         let (mut object_store, base_path) = match params.store_options.as_ref() {
             Some(store_options) => ObjectStore::from_uri_and_params(uri, store_options).await?,
             None => ObjectStore::from_uri(uri).await?,
         };
 
-        if let Some(block_size) = params.block_size {
+        if let Some(block_size) = params
+            .store_options
+            .as_ref()
+            .and_then(|opts| opts.block_size)
+        {
             object_store.set_block_size(block_size);
         }
 
@@ -232,7 +233,11 @@ impl Dataset {
         params: &ReadParams,
     ) -> Result<Self> {
         let (mut object_store, base_path) = ObjectStore::from_uri(uri).await?;
-        if let Some(block_size) = params.block_size {
+        if let Some(block_size) = params
+            .store_options
+            .as_ref()
+            .and_then(|opts| opts.block_size)
+        {
             object_store.set_block_size(block_size);
         };
 
@@ -379,14 +384,13 @@ impl Dataset {
         } else {
             // pull the store params from write params because there might be creds in there
             Some(
-                Self::open_with_params(
-                    uri,
-                    &ReadParams {
+                DatasetBuilder::from_uri(uri)
+                    .with_read_params(ReadParams {
                         store_options: params.store_params.clone(),
                         ..Default::default()
-                    },
-                )
-                .await?,
+                    })
+                    .load()
+                    .await?,
             )
         };
 
@@ -683,14 +687,13 @@ impl Dataset {
 
         let dataset = if dataset_exists {
             Some(
-                Self::open_with_params(
-                    base_uri,
-                    &ReadParams {
+                DatasetBuilder::from_uri(base_uri)
+                    .with_read_params(ReadParams {
                         store_options: store_params.clone(),
                         ..Default::default()
-                    },
-                )
-                .await?,
+                    })
+                    .load()
+                    .await?,
             )
         } else {
             None

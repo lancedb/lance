@@ -465,7 +465,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use crate::{
-        dataset::{ReadParams, WriteMode, WriteParams},
+        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
         index::{
             vector::{StageParams, VectorIndexParams},
             DatasetIndexExt,
@@ -698,16 +698,14 @@ mod tests {
         }
 
         async fn open(&self) -> Result<Box<Dataset>> {
-            Ok(Box::new(
-                Dataset::open_with_params(
-                    &self.dataset_path,
-                    &ReadParams {
-                        store_options: Some(self.os_params()),
-                        ..Default::default()
-                    },
-                )
-                .await?,
-            ))
+            let ds = DatasetBuilder::from_uri(&self.dataset_path)
+                .with_read_params(ReadParams {
+                    store_options: Some(self.os_params()),
+                    ..Default::default()
+                })
+                .load()
+                .await?;
+            Ok(Box::new(ds))
         }
 
         async fn count_files(&self) -> Result<FileCounts> {
