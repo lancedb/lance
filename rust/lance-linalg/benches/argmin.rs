@@ -19,7 +19,6 @@ use arrow_array::{Float32Array, UInt32Array};
 use criterion::{criterion_group, criterion_main, Criterion};
 use lance_linalg::kernels::argmin_opt;
 use lance_testing::datagen::generate_random_array_with_seed;
-use num_traits::Float;
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};

@@ -17,7 +17,6 @@ use arrow_array::{
     Float32Array,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatArray};
 use num_traits::Float;
 
