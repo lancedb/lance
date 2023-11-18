@@ -781,7 +781,9 @@ impl Dataset {
         Ok(self.ds.index_cache_entry_count())
     }
 
-    fn index_cache_hit_rate(&self) -> PyResult<f32> { Ok(self.ds.index_cache_hit_rate()) }
+    fn index_cache_hit_rate(&self) -> PyResult<f32> {
+        Ok(self.ds.index_cache_hit_rate())
+    }
 
     #[staticmethod]
     fn commit(
