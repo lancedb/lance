@@ -1218,6 +1218,11 @@ impl Dataset {
         self.session.index_cache.get_size()
     }
 
+    /// Get cache hit ratio.
+    pub fn index_cache_hit_rate(&self) -> f32 {
+        self.session.index_cache.hit_rate()
+    }
+
     /// Get all versions.
     pub async fn versions(&self) -> Result<Vec<Version>> {
         let mut versions: Vec<Version> = self
