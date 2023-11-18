@@ -41,6 +41,13 @@ def test_kmeans():
 def test_torch_kmean_accept_torch_device(tmp_path: Path, dt):
     from lance.torch import preferred_device
 
+    device = preferred_device()
+    if device == torch.device("cpu") and dt == np.float16:
+        # Torch does not support float16 on CPU
+        #
+        # raises RuntimeError: "addmm_impl_cpu_" not implemented for 'Half'
+        pytest.skip("Skip f16 test for CPU")
+
     arr = np.array(range(256)).astype(dt)
     fsl = pa.FixedSizeListArray.from_arrays(arr.ravel(), list_size=8)
     tbl = pa.Table.from_arrays([fsl], ["vector"])
