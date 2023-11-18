@@ -29,6 +29,7 @@ import pandas as pd
 import pandas.testing as tm
 import polars as pl
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
@@ -899,9 +900,11 @@ def test_scan_with_row_ids(tmp_path: Path):
 
 
 def test_count_index_rows(tmp_path: Path):
-    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), 32), False)])
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(1024 * dims).cast("float32")
     table = pa.Table.from_pydict(
-        {"a": [[float(i) for i in range(32)] for _ in range(512)]}, schema=schema
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
     )
 
     base_dir = tmp_path / "test"
@@ -920,17 +923,17 @@ def test_count_index_rows(tmp_path: Path):
         "a", "IVF_PQ", name=index_name, num_partitions=2, num_sub_vectors=4
     )
     assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 0
-    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 1024
 
     # append some data
     new_table = pa.Table.from_pydict(
-        {"a": [[float(i) for i in range(32)] for _ in range(512)]}, schema=schema
+        {"a": [[float(i) for i in range(dims)] for _ in range(512)]}, schema=schema
     )
     dataset = lance.write_dataset(new_table, base_dir, mode="append")
 
     # assert rows added since index was created are uncounted
     assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 512
-    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 1024
 
 
 def test_dataset_progress(tmp_path: Path):

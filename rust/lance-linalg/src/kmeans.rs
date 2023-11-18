@@ -182,7 +182,7 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
 
         if empty_count as f32 / self.k as f32 > 0.1 {
             warn!(
-                "KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset is too small to have a meaningful index (less than 5000 vectors) or that the random initialization was bad and indexing should be re-reun.",
+                "KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset is too small to have a meaningful index (less than 5000 vectors) or has many duplicate vectors.",
                 empty_count, self.k
             );
         }

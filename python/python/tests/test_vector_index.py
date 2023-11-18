@@ -25,7 +25,7 @@ import pytest
 from lance.vector import vec_to_table
 
 
-def create_table(nvec=1000, ndim=128):
+def create_table(nvec=1000, ndim=512):
     mat = np.random.randn(nvec, ndim)
     price = np.random.rand(nvec) * 100
 
@@ -59,7 +59,7 @@ def indexed_dataset(tmp_path):
 
 def run(ds, q=None, assert_func=None):
     if q is None:
-        q = np.random.randn(128)
+        q = np.random.randn(512)
     project = [None, ["price"], ["vector", "price"], ["vector", "meta", "price"]]
     refine = [None, 1, 2]
     filters = [None, pc.field("price") > 50.0]
@@ -139,7 +139,7 @@ def test_create_index_using_cuda(tmp_path):
         num_sub_vectors=16,
         accelerator="cuda",
     )
-    q = np.random.randn(128)
+    q = np.random.randn(512)
     expected = dataset.to_table(
         columns=["id"],
         nearest={
@@ -205,7 +205,7 @@ def test_use_index(dataset, tmp_path):
     ann_ds = ann_ds.create_index(
         "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
     )
-    q = np.random.randn(128)
+    q = np.random.randn(512)
     expected = dataset.to_table(
         columns=["id"],
         nearest={
@@ -244,7 +244,7 @@ def test_nearest_errors(dataset, tmp_path):
     ds = lance.write_dataset(pa.Table.from_pandas(df), tmp_path / "dataset.lance")
 
     with pytest.raises(TypeError, match="must be a vector"):
-        ds.to_table(nearest={"column": "a", "q": np.random.randn(128), "k": 10})
+        ds.to_table(nearest={"column": "a", "q": np.random.randn(512), "k": 10})
 
 
 def test_has_index(dataset, tmp_path):
@@ -272,7 +272,7 @@ def test_create_dot_index(dataset, tmp_path):
 
 
 def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
-    centroids = np.random.randn(5, 128).astype(np.float32)  # IVF5
+    centroids = np.random.randn(5, 512).astype(np.float32)  # IVF5
     dataset_with_index = dataset.create_index(
         ["vector"],
         index_type="IVF_PQ",
@@ -281,7 +281,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
         num_sub_vectors=8,
     )
 
-    q = np.random.randn(128)
+    q = np.random.randn(512)
     actual = dataset_with_index.to_table(
         columns=["id"],
         nearest={"column": "vector", "q": q, "k": 10, "use_index": False},
@@ -303,7 +303,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
         "metric_type": "l2",
         "num_partitions": 5,
         "sub_index": {
-            "dimension": 128,
+            "dimension": 512,
             "index_type": "PQ",
             "metric_type": "l2",
             "nbits": 8,
