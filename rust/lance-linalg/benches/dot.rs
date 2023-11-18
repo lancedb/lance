@@ -22,7 +22,7 @@ use arrow_array::{
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use half::bf16;
-use lance_arrow::FloatToArrayType;
+use lance_arrow::{ArrowFloatType, FloatToArrayType};
 use num_traits::{AsPrimitive, FromPrimitive};
 
 #[cfg(target_os = "linux")]
@@ -41,7 +41,7 @@ where
     sum(m.as_primitive::<T>()).unwrap().as_()
 }
 
-fn run_bench<T: ArrowNumericType>(c: &mut Criterion)
+fn run_bench<T: ArrowFloatType>(c: &mut Criterion)
 where
     T::Native: FromPrimitive + FloatToArrayType,
     NativeAdapter<T>: From<T::Native>,
@@ -50,9 +50,9 @@ where
     const DIMENSION: usize = 1024;
     const TOTAL: usize = 1024 * 1024; // 1M vectors
 
-    let key: PrimitiveArray<T> = generate_random_array_with_seed(DIMENSION, [0; 32]);
+    let key = generate_random_array_with_seed::<T>(DIMENSION, [0; 32]);
     // 1M of 1024 D vectors
-    let target: PrimitiveArray<T> = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
+    let target = generate_random_array_with_seed::<T>(TOTAL * DIMENSION, [42; 32]);
 
     let type_name = std::any::type_name::<T::Native>();
 
@@ -70,7 +70,7 @@ where
         |b| {
             let x = &key.values()[..];
             b.iter(|| unsafe {
-                Float32Array::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
+                T::ArrayType::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
                     let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
                     Some(black_box(dot(x, y)))
                 }));
@@ -87,9 +87,9 @@ fn bench_distance(c: &mut Criterion) {
 
     run_bench::<Float16Type>(c);
     c.bench_function("Dot(f16, SIMD)", |b| {
-        let key: Float16Array = generate_random_array_with_seed(DIMENSION, [0; 32]);
+        let key = generate_random_array_with_seed::<Float16Type>(DIMENSION, [0; 32]);
         // 1M of 1024 D vectors
-        let target: Float16Array = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
+        let target = generate_random_array_with_seed::<Float16Type>(TOTAL * DIMENSION, [42; 32]);
         b.iter(|| unsafe {
             let x = key.values().as_ref();
             Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {

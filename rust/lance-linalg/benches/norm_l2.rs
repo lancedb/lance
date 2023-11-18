@@ -48,7 +48,7 @@ where
     for<'a> &'a [T::Native]: Normalize<T::Native>,
 {
     // 1M of 1024 D vectors
-    let target: PrimitiveArray<T> = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
+    let target = generate_random_array_with_seed::<T>(TOTAL * DIMENSION, [42; 32]);
 
     let type_name = std::any::type_name::<T::Native>();
 

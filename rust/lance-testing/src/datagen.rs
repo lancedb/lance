@@ -18,12 +18,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::{iter::repeat_with, ops::Range};
 
-use arrow_array::{
-    ArrowNumericType, Float32Array, Int32Array, NativeAdapter, PrimitiveArray, RecordBatch,
-    RecordBatchIterator, RecordBatchReader,
-};
+use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use lance_arrow::{fixed_size_list_type, FixedSizeListArrayExt};
+use lance_arrow::{fixed_size_list_type, ArrowFloatType, FixedSizeListArrayExt};
 use num_traits::{real::Real, FromPrimitive};
 use rand::{
     distributions::Uniform, prelude::Distribution, rngs::StdRng, seq::SliceRandom, Rng, SeedableRng,
@@ -199,17 +196,17 @@ pub fn some_batch() -> impl RecordBatchReader {
 }
 
 /// Create a random float32 array.
-pub fn generate_random_array_with_seed<T: ArrowNumericType>(
-    n: usize,
-    seed: [u8; 32],
-) -> PrimitiveArray<T>
+pub fn generate_random_array_with_seed<T: ArrowFloatType>(n: usize, seed: [u8; 32]) -> T::ArrayType
 where
     T::Native: Real + FromPrimitive,
-    NativeAdapter<T>: From<T::Native>,
 {
     let mut rng = StdRng::from_seed(seed);
 
-    PrimitiveArray::<T>::from_iter(repeat_with(|| T::Native::from_f32(rng.gen::<f32>())).take(n))
+    T::ArrayType::from(
+        repeat_with(|| T::Native::from_f32(rng.gen::<f32>()).unwrap())
+            .take(n)
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Create a random float32 array where each element is uniformly

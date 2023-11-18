@@ -14,10 +14,12 @@
 
 use std::{sync::Arc, time::Duration};
 
+use arrow_array::types::Float32Type;
 use arrow_array::{Float32Array, UInt32Array};
 use criterion::{criterion_group, criterion_main, Criterion};
 use lance_linalg::kernels::argmin_opt;
 use lance_testing::datagen::generate_random_array_with_seed;
+use num_traits::Float;
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -45,7 +47,7 @@ fn bench_argmin(c: &mut Criterion) {
     const TOTAL: usize = 1024;
     const SEED: [u8; 32] = [42; 32];
 
-    let target = generate_random_array_with_seed(TOTAL * DIMENSION, SEED);
+    let target = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
 
     c.bench_function("argmin(arrow)", |b| {
         b.iter(|| {

@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #ifdef __X86_64__
 #include <immintrin.h>
-#endif // __X86_64__
+#endif  // __X86_64__
 
 /// Works on NEON + FP16 or AVX512FP16
 float norm_l2_f16(const _Float16 *data, uint32_t dimension) {
@@ -27,7 +28,7 @@ float norm_l2_f16(const _Float16 *data, uint32_t dimension) {
   for (uint32_t i = 0; i < dimension; i++) {
     sum += data[i] * data[i];
   }
-  return (float) sum;
+  return (float)sum;
 }
 
 /// @brief Dot product of two f16 vectors.
@@ -42,7 +43,7 @@ float dot_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
   for (uint32_t i = 0; i < dimension; i++) {
     sum += x[i] * y[i];
   }
-  return (float) sum;
+  return (float)sum;
 }
 
 float l2_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
@@ -53,5 +54,26 @@ float l2_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
     _Float16 s = x[i] - y[i];
     sum += s * s;
   }
-  return (float) sum;
+  return (float)sum;
+}
+
+/// @brief Cosine similarity between two f16 vectors.
+/// @param x A f16 vector
+/// @param y A f16 vector
+/// @param dimension The dimension of the vectors
+/// @return The cosine similarity between the two vectors.
+float cosine_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
+  float xy = 0.0;
+  float x2 = 0.0;
+  float y2 = 0.0;
+
+#pragma clang loop unroll(enable) interleave(enable) vectorize_width(32)
+  for (uint32_t i = 0; i < dimension; i++) {
+    _Float16 xi = x[i];
+    _Float16 yi = y[i];
+    xy += xi * yi;
+    x2 += xi * xi;
+    y2 += yi * yi;
+  }
+  return xy / sqrt(x2) / sqrt(y2);
 }
