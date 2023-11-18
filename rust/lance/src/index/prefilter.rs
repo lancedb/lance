@@ -25,15 +25,15 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use futures::future;
 use futures::stream;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use lance_core::utils::mask::RowIdMask;
-use roaring::{RoaringBitmap, RoaringTreemap};
+use lance_core::utils::mask::RowIdTreeMap;
+use roaring::RoaringBitmap;
 use tracing::instrument;
 use tracing::Instrument;
 
 use crate::error::Result;
 use crate::format::Index;
-use crate::format::RowAddress;
 use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
 
@@ -51,7 +51,7 @@ pub struct PreFilter {
     // Expressing these as tasks allows us to start calculating the block list
     // and allow list at the same time we start searching the query.  We will await
     // these tasks only when we've done as much work as we can without them.
-    deleted_ids: Option<Arc<SharedPrerequisite<Arc<RoaringTreemap>>>>,
+    deleted_ids: Option<Arc<SharedPrerequisite<Arc<RowIdTreeMap>>>>,
     filtered_ids: Option<Arc<SharedPrerequisite<RowIdMask>>>,
     // When the tasks are finished this is the combined filter
     final_mask: Mutex<OnceCell<RowIdMask>>,
@@ -106,7 +106,7 @@ impl PreFilter {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn load_deleted_ids(dataset: Arc<Dataset>, index: Index) -> Result<Arc<RoaringTreemap>> {
+    async fn load_deleted_ids(dataset: Arc<Dataset>, index: Index) -> Result<Arc<RowIdTreeMap>> {
         let fragments = dataset.get_fragments();
         let frag_id_deletion_vectors = stream::iter(fragments.iter())
             .map(|frag| async move {
@@ -116,7 +116,7 @@ impl PreFilter {
             })
             .collect::<Vec<_>>()
             .await;
-        let frag_id_deletion_vectors = stream::iter(frag_id_deletion_vectors)
+        let mut frag_id_deletion_vectors = stream::iter(frag_id_deletion_vectors)
             .buffer_unordered(num_cpus::get())
             .filter_map(|(id, maybe_deletion_vector)| {
                 let val = if let Ok(deletion_vector) = maybe_deletion_vector {
@@ -127,10 +127,13 @@ impl PreFilter {
                     Some(Err(maybe_deletion_vector.unwrap_err()))
                 };
                 future::ready(val)
-            })
-            .try_collect::<Vec<_>>()
-            .await?;
-        let mut deleted_ids = RoaringTreemap::from_bitmaps(frag_id_deletion_vectors);
+            });
+
+        let mut deleted_ids = RowIdTreeMap::new();
+        while let Some(res) = frag_id_deletion_vectors.next().await {
+            let (id, deletion_vector) = res?;
+            deleted_ids.insert_bitmap(id, deletion_vector);
+        }
 
         let frag_ids_in_dataset: HashSet<u32> =
             HashSet::from_iter(fragments.iter().map(|frag| frag.id() as u32));
@@ -138,7 +141,7 @@ impl PreFilter {
             for frag_id in fragment_bitmap.into_iter() {
                 if !frag_ids_in_dataset.contains(&frag_id) {
                     // Entire fragment has been deleted
-                    deleted_ids.insert_range(RowAddress::fragment_range(frag_id));
+                    deleted_ids.insert_fragment(frag_id);
                 }
             }
         }
