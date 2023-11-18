@@ -17,18 +17,25 @@ use arrow_array::{
     Float32Array,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use num_traits::{AsPrimitive, Float};
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance_arrow::{ArrowFloatType, FloatArray};
-use lance_linalg::distance::{
-    l2::{l2, l2_scalar},
-    l2_distance_batch, L2,
-};
+use lance_linalg::distance::{l2::l2, l2_distance_batch, L2};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 const TOTAL: usize = 1024 * 1024; // 1M vectors
+
+/// Naive scalar implementation of L2 distance.
+fn l2_scalar<T: Float + AsPrimitive<f32>>(x: &[T], y: &[T]) -> T {
+    let mut sum = T::zero();
+    for (&xi, &yi) in x.iter().zip(y.iter()) {
+        sum = sum + (xi - yi).powi(2);
+    }
+    sum.sqrt()
+}
 
 fn run_bench<T: ArrowFloatType + L2>(c: &mut Criterion) {
     const DIMENSION: usize = 1024;
@@ -41,12 +48,12 @@ fn run_bench<T: ArrowFloatType + L2>(c: &mut Criterion) {
     let type_name = std::any::type_name::<T::Native>();
 
     c.bench_function(format!("L2({type_name}, scalar)").as_str(), |b| {
-        b.iter(|| unsafe {
-            Float32Array::from_trusted_len_iter(
+        b.iter(|| {
+            Float32Array::from_iter_values(
                 target
                     .as_slice()
                     .chunks(DIMENSION)
-                    .map(|arr| Some(l2_scalar::<T::Native, 32>(key.as_slice(), arr))),
+                    .map(|arr| l2_scalar(key.as_slice(), arr).as_()),
             );
         });
     });
