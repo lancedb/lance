@@ -298,6 +298,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
         expected_filepath = expected_filepath.replace("\\", "/")
     expected_statistics = {
         "index_cache_entry_count": 1,
+        "index_cache_hit_rate": 0,
         "index_type": "IVF",
         "uuid": index_uuid,
         "uri": expected_filepath,
@@ -498,6 +499,9 @@ def test_index_cache_size(tmp_path):
     query_index(indexed_dataset, 1)
     assert (
         indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 2
+    )
+    assert (
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_hit_rate"] == 0.5
     )
     query_index(indexed_dataset, 128)
     assert (
