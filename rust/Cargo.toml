@@ -47,17 +47,17 @@ lance-test-macros = { version = "=0.8.17", path = "./lance-test-macros" }
 lance-testing = { version = "=0.8.17", path = "./lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
-arrow = { version = "47.0.0", optional = false }
-arrow-arith = "47.0"
-arrow-array = "47.0"
-arrow-buffer = "47.0"
-arrow-cast = "47.0"
-arrow-data = "47.0"
-arrow-ipc = { version = "47.0", features = ["zstd"] }
-arrow-ord = "47.0"
-arrow-row = "47.0"
-arrow-schema = "47.0"
-arrow-select = "47.0"
+arrow = { version = "48.0.1", optional = false }
+arrow-arith = "48.0"
+arrow-array = "48.0"
+arrow-buffer = "48.0"
+arrow-cast = "48.0"
+arrow-data = "48.0"
+arrow-ipc = { version = "48.0", features = ["zstd"] }
+arrow-ord = "48.0"
+arrow-row = "48.0"
+arrow-schema = "48.0"
+arrow-select = "48.0"
 async-recursion = "1.0"
 async-trait = "0.1"
 aws-config = "0.56"
@@ -71,11 +71,11 @@ bytes = "1.4"
 byteorder = "1.5"
 chrono = "0.4.23"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
-datafusion = { version = "32.0.0", default-features = false, features = [
+datafusion = { version = "33.0.0", default-features = false, features = [
     "regex_expressions",
 ] }
-datafusion-common = "32.0"
-datafusion-sql = "32.0"
+datafusion-common = "33.0"
+datafusion-sql = "33.0"
 either = "1.0"
 futures = "0.3"
 http = "0.2.9"
