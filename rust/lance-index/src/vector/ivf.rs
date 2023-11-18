@@ -301,17 +301,23 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
             "computing partition on {} chunks, out of {} centroids, and {} vectors",
             chunks, num_centroids, num_rows,
         );
-        let chunk_size = (num_rows as f32 / chunks as f32).ceil() as usize;
+        // TODO: when usize::div_ceil() comes to stable Rust, we can use it here.
+        let chunk_size = num_rows / chunks + if num_rows % chunks > 0 { 1 } else { 0 };
         let stride = chunk_size * dimension;
 
         let result: Vec<Vec<u32>> = stream::iter(0..chunks)
-            .map(|chunk_id| {
+            .map(|chunk_id| stride * chunk_id..std::cmp::min(stride * (chunk_id + 1), data.len()))
+            // When there are a large number of CPUs and a small number of rows,
+            // it's possible there isn't an split of rows that there isn't
+            // an even split of rows that both covers all CPUs and all rows.
+            // For example, for 400 rows and 32 CPUs, 12-element chunks (12 * 32 = 384)
+            // wouldn't cover all rows but 13-element chunks (13 * 32 = 416) would
+            // have one empty chunk at the end. This filter removes those empty chunks.
+            .filter(|range| futures::future::ready(range.start < range.end))
+            .map(|range| {
                 let centroids = centroids.clone();
                 let data = data.clone();
                 tokio::task::spawn_blocking(move || {
-                    let range =
-                        stride * chunk_id..std::cmp::min(stride * (chunk_id + 1), data.len());
-
                     compute_partitions::<T>(
                         centroids.as_slice(),
                         &data.as_slice()[range],
