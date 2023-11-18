@@ -17,10 +17,10 @@ use arrow_array::{
     Float32Array,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use lance_arrow::{ArrowFloatType, FloatArray};
+use lance_arrow::{bfloat16::BFloat16Type, ArrowFloatType, FloatArray};
+use lance_linalg::distance::cosine::{cosine_distance_batch, Cosine};
 use num_traits::Float;
 
-use lance_linalg::distance::cosine::{cosine_distance_batch, Cosine};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
@@ -75,14 +75,13 @@ fn run_bench<T: ArrowFloatType + Cosine>(c: &mut Criterion) {
 }
 
 fn bench_distance(c: &mut Criterion) {
-    // run_bench::<BFloat16Type>(c);
+    run_bench::<BFloat16Type>(c);
     run_bench::<Float16Type>(c);
     run_bench::<Float32Type>(c);
     run_bench::<Float64Type>(c);
 
     let key: Float32Array = generate_random_array_with_seed::<Float32Type>(8, [0; 32]);
-    let target: Float32Array =
-        generate_random_array_with_seed::<Float32Type>(1024 * 1024 * 8, [42; 32]);
+    let target = generate_random_array_with_seed::<Float32Type>(1024 * 1024 * 8, [42; 32]);
 
     c.bench_function("Cosine(simd,f32x8) rng seed", |b| {
         b.iter(|| {
