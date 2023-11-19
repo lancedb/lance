@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_basic() {
-        let session = Session::new(10, 1);
+        let session = Session::new(172, 1);
         let session = Arc::new(session);
 
         let pq = Arc::new(ProductQuantizerImpl::<Float32Type>::new(
@@ -114,6 +114,7 @@ mod tests {
         assert!(session.index_cache.get_vector("abc").is_some());
         assert_eq!(session.index_cache.len_vector(), 1);
         assert_eq!(session.index_cache.get_size(), 1);
+        assert_eq!(session.index_cache.get_byte_size(), 19);
 
         for iter_idx in 0..100 {
             let pq_other = Arc::new(ProductQuantizerImpl::<Float32Type>::new(
@@ -129,7 +130,8 @@ mod tests {
                 .insert_vector(format!("{iter_idx}").as_str(), idx_other.clone());
         }
 
-        // Capacity is 10 so there should be at most 10 items
+        // Set capacity allows for 10 entries so there should be at most 10 items
         assert_eq!(session.index_cache.len_vector(), 10);
+        assert_eq!(session.index_cache.get_byte_size(), 172);
     }
 }
