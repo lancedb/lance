@@ -17,6 +17,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array};
@@ -29,6 +30,7 @@ use lance_linalg::distance::{
 };
 use lance_linalg::kernels::{argmin, argmin_value_float};
 use lance_linalg::{distance::MetricType, MatrixView};
+use log::info;
 use snafu::{location, Location};
 pub mod builder;
 pub mod transform;
@@ -217,6 +219,9 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
     }
 
     fn l2_distance_table(&self, key: &dyn Array, code: &UInt8Array) -> Result<ArrayRef> {
+        let start = Instant::now();
+
+        info!("Start building L2 distance table, on {} codes", code.len());
         let key: &T::ArrayType = key.as_any().downcast_ref().ok_or(Error::Index {
             message: format!(
                 "Build L2 distance table, type mismatch: {}",
@@ -240,7 +245,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                 distance_table.extend(distances);
             });
 
-        Ok(Arc::new(Float32Array::from_iter_values(
+        let res: Result<ArrayRef> = Ok(Arc::new(Float32Array::from_iter_values(
             code.values().chunks_exact(self.num_sub_vectors).map(|c| {
                 c.iter()
                     .enumerate()
@@ -249,7 +254,10 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                     })
                     .sum()
             }),
-        )))
+        )));
+
+        info!("Build L2 distance table took: {:?}", start.elapsed());
+        res
     }
 
     /// Pre-compute dot product to each sub-centroids.
