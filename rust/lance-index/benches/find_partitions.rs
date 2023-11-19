@@ -28,7 +28,7 @@ fn bench_partitions(c: &mut Criterion) {
     const DIMENSION: usize = 1536;
     const SEED: [u8; 32] = [42; 32];
 
-    let query: Float32Array = generate_random_array_with_seed(DIMENSION, SEED);
+    let query: Float32Array = generate_random_array_with_seed::<Float32Type>(DIMENSION, SEED);
 
     for num_centroids in &[10240, 65536] {
         let centroids = Arc::new(generate_random_array_with_seed::<Float32Type>(

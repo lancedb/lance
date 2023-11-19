@@ -12,18 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::iter::repeat_with;
+use std::iter::{repeat_with, Sum};
 
-use arrow_arith::{aggregate::sum, numeric::mul};
 use arrow_array::{
-    cast::AsArray,
     types::{Float16Type, Float32Type, Float64Type},
-    ArrowNumericType, Float16Array, Float32Array, NativeAdapter, PrimitiveArray,
+    Float32Array,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use half::bf16;
-use lance_arrow::FloatToArrayType;
-use num_traits::{AsPrimitive, FromPrimitive};
+use lance_arrow::{ArrowFloatType, FloatArray};
+use num_traits::Float;
 
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -33,47 +31,43 @@ use lance_testing::datagen::generate_random_array_with_seed;
 use rand::Rng;
 
 #[inline]
-fn dot_arrow_artiy<T: ArrowNumericType>(x: &PrimitiveArray<T>, y: &PrimitiveArray<T>) -> f32
-where
-    T::Native: AsPrimitive<f32>,
-{
-    let m = mul(x, y).unwrap();
-    sum(m.as_primitive::<T>()).unwrap().as_()
+fn dot_scalar<T: Float + Sum>(x: &[T], y: &[T]) -> T {
+    x.iter().zip(y.iter()).map(|(&xi, &yi)| xi * yi).sum::<T>()
 }
 
-fn run_bench<T: ArrowNumericType>(c: &mut Criterion)
-where
-    T::Native: FromPrimitive + FloatToArrayType,
-    NativeAdapter<T>: From<T::Native>,
-    <T::Native as FloatToArrayType>::ArrowType: Dot,
-{
+fn run_bench<T: ArrowFloatType + Dot>(c: &mut Criterion) {
     const DIMENSION: usize = 1024;
     const TOTAL: usize = 1024 * 1024; // 1M vectors
 
-    let key: PrimitiveArray<T> = generate_random_array_with_seed(DIMENSION, [0; 32]);
+    let key = generate_random_array_with_seed::<T>(DIMENSION, [0; 32]);
     // 1M of 1024 D vectors
-    let target: PrimitiveArray<T> = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
+    let target = generate_random_array_with_seed::<T>(TOTAL * DIMENSION, [42; 32]);
 
     let type_name = std::any::type_name::<T::Native>();
-
     c.bench_function(format!("Dot({type_name}, arrow_artiy)").as_str(), |b| {
-        b.iter(|| unsafe {
-            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
-                let arr = target.slice(idx * DIMENSION, DIMENSION);
-                Some(dot_arrow_artiy(&key, &arr))
-            }));
+        b.iter(|| {
+            T::ArrayType::from(
+                target
+                    .as_slice()
+                    .chunks(DIMENSION)
+                    .map(|arr| dot_scalar(key.as_slice(), arr))
+                    .collect::<Vec<_>>(),
+            )
         });
     });
 
     c.bench_function(
         format!("Dot({type_name}, auto-vectorization)").as_str(),
         |b| {
-            let x = &key.values()[..];
-            b.iter(|| unsafe {
-                Float32Array::from_trusted_len_iter((0..target.len() / 1024).map(|idx| {
-                    let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                    Some(black_box(dot(x, y)))
-                }));
+            let x = key.as_slice();
+            b.iter(|| {
+                Float32Array::from(
+                    target
+                        .as_slice()
+                        .chunks(DIMENSION)
+                        .map(|y| black_box(dot(x, y)))
+                        .collect::<Vec<_>>(),
+                )
             });
         },
     );
@@ -87,9 +81,9 @@ fn bench_distance(c: &mut Criterion) {
 
     run_bench::<Float16Type>(c);
     c.bench_function("Dot(f16, SIMD)", |b| {
-        let key: Float16Array = generate_random_array_with_seed(DIMENSION, [0; 32]);
+        let key = generate_random_array_with_seed::<Float16Type>(DIMENSION, [0; 32]);
         // 1M of 1024 D vectors
-        let target: Float16Array = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
+        let target = generate_random_array_with_seed::<Float16Type>(TOTAL * DIMENSION, [42; 32]);
         b.iter(|| unsafe {
             let x = key.values().as_ref();
             Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
@@ -122,9 +116,9 @@ fn bench_distance(c: &mut Criterion) {
 
     run_bench::<Float32Type>(c);
     c.bench_function("Dot(f32, SIMD)", |b| {
-        let key: Float32Array = generate_random_array_with_seed(DIMENSION, [0; 32]);
+        let key = generate_random_array_with_seed::<Float32Type>(DIMENSION, [0; 32]);
         // 1M of 1024 D vectors
-        let target: Float32Array = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
+        let target = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, [42; 32]);
         b.iter(|| unsafe {
             let x = key.values().as_ref();
             Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
