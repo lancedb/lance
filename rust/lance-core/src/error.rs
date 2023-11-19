@@ -264,6 +264,16 @@ impl From<datafusion_common::DataFusionError> for Error {
     }
 }
 
+impl From<candle_core::Error> for Error {
+    #[track_caller]
+    fn from(e: candle_core::Error) -> Self {
+        Self::IO {
+            message: e.to_string(),
+            location: std::panic::Location::caller().to_snafu_location(),
+        }
+    }
+}
+
 // This is a bit odd but some object_store functions only accept
 // Stream<Result<T, ObjectStoreError>> and so we need to convert
 // to ObjectStoreError to call the methods.

@@ -109,6 +109,8 @@ tokio = { version = "1.23", features = [
 tracing = "0.1"
 url = "2.3"
 uuid = { version = "1.2", features = ["v4", "serde"] }
+candle-core = {version = "~0.3", features = ["cuda"]}
+rayon = "1"
 
 [profile.bench]
 opt-level = 3

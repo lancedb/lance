@@ -26,6 +26,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field};
 use arrow_select::take::take;
 use async_trait::async_trait;
+use candle_core::{Device, Tensor};
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result};
@@ -36,12 +37,14 @@ use lance_linalg::{
     MatrixView,
 };
 use log::info;
+use num_traits::AsPrimitive;
 use snafu::{location, Location};
 use tracing::{instrument, Instrument};
 
 mod builder;
 
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
+use crate::compute::candle::{CandleIVFCentroidRouter, IVFCentroidRouter};
 use crate::vector::{
     pq::{transform::PQTransformer, ProductQuantizer},
     residual::ResidualTransform,
@@ -234,6 +237,8 @@ pub struct IvfImpl<T: ArrowFloatType + Dot + L2 + Cosine> {
 
     /// Only covers a range of partitions.
     partition_range: Option<Range<u32>>,
+
+    router: Option<Arc<dyn IVFCentroidRouter>>,
 }
 
 impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
@@ -243,11 +248,27 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         transforms: Vec<Arc<dyn Transformer>>,
         range: Option<Range<u32>>,
     ) -> Self {
+        let device = Device::new_cuda(0).expect("failed to create device");
         Self {
-            centroids,
+            centroids: centroids.clone(),
             metric_type,
             transforms,
             partition_range: range,
+            router: Some(Arc::new(CandleIVFCentroidRouter::new(
+                device.clone(),
+                Tensor::from_slice(
+                    centroids
+                        .data()
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .expect("expected Float32Array")
+                        .as_slice(),
+                    (centroids.num_rows(), centroids.num_columns()),
+                    &device,
+                ).expect("failed to create tensor"),
+                10,
+                10240,
+            ))),
         }
     }
 
@@ -258,12 +279,13 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         pq: Arc<dyn ProductQuantizer>,
         range: Option<Range<u32>>,
     ) -> Self {
+        let device = Device::new_cuda(0).expect("failed to create device");
         Self {
             centroids: centroids.clone(),
             metric_type,
             transforms: vec![
                 Arc::new(ResidualTransform::new(
-                    centroids,
+                    centroids.clone(),
                     PART_ID_COLUMN,
                     vector_column,
                 )),
@@ -274,6 +296,22 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
                 )),
             ],
             partition_range: range,
+            router: Some(Arc::new(CandleIVFCentroidRouter::new(
+                device.clone(),
+                Tensor::from_slice(
+                    centroids
+                    .clone()
+                        .data()
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .expect("expected Float32Array")
+                        .as_slice(),
+                    (centroids.num_rows(), centroids.num_columns()),
+                    &device,
+                ).expect("failed to create tensor"),
+                10,
+                10240,
+            ))),
         }
     }
 
@@ -339,6 +377,9 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
 #[async_trait]
 impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
     async fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
+        if let Some(r) = self.router.clone() {
+            return r.search(data);
+        }
         let array = data
             .values()
             .as_any()

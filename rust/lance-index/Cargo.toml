@@ -44,6 +44,8 @@ serde.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+candle-core.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
