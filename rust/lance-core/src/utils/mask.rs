@@ -277,7 +277,13 @@ pub struct RowIdTreeMap {
     /// The contents of the set. If there is a pair (k, None) then the entire
     /// fragment k is selected. If there is a pair (k, Some(v)) then the
     /// fragment k has the selected rows in v.
-    inner: BTreeMap<u32, Option<RoaringBitmap>>,
+    inner: BTreeMap<u32, RowIdSelection>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum RowIdSelection {
+    Full,
+    Partial(RoaringBitmap),
 }
 
 impl RowIdTreeMap {
@@ -288,12 +294,12 @@ impl RowIdTreeMap {
 
     /// Add a bitmap for a single fragment
     pub fn insert_bitmap(&mut self, fragment: u32, bitmap: RoaringBitmap) {
-        self.inner.insert(fragment, Some(bitmap));
+        self.inner.insert(fragment, RowIdSelection::Partial(bitmap));
     }
 
     /// Add a whole fragment to the set
     pub fn insert_fragment(&mut self, fragment_id: u32) {
-        self.inner.insert(fragment_id, None);
+        self.inner.insert(fragment_id, RowIdSelection::Full);
     }
 
     /// Returns whether the set contains the given value
@@ -302,8 +308,8 @@ impl RowIdTreeMap {
         let row_id = value as u32;
         match self.inner.get(&fragment) {
             None => false,
-            Some(None) => true,
-            Some(Some(fragment_set)) => fragment_set.contains(row_id),
+            Some(RowIdSelection::Full) => true,
+            Some(RowIdSelection::Partial(fragment_set)) => fragment_set.contains(row_id),
         }
     }
 
@@ -314,7 +320,7 @@ impl RowIdTreeMap {
         for set in self.inner.values() {
             // Each entry is 8 bytes for the fragment id and the bitmap size
             size += 8;
-            if let Some(set) = set {
+            if let RowIdSelection::Partial(set) = set {
                 size += set.serialized_size();
             }
         }
@@ -336,7 +342,7 @@ impl RowIdTreeMap {
         writer.write_u32::<byteorder::LittleEndian>(self.inner.len() as u32)?;
         for (fragment, set) in &self.inner {
             writer.write_u32::<byteorder::LittleEndian>(*fragment)?;
-            if let Some(set) = set {
+            if let RowIdSelection::Partial(set) = set {
                 writer.write_u32::<byteorder::LittleEndian>(set.serialized_size() as u32)?;
                 set.serialize_into(&mut writer)?;
             } else {
@@ -354,12 +360,12 @@ impl RowIdTreeMap {
             let fragment = reader.read_u32::<byteorder::LittleEndian>()?;
             let bitmap_size = reader.read_u32::<byteorder::LittleEndian>()?;
             if bitmap_size == 0 {
-                inner.insert(fragment, None);
+                inner.insert(fragment, RowIdSelection::Full);
             } else {
                 let mut buffer = vec![0; bitmap_size as usize];
                 reader.read_exact(&mut buffer)?;
                 let set = RoaringBitmap::deserialize_from(&buffer[..])?;
-                inner.insert(fragment, Some(set));
+                inner.insert(fragment, RowIdSelection::Partial(set));
             }
         }
         Ok(Self { inner })
@@ -375,11 +381,11 @@ impl std::ops::BitOr<Self> for RowIdTreeMap {
                 None => {
                     self.inner.insert(*fragment, rhs_set.clone());
                 }
-                Some(None) => {
+                Some(RowIdSelection::Full) => {
                     // If the fragment is already selected then there is nothing to do
                 }
-                Some(Some(lhs_set)) => {
-                    if let Some(rhs_set) = rhs_set {
+                Some(RowIdSelection::Partial(lhs_set)) => {
+                    if let RowIdSelection::Partial(rhs_set) = rhs_set {
                         *lhs_set |= rhs_set;
                     }
                 }
@@ -401,20 +407,22 @@ impl std::ops::BitAnd<Self> for RowIdTreeMap {
         for (fragment, mut lhs_set) in &mut self.inner {
             match (&mut lhs_set, rhs.inner.get(fragment)) {
                 (_, None) => {} // Already handled by retain
-                (_, Some(None)) => {
+                (_, Some(RowIdSelection::Full)) => {
                     // Everything selected on RHS, so can leave LHS untouched.
                 }
-                (Some(lhs_set), Some(Some(rhs_set))) => {
+                (RowIdSelection::Partial(lhs_set), Some(RowIdSelection::Partial(rhs_set))) => {
                     *lhs_set &= rhs_set;
                 }
-                (None, Some(Some(rhs_set))) => {
-                    *lhs_set = Some(rhs_set.clone());
+                (RowIdSelection::Full, Some(RowIdSelection::Partial(rhs_set))) => {
+                    *lhs_set = RowIdSelection::Partial(rhs_set.clone());
                 }
             }
         }
         // Some bitmaps might now be empty. If they are, we should remove them.
-        self.inner
-            .retain(|_, set| set.as_ref().map(|set| !set.is_empty()).unwrap_or(true));
+        self.inner.retain(|_, set| match set {
+            RowIdSelection::Partial(set) => !set.is_empty(),
+            RowIdSelection::Full => true,
+        });
 
         self
     }
@@ -430,12 +438,12 @@ impl FromIterator<u64> for RowIdTreeMap {
                 None => {
                     let mut set = RoaringBitmap::new();
                     set.insert(row_id);
-                    inner.insert(fragment, Some(set));
+                    inner.insert(fragment, RowIdSelection::Partial(set));
                 }
-                Some(None) => {
+                Some(RowIdSelection::Full) => {
                     // If the fragment is already selected then there is nothing to do
                 }
-                Some(Some(set)) => {
+                Some(RowIdSelection::Partial(set)) => {
                     set.insert(row_id);
                 }
             }
@@ -459,12 +467,12 @@ impl Extend<u64> for RowIdTreeMap {
                 None => {
                     let mut set = RoaringBitmap::new();
                     set.insert(row_id);
-                    self.inner.insert(fragment, Some(set));
+                    self.inner.insert(fragment, RowIdSelection::Partial(set));
                 }
-                Some(None) => {
+                Some(RowIdSelection::Full) => {
                     // If the fragment is already selected then there is nothing to do
                 }
-                Some(Some(set)) => {
+                Some(RowIdSelection::Partial(set)) => {
                     set.insert(row_id);
                 }
             }
