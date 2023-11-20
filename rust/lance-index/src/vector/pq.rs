@@ -261,7 +261,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                                     let v = _mm512_i32gather_ps(
                                         simd_offsets,
                                         distance_table.as_ptr() as *const u8,
-                                        8,
+                                        4,
                                     );
                                     s = _mm512_add_ps(s, v);
                                 });
