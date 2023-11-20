@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::{Array, FixedSizeListArray};
+use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::*;
 use lance_core::io::Writer;
+use lance_datafusion::dataframe::BatchStreamGrouper;
 use lance_index::vector::PQ_CODE_COLUMN;
 
-use super::{shuffler::Shuffler, IVFIndex, Ivf};
+use super::{IVFIndex, Ivf};
 use crate::dataset::ROW_ID;
 use crate::encodings::plain::PlainEncoder;
 use crate::index::vector::pq::PQIndex;
@@ -28,13 +31,16 @@ use crate::Result;
 
 /// Write each partition of IVF_PQ index to the index file.
 ///
-/// Partitioned index data is already sorted in the [Shuffler].
+/// `batches`: RecordBatch stream of PQ codes and row ids, sorted by PQ code.
 pub(super) async fn write_index_partitions(
     writer: &mut dyn Writer,
     ivf: &mut Ivf,
-    shuffler: &Shuffler,
+    new_data: BatchStreamGrouper,
     existing_partitions: Option<&IVFIndex>,
 ) -> Result<()> {
+    let mut new_data = new_data.peekable();
+    let mut new_data_ref = Pin::new(&mut new_data);
+
     for part_id in 0..ivf.num_partitions() as u32 {
         let mut pq_array = Vec::<Arc<dyn Array>>::new();
         let mut row_id_array = Vec::<Arc<dyn Array>>::new();
@@ -53,14 +59,31 @@ pub(super) async fn write_index_partitions(
             }
         }
 
-        if let Some(mut stream) = shuffler.key_iter(part_id).await? {
-            while let Some(batch) = stream.next().await {
-                let batch = batch?;
-                let arr = batch.column_by_name(PQ_CODE_COLUMN).unwrap();
-                pq_array.push(arr.clone());
-                let arr = batch.column_by_name(ROW_ID).unwrap();
-                row_id_array.push(arr.clone());
+        // The new data is sorted by partition id, but it's not guaranteed that
+        // every partition id has data, so we peek into the next batch to check
+        // if the partition id matches.
+        match new_data_ref.as_mut().peek().await {
+            Some(Ok((part_values, _batch)))
+                if part_values[0] == ScalarValue::UInt32(Some(part_id)) =>
+            {
+                let batches = new_data_ref.as_mut().next().await.unwrap().unwrap().1;
+                for batch in batches {
+                    let arr = batch.column_by_name(PQ_CODE_COLUMN).unwrap();
+                    pq_array.push(arr.clone());
+                    let arr = batch.column_by_name(ROW_ID).unwrap();
+                    row_id_array.push(arr.clone());
+                }
             }
+            Some(Err(_)) => {
+                return Err(new_data_ref
+                    .as_mut()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .into())
+            }
+            _ => {}
         }
 
         let total_records = row_id_array.iter().map(|a| a.len()).sum::<usize>();

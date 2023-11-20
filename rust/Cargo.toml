@@ -76,6 +76,8 @@ datafusion = { version = "32.0.0", default-features = false, features = [
 ] }
 datafusion-common = "32.0"
 datafusion-sql = "32.0"
+datafusion-expr = "32.0"
+datafusion-physical-expr = { version = "32.0.0", default-features = false }
 either = "1.0"
 futures = "0.3"
 http = "0.2.9"

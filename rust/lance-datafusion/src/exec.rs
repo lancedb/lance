@@ -14,21 +14,21 @@
 
 //! Utilities for working with datafusion execution plans
 
-use std::{
-    cell::RefCell,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
+    dataframe::DataFrame,
+    datasource::streaming::StreamingTable,
     execution::{
-        context::{SessionConfig, SessionState},
+        context::{SessionConfig, SessionContext, SessionState},
         runtime_env::{RuntimeConfig, RuntimeEnv},
+        TaskContext,
     },
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
-        SendableRecordBatchStream,
+        stream::RecordBatchStreamAdapter, streaming::PartitionStream, DisplayAs, DisplayFormatType,
+        ExecutionPlan, SendableRecordBatchStream,
     },
 };
 use datafusion_common::DataFusionError;
@@ -74,7 +74,7 @@ pub fn reader_to_stream(
 /// It can only be used once, and will return the stream.  After that the node
 /// is exhuasted.
 pub struct OneShotExec {
-    stream: Mutex<RefCell<Option<SendableRecordBatchStream>>>,
+    stream: Mutex<Option<SendableRecordBatchStream>>,
     // We save off a copy of the schema to speed up formatting and so ExecutionPlan::schema & display_as
     // can still function after exhuasted
     schema: Arc<ArrowSchema>,
@@ -85,7 +85,7 @@ impl OneShotExec {
     pub fn new(stream: SendableRecordBatchStream) -> Self {
         let schema = stream.schema().clone();
         Self {
-            stream: Mutex::new(RefCell::new(Some(stream))),
+            stream: Mutex::new(Some(stream)),
             schema,
         }
     }
@@ -94,9 +94,8 @@ impl OneShotExec {
 impl std::fmt::Debug for OneShotExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let val_guard = self.stream.lock().unwrap();
-        let stream = val_guard.borrow();
         f.debug_struct("OneShotExec")
-            .field("exhausted", &stream.is_none())
+            .field("exhausted", &val_guard.is_none())
             .field("schema", self.schema.as_ref())
             .finish()
     }
@@ -109,10 +108,13 @@ impl DisplayAs for OneShotExec {
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         let val_guard = self.stream.lock().unwrap();
-        let stream = val_guard.borrow();
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let exhausted = if stream.is_some() { "" } else { "EXHUASTED " };
+                let exhausted = if val_guard.is_some() {
+                    ""
+                } else {
+                    "EXHUASTED "
+                };
                 let columns = self
                     .schema
                     .field_names()
@@ -163,13 +165,17 @@ impl ExecutionPlan for OneShotExec {
         _partition: usize,
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
-        let mut val_guard = self.stream.lock().unwrap();
-        let stream = val_guard.get_mut();
-        let stream = stream.take();
+        let mut val_guard = self
+            .stream
+            .lock()
+            .map_err(|err| DataFusionError::Execution(err.to_string()))?;
+        let stream = val_guard.take();
         if let Some(stream) = stream {
             Ok(stream)
         } else {
-            panic!("Attempt to use OneShotExec more than once");
+            Err(DataFusionError::Execution(
+                "OneShotExec has already been executed".to_string(),
+            ))
         }
     }
 
@@ -190,4 +196,54 @@ pub fn execute_plan(plan: Arc<dyn ExecutionPlan>) -> Result<SendableRecordBatchS
     // the plan has more than one partition, we will be missing data.
     assert_eq!(plan.output_partitioning().partition_count(), 1);
     Ok(plan.execute(0, session_state.task_ctx())?)
+}
+
+pub trait SessionContextExt {
+    /// Creates a DataFrame for reading a stream of data
+    ///
+    /// This dataframe may only be queried once, future queries will fail
+    fn read_one_shot(
+        &self,
+        data: SendableRecordBatchStream,
+    ) -> datafusion::common::Result<DataFrame>;
+}
+
+struct OneShotPartitionStream {
+    data: Arc<Mutex<Option<SendableRecordBatchStream>>>,
+    schema: Arc<ArrowSchema>,
+}
+
+impl OneShotPartitionStream {
+    fn new(data: SendableRecordBatchStream) -> Self {
+        let schema = data.schema().clone();
+        Self {
+            data: Arc::new(Mutex::new(Some(data))),
+            schema,
+        }
+    }
+}
+
+impl PartitionStream for OneShotPartitionStream {
+    fn schema(&self) -> &arrow_schema::SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let mut stream = self.data.lock().unwrap();
+        stream
+            .take()
+            .expect("Attempt to consume a one shot dataframe multiple times")
+    }
+}
+
+impl SessionContextExt for SessionContext {
+    fn read_one_shot(
+        &self,
+        data: SendableRecordBatchStream,
+    ) -> datafusion::common::Result<DataFrame> {
+        let schema = data.schema().clone();
+        let part_stream = Arc::new(OneShotPartitionStream::new(data));
+        let provider = StreamingTable::try_new(schema, vec![part_stream])?;
+        self.read_table(Arc::new(provider))
+    }
 }

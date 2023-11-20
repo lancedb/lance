@@ -13,10 +13,13 @@ description = "Internal utilities used by other lance modules to simplify workin
 arrow.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
+arrow-ord.workspace = true
+async-trait.workspace = true
 datafusion.workspace = true
 datafusion-common.workspace = true
-datafusion-expr = "32.0.0"
-datafusion-physical-expr = { version = "32.0.0", default-features = false }
+datafusion-expr.workspace = true
+datafusion-physical-expr.workspace = true
 futures.workspace = true
 lance-arrow.workspace = true
 lance-core.workspace = true
+tokio.workspace = true
