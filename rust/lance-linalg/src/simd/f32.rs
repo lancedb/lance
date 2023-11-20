@@ -47,10 +47,12 @@ impl std::fmt::Debug for f32x8 {
 }
 
 impl f32x8 {
-    pub fn gather(slice: &[f32], indices: &i32x8) -> Self {
+    #[inline]
+    pub fn gather(slice: &[f32], indices: &[i32; 8]) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm256_i32gather_ps::<1>(slice.as_ptr(), indices.0))
+            let idx = i32x8::from(indices);
+            Self(_mm256_i32gather_ps::<4>(slice.as_ptr(), idx.0))
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -859,5 +861,13 @@ mod tests {
         assert_eq!(Some(1), simd_a.find(2.0));
         assert_eq!(Some(13), simd_a.find(9.0));
         assert_eq!(None, simd_a.find(-200.0));
+    }
+
+    #[test]
+    fn test_f32x8_gather() {
+        let a = (0..256).map(|f| f as f32).collect::<Vec<_>>();
+        let idx = [0_i32, 4, 8, 12, 16, 20, 24, 28];
+        let v = f32x8::gather(&a, &idx);
+        assert_eq!(v.reduce_sum(), 112.0);
     }
 }

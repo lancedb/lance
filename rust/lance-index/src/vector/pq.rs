@@ -37,9 +37,7 @@ pub(crate) mod utils;
 pub use self::utils::num_centroids;
 use super::pb;
 pub use builder::PQBuildParams;
-use lance_linalg::simd::f32::f32x8;
-use lance_linalg::simd::i32::i32x8;
-use lance_linalg::simd::SIMD;
+use lance_linalg::simd::{f32::f32x8, SIMD};
 
 /// Product Quantization
 
@@ -267,8 +265,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                         lane_chunk.iter().enumerate().for_each(|(j, &code)| {
                             offsets[j] = ((idx * 8 + j) * 256 + code as usize) as i32
                         });
-                        let offset_simd = i32x8::from(&offsets);
-                        let v = f32x8::gather(&distance_table, &offset_simd);
+                        let v = f32x8::gather(&distance_table, &offsets);
                         s += v;
                     });
                     s.reduce_sum()
