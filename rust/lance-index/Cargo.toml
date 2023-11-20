@@ -61,3 +61,7 @@ prost-build.workspace = true
 [[bench]]
 name = "find_partitions"
 harness = false
+
+[[bench]]
+name = "pq_dist_table"
+harness = false
