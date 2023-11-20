@@ -243,7 +243,22 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                 distance_table.extend(distances);
             });
 
-        if cfg!(target_feature = "avx2") && self.num_sub_vectors % 8 == 0 {
+        if cfg!(target_feature = "avx512") && self.num_sub_vectors % 16 == 0 {
+            Ok(Arc::new(Float32Array::from_iter_values(
+                code.values().chunks_exact(self.num_sub_vectors).map(|c| {
+                    let mut s = c.chunks_exact(8).enumerate().for_each(|(idx, lane_chunk)| {
+                        let mut offsets: [i32; 8] = [0; 8];
+                        lane_chunk.iter().enumerate().for_each(|(j, &code)| {
+                            offsets[j] = ((idx * 8 + j) * 256 + code as usize) as i32
+                        });
+                        let offset_simd = i32x8::from(&offsets);
+                        let v = f32x8::gather(&distance_table, &offset_simd);
+                        s += v;
+                    });
+                    s.reduce_sum()
+                }),
+            )))
+        } else if cfg!(target_feature = "avx2") && self.num_sub_vectors % 8 == 0 {
             Ok(Arc::new(Float32Array::from_iter_values(
                 code.values().chunks_exact(self.num_sub_vectors).map(|c| {
                     let mut s = f32x8::zeros();
