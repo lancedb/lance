@@ -14,7 +14,7 @@
 
 //! Lance secondary index library
 
-#![cfg_attr(feature = "nightly", feature(stdsimd))]
+#![cfg_attr(nightly, feature(stdsimd))]
 
 use std::{any::Any, sync::Arc};
 
