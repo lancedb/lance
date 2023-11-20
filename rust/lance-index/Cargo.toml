@@ -57,6 +57,7 @@ datafusion-sql = "32.0.0"
 
 [build-dependencies]
 prost-build.workspace = true
+rustc_version.workspace = true
 
 [[bench]]
 name = "find_partitions"
