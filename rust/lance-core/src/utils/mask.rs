@@ -412,6 +412,9 @@ impl std::ops::BitAnd<Self> for RowIdTreeMap {
                 }
             }
         }
+        // Some bitmaps might now be empty. If they are, we should remove them.
+        self.inner
+            .retain(|_, set| set.as_ref().map(|set| !set.is_empty()).unwrap_or(true));
 
         self
     }
