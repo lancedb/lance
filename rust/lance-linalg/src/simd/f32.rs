@@ -22,7 +22,7 @@ use std::arch::aarch64::*;
 use std::arch::x86_64::*;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
-use super::{i32::i32x8, FloatSimd, SIMD};
+use super::{FloatSimd, SIMD};
 
 /// 8 of 32-bit `f32` values. Use 256-bit SIMD if possible.
 #[allow(non_camel_case_types)]
@@ -51,6 +51,8 @@ impl f32x8 {
     pub fn gather(slice: &[f32], indices: &[i32; 8]) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
+            use super::i32::i32x8;
+
             let idx = i32x8::from(indices);
             Self(_mm256_i32gather_ps::<4>(slice.as_ptr(), idx.0))
         }
@@ -58,18 +60,17 @@ impl f32x8 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             // aarch64 does not have relevant SIMD instructions.
-            let idx = indices.as_array();
             let ptr = slice.as_ptr();
 
             let values = [
-                *ptr.add(idx[0] as usize),
-                *ptr.add(idx[1] as usize),
-                *ptr.add(idx[2] as usize),
-                *ptr.add(idx[3] as usize),
-                *ptr.add(idx[4] as usize),
-                *ptr.add(idx[5] as usize),
-                *ptr.add(idx[6] as usize),
-                *ptr.add(idx[7] as usize),
+                *ptr.add(indices[0] as usize),
+                *ptr.add(indices[1] as usize),
+                *ptr.add(indices[2] as usize),
+                *ptr.add(indices[3] as usize),
+                *ptr.add(indices[4] as usize),
+                *ptr.add(indices[5] as usize),
+                *ptr.add(indices[6] as usize),
+                *ptr.add(indices[7] as usize),
             ];
             Self::load_unaligned(values.as_ptr())
         }
