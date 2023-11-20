@@ -866,8 +866,8 @@ mod tests {
     #[test]
     fn test_f32x8_gather() {
         let a = (0..256).map(|f| f as f32).collect::<Vec<_>>();
-        let idx = [0_i32, 4, 8, 12, 16, 20, 24, 28];
+        let idx = [0_i32, 4, 8, 12, 16, 20, 24, 29];
         let v = f32x8::gather(&a, &idx);
-        assert_eq!(v.reduce_sum(), 112.0);
+        assert_eq!(v.reduce_sum(), 113.0);
     }
 }
