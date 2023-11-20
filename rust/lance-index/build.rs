@@ -7,7 +7,7 @@ fn main() -> Result<()> {
         Channel::Nightly => {
             println!("cargo:rustc-cfg=nightly");
         }
-        _ => {},
+        _ => {}
     }
 
     println!("cargo:rerun-if-changed=protos");
