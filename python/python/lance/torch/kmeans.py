@@ -142,15 +142,18 @@ class KMeans:
         logging.info("Finish KMean training in %s", time.time() - start)
 
     @staticmethod
-    def _split_centroids(centroids: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    def _updated_centroids(
+        centroids: torch.Tensor, counts: torch.Tensor
+    ) -> torch.Tensor:
         for idx, cnt in enumerate(counts.cpu()):
+            # split the largest cluster and remove empty cluster
             if cnt == 0:
                 max_idx = torch.argmax(counts).item()
                 half_cnt = counts[max_idx] // 2
                 counts[idx], counts[max_idx] = half_cnt, half_cnt
                 centroids[idx] = centroids[max_idx] * 1.05
                 centroids[max_idx] = centroids[max_idx] / 1.05
-        return centroids
+        return centroids / counts[:, None]
 
     @staticmethod
     def _count_rows_in_clusters(part_ids: List[torch.Tensor], k: int) -> torch.Tensor:
@@ -195,7 +198,7 @@ class KMeans:
         if abs(total_dist - last_dist) / total_dist < self.tolerance:
             raise StopIteration("kmeans: converged")
 
-        self.centroids = self._split_centroids(new_centroids, counts_per_part)
+        self.centroids = self._updated_centroids(new_centroids, counts_per_part)
         return total_dist
 
     def _transform(self, data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
