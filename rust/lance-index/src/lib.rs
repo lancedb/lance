@@ -14,6 +14,8 @@
 
 //! Lance secondary index library
 
+#![cfg_attr(nightly, feature(stdsimd))]
+
 use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;

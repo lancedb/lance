@@ -22,7 +22,7 @@ use std::arch::aarch64::*;
 use std::arch::x86_64::*;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
-use super::{i32::i32x8, FloatSimd, SIMD};
+use super::{FloatSimd, SIMD};
 
 /// 8 of 32-bit `f32` values. Use 256-bit SIMD if possible.
 #[allow(non_camel_case_types)]
@@ -47,27 +47,30 @@ impl std::fmt::Debug for f32x8 {
 }
 
 impl f32x8 {
-    pub fn gather(slice: &[f32], indices: &i32x8) -> Self {
+    #[inline]
+    pub fn gather(slice: &[f32], indices: &[i32; 8]) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm256_i32gather_ps::<1>(slice.as_ptr(), indices.0))
+            use super::i32::i32x8;
+
+            let idx = i32x8::from(indices);
+            Self(_mm256_i32gather_ps::<4>(slice.as_ptr(), idx.0))
         }
 
         #[cfg(target_arch = "aarch64")]
         unsafe {
             // aarch64 does not have relevant SIMD instructions.
-            let idx = indices.as_array();
             let ptr = slice.as_ptr();
 
             let values = [
-                *ptr.add(idx[0] as usize),
-                *ptr.add(idx[1] as usize),
-                *ptr.add(idx[2] as usize),
-                *ptr.add(idx[3] as usize),
-                *ptr.add(idx[4] as usize),
-                *ptr.add(idx[5] as usize),
-                *ptr.add(idx[6] as usize),
-                *ptr.add(idx[7] as usize),
+                *ptr.add(indices[0] as usize),
+                *ptr.add(indices[1] as usize),
+                *ptr.add(indices[2] as usize),
+                *ptr.add(indices[3] as usize),
+                *ptr.add(indices[4] as usize),
+                *ptr.add(indices[5] as usize),
+                *ptr.add(indices[6] as usize),
+                *ptr.add(indices[7] as usize),
             ];
             Self::load_unaligned(values.as_ptr())
         }
@@ -859,5 +862,13 @@ mod tests {
         assert_eq!(Some(1), simd_a.find(2.0));
         assert_eq!(Some(13), simd_a.find(9.0));
         assert_eq!(None, simd_a.find(-200.0));
+    }
+
+    #[test]
+    fn test_f32x8_gather() {
+        let a = (0..256).map(|f| f as f32).collect::<Vec<_>>();
+        let idx = [0_i32, 4, 8, 12, 16, 20, 24, 29];
+        let v = f32x8::gather(&a, &idx);
+        assert_eq!(v.reduce_sum(), 113.0);
     }
 }
