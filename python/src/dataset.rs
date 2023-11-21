@@ -28,8 +28,9 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
-    Dataset as LanceDataset, MergeInsertBuilder, ReadParams, UpdateBuilder, Version, WhenMatched,
-    WhenNotMatched, WhenNotMatchedBySource, WriteMode, WriteParams,
+    Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams,
+    UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
+    WriteParams,
 };
 use lance::index::{
     scalar::ScalarIndexParams,
@@ -93,56 +94,116 @@ fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
     })
 }
 
-// #[pyclass(name = "MergeInsertBuilder", module = "_lib")]
-// #[derive(Clone)]
-// pub struct MergeInsertBuilder {
-//     ds: Arc<LanceDataset>,
-//     builder: Option<LanceMergeInsertBuilder>,
-// }
+#[pyclass(name = "_MergeInsertBuilder", module = "_lib")]
+pub struct MergeInsertBuilder {
+    builder: Option<LanceMergeInsertBuilder>,
+}
 
-// #[pymethods]
-// impl MergeInsertBuilder {
-//     pub fn when_matched(&mut self, update_all: bool) -> () {
-//         let new_behavior = if update_all {
-//             WhenMatched::UpdateAll
-//         } else {
-//             WhenMatched::DoNothing
-//         };
-//         let old_val = self.builder.take().unwrap();
-//         self.builder.replace(old_val.when_matched(new_behavior));
-//     }
+impl MergeInsertBuilder {
+    fn take_builder(&mut self) -> PyResult<LanceMergeInsertBuilder> {
+        self.builder
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("the MergeInsertBuilder can only be used once"))
+    }
+}
 
-//     pub fn when_not_matched(&mut self, insert_all: bool) -> () {
-//         let new_behavior = if insert_all {
-//             WhenNotMatched::InsertAll
-//         } else {
-//             WhenNotMatched::DoNothing
-//         };
-//         let old_val = self.builder.take().unwrap();
-//         self.builder.replace(old_val.when_not_matched(new_behavior));
-//     }
+#[pymethods]
+impl MergeInsertBuilder {
+    #[new]
+    pub fn new(dataset: &Dataset, on: &PyAny) -> PyResult<Self> {
+        // Either a single string, which we put in a vector or an iterator
+        // of strings, which we collect into a vector
+        let on = PyAny::downcast::<PyString>(on)
+            .map(|val| vec![val.to_string()])
+            .or_else(|_| {
+                let list = PyAny::downcast::<PyIterator>(on)?;
+                let mut keys = Vec::with_capacity(list.len()?);
+                for key in list {
+                    keys.push(PyAny::downcast::<PyString>(key?)?.to_string());
+                }
+                PyResult::Ok(keys)
+            })?;
 
-//     pub fn when_not_matched_by_source_delete(&mut self) {
-//         let old_val = self.builder.take().unwrap();
-//         self.builder
-//             .replace(old_val.when_not_matched_by_source(WhenNotMatchedBySource::AlwaysDelete));
-//     }
+        Ok(Self {
+            builder: Some(LanceMergeInsertBuilder::new(dataset.ds.clone(), on)),
+        })
+    }
 
-//     pub fn when_not_matched_by_source_do_nothing(&mut self) {
-//         let old_val = self.builder.take().unwrap();
-//         self.builder
-//             .replace(old_val.when_not_matched_by_source(WhenNotMatchedBySource::NeverDelete));
-//     }
+    pub fn when_matched(mut slf: PyRefMut<Self>, update_all: bool) -> PyResult<PyRefMut<Self>> {
+        let new_behavior = if update_all {
+            WhenMatched::UpdateAll
+        } else {
+            WhenMatched::DoNothing
+        };
+        let old_val = slf.take_builder()?;
+        slf.builder.replace(old_val.when_matched(new_behavior));
+        Ok(slf)
+    }
 
-//     pub fn when_not_matched_by_source_delete_if(&mut self, expr: &str) -> PyResult<()> {
-//         let new_val = WhenNotMatchedBySource::delete_if(&self.ds, expr)
-//             .map_err(|err| PyValueError::new_err(err.to_string()))?;
-//         let old_val = self.builder.take().unwrap();
-//         self.builder
-//             .replace(old_val.when_not_matched_by_source(new_val));
-//         Ok(())
-//     }
-// }
+    pub fn when_not_matched(mut slf: PyRefMut<Self>, insert_all: bool) -> PyResult<PyRefMut<Self>> {
+        let new_behavior = if insert_all {
+            WhenNotMatched::InsertAll
+        } else {
+            WhenNotMatched::DoNothing
+        };
+        let old_val = slf.take_builder()?;
+        slf.builder.replace(old_val.when_not_matched(new_behavior));
+        Ok(slf)
+    }
+
+    pub fn when_not_matched_by_source_delete(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
+        let old_val = slf.take_builder()?;
+        slf.builder
+            .replace(old_val.when_not_matched_by_source(WhenNotMatchedBySource::AlwaysDelete));
+        Ok(slf)
+    }
+
+    pub fn when_not_matched_by_source_do_nothing(
+        mut slf: PyRefMut<Self>,
+    ) -> PyResult<PyRefMut<Self>> {
+        let old_val = slf.take_builder()?;
+        slf.builder
+            .replace(old_val.when_not_matched_by_source(WhenNotMatchedBySource::NeverDelete));
+        Ok(slf)
+    }
+
+    pub fn when_not_matched_by_source_delete_if<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        expr: &str,
+        dataset: &Dataset,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        let new_val = WhenNotMatchedBySource::delete_if(&dataset.ds, expr)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let old_val = slf.take_builder()?;
+        slf.builder
+            .replace(old_val.when_not_matched_by_source(new_val));
+        Ok(slf)
+    }
+
+    pub fn execute(&mut self, new_data: &PyAny, mut dataset: PyRefMut<Dataset>) -> PyResult<()> {
+        let py = new_data.py();
+
+        let new_data: Box<dyn RecordBatchReader + Send> = if new_data.is_instance_of::<Scanner>() {
+            let scanner: Scanner = new_data.extract()?;
+            Box::new(
+                RT.block_on(Some(py), scanner.to_reader())?
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            )
+        } else {
+            Box::new(ArrowArrayStreamReader::from_pyarrow(new_data)?)
+        };
+
+        let job = self.take_builder()?.build();
+
+        let new_self = RT
+            .block_on(None, job.execute_reader(new_data))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        dataset.ds = new_self;
+
+        Ok(())
+    }
+}
 
 #[pymethods]
 impl Operation {
@@ -590,55 +651,6 @@ impl Dataset {
         RT.block_on(None, new_self.delete(&predicate))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
-        Ok(())
-    }
-
-    fn merge_into(
-        &mut self,
-        new_data: &PyAny,
-        on: Vec<String>,
-        when_matched_update: bool,
-        when_not_matched_insert: bool,
-        delete_if: Option<&str>,
-    ) -> PyResult<()> {
-        let py = new_data.py();
-
-        let mut builder = MergeInsertBuilder::new(self.ds.clone(), on);
-        if when_matched_update {
-            builder = builder.when_matched(WhenMatched::UpdateAll);
-        } else {
-            builder = builder.when_matched(WhenMatched::DoNothing);
-        };
-        if when_not_matched_insert {
-            builder = builder.when_not_matched(WhenNotMatched::InsertAll);
-        } else {
-            builder = builder.when_not_matched(WhenNotMatched::DoNothing);
-        };
-        if let Some(expr) = delete_if {
-            let criteria = WhenNotMatchedBySource::delete_if(&self.ds, expr)
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
-            builder = builder.when_not_matched_by_source(criteria);
-        } else {
-            builder = builder.when_not_matched_by_source(WhenNotMatchedBySource::NeverDelete);
-        };
-        let operation = builder.build();
-
-        let new_data: Box<dyn RecordBatchReader + Send> = if new_data.is_instance_of::<Scanner>() {
-            let scanner: Scanner = new_data.extract()?;
-            Box::new(
-                RT.block_on(Some(py), scanner.to_reader())?
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
-            )
-        } else {
-            Box::new(ArrowArrayStreamReader::from_pyarrow(new_data)?)
-        };
-
-        let new_self = RT
-            .block_on(None, operation.execute_reader(new_data))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-
-        self.ds = new_self;
-
         Ok(())
     }
 

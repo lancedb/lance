@@ -793,6 +793,62 @@ def test_delete_data(tmp_path: Path):
     assert dataset.count_rows() == 0
 
 
+def test_merge_insert(tmp_path: Path):
+    nrows = 1000
+    table = pa.Table.from_pydict({"a": range(nrows), "b": [1 for _ in range(nrows)]})
+    dataset = lance.write_dataset(
+        table, tmp_path / "dataset", mode="create", max_rows_per_file=100
+    )
+    version = dataset.version
+
+    new_table = pa.Table.from_pydict(
+        {"a": range(300, 300 + nrows), "b": [2 for _ in range(nrows)]}
+    )
+
+    is_new = pc.field("b") == 2
+
+    dataset.merge_insert("a").execute(new_table)
+    table = dataset.to_table()
+    assert table.num_rows == 1300
+    assert table.filter(is_new).num_rows == 300
+
+    dataset = lance.dataset(tmp_path / "dataset", version=version)
+    dataset.restore()
+    dataset.merge_insert(
+        "a"
+    ).when_matched_update_all().when_not_matched_do_nothing().execute(new_table)
+    table = dataset.to_table()
+    assert table.num_rows == 1000
+    assert table.filter(is_new).num_rows == 700
+
+    dataset = lance.dataset(tmp_path / "dataset", version=version)
+    dataset.restore()
+    dataset.merge_insert("a").when_matched_update_all().execute(new_table)
+    table = dataset.to_table()
+    assert table.num_rows == 1300
+    assert table.filter(is_new).num_rows == 1000
+
+    dataset = lance.dataset(tmp_path / "dataset", version=version)
+    dataset.restore()
+    dataset.merge_insert(
+        "a"
+    ).when_not_matched_by_source_delete().when_not_matched_do_nothing().execute(
+        new_table
+    )
+    table = dataset.to_table()
+    assert table.num_rows == 700
+    assert table.filter(is_new).num_rows == 0
+
+    dataset = lance.dataset(tmp_path / "dataset", version=version)
+    dataset.restore()
+    dataset.merge_insert("a").when_not_matched_by_source_delete_if("a < 100").execute(
+        new_table
+    )
+    table = dataset.to_table()
+    assert table.num_rows == 1200
+    assert table.filter(is_new).num_rows == 300
+
+
 def test_update_dataset(tmp_path: Path):
     nrows = 100
     vecs = pa.FixedSizeListArray.from_arrays(

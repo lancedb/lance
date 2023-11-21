@@ -46,7 +46,14 @@ from .dependencies import _check_for_numpy, _check_for_pandas, torch
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import FragmentMetadata, LanceFragment
-from .lance import CleanupStats, _Dataset, _Operation, _Scanner, _write_dataset
+from .lance import (
+    CleanupStats,
+    _Dataset,
+    _MergeInsertBuilder,
+    _Operation,
+    _Scanner,
+    _write_dataset,
+)
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .optimize import Compaction
@@ -74,6 +81,44 @@ if TYPE_CHECKING:
         np.ndarray,
         Iterable[float],
     ]
+
+
+class MergeInsertBuilder(object):
+    def __init__(self, dataset: LanceDataset, on: Union[str, Iterable[str]]):
+        self.dataset = dataset
+        self.builder = _MergeInsertBuilder(dataset._ds, on)
+
+    def when_matched_update_all(self) -> MergeInsertBuilder:
+        self.builder.when_matched(True)
+        return self
+
+    def when_matched_do_nothing(self) -> MergeInsertBuilder:
+        self.builder.when_matched(False)
+        return self
+
+    def when_not_matched_insert_all(self) -> MergeInsertBuilder:
+        self.builder.when_not_matched(True)
+        return self
+
+    def when_not_matched_do_nothing(self) -> MergeInsertBuilder:
+        self.builder.when_not_matched(False)
+        return self
+
+    def when_not_matched_by_source_delete(self) -> MergeInsertBuilder:
+        self.builder.when_not_matched_by_source_delete()
+        return self
+
+    def when_not_matched_by_source_do_nothing(self) -> MergeInsertBuilder:
+        self.builder.when_not_matched_by_source_do_nothing()
+        return self
+
+    def when_not_matched_by_source_delete_if(self, expr: str) -> MergeInsertBuilder:
+        self.builder.when_not_matched_by_source_delete_if(expr, self.dataset._ds)
+        return self
+
+    def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
+        reader = _coerce_reader(data_obj, schema)
+        self.builder.execute(reader, self.dataset._ds)
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -624,6 +669,12 @@ class LanceDataset(pa.dataset.Dataset):
         if isinstance(predicate, pa.compute.Expression):
             predicate = str(predicate)
         self._ds.delete(predicate)
+
+    def merge_insert(
+        self,
+        on: Union[str, Iterable[str]],
+    ):
+        return MergeInsertBuilder(self, on)
 
     def update(
         self,

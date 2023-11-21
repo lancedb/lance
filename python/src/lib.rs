@@ -33,6 +33,7 @@ use dataset::cleanup::CleanupStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
+use dataset::MergeInsertBuilder;
 use env_logger::Env;
 use futures::StreamExt;
 use pyo3::exceptions::{PyIOError, PyValueError};
@@ -98,6 +99,7 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<Operation>()?;
     m.add_class::<FileFragment>()?;
     m.add_class::<FragmentMetadata>()?;
+    m.add_class::<MergeInsertBuilder>()?;
     m.add_class::<DataFile>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
