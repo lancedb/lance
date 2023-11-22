@@ -160,7 +160,7 @@ fn is_diskann(stages: &[StageParams]) -> bool {
 }
 
 /// Build a Vector Index
-#[instrument(skip(dataset))]
+#[instrument(level = "debug", skip(dataset))]
 pub(crate) async fn build_vector_index(
     dataset: &Dataset,
     column: &str,
@@ -222,7 +222,7 @@ pub(crate) async fn build_vector_index(
     Ok(())
 }
 
-#[instrument(skip_all, fields(old_uuid = old_uuid.to_string(), new_uuid = new_uuid.to_string(), num_rows = mapping.len()))]
+#[instrument(level = "debug", skip_all, fields(old_uuid = old_uuid.to_string(), new_uuid = new_uuid.to_string(), num_rows = mapping.len()))]
 pub(crate) async fn remap_vector_index(
     dataset: Arc<Dataset>,
     column: &str,

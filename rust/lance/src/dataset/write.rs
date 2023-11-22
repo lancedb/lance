@@ -154,7 +154,7 @@ pub async fn write_fragments(
 /// This is a private variant that takes a `SendableRecordBatchStream` instead
 /// of a reader. We don't expose the stream at our interface because it is a
 /// DataFusion type.
-#[instrument(skip_all)]
+#[instrument(level = "debug", skip_all)]
 pub async fn write_fragments_internal(
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
