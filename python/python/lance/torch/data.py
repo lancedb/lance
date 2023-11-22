@@ -36,7 +36,7 @@ __all__ = ["LanceDataset"]
 
 def _to_tensor(batch: pa.RecordBatch) -> Union[dict[str, torch.Tensor], torch.Tensor]:
     ret = {}
-    for col in batch.column_names:
+    for col in batch.schema.names:
         arr: pa.Array = batch[col]
         if pa.types.is_fixed_size_list(arr.type) and pa.types.is_floating(
             arr.type.value_type

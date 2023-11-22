@@ -982,6 +982,13 @@ class LanceDataset(pa.dataset.Dataset):
                 raise ValueError(
                     "num_partitions and num_sub_vectors are required for IVF_PQ"
                 )
+            if isinstance(num_partitions, float):
+                warnings.warn("num_partitions is float, converting to int")
+                num_partitions = int(num_partitions)
+            elif not isinstance(num_partitions, int):
+                raise TypeError(
+                    f"num_partitions must be int, got {type(num_partitions)}"
+                )
             kwargs["num_partitions"] = num_partitions
             kwargs["num_sub_vectors"] = num_sub_vectors
 
