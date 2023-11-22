@@ -29,6 +29,7 @@ use lance_index::scalar::ScalarIndex;
 use lance_index::{pb, Index, IndexType, INDEX_FILE_NAME};
 use nohash_hasher::IntMap;
 use snafu::{location, Location};
+use tracing::instrument;
 use uuid::Uuid;
 
 pub(crate) mod append;
@@ -181,6 +182,7 @@ async fn open_index_proto(dataset: &Dataset, reader: &dyn Reader) -> Result<pb::
 
 #[async_trait]
 impl DatasetIndexExt for Dataset {
+    #[instrument(skip_all)]
     async fn create_index(
         &mut self,
         columns: &[&str],
@@ -277,6 +279,7 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     async fn optimize_indices(&mut self) -> Result<()> {
         let dataset = Arc::new(self.clone());
         // Append index

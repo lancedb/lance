@@ -24,6 +24,10 @@ N_DIMS = 768
 NUM_ROWS = 100_000
 NEW_ROWS = 10_000
 
+from lance.tracing import trace_to_chrome
+
+trace_to_chrome(level="debug")
+
 
 def find_or_clean(dataset_path: Path) -> Union[lance.LanceDataset, None]:
     if dataset_path.exists():
@@ -192,3 +196,46 @@ def test_filtered_search(test_dataset, benchmark, selectivity, prefilter, use_in
     # With post-filtering it is possible we don't get any results
     if prefilter:
         assert result.num_rows > 0
+
+
+@pytest.mark.benchmark(group="query_ann")
+@pytest.mark.parametrize(
+    "filter",
+    (
+        None,
+        "filterable = 0",
+        "filterable != 0",
+        "filterable IN (0)",
+        "filterable NOT IN (0)",
+        "filterable != 0 AND filterable != 5000 AND filterable != 10000 AND filterable != 15000",
+        "filterable NOT IN (0, 5000, 10000, 15000)",
+        "filterable < 5000",
+        "filterable > 5000",
+    ),
+)
+def test_scalar_index_prefilter(datasets: Datasets, benchmark, filter: str):
+    dataset = datasets.clean
+    dataset.create_scalar_index("filterable", "BTREE")
+    q = pc.random(N_DIMS).cast(pa.float32())
+    if filter is None:
+        benchmark(
+            dataset.to_table,
+            nearest=dict(
+                column="vector",
+                q=q,
+                k=100,
+                nprobes=10,
+            ),
+        )
+    else:
+        benchmark(
+            dataset.to_table,
+            nearest=dict(
+                column="vector",
+                q=q,
+                k=100,
+                nprobes=10,
+            ),
+            prefilter=True,
+            filter=filter,
+        )

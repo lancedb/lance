@@ -31,6 +31,7 @@ use lance_index::scalar::{
 };
 use pin_project::pin_project;
 use snafu::{location, Location};
+use tracing::instrument;
 
 use crate::{index::DatasetIndexInternalExt, Dataset};
 
@@ -243,6 +244,7 @@ impl MaterializeIndexExec {
         }
     }
 
+    #[instrument(name = "materialize_scalar_index", skip_all, level = "debug")]
     async fn do_execute(
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,

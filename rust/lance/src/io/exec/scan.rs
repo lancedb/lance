@@ -28,6 +28,7 @@ use datafusion::physical_plan::{
 use futures::stream::Stream;
 use futures::{stream, Future};
 use futures::{StreamExt, TryStreamExt};
+use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::ROW_ID_FIELD;
 use tracing::Instrument;
 
@@ -146,6 +147,7 @@ impl LanceStream {
                 .try_flatten()
                 // We buffer up to `batch_readahead` batches across all streams.
                 .try_buffered(batch_readahead)
+                .stream_in_current_span()
                 .boxed()
         } else {
             stream::iter(file_fragments)
@@ -164,6 +166,7 @@ impl LanceStream {
                 .try_flatten_unordered(fragment_readahead)
                 // We buffer up to `batch_readahead` batches across all streams.
                 .try_buffer_unordered(batch_readahead)
+                .stream_in_current_span()
                 .boxed()
         };
 

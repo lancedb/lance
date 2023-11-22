@@ -26,6 +26,7 @@ use lance_core::{
     Result,
 };
 use lance_datafusion::expr::safe_coerce_scalar;
+use tracing::instrument;
 
 use super::{ScalarIndex, ScalarQuery};
 
@@ -225,6 +226,7 @@ impl ScalarIndexExpr {
     /// TODO: We could potentially try and be smarter about reusing loaded indices for
     /// any situations where the session cache has been disabled.
     #[async_recursion]
+    #[instrument(level = "debug", skip_all)]
     pub async fn evaluate(&self, index_loader: &dyn ScalarIndexLoader) -> Result<RowIdMask> {
         match self {
             Self::Not(inner) => {
