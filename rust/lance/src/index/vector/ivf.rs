@@ -631,8 +631,21 @@ pub async fn build_ivf_pq_index(
         lance_index::vector::pq::num_centroids(pq_params.num_bits as u32),
     ) * ivf_params.sample_rate;
 
-    // TODO: only sample data if training is necessary.
-    let mut training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+    let mut training_data = if ivf_params.centroids.is_none() {
+        let start = std::time::Instant::now();
+        log::info!(
+            "Loading training data for IVF. Sample size: {}",
+            sample_size_hint
+        );
+        let data = Some(maybe_sample_training_data(dataset, column, sample_size_hint).await?);
+        log::info!(
+            "Finished loading training data in {:02} seconds",
+            start.elapsed().as_secs_f32()
+        );
+        data
+    } else {
+        None
+    };
 
     #[cfg(feature = "opq")]
     let mut transforms: Vec<Box<dyn Transformer>> = vec![];
@@ -670,11 +683,13 @@ pub async fn build_ivf_pq_index(
 
         // Transform training data if necessary.
         for transform in transforms.iter() {
-            training_data = transform.transform(&training_data).await?;
+            if let Some(training_data) = &mut training_data {
+                *training_data = transform.transform(training_data).await?;
+            }
         }
 
         info!("Start to train IVF model");
-        train_ivf_model(&training_data, metric_type, ivf_params).await?
+        train_ivf_model(training_data.as_ref().unwrap(), metric_type, ivf_params).await?
     };
     info!(
         "Traied IVF model in {:02} seconds",
@@ -698,10 +713,24 @@ pub async fn build_ivf_pq_index(
         let expected_sample_size =
             lance_index::vector::pq::num_centroids(pq_params.num_bits as u32)
                 * pq_params.sample_rate;
-        let training_data = if training_data.value_length() as usize > expected_sample_size {
-            training_data.sample(expected_sample_size)?
+        let training_data = if let Some(training_data) = training_data {
+            if training_data.value_length() as usize > expected_sample_size {
+                training_data.sample(expected_sample_size)?
+            } else {
+                training_data
+            }
         } else {
-            training_data
+            let start = std::time::Instant::now();
+            log::info!(
+                "Loading training data for PQ. Sample size: {}",
+                expected_sample_size
+            );
+            let data = maybe_sample_training_data(dataset, column, expected_sample_size).await?;
+            log::info!(
+                "Finished loading training data in {:02} seconds",
+                start.elapsed().as_secs_f32()
+            );
+            data
         };
 
         // TODO: consolidate IVF models to `lance_index`.
