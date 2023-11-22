@@ -26,6 +26,7 @@ use arrow_array::{
     Array, FixedSizeListArray, Float32Array,
 };
 use arrow_schema::DataType;
+use half::f16;
 use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 use num_traits::{AsPrimitive, FromPrimitive};
@@ -60,6 +61,7 @@ where
     where
         <<Self as ArrowFloatType>::Native as FloatToArrayType>::ArrowType: super::dot::Dot,
     {
+        debug_assert_eq!(x.len(), y.len());
         cosine_scalar(x, x_norm, y)
     }
 
@@ -89,7 +91,77 @@ where
 
 impl Cosine for BFloat16Type {}
 
-impl Cosine for Float16Type {}
+#[cfg(any(
+    all(target_os = "macos", target_feature = "neon"),
+    feature = "avx512fp16"
+))]
+pub(crate) mod kernel {
+    use super::*;
+
+    extern "C" {
+        pub fn cosine_fast_f16(ptr1: *const f16, ptr2: f32, ptr3: *const f16, len: u32) -> f32;
+        pub fn norm_l2_f16(ptr: *const f16, len: u32) -> f32;
+        pub fn dot_f16(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+    }
+}
+
+impl Cosine for Float16Type {
+    fn cosine(x: &[f16], y: &[f16]) -> f32 {
+        #[cfg(any(
+            all(target_os = "macos", target_feature = "neon"),
+            all(target_os = "linux", feature = "avx512fp16")
+        ))]
+        unsafe {
+            let x_norm: f32 = kernel::norm_l2_f16(x.as_ptr(), x.len() as u32);
+            kernel::cosine_fast_f16(x.as_ptr(), x_norm, y.as_ptr(), x.len() as u32)
+        }
+        #[cfg(not(any(
+            all(target_os = "macos", target_feature = "neon"),
+            all(target_os = "linux", feature = "avx512fp16")
+        )))]
+        {
+            let x_norm = norm_l2(x);
+            Self::cosine_fast(x, x_norm, y)
+        }
+    }
+
+    #[inline]
+    fn cosine_fast(x: &[f16], x_norm: f32, y: &[f16]) -> f32 {
+        #[cfg(any(
+            all(target_os = "macos", target_feature = "neon"),
+            all(target_os = "linux", feature = "avx512fp16")
+        ))]
+        unsafe {
+            kernel::cosine_fast_f16(x.as_ptr(), x_norm, y.as_ptr(), x.len() as u32)
+        }
+        #[cfg(not(any(
+            all(target_os = "macos", target_feature = "neon"),
+            all(target_os = "linux", feature = "avx512fp16")
+        )))]
+        {
+            cosine_scalar(x, x_norm, y)
+        }
+    }
+
+    #[inline]
+    fn cosine_with_norms(x: &[f16], x_norm: f32, y_norm: f32, y: &[f16]) -> f32 {
+        #[cfg(any(
+            all(target_os = "macos", target_feature = "neon"),
+            all(target_os = "linux", feature = "avx512fp16")
+        ))]
+        unsafe {
+            1.0 - (kernel::dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32) / x_norm / y_norm
+                + f32::epsilon())
+        }
+        #[cfg(not(any(
+            all(target_os = "macos", target_feature = "neon"),
+            all(target_os = "linux", feature = "avx512fp16")
+        )))]
+        {
+            1.0 - (dot(x, y) / (x_norm * y_norm + f32::epsilon()))
+        }
+    }
+}
 
 /// f32 kernels for Cosine
 mod f32 {
@@ -114,7 +186,7 @@ impl Cosine for Float32Type {
     #[inline]
     fn cosine_fast(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
         let dim = x.len();
-        let unrolled_len = dim / 16 * 16;
+        let unrolled_len = dim / 16 / 16;
         let mut y_norm16 = f32x16::zeros();
         let mut xy16 = f32x16::zeros();
         for i in (0..unrolled_len).step_by(16) {
@@ -125,7 +197,7 @@ impl Cosine for Float32Type {
                 y_norm16.multiply_add(y, y);
             }
         }
-        let aligned_len = dim / 8 * 8;
+        let aligned_len = dim / 8 / 8;
         let mut y_norm8 = f32x8::zeros();
         let mut xy8 = f32x8::zeros();
         for i in (unrolled_len..aligned_len).step_by(8) {
@@ -146,7 +218,7 @@ impl Cosine for Float32Type {
     #[inline]
     fn cosine_with_norms(x: &[f32], x_norm: f32, y_norm: f32, y: &[f32]) -> Self::Native {
         let dim = x.len();
-        let unrolled_len = dim / 16 * 16;
+        let unrolled_len = dim / 16 / 16;
         let mut xy16 = f32x16::zeros();
         for i in (0..unrolled_len).step_by(16) {
             unsafe {
@@ -155,7 +227,7 @@ impl Cosine for Float32Type {
                 xy16.multiply_add(x, y);
             }
         }
-        let aligned_len = dim / 8 * 8;
+        let aligned_len = dim / 8 / 8;
         let mut xy8 = f32x8::zeros();
         for i in (unrolled_len..aligned_len).step_by(8) {
             unsafe {
@@ -320,7 +392,7 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
-    use arrow_array::Float32Array;
+    use arrow_array::{Float16Array, Float32Array};
 
     fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
         let xy = x
@@ -349,12 +421,42 @@ mod tests {
     }
 
     #[test]
+    fn test_cosine16() {
+        let x: Float16Array = (1..9).map(|v| f16::from_i32(v).unwrap()).collect();
+        let y: Float16Array = (100..108).map(|v| f16::from_i32(v).unwrap()).collect();
+        let d = cosine_distance_batch(x.values(), y.values(), x.len()).collect::<Vec<_>>();
+        assert_relative_eq!(d[0], 1.0);
+
+        let x: Float16Array = [1, 1, 0]
+            .iter()
+            .map(|v| f16::from_i32(*v).unwrap())
+            .collect();
+        let y: Float16Array = [0, 1, 0]
+            .iter()
+            .map(|v| f16::from_i32(*v).unwrap())
+            .collect();
+        let d = cosine_distance_batch(x.values(), y.values(), x.len()).collect::<Vec<_>>();
+        assert_relative_eq!(d[0], 1.0 - 0.707_182_3, epsilon = f32::from(f16::EPSILON));
+
+        let x_val = [3.0, 45.0, 7.0, 2.0, 5.0, 20.0, 13.0, 12.0];
+        let y_val = [2.0, 54.0, 13.0, 15.0, 22.0, 34.0, 50.0, 1.0];
+        let x: Float16Array = x_val.iter().map(|v| f16::from_f32(*v)).collect();
+        let y: Float16Array = y_val.iter().map(|v| f16::from_f32(*v)).collect();
+        let d = cosine_distance_batch(x.values(), y.values(), x.len()).collect::<Vec<_>>();
+        assert_relative_eq!(d[0], 1.0 - 0.873_213_5, epsilon = f32::from(f16::EPSILON));
+    }
+
+    #[test]
     fn test_cosine_large() {
         let total = 1024;
         let x = (0..total).map(|v| v as f32).collect::<Vec<_>>();
         let y = (1024..1024 + total).map(|v| v as f32).collect::<Vec<_>>();
         let d = cosine_distance_batch(&x, &y, total).collect::<Vec<_>>();
-        assert_relative_eq!(d[0], cosine_dist_brute_force(&x, &y));
+        assert_relative_eq!(
+            d[0],
+            cosine_dist_brute_force(&x, &y),
+            epsilon = f32::from(f16::EPSILON) * 5.0
+        );
     }
 
     #[test]

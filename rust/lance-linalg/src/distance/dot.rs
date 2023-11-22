@@ -99,7 +99,7 @@ impl Dot for BFloat16Type {
 
 #[cfg(any(
     all(target_os = "macos", target_feature = "neon"),
-    all(target_os = "linux", feature = "avx512fp16")
+    feature = "avx512fp16"
 ))]
 mod kernel {
     use super::*;

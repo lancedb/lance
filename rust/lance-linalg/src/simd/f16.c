@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -55,3 +56,26 @@ float l2_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
   }
   return (float) sum;
 }
+
+/// @brief Fast cosine function, that assumes that the norm of the first vector is already known.
+/// @param x A f16 vector
+/// @param x_norm Norm of the first vector
+/// @param y A f16 vector
+/// @param dimension The dimension of the vectors
+/// @return The cosine distance of the two vectors.
+float cosine_fast_f16(const _Float16 *x, const float x_norm, const _Float16 *y, uint32_t dimension) {
+  _Float16 xy = 0.0;
+  _Float16 y_sq = 0.0;
+
+#pragma clang loop unroll(enable) interleave(enable) vectorize_width(32)
+  for (uint32_t i = 0; i < dimension; i++) {
+    const _Float16 yi = y[i];
+    xy += x[i] * yi;
+    y_sq += yi * yi;
+  }
+  if (x_norm == 0.0 || y_sq == 0.0) {
+    return 1.0;
+  }
+  return (float) (1 - xy / x_norm / sqrt(y_sq));
+}
+
