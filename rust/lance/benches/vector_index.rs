@@ -20,6 +20,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::TryStreamExt;
+use lance::dataset::builder::DatasetBuilder;
 use lance_index::IndexType;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -88,6 +89,39 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
                     .unwrap()
                     .nprobs(10)
                     .refine(2)
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert!(!results.is_empty());
+            })
+        },
+    );
+
+    // reopen with no index caching to test IO overhead
+    let dataset = rt.block_on(async {
+        DatasetBuilder::from_uri("./vec_data.lance")
+            .with_index_cache_size(0)
+            .load()
+            .await
+            .unwrap()
+    });
+
+    c.bench_function(
+        format!(
+            "Ivf_PQ_NoCache(d={},top_k=10,nprobes=32, refine=1)",
+            q.len()
+        )
+        .as_str(),
+        |b| {
+            b.to_async(&rt).iter(|| async {
+                let results = dataset
+                    .scan()
+                    .nearest("vector", q, 10)
+                    .unwrap()
+                    .nprobs(32)
                     .try_into_stream()
                     .await
                     .unwrap()

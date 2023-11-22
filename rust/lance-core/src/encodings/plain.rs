@@ -18,6 +18,7 @@
 //! it stores the array directly in the file. It offers O(1) read access.
 
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
+use std::ptr::NonNull;
 use std::slice::from_raw_parts;
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use arrow_array::{
     BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, UInt32Array, UInt8Array,
 };
 use arrow_buffer::{bit_util, Buffer};
-use arrow_data::ArrayDataBuilder;
+use arrow_data::{layout, ArrayDataBuilder, BufferSpec};
 use arrow_schema::{DataType, Field};
 use arrow_select::{concat::concat, take::take};
 use async_recursion::async_recursion;
@@ -193,7 +194,45 @@ pub fn bytes_to_array(
     len: usize,
     offset: usize,
 ) -> Result<ArrayRef> {
-    let buf: Buffer = bytes.into();
+    let layout = layout(data_type);
+
+    if layout.buffers.len() != 1 {
+        return Err(Error::Internal {
+            message: format!(
+                "Can only convert datatypes that require one buffer, found {:?}",
+                data_type
+            ),
+            location: location!(),
+        });
+    }
+
+    let buf: Buffer = if let BufferSpec::FixedWidth {
+        byte_width,
+        alignment,
+    } = &layout.buffers[0]
+    {
+        // this code is taken from
+        // https://github.com/apache/arrow-rs/blob/master/arrow-data/src/data.rs#L748-L768
+        let len_plus_offset = bytes.len() + offset;
+        let min_buffer_size = len_plus_offset.saturating_mul(*byte_width);
+
+        // alignment or size isn't right -- just make a copy
+        if (bytes.len() < min_buffer_size) || (bytes.as_ptr().align_offset(*alignment) != 0) {
+            bytes.into()
+        } else {
+            // SAFETY: the alignment is correct we can make this conversion
+            unsafe {
+                Buffer::from_custom_allocation(
+                    NonNull::new(bytes.as_ptr() as _).expect("should be a valid pointer"),
+                    bytes.len(),
+                    Arc::new(bytes),
+                )
+            }
+        }
+    } else {
+        // cases we don't handle, just copy
+        bytes.into()
+    };
 
     let array_data = ArrayDataBuilder::new(data_type.clone())
         .len(len)
