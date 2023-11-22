@@ -903,6 +903,7 @@ mod tests {
         UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow_select::interleave::interleave;
+    use arrow_shortcuts::macros::arr_schema;
     use num_traits::One;
     use proptest::{prop_assert, prop_assert_eq, strategy::Strategy, test_runner::TestCaseError};
 
@@ -1619,10 +1620,7 @@ mod tests {
         use crate::datatypes::Schema;
 
         // Check the output schema is correct
-        let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("a", DataType::Int32, true),
-            ArrowField::new("b", DataType::Utf8, true),
-        ]);
+        let arrow_schema = arr_schema!({a: i32, b: &str});
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let mut collector = StatisticsCollector::new(&schema.fields);
 

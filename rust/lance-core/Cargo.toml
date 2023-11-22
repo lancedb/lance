@@ -20,6 +20,7 @@ arrow-data.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
+arrow-shortcuts.workspace = true
 async-recursion.workspace = true
 async-trait.workspace = true
 lance-arrow.workspace = true

@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "arrow-shortcuts",
+    "arrow-shortcuts-macros",
     "lance-arrow",
     "lance-core",
     "lance-datagen",
@@ -58,6 +60,8 @@ arrow-ord = "47.0"
 arrow-row = "47.0"
 arrow-schema = "47.0"
 arrow-select = "47.0"
+arrow-shortcuts = { version = "47.0", path = "./arrow-shortcuts" }
+arrow-shortcuts-macros = { version = "47.0", path = "./arrow-shortcuts-macros" }
 async-recursion = "1.0"
 async-trait = "0.1"
 aws-config = "0.56"

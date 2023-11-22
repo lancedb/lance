@@ -464,6 +464,7 @@ mod tests {
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
+    use arrow_shortcuts::macros::arr_schema;
 
     #[test]
     fn test_schema_projection() {
@@ -529,15 +530,11 @@ mod tests {
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
 
         let projected = schema.project_by_ids(&[2]);
-        let expected_arrow_schema = ArrowSchema::new(vec![ArrowField::new(
-            "b",
-            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                "f1",
-                DataType::Utf8,
-                true,
-            )])),
-            true,
-        )]);
+        let expected_arrow_schema = arr_schema!({
+            b: {
+                f1: &str
+            }
+        });
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
     }
 
