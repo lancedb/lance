@@ -23,7 +23,6 @@ use pyo3::pymethods;
 use pyo3::PyResult;
 use tracing::subscriber;
 use tracing_chrome::{ChromeLayerBuilder, TraceStyle};
-use tracing_forest::ForestLayer;
 use tracing_subscriber::filter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::Registry;
@@ -69,9 +68,7 @@ pub fn trace_to_chrome(path: Option<&str>, level: Option<&str>) -> PyResult<Trac
     let filter = filter::Targets::new()
         .with_target("lance", level_filter)
         .with_target("pylance", level_filter);
-    let subscriber = Registry::default()
-        .with(chrome_layer.with_filter(filter))
-        .with(ForestLayer::default());
+    let subscriber = Registry::default().with(chrome_layer.with_filter(filter));
     subscriber::set_global_default(subscriber)
         .map(move |_| TraceGuard { guard: Some(guard) })
         .map_err(|_| {

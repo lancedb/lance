@@ -24,10 +24,6 @@ N_DIMS = 768
 NUM_ROWS = 100_000
 NEW_ROWS = 10_000
 
-from lance.tracing import trace_to_chrome
-
-trace_to_chrome(level="debug")
-
 
 def find_or_clean(dataset_path: Path) -> Union[lance.LanceDataset, None]:
     if dataset_path.exists():
@@ -207,8 +203,8 @@ def test_filtered_search(test_dataset, benchmark, selectivity, prefilter, use_in
         "filterable != 0",
         "filterable IN (0)",
         "filterable NOT IN (0)",
-        "filterable != 0 AND filterable != 5000 AND filterable != 10000 AND filterable != 15000",
-        "filterable NOT IN (0, 5000, 10000, 15000)",
+        "filterable != 0 AND filterable != 5000 AND filterable != 10000",
+        "filterable NOT IN (0, 5000, 10000)",
         "filterable < 5000",
         "filterable > 5000",
     ),
