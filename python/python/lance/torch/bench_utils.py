@@ -68,5 +68,3 @@ def ground_truth(
         )
         vectors = vectors.to(device)
         dists = l2_distance(query, vectors)
-        print(dists)
-        pass
