@@ -76,3 +76,6 @@ def ground_truth(
             print(dists)
 
         values, indices = torch.sort(dists)
+        # Keep only k elements
+        indices = indices[:k, :]
+        print(indices)
