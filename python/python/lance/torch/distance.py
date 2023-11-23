@@ -94,7 +94,7 @@ def pairwise_l2(x: torch.Tensor, y: torch.Tensor, y2: Optional[torch.Tensor] = N
     y : torch.Tensor
         A 2-D ``[N, D]`` tensor, containing `N` vectors.
     y2: 1-D tensor.Tensor, optional
-        Optionally, contains `y^2`.
+        Optionally, the pre-computed `y^2`.
 
     Returns
     -------
