@@ -21,6 +21,7 @@ import torch
 
 from .. import LanceDataset
 from . import preferred_device
+from .distance import pairwise_l2
 
 
 def ground_truth(
@@ -58,13 +59,20 @@ def ground_truth(
     if isinstance(query, np.ndarray):
         query = torch.from_numpy(query)
     query = query.to(device)
+    metric_type = metric_type.lower()
 
     for batch in ds.to_batches(
         columns=[column], batch_size=batch_size, with_row_id=True
     ):
-        print(batch)
         vectors = torch.from_numpy(
             np.stack(batch[column].to_numpy(zero_copy_only=False))
         )
+        row_ids = torch.from_numpy(
+            np.stack(batch["_row_id"].to_numpy(zero_copy_only=False))
+        )
         vectors = vectors.to(device)
-        dists = l2_distance(query, vectors)
+        if metric_type == "l2":
+            dists = pairwise_l2(query, vectors)
+            print(dists)
+
+        values, indices = torch.sort(dists)
