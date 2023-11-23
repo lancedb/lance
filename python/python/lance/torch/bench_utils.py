@@ -14,7 +14,7 @@
 
 """Benchmark Utilities built on PyTorch"""
 
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -22,6 +22,15 @@ import torch
 from .. import LanceDataset
 from . import preferred_device
 from .distance import pairwise_l2
+
+
+def sort_tensors(
+    values: torch.Tensor, ids: torch.Tensor, k: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    sorted, indices = torch.sort(values)
+    indices = indices[:, :k]
+    sorted_idx = torch.gather(ids, 1, indices)
+    return sorted[:, :k], sorted_idx
 
 
 def ground_truth(
