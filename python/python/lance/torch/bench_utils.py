@@ -24,13 +24,13 @@ from . import preferred_device
 from .distance import pairwise_l2
 
 
-def sort_tensors(
-    values: torch.Tensor, ids: torch.Tensor, k: int
+def sort_multiple_tensors(
+    source: torch.Tensor, other: torch.Tensor, k: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    sorted, indices = torch.sort(values)
+    sorted_values, indices = torch.sort(source)
     indices = indices[:, :k]
-    sorted_idx = torch.gather(ids, 1, indices)
-    return sorted[:, :k], sorted_idx
+    sorted_others = torch.gather(other, 1, indices)
+    return sorted_values[:, :k], sorted_others
 
 
 def ground_truth(
@@ -70,6 +70,9 @@ def ground_truth(
     query = query.to(device)
     metric_type = metric_type.lower()
 
+    all_ids = torch.tensor([[]], device=device)
+    all_dists = torch.tensor([[]], device=device)
+
     for batch in ds.to_batches(
         columns=[column], batch_size=batch_size, with_row_id=True
     ):
@@ -82,9 +85,13 @@ def ground_truth(
         vectors = vectors.to(device)
         if metric_type == "l2":
             dists = pairwise_l2(query, vectors)
-            print(dists)
+        elif metric_type == "cosine":
+            pass
 
-        values, indices = torch.sort(dists)
-        # Keep only k elements
-        indices = indices[:k, :]
-        print(indices)
+        dists, row_ids = sort_multiple_tensors(dists, row_ids, k)
+
+        all_ids = torch.cat([all_ids, row_ids], 1)
+        all_dists = torch.cat([dists, all_dists], 1)
+        all_dists, all_ids = sort_multiple_tensors(all_dists, all_ids, k)
+
+    return all_ids
