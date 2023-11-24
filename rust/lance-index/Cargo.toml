@@ -44,6 +44,12 @@ serde.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+bincode = { version = "2.0.0-rc.3" }
+rocksdb = { version = "0.21" }
+kdam = "0.5"
+tempfile.workspace = true
+moka.workspace = true
+npy = "0"
 
 [dev-dependencies]
 approx.workspace = true
@@ -51,9 +57,9 @@ criterion.workspace = true
 lance-datagen.workspace = true
 lance-testing.workspace = true
 pprof.workspace = true
-tempfile.workspace = true
 sqlparser = "0.39.0"
 datafusion-sql = "32.0.0"
+
 
 [build-dependencies]
 prost-build.workspace = true
@@ -66,3 +72,12 @@ harness = false
 [[bench]]
 name = "pq_dist_table"
 harness = false
+
+[[bin]]
+name = "index_1mil"
+
+[[bin]]
+name = "index_test"
+
+[[bin]]
+name = "index_inspect"
