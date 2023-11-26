@@ -69,15 +69,15 @@ def _efficient_sample(
     chunk_sample_size = n // max_takes
     for idx, i in enumerate(range(0, total_records, chunk_size)):
         # Add more randomness within each chunk.
-        offset = i + np.random.randint(0, chunk_size - chunk_sample_size)
+        offset = min(total_records - chunk_sample_size, i + np.random.randint(0, chunk_size - chunk_sample_size))
         buf.extend(
             dataset.take(
-                list(range(offset, offset + chunk_sample_size)),
+                list(range(max(i, offset), offset + chunk_sample_size)),
                 columns=columns,
             ).to_batches()
         )
         if idx % 50 == 0:
-            logging.info("Sampled at offset=%s, len=%s", offset, chunk_sample_size)
+            logging.info("Sampled at offset=%s, len=%s", max(i, offset), chunk_sample_size)
         if sum(len(b) for b in buf) >= batch_size:
             tbl = pa.Table.from_batches(buf)
             buf.clear()
