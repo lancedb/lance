@@ -39,7 +39,6 @@ mod kernel {
 
     extern "C" {
         pub fn norm_l2_f16(ptr: *const f16, len: u32) -> f32;
-        pub fn norm_l2_bf16(ptr: *const bf16, len: u32) -> f32;
     }
 }
 
@@ -89,11 +88,21 @@ impl Normalize<f16> for &[f16] {
     }
 }
 
+// `avx512bf16` is not supported in rustc yet. Once it is supported, we can
+// move it to target_feture.
+#[cfg(any(
+all(target_os = "macos", target_feature = "neon"),
+feature = "avx512bf16"
+))]
+mod kernel {
+    use super::*;
+
+    extern "C" {
+        pub fn norm_l2_bf16(ptr: *const bf16, len: u32) -> f32;
+    }
+}
+
 impl Normalize<bf16> for &[bf16] {
-    // #[inline]
-    // fn norm_l2(&self) -> f32 {   
-    //     norm_l2_impl::<bf16, 32>(self)
-    // }
     fn norm_l2(&self) -> f32 {
         #[cfg(any(
             all(target_os = "macos", target_feature = "neon"),
@@ -106,35 +115,7 @@ impl Normalize<bf16> for &[bf16] {
             all(target_os = "macos", target_feature = "neon"),
             feature = "avx512bf16"
         )))]
-        {
-            // Please run `cargo bench --bench norm_l2" on Apple Silicon when
-            // change the following code.
-            const LANES: usize = 16;
-            let chunks = self.chunks_exact(LANES);
-            let sum = if chunks.remainder().is_empty() {
-                0.0
-            } else {
-                chunks
-                    .remainder()
-                    .iter()
-                    .map(|v| v.to_f32().powi(2))
-                    .sum::<f32>()
-            };
-
-            let mut sums: [f32; LANES] = [0_f32; LANES];
-            for chk in chunks {
-                // Convert to f32
-                let mut f32_vals: [f32; LANES] = [0_f32; LANES];
-                for i in 0..LANES {
-                    f32_vals[i] = chk[i].to_f32();
-                }
-                // Vectorized multiply
-                for i in 0..LANES {
-                    sums[i] += f32_vals[i].powi(2);
-                }
-            }
-            (sums.iter().copied().sum::<f32>() + sum).sqrt()
-        }
+        norm_l2_impl::<bf16, 32>(self)
     }
 }
 
