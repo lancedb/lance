@@ -145,6 +145,29 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                 _ => Ok(expr.clone()),
             }
         }
+        Expr::InList(in_list) => {
+            if matches!(
+                in_list.expr.as_ref(),
+                Expr::Column(_) | Expr::GetIndexedField(_)
+            ) {
+                if let Some(resolved_type) = resolve_column_type(in_list.expr.as_ref(), schema) {
+                    let resolved_values = in_list
+                        .list
+                        .iter()
+                        .map(|val| coerce_expr(val, &resolved_type))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Expr::in_list(
+                        in_list.expr.as_ref().clone(),
+                        resolved_values,
+                        in_list.negated,
+                    ))
+                } else {
+                    Ok(expr.clone())
+                }
+            } else {
+                Ok(expr.clone())
+            }
+        }
         _ => {
             // Passthrough
             Ok(expr.clone())
@@ -248,6 +271,37 @@ mod tests {
             },
             _ => panic!("Expected BinaryExpr"),
         }
+    }
+
+    #[test]
+    fn test_resolve_in_expr() {
+        // Type coersion should apply for `A IN (0)` or `A NOT IN (0)`
+        let arrow_schema = ArrowSchema::new(vec![Field::new("a", DataType::Float32, false)]);
+        let expr = Expr::in_list(
+            Expr::Column("a".to_string().into()),
+            vec![Expr::Literal(ScalarValue::Float64(Some(0.0)))],
+            false,
+        );
+        let resolved = resolve_expr(&expr, &Schema::try_from(&arrow_schema).unwrap()).unwrap();
+        let expected = Expr::in_list(
+            Expr::Column("a".to_string().into()),
+            vec![Expr::Literal(ScalarValue::Float32(Some(0.0)))],
+            false,
+        );
+        assert_eq!(resolved, expected);
+
+        let expr = Expr::in_list(
+            Expr::Column("a".to_string().into()),
+            vec![Expr::Literal(ScalarValue::Float64(Some(0.0)))],
+            true,
+        );
+        let resolved = resolve_expr(&expr, &Schema::try_from(&arrow_schema).unwrap()).unwrap();
+        let expected = Expr::in_list(
+            Expr::Column("a".to_string().into()),
+            vec![Expr::Literal(ScalarValue::Float32(Some(0.0)))],
+            true,
+        );
+        assert_eq!(resolved, expected);
     }
 
     #[test]

@@ -39,7 +39,7 @@ use nohash_hasher::IntMap;
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::{location, Location};
-use tracing::{instrument, Instrument};
+use tracing::instrument;
 
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
@@ -204,7 +204,6 @@ impl VectorIndex for PQIndex {
             ]));
             Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
         })
-        .in_current_span()
         .await
     }
 

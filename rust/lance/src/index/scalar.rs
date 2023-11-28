@@ -69,7 +69,7 @@ impl BtreeTrainingSource for TrainingRequest {
 }
 
 /// Build a Vector Index
-#[instrument(skip(dataset))]
+#[instrument(level = "debug", skip(dataset))]
 pub async fn build_scalar_index(dataset: &Dataset, column: &str, uuid: &str) -> Result<()> {
     let training_request = Box::new(TrainingRequest {
         dataset: Arc::new(dataset.clone()),
