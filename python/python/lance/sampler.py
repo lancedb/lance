@@ -21,15 +21,19 @@ import logging
 from dataclasses import dataclass, field
 from heapq import heappush, heappushpop
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, TypeVar, Union
+from typing import TYPE_CHECKING, Iterable, NamedTuple, Optional, TypeVar, Union
 
 import numpy as np
 import pyarrow as pa
 
 import lance
 
+from .lance import _build_shuffle_sample
+
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+    from .lance import DatasetSample
 
 __all__ = ["maybe_sample"]
 
@@ -163,3 +167,82 @@ def reservoir_sampling(stream: Iterable[T], k: int) -> list[T]:
     samples = [i.item for i in heap]
     del heap
     return samples
+
+
+@dataclass
+class SampleParams:
+    """Advanced parameters for how a dataset should be sampled.
+
+    Intuitively, the sampler follows the following steps:
+    1. Filter the dataset using the predicate.
+    2. Sample rows that pass the filter
+    3. Batch the sampled rows.
+    4. Shuffle the batches.
+    """
+
+    predicate: Optional[str] = None
+    """A SQL filter to apply to the dataset prior to sampling and shuffling."""
+    batch_size: int = 32
+    """
+    The max size of a batch to read as contiguous rows. Smaller values mean more
+    randomization, but also more IO overhead. Defaults to 32.
+
+    Values higher than 1024 (or whatever the group size of the dataset files is)
+    have no meaningful performance benefit.
+    """
+    shuffle: bool = True
+    """
+    Whether to shuffle the batches after sampling to randomize the order.
+
+    This is useful for training, if the order of rows isn't already random.
+    """
+    sample_rate: Optional[float] = None
+    """
+    The number of rows to sample. If None, all rows are sampled.
+
+    This is applied *after* the predicate is applied. Fewer rows may be sampled
+    if the predicate filters the dataset down to fewer rows than desired count.
+    """
+    seed: Optional[int] = None
+    """
+    The random seed to use for sampling.
+
+    Use this to ensure that the same sample is generated across multiple runs.
+    """
+
+    def __post_init__(self):
+        if self.sample_rate is not None and self.sample_rate <= 0:
+            raise ValueError("sample_rate must be > 0")
+        if self.sample_rate is not None and self.sample_rate > 1:
+            raise ValueError("sample_rate must be <= 1")
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+
+
+class SampleMetrics(NamedTuple):
+    dataset_size: int
+    """
+    The number of rows in the dataset
+    """
+    matched_rows: int
+    """
+    The number of rows that matched the predicate (or all rows if no predicate was
+    specified).
+    """
+    sampled_rows: int
+    """
+    The number of rows that were sampled (or all rows if no sampling was specified).
+    """
+
+
+def build_shuffle_sample(
+    dataset: lance.LanceDataset,
+    params: Optional[SampleParams] = None,
+    **kwargs,
+) -> DatasetSample:
+    """Build a pre-computed sample from the dataset."""
+    if params is None:
+        params = SampleParams(**kwargs)
+
+    # python/src/sampler.rs
+    return _build_shuffle_sample(dataset._ds, params)

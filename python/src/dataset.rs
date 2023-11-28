@@ -149,7 +149,7 @@ impl Operation {
 pub struct Dataset {
     #[pyo3(get)]
     uri: String,
-    ds: Arc<LanceDataset>,
+    pub(crate) ds: Arc<LanceDataset>,
 }
 
 #[pymethods]
@@ -408,7 +408,7 @@ impl Dataset {
         Ok(Scanner::new(scan))
     }
 
-    fn count_rows(&self) -> PyResult<usize> {
+    pub fn count_rows(&self) -> PyResult<usize> {
         RT.runtime
             .block_on(self.ds.count_rows())
             .map_err(|err| PyIOError::new_err(err.to_string()))

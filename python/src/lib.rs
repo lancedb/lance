@@ -37,6 +37,7 @@ use env_logger::Env;
 use futures::StreamExt;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
+use sampler::DatasetSample;
 
 #[macro_use]
 extern crate lazy_static;
@@ -48,6 +49,7 @@ pub(crate) mod dataset;
 pub(crate) mod executor;
 pub(crate) mod fragment;
 pub(crate) mod reader;
+pub(crate) mod sampler;
 pub(crate) mod scanner;
 pub(crate) mod tracing;
 pub(crate) mod updater;
@@ -55,6 +57,7 @@ pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
 use crate::fragment::{cleanup_partial_writes, write_fragments};
+use crate::sampler::build_shuffle_sample;
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::KMeans;
 pub use dataset::write_dataset;
@@ -108,6 +111,8 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
     m.add_class::<TraceGuard>()?;
+    m.add_class::<DatasetSample>()?;
+    m.add_wrapped(wrap_pyfunction!(build_shuffle_sample))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
