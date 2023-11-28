@@ -107,33 +107,35 @@ impl Normalize<bf16> for &[bf16] {
             feature = "avx512fp16"
         )))]
         {
-            // Please run `cargo bench --bench norm_l2" on Apple Silicon when
-            // change the following code.
-            const LANES: usize = 16;
-            let chunks = self.chunks_exact(LANES);
-            let sum = if chunks.remainder().is_empty() {
-                0.0
-            } else {
-                chunks
-                    .remainder()
-                    .iter()
-                    .map(|v| v.to_f32().powi(2))
-                    .sum::<f32>()
-            };
-
-            let mut sums: [f32; LANES] = [0_f32; LANES];
-            for chk in chunks {
-                // Convert to f32
-                let mut f32_vals: [f32; LANES] = [0_f32; LANES];
-                for i in 0..LANES {
-                    f32_vals[i] = chk[i].to_f32();
-                }
-                // Vectorized multiply
-                for i in 0..LANES {
-                    sums[i] += f32_vals[i].powi(2);
-                }
-            }
-            (sums.iter().copied().sum::<f32>() + sum).sqrt()
+            return norm_l2_impl::<bf16, 32>(self);
+            // norm_l2_impl::<bf16, 32>(self)
+            // // Please run `cargo bench --bench norm_l2" on Apple Silicon when
+            // // change the following code.
+            // const LANES: usize = 16;
+            // let chunks = self.chunks_exact(LANES);
+            // let sum = if chunks.remainder().is_empty() {
+            //     0.0
+            // } else {
+            //     chunks
+            //         .remainder()
+            //         .iter()
+            //         .map(|v| v.to_f32().powi(2))
+            //         .sum::<f32>()
+            // };
+            //
+            // let mut sums: [f32; LANES] = [0_f32; LANES];
+            // for chk in chunks {
+            //     // Convert to f32
+            //     let mut f32_vals: [f32; LANES] = [0_f32; LANES];
+            //     for i in 0..LANES {
+            //         f32_vals[i] = chk[i].to_f32();
+            //     }
+            //     // Vectorized multiply
+            //     for i in 0..LANES {
+            //         sums[i] += f32_vals[i].powi(2);
+            //     }
+            // }
+            // (sums.iter().copied().sum::<f32>() + sum).sqrt()
         }
     }
 }

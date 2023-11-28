@@ -20,8 +20,8 @@
 #endif // __X86_64__
 
 /// Works on NEON + FP16 or AVX512FP16
-float norm_l2_bf16(const _BFloat16 *data, uint32_t dimension) {
-  _BFloat16 sum = 0;
+float norm_l2_bf16(const __bf16 *data, uint32_t dimension) {
+  __bf16 sum = 0;
 
 #pragma clang loop unroll(enable) vectorize(enable) interleave(enable)
   for (uint32_t i = 0; i < dimension; i++) {
@@ -30,12 +30,12 @@ float norm_l2_bf16(const _BFloat16 *data, uint32_t dimension) {
   return (float) sum;
 }
 
-float l2_bf16(const _BFloat16 *x, const _Float16 *y, uint32_t dimension) {
-  _BFloat16 sum = 0.0;
+float l2_bf16(const __bf16 *x, const __bf16 *y, uint32_t dimension) {
+  __bf16 sum = 0.0;
 
 #pragma clang loop unroll(enable) interleave(enable) vectorize_width(32)
   for (uint32_t i = 0; i < dimension; i++) {
-    _BFloat16 s = x[i] - y[i];
+    __bf16 s = x[i] - y[i];
     sum += s * s;
   }
   return (float) sum;
