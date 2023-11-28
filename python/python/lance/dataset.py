@@ -1551,7 +1551,7 @@ class ScannerBuilder:
         if k is not None and int(k) <= 0:
             raise ValueError(f"Nearest-K must be > 0 but got {k}")
         if nprobes is not None and int(nprobes) <= 0:
-            raise ValueError(f"Nearest-K must be > 0 but got {nprobes}")
+            raise ValueError(f"Nprobes must be > 0 but got {nprobes}")
         if refine_factor is not None and int(refine_factor) < 1:
             raise ValueError(f"Refine factor must be 1 or more got {refine_factor}")
         self._nearest = {
