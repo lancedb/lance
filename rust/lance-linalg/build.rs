@@ -14,18 +14,19 @@ fn main() {
             .flag("-Wextra")
             .flag("-Wpedantic")
             .compile("f16");
-
-        // cc::Build::new()
-        //     .compiler("clang")
-        //     .file("src/simd/bf16.c")
-        //     .flag("-mtune=apple-m1")
-        //     .flag("-ffast-math")
-        //     .flag("-O3")
-        //     .flag("-Wall")
-        //     .flag("-Werror")
-        //     .flag("-Wextra")
-        //     .flag("-Wpedantic")
-        //     .compile("bf16");
+    }
+    if cfg!(all(target_os = "macos", feature = "FEAT_BF16")) {
+        cc::Build::new()
+            .compiler("clang")
+            .file("src/simd/bf16.c")
+            .flag("-mtune=apple-m1")
+            .flag("-ffast-math")
+            .flag("-O3")
+            .flag("-Wall")
+            .flag("-Werror")
+            .flag("-Wextra")
+            .flag("-Wpedantic")
+            .compile("bf16");
     }
 
     if cfg!(all(target_os = "linux", feature = "avx512fp16")) {
@@ -47,7 +48,9 @@ fn main() {
             .flag("-Wextra")
             .flag("-Wpedantic")
             .compile("f16");
+    }
 
+    if cfg!(all(target_os = "linux", feature = "AVX512bf16")) {
         cc::Build::new()
             .compiler("clang")
             .std("c17")
@@ -56,9 +59,7 @@ fn main() {
             .flag("-ffast-math")
             .flag("-mavx512f")
             .flag("-mavx512vl")
-            .flag("-mavx512bw")
-            .flag("-mavx512vnni")
-            .flag("-mavx512fp16")
+            .flag("-mavx512bf16")
             .flag("-O3")
             .flag("-Wall")
             .flag("-Werror")
