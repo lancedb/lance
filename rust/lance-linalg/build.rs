@@ -59,7 +59,7 @@ fn main() {
             .flag("-ffast-math")
             .flag("-mavx512f")
             .flag("-mavx512vl")
-            .flag("-mavx512bf16")
+            .flag("-mavx512_bf16")
             .flag("-O3")
             .flag("-Wall")
             .flag("-Werror")
