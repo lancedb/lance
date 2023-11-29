@@ -241,6 +241,39 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             _ => None,
         },
         ScalarValue::Null => Some(value.clone()),
+        ScalarValue::List(vals, _) => {
+            if let DataType::FixedSizeList(_, size) = ty {
+                if let Some(vals) = vals {
+                    if vals.len() as i32 != *size {
+                        return None;
+                    }
+                }
+            }
+            let (new_values, field) = match ty {
+                DataType::List(field)
+                | DataType::LargeList(field)
+                | DataType::FixedSizeList(field, _) => {
+                    if let Some(vals) = vals {
+                        let values = vals
+                            .iter()
+                            .map(|val| safe_coerce_scalar(val, field.data_type()))
+                            .collect::<Option<Vec<_>>>();
+                        (values, field)
+                    } else {
+                        (None, field)
+                    }
+                }
+                _ => return None,
+            };
+
+            match ty {
+                DataType::List(_) => Some(ScalarValue::List(new_values, field.clone())),
+                DataType::FixedSizeList(_, size) => {
+                    Some(ScalarValue::Fixedsizelist(new_values, field.clone(), *size))
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

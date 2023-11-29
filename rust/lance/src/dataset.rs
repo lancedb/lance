@@ -58,6 +58,7 @@ pub mod progress;
 pub mod scanner;
 pub mod transaction;
 pub mod updater;
+mod utils;
 mod write;
 
 use self::builder::DatasetBuilder;
@@ -79,6 +80,7 @@ use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
+pub use write::update::{UpdateBuilder, UpdateJob};
 pub use write::{write_fragments, WriteMode, WriteParams};
 
 const INDICES_DIR: &str = "_indices";

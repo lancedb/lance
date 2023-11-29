@@ -366,6 +366,9 @@ pub trait RecordBatchExt {
     /// If the named column does not exist, it returns a copy of this [`RecordBatch`].
     fn drop_column(&self, name: &str) -> Result<RecordBatch>;
 
+    /// Replace a column (specified by name) and return the new [`RecordBatch`].
+    fn replace_column_by_name(&self, name: &str, column: Arc<dyn Array>) -> Result<RecordBatch>;
+
     /// Get (potentially nested) column by qualified name.
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef>;
 
@@ -426,6 +429,18 @@ impl RecordBatchExt for RecordBatch {
             )),
             columns,
         )
+    }
+
+    fn replace_column_by_name(&self, name: &str, column: Arc<dyn Array>) -> Result<RecordBatch> {
+        let mut columns = self.columns().to_vec();
+        let field_i = self
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == name)
+            .ok_or_else(|| ArrowError::SchemaError(format!("Field {} does not exist", name)))?;
+        columns[field_i] = column;
+        Self::try_new(self.schema().clone(), columns)
     }
 
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef> {

@@ -19,7 +19,7 @@ use std::task::{Context, Poll};
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use async_recursion::async_recursion;
-use datafusion::logical_expr::AggregateFunction;
+use datafusion::logical_expr::{AggregateFunction, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -55,7 +55,6 @@ use crate::io::{
     exec::{KNNFlatExec, KNNIndexExec, LanceScanExec, Planner, ProjectionExec, TakeExec},
     RecordBatchStream,
 };
-use crate::utils::sql::parse_sql_filter;
 use crate::{Error, Result};
 use snafu::{location, Location};
 
@@ -132,8 +131,8 @@ pub struct Scanner {
     /// If true then the filter will be applied before an index scan
     prefilter: bool,
 
-    /// Optional filters string.
-    filter: Option<String>,
+    /// Optional filter expression.
+    filter: Option<Expr>,
 
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: usize,
@@ -280,9 +279,14 @@ impl Scanner {
     /// Once the filter is applied, Lance will create an optimized I/O plan for filtering.
     ///
     pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
-        parse_sql_filter(filter)?;
-        self.filter = Some(filter.to_string());
+        let planner = Planner::new(self.schema()?);
+        self.filter = Some(planner.parse_filter(filter)?);
         Ok(self)
+    }
+
+    pub(crate) fn filter_expr(&mut self, filter: Expr) -> &mut Self {
+        self.filter = Some(filter);
+        self
     }
 
     /// Set the batch size.
@@ -651,7 +655,8 @@ impl Scanner {
         let mut filter_plan = if let Some(filter) = self.filter.as_ref() {
             let planner = Planner::new(Arc::new(self.dataset.schema().into()));
             let index_info = self.dataset.scalar_index_info().await?;
-            let filter_plan = planner.create_filter_plan(filter, &index_info, use_scalar_index)?;
+            let filter_plan =
+                planner.create_filter_plan(filter.clone(), &index_info, use_scalar_index)?;
 
             // TODO: Remove this check once we handle indexed scans with new data
             // This check is testing to see if we have an indexed query and new data
@@ -678,7 +683,7 @@ impl Scanner {
                 if has_new_data || has_missing_row_count {
                     // We need row counts to use scalar indices.  If we don't have them then
                     // fallback to a non-indexed filter
-                    planner.create_filter_plan(filter, &index_info, false)?
+                    planner.create_filter_plan(filter.clone(), &index_info, false)?
                 } else {
                     filter_plan
                 }
@@ -1233,6 +1238,7 @@ mod test {
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{ArrowError, DataType};
     use arrow_select::take;
+    use datafusion::logical_expr::{col, lit};
     use futures::TryStreamExt;
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
@@ -1326,7 +1332,7 @@ mod test {
         assert!(scan.filter.is_none());
 
         scan.filter("i > 50").unwrap();
-        assert_eq!(scan.filter, Some("i > 50".to_string()));
+        assert_eq!(scan.filter, Some(col("i").gt(lit(50))));
 
         let batches = scan
             .project(&["s"])

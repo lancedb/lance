@@ -96,10 +96,7 @@ use std::collections::HashMap;
 use std::ops::{AddAssign, Range};
 use std::sync::{Arc, RwLock};
 
-use arrow_array::{RecordBatch, UInt64Array};
 use async_trait::async_trait;
-use datafusion::error::Result as DFResult;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use nohash_hasher::{BuildNoHashHasher, IntMap};
@@ -107,7 +104,6 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::dataset::ROW_ID;
 use crate::format::RowAddress;
 use crate::io::commit::{commit_transaction, migrate_fragments};
 use crate::Result;
@@ -116,6 +112,7 @@ use crate::{format::Fragment, Dataset};
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
 use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
+use super::utils::make_rowid_capture_stream;
 use super::{write_fragments_internal, WriteMode, WriteParams};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -617,65 +614,6 @@ pub struct RewriteResult {
     /// The original fragments being replaced
     pub original_fragments: Vec<Fragment>,
     pub row_id_map: IntMap<u64, Option<u64>>,
-}
-
-fn extract_row_ids(
-    row_ids: &mut RoaringTreemap,
-    batch: DFResult<RecordBatch>,
-) -> DFResult<RecordBatch> {
-    let batch = batch?;
-
-    let (row_id_idx, _) = batch
-        .schema()
-        .column_with_name(ROW_ID)
-        .expect("Received a batch without row ids");
-    let row_ids_arr = batch.column(row_id_idx);
-    let row_ids_itr = row_ids_arr
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .unwrap_or_else(|| {
-            panic!(
-                "Row ids had an unexpected type: {}",
-                row_ids_arr.data_type()
-            )
-        })
-        .values()
-        .iter()
-        .copied();
-    row_ids.append(row_ids_itr).map_err(|err| {
-        datafusion::error::DataFusionError::Execution(format!(
-            "Row ids did not arrive in sorted order: {}",
-            err
-        ))
-    })?;
-    let non_row_ids_cols = (0..batch.num_columns())
-        .filter(|col| *col != row_id_idx)
-        .collect::<Vec<_>>();
-    Ok(batch.project(&non_row_ids_cols)?)
-}
-
-fn make_rowid_capture_stream(
-    row_ids: Arc<RwLock<RoaringTreemap>>,
-    target: SendableRecordBatchStream,
-) -> Result<SendableRecordBatchStream> {
-    let schema = target.schema();
-    let stream = target.map(move |batch| {
-        let mut row_ids = row_ids.write().unwrap();
-        extract_row_ids(&mut row_ids, batch)
-    });
-
-    let (row_id_idx, _) = schema
-        .column_with_name(ROW_ID)
-        .expect("Received a batch without row ids");
-
-    let non_row_ids_cols = (0..schema.fields.len())
-        .filter(|col| *col != row_id_idx)
-        .collect::<Vec<_>>();
-
-    let schema = Arc::new(schema.project(&non_row_ids_cols)?);
-
-    let stream = RecordBatchStreamAdapter::new(schema, stream);
-    Ok(Box::pin(stream))
 }
 
 /// Iterator that yields row_ids that are in the given fragments but not in

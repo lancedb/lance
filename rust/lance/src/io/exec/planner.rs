@@ -17,15 +17,15 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use arrow_schema::{DataType as ArrowDataType, SchemaRef, TimeUnit};
+use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
 use datafusion::common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion};
 use datafusion::common::DFSchema;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{GetFieldAccess, GetIndexedField};
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::sqlparser::ast::{
-    BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr, Function,
-    FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
+    Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr,
+    Function, FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
 };
 use datafusion::{
     common::Column,
@@ -35,12 +35,14 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
+use lance_datafusion::expr::safe_coerce_scalar;
 use lance_index::scalar::expression::{
     apply_scalar_indices, IndexInformationProvider, ScalarIndexExpr,
 };
 use snafu::{location, Location};
 
 use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
+use crate::utils::sql::parse_sql_expr;
 use crate::{
     datafusion::logical_expr::resolve_expr, datatypes::Schema, utils::sql::parse_sql_filter, Error,
     Result,
@@ -345,6 +347,48 @@ impl Planner {
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
             SQLExpr::Value(value) => self.value(value),
+            SQLExpr::Array(SQLArray { elem, .. }) => {
+                let mut values = vec![];
+
+                for expr in elem {
+                    if let SQLExpr::Value(value) = expr {
+                        if let Expr::Literal(value) = self.value(value)? {
+                            values.push(value);
+                        } else {
+                            return Err(Error::Internal {
+                                message: "Expected a literal value in array.".into(),
+                                location: location!(),
+                            });
+                        }
+                    } else {
+                        return Err(Error::IO {
+                            message: "Only arrays of literals are supported in lance.".into(),
+                            location: location!(),
+                        });
+                    }
+                }
+
+                let field = if !values.is_empty() {
+                    let data_type = values[0].data_type();
+
+                    for value in &mut values {
+                        if value.data_type() != data_type {
+                            *value = safe_coerce_scalar(value, &data_type).ok_or_else(|| Error::IO {
+                                message: format!("Array expressions must have a consistent datatype. Expected: {}, got: {}", data_type, value.data_type()),
+                                location: location!()
+                            })?;
+                        }
+                    }
+                    Field::new("item", data_type, true)
+                } else {
+                    Field::new("item", ArrowDataType::Null, true)
+                };
+
+                Ok(Expr::Literal(ScalarValue::List(
+                    Some(values),
+                    Arc::new(field),
+                )))
+            }
             // For example, DATE '2020-01-01'
             SQLExpr::TypedString { data_type, value } => {
                 Ok(Expr::Cast(datafusion::logical_expr::Cast {
@@ -401,7 +445,7 @@ impl Planner {
                 data_type: self.parse_type(data_type)?,
             })),
             _ => Err(Error::IO {
-                message: format!("Expression '{expr}' is not supported as filter in lance"),
+                message: format!("Expression '{expr}' is not supported SQL in lance"),
                 location: location!(),
             }),
         }
@@ -413,12 +457,23 @@ impl Planner {
     /// before being passed to [create_physical_expr()].
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
-
         let ast_expr = parse_sql_filter(filter)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
         let resolved = resolve_expr(&expr, &schema)?;
         coerce_filter_type_to_boolean(resolved)
+    }
+
+    /// Create Logical [Expr] from a SQL expression.
+    ///
+    /// Note: the returned expression must be passed through [optimize_filter()]
+    /// before being passed to [create_physical_expr()].
+    pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
+        let ast_expr = parse_sql_expr(expr)?;
+        let expr = self.parse_sql_expr(&ast_expr)?;
+        let schema = Schema::try_from(self.schema.as_ref())?;
+        let resolved = resolve_expr(&expr, &schema)?;
+        Ok(resolved)
     }
 
     /// Optimize the filter expression and coerce data types.
@@ -431,6 +486,7 @@ impl Planner {
         let simplify_context = SimplifyContext::new(&props).with_schema(df_schema.clone());
         let simplifier =
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
+
         let expr = simplifier.simplify(expr.clone())?;
         let expr = simplifier.coerce(expr, df_schema.clone())?;
 
@@ -469,12 +525,11 @@ impl Planner {
     /// a refine portion that must be applied after the index search
     pub fn create_filter_plan(
         &self,
-        filter: &str,
+        filter: Expr,
         index_info: &dyn IndexInformationProvider,
         use_scalar_index: bool,
     ) -> Result<FilterPlan> {
-        let logical_expr = self.parse_filter(filter)?;
-        let logical_expr = self.optimize_expr(logical_expr)?;
+        let logical_expr = self.optimize_expr(filter)?;
         if use_scalar_index {
             let indexed_expr = apply_scalar_indices(logical_expr, index_info);
             Ok(FilterPlan {
@@ -992,6 +1047,44 @@ mod tests {
                         assert_eq!(data_type, expected_data_type);
                     }
                     _ => panic!("Expected right to be a cast"),
+                },
+                _ => panic!("Expected binary expression"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_sql_array_literals() {
+        let cases = [
+            (
+                "x = [1, 2, 3]",
+                ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Int64, true))),
+            ),
+            (
+                "x = [1, 2, 3]",
+                ArrowDataType::FixedSizeList(
+                    Arc::new(Field::new("item", ArrowDataType::Int64, true)),
+                    3,
+                ),
+            ),
+        ];
+
+        for (sql, expected_data_type) in cases {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "x",
+                expected_data_type.clone(),
+                true,
+            )]));
+            let planner = Planner::new(schema.clone());
+            let expr = planner.parse_filter(sql).unwrap();
+            let expr = planner.optimize_expr(expr).unwrap();
+
+            match expr {
+                Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
+                    Expr::Literal(value) => {
+                        assert_eq!(&value.data_type(), &expected_data_type);
+                    }
+                    _ => panic!("Expected right to be a literal"),
                 },
                 _ => panic!("Expected binary expression"),
             }
