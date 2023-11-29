@@ -700,6 +700,19 @@ def test_delete_data(tmp_path: Path):
     assert dataset.version == 4
     assert dataset.to_table() == pa.table({"a": range(20, 98), "b": range(20, 98)})
 
+    # These sorts of filters were previously used as a work-around for not
+    # supporting "WHERE true". But now we need to make sure they still work
+    # even with presence of expression simplification passes.
+    old_version = dataset.version
+    dataset.delete("b IS NOT NULL")
+    assert dataset.count_rows() == 0
+
+    dataset = lance.dataset(tmp_path / "dataset", version=old_version)
+    dataset.restore()
+    assert dataset.count_rows() > 0
+    dataset.delete("true")
+    assert dataset.count_rows() == 0
+
 
 def test_update_dataset(tmp_path: Path):
     nrows = 100
