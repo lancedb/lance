@@ -131,7 +131,7 @@ pub enum Operation {
     /// indices to be remapped to the new row ids as part of the operation.
     ReserveFragments { num_fragments: u32 },
 
-    /// Updates values in the dataset.
+    /// Update values in the dataset.
     Update {
         /// Ids of fragments that have been moved
         removed_fragment_ids: Vec<u64>,

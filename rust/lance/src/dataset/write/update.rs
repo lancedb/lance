@@ -48,10 +48,10 @@ use crate::{Error, Result};
 /// Use the [UpdateBuilder] to construct an update job. For example:
 ///
 /// ```ignore
-/// let dataset = UpdateBuilder::new()
+/// let dataset = UpdateBuilder::new(dataset.clone())
 ///     .update_where("region_id = 10")
 ///     .set("region_name", "New York")
-///     .build?
+///     .build()?
 ///     .execute()
 ///     .await?;
 /// ```
