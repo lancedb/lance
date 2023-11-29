@@ -50,7 +50,7 @@ fn main() {
             .compile("f16");
     }
 
-    if cfg!(all(target_os = "linux", feature = "avx512_bf16")) {
+    if cfg!(all(target_os = "linux", target_feature = "avx512_bf16")) {
         cc::Build::new()
             .compiler("clang")
             .std("c17")
