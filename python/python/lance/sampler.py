@@ -67,12 +67,29 @@ def _efficient_sample(
     assert total_records > n
     chunk_size = total_records // max_takes
     chunk_sample_size = n // max_takes
+
+    num_sampled = 0
+
     for idx, i in enumerate(range(0, total_records, chunk_size)):
-        # Add more randomness within each chunk.
-        offset = i + np.random.randint(0, chunk_size - chunk_sample_size)
+        # If we have already sampled enough, break. This can happen if there
+        # is a remainder in the division.
+        if num_sampled >= n:
+            break
+        num_sampled += chunk_sample_size
+
+        # If we are at the last chunk, we may not have enough records to sample.
+        local_size = min(chunk_size, total_records - i)
+        local_sample_size = min(chunk_sample_size, local_size)
+
+        if local_sample_size < local_size:
+            # Add more randomness within each chunk, if there is room.
+            offset = i + np.random.randint(0, local_size - local_sample_size)
+        else:
+            offset = i
+
         buf.extend(
             dataset.take(
-                list(range(offset, offset + chunk_sample_size)),
+                list(range(offset, offset + local_sample_size)),
                 columns=columns,
             ).to_batches()
         )
