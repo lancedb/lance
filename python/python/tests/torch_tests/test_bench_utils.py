@@ -15,11 +15,11 @@
 from pathlib import Path
 
 import lance
-from lance.torch import preferred_device
 import numpy as np
 import pyarrow as pa
 import torch
-from lance.torch.bench_utils import sort_multiple_tensors, ground_truth
+from lance.torch import preferred_device
+from lance.torch.bench_utils import ground_truth, sort_multiple_tensors
 from lance.torch.distance import pairwise_l2
 
 
@@ -39,7 +39,7 @@ def test_sort_tensor():
 
 def test_ground_truth(tmp_path: Path):
     N = 1000
-    K = 5
+    NUM_QUERIES = 2
     DIM = 128
 
     device = preferred_device()
@@ -47,19 +47,16 @@ def test_ground_truth(tmp_path: Path):
     fsl = pa.FixedSizeListArray.from_arrays(data, DIM)
     data = torch.from_numpy(data.reshape((-1, DIM))).to(device)
 
-    schema = pa.schema([pa.field("vec", pa.list_(pa.float32(), DIM))])
-    tbl = pa.Table.from_arrays([fsl], schema=schema)
+    tbl = pa.Table.from_arrays([fsl], ["vec"])
 
     ds = lance.write_dataset(tbl, tmp_path)
 
-    idx = np.random.choice(range(N), K)
+    idx = np.random.choice(range(N), NUM_QUERIES)
     keys = data[idx, :]
 
     gt = ground_truth(ds, "vec", keys, k=20, batch_size=128)
-    print(gt)
+    gt, _ = torch.sort(gt, dim=1)
 
     actual_dists = pairwise_l2(keys, data)
-    print(actual_dists.shape)
-    expected = torch.argsort(actual_dists, 1)[:, :20]
-    print(expected, expected.shape, gt.shape)
+    expected, _ = torch.sort(torch.argsort(actual_dists, 1)[:, :20], dim=1)
     assert torch.allclose(expected, gt)

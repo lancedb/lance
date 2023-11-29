@@ -30,7 +30,7 @@ def sort_multiple_tensors(
     source: torch.Tensor, other: torch.Tensor, k: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Sort multiple tensors based on the order of the source."""
-    sorted_values, indices = torch.sort(source)
+    sorted_values, indices = torch.sort(source, dim=1)
     indices = indices[:, :k]
     sorted_others = torch.gather(other, 1, indices)
     return sorted_values[:, :k], sorted_others
@@ -95,7 +95,6 @@ def ground_truth(
         elif metric_type == "cosine":
             pass
 
-        print(dists.shape, row_ids.shape)
         dists, row_ids = sort_multiple_tensors(dists, row_ids, k)
 
         if all_ids is None:
@@ -106,7 +105,7 @@ def ground_truth(
         if all_dists is None:
             all_dists = dists
         else:
-            all_dists = torch.cat([dists, all_dists], 1)
+            all_dists = torch.cat([all_dists, dists], 1)
         all_dists, all_ids = sort_multiple_tensors(all_dists, all_ids, k)
 
     return all_ids
