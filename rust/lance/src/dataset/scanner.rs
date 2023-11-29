@@ -132,7 +132,7 @@ pub struct Scanner {
     prefilter: bool,
 
     /// Optional filter expression.
-    filter: Option<Expr>,
+    pub(crate) filter: Option<Expr>,
 
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: usize,
@@ -279,8 +279,10 @@ impl Scanner {
     /// Once the filter is applied, Lance will create an optimized I/O plan for filtering.
     ///
     pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
-        let planner = Planner::new(self.schema()?);
+        let schema = Arc::new(ArrowSchema::from(self.dataset.schema()));
+        let planner = Planner::new(schema);
         self.filter = Some(planner.parse_filter(filter)?);
+        self.filter = Some(planner.optimize_expr(self.filter.take().unwrap())?);
         Ok(self)
     }
 
