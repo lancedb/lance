@@ -39,7 +39,7 @@ def test_sort_tensor():
 
 def test_ground_truth(tmp_path: Path):
     N = 1000
-    NUM_QUERIES = 2
+    NUM_QUERIES = 50
     DIM = 128
 
     device = preferred_device()
@@ -54,9 +54,11 @@ def test_ground_truth(tmp_path: Path):
     idx = np.random.choice(range(N), NUM_QUERIES)
     keys = data[idx, :]
 
-    gt = ground_truth(ds, "vec", keys, k=20, batch_size=128)
+    gt = ground_truth(ds, "vec", keys, k=20, batch_size=128, device=device)
     gt, _ = torch.sort(gt, dim=1)
 
     actual_dists = pairwise_l2(keys, data)
     expected, _ = torch.sort(torch.argsort(actual_dists, 1)[:, :20], dim=1)
+
     assert torch.allclose(expected, gt)
+
