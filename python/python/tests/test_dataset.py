@@ -686,7 +686,14 @@ def test_merge_data(tmp_path: Path):
 
 
 def test_delete_data(tmp_path: Path):
-    tab = pa.table({"a": range(100), "b": range(100)})
+    # We pass schema explicitly since we want b to be non-nullable.
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64()),
+            pa.field("b", pa.int64(), nullable=False),
+        ]
+    )
+    tab = pa.table({"a": range(100), "b": range(100)}, schema=schema)
     lance.write_dataset(tab, tmp_path / "dataset", mode="append")
 
     dataset = lance.dataset(tmp_path / "dataset")
@@ -694,11 +701,28 @@ def test_delete_data(tmp_path: Path):
     dataset.delete("a < 10")
     dataset.delete("b in (98, 99)")
     assert dataset.version == 3
-    assert dataset.to_table() == pa.table({"a": range(10, 98), "b": range(10, 98)})
+    assert dataset.to_table() == pa.table(
+        {"a": range(10, 98), "b": range(10, 98)}, schema=schema
+    )
 
     dataset.delete(pa_ds.field("a") < 20)
     assert dataset.version == 4
-    assert dataset.to_table() == pa.table({"a": range(20, 98), "b": range(20, 98)})
+    assert dataset.to_table() == pa.table(
+        {"a": range(20, 98), "b": range(20, 98)}, schema=schema
+    )
+
+    # These sorts of filters were previously used as a work-around for not
+    # supporting "WHERE true". But now we need to make sure they still work
+    # even with presence of expression simplification passes.
+    old_version = dataset.version
+    dataset.delete("b IS NOT NULL")
+    assert dataset.count_rows() == 0
+
+    dataset = lance.dataset(tmp_path / "dataset", version=old_version)
+    dataset.restore()
+    assert dataset.count_rows() > 0
+    dataset.delete("true")
+    assert dataset.count_rows() == 0
 
 
 def test_update_dataset(tmp_path: Path):

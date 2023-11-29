@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
+use datafusion::logical_expr::Expr;
+use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
@@ -548,8 +550,6 @@ impl FileFragment {
         // scan with predicate and row ids
         let mut scanner = self.scan();
 
-        // if predicate is `true`, delete the whole fragment
-        // else if predicate is `false`, filter the predicate
         let predicate_lower = predicate.trim().to_lowercase();
         if predicate_lower == "true" {
             return Ok(None);
@@ -561,6 +561,19 @@ impl FileFragment {
             .with_row_id()
             .filter(predicate)?
             .project::<&str>(&[])?;
+
+        // if predicate is `true`, delete the whole fragment
+        // else if predicate is `false`, filter the predicate
+        // We do this on the expression level after expression optimization has
+        // occurred so we also catch expressions that are equivalent to `true`
+        if let Some(predicate) = &scanner.filter {
+            if matches!(predicate, Expr::Literal(ScalarValue::Boolean(Some(false)))) {
+                return Ok(Some(self));
+            }
+            if matches!(predicate, Expr::Literal(ScalarValue::Boolean(Some(true)))) {
+                return Ok(None);
+            }
+        }
 
         // As we get row ids, add them into our deletion vector
         scanner
