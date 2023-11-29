@@ -12,23 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io::Cursor;
 use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::compute::kernels::take::take;
+use arrow::ipc::reader::FileReader;
+use arrow::ipc::writer::IpcWriteOptions;
+use arrow::ipc::CompressionType;
 use arrow::pyarrow::ToPyArrow;
 use arrow_array::builder::PrimitiveBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{ArrowPrimitiveType, UInt16Type, UInt32Type, UInt64Type};
-use arrow_array::{Array, ArrayRef, UInt16Array, UInt32Array, UInt64Array};
-use arrow_schema::DataType;
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt16Array, UInt32Array, UInt64Array};
+use arrow_schema::{ArrowError, DataType, Field, Schema as ArrowSchema};
 use either::Either;
 use futures::StreamExt;
 use lance::dataset::Dataset as LanceDataset;
 use lance_core::ROW_ID;
 use num_traits::NumCast;
 use pyo3::exceptions::*;
-use pyo3::types::{PySlice, PySliceIndices};
+use pyo3::pyclass::CompareOp;
+use pyo3::types::{PyBytes, PyDict, PySlice, PySliceIndices, PyString};
 use pyo3::{intern, prelude::*};
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -39,12 +44,14 @@ use crate::{Dataset, RT};
 
 /// How a dataset should be sampled.
 ///
+/// This struct has a sibling dataclass in python/lance/sampler.py.
+///
 /// Intuitively, sampling follows these steps:
 /// 1. Apply the filter to the dataset.
 /// 2. Sample the rows that pass the filter.
 /// 3. Batch the sampled rows.
 /// 4. Shuffle the batches.
-#[derive(Clone, Serialize, Deserialize, FromPyObject)]
+#[derive(Clone, Serialize, Deserialize, FromPyObject, PartialEq)]
 pub struct SampleParams {
     /// A filter to apply before sampling.
     predicate: Option<String>,
@@ -80,7 +87,10 @@ impl IntoPy<PyObject> for SampleParams {
     }
 }
 
-#[derive(Debug, Clone, FromPyObject)]
+/// Metrics about a sample.
+///
+/// This struct has a sibling NamedTuple in python/lance/sampler.py
+#[derive(Debug, Clone, FromPyObject, Serialize, Deserialize, PartialEq)]
 pub struct SampleMetrics {
     pub dataset_size: usize,
     pub matched_rows: usize,
@@ -114,7 +124,7 @@ impl IntoPy<PyObject> for SampleMetrics {
 /// A sample of batches of a dataset.
 ///
 /// These batches might be sampled and their order randomized.
-#[pyclass]
+#[pyclass(module = "lance.sampler")]
 #[derive(Clone)]
 pub struct DatasetSample {
     /// The original parameters used to construct the sample.
@@ -135,6 +145,394 @@ pub struct DatasetSample {
     #[pyo3(get)]
     metrics: SampleMetrics,
 }
+
+
+impl DatasetSample {
+    fn get_start(&self, i: usize) -> PyResult<usize> {
+        if i >= self.batch_starts.len() {
+            return Err(PyIndexError::new_err(format!(
+                "Index {} out of bounds for DatasetSample of length {}",
+                i,
+                self.batch_starts.len()
+            )));
+        }
+
+        match self.batch_starts.data_type() {
+            DataType::UInt32 => {
+                let start = self.batch_starts.as_primitive::<UInt32Type>().value(i);
+                Ok(start as usize)
+            }
+            DataType::UInt64 => {
+                let start = self.batch_starts.as_primitive::<UInt64Type>().value(i);
+                Ok(start as usize)
+            }
+            _ => Err(PyTypeError::new_err(format!(
+                "batch_starts must be UInt32Array or UInt64Array, but was {}",
+                self.batch_starts.data_type()
+            ))),
+        }
+    }
+
+    fn num_rows(&self) -> u64 {
+        if let Some(mask) = self.row_id_mask.as_ref() {
+            mask.len()
+        } else {
+            self.batch_lengths.values().iter().map(|v| *v as u64).sum()
+        }
+    }
+}
+
+#[derive(FromPyObject)]
+enum SliceOrInt<'a> {
+    Slice(&'a PySlice),
+    Int(isize),
+}
+
+#[pymethods]
+impl DatasetSample {
+    /// The number of rows in the sample.
+    #[getter(num_rows)]
+    fn num_rows_py(&self) -> u64 {
+        self.num_rows()
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let mut repr = String::new();
+        repr.push_str("DatasetSample(params=");
+
+        let params_repr = self
+            .params
+            .clone()
+            .into_py(py)
+            .call_method0(py, intern!(py, "__repr__"))
+            .unwrap()
+            .extract::<String>(py)
+            .unwrap();
+        repr.push_str(&params_repr);
+
+        repr.push_str(", row_id_mask=");
+
+        if let Some(mask) = &self.row_id_mask {
+            repr.push_str(&format!("Mask<n={}>", mask.len(),));
+        } else {
+            repr.push_str("None");
+        }
+
+        repr.push_str(", batch_starts=");
+        repr.push_str(&format!("{:?}", self.batch_starts));
+
+        repr.push_str(", batch_lengths=");
+        repr.push_str(&format!("{:?}", self.batch_lengths));
+
+        repr.push_str(", metrics=");
+        let metrics_repr = self
+            .metrics
+            .clone()
+            .into_py(py)
+            .call_method0(py, intern!(py, "__repr__"))
+            .unwrap()
+            .extract::<String>(py)
+            .unwrap();
+        repr.push_str(&metrics_repr);
+
+        repr.push(')');
+
+        repr
+    }
+
+    /// Get the number of batches in the sample.
+    fn __len__(&self) -> usize {
+        self.batch_starts.len()
+    }
+
+    fn __iter__(&self) -> DatasetSampleIter {
+        DatasetSampleIter::new(self.clone())
+    }
+
+    fn __richcmp__(&self, other: &Self, op: CompareOp) -> PyResult<bool> {
+        match op {
+            CompareOp::Eq => Ok(self.params == other.params
+                && self.row_id_mask == other.row_id_mask
+                && self.batch_starts.as_ref() == other.batch_starts.as_ref()
+                && self.batch_lengths == other.batch_lengths
+                && self.metrics == other.metrics),
+            _ => Err(PyNotImplementedError::new_err("Only == is supported.")),
+        }
+    }
+
+    fn __getitem__(&self, py: Python<'_>, idx: SliceOrInt) -> PyResult<PyObject> {
+        match idx {
+            SliceOrInt::Slice(slice) => {
+                let PySliceIndices {
+                    start,
+                    stop,
+                    step,
+                    slicelength,
+                } = slice.indices(self.__len__() as i64)?;
+                let start = start as usize;
+                let stop = stop as usize;
+                let length = slicelength as usize;
+
+                let (batch_starts, batch_lengths) = if step == 1 {
+                    (
+                        self.batch_starts.slice(start, length),
+                        Arc::new(self.batch_lengths.slice(start, length)),
+                    )
+                } else {
+                    let indices = (start as u64..stop as u64)
+                        .step_by(step as usize)
+                        .collect::<UInt64Array>();
+                    let batch_starts = take(&self.batch_starts, &indices, None).map_err(|err| {
+                        PyValueError::new_err(format!(
+                            "Failed to compute DatasetSample slice: {err}"
+                        ))
+                    })?;
+
+                    let batch_lengths = self.batch_lengths.as_ref() as &dyn Array;
+                    let batch_lengths = take(batch_lengths, &indices, None).map_err(|err| {
+                        PyValueError::new_err(format!(
+                            "Failed to compute DatasetSample slice: {err}"
+                        ))
+                    })?;
+                    let batch_lengths = batch_lengths
+                        .as_any()
+                        .downcast_ref::<UInt16Array>()
+                        .ok_or_else(|| {
+                            PyTypeError::new_err(format!(
+                                "batch_lengths must be UInt16Array, but was {}",
+                                batch_lengths.data_type()
+                            ))
+                        })?;
+
+                    (batch_starts, Arc::new(batch_lengths.clone()))
+                };
+
+                // Also need to shrink the mask.
+                let row_id_mask = if let Some(mask) = self.row_id_mask.as_ref() {
+                    let mut range_mask = RoaringTreemap::new();
+
+                    let starts = match batch_starts.data_type() {
+                        DataType::UInt32 => Either::Left(
+                            batch_starts
+                                .as_primitive::<UInt32Type>()
+                                .values()
+                                .iter()
+                                .map(|v| *v as u64),
+                        ),
+                        DataType::UInt64 => Either::Right(
+                            batch_starts
+                                .as_primitive::<UInt64Type>()
+                                .values()
+                                .iter()
+                                .copied(),
+                        ),
+                        _ => {
+                            return Err(PyTypeError::new_err(format!(
+                                "batch_starts must be UInt32Array or UInt64Array, but was {}",
+                                batch_starts.data_type()
+                            )))
+                        }
+                    };
+                    for (start, length) in
+                        starts.zip(batch_lengths.values().iter().map(|v| *v as u64))
+                    {
+                        let end = start + length;
+                        range_mask.insert_range(start..end);
+                    }
+
+                    Some(mask.as_ref() & range_mask)
+                } else {
+                    None
+                };
+
+                let out = Self {
+                    params: self.params.clone(),
+                    row_id_mask: row_id_mask.map(Arc::new),
+                    batch_starts,
+                    batch_lengths,
+                    // TODO: fix the metrics, or make some warning to the user about them.
+                    metrics: self.metrics.clone(),
+                };
+                Ok(out.into_py(py))
+            }
+            SliceOrInt::Int(i) => {
+                let start = self.get_start(i as usize)? as u64;
+                let len = self.batch_lengths.value(i as usize) as u64;
+                let end = start + len;
+                let indices = (start..end)
+                    .filter(|i| {
+                        self.row_id_mask
+                            .as_ref()
+                            .map(|mask| mask.contains(*i))
+                            .unwrap_or(true)
+                    })
+                    .collect::<UInt64Array>();
+                Ok(indices.to_data().to_pyarrow(py)?.into_py(py))
+            }
+        }
+    }
+
+    fn __setstate__(&mut self, py: Python, state: PyObject) -> PyResult<()> {
+        let data = py
+            .import(intern!(py, "io"))?
+            .getattr(intern!(py, "BytesIO"))?
+            .call1((state,))?;
+        let new_self = Self::deserialize_from(py, data)?;
+
+        *self = new_self;
+        Ok(())
+    }
+
+    fn __getstate__(&self, py: Python) -> PyResult<PyObject> {
+        let output = py
+            .import(intern!(py, "io"))?
+            .getattr(intern!(py, "BytesIO"))?
+            .call0()?;
+        self.serialize_into(py, output)?;
+
+        Ok(output.call_method0(intern!(py, "getvalue"))?.into_py(py))
+    }
+
+    /// Serialize the sample to a file object.
+    ///
+    /// The data written can be treated as opaque bytes and read back with
+    /// :meth:`DatasetSample.deserialize_from`. However, it is written as a
+    /// gzip-compressed tarfile with the following structure:
+    ///
+    /// * ``params.json``: the parameters used to construct the sample.
+    /// * ``metrics.json``: the metrics of the sample.
+    /// * ``row_id_mask.bin``: the row_id_mask as a binary file.
+    /// * ``batches.arrow``: the batch_starts and batch_lengths as an Arrow file.
+    ///
+    /// You can save this file with a ``.tar.gz`` extension, and it will be
+    /// readable by other tools. This can be useful for debugging purposes.
+    ///
+    /// Parameters
+    /// ----------
+    /// fileobj : string path or file-like object
+    ///     This is the file to write the sample to. If it is a string, it is
+    ///     treated as a path to a file. Otherwise, it is treated as a file-like
+    ///     object. If it is a file, it must be opened in binary mode.
+    fn serialize_into(&self, py: Python<'_>, path_or_file: &PyAny) -> PyResult<()> {
+        // open file object as a tarfile in gz mode.
+        let archive = tarfile::open(path_or_file, "w:gz")?;
+
+        // params -> params.json
+        let params_data = serde_json::to_vec_pretty(&self.params)
+            .map_err(|err| PyIOError::new_err(format!("Failed to serialize params: {err}")))?;
+        let output = PyBytes::new(py, &params_data);
+        tarfile::add_file(&archive, "params.json", &output)?;
+
+        // metrics -> metrics.json
+        let metrics_data = serde_json::to_vec_pretty(&self.metrics)
+            .map_err(|err| PyIOError::new_err(format!("Failed to serialize params: {err}")))?;
+        let output = PyBytes::new(py, &metrics_data);
+        tarfile::add_file(&archive, "metrics.json", &output)?;
+
+        // row_id_mask -> row_id_mask.bin
+        if let Some(mask) = self.row_id_mask.as_ref() {
+            let row_id_data =
+                PyBytes::new_with(py, mask.serialized_size(), |bytes: &mut [u8]| {
+                    mask.serialize_into(bytes).map_err(|err| {
+                        PyIOError::new_err(format!("Failed to serialize row_id_mask: {err}"))
+                    })
+                })?;
+            tarfile::add_file(&archive, "row_id_mask.bin", &row_id_data)?;
+        }
+
+        // batch_start, batch_lengths -> batches.arrow
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("batch_start", self.batch_starts.data_type().clone(), false),
+                Field::new(
+                    "batch_lengths",
+                    self.batch_lengths.data_type().clone(),
+                    false,
+                ),
+            ])),
+            vec![self.batch_starts.clone(), self.batch_lengths.clone()],
+        )
+        .map_err(|err| PyIOError::new_err(format!("Failed to create RecordBatch: {err}")))?;
+        let batch_data = serialize_record_batch(&batch)
+            .map_err(|err| PyIOError::new_err(format!("Failed to serialize RecordBatch: {err}")))?;
+        let batch_data = PyBytes::new(py, &batch_data);
+
+        tarfile::add_file(&archive, "batches.arrow", &batch_data)?;
+
+        // Close the tarfile
+        archive.call_method0(intern!(py, "close"))?;
+
+        Ok(())
+    }
+
+    #[staticmethod]
+    fn deserialize_from(py: Python<'_>, path_or_file: &PyAny) -> PyResult<Self> {
+        // open file object as a tarfile in gz mode.
+        let archive = tarfile::open(path_or_file, "r:gz")?;
+
+        // Read each attribute from the tarfile:
+        // params -> params.json
+        let params_data = tarfile::read_file(archive, intern!(py, "params.json"))?
+            .ok_or_else(|| PyIOError::new_err("Failed to deserialize: params.json is missing"))?;
+        let params: SampleParams = serde_json::from_slice(params_data.as_bytes())
+            .map_err(|err| PyIOError::new_err(format!("Failed to deserialize params: {err}")))?;
+
+        // metrics -> metrics.json
+        let metrics_data = tarfile::read_file(archive, intern!(py, "metrics.json"))?
+            .ok_or_else(|| PyIOError::new_err("Failed to deserialize: metrics.json is missing"))?;
+        let metrics: SampleMetrics = serde_json::from_slice(metrics_data.as_bytes())
+            .map_err(|err| PyIOError::new_err(format!("Failed to deserialize params: {err}")))?;
+
+        // row_id_mask -> row_id_mask.bin
+        let row_id_mask = if let Some(data) =
+            tarfile::read_file(archive, intern!(py, "row_id_mask.bin"))?
+        {
+            let row_id_mask = RoaringTreemap::deserialize_from(data.as_bytes()).map_err(|err| {
+                PyIOError::new_err(format!("Failed to deserialize row_id_mask: {err}"))
+            })?;
+            Some(Arc::new(row_id_mask))
+        } else {
+            None
+        };
+
+        // batch_start, batch_lengths -> batches.arrow
+        let batch_data = tarfile::read_file(archive, intern!(py, "batches.arrow"))?
+            .ok_or_else(|| PyIOError::new_err("Failed to deserialize: batches.arrow is missing"))?;
+        let mut batch_reader = FileReader::try_new(Cursor::new(batch_data.as_bytes()), None)
+            .map_err(|err| {
+                PyIOError::new_err(format!("Failed to create Arrow file reader: {err}"))
+            })?;
+        let batch = batch_reader
+            .next()
+            .ok_or_else(|| PyIOError::new_err("Failed to read RecordBatch: no batches found."))?
+            .map_err(|err| PyIOError::new_err(format!("Failed to read RecordBatch: {err}")))?;
+
+        let batch_starts = batch
+            .column_by_name("batch_start")
+            .ok_or_else(|| {
+                PyIOError::new_err("Failed to read RecordBatch: no batch_start column.")
+            })?
+            .clone();
+        let batch_lengths = batch
+            .column_by_name("batch_lengths")
+            .ok_or_else(|| {
+                PyIOError::new_err("Failed to read RecordBatch: no batch_lengths column.")
+            })?
+            .as_primitive::<UInt16Type>()
+            .clone();
+        let batch_lengths = Arc::new(batch_lengths);
+
+        // Close the tarfile
+        Ok(Self {
+            params,
+            row_id_mask,
+            batch_starts,
+            batch_lengths,
+            metrics,
+        })
+    }
+}
+
 
 /// A struct that maps row_ids to row positions.
 struct DatasetRowIdMapper {
@@ -389,229 +787,6 @@ fn random_indices(num_indices: usize, rng: &mut impl Rng) -> PyResult<ArrayRef> 
     }
 }
 
-impl DatasetSample {
-    fn get_start(&self, i: usize) -> PyResult<usize> {
-        if i >= self.batch_starts.len() {
-            return Err(PyIndexError::new_err(format!(
-                "Index {} out of bounds for DatasetSample of length {}",
-                i,
-                self.batch_starts.len()
-            )));
-        }
-
-        match self.batch_starts.data_type() {
-            DataType::UInt32 => {
-                let start = self.batch_starts.as_primitive::<UInt32Type>().value(i);
-                Ok(start as usize)
-            }
-            DataType::UInt64 => {
-                let start = self.batch_starts.as_primitive::<UInt64Type>().value(i);
-                Ok(start as usize)
-            }
-            _ => Err(PyTypeError::new_err(format!(
-                "batch_starts must be UInt32Array or UInt64Array, but was {}",
-                self.batch_starts.data_type()
-            ))),
-        }
-    }
-
-    fn num_rows(&self) -> u64 {
-        if let Some(mask) = self.row_id_mask.as_ref() {
-            mask.len() as u64
-        } else {
-            self.batch_lengths.values().iter().map(|v| *v as u64).sum()
-        }
-    }
-}
-
-#[derive(FromPyObject)]
-enum SliceOrInt<'a> {
-    Slice(&'a PySlice),
-    Int(isize),
-}
-
-#[pymethods]
-impl DatasetSample {
-    /// The number of rows in the sample.
-    #[getter(num_rows)]
-    fn num_rows_py(&self) -> u64 {
-        self.num_rows()
-    }
-
-    fn __repr__(&self, py: Python<'_>) -> String {
-        let mut repr = String::new();
-        repr.push_str("DatasetSample(params=");
-
-        let params_repr = self
-            .params
-            .clone()
-            .into_py(py)
-            .call_method0(py, intern!(py, "__repr__"))
-            .unwrap()
-            .extract::<String>(py)
-            .unwrap();
-        repr.push_str(&params_repr);
-
-        repr.push_str(", row_id_mask=");
-
-        if let Some(mask) = &self.row_id_mask {
-            repr.push_str(&format!("Mask<n={}>", mask.len(),));
-        } else {
-            repr.push_str("None");
-        }
-
-        repr.push_str(", batch_starts=");
-        repr.push_str(&format!("{:?}", self.batch_starts));
-
-        repr.push_str(", batch_lengths=");
-        repr.push_str(&format!("{:?}", self.batch_lengths));
-
-        repr.push_str(", metrics=");
-        let metrics_repr = self
-            .metrics
-            .clone()
-            .into_py(py)
-            .call_method0(py, intern!(py, "__repr__"))
-            .unwrap()
-            .extract::<String>(py)
-            .unwrap();
-        repr.push_str(&metrics_repr);
-
-        repr.push(')');
-
-        repr
-    }
-
-    /// Get the number of batches in the sample.
-    fn __len__(&self) -> usize {
-        self.batch_starts.len()
-    }
-
-    fn __iter__(&self) -> DatasetSampleIter {
-        DatasetSampleIter::new(self.clone())
-    }
-
-    fn __getitem__(&self, py: Python<'_>, idx: SliceOrInt) -> PyResult<PyObject> {
-        match idx {
-            SliceOrInt::Slice(slice) => {
-                let PySliceIndices {
-                    start,
-                    stop,
-                    step,
-                    slicelength,
-                } = slice.indices(self.__len__() as i64)?;
-                let start = start as usize;
-                let stop = stop as usize;
-                let length = slicelength as usize;
-
-                let (batch_starts, batch_lengths) = if step == 1 {
-                    (
-                        self.batch_starts.slice(start, length),
-                        Arc::new(self.batch_lengths.slice(start, length)),
-                    )
-                } else {
-                    let indices = (start as u64..stop as u64)
-                        .step_by(step as usize)
-                        .collect::<UInt64Array>();
-                    let batch_starts = take(&self.batch_starts, &indices, None).map_err(|err| {
-                        PyValueError::new_err(format!(
-                            "Failed to compute DatasetSample slice: {err}"
-                        ))
-                    })?;
-
-                    let batch_lengths = self.batch_lengths.as_ref() as &dyn Array;
-                    let batch_lengths = take(batch_lengths, &indices, None).map_err(|err| {
-                        PyValueError::new_err(format!(
-                            "Failed to compute DatasetSample slice: {err}"
-                        ))
-                    })?;
-                    let batch_lengths = batch_lengths
-                        .as_any()
-                        .downcast_ref::<UInt16Array>()
-                        .ok_or_else(|| {
-                            PyTypeError::new_err(format!(
-                                "batch_lengths must be UInt16Array, but was {}",
-                                batch_lengths.data_type()
-                            ))
-                        })?;
-
-                    (batch_starts, Arc::new(batch_lengths.clone()))
-                };
-
-                // Also need to shrink the mask.
-                let row_id_mask = if let Some(mask) = self.row_id_mask.as_ref() {
-                    let mut range_mask = RoaringTreemap::new();
-
-                    let starts = match batch_starts.data_type() {
-                        DataType::UInt32 => Either::Left(
-                            batch_starts
-                                .as_primitive::<UInt32Type>()
-                                .values()
-                                .iter()
-                                .map(|v| *v as u64),
-                        ),
-                        DataType::UInt64 => Either::Right(
-                            batch_starts
-                                .as_primitive::<UInt64Type>()
-                                .values()
-                                .iter()
-                                .copied(),
-                        ),
-                        _ => {
-                            return Err(PyTypeError::new_err(format!(
-                                "batch_starts must be UInt32Array or UInt64Array, but was {}",
-                                batch_starts.data_type()
-                            )))
-                        }
-                    };
-                    for (start, length) in
-                        starts.zip(batch_lengths.values().iter().map(|v| *v as u64))
-                    {
-                        let end = start + length;
-                        range_mask.insert_range(start..end);
-                    }
-
-                    Some(mask.as_ref() & range_mask)
-                } else {
-                    None
-                };
-
-                let out = Self {
-                    params: self.params.clone(),
-                    row_id_mask: row_id_mask.map(Arc::new),
-                    batch_starts,
-                    batch_lengths,
-                    // TODO: fix the metrics, or make some warning to the user about them.
-                    metrics: self.metrics.clone(),
-                };
-                Ok(out.into_py(py))
-            }
-            SliceOrInt::Int(i) => {
-                let start = self.get_start(i as usize)? as u64;
-                let len = self.batch_lengths.value(i as usize) as u64;
-                let end = start + len;
-                let indices = (start..end)
-                    .filter(|i| {
-                        self.row_id_mask
-                            .as_ref()
-                            .map(|mask| mask.contains(*i))
-                            .unwrap_or(true)
-                    })
-                    .collect::<UInt64Array>();
-                Ok(indices.to_data().to_pyarrow(py)?.into_py(py))
-            }
-        }
-    }
-
-    fn __setstate__(&mut self, py: Python, state: PyObject) -> PyResult<()> {
-        todo!()
-    }
-
-    fn __getstate__(&self, py: Python) -> PyResult<PyObject> {
-        todo!()
-    }
-}
-
 #[pyclass]
 struct DatasetSampleIter {
     sample: DatasetSample,
@@ -638,5 +813,89 @@ impl DatasetSampleIter {
             .__getitem__(slf.py(), SliceOrInt::Int(slf.i as isize));
         slf.i += 1;
         out.map(Some)
+    }
+}
+
+fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, ArrowError> {
+    let mut batch_data = Vec::new();
+    let mut batch_writer = arrow::ipc::writer::FileWriter::try_new_with_options(
+        &mut batch_data,
+        batch.schema().as_ref(),
+        IpcWriteOptions::default().try_with_compression(Some(CompressionType::ZSTD))?,
+    )?;
+    batch_writer.write(&batch)?;
+    batch_writer.finish()?;
+    drop(batch_writer);
+    Ok(batch_data)
+}
+
+mod tarfile {
+    use super::*;
+
+    /// Open a tarfile with the given mode.
+    pub fn open<'py>(path_or_file: &'py PyAny, mode: &str) -> PyResult<&'py PyAny> {
+        let py = path_or_file.py();
+        if path_or_file.is_instance_of::<PyString>() {
+            py.import(intern!(py, "tarfile"))?
+                .getattr(intern!(py, "open"))?
+                .call1((path_or_file, mode))
+        } else {
+            let args = PyDict::new(py);
+            args.set_item("fileobj", path_or_file)?;
+            // Should we even set mode?
+            args.set_item("mode", mode)?;
+            py.import(intern!(py, "tarfile"))?
+                .getattr(intern!(py, "open"))?
+                .call((), Some(args))
+        }
+    }
+
+    /// Add a file to a tarfile based on the name and provided bytes
+    pub fn add_file(
+        tarfile: &PyAny,
+        name: impl IntoPy<Py<PyString>>,
+        data: &PyBytes,
+    ) -> PyResult<()> {
+        let py = tarfile.py();
+        let name = name.into_py(py);
+        let info = py
+            .import(intern!(py, "tarfile"))?
+            .getattr(intern!(py, "TarInfo"))?
+            .call1((name,))?;
+        info.setattr(intern!(py, "size"), data.len()?)?;
+
+        let bytes_io = py
+            .import(intern!(py, "io"))?
+            .getattr(intern!(py, "BytesIO"))?;
+
+        tarfile
+            .getattr(intern!(tarfile.py(), "addfile"))?
+            .call1((info, bytes_io.call1((data,))?))?;
+        Ok(())
+    }
+
+    /// Read a file from a tarfile.
+    pub fn read_file<'py>(
+        tarfile: &'py PyAny,
+        name: impl IntoPy<Py<PyString>>,
+    ) -> PyResult<Option<&'py PyBytes>> {
+        let name = name.into_py(tarfile.py());
+        let file = tarfile
+            .call_method1(intern!(tarfile.py(), "extractfile"), (&name,))
+            .map_err(|err| {
+                PyIOError::new_err(format!(
+                    "Failed to extract file {} from tarfile: {err}",
+                    name
+                ))
+            })?;
+        if file.is_none() {
+            return Ok(None);
+        }
+        file.call_method0(intern!(tarfile.py(), "read"))?
+            .downcast::<PyBytes>()
+            .map_err(|err| {
+                PyIOError::new_err(format!("Failed to read file {} from tarfile: {err}", name))
+            })
+            .map(Some)
     }
 }

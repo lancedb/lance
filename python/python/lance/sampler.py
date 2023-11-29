@@ -28,12 +28,10 @@ import pyarrow as pa
 
 import lance
 
-from .lance import _build_shuffle_sample
+from .lance import _build_shuffle_sample, DatasetSample as DatasetSample
 
 if TYPE_CHECKING:
     from collections.abc import Generator
-
-    from .lance import DatasetSample
 
 __all__ = ["maybe_sample"]
 
@@ -238,11 +236,54 @@ class SampleMetrics(NamedTuple):
 def build_shuffle_sample(
     dataset: lance.LanceDataset,
     params: Optional[SampleParams] = None,
-    **kwargs,
+    *,
+    predicate: Optional[str] = None,
+    batch_size: int = 32,
+    shuffle: bool = True,
+    sample_rate: Optional[float] = None,
+    seed: Optional[int] = None,
 ) -> DatasetSample:
-    """Build a pre-computed sample from the dataset."""
+    """
+    Build a pre-computed sample from the dataset.
+
+    Parameters
+    ----------
+    dataset : lance.LanceDataset
+        The dataset to sample.
+    params : Optional[SampleParams], optional
+        The parameters to use for sampling, by default None. The parameter object
+        has the same arguments as the keyword arguments of this function. If this
+        is provided, the keyword arguments are ignored.
+    predicate : Optional[str], optional
+        A SQL filter to apply to the dataset prior to sampling and shuffling.
+    batch_size : int, default 32
+        The max size of a batch to read as contiguous rows. Smaller values mean more
+        randomization, but also more IO overhead. Defaults to 32.
+    shuffle : bool, default True
+        Whether to shuffle the batches after sampling to randomize the order.
+        This is useful for training, if the order of rows isn't already random.
+    sample_rate : Optional[float], optional
+        The number of rows to sample. If None, all rows are sampled.
+        This is applied *after* the predicate is applied. Fewer rows may be sampled
+        if the predicate filters the dataset down to fewer rows than desired count.
+        Must be between 0 and 1.
+    seed : Optional[int], optional
+        The random seed to use for sampling.
+        Use this to ensure that the same sample is generated across multiple runs.
+
+    Returns
+    -------
+    DatasetSample
+        A pre-computed sample of the dataset.
+    """
     if params is None:
-        params = SampleParams(**kwargs)
+        params = SampleParams(
+            predicate=predicate,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            sample_rate=sample_rate,
+            seed=seed,
+        )
 
     # python/src/sampler.rs
     return _build_shuffle_sample(dataset._ds, params)
