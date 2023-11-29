@@ -61,4 +61,3 @@ def test_ground_truth(tmp_path: Path):
     expected, _ = torch.sort(torch.argsort(actual_dists, 1)[:, :20], dim=1)
 
     assert torch.allclose(expected, gt)
-
