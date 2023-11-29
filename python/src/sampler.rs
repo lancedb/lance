@@ -679,7 +679,7 @@ async fn build_shuffle_sample_impl(
             }
             (None, Some(sample_rate)) => {
                 // No filter, but we do have a sample rate.
-
+                // TODO: we should build a mask here.
                 metrics.matched_rows = dataset_size;
                 let row_iter = (0..dataset_size as u64).filter(|_| rng.gen::<f32>() < sample_rate);
                 let (batch_starts, batch_lengths) =
@@ -748,6 +748,8 @@ where
     T::Native: NumCast,
 {
     // TODO: sampled but no filter case doesn't have a size hint.
+    // TODO: we should operate based on the number of rows, not the distance
+    // from the start.
     let min_length = row_iter.size_hint().0 / batch_size;
     let mut batch_starts = PrimitiveBuilder::<T>::with_capacity(min_length);
     let mut batch_lengths: Vec<u16> = Vec::with_capacity(min_length);
