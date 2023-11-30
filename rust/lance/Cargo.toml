@@ -117,6 +117,7 @@ tracing-chrome = "0.7.1"
 
 [features]
 avx512fp16 = ["lance-linalg/avx512fp16"]
+avx512bf16 = ["lance-linalg/avx512bf16"]
 cli = ["clap"]
 # opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
 tensorflow = ["tfrecord"]

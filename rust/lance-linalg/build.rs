@@ -50,7 +50,7 @@ fn main() {
             .compile("f16");
     }
 
-    if cfg!(all(target_os = "linux", target_feature = "avx512_bf16")) {
+    if cfg!(all(feature = "avx512bf16")) {
         cc::Build::new()
             .compiler("clang")
             .std("c17")
@@ -59,7 +59,7 @@ fn main() {
             .flag("-ffast-math")
             .flag("-mavx512f")
             .flag("-mavx512vl")
-            .flag("-mavx512_bf16")
+            .flag("-mavx512bf16")
             .flag("-O3")
             .flag("-Wall")
             .flag("-Werror")
