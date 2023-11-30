@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int64Type;
-use arrow_array::{Array, Int64Array, PrimitiveArray, RecordBatch, UInt32Array};
+use arrow_array::types::{Int64Type, UInt64Type};
+use arrow_array::{Array, BooleanArray, Int64Array, PrimitiveArray, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
 use datafusion::error::{DataFusionError, Result};
@@ -146,8 +146,9 @@ impl ExecutionPlan for LancePushdownScanExec {
     fn schema(&self) -> SchemaRef {
         let schema: ArrowSchema = self.projection.as_ref().into();
         if self.config.with_row_id {
-            let mut fields: Vec<Arc<Field>> = schema.fields.to_vec();
-            fields.push(Arc::new(Field::new(ROW_ID, DataType::UInt64, false)));
+            let mut fields: Vec<Arc<Field>> = Vec::with_capacity(schema.fields.len() + 1);
+            fields.push(Arc::new(ROW_ID_FIELD.clone()));
+            fields.extend(schema.fields.iter().cloned());
             Arc::new(ArrowSchema::new(fields))
         } else {
             Arc::new(schema)
@@ -374,9 +375,12 @@ impl FragmentScanner {
                 let predicate_projection =
                     Arc::new(self.fragment.dataset().schema().project(&columns).unwrap());
                 let mut reader = self.reader.clone();
-                if self.config.with_row_id {
-                    reader.with_row_id();
-                }
+
+                // Make deletions null so we can have correct indices when we
+                // request additional columns. See ColumnarValue::Array branch below.
+                reader.with_make_deletions_null();
+                reader.with_row_id();
+
                 let batch = reader
                     .read_batch_projected(batch_id, .., &predicate_projection)
                     .await?;
@@ -398,11 +402,16 @@ impl FragmentScanner {
                             .as_any()
                             .downcast_ref::<arrow_array::BooleanArray>()
                             .unwrap();
+
+                        // Selection is a list of indices into the batch. These
+                        // indices are physical, which is why we made deletions
+                        // null earlier.
                         let selection: UInt32Array = array
                             .iter()
+                            .zip(batch[ROW_ID].as_primitive::<UInt64Type>())
                             .enumerate()
-                            .filter_map(|(i, value)| {
-                                if value.unwrap_or_default() {
+                            .filter_map(|(i, (matched, row_id))| {
+                                if matched.unwrap_or_default() && row_id.is_some() {
                                     Some(i as u32)
                                 } else {
                                     None
@@ -453,10 +462,18 @@ impl FragmentScanner {
 
                 // 4. If filter columns are in the projection, merge them in
                 //    and project the final schema.
-                let batch = if let ReadBatchParams::Indices(indices) = selection {
-                    batch.take(&indices)?
+                let batch = if let ReadBatchParams::Indices(indices) = &selection {
+                    batch.take(indices)?
                 } else {
-                    batch
+                    // It's possible there were some deleted rows.
+                    if let Some(deletion_mask) = batch[ROW_ID].nulls() {
+                        filter_record_batch(
+                            &batch,
+                            &BooleanArray::new(deletion_mask.clone().into_inner(), None),
+                        )?
+                    } else {
+                        batch
+                    }
                 };
                 let batch = if let Some(remainder_batch) = remainder_batch {
                     debug_assert_eq!(batch.num_rows(), remainder_batch.num_rows());
@@ -647,7 +664,7 @@ impl FragmentScanner {
 #[cfg(test)]
 mod test {
     use arrow_array::{
-        types::{Int32Type, UInt64Type},
+        types::{Float32Type, Int32Type, UInt64Type},
         ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array,
         RecordBatchIterator, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array,
     };
@@ -703,6 +720,7 @@ mod test {
         let ctx = SessionContext::new();
 
         let results = exec.execute(0, ctx.task_ctx()).unwrap();
+        assert_eq!(results.schema(), exec.schema());
         let results = results.try_collect::<Vec<_>>().await.unwrap();
         assert!(results.is_empty());
     }
@@ -994,8 +1012,6 @@ mod test {
 
         let dataset = Arc::new(test_dataset().await);
 
-        // TODO: it seems like nested column references work by accident. We
-        // can move the string to a flat column.
         let predicate = col("struct")
             .field("int")
             .gt(lit(4))
@@ -1025,6 +1041,7 @@ mod test {
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();
+            assert_eq!(batches[0].schema(), scan.schema());
             let mut result = concat_batches(&batches[0].schema(), &batches).unwrap();
 
             let mut expected_schema = ArrowSchema::from(dataset.schema());
@@ -1082,7 +1099,12 @@ mod test {
         )
         .unwrap();
         let result: Vec<RecordBatch> = scan.execute(0, ctx.task_ctx())?.try_collect().await?;
-        Ok(concat_batches(&result[0].schema(), &result)?)
+        let schema = scan.schema();
+        if result.is_empty() {
+            Ok(RecordBatch::new_empty(schema))
+        } else {
+            Ok(concat_batches(&schema, &result)?)
+        }
     }
 
     #[derive(Debug)]
@@ -1319,7 +1341,15 @@ mod test {
             .await
             .unwrap();
 
-        dataset.delete("int >= 10 AND int < 25").await.unwrap();
+        // Modified each group in a different way:
+        // Group 0: all kept
+        // Group 1: all deleted
+        // Group 2: first half deleted
+        // Group 3: some indices deleted
+        dataset
+            .delete("(int >= 10 AND int < 25) OR int in (33, 35, 37)")
+            .await
+            .unwrap();
 
         let dataset = Arc::new(dataset.clone());
         let ctx = SessionContext::new();
@@ -1327,7 +1357,7 @@ mod test {
         let result = pushdown_scan(
             &ctx,
             dataset.clone(),
-            vec![0],
+            vec![],
             col("int").lt(lit(40)),
             ScanConfig {
                 with_row_id: true,
@@ -1336,10 +1366,81 @@ mod test {
         )
         .await
         .unwrap();
+        assert_eq!(result.num_columns(), 1);
         let row_ids = result[ROW_ID].as_primitive::<UInt64Type>();
         assert_eq!(
             row_ids,
-            &UInt64Array::from_iter_values((0..10).chain(25..40))
+            &UInt64Array::from_iter_values((0..10).chain(25..33).chain([34, 36, 38, 39]))
         );
+    }
+
+    #[tokio::test]
+    async fn test_with_deletions() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("int", DataType::Int32, false),
+            Field::new("float", DataType::Float32, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..12)),
+                Arc::new(Float32Array::from_iter_values((0..12).map(|x| x as f32))),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let write_params = WriteParams {
+            max_rows_per_group: 4,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Delete group 1
+        dataset.delete("int >= 4 AND int < 8").await.unwrap();
+        // Delete part of group 2
+        dataset.delete("int = 9").await.unwrap();
+
+        let expected_int = [0, 1, 2, 3, 8, 10, 11];
+
+        let dataset = Arc::new(dataset.clone());
+        let ctx = SessionContext::new();
+
+        for max_value in 0..12 {
+            let result = pushdown_scan(
+                &ctx,
+                dataset.clone(),
+                vec![0, 1],
+                col("int").lt(lit(max_value)),
+                ScanConfig {
+                    with_row_id: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.num_columns(), 3);
+
+            let ints = result["int"].as_primitive::<Int32Type>();
+            let expected =
+                Int32Array::from_iter_values(expected_int.into_iter().filter(|x| x < &max_value));
+            assert_eq!(ints, &expected);
+
+            let floats = result["float"].as_primitive::<Float32Type>();
+            let expected = Float32Array::from_iter_values(
+                expected_int
+                    .into_iter()
+                    .filter(|x| x < &max_value)
+                    .map(|x| x as f32),
+            );
+            assert_eq!(floats, &expected);
+        }
     }
 }
