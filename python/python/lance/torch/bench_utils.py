@@ -21,15 +21,35 @@ import torch
 
 from .. import LanceDataset
 from . import preferred_device
+from .data import LanceDataset as PytorchLanceDataset
 from .distance import pairwise_l2
 
 __all__ = ["ground_truth"]
 
 
-def sort_multiple_tensors(
+def sort_tensors(
     source: torch.Tensor, other: torch.Tensor, k: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Sort multiple tensors based on the order of the source."""
+    """Sort multiple tensors based on the order of the source.
+
+    Sort both tensor based on the `source` tensor (a M x N tensor),
+    and keep k values for each row.
+
+    Parameters
+    ----------
+    source: torch.Tensor
+        The source tensor to sort by.
+    other: torch.Tensor
+        The other tensor to sort, the order of the other tensor will be
+        determined by the `source` tensor.
+    k: int
+        The number of values to keep.
+
+    Returns
+    -------
+    The sorted source tensor and the sorted other tensor.
+
+    """
     sorted_values, indices = torch.sort(source, dim=1)
     indices = indices[:, :k]
     sorted_others = torch.gather(other, 1, indices)
@@ -76,26 +96,19 @@ def ground_truth(
     all_ids = None
     all_dists = None
 
-    for batch in ds.to_batches(
-        columns=[column], batch_size=batch_size, with_row_id=True
-    ):
-        vectors = torch.from_numpy(
-            np.stack(batch[column].to_numpy(zero_copy_only=False))
-        )
-        row_ids = (
-            torch.from_numpy(
-                np.stack(batch["_rowid"].to_numpy(zero_copy_only=False)).astype("int64")
-            )
-            .to(device)
-            .broadcast_to((query.shape[0], -1))
-        )
-        vectors = vectors.to(device)
+    tds = PytorchLanceDataset(
+        ds, batch_size=batch_size, columns=[column], with_row_id=True
+    )
+
+    for batch in tds:
+        vectors = batch[column].to(device)
+        row_ids = batch["_rowid"].to(device).broadcast_to((query.shape[0], -1))
         if metric_type == "l2":
             dists = pairwise_l2(query, vectors)
         elif metric_type == "cosine":
-            pass
+            raise NotImplementedError("Cosine distance is not implemented yet.")
 
-        dists, row_ids = sort_multiple_tensors(dists, row_ids, k)
+        dists, row_ids = sort_tensors(dists, row_ids, k)
 
         if all_ids is None:
             all_ids = row_ids
@@ -106,6 +119,6 @@ def ground_truth(
             all_dists = dists
         else:
             all_dists = torch.cat([all_dists, dists], 1)
-        all_dists, all_ids = sort_multiple_tensors(all_dists, all_ids, k)
+        all_dists, all_ids = sort_tensors(all_dists, all_ids, k)
 
     return all_ids

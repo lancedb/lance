@@ -18,8 +18,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import torch
-from lance.torch import preferred_device
-from lance.torch.bench_utils import ground_truth, sort_multiple_tensors
+from lance.torch.bench_utils import ground_truth, sort_tensors
 from lance.torch.distance import pairwise_l2
 
 
@@ -27,7 +26,7 @@ def test_sort_tensor():
     ids = torch.tensor([[5, 7, 3, 9, 1], [10, 2, 4, 6, 8]], dtype=torch.float32)
     values = ids.clone()
 
-    sorted_vals, sorted_ids = sort_multiple_tensors(values, ids, 3)
+    sorted_vals, sorted_ids = sort_tensors(values, ids, 3)
 
     assert torch.allclose(
         sorted_vals, torch.tensor([[1, 3, 5], [2, 4, 6]], dtype=torch.float32)
@@ -42,7 +41,7 @@ def test_ground_truth(tmp_path: Path):
     NUM_QUERIES = 50
     DIM = 128
 
-    device = preferred_device()
+    device = "cpu"  # Github action friendly.
     data = np.random.rand(N * DIM).astype(np.float32)
     fsl = pa.FixedSizeListArray.from_arrays(data, DIM)
     data = torch.from_numpy(data.reshape((-1, DIM))).to(device)
