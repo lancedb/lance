@@ -63,6 +63,20 @@ impl Reader for CloudObjectReader {
     }
 
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
-        Ok(self.object_store.get_range(&self.path, range).await?)
+        // Retries for the initial request are handled by object store, but
+        // there are no retries for failures that occur during the streaming
+        // of the response body. Thus we add an outer retry loop here.
+        let mut retries = 3;
+        loop {
+            match self.object_store.get_range(&self.path, range.clone()).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(err) => {
+                    if retries == 0 {
+                        return Err(err.into());
+                    }
+                    retries -= 1;
+                }
+            }
+        }
     }
 }
