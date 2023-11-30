@@ -14,6 +14,7 @@
 
 //! Floats Array
 
+use std::fmt::{Debug, Display};
 use std::iter::Sum;
 use std::{
     fmt::Formatter,
@@ -72,8 +73,12 @@ impl TryFrom<&DataType> for FloatType {
 
 /// Trait for float types used in Arrow Array.
 ///
-pub trait ArrowFloatType: std::fmt::Debug {
-    type Native: FromPrimitive + FloatToArrayType<ArrowType = Self> + AsPrimitive<f32>;
+pub trait ArrowFloatType: Debug {
+    type Native: FromPrimitive
+        + FloatToArrayType<ArrowType = Self>
+        + AsPrimitive<f32>
+        + Debug
+        + Display;
 
     const FLOAT_TYPE: FloatType;
 
