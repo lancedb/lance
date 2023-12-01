@@ -13,68 +13,162 @@
 #  limitations under the License.
 
 
+from typing import Optional, Tuple
+
 import torch
 
 
 @torch.jit.script
-def cosine_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def _cosine_distance(
+    vectors: torch.Tensor, centroids: torch.Tensor, split_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if len(vectors.shape) != 2 or len(centroids.shape) != 2:
+        raise ValueError(
+            f"x and y must be 2-D matrix, got: vectors.shape={vectors.shape}"
+            f", centroids.shape={centroids.shape}"
+        )
+
+    y2 = torch.linalg.norm(centroids.T, dim=0, keepdim=True)
+
+    partitions = []
+    distances = []
+
+    for sub_vectors in torch.split(vectors, split_size):
+        x2 = torch.linalg.norm(sub_vectors, dim=1, keepdim=True)
+        dists = 1 - (sub_vectors @ centroids.T).div_(x2 * y2)
+        part_ids = torch.argmin(dists, dim=1, keepdim=True)
+        partitions.append(part_ids)
+        distances.append(dists.take_along_dim(part_ids, dim=1))
+
+    return torch.cat(partitions).reshape(-1), torch.cat(distances).reshape(-1)
+
+
+def _suggest_batch_size(tensor: torch.Tensor) -> int:
+    if torch.cuda.is_available():
+        (free_mem, total_mem) = torch.cuda.mem_get_info()
+        return free_mem // tensor.shape[0] // 4  # TODO: support bf16/f16
+    else:
+        return 1024 * 128
+
+
+def cosine_distance(
+    vectors: torch.Tensor, centroids: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Cosine pair-wise distances between two 2-D Tensors.
 
     Cosine distance = 1 - |xy| / ||x|| * ||y||
 
     Parameters
     ----------
-    x : torch.Tensor
+    vectors : torch.Tensor
         A 2-D [N, D] tensor
-    y : torch.Tensor
+    centroids : torch.Tensor
         A 2-D [M, D] tensor
 
     Returns
     -------
+    A tuple of Tensors, for centroids id, and distance to the centroid.
+
     A 2-D [N, M] tensor of cosine distances between x and y
     """
-    if len(x.shape) != 2 or len(y.shape) != 2:
-        raise ValueError(
-            f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
-        )
+    split = _suggest_batch_size(centroids)
+    while split >= 256:
+        try:
+            return _cosine_distance(vectors, centroids, split_size=split)
+        except RuntimeError as e:  # noqa: PERF203
+            if "CUDA out of memory" in str(e):
+                split //= 2
+                continue
+            raise
 
-    x2 = torch.linalg.norm(x, dim=1, keepdim=True)
-    y2 = torch.linalg.norm(y.T, dim=0, keepdim=True)
-    return 1 - x @ y.T / (x2 * y2)
+    raise RuntimeError("Cosine distance out of memory")
 
 
-@torch.jit.script
-def l2_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Pair-wise L2 / Euclidean distance between two 2-D Tensors.
+def pairwise_l2(x: torch.Tensor, y: torch.Tensor, y2: Optional[torch.Tensor] = None):
+    """Compute pair-wise L2 distance between x and y.
 
     Parameters
     ----------
     x : torch.Tensor
-        A 2-D [N, D] tensor
+        A 2-D ``[M, D]`` tensor, containing `M` vectors.
     y : torch.Tensor
-        A 2-D [M, D] tensor
+        A 2-D ``[N, D]`` tensor, containing `N` vectors.
+    y2: 1-D tensor.Tensor, optional
+        Optionally, the pre-computed `y^2`.
 
     Returns
     -------
-    A 2-D [N, M] tensor of L2 distances between x and y.
+    A ``[M, N]`` tensor with pair-wise L2 distance between x and y.
     """
     if len(x.shape) != 2 or len(y.shape) != 2:
         raise ValueError(
             f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
         )
-    # (x - y)^2 = x^2 + y^2 - 2xy
+    if y2 is None:
+        y2 = (y * y).sum(dim=1)
     x2 = (x * x).sum(dim=1)
-    y2 = (y * y).sum(dim=1)
     xy = x @ y.T
-    return (
+    dists = (
         x2.broadcast_to(y2.shape[0], x2.shape[0]).T
         + y2.broadcast_to(x2.shape[0], y2.shape[0])
         - 2 * xy
     )
+    return dists
 
 
 @torch.jit.script
-def dot_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def _l2_distance(
+    x: torch.Tensor, y: torch.Tensor, split_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if len(x.shape) != 2 or len(y.shape) != 2:
+        raise ValueError(
+            f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
+        )
+
+    part_ids = []
+    distances = []
+
+    y2 = (y * y).sum(dim=1)
+    for sub_vectors in x.split(split_size):
+        dists = pairwise_l2(sub_vectors, y, y2)
+        idx = torch.argmin(dists, dim=1, keepdim=True)
+        part_ids.append(idx)
+        distances.append(dists.take_along_dim(idx, dim=1))
+
+    return torch.cat(part_ids).reshape(-1), torch.cat(distances).reshape(-1)
+
+
+def l2_distance(
+    vectors: torch.Tensor, centroids: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pair-wise L2 / Euclidean distance between two 2-D Tensors.
+
+    Parameters
+    ----------
+    vectors : torch.Tensor
+       A 2-D [N, D] tensor
+    centroids : torch.Tensor
+       A 2-D [M, D] tensor
+
+    Returns
+    -------
+    A tuple of Tensors, for centroids id, and distance to the centroids.
+    """
+    split = _suggest_batch_size(centroids)
+    while split >= 256:
+        try:
+            return _l2_distance(vectors, centroids, split_size=split)
+        except RuntimeError as e:  # noqa: PERF203
+            if "CUDA out of memory" in str(e):
+                split //= 2
+                continue
+            raise
+
+    raise RuntimeError("L2 distance out of memory")
+
+
+@torch.jit.script
+def dot_distance(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pair-wise dot distance between two 2-D Tensors.
 
     Parameters
@@ -93,4 +187,7 @@ def dot_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
         )
 
-    return 1 - x @ y.T
+    dists = 1 - x @ y.T
+    idx = torch.argmin(dists, dim=1, keepdim=True)
+    dists = dists.take_along_dim(idx, dim=1).reshape(-1)
+    return idx.reshape(-1), dists.reshape(-1)

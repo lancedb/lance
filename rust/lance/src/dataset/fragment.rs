@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
+use datafusion::logical_expr::Expr;
+use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
@@ -33,11 +35,11 @@ use lance_core::{
     },
     Error, Result, ROW_ID,
 };
+use lance_datafusion::chunker::chunk_stream;
 use object_store::path::Path;
 use snafu::{location, Location};
 use uuid::Uuid;
 
-use super::chunker::chunk_stream;
 use super::hash_joiner::HashJoiner;
 use super::scanner::Scanner;
 use super::updater::Updater;
@@ -533,7 +535,7 @@ impl FileFragment {
     /// If all rows are deleted, returns `Ok(None)`. Otherwise, returns a new
     /// fragment with the updated deletion vector. This must be persisted to
     /// the manifest.
-    pub async fn delete(mut self, predicate: &str) -> Result<Option<Self>> {
+    pub async fn delete(self, predicate: &str) -> Result<Option<Self>> {
         // Load existing deletion vector
         let mut deletion_vector = read_deletion_file(
             &self.dataset.base,
@@ -548,8 +550,6 @@ impl FileFragment {
         // scan with predicate and row ids
         let mut scanner = self.scan();
 
-        // if predicate is `true`, delete the whole fragment
-        // else if predicate is `false`, filter the predicate
         let predicate_lower = predicate.trim().to_lowercase();
         if predicate_lower == "true" {
             return Ok(None);
@@ -561,6 +561,19 @@ impl FileFragment {
             .with_row_id()
             .filter(predicate)?
             .project::<&str>(&[])?;
+
+        // if predicate is `true`, delete the whole fragment
+        // else if predicate is `false`, filter the predicate
+        // We do this on the expression level after expression optimization has
+        // occurred so we also catch expressions that are equivalent to `true`
+        if let Some(predicate) = &scanner.filter {
+            if matches!(predicate, Expr::Literal(ScalarValue::Boolean(Some(false)))) {
+                return Ok(Some(self));
+            }
+            if matches!(predicate, Expr::Literal(ScalarValue::Boolean(Some(true)))) {
+                return Ok(None);
+            }
+        }
 
         // As we get row ids, add them into our deletion vector
         scanner
@@ -585,8 +598,27 @@ impl FileFragment {
             return Ok(Some(self));
         }
 
-        // TODO: could we keep the number of rows in memory when we first get
-        // the fragment metadata?
+        self.write_deletions(deletion_vector).await
+    }
+
+    pub(crate) async fn extend_deletions(
+        self,
+        new_deletions: impl IntoIterator<Item = u32>,
+    ) -> Result<Option<Self>> {
+        let mut deletion_vector = read_deletion_file(
+            &self.dataset.base,
+            &self.metadata,
+            self.dataset.object_store(),
+        )
+        .await?
+        .unwrap_or_default();
+
+        deletion_vector.extend(new_deletions);
+
+        self.write_deletions(deletion_vector).await
+    }
+
+    async fn write_deletions(mut self, deletion_vector: DeletionVector) -> Result<Option<Self>> {
         let physical_rows = self.physical_rows().await?;
         if deletion_vector.len() == physical_rows
             && deletion_vector.contains_range(0..physical_rows as u32)

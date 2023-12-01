@@ -22,17 +22,30 @@ use std::{
 };
 
 use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
-use datafusion_common::ScalarValue;
+use datafusion::physical_plan::{
+    sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
+    union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+};
+use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::Accumulator;
-use datafusion_physical_expr::expressions::{MaxAccumulator, MinAccumulator};
+use datafusion_physical_expr::{
+    expressions::{Column, MaxAccumulator, MinAccumulator},
+    PhysicalSortExpr,
+};
 use futures::{
-    stream::{self, BoxStream},
-    FutureExt, StreamExt, TryStreamExt,
+    future::BoxFuture,
+    stream::{self},
+    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{Error, Result};
+use lance_datafusion::{
+    chunker::chunk_concat_stream,
+    exec::{execute_plan, OneShotExec},
+};
 use nohash_hasher::IntMap;
+use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
 use snafu::{location, Location};
 
@@ -636,9 +649,9 @@ impl BTreeLookup {
 ///
 /// Note: this is very similar to the IVF index except we store the IVF part in a btree
 /// for faster lookup
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BTreeIndex {
-    page_lookup: BTreeLookup,
+    page_lookup: Arc<BTreeLookup>,
     store: Arc<dyn IndexStore>,
     sub_index: Arc<dyn BTreeSubIndex>,
 }
@@ -650,7 +663,7 @@ impl BTreeIndex {
         store: Arc<dyn IndexStore>,
         sub_index: Arc<dyn BTreeSubIndex>,
     ) -> Self {
-        let page_lookup = BTreeLookup::new(tree, null_pages);
+        let page_lookup = Arc::new(BTreeLookup::new(tree, null_pages));
         Self {
             page_lookup,
             store,
@@ -721,6 +734,22 @@ impl BTreeIndex {
 
         Ok(Self::new(map, null_pages, store, sub_index))
     }
+
+    /// Create a stream of all the data in the index, in the same format used to train the index
+    async fn into_data_stream(self) -> Result<impl RecordBatchStream> {
+        let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+        let pages = self.page_lookup.all_page_ids();
+        let schema = self.sub_index.schema().clone();
+        let batches = IndexReaderStream {
+            reader,
+            pages,
+            idx: 0,
+        }
+        .map(|fut| fut.map_err(DataFusionError::from))
+        .buffered(num_cpus::get())
+        .boxed();
+        Ok(RecordBatchStreamAdapter::new(schema, batches))
+    }
 }
 
 fn wrap_bound(bound: &Bound<ScalarValue>) -> Bound<OrderableScalarValue> {
@@ -751,6 +780,7 @@ struct BTreeStatistics {
     num_pages: u32,
 }
 
+#[async_trait]
 impl Index for BTreeIndex {
     fn as_any(&self) -> &dyn Any {
         self
@@ -781,6 +811,19 @@ impl Index for BTreeIndex {
             max,
         })
         .map_err(|err| err.into())
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        let mut frag_ids = RoaringBitmap::default();
+
+        let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+        for page_number in self.page_lookup.all_page_ids() {
+            let serialized = sub_index_reader.read_record_batch(page_number).await?;
+            let page = self.sub_index.load_subindex(serialized).await?;
+            frag_ids |= page.calculate_included_frags().await?;
+        }
+
+        Ok(frag_ids)
     }
 }
 
@@ -859,6 +902,16 @@ impl ScalarIndex for BTreeIndex {
             .copy_index_file(BTREE_LOOKUP_NAME, dest_store)
             .await
     }
+
+    async fn update(
+        &self,
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
+    ) -> Result<()> {
+        // Merge the existing index data with the new data and then retrain the index on the merged stream
+        let merged_data_source = Box::new(BTreeUpdater::new(self.clone(), new_data));
+        train_btree_index(merged_data_source, self.sub_index.as_ref(), dest_store).await
+    }
 }
 
 struct BatchStats {
@@ -916,6 +969,14 @@ pub trait BTreeSubIndex: Debug + Send + Sync {
     /// Deserialize a subindex from Arrow
     async fn load_subindex(&self, serialized: RecordBatch) -> Result<Arc<dyn ScalarIndex>>;
 
+    /// Retrieve the data used to originally train this page
+    ///
+    /// In order to perform an update we need to merge the old data in with the new data which
+    /// means we need to access the new data.  Right now this is convenient for flat indices but
+    /// we may need to take a different approach if we ever decide to use a sub-index other than
+    /// flat
+    async fn retrieve_data(&self, serialized: RecordBatch) -> Result<RecordBatch>;
+
     /// The schema of the subindex when serialized to Arrow
     fn schema(&self) -> &Arc<Schema>;
 
@@ -971,7 +1032,7 @@ fn btree_stats_as_batch(stats: Vec<EncodedBatch>) -> Result<RecordBatch> {
 }
 
 #[async_trait]
-pub trait BtreeTrainingSource: Send + Sync {
+pub trait BtreeTrainingSource: Send {
     /// Returns a stream of batches, ordered by the value column (in ascending order)
     ///
     /// Each batch should have chunk_size rows
@@ -982,7 +1043,7 @@ pub trait BtreeTrainingSource: Send + Sync {
     async fn scan_ordered_chunks(
         self: Box<Self>,
         chunk_size: u32,
-    ) -> Result<BoxStream<'static, Result<RecordBatch>>>;
+    ) -> Result<SendableRecordBatchStream>;
 }
 
 /// Train a btree index from a stream of sorted page-size batches of values and row ids
@@ -1017,4 +1078,82 @@ pub async fn train_btree_index(
     btree_index_file.write_record_batch(record_batch).await?;
     btree_index_file.finish().await?;
     Ok(())
+}
+
+/// A source of training data created by merging existing data with new data
+struct BTreeUpdater {
+    index: BTreeIndex,
+    new_data: SendableRecordBatchStream,
+}
+
+impl BTreeUpdater {
+    fn new(index: BTreeIndex, new_data: SendableRecordBatchStream) -> Self {
+        Self { index, new_data }
+    }
+}
+
+impl BTreeUpdater {
+    fn into_old_input(index: BTreeIndex) -> Arc<dyn ExecutionPlan> {
+        let schema = index.sub_index.schema().clone();
+        let batches = index.into_data_stream().into_stream().try_flatten().boxed();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, batches));
+        Arc::new(OneShotExec::new(stream))
+    }
+}
+
+#[async_trait]
+impl BtreeTrainingSource for BTreeUpdater {
+    async fn scan_ordered_chunks(
+        self: Box<Self>,
+        chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream> {
+        let new_input = Arc::new(OneShotExec::new(self.new_data));
+        let old_input = Self::into_old_input(self.index);
+        debug_assert_eq!(
+            old_input.schema().all_fields().len(),
+            new_input.schema().all_fields().len()
+        );
+        let sort_expr = PhysicalSortExpr {
+            expr: Arc::new(Column::new("values", 0)),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        };
+        // The UnionExec creates multiple partitions but the SortPreservingMergeExec merges
+        // them back into a single partition.
+        let all_data = Arc::new(UnionExec::new(vec![old_input, new_input]));
+        let ordered = Arc::new(SortPreservingMergeExec::new(vec![sort_expr], all_data));
+        let unchunked = execute_plan(ordered)?;
+        Ok(chunk_concat_stream(unchunked, chunk_size as usize))
+    }
+}
+
+/// A stream that reads the original training data back out of the index
+///
+/// This is used for updating the index
+struct IndexReaderStream {
+    reader: Arc<dyn IndexReader>,
+    pages: Vec<u32>,
+    idx: usize,
+}
+
+impl Stream for IndexReaderStream {
+    type Item = BoxFuture<'static, Result<RecordBatch>>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let idx = this.idx;
+        if idx >= this.pages.len() {
+            return std::task::Poll::Ready(None);
+        }
+        let page_number = this.pages[idx];
+        this.idx += 1;
+        let reader_copy = this.reader.clone();
+        let read_task = async move { reader_copy.read_record_batch(page_number).await }.boxed();
+        std::task::Poll::Ready(Some(read_task))
+    }
 }

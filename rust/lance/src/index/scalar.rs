@@ -15,12 +15,11 @@
 //! Utilities for integrating scalar indices with datasets
 //!
 
-use std::{future, sync::Arc};
+use std::sync::Arc;
 
-use arrow::compute::kernels;
-use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use futures::{stream::BoxStream, StreamExt, TryStreamExt};
+use datafusion::physical_plan::SendableRecordBatchStream;
+use lance_datafusion::chunker::chunk_concat_stream;
 use lance_index::scalar::{
     btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
     flat::FlatIndexMetadata,
@@ -32,10 +31,7 @@ use tracing::instrument;
 
 use lance_core::{Error, Result};
 
-use crate::{
-    dataset::{chunker, scanner::ColumnOrdering},
-    Dataset,
-};
+use crate::{dataset::scanner::ColumnOrdering, Dataset};
 
 use super::IndexParams;
 
@@ -58,7 +54,7 @@ impl BtreeTrainingSource for TrainingRequest {
     async fn scan_ordered_chunks(
         self: Box<Self>,
         chunk_size: u32,
-    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    ) -> Result<SendableRecordBatchStream> {
         let mut scan = self.dataset.scan();
         let scan = scan
             .with_row_id()
@@ -67,23 +63,13 @@ impl BtreeTrainingSource for TrainingRequest {
             )]))?
             .project(&[&self.column])?;
 
-        let schema = scan.schema()?;
-        let ordered_batches = scan.try_into_stream().await?;
-        let chunked = chunker::chunk_stream(ordered_batches.into(), chunk_size as usize);
-        Ok(chunked
-            .and_then(move |batches| {
-                future::ready(
-                    // chunk_stream is zero-copy and so it gives us pieces of batches.  However, the btree
-                    // index needs 1 batch-per-page and so we concatenate here.
-                    kernels::concat::concat_batches(&schema, batches.iter()).map_err(|e| e.into()),
-                )
-            })
-            .boxed())
+        let ordered_batches = scan.try_into_dfstream().await?;
+        Ok(chunk_concat_stream(ordered_batches, chunk_size as usize))
     }
 }
 
 /// Build a Vector Index
-#[instrument(skip(dataset))]
+#[instrument(level = "debug", skip(dataset))]
 pub async fn build_scalar_index(dataset: &Dataset, column: &str, uuid: &str) -> Result<()> {
     let training_request = Box::new(TrainingRequest {
         dataset: Arc::new(dataset.clone()),

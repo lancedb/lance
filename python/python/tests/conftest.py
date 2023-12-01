@@ -83,16 +83,3 @@ def pytest_collection_modifyitems(config, items):
         disable_items_with_mark(items, "torch", reason)
         disable_items_with_mark(items, "cuda", reason)
         disable_items_with_mark(items, "gpu", reason)
-
-
-def pytest_configure(config):
-    config.addinivalue_line(
-        "markers", "integration: mark test to run only on named environment"
-    )
-    config.addinivalue_line(
-        "markers", "torch: tests which rely on pytorch being installed"
-    )
-    config.addinivalue_line("markers", "cuda: tests which rely on pytorch and cuda")
-    config.addinivalue_line(
-        "markers", "gpu: tests which rely on pytorch and some kind of gpu"
-    )

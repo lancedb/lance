@@ -20,9 +20,11 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 
+use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
-use lance_core::Result;
+use lance_core::{format::RowAddress, Result};
 use nohash_hasher::IntMap;
+use roaring::RoaringBitmap;
 use serde::Serialize;
 
 use crate::{Index, IndexType};
@@ -125,6 +127,10 @@ impl BTreeSubIndex for FlatIndexMetadata {
     ) -> Result<RecordBatch> {
         remap_batch(serialized, mapping)
     }
+
+    async fn retrieve_data(&self, serialized: RecordBatch) -> Result<RecordBatch> {
+        Ok(serialized)
+    }
 }
 
 #[derive(Serialize)]
@@ -132,6 +138,7 @@ struct FlatStatistics {
     num_values: u32,
 }
 
+#[async_trait]
 impl Index for FlatIndex {
     fn as_any(&self) -> &dyn Any {
         self
@@ -150,6 +157,18 @@ impl Index for FlatIndex {
             num_values: self.data.num_rows() as u32,
         })
         .map_err(|err| err.into())
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        let mut frag_ids = self
+            .ids()
+            .as_primitive::<UInt64Type>()
+            .iter()
+            .map(|row_id| RowAddress::new_from_id(row_id.unwrap()).fragment_id())
+            .collect::<Vec<_>>();
+        frag_ids.sort();
+        frag_ids.dedup();
+        Ok(RoaringBitmap::from_sorted_iter(frag_ids).unwrap())
     }
 }
 
@@ -245,6 +264,15 @@ impl ScalarIndex for FlatIndex {
         writer.write_record_batch(remapped).await?;
         writer.finish().await?;
         Ok(())
+    }
+
+    async fn update(
+        &self,
+        _new_data: SendableRecordBatchStream,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<()> {
+        // If this was desired, then you would need to merge new_data and data and write it back out
+        todo!()
     }
 }
 

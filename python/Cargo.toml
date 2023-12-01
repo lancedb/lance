@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "0.8.14"
+version = "0.8.18"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 rust-version = "1.65"
@@ -42,6 +42,7 @@ tracing = "0.1.37"
 
 [features]
 datagen = ["lance-datagen"]
+avx512fp16 = ["lance/avx512fp16"]
 
 [build-dependencies]
 prost-build = "0.11"

@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.14"
+version = "0.8.18"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -36,14 +36,15 @@ categories = [
 rust-version = "1.70"
 
 [workspace.dependencies]
-lance = { version = "=0.8.14", path = "./lance" }
-lance-arrow = { version = "=0.8.14", path = "./lance-arrow" }
-lance-core = { version = "=0.8.14", path = "./lance-core" }
-lance-datagen = { version = "=0.8.14", path = "./lance-datagen" }
-lance-index = { version = "=0.8.14", path = "./lance-index" }
-lance-linalg = { version = "=0.8.14", path = "./lance-linalg" }
-lance-test-macros = { version = "=0.8.14", path = "./lance-test-macros" }
-lance-testing = { version = "=0.8.14", path = "./lance-testing" }
+lance = { version = "=0.8.18", path = "./lance" }
+lance-arrow = { version = "=0.8.18", path = "./lance-arrow" }
+lance-core = { version = "=0.8.18", path = "./lance-core" }
+lance-datafusion = { version = "=0.8.18", path = "./lance-datafusion" }
+lance-datagen = { version = "=0.8.18", path = "./lance-datagen" }
+lance-index = { version = "=0.8.18", path = "./lance-index" }
+lance-linalg = { version = "=0.8.18", path = "./lance-linalg" }
+lance-test-macros = { version = "=0.8.18", path = "./lance-test-macros" }
+lance-testing = { version = "=0.8.18", path = "./lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "47.0.0", optional = false }
@@ -70,6 +71,9 @@ bytes = "1.4"
 byteorder = "1.5"
 chrono = "0.4.23"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
+datafusion = { version = "32.0.0", default-features = false, features = [
+    "regex_expressions",
+] }
 datafusion-common = "32.0"
 datafusion-sql = "32.0"
 either = "1.0"
@@ -91,6 +95,7 @@ prost-build = "0.12"
 prost-types = "0.12"
 rand = { version = "0.8.3", features = ["small_rng"] }
 roaring = "0.10.1"
+rustc_version = "0.4"
 serde = { version = "^1" }
 serde_json = { version = "1" }
 shellexpand = "3.0"

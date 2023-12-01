@@ -31,12 +31,15 @@ use lance_core::{
     },
     Error, Result,
 };
+use lance_datafusion::chunker::chunk_stream;
 use object_store::path::Path;
 use tracing::instrument;
 use uuid::Uuid;
 
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
-use super::{chunker::chunk_stream, DATA_DIR};
+use super::DATA_DIR;
+
+pub mod update;
 
 /// The mode to write dataset.
 #[derive(Debug, Clone, Copy)]
@@ -153,7 +156,7 @@ pub async fn write_fragments(
 /// This is a private variant that takes a `SendableRecordBatchStream` instead
 /// of a reader. We don't expose the stream at our interface because it is a
 /// DataFusion type.
-#[instrument(skip_all)]
+#[instrument(level = "debug", skip_all)]
 pub async fn write_fragments_internal(
     object_store: Arc<ObjectStore>,
     base_dir: &Path,

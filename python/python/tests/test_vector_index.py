@@ -297,6 +297,8 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     if platform.system() == "Windows":
         expected_filepath = expected_filepath.replace("\\", "/")
     expected_statistics = {
+        "index_cache_entry_count": 1,
+        "index_cache_hit_rate": 0,
         "index_type": "IVF",
         "uuid": index_uuid,
         "uri": expected_filepath,
@@ -465,3 +467,73 @@ def test_knn_with_deletions(tmp_path):
     assert len(results) == 10
 
     assert expected == [r.as_py() for r in results]
+
+
+def test_index_cache_size(tmp_path):
+    rng = np.random.default_rng(seed=42)
+
+    def query_index(ds, ntimes):
+        ndim = ds.schema[0].type.list_size
+        for _ in range(ntimes):
+            ds.to_table(
+                nearest={
+                    "column": "vector",
+                    "q": rng.standard_normal(ndim),
+                },
+            )
+
+    tbl = create_table(nvec=1024, ndim=16)
+    dataset = lance.write_dataset(tbl, tmp_path / "test")
+
+    indexed_dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=128,
+        num_sub_vectors=2,
+        index_cache_size=10,
+    )
+
+    assert (
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 1
+    )
+    query_index(indexed_dataset, 1)
+    assert (
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 2
+    )
+    assert (
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_hit_rate"] == 0.5
+    )
+    query_index(indexed_dataset, 128)
+    assert (
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 10
+    )
+
+    indexed_dataset = lance.LanceDataset(indexed_dataset.uri, index_cache_size=5)
+    query_index(indexed_dataset, 128)
+    assert (
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 5
+    )
+
+
+def test_f16_index(tmp_path: Path):
+    DIM = 64
+    uri = tmp_path / "f16data.lance"
+    f16_data = np.random.uniform(0, 1, 2048 * DIM).astype(np.float16)
+    fsl = pa.FixedSizeListArray.from_arrays(f16_data, DIM)
+    tbl = pa.Table.from_pydict({"vector": fsl})
+    dataset = lance.write_dataset(tbl, uri)
+    dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=2
+    )
+
+    q = np.random.uniform(0, 1, DIM).astype(np.float16)
+    rst = dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 10,
+        }
+    )
+
+    assert rst.schema.field("vector").type.value_type == pa.float16()
+    assert len(rst) == 10

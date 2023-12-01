@@ -16,8 +16,12 @@
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
 
+import gc
+import logging
+from dataclasses import dataclass, field
+from heapq import heappush, heappushpop
 from pathlib import Path
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Iterable, TypeVar, Union
 
 import numpy as np
 import pyarrow as pa
@@ -52,7 +56,7 @@ def _efficient_sample(
     max_takes : int
         The maximum number of takes to perform. This is used to limit the number of
         random reads. Large enough value can give a good random sample without
-        having to issue too much random reads.
+        having to issue too many random reads.
 
     Returns
     -------
@@ -63,25 +67,44 @@ def _efficient_sample(
     assert total_records > n
     chunk_size = total_records // max_takes
     chunk_sample_size = n // max_takes
-    for i in range(0, total_records, chunk_size):
-        # Add more randomness within each chunk.
-        offset = i + np.random.randint(0, chunk_size - chunk_sample_size)
+
+    num_sampled = 0
+
+    for idx, i in enumerate(range(0, total_records, chunk_size)):
+        # If we have already sampled enough, break. This can happen if there
+        # is a remainder in the division.
+        if num_sampled >= n:
+            break
+        num_sampled += chunk_sample_size
+
+        # If we are at the last chunk, we may not have enough records to sample.
+        local_size = min(chunk_size, total_records - i)
+        local_sample_size = min(chunk_sample_size, local_size)
+
+        if local_sample_size < local_size:
+            # Add more randomness within each chunk, if there is room.
+            offset = i + np.random.randint(0, local_size - local_sample_size)
+        else:
+            offset = i
+
         buf.extend(
-            dataset.to_batches(
+            dataset.take(
+                list(range(offset, offset + local_sample_size)),
                 columns=columns,
-                batch_size=chunk_size,
-                offset=offset,
-                limit=chunk_sample_size,
-            )
+            ).to_batches()
         )
+        if idx % 50 == 0:
+            logging.info("Sampled at offset=%s, len=%s", offset, chunk_sample_size)
         if sum(len(b) for b in buf) >= batch_size:
             tbl = pa.Table.from_batches(buf)
             buf.clear()
             tbl = tbl.combine_chunks()
             yield tbl.to_batches()[0]
+            del tbl
     if buf:
         tbl = pa.Table.from_batches(buf).combine_chunks()
         yield tbl.to_batches()[0]
+        del tbl
 
 
 def maybe_sample(
@@ -89,7 +112,7 @@ def maybe_sample(
     n: int,
     columns: Union[list[str], str],
     batch_size: int = 10240,
-    max_takes: int = 8194,
+    max_takes: int = 512,
 ) -> Generator[pa.RecordBatch, None, None]:
     """Sample n records from the dataset.
 
@@ -128,5 +151,32 @@ def maybe_sample(
             yield from _efficient_sample(dataset, n, columns, batch_size, max_takes)
         else:
             choices = np.random.choice(len(dataset), n, replace=False)
-            tbl = dataset._take_rows(choices, columns=columns).combine_chunks()
+            tbl = dataset.take(choices, columns=columns).combine_chunks()
             yield tbl.to_batches()[0]
+
+
+T = TypeVar("T")
+
+
+@dataclass(order=True)
+class PrioritizedItem:
+    priority: int
+    item: T = field(compare=False)
+
+
+def reservoir_sampling(stream: Iterable[T], k: int) -> list[T]:
+    rng = np.random.default_rng()
+    heap = []
+    for idx, item in enumerate(stream):
+        entry = PrioritizedItem(rng.integers(0, k * 2), item)
+        if len(heap) < k:
+            heappush(heap, entry)
+        else:
+            vic = heappushpop(heap, entry)
+            del vic
+        if idx % 10240 == 0:
+            logging.info("Force Python GC")
+            gc.collect()
+    samples = [i.item for i in heap]
+    del heap
+    return samples

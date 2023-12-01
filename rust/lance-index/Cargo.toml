@@ -20,6 +20,7 @@ arrow-arith.workspace = true
 arrow-select.workspace = true
 async-recursion.workspace = true
 async-trait.workspace = true
+datafusion.workspace = true
 datafusion-common.workspace = true
 datafusion-expr = "32.0.0"
 datafusion-physical-expr = { version = "32.0.0", default-features = false }
@@ -27,12 +28,14 @@ futures.workspace = true
 half.workspace = true
 lance-arrow.workspace = true
 lance-core.workspace = true
+lance-datafusion.workspace = true
 lance-linalg.workspace = true
 log.workspace = true
 nohash-hasher.workspace = true
 num_cpus.workspace = true
 num-traits.workspace = true
 object_store.workspace = true
+pin-project.workspace = true
 prost.workspace = true
 rand.workspace = true
 roaring.workspace = true
@@ -54,7 +57,12 @@ datafusion-sql = "32.0.0"
 
 [build-dependencies]
 prost-build.workspace = true
+rustc_version.workspace = true
 
 [[bench]]
 name = "find_partitions"
+harness = false
+
+[[bench]]
+name = "pq_dist_table"
 harness = false

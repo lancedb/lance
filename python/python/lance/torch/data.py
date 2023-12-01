@@ -34,14 +34,24 @@ if TYPE_CHECKING:
 __all__ = ["LanceDataset"]
 
 
-def _to_tensor(batch: pa.RecordBatch) -> dict[str, torch.Tensor]:
+def _to_tensor(
+    batch: pa.RecordBatch, *, uint64_as_int64: bool = True
+) -> Union[dict[str, torch.Tensor], torch.Tensor]:
+    """Convert a pyarrow RecordBatch to torch Tensor."""
     ret = {}
-    for col in batch.column_names:
+    for col in batch.schema.names:
         arr: pa.Array = batch[col]
+        if pa.types.is_uint64(arr.type) and uint64_as_int64:
+            arr = arr.cast(pa.int64())
+
         if pa.types.is_fixed_size_list(arr.type) and pa.types.is_floating(
             arr.type.value_type
         ):
-            tensor = torch.tensor(np.stack(arr.to_numpy(zero_copy_only=False)))
+            np_arrs = arr.to_numpy(zero_copy_only=False)
+            np_tensor = np.stack(np_arrs)
+            del np_arrs
+            tensor = torch.tensor(np_tensor)
+            del np_tensor
         elif (
             pa.types.is_integer(arr.type)
             or pa.types.is_floating(arr.type)
@@ -53,7 +63,12 @@ def _to_tensor(batch: pa.RecordBatch) -> dict[str, torch.Tensor]:
                 "Only support FixedSizeList<f16/f32/f64> or "
                 + f"numeric values, got: {arr.type}"
             )
+        del arr
         ret[col] = tensor
+    if len(ret) == 1:
+        t = next(iter(ret.values()))
+        del ret
+        return t
     return ret
 
 
@@ -69,6 +84,7 @@ class LanceDataset(IterableDataset):
         filter: Optional[str] = None,
         samples: Optional[int] = 0,
         cache: Optional[Union[str, bool]] = None,
+        with_row_id: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -76,12 +92,16 @@ class LanceDataset(IterableDataset):
         self.columns = columns
         self.batch_size = batch_size
         self.samples: Optional[int] = samples
+        self.filter = filter
 
         if samples is not None and filter is not None:
             raise ValueError("Does not support sampling over filtered dataset")
 
         self.cache = cache
         self.cached_ds: Optional[CachedDataset] = None
+
+    def __repr__(self) -> str:
+        return f"LanceTorchDataset({self.dataset.uri}, size={self.samples})"
 
     def __iter__(self):
         stream: Iterable[pa.RecordBatch]
@@ -99,7 +119,8 @@ class LanceDataset(IterableDataset):
                 stream = self.dataset.to_batches(
                     columns=self.columns,
                     batch_size=self.batch_size,
-                    filter=filter,
+                    filter=self.filter,
+                    with_row_id=True,
                 )
 
             if self.cache:
@@ -108,3 +129,4 @@ class LanceDataset(IterableDataset):
 
         for batch in stream:
             yield _to_tensor(batch)
+            del batch

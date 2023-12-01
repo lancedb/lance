@@ -19,7 +19,7 @@ import platform
 import re
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -680,7 +680,14 @@ def test_merge_data(tmp_path: Path):
 
 
 def test_delete_data(tmp_path: Path):
-    tab = pa.table({"a": range(100), "b": range(100)})
+    # We pass schema explicitly since we want b to be non-nullable.
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64()),
+            pa.field("b", pa.int64(), nullable=False),
+        ]
+    )
+    tab = pa.table({"a": range(100), "b": range(100)}, schema=schema)
     lance.write_dataset(tab, tmp_path / "dataset", mode="append")
 
     dataset = lance.dataset(tmp_path / "dataset")
@@ -688,11 +695,119 @@ def test_delete_data(tmp_path: Path):
     dataset.delete("a < 10")
     dataset.delete("b in (98, 99)")
     assert dataset.version == 3
-    assert dataset.to_table() == pa.table({"a": range(10, 98), "b": range(10, 98)})
+    assert dataset.to_table() == pa.table(
+        {"a": range(10, 98), "b": range(10, 98)}, schema=schema
+    )
 
     dataset.delete(pa_ds.field("a") < 20)
     assert dataset.version == 4
-    assert dataset.to_table() == pa.table({"a": range(20, 98), "b": range(20, 98)})
+    assert dataset.to_table() == pa.table(
+        {"a": range(20, 98), "b": range(20, 98)}, schema=schema
+    )
+
+    # These sorts of filters were previously used as a work-around for not
+    # supporting "WHERE true". But now we need to make sure they still work
+    # even with presence of expression simplification passes.
+    old_version = dataset.version
+    dataset.delete("b IS NOT NULL")
+    assert dataset.count_rows() == 0
+
+    dataset = lance.dataset(tmp_path / "dataset", version=old_version)
+    dataset.restore()
+    assert dataset.count_rows() > 0
+    dataset.delete("true")
+    assert dataset.count_rows() == 0
+
+
+def test_update_dataset(tmp_path: Path):
+    nrows = 100
+    vecs = pa.FixedSizeListArray.from_arrays(
+        pa.array(range(2 * nrows), type=pa.float32()), 2
+    )
+    tab = pa.table({"a": range(nrows), "b": range(nrows), "vec": vecs})
+    lance.write_dataset(tab, tmp_path / "dataset", mode="append")
+
+    dataset = lance.dataset(tmp_path / "dataset")
+
+    dataset.update(dict(b="b + 1"))
+    expected = pa.table({"a": range(100), "b": range(1, 101)})
+    assert dataset.to_table(columns=["a", "b"]) == expected
+
+    dataset.update(dict(a="a * 2"), where="a < 50")
+    expected = pa.table(
+        {"a": [x * 2 if x < 50 else x for x in range(100)], "b": range(1, 101)}
+    )
+    assert dataset.to_table(columns=["a", "b"]).sort_by("b") == expected
+
+    dataset.update(dict(vec="[42.0, 43.0]"))
+    expected = pa.table(
+        {
+            "b": range(1, 101),
+            "vec": pa.array(
+                [[42.0, 43.0] for _ in range(100)], pa.list_(pa.float32(), 2)
+            ),
+        }
+    )
+    assert dataset.to_table(columns=["b", "vec"]).sort_by("b") == expected
+
+
+def test_update_dataset_all_types(tmp_path: Path):
+    table = pa.table(
+        {
+            "int32": pa.array([1], pa.int32()),
+            "int64": pa.array([1], pa.int64()),
+            "uint32": pa.array([1], pa.uint32()),
+            "string": pa.array(["foo"], pa.string()),
+            "large_string": pa.array(["foo"], pa.large_string()),
+            "float32": pa.array([1.0], pa.float32()),
+            "float64": pa.array([1.0], pa.float64()),
+            "bool": pa.array([True], pa.bool_()),
+            "date32": pa.array([date(2021, 1, 1)], pa.date32()),
+            "timestamp_ns": pa.array([datetime(2021, 1, 1)], pa.timestamp("ns")),
+            "timestamp_ms": pa.array([datetime(2021, 1, 1)], pa.timestamp("ms")),
+            "vec_f32": pa.array([[1.0, 2.0]], pa.list_(pa.float32(), 2)),
+            "vec_f64": pa.array([[1.0, 2.0]], pa.list_(pa.float64(), 2)),
+        }
+    )
+
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # One update with all matching types
+    dataset.update(
+        dict(
+            int32="2",
+            int64="2",
+            uint32="2",
+            string="'bar'",
+            large_string="'bar'",
+            float32="2.0",
+            float64="2.0",
+            bool="false",
+            date32="DATE '2021-01-02'",
+            timestamp_ns='TIMESTAMP "2021-01-02 00:00:00"',
+            timestamp_ms='TIMESTAMP "2021-01-02 00:00:00"',
+            vec_f32="[3.0, 4.0]",
+            vec_f64="[3.0, 4.0]",
+        )
+    )
+    expected = pa.table(
+        {
+            "int32": pa.array([2], pa.int32()),
+            "int64": pa.array([2], pa.int64()),
+            "uint32": pa.array([2], pa.uint32()),
+            "string": pa.array(["bar"], pa.string()),
+            "large_string": pa.array(["bar"], pa.large_string()),
+            "float32": pa.array([2.0], pa.float32()),
+            "float64": pa.array([2.0], pa.float64()),
+            "bool": pa.array([False], pa.bool_()),
+            "date32": pa.array([date(2021, 1, 2)], pa.date32()),
+            "timestamp_ns": pa.array([datetime(2021, 1, 2)], pa.timestamp("ns")),
+            "timestamp_ms": pa.array([datetime(2021, 1, 2)], pa.timestamp("ms")),
+            "vec_f32": pa.array([[3.0, 4.0]], pa.list_(pa.float32(), 2)),
+            "vec_f64": pa.array([[3.0, 4.0]], pa.list_(pa.float64(), 2)),
+        }
+    )
+    assert dataset.to_table() == expected
 
 
 def test_create_update_empty_dataset(tmp_path: Path, provide_pandas: bool):

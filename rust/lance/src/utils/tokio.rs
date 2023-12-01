@@ -2,6 +2,7 @@ use crate::Result;
 
 use futures::{Future, FutureExt};
 use tokio::runtime::{Builder, Runtime};
+use tracing::Span;
 
 lazy_static::lazy_static! {
     static ref CPU_RUNTIME: Runtime = Builder::new_multi_thread()
@@ -23,7 +24,10 @@ pub fn spawn_cpu<F: FnOnce() -> Result<R> + Send + 'static, R: Send + 'static>(
     func: F,
 ) -> impl Future<Output = Result<R>> {
     let (send, recv) = tokio::sync::oneshot::channel();
-    CPU_RUNTIME.spawn_blocking(|| {
+    // Propagate the current span into the task
+    let span = Span::current();
+    CPU_RUNTIME.spawn_blocking(move || {
+        let _span_guard = span.enter();
         let result = func();
         let _ = send.send(result);
     });

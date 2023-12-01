@@ -14,47 +14,18 @@
 
 import logging
 import time
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
 import torch
+from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
 from . import preferred_device
 from .distance import cosine_distance, dot_distance, l2_distance
 
 __all__ = ["KMeans"]
-
-
-def _random_init(data: np.ndarray, n: int, seed: Optional[int] = None) -> torch.Tensor:
-    if seed is not None:
-        np.random.seed(seed)
-    sample_idx = np.random.randint(0, data.shape[0], (n,))
-    samples = data[sample_idx]
-    return samples
-
-
-@torch.jit.script
-def _new_centroids_mps(
-    part_ids: List[torch.Tensor],
-    k: int,
-    data: List[torch.Tensor],
-    cnts: torch.Tensor,
-) -> torch.Tensor:
-    # MPS does not have Torch.index_reduce_()
-    # See https://github.com/pytorch/pytorch/issues/77764
-
-    new_centroids = torch.zeros((k, data[0].shape[1]), device=data[0].device)
-    for ids, chunk in zip(part_ids, data):
-        new_centroids.index_add_(0, ids, chunk)
-    for idx, cnt in enumerate(cnts.cpu()):
-        if cnt == 0:
-            new_centroids[idx, :] = torch.nan
-        else:
-            new_centroids[idx, :] = new_centroids[idx, :].div(cnt)
-
-    return new_centroids.to(data[0].device)
 
 
 class KMeans:
@@ -90,6 +61,7 @@ class KMeans:
         init: str = "random",
         max_iters: int = 50,
         tolerance: float = 1e-4,
+        centroids: Optional[torch.Tensor] = None,
         seed: Optional[int] = None,
         device: Optional[str] = None,
     ):
@@ -110,7 +82,7 @@ class KMeans:
             )
 
         self.total_distance = 0
-        self.centroids: Optional[torch.Tensor] = None
+        self.centroids: Optional[torch.Tensor] = centroids
         self.init = init
         self.device = preferred_device(device)
         self.tolerance = tolerance
@@ -138,7 +110,10 @@ class KMeans:
         data = data.to(self.device)
         return data
 
-    def fit(self, data: Union[pa.FixedSizeListArray, np.ndarray, torch.Tensor]):
+    def fit(
+        self,
+        data: IterableDataset,
+    ):
         """Fit - Train the kmeans models.
 
         Parameters
@@ -148,52 +123,37 @@ class KMeans:
 
         """
         start = time.time()
-        assert self.centroids is None
+        assert self.centroids is not None
+        self.centroids = self.centroids.to(self.device)
 
-        if isinstance(data, pa.FixedSizeListArray):
-            arr = np.stack(data.to_numpy(zero_copy_only=False))
-        elif isinstance(data, torch.Tensor):
-            arr = data.cpu().numpy()
-        elif isinstance(data, np.ndarray):
-            arr = data
-        else:
-            raise ValueError(
-                "Input data can only be FixedSizeListArray"
-                + f" or numpy ndarray: got {type(data)}"
-            )
-
-        if self.init == "random":
-            self.centroids = self._to_tensor(_random_init(arr, self.k, self.seed))
-        else:
-            raise ValueError("KMeans::fit: only random initialization is supported.")
-
-        chunks = [
-            torch.from_numpy(c).to(self.device)
-            for c in np.vsplit(arr, int(np.ceil(arr.shape[0] / 65536)))
-        ]
-        del arr
-        del data
-
+        logging.info(
+            "Start kmean training, metric: %s, iters: %s", self.metric, self.max_iters
+        )
         self.total_distance = 0
         for i in tqdm(range(self.max_iters)):
             try:
-                self.total_distance = self._fit_once(chunks, self.total_distance)
+                self.total_distance = self._fit_once(
+                    data, i, last_dist=self.total_distance
+                )
             except StopIteration:
                 break
             if i % 10 == 0:
                 logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
-        logging.info("Finish KMean training in %{}s", time.time() - start)
+        logging.info("Finish KMean training in %s", time.time() - start)
 
     @staticmethod
-    def _split_centroids(centroids: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    def _updated_centroids(
+        centroids: torch.Tensor, counts: torch.Tensor
+    ) -> torch.Tensor:
         for idx, cnt in enumerate(counts.cpu()):
+            # split the largest cluster and remove empty cluster
             if cnt == 0:
                 max_idx = torch.argmax(counts).item()
                 half_cnt = counts[max_idx] // 2
                 counts[idx], counts[max_idx] = half_cnt, half_cnt
                 centroids[idx] = centroids[max_idx] * 1.05
                 centroids[max_idx] = centroids[max_idx] / 1.05
-        return centroids
+        return centroids / counts[:, None]
 
     @staticmethod
     def _count_rows_in_clusters(part_ids: List[torch.Tensor], k: int) -> torch.Tensor:
@@ -204,7 +164,7 @@ class KMeans:
             num_rows.scatter_add_(0, part_id, ones)
         return num_rows
 
-    def _fit_once(self, chunks: List[torch.Tensor], last_dist=0) -> float:
+    def _fit_once(self, data: IterableDataset, epoch: int, last_dist=0) -> float:
         """Train KMean once and return the total distance.
 
         Parameters
@@ -217,35 +177,32 @@ class KMeans:
         float
             The total distance of the current centroids and the input data.
         """
-        device = chunks[0].device
-        part_ids = []
         total_dist = 0
-        for chunk in chunks:
+
+        new_centroids = torch.zeros_like(self.centroids, device=self.device)
+        counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
+        for idx, chunk in enumerate(data):
+            if idx % 50 == 0:
+                logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
+            chunk = chunk.to(self.device)
             ids, dists = self._transform(chunk)
             total_dist += dists.sum().item()
-            part_ids.append(ids)
+            ones = torch.ones(len(ids), device=self.device)
+
+            new_centroids.index_add_(0, ids, chunk)
+            counts_per_part.index_add_(0, ids, ones)
+            del ids
+            del dists
+            del chunk
 
         if abs(total_dist - last_dist) / total_dist < self.tolerance:
             raise StopIteration("kmeans: converged")
 
-        num_rows = self._count_rows_in_clusters(part_ids, self.k)
-        if self.device.type == "cuda":
-            new_centroids = torch.zeros_like(self.centroids, device=device)
-            for ids, chunk in zip(part_ids, chunks):
-                new_centroids.index_reduce_(
-                    0, ids, chunk, reduce="mean", include_self=False
-                )
-        else:
-            new_centroids = _new_centroids_mps(part_ids, self.k, chunks, num_rows)
-
-        self.centroids = self._split_centroids(new_centroids, num_rows)
+        self.centroids = self._updated_centroids(new_centroids, counts_per_part)
         return total_dist
 
-    def _transform(self, data: torch.Tensor) -> torch.Tensor:
-        dists = self.dist_func(data, self.centroids)
-        min_idx = torch.argmin(dists, dim=1, keepdim=True)
-        dists = dists.take_along_dim(min_idx, dim=1)
-        return min_idx.reshape((-1)), dists.reshape(-1)
+    def _transform(self, data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.dist_func(data, self.centroids)
 
     def transform(
         self, data: Union[pa.Array, np.ndarray, torch.Tensor]

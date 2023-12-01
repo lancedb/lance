@@ -48,8 +48,6 @@ use std::sync::Arc;
 use tracing::instrument;
 
 pub mod builder;
-pub(crate) mod chunker;
-
 pub mod cleanup;
 mod feature_flags;
 pub mod fragment;
@@ -60,8 +58,10 @@ pub mod progress;
 pub mod scanner;
 pub mod transaction;
 pub mod updater;
+mod utils;
 mod write;
 
+use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
@@ -80,6 +80,7 @@ use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
+pub use write::update::{UpdateBuilder, UpdateJob};
 pub use write::{write_fragments, WriteMode, WriteParams};
 
 const INDICES_DIR: &str = "_indices";
@@ -122,11 +123,6 @@ impl From<&Manifest> for Version {
 
 /// Customize read behavior of a dataset.
 pub struct ReadParams {
-    /// The block size passed to the underlying Object Store reader.
-    ///
-    /// This is used to control the minimal request size.
-    pub block_size: Option<usize>,
-
     /// Cache size for index cache. If it is zero, index cache is disabled.
     ///
     pub index_cache_size: usize,
@@ -166,7 +162,6 @@ impl ReadParams {
 impl Default for ReadParams {
     fn default() -> Self {
         Self {
-            block_size: None,
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
             metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
             session: None,
@@ -177,19 +172,27 @@ impl Default for ReadParams {
 
 impl Dataset {
     /// Open an existing dataset.
+    ///
+    /// See also [DatasetBuilder].
+    #[instrument]
     pub async fn open(uri: &str) -> Result<Self> {
-        let params = ReadParams::default();
-        Self::open_with_params(uri, &params).await
+        DatasetBuilder::from_uri(uri).load().await
     }
 
     /// Open a dataset with read params.
+    #[deprecated(since = "0.8.17", note = "Please use `DatasetBuilder` instead.")]
+    #[instrument(skip(params))]
     pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
         let (mut object_store, base_path) = match params.store_options.as_ref() {
             Some(store_options) => ObjectStore::from_uri_and_params(uri, store_options).await?,
             None => ObjectStore::from_uri(uri).await?,
         };
 
-        if let Some(block_size) = params.block_size {
+        if let Some(block_size) = params
+            .store_options
+            .as_ref()
+            .and_then(|opts| opts.block_size)
+        {
             object_store.set_block_size(block_size);
         }
 
@@ -234,7 +237,11 @@ impl Dataset {
         params: &ReadParams,
     ) -> Result<Self> {
         let (mut object_store, base_path) = ObjectStore::from_uri(uri).await?;
-        if let Some(block_size) = params.block_size {
+        if let Some(block_size) = params
+            .store_options
+            .as_ref()
+            .and_then(|opts| opts.block_size)
+        {
             object_store.set_block_size(block_size);
         };
 
@@ -381,14 +388,13 @@ impl Dataset {
         } else {
             // pull the store params from write params because there might be creds in there
             Some(
-                Self::open_with_params(
-                    uri,
-                    &ReadParams {
+                DatasetBuilder::from_uri(uri)
+                    .with_read_params(ReadParams {
                         store_options: params.store_params.clone(),
                         ..Default::default()
-                    },
-                )
-                .await?,
+                    })
+                    .load()
+                    .await?,
             )
         };
 
@@ -685,14 +691,13 @@ impl Dataset {
 
         let dataset = if dataset_exists {
             Some(
-                Self::open_with_params(
-                    base_uri,
-                    &ReadParams {
+                DatasetBuilder::from_uri(base_uri)
+                    .with_read_params(ReadParams {
                         store_options: store_params.clone(),
                         ..Default::default()
-                    },
-                )
-                .await?,
+                    })
+                    .load()
+                    .await?,
             )
         } else {
             None
@@ -838,6 +843,7 @@ impl Dataset {
         Ok(counts.iter().sum())
     }
 
+    #[instrument(skip_all, fields(num_rows=row_indices.len()))]
     pub async fn take(&self, row_indices: &[u64], projection: &Schema) -> Result<RecordBatch> {
         if row_indices.is_empty() {
             let schema = Arc::new(projection.into());
@@ -1212,6 +1218,16 @@ impl Dataset {
         Version::from(self.manifest.as_ref())
     }
 
+    /// Get the number of entries currently in the index cache.
+    pub fn index_cache_entry_count(&self) -> usize {
+        self.session.index_cache.get_size()
+    }
+
+    /// Get cache hit ratio.
+    pub fn index_cache_hit_rate(&self) -> f32 {
+        self.session.index_cache.hit_rate()
+    }
+
     /// Get all versions.
     pub async fn versions(&self) -> Result<Vec<Version>> {
         let mut versions: Vec<Version> = self
@@ -1508,6 +1524,7 @@ mod tests {
 
     use super::*;
     use crate::arrow::FixedSizeListArrayExt;
+    use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::WriteMode::Overwrite;
     use crate::datatypes::Schema;
     use crate::index::scalar::ScalarIndexParams;
@@ -3436,5 +3453,88 @@ mod tests {
             .unwrap();
         let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_v0_8_14_invalid_index_fragment_bitmap() {
+        // Old versions of lance could create an index whose fragment bitmap was
+        // invalid because it did not include fragments that were part of the index
+        //
+        // We need to make sure we do not rely on the fragment bitmap in these older
+        // versions and instead fall back to a slower legacy behavior
+        let test_dir = copy_test_data_to_tmp("v0.8.14/corrupt_index").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+
+        // Uncomment to reproduce the issue.  The below query will panic
+        // let mut scan = dataset.scan();
+        // let query_vec = Float32Array::from(vec![0_f32; 128]);
+        // let scan_fut = scan
+        //     .nearest("vector", &query_vec, 2000)
+        //     .unwrap()
+        //     .nprobs(4)
+        //     .prefilter(true)
+        //     .try_into_stream()
+        //     .await
+        //     .unwrap()
+        //     .try_collect::<Vec<_>>()
+        //     .await
+        //     .unwrap();
+
+        // Add some data and recalculate the index, forcing a migration
+        let mut scan = dataset.scan();
+        let data = scan
+            .limit(Some(10), None)
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let schema = data[0].schema();
+        let data = RecordBatchIterator::new(data.into_iter().map(arrow::error::Result::Ok), schema);
+
+        let broken_version = dataset.version().version;
+
+        // Any transaction, no matter how simple, should trigger the fragment bitmap to be recalculated
+        dataset.append(data, None).await.unwrap();
+
+        for idx in dataset.load_indices().await.unwrap() {
+            // The corrupt fragment_bitmap does not contain 0 but the
+            // restored one should
+            assert!(idx.fragment_bitmap.unwrap().contains(0));
+        }
+
+        let mut dataset = dataset.checkout_version(broken_version).await.unwrap();
+        dataset.restore(None).await.unwrap();
+
+        // Running compaction right away should work (this is verifying compaction
+        // is not broken by the potentially malformed fragment bitmaps)
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        for idx in dataset.load_indices().await.unwrap() {
+            assert!(idx.fragment_bitmap.unwrap().contains(0));
+        }
+
+        let mut scan = dataset.scan();
+        let query_vec = Float32Array::from(vec![0_f32; 128]);
+        let batches = scan
+            .nearest("vector", &query_vec, 2000)
+            .unwrap()
+            .nprobs(4)
+            .prefilter(true)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let row_count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+        assert_eq!(row_count, 1900);
     }
 }

@@ -15,25 +15,37 @@
 use std::sync::Arc;
 
 use lance_core::{format::Index as IndexMetadata, Error, Result};
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::IndexType;
 use log::info;
+use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
 use crate::dataset::index::unindexed_fragments;
+use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::Dataset;
 use crate::index::vector::ivf::IVFIndex;
 
 use super::DatasetIndexInternalExt;
 
 /// Append new data to the index, without re-train.
+///
+/// Returns the UUID of the new index along with a vector of newly indexed fragment ids
 pub async fn append_index(
     dataset: Arc<Dataset>,
     old_index: &IndexMetadata,
-) -> Result<Option<Uuid>> {
+) -> Result<Option<(Uuid, Option<RoaringBitmap>)>> {
     let unindexed = unindexed_fragments(old_index, dataset.as_ref()).await?;
     if unindexed.is_empty() {
         return Ok(None);
     };
+
+    let frag_bitmap = old_index.fragment_bitmap.as_ref().map(|bitmap| {
+        let mut bitmap = bitmap.clone();
+        bitmap.extend(unindexed.iter().map(|frag| frag.id as u32));
+        bitmap
+    });
 
     let column = dataset
         .schema()
@@ -47,24 +59,57 @@ pub async fn append_index(
         })?;
 
     let index = dataset
-        .open_vector_index(&column.name, old_index.uuid.to_string().as_str())
+        .open_generic_index(&column.name, &old_index.uuid.to_string())
         .await?;
 
-    let Some(ivf_idx) = index.as_any().downcast_ref::<IVFIndex>() else {
-        info!("Index type: {:?} does not support append", index);
-        return Ok(None);
-    };
+    match index.index_type() {
+        IndexType::Scalar => {
+            let index = dataset
+                .open_scalar_index(&column.name, &old_index.uuid.to_string())
+                .await?;
 
-    let mut scanner = dataset.scan();
-    scanner.with_fragments(unindexed);
-    scanner.with_row_id();
-    scanner.project(&[&column.name])?;
-    let stream = scanner.try_into_stream().await?;
+            let mut scanner = dataset.scan();
+            scanner
+                .with_fragments(unindexed)
+                .with_row_id()
+                .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                    column.name.clone(),
+                )]))?
+                .project(&[&column.name])?;
+            let new_data_stream = scanner.try_into_stream().await?;
 
-    let new_index = ivf_idx
-        .append(dataset.as_ref(), stream, old_index, &column.name)
-        .await?;
-    Ok(Some(new_index))
+            let new_uuid = Uuid::new_v4();
+
+            let index_dir = dataset.indices_dir().child(new_uuid.to_string());
+            let new_store = LanceIndexStore::new((*dataset.object_store).clone(), index_dir);
+
+            index.update(new_data_stream.into(), &new_store).await?;
+
+            Ok(Some((new_uuid, frag_bitmap)))
+        }
+        IndexType::Vector => {
+            let mut scanner = dataset.scan();
+            scanner.with_fragments(unindexed);
+            scanner.with_row_id();
+            scanner.project(&[&column.name])?;
+            let new_data_stream = scanner.try_into_stream().await?;
+
+            let index = dataset
+                .open_vector_index(&column.name, old_index.uuid.to_string().as_str())
+                .await?;
+
+            let Some(ivf_idx) = index.as_any().downcast_ref::<IVFIndex>() else {
+                info!("Index type: {:?} does not support append", index);
+                return Ok(None);
+            };
+
+            let new_index = ivf_idx
+                .append(dataset.as_ref(), new_data_stream, old_index, &column.name)
+                .await?;
+
+            Ok(Some((new_index, frag_bitmap)))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -191,7 +236,7 @@ mod tests {
         let ivf_index = binding.as_any().downcast_ref::<IVFIndex>().unwrap();
         let row_in_index = stream::iter(0..IVF_PARTITIONS)
             .map(|part_id| async move {
-                let part = ivf_index.load_partition(part_id).await.unwrap();
+                let part = ivf_index.load_partition(part_id, true).await.unwrap();
                 let pq_idx = part.as_any().downcast_ref::<PQIndex>().unwrap();
                 pq_idx.row_ids.as_ref().unwrap().len()
             })
@@ -201,5 +246,6 @@ mod tests {
             .iter()
             .sum::<usize>();
         assert_eq!(row_in_index, 2000);
+        assert_eq!(dataset.index_cache_entry_count(), 6)
     }
 }

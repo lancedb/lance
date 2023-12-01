@@ -14,7 +14,10 @@
 
 //! IVF - Inverted File index.
 
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    sync::{Arc, Weak},
+};
 
 use arrow_arith::numeric::sub;
 use arrow_array::{
@@ -45,13 +48,11 @@ use lance_index::{
     },
     Index, IndexType,
 };
-use lance_linalg::{
-    distance::{Cosine, Dot, MetricType, L2},
-    matrix::MatrixView,
-};
+use lance_linalg::distance::{Cosine, Dot, MetricType, L2};
 use log::{debug, info};
 use nohash_hasher::IntMap;
 use rand::{rngs::SmallRng, SeedableRng};
+use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::{location, Location};
 use tracing::{instrument, span, Level};
@@ -92,7 +93,10 @@ pub struct IVFIndex {
 
     metric_type: MetricType,
 
-    session: Arc<Session>,
+    // The session cache holds an Arc to this object so we need to
+    // hold a weak pointer to avoid cycles
+    /// The session cache, used when fetching pages
+    session: Weak<Session>,
 }
 
 impl IVFIndex {
@@ -113,7 +117,7 @@ impl IVFIndex {
         }
         Ok(Self {
             uuid: uuid.to_owned(),
-            session,
+            session: Arc::downgrade(&session),
             ivf,
             reader,
             sub_index,
@@ -127,9 +131,17 @@ impl IVFIndex {
     /// ----------
     ///  - partition_id: partition ID.
     #[instrument(level = "debug", skip(self))]
-    pub(crate) async fn load_partition(&self, partition_id: usize) -> Result<Arc<dyn VectorIndex>> {
+    pub(crate) async fn load_partition(
+        &self,
+        partition_id: usize,
+        write_cache: bool,
+    ) -> Result<Arc<dyn VectorIndex>> {
         let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
-        let part_index = if let Some(part_idx) = self.session.index_cache.get_vector(&cache_key) {
+        let session = self.session.upgrade().ok_or(Error::Internal {
+            message: "attempt to use index after dataset was destroyed".into(),
+            location: location!(),
+        })?;
+        let part_index = if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
             part_idx
         } else {
             let offset = self.ivf.offsets[partition_id];
@@ -139,9 +151,9 @@ impl IVFIndex {
                 .load(self.reader.as_ref(), offset, length)
                 .await?;
             let idx: Arc<dyn VectorIndex> = idx.into();
-            self.session
-                .index_cache
-                .insert_vector(&cache_key, idx.clone());
+            if write_cache {
+                session.index_cache.insert_vector(&cache_key, idx.clone());
+            }
             idx
         };
         Ok(part_index)
@@ -153,7 +165,7 @@ impl IVFIndex {
         query: &Query,
         pre_filter: Arc<PreFilter>,
     ) -> Result<RecordBatch> {
-        let part_index = self.load_partition(partition_id).await?;
+        let part_index = self.load_partition(partition_id, true).await?;
 
         let partition_centroids = self.ivf.centroids.value(partition_id);
         let residual_key = sub(&query.key, &partition_centroids)?;
@@ -246,6 +258,7 @@ pub struct IvfIndexStatistics {
     partitions: Vec<IvfIndexPartitionStatistics>,
 }
 
+#[async_trait]
 impl Index for IVFIndex {
     fn as_any(&self) -> &dyn Any {
         self
@@ -287,6 +300,16 @@ impl Index for IVFIndex {
             sub_index: serde_json::from_str(&self.sub_index.statistics()?)?,
             partitions: partitions_statistics,
         })?)
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        let mut frag_ids = RoaringBitmap::default();
+        let part_ids = 0..self.ivf.num_partitions();
+        for part_id in part_ids {
+            let part = self.load_partition(part_id, false).await?;
+            frag_ids |= part.calculate_included_frags().await?;
+        }
+        Ok(frag_ids)
     }
 }
 
@@ -408,7 +431,9 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                 )?)),
             },
             pb::VectorIndexStage {
-                stage: Some(pb::vector_index_stage::Stage::Pq(idx.pq.as_ref().into())),
+                stage: Some(pb::vector_index_stage::Stage::Pq(
+                    idx.pq.as_ref().try_into()?,
+                )),
             },
         ]);
 
@@ -473,15 +498,14 @@ impl Ivf {
         nprobes: usize,
         metric_type: MetricType,
     ) -> Result<UInt32Array> {
-        use lance_index::vector::ivf::Ivf as IvfTrait;
-
-        let ivf = lance_index::vector::ivf::IvfImpl::<Float32Type>::new(
-            MatrixView::try_from(self.centroids.as_ref())?,
+        let internal = lance_index::vector::ivf::new_ivf(
+            self.centroids.values(),
+            self.dimension(),
             metric_type,
             vec![],
             None,
-        );
-        ivf.find_partitions(query, nprobes)
+        )?;
+        internal.find_partitions(query, nprobes)
     }
 
     /// Add the offset and length of one partition.
@@ -549,10 +573,10 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
         });
     };
     if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
-        if !matches!(elem_type.data_type(), DataType::Float32) {
+        if !elem_type.data_type().is_floating() {
             return Err(Error::Index{
                 message:format!(
-                    "VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+                    "VectorIndex requires the column data type to be fixed size list of f16/f32/f64, got {}",
                     elem_type.data_type()
                 ),
                 location: location!()
@@ -607,8 +631,21 @@ pub async fn build_ivf_pq_index(
         lance_index::vector::pq::num_centroids(pq_params.num_bits as u32),
     ) * ivf_params.sample_rate;
 
-    // TODO: only sample data if training is necessary.
-    let mut training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+    let mut training_data = if ivf_params.centroids.is_none() {
+        let start = std::time::Instant::now();
+        log::info!(
+            "Loading training data for IVF. Sample size: {}",
+            sample_size_hint
+        );
+        let data = Some(maybe_sample_training_data(dataset, column, sample_size_hint).await?);
+        log::info!(
+            "Finished loading training data in {:02} seconds",
+            start.elapsed().as_secs_f32()
+        );
+        data
+    } else {
+        None
+    };
 
     #[cfg(feature = "opq")]
     let mut transforms: Vec<Box<dyn Transformer>> = vec![];
@@ -646,11 +683,13 @@ pub async fn build_ivf_pq_index(
 
         // Transform training data if necessary.
         for transform in transforms.iter() {
-            training_data = transform.transform(&training_data).await?;
+            if let Some(training_data) = &mut training_data {
+                *training_data = transform.transform(training_data).await?;
+            }
         }
 
         info!("Start to train IVF model");
-        train_ivf_model(&training_data, metric_type, ivf_params).await?
+        train_ivf_model(training_data.as_ref().unwrap(), metric_type, ivf_params).await?
     };
     info!(
         "Traied IVF model in {:02} seconds",
@@ -674,10 +713,24 @@ pub async fn build_ivf_pq_index(
         let expected_sample_size =
             lance_index::vector::pq::num_centroids(pq_params.num_bits as u32)
                 * pq_params.sample_rate;
-        let training_data = if training_data.value_length() as usize > expected_sample_size {
-            training_data.sample(expected_sample_size)?
+        let training_data = if let Some(training_data) = training_data {
+            if training_data.value_length() as usize > expected_sample_size {
+                training_data.sample(expected_sample_size)?
+            } else {
+                training_data
+            }
         } else {
-            training_data
+            let start = std::time::Instant::now();
+            log::info!(
+                "Loading training data for PQ. Sample size: {}",
+                expected_sample_size
+            );
+            let data = maybe_sample_training_data(dataset, column, expected_sample_size).await?;
+            log::info!(
+                "Finished loading training data in {:02} seconds",
+                start.elapsed().as_secs_f32()
+            );
+            data
         };
 
         // TODO: consolidate IVF models to `lance_index`.
@@ -688,6 +741,11 @@ pub async fn build_ivf_pq_index(
             vec![],
             None,
         )?;
+
+        info!(
+            "starting to compute partitions for PQ training, sample size: {}",
+            training_data.value_length()
+        );
         // Compute the residual vector to train Product Quantizer.
         let part_ids = ivf2.compute_partitions(&training_data).await?;
 
@@ -956,12 +1014,14 @@ mod tests {
     use super::*;
 
     use std::collections::HashMap;
+    use std::iter::repeat;
 
     use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
-        generate_random_array, generate_scaled_random_array, sample_without_replacement,
+        generate_random_array, generate_random_array_with_seed, generate_scaled_random_array,
+        sample_without_replacement,
     };
     use rand::{seq::SliceRandom, thread_rng};
     use tempfile::tempdir;
@@ -1511,5 +1571,69 @@ mod tests {
                 .iter()
                 .all(|v| (-2.0 * DIM as f32..0.0).contains(v)));
         }
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_pq_f16() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        const DIM: usize = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float16, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            PQBuildParams::new(4, 8),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let results = dataset
+            .scan()
+            .nearest(
+                "vector",
+                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                5,
+            )
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 5);
+        let batch = &results[0];
+        assert_eq!(
+            batch.schema(),
+            Arc::new(Schema::new(vec![
+                Field::new(
+                    "vector",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float16, true)),
+                        DIM as i32,
+                    ),
+                    true,
+                ),
+                Field::new("_distance", DataType::Float32, true)
+            ]))
+        );
     }
 }

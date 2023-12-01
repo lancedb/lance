@@ -108,6 +108,34 @@ to those files. Any subsequent queries will not return the deleted rows.
   Do not read datasets with deleted rows using Lance versions prior to 0.5.0,
   as they will return the deleted rows. This is fixed in 0.5.0 and later.
 
+Updating rows
+~~~~~~~~~~~~~
+
+Lance supports updating rows based on SQL expressions with the
+:py:meth:`lance.LanceDataset.update` method. For example, if we notice
+that Bob's name in our dataset has been sometimes written as ``Blob``, we can fix
+that with:
+
+  .. code-block:: python
+    import lance
+
+    dataset = lance.dataset("./alice_and_bob.lance")
+    dataset.update({"name": "'Bob'"}), where="name = 'Blob'")
+
+The update values are SQL expressions, which is why ``'Bob'`` is wrapped in single
+quotes. This means we can use complex expressions that reference existing columns if
+we wish. For example, if two years have passed and we wish to update the ages
+of Alice and Bob in the same example, we could write:
+
+  .. code-block:: python
+    import lance
+
+    dataset = lance.dataset("./alice_and_bob.lance")
+    dataset.update({"age": "age + 2"})
+
+.. TODO: Once we implement MERGE, we should make a note that this method shouldn't be used 
+..       for updating single rows in a loop, and users should instead do bulk updates
+..       using MERGE.
 
 Committing mechanisms for S3
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~

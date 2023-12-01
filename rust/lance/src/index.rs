@@ -34,7 +34,7 @@ use uuid::Uuid;
 pub(crate) mod append;
 pub(crate) mod cache;
 pub(crate) mod prefilter;
-pub(crate) mod scalar;
+pub mod scalar;
 pub mod vector;
 
 use crate::dataset::transaction::{Operation, Transaction};
@@ -288,7 +288,7 @@ impl DatasetIndexExt for Dataset {
             if idx.dataset_version == self.manifest.version {
                 continue;
             }
-            let Some(new_id) = append_index(dataset.clone(), idx).await? else {
+            let Some((new_id, new_frag_ids)) = append_index(dataset.clone(), idx).await? else {
                 continue;
             };
 
@@ -297,7 +297,7 @@ impl DatasetIndexExt for Dataset {
                 name: idx.name.clone(),
                 fields: idx.fields.clone(),
                 dataset_version: self.manifest.version,
-                fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+                fragment_bitmap: new_frag_ids,
             };
             removed_indices.push(idx.clone());
             new_indices.push(new_idx);

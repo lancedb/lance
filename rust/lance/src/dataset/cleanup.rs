@@ -241,11 +241,14 @@ impl<'a> CleanupTask<'a> {
         let old_manifests = inspection.old_manifests.clone();
         let num_old_manifests = old_manifests.len();
 
+        // Ideally this collect shouldn't be needed here but it seems necessary
+        // to avoid https://github.com/rust-lang/rust/issues/102211
         let manifest_bytes_removed = stream::iter(&old_manifests)
-            .then(|path| async move { self.dataset.object_store.size(path).await })
-            // TODO: uncomment this after
-            // https://github.com/rust-lang/rust/issues/102211 is resolved
-            // .buffer_unordered(num_cpus::get())
+            .map(|path| self.dataset.object_store.size(path))
+            .collect::<Vec<_>>()
+            .await;
+        let manifest_bytes_removed = stream::iter(manifest_bytes_removed)
+            .buffer_unordered(num_cpus::get())
             .try_fold(0, |acc, size| async move { Ok(acc + (size as u64)) })
             .await;
 
@@ -465,7 +468,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use crate::{
-        dataset::{ReadParams, WriteMode, WriteParams},
+        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
         index::{
             vector::{StageParams, VectorIndexParams},
             DatasetIndexExt,
@@ -698,16 +701,14 @@ mod tests {
         }
 
         async fn open(&self) -> Result<Box<Dataset>> {
-            Ok(Box::new(
-                Dataset::open_with_params(
-                    &self.dataset_path,
-                    &ReadParams {
-                        store_options: Some(self.os_params()),
-                        ..Default::default()
-                    },
-                )
-                .await?,
-            ))
+            let ds = DatasetBuilder::from_uri(&self.dataset_path)
+                .with_read_params(ReadParams {
+                    store_options: Some(self.os_params()),
+                    ..Default::default()
+                })
+                .load()
+                .await?;
+            Ok(Box::new(ds))
         }
 
         async fn count_files(&self) -> Result<FileCounts> {

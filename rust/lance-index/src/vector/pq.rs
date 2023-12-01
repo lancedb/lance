@@ -18,7 +18,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, UInt8Array};
+use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array};
 use async_trait::async_trait;
 use lance_arrow::floats::FloatArray;
@@ -37,6 +37,7 @@ pub(crate) mod utils;
 pub use self::utils::num_centroids;
 use super::pb;
 pub use builder::PQBuildParams;
+use lance_linalg::simd::{f32::f32x8, SIMD};
 
 /// Product Quantization
 
@@ -57,6 +58,9 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
     fn num_sub_vectors(&self) -> usize;
 
     fn dimension(&self) -> usize;
+
+    // TODO: move to pub(crate) once the refactor of lance::index to lance-index is done.
+    fn codebook_as_fsl(&self) -> FixedSizeListArray;
 }
 
 /// Product Quantization, optimized for [Apache Arrow] buffer memory layout.
@@ -237,16 +241,63 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                 distance_table.extend(distances);
             });
 
-        Ok(Arc::new(Float32Array::from_iter_values(
-            code.values().chunks_exact(self.num_sub_vectors).map(|c| {
-                c.iter()
-                    .enumerate()
-                    .map(|(sub_vec_idx, centroid)| {
-                        distance_table[sub_vec_idx * 256 + *centroid as usize]
-                    })
-                    .sum()
-            }),
-        )))
+        #[cfg(target_feature = "avx512f")]
+        {
+            if self.num_sub_vectors % 16 == 0 {
+                use std::arch::x86_64::*;
+                return Ok(Arc::new(Float32Array::from_iter_values(
+                    code.values()
+                        .chunks_exact(self.num_sub_vectors)
+                        .map(|c| unsafe {
+                            let mut s = _mm512_setzero_ps();
+                            c.chunks_exact(16)
+                                .enumerate()
+                                .for_each(|(idx, lane_chunk)| {
+                                    let mut offsets: [i32; 16] = [0; 16];
+                                    lane_chunk.iter().enumerate().for_each(|(j, &code)| {
+                                        offsets[j] = ((idx * 8 + j) * 256 + code as usize) as i32
+                                    });
+                                    let simd_offsets = _mm512_loadu_epi32(offsets.as_ptr());
+                                    let v = _mm512_i32gather_ps(
+                                        simd_offsets,
+                                        distance_table.as_ptr() as *const u8,
+                                        4,
+                                    );
+                                    s = _mm512_add_ps(s, v);
+                                });
+                            _mm512_reduce_add_ps(s)
+                        }),
+                )));
+            }
+        }
+
+        if cfg!(target_feature = "avx2") && self.num_sub_vectors % 8 == 0 {
+            Ok(Arc::new(Float32Array::from_iter_values(
+                code.values().chunks_exact(self.num_sub_vectors).map(|c| {
+                    let mut s = f32x8::zeros();
+                    c.chunks_exact(8).enumerate().for_each(|(idx, lane_chunk)| {
+                        let mut offsets: [i32; 8] = [0; 8];
+                        lane_chunk.iter().enumerate().for_each(|(j, &code)| {
+                            offsets[j] = ((idx * 8 + j) * 256 + code as usize) as i32
+                        });
+                        let v = f32x8::gather(&distance_table, &offsets);
+                        s += v;
+                    });
+                    s.reduce_sum()
+                }),
+            )))
+        } else {
+            Ok(Arc::new(Float32Array::from_iter_values(
+                code.values().chunks_exact(self.num_sub_vectors).map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .map(|(sub_vec_idx, centroid)| {
+                            distance_table[sub_vec_idx * 256 + *centroid as usize]
+                        })
+                        .sum()
+                }),
+            )))
+        }
     }
 
     /// Pre-compute dot product to each sub-centroids.
@@ -431,7 +482,13 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
                             dot_distance_batch(sub_vector, centroids, sub_dim)
                         }
                     };
-                    let code = argmin(dist_iter).unwrap();
+                    let code = argmin(dist_iter).ok_or(Error::Index {
+                        message: format!(
+                            "Failed to assign PQ code: {}, sub-vector={:#?}",
+                            "it is likely that distance is NaN or Inf", sub_vector
+                        ),
+                        location: location!(),
+                    })? as u8;
                     builder[i * num_sub_vectors + sub_idx] = code as u8;
                 }
             }
@@ -464,23 +521,88 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
     fn dimension(&self) -> usize {
         self.dimension
     }
+
+    fn codebook_as_fsl(&self) -> FixedSizeListArray {
+        FixedSizeListArray::try_new_from_values(
+            self.codebook.as_ref().clone(),
+            self.dimension as i32,
+        )
+        .unwrap()
+    }
 }
 
 #[allow(clippy::fallible_impl_from)]
-impl From<&dyn ProductQuantizer> for pb::Pq {
-    fn from(pq: &dyn ProductQuantizer) -> Self {
-        Self {
+impl TryFrom<&dyn ProductQuantizer> for pb::Pq {
+    type Error = Error;
+
+    fn try_from(pq: &dyn ProductQuantizer) -> Result<Self> {
+        let fsl = pq.codebook_as_fsl();
+        let tensor = pb::Tensor::try_from(&fsl)?;
+        Ok(Self {
             num_bits: pq.num_bits(),
             num_sub_vectors: pq.num_sub_vectors() as u32,
             dimension: pq.dimension() as u32,
-            codebook: pq
-                .as_any()
-                .downcast_ref::<ProductQuantizerImpl<Float32Type>>()
-                .unwrap()
-                .codebook
-                .values()
-                .to_vec(),
-            codebook_tensor: None,
-        }
+            codebook: vec![],
+            codebook_tensor: Some(tensor),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::iter::repeat;
+
+    use arrow_array::{
+        types::{Float16Type, Float32Type},
+        Float16Array, Float32Array,
+    };
+    use half::f16;
+    use num_traits::Zero;
+
+    #[test]
+    fn test_f16_pq_to_protobuf() {
+        let pq = ProductQuantizerImpl::<Float16Type> {
+            num_bits: 8,
+            num_sub_vectors: 4,
+            dimension: 16,
+            codebook: Arc::new(Float16Array::from_iter_values(
+                repeat(f16::zero()).take(256 * 16),
+            )),
+            metric_type: MetricType::L2,
+        };
+        let proto: pb::Pq = pb::Pq::try_from(&pq as &dyn ProductQuantizer).unwrap();
+        assert_eq!(proto.num_bits, 8);
+        assert_eq!(proto.num_sub_vectors, 4);
+        assert_eq!(proto.dimension, 16);
+        assert!(proto.codebook.is_empty());
+        assert!(proto.codebook_tensor.is_some());
+
+        let tensor = proto.codebook_tensor.as_ref().unwrap();
+        assert_eq!(tensor.data_type, pb::tensor::DataType::Float16 as i32);
+        assert_eq!(tensor.shape, vec![256, 16]);
+    }
+
+    #[tokio::test]
+    async fn test_empty_dist_iter() {
+        let pq = ProductQuantizerImpl::<Float32Type> {
+            num_bits: 8,
+            num_sub_vectors: 4,
+            dimension: 16,
+            codebook: Arc::new(Float32Array::from_iter_values(
+                (0..256 * 16).map(|v| v as f32),
+            )),
+            metric_type: MetricType::Cosine,
+        };
+
+        let data = Float32Array::from_iter_values(repeat(0.0).take(16));
+        let data = FixedSizeListArray::try_new_from_values(data, 16).unwrap();
+        let rst = pq.transform(&data).await;
+        assert!(rst.is_err());
+        assert!(rst
+            .unwrap_err()
+            .to_string()
+            .contains("it is likely that distance is NaN"));
     }
 }

@@ -53,6 +53,7 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig};
 use crate::format::{DeletionFile, Fragment};
+use crate::index::DatasetIndexInternalExt;
 use crate::Dataset;
 
 #[cfg(all(target_feature = "dynamodb", tests))]
@@ -246,28 +247,25 @@ pub(crate) async fn migrate_fragments(
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()> {
-    // Early return so we have a fast path if they are already migrated.
-    if indices.iter().all(|i| i.fragment_bitmap.is_some()) {
-        return Ok(());
-    }
-
     for index in indices {
-        if index.fragment_bitmap.is_none() {
-            // Load the read version of the index
-            let old_version = match dataset.checkout_version(index.dataset_version).await {
-                Ok(dataset) => dataset,
-                // If the version doesn't exist anymore, skip it.
-                Err(crate::Error::DatasetNotFound { .. }) => continue,
-                // Any other error we return.
-                Err(e) => return Err(e),
+        // If the fragment bitmap is missing we need to recalculate it
+        let mut must_recalculate_fragment_bitmap = index.fragment_bitmap.is_none();
+        // If the fragment bitmap was written by an old version of lance then we need to recalculate
+        // it because it could be corrupt due to a bug in versions < 0.8.15
+        must_recalculate_fragment_bitmap |=
+            if let Some(writer_version) = &dataset.manifest.writer_version {
+                writer_version.older_than(0, 8, 15)
+            } else {
+                true
             };
-            index.fragment_bitmap = Some(
-                old_version
-                    .get_fragments()
-                    .iter()
-                    .map(|f| f.id() as u32)
-                    .collect(),
-            );
+        if must_recalculate_fragment_bitmap {
+            debug_assert_eq!(index.fields.len(), 1);
+            let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;
+            // We need to calculate the fragments covered by the index
+            let idx = dataset
+                .open_generic_index(&idx_field.name, &index.uuid.to_string())
+                .await?;
+            index.fragment_bitmap = Some(idx.calculate_included_frags().await?);
         }
     }
 

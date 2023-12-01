@@ -154,6 +154,17 @@ message Transaction {
     uint32 num_fragments = 1;
   }
 
+  // An operation that updates rows but does not add or remove rows.
+  message Update {
+    // The fragments that have been removed. These are fragments where all rows
+    // have been updated and moved to a new fragment.
+    repeated uint64 removed_fragment_ids = 1;
+    // The fragments that have been updated.
+    repeated DataFragment updated_fragments = 2;
+    // The new fragments where updated rows have been moved to.
+    repeated DataFragment new_fragments = 3;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -164,5 +175,6 @@ message Transaction {
     Merge merge = 105;
     Restore restore = 106;
     ReserveFragments reserve_fragments = 107;
+    Update update = 108;
   }
 }

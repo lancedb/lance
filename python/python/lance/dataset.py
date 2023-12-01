@@ -31,6 +31,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     TypedDict,
     Union,
@@ -399,6 +400,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         num_rows: int,
         columns: Optional[List[str]] = None,
+        randomize_order: bool = True,
         **kwargs,
     ) -> pa.Table:
         """Select a random sample of data
@@ -419,6 +421,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         total_num_rows = self.count_rows()
         indices = random.sample(range(total_num_rows), num_rows)
+        if not randomize_order:
+            # Sort the indices in order to increase the locality and thus reduce
+            # the number of random reads.
+            indices = sorted(indices)
         return self.take(indices, columns, **kwargs)
 
     def take(
@@ -612,6 +618,38 @@ class LanceDataset(pa.dataset.Dataset):
             predicate = str(predicate)
         self._ds.delete(predicate)
 
+    def update(
+        self,
+        updates: Dict[str, str],
+        where: Optional[str] = None,
+    ):
+        """
+        Update column values for rows matching where.
+
+        Parameters
+        ----------
+        updates : dict of str to str
+            A mapping of column names to a SQL expression.
+        where : str, optional
+            A SQL predicate indicating which rows should be updated.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.update(dict(a = 'a + 2'), where="b != 'a'")
+        >>> dataset.to_table().to_pandas()
+           a  b
+        0  1  a
+        1  4  b
+        2  5  c
+        """
+        if isinstance(where, pa.compute.Expression):
+            where = str(where)
+        self._ds.update(updates, where)
+
     def versions(self):
         """
         Return all versions in this dataset.
@@ -689,6 +727,139 @@ class LanceDataset(pa.dataset.Dataset):
             td_to_micros(older_than), delete_unverified
         )
 
+    def create_scalar_index(
+        self,
+        column: str,
+        index_type: Literal["BTREE"],
+        name: Optional[str] = None,
+        *,
+        replace: bool = True,
+    ):
+        """Create a scalar index on a column.
+
+        Scalar indices, like vector indices, can be used to speed up scans.  A scalar
+        index can speed up scans that contain filter expressions on the indexed column.
+        For example, the following scan will be faster if the column ``my_col`` has
+        a scalar index:
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/images.lance")
+            my_table = dataset.scanner(filter="my_col != 7").to_table()
+
+        Scalar indices can also speed up scans containing a vector search and a
+        prefilter:
+
+        .. code-block::python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/images.lance")
+            my_table = dataset.scanner(
+                nearest=dict(
+                   column="vector",
+                   q=[1, 2, 3, 4],
+                   k=10,
+                )
+                filter="my_col != 7",
+                prefilter=True
+            )
+
+        Scalar indices can only speed up scans for basic filters using
+        equality, comparison, range (e.g. ``my_col BETWEEN 0 AND 100``), and set
+        membership (e.g. `my_col IN (0, 1, 2)`)
+
+        Scalar indices can be used if the filter contains multiple indexed columns and
+        the filter criteria are AND'd or OR'd together
+        (e.g. ``my_col < 0 AND other_col> 100``)
+
+        Scalar indices may be used if the filter contains non-indexed columns but,
+        depending on the structure of the filter, they may not be usable.  For example,
+        if the column ``not_indexed`` does not have a scalar index then the filter
+        ``my_col = 0 OR not_indexed = 1`` will not be able to use any scalar index on
+        ``my_col``.
+
+        To determine if a scan is making use of a scalar index you can use
+        ``explain_plan`` to look at the query plan that lance has created.  Queries
+        that use scalar indices will either have a ``ScalarIndexQuery`` relation or a
+        ``MaterializeIndex`` operator.
+
+        Currently, the only type of scalar index available is ``BTREE``. This index
+        combines is inspired by the btree data structure although only the first few
+        layers of the btree are cached in memory.
+
+        **Experimental API**
+
+        Parameters
+        ----------
+        column : str
+            The column to be indexed.  Must be a boolean, integer, float,
+            or string column.
+        index_type : str
+            The type of the index.  Only ``"BTREE"`` is supported now.
+        name : str, optional
+            The index name. If not provided, it will be generated from the
+            column name.
+        replace : bool, default True
+            Replace the existing index if it exists.
+
+        Examples
+        --------
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/images.lance")
+            dataset.create_index(
+                "category",
+                "BTREE",
+            )
+
+        Experimental Status:
+
+        Scalar indices are experimental and only utilized if there is no new or deleted
+        data that has been uploaded since the index was created.  This limitation should
+        be addressed soon.  In the meantime, ``compact_files`` can be used to remove
+        deletion files and ``optimize_indices`` can be used to catch up the index with
+        new data.
+        """
+        if isinstance(column, str):
+            column = [column]
+
+        if len(column) > 1:
+            raise NotImplementedError(
+                "Scalar indices currently only support a single column"
+            )
+
+        column = column[0]
+        if column not in self.schema.names:
+            raise KeyError(f"{column} not found in schema")
+
+        field = self.schema.field(column)
+        if (
+            not pa.types.is_integer(field.type)
+            and not pa.types.is_floating(field.type)
+            and not pa.types.is_boolean(field.type)
+            and not pa.types.is_string(field.type)
+        ):
+            raise TypeError(
+                f"Scalar index column {column} must be int, float, bool, or str"
+            )
+
+        index_type = index_type.upper()
+        if index_type != "BTREE":
+            raise NotImplementedError(
+                (
+                    'Only "BTREE" is supported for ',
+                    f"index_type.  Received {index_type}",
+                )
+            )
+
+        self._ds.create_index([column], index_type, name, replace)
+
     def create_index(
         self,
         column: Union[str, List[str]],
@@ -700,6 +871,7 @@ class LanceDataset(pa.dataset.Dataset):
         ivf_centroids: Optional[Union[np.ndarray, pa.FixedSizeListArray]] = None,
         num_sub_vectors: Optional[int] = None,
         accelerator: Optional[Union[str, "torch.Device"]] = None,
+        index_cache_size: Optional[int] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -731,6 +903,8 @@ class LanceDataset(pa.dataset.Dataset):
             If set, use an accelerator to speed up the training process.
             Accepted accelerator: "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU).
             If not set, use the CPU.
+        index_cache_size : int, optional
+            The size of the index cache in number of entries. Default value is 256.
         kwargs :
             Parameters passed to the index building process.
 
@@ -814,9 +988,9 @@ class LanceDataset(pa.dataset.Dataset):
                     f"Vector column {c} must be FixedSizeListArray "
                     f"1-dimensional FixedShapeTensorArray, got {field.type}"
                 )
-            if not pa.types.is_float32(field.type.value_type):
+            if not pa.types.is_floating(field.type.value_type):
                 raise TypeError(
-                    f"Vector column {c} must have float32 value type, "
+                    f"Vector column {c} must have floating value type, "
                     f"got {field.type.value_type}"
                 )
 
@@ -827,6 +1001,9 @@ class LanceDataset(pa.dataset.Dataset):
             "dot",
         ]:
             raise ValueError(f"Metric {metric} not supported.")
+
+        kwargs["metric_type"] = metric
+
         index_type = index_type.upper()
         if index_type not in ["IVF_PQ", "DISKANN"]:
             raise NotImplementedError(
@@ -836,6 +1013,13 @@ class LanceDataset(pa.dataset.Dataset):
             if num_partitions is None or num_sub_vectors is None:
                 raise ValueError(
                     "num_partitions and num_sub_vectors are required for IVF_PQ"
+                )
+            if isinstance(num_partitions, float):
+                warnings.warn("num_partitions is float, converting to int")
+                num_partitions = int(num_partitions)
+            elif not isinstance(num_partitions, int):
+                raise TypeError(
+                    f"num_partitions must be int, got {type(num_partitions)}"
                 )
             kwargs["num_partitions"] = num_partitions
             kwargs["num_sub_vectors"] = num_sub_vectors
@@ -872,10 +1056,8 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 kwargs["ivf_centroids"] = ivf_centroids_batch
 
-        kwargs["replace"] = replace
-
-        self._ds.create_index(column, index_type, name, metric, kwargs)
-        return LanceDataset(self.uri)
+        self._ds.create_index(column, index_type, name, replace, kwargs)
+        return LanceDataset(self.uri, index_cache_size=index_cache_size)
 
     @staticmethod
     def _commit(
@@ -1408,7 +1590,7 @@ class ScannerBuilder:
         if k is not None and int(k) <= 0:
             raise ValueError(f"Nearest-K must be > 0 but got {k}")
         if nprobes is not None and int(nprobes) <= 0:
-            raise ValueError(f"Nearest-K must be > 0 but got {nprobes}")
+            raise ValueError(f"Nprobes must be > 0 but got {nprobes}")
         if refine_factor is not None and int(refine_factor) < 1:
             raise ValueError(f"Refine factor must be 1 or more got {refine_factor}")
         self._nearest = {
@@ -1667,6 +1849,8 @@ class LanceStats:
         index_stats = json.loads(self._ds.index_statistics(index_name))
         index_stats["num_indexed_rows"] = self._ds.count_indexed_rows(index_name)
         index_stats["num_unindexed_rows"] = self._ds.count_unindexed_rows(index_name)
+        index_stats["index_cache_entry_count"] = self._ds.index_cache_entry_count()
+        index_stats["index_cache_hit_rate"] = self._ds.index_cache_hit_rate()
         return index_stats
 
 

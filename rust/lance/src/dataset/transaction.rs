@@ -130,6 +130,16 @@ pub enum Operation {
     /// has been committed.  It is used during a rewrite operation to allow
     /// indices to be remapped to the new row ids as part of the operation.
     ReserveFragments { num_fragments: u32 },
+
+    /// Update values in the dataset.
+    Update {
+        /// Ids of fragments that have been moved
+        removed_fragment_ids: Vec<u64>,
+        /// Fragments that have been updated
+        updated_fragments: Vec<Fragment>,
+        /// Fragments that have been added
+        new_fragments: Vec<Fragment>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +182,16 @@ impl Operation {
                     .flat_map(|f| f.old_fragments.iter().map(|f| f.id)),
             ),
             Self::Merge { fragments, .. } => Box::new(fragments.iter().map(|f| f.id)),
+            Self::Update {
+                updated_fragments,
+                removed_fragment_ids,
+                ..
+            } => Box::new(
+                updated_fragments
+                    .iter()
+                    .map(|f| f.id)
+                    .chain(removed_fragment_ids.iter().copied()),
+            ),
         }
     }
 
@@ -192,6 +212,7 @@ impl Operation {
             Self::Merge { .. } => "Merge",
             Self::ReserveFragments { .. } => "ReserveFragments",
             Self::Restore { .. } => "Restore",
+            Self::Update { .. } => "Update",
         }
     }
 }
@@ -220,7 +241,7 @@ impl Transaction {
                 Operation::Append { .. } => false,
                 Operation::Rewrite { .. } => false,
                 Operation::CreateIndex { .. } => false,
-                Operation::Delete { .. } => false,
+                Operation::Delete { .. } | Operation::Update { .. } => false,
                 Operation::ReserveFragments { .. } => false,
                 _ => true,
             },
@@ -231,12 +252,7 @@ impl Transaction {
                 // fragments we don't touch.
                 Operation::Append { .. } => false,
                 Operation::ReserveFragments { .. } => false,
-                Operation::Delete { .. } => {
-                    // If we rewrote any fragments that were modified by delete,
-                    // we conflict.
-                    self.operation.modifies_same_ids(&other.operation)
-                }
-                Operation::Rewrite { .. } => {
+                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
                     // As long as they rewrite disjoint fragments they shouldn't conflict.
                     self.operation.modifies_same_ids(&other.operation)
                 }
@@ -255,9 +271,9 @@ impl Transaction {
                 Operation::Append { .. } => false,
                 // Indices are identified by UUIDs, so they shouldn't conflict.
                 Operation::CreateIndex { .. } => false,
-                // Although some of the rows we indexed may have been deleted,
+                // Although some of the rows we indexed may have been deleted / moved,
                 // row ids are still valid, so we allow this optimistically.
-                Operation::Delete { .. } => false,
+                Operation::Delete { .. } | Operation::Update { .. } => false,
                 // Merge & reserve don't change row ids, so this should be fine.
                 Operation::Merge { .. } => false,
                 Operation::ReserveFragments { .. } => false,
@@ -268,15 +284,11 @@ impl Transaction {
                 Operation::Rewrite { .. } => true,
                 _ => true,
             },
-            Operation::Delete { .. } => match &other.operation {
+            Operation::Delete { .. } | Operation::Update { .. } => match &other.operation {
                 Operation::CreateIndex { .. } => false,
                 Operation::ReserveFragments { .. } => false,
-                Operation::Delete { .. } => {
+                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
                     // If we update the same fragments, we conflict.
-                    self.operation.modifies_same_ids(&other.operation)
-                }
-                Operation::Rewrite { .. } => {
-                    // If we update any fragments that were rewritten, we conflict.
                     self.operation.modifies_same_ids(&other.operation)
                 }
                 _ => true,
@@ -395,6 +407,26 @@ impl Transaction {
                         }
                     }
                 });
+            }
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+            } => {
+                final_fragments.extend(maybe_existing_fragments?.iter().filter_map(|f| {
+                    if removed_fragment_ids.contains(&f.id) {
+                        return None;
+                    }
+                    if let Some(updated) = updated_fragments.iter().find(|uf| uf.id == f.id) {
+                        Some(updated.clone())
+                    } else {
+                        Some(f.clone())
+                    }
+                }));
+                final_fragments.extend(Self::fragments_with_ids(
+                    new_fragments.clone(),
+                    &mut fragment_id,
+                ));
             }
             Operation::Overwrite { ref fragments, .. } => {
                 final_fragments.extend(Self::fragments_with_ids(
@@ -666,6 +698,15 @@ impl TryFrom<&pb::Transaction> for Transaction {
             Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
                 Operation::Restore { version: *version }
             }
+            Some(pb::transaction::Operation::Update(pb::transaction::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+            })) => Operation::Update {
+                removed_fragment_ids: removed_fragment_ids.clone(),
+                updated_fragments: updated_fragments.iter().map(Fragment::from).collect(),
+                new_fragments: new_fragments.iter().map(Fragment::from).collect(),
+            },
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),
@@ -785,6 +826,18 @@ impl From<&Transaction> for pb::Transaction {
             Operation::Restore { version } => {
                 pb::transaction::Operation::Restore(pb::transaction::Restore { version: *version })
             }
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+            } => pb::transaction::Operation::Update(pb::transaction::Update {
+                removed_fragment_ids: removed_fragment_ids.clone(),
+                updated_fragments: updated_fragments
+                    .iter()
+                    .map(pb::DataFragment::from)
+                    .collect(),
+                new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
+            }),
         };
 
         Self {
@@ -868,6 +921,11 @@ mod tests {
                 rewritten_indices: vec![],
             },
             Operation::ReserveFragments { num_fragments: 3 },
+            Operation::Update {
+                removed_fragment_ids: vec![1],
+                updated_fragments: vec![fragment0.clone()],
+                new_fragments: vec![fragment2.clone()],
+            },
         ];
         let other_transactions = other_operations
             .iter()
@@ -881,7 +939,7 @@ mod tests {
                 Operation::Append {
                     fragments: vec![fragment0.clone()],
                 },
-                [false, false, false, true, true, false, false],
+                [false, false, false, true, true, false, false, false],
             ),
             (
                 Operation::Delete {
@@ -890,7 +948,7 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [true, false, false, true, true, false, false],
+                [true, false, false, true, true, false, false, true],
             ),
             (
                 Operation::Delete {
@@ -899,7 +957,7 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [true, false, true, true, true, true, false],
+                [true, false, true, true, true, true, false, true],
             ),
             (
                 Operation::Overwrite {
@@ -908,7 +966,7 @@ mod tests {
                 },
                 // No conflicts: overwrite can always happen since it doesn't
                 // depend on previous state of the table.
-                [false, false, false, false, false, false, false],
+                [false, false, false, false, false, false, false, false],
             ),
             (
                 Operation::CreateIndex {
@@ -916,7 +974,7 @@ mod tests {
                     removed_indices: vec![index0.clone()],
                 },
                 // Will only conflict with operations that modify row ids.
-                [false, false, false, false, true, true, false],
+                [false, false, false, false, true, true, false, false],
             ),
             (
                 // Rewrite that affects different fragments
@@ -927,7 +985,7 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                 },
-                [false, true, false, true, true, false, false],
+                [false, true, false, true, true, false, false, true],
             ),
             (
                 // Rewrite that affects the same fragments
@@ -938,7 +996,7 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                 },
-                [false, true, true, true, true, true, false],
+                [false, true, true, true, true, true, false, true],
             ),
             (
                 Operation::Merge {
@@ -946,12 +1004,21 @@ mod tests {
                     schema: Schema::default(),
                 },
                 // Merge conflicts with everything except CreateIndex and ReserveFragments.
-                [true, false, true, true, true, true, false],
+                [true, false, true, true, true, true, false, true],
             ),
             (
                 Operation::ReserveFragments { num_fragments: 2 },
                 // ReserveFragments only conflicts with Overwrite and Restore.
-                [false, false, false, false, true, false, false],
+                [false, false, false, false, true, false, false, false],
+            ),
+            (
+                Operation::Update {
+                    // Delete that affects same fragments as other transactions
+                    updated_fragments: vec![fragment0.clone()],
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![fragment2.clone()],
+                },
+                [true, false, true, true, true, true, false, true],
             ),
         ];
 

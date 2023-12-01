@@ -21,10 +21,11 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::{expr::InList, Between, BinaryExpr, Expr, Operator};
 
 use futures::join;
-use lance_core::{utils::mask::RowIdMask, Result};
-use roaring::RoaringTreemap;
-
-use crate::util::datafusion::safe_coerce_scalar;
+use lance_core::{
+    utils::mask::{RowIdMask, RowIdTreeMap},
+    Result,
+};
+use lance_datafusion::expr::safe_coerce_scalar;
 
 use super::{ScalarIndex, ScalarQuery};
 
@@ -245,7 +246,7 @@ impl ScalarIndexExpr {
             Self::Query(column, query) => {
                 let index = index_loader.load_index(column).await?;
                 let allow_list = index.search(query).await?;
-                let allow_list = RoaringTreemap::from_iter(allow_list.values().iter());
+                let allow_list = RowIdTreeMap::from_iter(allow_list.values().iter());
                 Ok(RowIdMask {
                     block_list: None,
                     allow_list: Some(allow_list),

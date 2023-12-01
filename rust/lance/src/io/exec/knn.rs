@@ -28,10 +28,9 @@ use datafusion::physical_plan::{
 };
 use futures::stream::Stream;
 use futures::{FutureExt, StreamExt, TryStreamExt};
-use lance_core::utils::mask::RowIdMask;
+use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{flat::flat_search, Query, DIST_COL};
-use roaring::RoaringTreemap;
 use snafu::{location, Location};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
@@ -105,7 +104,7 @@ impl Stream for KNNFlatStream {
                 Poll::Ready(Ok(())) => true,
                 Poll::Ready(Err(join_error)) => {
                     return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
-                        "ExecNode(Projection): thread panicked: {}",
+                        "ExecNode(KNNFlatStream): thread panicked: {}",
                         join_error
                     )))));
                 }
@@ -257,7 +256,7 @@ struct FilteredRowIdsToPrefilter(SendableRecordBatchStream);
 #[async_trait]
 impl FilterLoader for FilteredRowIdsToPrefilter {
     async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
-        let mut allow_list = RoaringTreemap::new();
+        let mut allow_list = RowIdTreeMap::new();
         while let Some(batch) = self.0.next().await {
             let batch = batch?;
             let row_ids = batch.column_by_name(ROW_ID).expect(
@@ -381,7 +380,7 @@ impl Stream for KNNIndexStream {
                 Poll::Ready(Ok(())) => true,
                 Poll::Ready(Err(join_error)) => {
                     return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
-                        "ExecNode(Projection): thread panicked: {}",
+                        "ExecNode(KNNIndexStream): thread panicked: {}",
                         join_error
                     )))));
                 }

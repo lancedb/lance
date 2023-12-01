@@ -15,6 +15,7 @@
 //! bfloat16 support for Apache Arrow.
 
 use std::fmt::Formatter;
+use std::slice;
 
 use arrow_array::{
     builder::BooleanBufferBuilder, iterator::ArrayIter, Array, ArrayAccessor, ArrayRef,
@@ -25,7 +26,7 @@ use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType};
 use half::bf16;
 
-use crate::{ArrowFloatType, FloatArray};
+use crate::FloatArray;
 
 #[derive(Debug)]
 pub struct BFloat16Type {}
@@ -275,8 +276,13 @@ mod from_arrow {
 impl FloatArray<BFloat16Type> for BFloat16Array {
     type FloatType = BFloat16Type;
 
-    fn as_slice(&self) -> &[<BFloat16Type as ArrowFloatType>::Native] {
-        unsafe { std::mem::transmute(self.inner.value_data()) }
+    fn as_slice(&self) -> &[bf16] {
+        unsafe {
+            slice::from_raw_parts(
+                self.inner.value_data().as_ptr() as *const bf16,
+                self.inner.value_data().len() / 2,
+            )
+        }
     }
 }
 

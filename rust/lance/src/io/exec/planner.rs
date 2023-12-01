@@ -14,38 +14,35 @@
 
 //! Exec plan planner
 
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use arrow_cast::can_cast_types;
-use arrow_schema::{DataType as ArrowDataType, SchemaRef, TimeUnit};
+use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
+use datafusion::common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion};
+use datafusion::common::DFSchema;
+use datafusion::error::Result as DFResult;
+use datafusion::logical_expr::{GetFieldAccess, GetIndexedField};
+use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::sqlparser::ast::{
-    BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr, Function,
-    FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
+    Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr,
+    Function, FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
 };
 use datafusion::{
     common::Column,
-    logical_expr::{
-        col,
-        expr::{InList, ScalarFunction},
-        BinaryExpr, BuiltinScalarFunction, Like, Operator,
-    },
+    logical_expr::{col, expr::ScalarFunction, BinaryExpr, BuiltinScalarFunction, Like, Operator},
     physical_expr::execution_props::ExecutionProps,
-    physical_plan::{
-        expressions::{
-            CastExpr, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr,
-        },
-        functions, PhysicalExpr,
-    },
+    physical_plan::PhysicalExpr,
     prelude::Expr,
     scalar::ScalarValue,
 };
+use lance_datafusion::expr::safe_coerce_scalar;
 use lance_index::scalar::expression::{
     apply_scalar_indices, IndexInformationProvider, ScalarIndexExpr,
 };
 use snafu::{location, Location};
 
 use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
-use crate::datafusion::physical_expr::column_names_in_expr;
+use crate::utils::sql::parse_sql_expr;
 use crate::{
     datafusion::logical_expr::resolve_expr, datatypes::Schema, utils::sql::parse_sql_filter, Error,
     Result,
@@ -54,14 +51,14 @@ use crate::{
 #[derive(Default)]
 pub struct FilterPlan {
     pub index_query: Option<ScalarIndexExpr>,
-    pub refine_expr: Option<Arc<dyn PhysicalExpr>>,
+    pub refine_expr: Option<Expr>,
 }
 
 impl FilterPlan {
     pub fn refine_columns(&self) -> Vec<String> {
         self.refine_expr
             .as_ref()
-            .map(|expr| column_names_in_expr(expr.as_ref()))
+            .map(Planner::column_names_in_expr)
             .unwrap_or_default()
     }
 
@@ -81,11 +78,11 @@ impl Planner {
     }
 
     fn column(&self, idents: &[Ident]) -> Result<Expr> {
-        Ok(col(idents
-            .iter()
-            .map(|id| id.value.clone())
-            .collect::<Vec<_>>()
-            .join(".")))
+        let mut column = col(&idents[0].value);
+        for ident in &idents[1..] {
+            column = column.field(&ident.value);
+        }
+        Ok(column)
     }
 
     fn binary_op(&self, op: &BinaryOperator) -> Result<Operator> {
@@ -350,6 +347,48 @@ impl Planner {
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
             SQLExpr::Value(value) => self.value(value),
+            SQLExpr::Array(SQLArray { elem, .. }) => {
+                let mut values = vec![];
+
+                for expr in elem {
+                    if let SQLExpr::Value(value) = expr {
+                        if let Expr::Literal(value) = self.value(value)? {
+                            values.push(value);
+                        } else {
+                            return Err(Error::Internal {
+                                message: "Expected a literal value in array.".into(),
+                                location: location!(),
+                            });
+                        }
+                    } else {
+                        return Err(Error::IO {
+                            message: "Only arrays of literals are supported in lance.".into(),
+                            location: location!(),
+                        });
+                    }
+                }
+
+                let field = if !values.is_empty() {
+                    let data_type = values[0].data_type();
+
+                    for value in &mut values {
+                        if value.data_type() != data_type {
+                            *value = safe_coerce_scalar(value, &data_type).ok_or_else(|| Error::IO {
+                                message: format!("Array expressions must have a consistent datatype. Expected: {}, got: {}", data_type, value.data_type()),
+                                location: location!()
+                            })?;
+                        }
+                    }
+                    Field::new("item", data_type, true)
+                } else {
+                    Field::new("item", ArrowDataType::Null, true)
+                };
+
+                Ok(Expr::Literal(ScalarValue::List(
+                    Some(values),
+                    Arc::new(field),
+                )))
+            }
             // For example, DATE '2020-01-01'
             SQLExpr::TypedString { data_type, value } => {
                 Ok(Expr::Cast(datafusion::logical_expr::Cast {
@@ -406,16 +445,18 @@ impl Planner {
                 data_type: self.parse_type(data_type)?,
             })),
             _ => Err(Error::IO {
-                message: format!("Expression '{expr}' is not supported as filter in lance"),
+                message: format!("Expression '{expr}' is not supported SQL in lance"),
                 location: location!(),
             }),
         }
     }
 
     /// Create Logical [Expr] from a SQL filter clause.
+    ///
+    /// Note: the returned expression must be passed through [optimize_expr()]
+    /// before being passed to [create_physical_expr()].
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
-
         let ast_expr = parse_sql_filter(filter)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
@@ -423,120 +464,57 @@ impl Planner {
         coerce_filter_type_to_boolean(resolved)
     }
 
+    /// Create Logical [Expr] from a SQL expression.
+    ///
+    /// Note: the returned expression must be passed through [optimize_filter()]
+    /// before being passed to [create_physical_expr()].
+    pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
+        let ast_expr = parse_sql_expr(expr)?;
+        let expr = self.parse_sql_expr(&ast_expr)?;
+        let schema = Schema::try_from(self.schema.as_ref())?;
+        let resolved = resolve_expr(&expr, &schema)?;
+        Ok(resolved)
+    }
+
+    /// Optimize the filter expression and coerce data types.
+    pub fn optimize_expr(&self, expr: Expr) -> Result<Expr> {
+        let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
+
+        // DataFusion needs the simplify and coerce passes to be applied before
+        // expressions can be handled by the physical planner.
+        let props = ExecutionProps::default();
+        let simplify_context = SimplifyContext::new(&props).with_schema(df_schema.clone());
+        let simplifier =
+            datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
+
+        let expr = simplifier.simplify(expr.clone())?;
+        let expr = simplifier.coerce(expr, df_schema.clone())?;
+
+        Ok(expr)
+    }
+
     /// Create the [`PhysicalExpr`] from a logical [`Expr`]
     pub fn create_physical_expr(&self, expr: &Expr) -> Result<Arc<dyn PhysicalExpr>> {
-        use crate::datafusion::physical_expr::Column;
-        use datafusion::physical_expr::expressions::{BinaryExpr, NegativeExpr};
+        let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
 
-        Ok(match expr {
-            Expr::Column(c) => Arc::new(Column::new(c.flat_name())),
-            Expr::Literal(v) => Arc::new(Literal::new(v.clone())),
-            Expr::BinaryExpr(expr) => {
-                let left = self.create_physical_expr(expr.left.as_ref())?;
-                let right = self.create_physical_expr(expr.right.as_ref())?;
-                let left_data_type = left.data_type(&self.schema)?;
-                let right_data_type = right.data_type(&self.schema)?;
-                // Make sure RHS matches the LHS
-                let right = if right_data_type != left_data_type {
-                    if can_cast_types(&right_data_type, &left_data_type) {
-                        Arc::new(CastExpr::new(right, left_data_type, None))
-                    } else {
-                        return Err(Error::invalid_input(
-                            format!("Cannot compare {} and {}", left_data_type, right_data_type),
-                            location!(),
-                        ));
-                    }
-                } else {
-                    right
-                };
-                Arc::new(BinaryExpr::new(left, expr.op, right))
-            }
-            Expr::Negative(expr) => {
-                Arc::new(NegativeExpr::new(self.create_physical_expr(expr.as_ref())?))
-            }
-            Expr::IsNotNull(expr) => Arc::new(IsNotNullExpr::new(self.create_physical_expr(expr)?)),
-            Expr::IsNull(expr) => Arc::new(IsNullExpr::new(self.create_physical_expr(expr)?)),
-            Expr::IsTrue(expr) => self.create_physical_expr(expr)?,
-            Expr::IsFalse(expr) => Arc::new(NotExpr::new(self.create_physical_expr(expr)?)),
-            Expr::InList(InList {
-                expr,
-                list,
-                negated,
-            }) => {
-                // It's important that all the values in the list are casted to match
-                // the datatype of the column.
-                let expr = self.create_physical_expr(expr)?;
-                let datatype = expr.data_type(self.schema.as_ref())?;
+        Ok(datafusion::physical_expr::create_physical_expr(
+            expr,
+            df_schema.as_ref(),
+            &self.schema,
+            &Default::default(),
+        )?)
+    }
 
-                let list = list
-                    .iter()
-                    .map(|e| {
-                        let e = self.create_physical_expr(e)?;
-                        if e.data_type(self.schema.as_ref())? == datatype {
-                            Ok(e)
-                        } else {
-                            // Cast the value to the column's datatype
-                            let e: Arc<dyn PhysicalExpr> =
-                                Arc::new(CastExpr::new(e, datatype.clone(), None));
-                            Ok(e)
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                Arc::new(InListExpr::new(expr, list, *negated, None))
-            }
-            Expr::Like(expr) => Arc::new(LikeExpr::new(
-                expr.negated,
-                true,
-                self.create_physical_expr(expr.expr.as_ref())?,
-                self.create_physical_expr(expr.pattern.as_ref())?,
-            )),
-            Expr::Not(expr) => Arc::new(NotExpr::new(self.create_physical_expr(expr)?)),
-            Expr::Cast(datafusion::logical_expr::Cast { expr, data_type }) => {
-                let expr = self.create_physical_expr(expr.as_ref())?;
-                Arc::new(CastExpr::new(expr, data_type.clone(), None))
-            }
-            Expr::ScalarFunction(ScalarFunction { fun, args }) => {
-                if fun != &BuiltinScalarFunction::RegexpMatch {
-                    return Err(Error::IO {
-                        message: format!("Scalar function '{:?}' is not supported", fun),
-                        location: location!(),
-                    });
-                }
-                let execution_props = ExecutionProps::new();
-                let args_vec = args
-                    .iter()
-                    .map(|e| self.create_physical_expr(e).unwrap())
-                    .collect::<Vec<_>>();
-                if args_vec.len() != 2 {
-                    return Err(Error::IO {
-                        message: format!(
-                            "Scalar function '{:?}' only supports 2 args, got {}",
-                            fun,
-                            args_vec.len()
-                        ),
-                        location: location!(),
-                    });
-                }
-
-                let args_array: [Arc<dyn PhysicalExpr>; 2] =
-                    [args_vec[0].clone(), args_vec[1].clone()];
-
-                let physical_expr = functions::create_physical_expr(
-                    fun,
-                    &args_array,
-                    self.schema.as_ref(),
-                    &execution_props,
-                );
-                physical_expr?
-            }
-            _ => {
-                return Err(Error::IO {
-                    message: format!("Expression '{expr}' is not supported as filter in lance"),
-                    location: location!(),
-                })
-            }
-        })
+    /// Collect the columns in the expression.
+    ///
+    /// The columns are returned in sorted order.
+    pub fn column_names_in_expr(expr: &Expr) -> Vec<String> {
+        let mut visitor = ColumnCapturingVisitor {
+            current_path: VecDeque::new(),
+            columns: BTreeSet::new(),
+        };
+        expr.visit(&mut visitor).unwrap();
+        visitor.columns.into_iter().collect()
     }
 
     /// Determine how to apply a provided filter
@@ -547,28 +525,58 @@ impl Planner {
     /// a refine portion that must be applied after the index search
     pub fn create_filter_plan(
         &self,
-        filter: &str,
+        filter: Expr,
         index_info: &dyn IndexInformationProvider,
         use_scalar_index: bool,
     ) -> Result<FilterPlan> {
-        let logical_expr = self.parse_filter(filter)?;
+        let logical_expr = self.optimize_expr(filter)?;
         if use_scalar_index {
             let indexed_expr = apply_scalar_indices(logical_expr, index_info);
-            let refine_expr = indexed_expr
-                .refine_expr
-                .map(|refine_expr| self.create_physical_expr(&refine_expr))
-                .transpose()?;
             Ok(FilterPlan {
                 index_query: indexed_expr.scalar_query,
-                refine_expr,
+                refine_expr: indexed_expr.refine_expr,
             })
         } else {
-            let refine_expr = self.create_physical_expr(&logical_expr)?;
             Ok(FilterPlan {
                 index_query: None,
-                refine_expr: Some(refine_expr),
+                refine_expr: Some(logical_expr),
             })
         }
+    }
+}
+
+struct ColumnCapturingVisitor {
+    // Current column path. If this is empty, we are not in a column expression.
+    current_path: VecDeque<String>,
+    columns: BTreeSet<String>,
+}
+
+impl TreeNodeVisitor for ColumnCapturingVisitor {
+    type N = Expr;
+
+    fn pre_visit(&mut self, node: &Self::N) -> DFResult<VisitRecursion> {
+        match node {
+            Expr::Column(Column { name, .. }) => {
+                let mut path = name.clone();
+                for part in self.current_path.drain(..) {
+                    path.push('.');
+                    path.push_str(&part);
+                }
+                self.columns.insert(path);
+                self.current_path.clear();
+            }
+            Expr::GetIndexedField(GetIndexedField {
+                expr: _,
+                field: GetFieldAccess::NamedStructField { name },
+            }) => {
+                self.current_path.push_front(name.to_string());
+            }
+            _ => {
+                self.current_path.clear();
+            }
+        }
+
+        Ok(VisitRecursion::Continue)
     }
 }
 
@@ -584,7 +592,7 @@ mod tests {
         TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow_schema::{DataType, Field, Fields, Schema};
-    use datafusion::logical_expr::{col, lit, Cast};
+    use datafusion::logical_expr::{col, lit, Cast, GetFieldAccess, GetIndexedField};
 
     #[test]
     fn test_parse_filter_simple() {
@@ -605,7 +613,7 @@ mod tests {
 
         let expected = col("i")
             .gt(lit(3_i32))
-            .and(col("st.x").lt_eq(lit(5.0_f32)))
+            .and(col("st").field("x").lt_eq(lit(5.0_f32)))
             .and(
                 col("s")
                     .eq(lit("str-4"))
@@ -656,6 +664,84 @@ mod tests {
                 false, false, false, false, true, true, false, false, false, false
             ])
         );
+    }
+
+    #[test]
+    fn test_nested_col_refs() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s0", DataType::Utf8, true),
+            Field::new(
+                "st",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("s1", DataType::Utf8, true),
+                    Field::new(
+                        "st",
+                        DataType::Struct(Fields::from(vec![Field::new(
+                            "s2",
+                            DataType::Utf8,
+                            true,
+                        )])),
+                        true,
+                    ),
+                ])),
+                true,
+            ),
+        ]));
+
+        let planner = Planner::new(schema.clone());
+
+        fn assert_column_eq(planner: &Planner, expr: &str, expected: &Expr) {
+            let expr = planner.parse_filter(&format!("{expr} = 'val'")).unwrap();
+            assert!(matches!(
+                expr,
+                Expr::BinaryExpr(BinaryExpr {
+                    left: _,
+                    op: Operator::Eq,
+                    right: _
+                })
+            ));
+            if let Expr::BinaryExpr(BinaryExpr { left, .. }) = expr {
+                assert_eq!(left.as_ref(), expected);
+            }
+        }
+
+        let expected = Expr::Column(Column {
+            relation: None,
+            name: "s0".to_string(),
+        });
+        assert_column_eq(&planner, "s0", &expected);
+        assert_column_eq(&planner, "`s0`", &expected);
+
+        let expected = Expr::GetIndexedField(GetIndexedField {
+            expr: Box::new(Expr::Column(Column {
+                relation: None,
+                name: "st".to_string(),
+            })),
+            field: GetFieldAccess::NamedStructField {
+                name: ScalarValue::from("s1"),
+            },
+        });
+        assert_column_eq(&planner, "st.s1", &expected);
+        assert_column_eq(&planner, "`st`.`s1`", &expected);
+        assert_column_eq(&planner, "st.`s1`", &expected);
+
+        let expected = Expr::GetIndexedField(GetIndexedField {
+            expr: Box::new(Expr::GetIndexedField(GetIndexedField {
+                expr: Box::new(Expr::Column(Column {
+                    relation: None,
+                    name: "st".to_string(),
+                })),
+                field: GetFieldAccess::NamedStructField {
+                    name: ScalarValue::from("st"),
+                },
+            })),
+            field: GetFieldAccess::NamedStructField {
+                name: ScalarValue::from("s2"),
+            },
+        });
+        assert_column_eq(&planner, "st.st.s2", &expected);
+        assert_column_eq(&planner, "`st`.`st`.`s2`", &expected);
+        assert_column_eq(&planner, "st.st.`s2`", &expected);
     }
 
     #[test]
@@ -968,6 +1054,44 @@ mod tests {
     }
 
     #[test]
+    fn test_sql_array_literals() {
+        let cases = [
+            (
+                "x = [1, 2, 3]",
+                ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Int64, true))),
+            ),
+            (
+                "x = [1, 2, 3]",
+                ArrowDataType::FixedSizeList(
+                    Arc::new(Field::new("item", ArrowDataType::Int64, true)),
+                    3,
+                ),
+            ),
+        ];
+
+        for (sql, expected_data_type) in cases {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "x",
+                expected_data_type.clone(),
+                true,
+            )]));
+            let planner = Planner::new(schema.clone());
+            let expr = planner.parse_filter(sql).unwrap();
+            let expr = planner.optimize_expr(expr).unwrap();
+
+            match expr {
+                Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
+                    Expr::Literal(value) => {
+                        assert_eq!(&value.data_type(), &expected_data_type);
+                    }
+                    _ => panic!("Expected right to be a literal"),
+                },
+                _ => panic!("Expected binary expression"),
+            }
+        }
+    }
+
+    #[test]
     fn test_sql_comparison() {
         // Create a batch with all data types
         let batch: Vec<(&str, ArrayRef)> = vec![
@@ -1008,6 +1132,7 @@ mod tests {
         for expression in expressions {
             // convert to physical expression
             let logical_expr = planner.parse_filter(expression).unwrap();
+            let logical_expr = planner.optimize_expr(logical_expr).unwrap();
             let physical_expr = planner.create_physical_expr(&logical_expr).unwrap();
 
             // Evaluate and assert they have correct results
@@ -1015,5 +1140,21 @@ mod tests {
             let result = result.into_array(batch.num_rows());
             assert_eq!(&expected, &result, "unexpected result for {}", expression);
         }
+    }
+
+    #[test]
+    fn test_columns_in_expr() {
+        let expr = col("s0").gt(lit("value")).and(
+            col("st")
+                .field("st")
+                .field("s2")
+                .eq(lit("value"))
+                .or(col("st")
+                    .field("s1")
+                    .in_list(vec![lit("value 1"), lit("value 2")], false)),
+        );
+
+        let columns = Planner::column_names_in_expr(&expr);
+        assert_eq!(columns, vec!["s0", "st.s1", "st.st.s2"]);
     }
 }

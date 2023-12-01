@@ -19,10 +19,29 @@ use moka::sync::{Cache, ConcurrentCacheExt};
 
 use super::vector::VectorIndex;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Debug, Default)]
+pub struct CacheStats {
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl CacheStats {
+    pub fn record_hit(&self) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_miss(&self) {
+        self.misses.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 pub struct IndexCache {
     scalar_cache: Arc<Cache<String, Arc<dyn ScalarIndex>>>,
     vector_cache: Arc<Cache<String, Arc<dyn VectorIndex>>>,
+    cache_stats: Arc<CacheStats>,
 }
 
 impl IndexCache {
@@ -30,6 +49,7 @@ impl IndexCache {
         Self {
             scalar_cache: Arc::new(Cache::new(capacity as u64)),
             vector_cache: Arc::new(Cache::new(capacity as u64)),
+            cache_stats: Arc::new(CacheStats::default()),
         }
     }
 
@@ -39,12 +59,23 @@ impl IndexCache {
         self.vector_cache.entry_count() as usize
     }
 
+    pub(crate) fn get_size(&self) -> usize {
+        self.scalar_cache.sync();
+        self.vector_cache.sync();
+        self.scalar_cache.entry_count() as usize + self.vector_cache.entry_count() as usize
+    }
+
     /// Get an Index if present. Otherwise returns [None].
     pub(crate) fn get_scalar(&self, key: &str) -> Option<Arc<dyn ScalarIndex>> {
         self.scalar_cache.get(key)
     }
 
     pub(crate) fn get_vector(&self, key: &str) -> Option<Arc<dyn VectorIndex>> {
+        if self.vector_cache.contains_key(key) || self.scalar_cache.contains_key(key) {
+            self.cache_stats.record_hit();
+        } else {
+            self.cache_stats.record_miss();
+        }
         self.vector_cache.get(key)
     }
 
@@ -55,5 +86,17 @@ impl IndexCache {
 
     pub(crate) fn insert_vector(&self, key: &str, index: Arc<dyn VectorIndex>) {
         self.vector_cache.insert(key.to_string(), index);
+    }
+
+    /// Get cache hit ratio.
+    #[allow(dead_code)]
+    pub(crate) fn hit_rate(&self) -> f32 {
+        let hits = self.cache_stats.hits.load(Ordering::Relaxed) as f32;
+        let misses = self.cache_stats.misses.load(Ordering::Relaxed) as f32;
+        // Returns 1.0 if hits + misses == 0 and avoids division by zero.
+        if (hits + misses) == 0.0 {
+            return 1.0;
+        }
+        hits / (hits + misses)
     }
 }

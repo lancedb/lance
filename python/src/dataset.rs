@@ -24,12 +24,16 @@ use async_trait::async_trait;
 use chrono::Duration;
 
 use futures::StreamExt;
+use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::UpdateBuilder;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
     Dataset as LanceDataset, ReadParams, Version, WriteMode, WriteParams,
 };
+use lance::index::IndexParams;
 use lance::index::{
+    scalar::ScalarIndexParams,
     vector::{diskann::DiskANNParams, VectorIndexParams},
     DatasetIndexExt,
 };
@@ -161,11 +165,13 @@ impl Dataset {
         commit_handler: Option<PyObject>,
     ) -> PyResult<Self> {
         let mut params = ReadParams {
-            block_size,
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
             metadata_cache_size: metadata_cache_size.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
             session: None,
-            store_options: None,
+            store_options: Some(ObjectStoreParams {
+                block_size,
+                ..Default::default()
+            }),
         };
 
         if let Some(commit_handler) = commit_handler {
@@ -178,8 +184,11 @@ impl Dataset {
             RT.runtime
                 .block_on(LanceDataset::checkout_with_params(&uri, ver, &params))
         } else {
-            RT.runtime
-                .block_on(LanceDataset::open_with_params(&uri, &params))
+            RT.runtime.block_on(
+                DatasetBuilder::from_uri(&uri)
+                    .with_read_params(params)
+                    .load(),
+            )
         };
         match dataset {
             Ok(ds) => Ok(Self {
@@ -515,6 +524,36 @@ impl Dataset {
         Ok(())
     }
 
+    fn update(&mut self, updates: &PyDict, predicate: Option<&str>) -> PyResult<()> {
+        let mut builder = UpdateBuilder::new(self.ds.clone());
+        if let Some(predicate) = predicate {
+            builder = builder
+                .update_where(predicate)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+
+        for (key, value) in updates {
+            let column: &str = key.extract()?;
+            let expr: &str = value.extract()?;
+
+            builder = builder
+                .set(column, expr)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+
+        let operation = builder
+            .build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let new_self = RT
+            .block_on(None, operation.execute())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        self.ds = new_self;
+
+        Ok(())
+    }
+
     fn count_deleted_rows(&self) -> PyResult<usize> {
         RT.block_on(None, self.ds.count_deleted_rows())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
@@ -597,10 +636,11 @@ impl Dataset {
         columns: Vec<&str>,
         index_type: &str,
         name: Option<String>,
-        metric_type: Option<&str>,
+        replace: Option<bool>,
         kwargs: Option<&PyDict>,
     ) -> PyResult<()> {
         let idx_type = match index_type.to_uppercase().as_str() {
+            "BTREE" => IndexType::Scalar,
             "IVF_PQ" | "DISKANN" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -609,24 +649,19 @@ impl Dataset {
             }
         };
 
-        let m_type = match metric_type {
-            Some(mt) => MetricType::try_from(mt.to_string().to_lowercase().as_str())
-                .map_err(|err| PyValueError::new_err(err.to_string()))?,
-            None => MetricType::L2,
-        };
-
-        let replace = if let Some(replace) = kwargs.and_then(|k| k.get_item("replace")) {
-            PyAny::downcast::<PyBool>(replace)?.extract()?
-        } else {
-            false
-        };
-
         // Only VectorParams are supported.
-        let params = match index_type.to_uppercase().as_str() {
+        let params: Box<dyn IndexParams> = match index_type.to_uppercase().as_str() {
+            "BTREE" => Box::<ScalarIndexParams>::default(),
             "IVF_PQ" => {
                 let mut ivf_params = IvfBuildParams::default();
                 let mut pq_params = PQBuildParams::default();
+                let mut m_type = MetricType::L2;
                 if let Some(kwargs) = kwargs {
+                    if let Some(mt) = kwargs.get_item("metric_type") {
+                        m_type = MetricType::try_from(mt.to_string().to_lowercase().as_str())
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                    }
+
                     if let Some(n) = kwargs.get_item("num_partitions") {
                         ivf_params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
                     };
@@ -664,11 +699,19 @@ impl Dataset {
                         ivf_params.centroids = Some(Arc::new(centroids.clone()))
                     };
                 }
-                VectorIndexParams::with_ivf_pq_params(m_type, ivf_params, pq_params)
+                Box::new(VectorIndexParams::with_ivf_pq_params(
+                    m_type, ivf_params, pq_params,
+                ))
             }
             "DISKANN" => {
                 let mut params = DiskANNParams::default();
+                let mut m_type = MetricType::L2;
                 if let Some(kwargs) = kwargs {
+                    if let Some(mt) = kwargs.get_item("metric_type") {
+                        m_type = MetricType::try_from(mt.to_string().to_lowercase().as_str())
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                    }
+
                     if let Some(n) = kwargs.get_item("r") {
                         params.r = PyAny::downcast::<PyInt>(n)?.extract()?
                     };
@@ -681,7 +724,7 @@ impl Dataset {
                         params.l = PyAny::downcast::<PyInt>(n)?.extract()?
                     };
                 }
-                VectorIndexParams::with_diskann_params(m_type, params)
+                Box::new(VectorIndexParams::with_diskann_params(m_type, params))
             }
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -690,10 +733,12 @@ impl Dataset {
             }
         };
 
+        let replace = replace.unwrap_or(true);
+
         let mut new_self = self.ds.as_ref().clone();
         RT.block_on(
             None,
-            new_self.create_index(&columns, idx_type, name, &params, replace),
+            new_self.create_index(&columns, idx_type, name, params.as_ref(), replace),
         )?
         .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
@@ -761,6 +806,14 @@ impl Dataset {
                 index_name
             )))
         }
+    }
+
+    fn index_cache_entry_count(&self) -> PyResult<usize> {
+        Ok(self.ds.index_cache_entry_count())
+    }
+
+    fn index_cache_hit_rate(&self) -> PyResult<f32> {
+        Ok(self.ds.index_cache_hit_rate())
     }
 
     #[staticmethod]
