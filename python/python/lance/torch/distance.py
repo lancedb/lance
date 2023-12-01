@@ -13,7 +13,7 @@
 #  limitations under the License.
 
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -84,6 +84,38 @@ def cosine_distance(
     raise RuntimeError("Cosine distance out of memory")
 
 
+def pairwise_l2(x: torch.Tensor, y: torch.Tensor, y2: Optional[torch.Tensor] = None):
+    """Compute pair-wise L2 distance between x and y.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        A 2-D ``[M, D]`` tensor, containing `M` vectors.
+    y : torch.Tensor
+        A 2-D ``[N, D]`` tensor, containing `N` vectors.
+    y2: 1-D tensor.Tensor, optional
+        Optionally, the pre-computed `y^2`.
+
+    Returns
+    -------
+    A ``[M, N]`` tensor with pair-wise L2 distance between x and y.
+    """
+    if len(x.shape) != 2 or len(y.shape) != 2:
+        raise ValueError(
+            f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
+        )
+    if y2 is None:
+        y2 = (y * y).sum(dim=1)
+    x2 = (x * x).sum(dim=1)
+    xy = x @ y.T
+    dists = (
+        x2.broadcast_to(y2.shape[0], x2.shape[0]).T
+        + y2.broadcast_to(x2.shape[0], y2.shape[0])
+        - 2 * xy
+    )
+    return dists
+
+
 @torch.jit.script
 def _l2_distance(
     x: torch.Tensor, y: torch.Tensor, split_size: int
@@ -98,13 +130,7 @@ def _l2_distance(
 
     y2 = (y * y).sum(dim=1)
     for sub_vectors in x.split(split_size):
-        x2 = (sub_vectors * sub_vectors).sum(dim=1)
-        xy = sub_vectors @ y.T
-        dists = (
-            x2.broadcast_to(y2.shape[0], x2.shape[0]).T
-            + y2.broadcast_to(x2.shape[0], y2.shape[0])
-            - 2 * xy
-        )
+        dists = pairwise_l2(sub_vectors, y, y2)
         idx = torch.argmin(dists, dim=1, keepdim=True)
         part_ids.append(idx)
         distances.append(dists.take_along_dim(idx, dim=1))

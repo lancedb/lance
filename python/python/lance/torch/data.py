@@ -34,10 +34,16 @@ if TYPE_CHECKING:
 __all__ = ["LanceDataset"]
 
 
-def _to_tensor(batch: pa.RecordBatch) -> Union[dict[str, torch.Tensor], torch.Tensor]:
+def _to_tensor(
+    batch: pa.RecordBatch, *, uint64_as_int64: bool = True
+) -> Union[dict[str, torch.Tensor], torch.Tensor]:
+    """Convert a pyarrow RecordBatch to torch Tensor."""
     ret = {}
     for col in batch.schema.names:
         arr: pa.Array = batch[col]
+        if pa.types.is_uint64(arr.type) and uint64_as_int64:
+            arr = arr.cast(pa.int64())
+
         if pa.types.is_fixed_size_list(arr.type) and pa.types.is_floating(
             arr.type.value_type
         ):
@@ -78,6 +84,7 @@ class LanceDataset(IterableDataset):
         filter: Optional[str] = None,
         samples: Optional[int] = 0,
         cache: Optional[Union[str, bool]] = None,
+        with_row_id: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -113,6 +120,7 @@ class LanceDataset(IterableDataset):
                     columns=self.columns,
                     batch_size=self.batch_size,
                     filter=self.filter,
+                    with_row_id=True,
                 )
 
             if self.cache:
