@@ -68,7 +68,9 @@ def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa
     expected_price = data_table["price"][50]
 
     for filter in [f"meta='{sample_meta}'", f"price >= 0 AND meta='{sample_meta}'"]:
-        scanner = indexed_dataset.scanner(columns=["price"], filter=filter)
+        scanner = indexed_dataset.scanner(
+            columns=["price"], filter=filter, prefilter=True
+        )
 
         assert "MaterializeIndex" in scanner.explain_plan()
 
@@ -115,3 +117,22 @@ def test_indexed_vector_scan(indexed_dataset: lance.LanceDataset, data_table: pa
     assert "MaterializeIndex" in scanner.explain_plan()
 
     check_result(scanner.to_table())
+
+
+# Post filtering does not use scalar indices.  This test merely confirms
+# that post filtering is still being applied even if the query could be
+# satisfied with scalar indices
+def test_indexed_vector_scan_postfilter(
+    indexed_dataset: lance.LanceDataset, data_table: pa.Table
+):
+    query_vec = data_table["vector"][25].as_py()
+    sample_meta = data_table["meta"][50]
+
+    scanner = indexed_dataset.scanner(
+        nearest={"column": "vector", "q": query_vec, "k": 1, "nprobes": 4},
+        columns=["price"],
+        prefilter=False,
+        filter=f"meta='{sample_meta}'",
+    )
+
+    assert scanner.to_table().num_rows == 0

@@ -650,7 +650,9 @@ impl Scanner {
         // TODO: Currently, if any of the fragments have a deletion file, we
         // cannot use scalar indices.  This is fixable, but deferring for a
         // future PR.
-        let use_scalar_index = !self.need_to_handle_delete_files();
+        //
+        // Also, we do not use scalar indices if there is a post-filter.
+        let use_scalar_index = self.prefilter && !self.need_to_handle_delete_files();
 
         // NOTE: we only support node that have one partition. So any nodes that
         // produce multiple need to be repartitioned to 1.
