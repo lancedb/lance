@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Iterable, Optional, Union
+from typing import Iterable, Optional, Union
 
 import numpy as np
 import pyarrow as pa
@@ -28,9 +28,6 @@ from torch.utils.data import Dataset, IterableDataset
 
 from ..cache import CachedDataset
 from ..sampler import maybe_sample
-
-if TYPE_CHECKING:
-    from .. import LanceDataset as Dataset
 
 __all__ = ["LanceDataset"]
 
@@ -74,7 +71,11 @@ def _to_tensor(
 
 
 class TensorDataset(Dataset):
-    """A tensor dataset, returns in batch."""
+    """A PyTorch Dataset that wraps over a tensor, returns in batches.
+
+    Unlike `torch.utils.data.TensorDataset`, this has the same behavior as LanceDataset
+    that it yields tensor in batches.
+    """
 
     def __init__(
         self, data: Union[torch.Tensor, np.ndarray], batch_size: int, *args, **kwargs
