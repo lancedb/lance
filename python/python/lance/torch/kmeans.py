@@ -110,11 +110,18 @@ class KMeans:
         data = data.to(self.device)
         return data
 
+    def _random_init(self, data: Union[torch.Tensor, np.ndarray]):
+        """Random centroid initialization."""
+        indices = np.random.choice(data.shape[0], self.k)
+        if isinstance(data, np.ndarray):
+            data = torch.from_numpy(data)
+        self.centroids = data[indices]
+
     def fit(
         self,
-        data: IterableDataset,
+        data: Union[IterableDataset, np.ndarray, torch.Tensor],
     ):
-        """Fit - Train the kmeans models.
+        """Fit - Train the kmeans model.
 
         Parameters
         ----------
@@ -123,6 +130,9 @@ class KMeans:
 
         """
         start = time.time()
+        if isinstance(data, (np.ndarray, torch.Tensor)):
+            self._random_init(data)
+
         assert self.centroids is not None
         self.centroids = self.centroids.to(self.device)
 
