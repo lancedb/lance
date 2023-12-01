@@ -54,8 +54,12 @@ pub async fn flat_search(
         .await?;
 
     if batches.is_empty() {
-        let schema_with_distance = input_schema.try_with_column(distance_field())?;
-        return Ok(RecordBatch::new_empty(schema_with_distance.into()));
+        if input_schema.column_with_name(DIST_COL).is_none() {
+            let schema_with_distance = input_schema.try_with_column(distance_field())?;
+            return Ok(RecordBatch::new_empty(schema_with_distance.into()));
+        } else {
+            return Ok(RecordBatch::new_empty(input_schema));
+        }
     }
 
     // TODO: waiting to do this until the end adds quite a bit of latency. We should

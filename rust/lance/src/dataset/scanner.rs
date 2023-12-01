@@ -872,7 +872,7 @@ impl Scanner {
                 knn_node_with_vector
             }; // vector, _distance, _rowid
 
-            knn_node = self.knn_combined(&q, index, knn_node).await?;
+            knn_node = self.knn_combined(&q, index, knn_node, filter_plan).await?;
 
             Ok(knn_node)
         } else {
@@ -904,13 +904,23 @@ impl Scanner {
         q: &&Query,
         index: &Index,
         knn_node: Arc<dyn ExecutionPlan>,
+        filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Check if we've created new versions since the index
         let unindexed_fragments = unindexed_fragments(index, self.dataset.as_ref()).await?;
         if !unindexed_fragments.is_empty() {
-            let vector_scan_projection =
-                Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-            let scan_node = self.scan_fragments(
+            let mut columns = vec![q.column.clone()];
+            let mut num_filter_columns = 0;
+            if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+                let filter_columns = Planner::column_names_in_expr(refine_expr);
+                num_filter_columns = filter_columns.len();
+                columns.extend(filter_columns);
+            }
+            let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
+            // Note: we could try and use the scalar indices here to reduce the scope of this scan but the
+            // most common case is that fragments that are newer than the vector index are going to be newer
+            // than the scalar indices anyways
+            let mut scan_node = self.scan_fragments(
                 true,
                 true,
                 vector_scan_projection,
@@ -919,16 +929,22 @@ impl Scanner {
                 // in a deterministic order.
                 false,
             );
+            if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+                // If there is a prefilter we need to manually apply it to the new data
+                let planner = Planner::new(scan_node.schema());
+                let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
+                scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
+            }
             // first we do flat search on just the new data
             let topk_appended = self.flat_knn(scan_node, q)?;
 
             // To do a union, we need to make the schemas match. Right now
             // knn_node: _distance, _rowid, vector
-            // topk_appended: vector, _rowid, _distance
+            // topk_appended: vector, <filter columns?>, _rowid, _distance
             let new_schema = Schema::try_from(
                 &topk_appended
                     .schema()
-                    .project(&[2, 1, 0])?
+                    .project(&[2 + num_filter_columns, 1 + num_filter_columns, 0])?
                     .with_metadata(knn_node.schema().metadata.clone()),
             )?;
             let topk_appended = ProjectionExec::try_new(topk_appended, Arc::new(new_schema))?;
@@ -1417,6 +1433,15 @@ mod test {
         expected_batches
     }
 
+    // Creates a dataset with 5 batches where each batch has 80 rows
+    //
+    // The dataset has the following columns:
+    //
+    //  i   - i32      : [0, 1, ..., 399]
+    //  s   - &str     : ["s-0", "s-1", ..., "s-399"]
+    //  vec - [f32; 32]: [[0, 1, ... 31], [32, ..., 63], ... [..., (80 * 5 * 32) - 1]]
+    //
+    // An IVF-PQ index with 2 partitions is trained on this data
     async fn create_vector_dataset(path: &str, build_index: bool) -> Arc<Dataset> {
         // Make sure the schema has metadata so it tests all paths that re-construct the schema along the way
         let metadata: HashMap<String, String> = vec![("dataset".to_string(), "vector".to_string())]
@@ -1482,6 +1507,46 @@ mod test {
         Arc::new(Dataset::open(path).await.unwrap())
     }
 
+    // Given a dataset created with the create_vector_dataset method above this adds
+    // 10 additional rows
+    //
+    //  i   - i32      : [400, 401, ..., 409]
+    //  s   - &str     : ["s-400", "s-401", ..., "s-409"]
+    //  vec - [f32; 32]: [[0, 0, ... 0], [1, 1, ..., 1], ... [9, 9, ..., 9]]
+    async fn add_vector_dataset_new_data(dataset: Arc<Dataset>, test_uri: &str) -> Arc<Dataset> {
+        // Insert more data
+        // (0, 0, ...), (1, 1, ...), (2, 2, ...)
+        let vector_values: Float32Array =
+            (0..10).flat_map(|i| [i as f32; 32].into_iter()).collect();
+        let new_vectors = FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
+        let new_data: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from_iter_values(400..410)), // 5 * 80
+            Arc::new(StringArray::from_iter_values(
+                (400..410).map(|v| format!("s-{}", v)),
+            )),
+            Arc::new(new_vectors),
+        ];
+        let schema: Arc<ArrowSchema> = Arc::new(dataset.schema().try_into().unwrap());
+        let new_data_reader = RecordBatchIterator::new(
+            vec![RecordBatch::try_new(schema.clone(), new_data).unwrap()]
+                .into_iter()
+                .map(Ok),
+            schema.clone(),
+        );
+        Arc::new(
+            Dataset::write(
+                new_data_reader,
+                test_uri,
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn test_knn_nodes() {
         for build_index in &[true, false] {
@@ -1538,36 +1603,7 @@ mod test {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let dataset = create_vector_dataset(test_uri, true).await;
-
-        // Insert more data
-        // (0, 0, ...), (1, 1, ...), (2, 2, ...)
-        let vector_values: Float32Array =
-            (0..10).flat_map(|i| [i as f32; 32].into_iter()).collect();
-        let new_vectors = FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
-        let new_data: Vec<ArrayRef> = vec![
-            Arc::new(Int32Array::from_iter_values(400..410)), // 5 * 80
-            Arc::new(StringArray::from_iter_values(
-                (400..410).map(|v| format!("s-{}", v)),
-            )),
-            Arc::new(new_vectors),
-        ];
-        let schema: Arc<ArrowSchema> = Arc::new(dataset.schema().try_into().unwrap());
-        let new_data_reader = RecordBatchIterator::new(
-            vec![RecordBatch::try_new(schema.clone(), new_data).unwrap()]
-                .into_iter()
-                .map(Ok),
-            schema.clone(),
-        );
-        let dataset = Dataset::write(
-            new_data_reader,
-            test_uri,
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let dataset = add_vector_dataset_new_data(dataset, test_uri).await;
 
         // Create a bunch of queries
         let key: Float32Array = [0f32; 32].into_iter().collect();
@@ -1694,6 +1730,70 @@ mod test {
             .collect();
         assert!(exact_i.is_subset(&actual_i));
         assert!(actual_i.is_subset(&close_i));
+    }
+
+    #[tokio::test]
+    async fn test_knn_filter_new_data() {
+        // This test verifies that a filter (prefilter or postfilter) gets applied to the flat KNN results
+        // in a combined KNN scan (a scan that combines results from an indexed ANN with an unindexed flat
+        // search of new data)
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_vector_dataset(test_uri, true).await;
+        let dataset = add_vector_dataset_new_data(dataset, test_uri).await;
+
+        // This query will match exactly the new row with i = 400 which should be excluded by the prefilter
+        let key: Float32Array = [0f32; 32].into_iter().collect();
+
+        let mut query = dataset.scan();
+        query.nearest("vec", &key, 20).unwrap();
+
+        // Sanity check that 400 is in our results
+        let results = query
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let results_i = results[0]["i"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        dbg!(&results_i);
+        assert!(results_i.contains(&400));
+
+        // Both prefilter and postfilter should remove 400 from our results
+        for prefilter in [false, true] {
+            let mut query = dataset.scan();
+            query
+                .filter("i != 400")
+                .unwrap()
+                .prefilter(prefilter)
+                .nearest("vec", &key, 20)
+                .unwrap();
+
+            let results = query
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+
+            let results_i = results[0]["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+
+            assert!(!results_i.contains(&400));
+        }
     }
 
     #[tokio::test]
@@ -3066,8 +3166,7 @@ mod test {
                 |val| val == 50,
                 "The query contained 50 even though it was filtered",
             );
-            // TODO: Remove this check once #1561 is addressed
-            if !params.use_index || !params.use_new_data {
+            if !params.use_new_data {
                 // Refine should have been applied
                 self.assert_none(
                     &batch,
@@ -3112,8 +3211,7 @@ mod test {
                     |val| val == 1050,
                     "The query did not contain 1050 from the new data",
                 );
-                // TODO: Remove this check once #1561 is addressed
-                if !params.use_index || !params.use_new_data {
+                if !params.use_new_data {
                     // Let's also make sure our filter can target something in the new data only
                     let (_, batch) = self
                         .run_query("indexed == 1050", Some(self.sample_query()), params)
@@ -3125,8 +3223,7 @@ mod test {
                 let (_, batch) = self
                     .run_query("indexed == 75", Some(self.delete_query()), params)
                     .await;
-                // TODO: Remove this check once #1561 is addressed
-                if !params.use_index || !params.use_new_data {
+                if !params.use_new_data {
                     assert_eq!(batch.num_rows(), 0);
                 }
             }
