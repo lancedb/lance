@@ -18,12 +18,13 @@
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Iterable, Optional, Union
 
 import numpy as np
 import pyarrow as pa
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, Dataset
 
 from ..cache import CachedDataset
 from ..sampler import maybe_sample
@@ -70,6 +71,30 @@ def _to_tensor(
         del ret
         return t
     return ret
+
+
+class TensorDataset(Dataset):
+    """A tensor dataset, returns in batch."""
+
+    def __init__(
+        self, data: Union[torch.Tensor, np.ndarray], batch_size: int, *args, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        if isinstance(data, np.ndarray):
+            data = torch.from_numpy(data)
+        self._data: torch.Tensor = data
+        self._batch_size = batch_size
+
+    def __repr__(self):
+        return "LanceTensorDataset"
+
+    def __len__(self):
+        return math.ceil(self._data.shape[0])
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        start = idx * self._batch_size
+        end = min((idx + 1) * self._batch_size, self._data.shape[0])
+        return self._data[start:end, :]
 
 
 class LanceDataset(IterableDataset):
