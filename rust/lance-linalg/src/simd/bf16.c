@@ -19,24 +19,76 @@
 #include <immintrin.h>
 #endif // __X86_64__
 
-/// Works on NEON + FP16 or AVX512_BF16
-float norm_l2_bf16(const __bf16 *data, uint32_t dimension) {
-  __bf16 sum = 0;
+// See https://github.com/ashvardanian/SimSIMD/blob/main/include/simsimd/spatial.h
+// https://www.intel.com/content/www/us/en/developer/articles/technical/intel-deep-learning-boost-new-instruction-bfloat16.html
 
-#pragma clang loop unroll(enable) vectorize(enable) interleave(enable)
-  for (uint32_t i = 0; i < dimension; i++) {
-    sum += data[i] * data[i];
-  }
-  return (float) sum;
+/// Need avx512bf16 and avx512bw
+float l2_bf16(__bf16 const* a, __bf16 const* b, size_t d) {
+    __m512h d2_vec = _mm512_set1_ph(0);
+    for (size_t i = 0; i < d; i += 32) {
+//        __mmask16 mask = d - i >= 32 ? 0xFFFFFFFF : ((1u << (d - i)) - 1u);
+        __mmask16 mask = _bzhi_u32(0xFFFFFFFF, d);
+        __m512i a_vec = _mm512_maskz_loadu_epi16(mask, a + i);
+        __m512i b_vec = _mm512_maskz_loadu_epi16(mask, b + i);
+        __m512h d_vec = _mm512_sub_ph(_mm512_castsi512_ph(a_vec), _mm512_castsi512_ph(b_vec));
+        d2_vec = _mm512_fmadd_ph(d_vec, d_vec, d2_vec);
+    }
+    return _mm512_reduce_add_ph(d2_vec);
 }
 
-float l2_bf16(const __bf16 *x, const __bf16 *y, uint32_t dimension) {
-  __bf16 sum = 0.0;
+float dot_bf16(__bf16 const* a, __bf16 const* b, size_t n) {
+    __m512h ab_vec = _mm512_set1_ph(0);
+    __m512i a_vec, b_vec;
 
-#pragma clang loop unroll(enable) interleave(enable) vectorize_width(32)
-  for (uint32_t i = 0; i < dimension; i++) {
-    __bf16 s = x[i] - y[i];
-    sum += s * s;
-  }
-  return (float) sum;
+    while (n > 0) {
+        if (n < 32) {
+//            __mmask16 mask = (1u << n) - 1u;
+            __mmask16 mask = _bzhi_u32(0xFFFFFFFF, n);
+            a_vec = _mm512_maskz_loadu_epi16(mask, a);
+            b_vec = _mm512_maskz_loadu_epi16(mask, b);
+            n = 0;
+        } else {
+            a_vec = _mm512_loadu_epi16(a);
+            b_vec = _mm512_loadu_epi16(b);
+            a += 32, b += 32, n -= 32;
+        }
+        ab_vec = _mm512_fmadd_ph(a_vec, b_vec, ab_vec);
+    }
+
+    return _mm512_reduce_add_ph(ab_vec);
+}
+
+float cosine_bf16(__bf16 const* a, __bf16 const* b, size_t n) {
+    __m512h ab_vec = _mm512_set1_ph(0);
+    __m512h a2_vec = _mm512_set1_ph(0);
+    __m512h b2_vec = _mm512_set1_ph(0);
+    __m512i a_vec, b_vec;
+
+    while (n > 0) {
+        if (n < 32) {
+//            __mmask16 mask = (1u << n) - 1u;
+            __mmask16 mask = _bzhi_u32(0xFFFFFFFF, n);
+            a_vec = _mm512_maskz_loadu_epi16(mask, a);
+            b_vec = _mm512_maskz_loadu_epi16(mask, b);
+            n = 0;
+        } else {
+            a_vec = _mm512_loadu_epi16(a);
+            b_vec = _mm512_loadu_epi16(b);
+            a += 32, b += 32, n -= 32;
+        }
+        ab_vec = _mm512_fmadd_ph(a_vec, b_vec, ab_vec);
+        a2_vec = _mm512_fmadd_ph(a_vec, a_vec, a2_vec);
+        b2_vec = _mm512_fmadd_ph(b_vec, b_vec, b2_vec);
+    }
+
+    __bf16 ab = _mm512_reduce_add_ph(ab_vec);
+    __bf16 a2 = _mm512_reduce_add_ph(a2_vec);
+    __bf16 b2 = _mm512_reduce_add_ph(b2_vec);
+
+    // Compute the reciprocal square roots of a2 and b2
+    // __m128 rsqrts = __m128(_mm_set_ps(0.f, 0.f, a2 + 1.e-9f, b2 + 1.e-9f));
+    // __m128 rsqrt_a2 = _mm_cvtss_f32(rsqrts);
+    // f32_t rsqrt_b2 = _mm_cvtss_f32(_mm_shuffle_ps(rsqrts, rsqrts, _MM_SHUFFLE(0, 0, 0, 1)));
+    // return 1 - ab * rsqrt_a2 * rsqrt_b2;
+    return 1;
 }
