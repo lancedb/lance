@@ -93,6 +93,7 @@ class LanceDataset(IterableDataset):
         self.batch_size = batch_size
         self.samples: Optional[int] = samples
         self.filter = filter
+        self.with_row_id = with_row_id
 
         if samples is not None and filter is not None:
             raise ValueError("Does not support sampling over filtered dataset")
@@ -120,7 +121,7 @@ class LanceDataset(IterableDataset):
                     columns=self.columns,
                     batch_size=self.batch_size,
                     filter=self.filter,
-                    with_row_id=True,
+                    with_row_id=self.with_row_id,
                 )
 
             if self.cache:
