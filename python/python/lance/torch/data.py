@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Iterable, Optional, Union
 import numpy as np
 import pyarrow as pa
 import torch
-from torch.utils.data import IterableDataset, Dataset
+from torch.utils.data import Dataset, IterableDataset
 
 from ..cache import CachedDataset
 from ..sampler import maybe_sample
