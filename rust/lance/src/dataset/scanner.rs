@@ -1764,7 +1764,6 @@ mod test {
             .copied()
             .collect::<BTreeSet<_>>();
 
-        dbg!(&results_i);
         assert!(results_i.contains(&400));
 
         // Both prefilter and postfilter should remove 400 from our results
