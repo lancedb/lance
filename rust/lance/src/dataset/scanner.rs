@@ -164,6 +164,11 @@ pub struct Scanner {
     /// Scan the dataset with a meta column: "_rowid"
     with_row_id: bool,
 
+    /// Whether to use statistics to optimize the scan (default: true)
+    ///
+    /// This is used for debugging or benchmarking purposes.
+    use_stats: bool,
+
     /// Whether to scan in deterministic order (default: true)
     ///
     /// This field is ignored if `ordering` is defined
@@ -195,6 +200,7 @@ impl Scanner {
             offset: None,
             ordering: None,
             nearest: None,
+            use_stats: true,
             with_row_id: false,
             ordered: true,
             fragments: None,
@@ -202,23 +208,9 @@ impl Scanner {
     }
 
     pub fn from_fragment(dataset: Arc<Dataset>, fragment: Fragment) -> Self {
-        let projection = dataset.schema().clone();
-        let batch_size = std::cmp::max(dataset.object_store().block_size() / 4, DEFAULT_BATCH_SIZE);
         Self {
-            dataset,
-            projections: projection,
-            prefilter: false,
-            filter: None,
-            batch_size,
-            batch_readahead: DEFAULT_BATCH_READAHEAD,
-            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
-            limit: None,
-            offset: None,
-            ordering: None,
-            nearest: None,
-            with_row_id: false,
-            ordered: true,
             fragments: Some(vec![fragment]),
+            ..Self::new(dataset)
         }
     }
 
@@ -489,6 +481,14 @@ impl Scanner {
         self
     }
 
+    /// Set whether to use statistics to optimize the scan (default: true)
+    ///
+    /// This is used for debugging or benchmarking purposes.
+    pub fn use_stats(&mut self, use_stats: bool) -> &mut Self {
+        self.use_stats = use_stats;
+        self
+    }
+
     /// The Arrow schema of the output, including projections and vector / _distance
     pub fn schema(&self) -> Result<SchemaRef> {
         let schema = self
@@ -725,13 +725,13 @@ impl Scanner {
                     self.scalar_indexed_scan(&filter_schema, index_query)
                         .await?
                 }
-                (None, Some(_)) => self.pushdown_scan(
+                (None, Some(_)) if self.use_stats => self.pushdown_scan(
                     self.with_row_id,
                     false,
                     self.projections.clone().into(),
                     filter_plan.refine_expr.take().unwrap(),
                 )?,
-                (None, None) => {
+                (None, _) => {
                     // The source is a full scan of the table
                     self.scan(self.with_row_id, false, self.projections.clone().into())
                 }
@@ -1101,7 +1101,6 @@ impl Scanner {
             with_row_id,
             make_deletions_null,
             ordered_output: self.ordered,
-            use_stats: true, // TODO: make this configurable
             ..Default::default()
         };
 
@@ -3008,7 +3007,6 @@ mod test {
 
             let plan = scan.explain_plan(true).await.unwrap();
             let output_schema = scan.schema().unwrap();
-            println!("{}", scan.explain_plan(true).await.unwrap());
             let batches = scan
                 .try_into_stream()
                 .await

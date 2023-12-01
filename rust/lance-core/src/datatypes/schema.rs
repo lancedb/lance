@@ -37,7 +37,7 @@ pub struct Schema {
 }
 
 /// State for a pre-order DFS iterator over the fields of a schema.
-pub struct SchemaFieldIterPreOrder<'a> {
+struct SchemaFieldIterPreOrder<'a> {
     field_stack: Vec<&'a Field>,
 }
 
@@ -135,7 +135,7 @@ impl Schema {
     ///
     /// This is a DFS traversal where the parent is visited
     /// before its children
-    pub fn fields_pre_order(&self) -> SchemaFieldIterPreOrder {
+    pub fn fields_pre_order(&self) -> impl Iterator<Item = &Field> {
         SchemaFieldIterPreOrder::new(self)
     }
 

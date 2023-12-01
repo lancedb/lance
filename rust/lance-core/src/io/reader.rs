@@ -556,6 +556,7 @@ impl FileReader {
         })
     }
 
+    /// Get the page statistics for the given data field ids.
     pub async fn read_page_stats(&self, field_ids: &[i32]) -> Result<Option<RecordBatch>> {
         if let Some(stats_page_table) = self.stats_page_table.as_ref() {
             let projection = self.page_stats_schema(field_ids).unwrap();

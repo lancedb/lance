@@ -71,9 +71,6 @@ pub struct ScanConfig {
     /// If true (default), the scan will emit batches in the same order as the
     /// fragments. If false, the scan may emit batches in an arbitrary order.
     pub ordered_output: bool,
-    /// Whether to use statistics to optimize the scan. This is primarily used
-    /// for testing purposes.
-    pub use_stats: bool,
     /// The number of rows to read per batch.
     pub batch_size: usize, // TODO: respect batch size.
 }
@@ -86,7 +83,6 @@ impl Default for ScanConfig {
             with_row_id: false,
             make_deletions_null: false,
             ordered_output: true,
-            use_stats: true,
             batch_size: 1024,
         }
     }
@@ -337,28 +333,6 @@ impl FragmentScanner {
             Expr::Literal(ScalarValue::Boolean(Some(false))) => {
                 // Predicate is always false, we can skip this batch.
                 Ok(None)
-            }
-            _ if !self.config.use_stats => {
-                // 1. Load the full projection
-                let mut reader = self.reader.clone();
-                if self.config.with_row_id {
-                    reader.with_row_id();
-                }
-                let batch = reader.read_batch(batch_id, ..).await?;
-
-                // 2. Evaluate the predicate
-                let planner = Planner::new(batch.schema());
-                let physical_expr = planner.create_physical_expr(&predicate)?;
-                let result = physical_expr.evaluate(&batch)?.into_array(batch.num_rows());
-
-                // 3. Apply the final projection
-                let batch = self.final_projection(batch)?;
-
-                // 4. Apply the filter
-                let mask = result.as_boolean();
-                let batch = filter_record_batch(&batch, mask)?;
-
-                Ok(Some(batch))
             }
             _ => {
                 // Predicate is not always true or always false, we need to load
@@ -999,7 +973,6 @@ mod test {
             with_row_id: bool,
             make_deletions_null: bool,
             ordered_output: bool,
-            use_stats: bool,
         }
 
         // This is a little galaxy-brained, but at least it's concise.
@@ -1007,7 +980,6 @@ mod test {
             with_row_id: i & 1 != 0 || i & 2 != 0, // If make_deletions_null is true, with_row_id is required
             make_deletions_null: i & 2 != 0,
             ordered_output: i & 4 != 0,
-            use_stats: i & 8 != 0,
         });
 
         let dataset = Arc::new(test_dataset().await);
@@ -1022,7 +994,6 @@ mod test {
                 with_row_id: case.with_row_id,
                 make_deletions_null: case.make_deletions_null,
                 ordered_output: case.ordered_output,
-                use_stats: case.use_stats,
                 ..Default::default()
             };
             let scan = LancePushdownScanExec::try_new(
@@ -1237,30 +1208,7 @@ mod test {
             )
             .await
             .unwrap();
-            assert_eq!(
-                &expected, &result,
-                "Failed with use_stats = true: {:#?}",
-                self
-            );
-
-            // Also validate with use_stats = false
-            let result = pushdown_scan(
-                &ctx,
-                dataset.clone(),
-                self.projection_indices.clone(),
-                self.predicate.clone(),
-                ScanConfig {
-                    use_stats: false,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                &expected, &result,
-                "Failed with use_stats = false: {:#?}",
-                self
-            );
+            assert_eq!(&expected, &result, "Failed with: {:#?}", self);
         }
     }
 
