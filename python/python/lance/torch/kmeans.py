@@ -23,6 +23,7 @@ from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
 from . import preferred_device
+from .data import TensorDataset
 from .distance import cosine_distance, dot_distance, l2_distance
 
 __all__ = ["KMeans"]
@@ -132,6 +133,7 @@ class KMeans:
         start = time.time()
         if isinstance(data, (np.ndarray, torch.Tensor)):
             self._random_init(data)
+            data = TensorDataset(data, batch_size=4096)
 
         assert self.centroids is not None
         self.centroids = self.centroids.to(self.device)

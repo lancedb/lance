@@ -18,18 +18,16 @@
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable, Optional, Union
+import math
+from typing import Iterable, Optional, Union
 
 import numpy as np
 import pyarrow as pa
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset, IterableDataset
 
 from ..cache import CachedDataset
 from ..sampler import maybe_sample
-
-if TYPE_CHECKING:
-    from .. import LanceDataset as Dataset
 
 __all__ = ["LanceDataset"]
 
@@ -70,6 +68,36 @@ def _to_tensor(
         del ret
         return t
     return ret
+
+
+class TensorDataset(Dataset):
+    """A PyTorch Dataset that wraps over a tensor, returns in batches.
+
+    Unlike `torch.utils.data.TensorDataset`, this has the same behavior as LanceDataset
+    that it yields tensor in batches.
+    """
+
+    def __init__(
+        self, data: Union[torch.Tensor, np.ndarray], batch_size: int, *args, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        if isinstance(data, np.ndarray):
+            data = torch.from_numpy(data)
+        self._data: torch.Tensor = data
+        self._batch_size = batch_size
+
+    def __repr__(self):
+        return "LanceTensorDataset"
+
+    def __len__(self) -> int:
+        return math.ceil(self._data.shape[0] / self._batch_size)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        if idx >= len(self):
+            raise StopIteration
+        start = idx * self._batch_size
+        end = min((idx + 1) * self._batch_size, self._data.shape[0])
+        return self._data[start:end, :]
 
 
 class LanceDataset(IterableDataset):
