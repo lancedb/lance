@@ -35,6 +35,8 @@ pub struct IvfBuildParams {
     pub centroids: Option<Arc<FixedSizeListArray>>,
 
     pub sample_rate: usize,
+
+    pub precomputed_partitons_file: Option<String>,
 }
 
 impl Default for IvfBuildParams {
@@ -44,6 +46,7 @@ impl Default for IvfBuildParams {
             max_iters: 50,
             centroids: None,
             sample_rate: 256, // See faiss
+            precomputed_partitons_file: None,
         }
     }
 }

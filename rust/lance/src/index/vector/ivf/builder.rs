@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::{collections::BTreeMap, ops::Range};
 
@@ -24,6 +25,7 @@ use lance_core::{io::Writer, ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_linalg::distance::MetricType;
+use log::info;
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -108,6 +110,8 @@ pub async fn shuffle_dataset(
     ]);
     const FLUSH_THRESHOLD: usize = 40 * 1024;
 
+    info!("Building IVF shuffler");
+
     let mut shuffler_builder = ShufflerBuilder::try_new(&schema, FLUSH_THRESHOLD).await?;
     while let Some(result) = stream.next().await {
         let batches = result??;
@@ -118,12 +122,15 @@ pub async fn shuffle_dataset(
             shuffler_builder.insert(part_id, batch).await?;
         }
     }
+
+    info!("IVF shuffler built");
     shuffler_builder.finish().await
 }
 
 /// Build specific partitions of IVF index.
 ///
 ///
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip(writer, data, ivf, pq))]
 pub(super) async fn build_partitions(
     writer: &mut dyn Writer,
@@ -133,6 +140,7 @@ pub(super) async fn build_partitions(
     pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
     part_range: Range<u32>,
+    precomputed_partitons: Option<HashMap<u64, u32>>,
 ) -> Result<()> {
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
@@ -155,6 +163,7 @@ pub(super) async fn build_partitions(
         column,
         pq.clone(),
         Some(part_range),
+        precomputed_partitons,
     )?;
     let shuffler = shuffle_dataset(data, column, ivf_model, pq.num_sub_vectors()).await?;
     write_index_partitions(writer, ivf, &shuffler, None).await?;

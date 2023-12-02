@@ -16,6 +16,8 @@
 
 use std::{
     any::Any,
+    collections::HashMap,
+    ops::RangeFull,
     sync::{Arc, Weak},
 };
 
@@ -23,10 +25,10 @@ use arrow_arith::numeric::sub;
 use arrow_array::{
     cast::{as_primitive_array, as_struct_array, AsArray},
     types::{Float16Type, Float32Type, Float64Type},
-    Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
+    Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array, UInt64Array,
 };
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
 use futures::{
@@ -35,10 +37,13 @@ use futures::{
 };
 use lance_arrow::*;
 use lance_core::io::{
-    local::to_local_path, ObjectWriter, Reader, RecordBatchStream, WriteExt, Writer,
+    local::to_local_path, FileReader, ObjectWriter, Reader, RecordBatchStream, WriteExt, Writer,
 };
 use lance_core::{
-    datatypes::Field, encodings::plain::PlainEncoder, format::Index as IndexMetadata, Error, Result,
+    datatypes::{Field, Schema},
+    encodings::plain::PlainEncoder,
+    format::Index as IndexMetadata,
+    Error, Result,
 };
 use lance_index::{
     vector::{
@@ -62,7 +67,7 @@ use uuid::Uuid;
 use super::opq::train_opq;
 use super::{pq::PQIndex, utils::maybe_sample_training_data, VectorIndex};
 use crate::{
-    dataset::Dataset,
+    dataset::{Dataset, DATA_DIR},
     index::{
         pb,
         prefilter::PreFilter,
@@ -207,6 +212,7 @@ impl IVFIndex {
             self.metric_type,
             column,
             pq_index.pq.clone(),
+            None,
             None,
         )?;
         let shuffler = shuffle_dataset(data, column, ivf, pq_index.pq.num_sub_vectors()).await?;
@@ -504,6 +510,7 @@ impl Ivf {
             metric_type,
             vec![],
             None,
+            None,
         )?;
         internal.find_partitions(query, nprobes)
     }
@@ -594,6 +601,17 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
     Ok(field)
 }
 
+fn sanity_check_ivf_param(params: &IvfBuildParams) -> Result<()> {
+    if params.precomputed_partitons_file.is_some() && params.centroids.is_none() {
+        return Err(Error::Index {
+            message: "precomputed_partitons_file requires centroids to be set".to_string(),
+            location: location!(),
+        });
+    }
+
+    Ok(())
+}
+
 /// Build IVF(PQ) index
 pub async fn build_ivf_pq_index(
     dataset: &Dataset,
@@ -604,6 +622,8 @@ pub async fn build_ivf_pq_index(
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
 ) -> Result<()> {
+    sanity_check_ivf_param(ivf_params)?;
+
     info!(
         "Building vector index: IVF{},{}PQ{}, metric={}",
         ivf_params.num_partitions,
@@ -740,6 +760,7 @@ pub async fn build_ivf_pq_index(
             metric_type,
             vec![],
             None,
+            None,
         )?;
 
         info!(
@@ -747,6 +768,8 @@ pub async fn build_ivf_pq_index(
             training_data.value_length()
         );
         // Compute the residual vector to train Product Quantizer.
+        // TODO: maybe use precomputed partitions here. since these are aggressively down sampled
+        // the time to compute them is not that bad.
         let part_ids = ivf2.compute_partitions(&training_data).await?;
 
         let residuals = span!(Level::INFO, "compute residual for PQ training")
@@ -767,6 +790,61 @@ pub async fn build_ivf_pq_index(
     // For now, it loads all data into memory.
     let stream = scanner.try_into_stream().await?;
 
+    let precomputed_partitions = match &ivf_params.precomputed_partitons_file {
+        Some(file) => {
+            info!("Loading precomputed partitions from file: {}", file);
+            let arrow_schema = ArrowSchema::new(vec![
+                ArrowField::new("row_id", DataType::UInt64, false),
+                ArrowField::new("partition", DataType::UInt32, false),
+            ]);
+
+            let schema = Schema::try_from(&arrow_schema)?;
+
+            let reader = FileReader::try_new_with_fragment(
+                dataset.object_store.as_ref(),
+                &dataset.base.child(DATA_DIR).child(file.as_str()),
+                0,
+                None,
+                None,
+            )
+            .await?;
+
+            let mut partition_lookup = HashMap::with_capacity(reader.len());
+
+            for i in 0..reader.num_batches() {
+                let batch = reader.read_batch(i as i32, RangeFull, &schema).await?;
+                let row_ids = batch.column_by_name("row_id");
+                let partitions = batch.column_by_name("partition");
+                match (row_ids, partitions) {
+                    (Some(row_ids), Some(partitions)) => {
+                        let row_ids: &UInt64Array = as_primitive_array(row_ids.as_ref());
+                        let partitons_ids: &UInt32Array = as_primitive_array(partitions.as_ref());
+
+                        for (row_id, partition) in
+                            row_ids.values().iter().zip(partitons_ids.values().iter())
+                        {
+                            partition_lookup.insert(*row_id, *partition);
+                        }
+                    }
+                    _ => {
+                        return Err(Error::Index {
+                            message: "malformed partition file".into(),
+                            location: location!(),
+                        })
+                    }
+                }
+            }
+
+            info!(
+                "Loaded {} rows of precomputed partitions",
+                partition_lookup.len()
+            );
+
+            Some(partition_lookup)
+        }
+        None => None,
+    };
+
     write_index_file(
         dataset,
         column,
@@ -777,6 +855,7 @@ pub async fn build_ivf_pq_index(
         pq,
         metric_type,
         stream,
+        precomputed_partitions,
     )
     .await
 }
@@ -913,6 +992,7 @@ async fn write_index_file(
     pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin,
+    precomputed_partitons: Option<HashMap<u64, u32>>,
 ) -> Result<()> {
     let object_store = dataset.object_store();
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
@@ -928,6 +1008,7 @@ async fn write_index_file(
         pq.clone(),
         metric_type,
         0..num_partitions,
+        precomputed_partitons,
     )
     .await?;
     info!("Built IVF partitions: {}s", start.elapsed().as_secs_f32());

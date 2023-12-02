@@ -15,12 +15,14 @@
 
 import logging
 import re
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Union
 
 import numpy as np
 import pyarrow as pa
+from tqdm.auto import tqdm
 
 from . import LanceDataset
+from .fragment import write_fragments
 
 if TYPE_CHECKING:
     import torch
@@ -135,7 +137,8 @@ def train_ivf_centroids_on_accelerator(
     accelerator: Union[str, "torch.Device"],
     *,
     sample_rate: int = 256,
-) -> np.ndarray:
+    assignment_loader_buffer_size: int = 10,
+) -> (np.ndarray, str):
     """Use accelerator (GPU or MPS) to train kmeans."""
     if isinstance(accelerator, str) and (
         not (CUDA_REGEX.match(accelerator) or accelerator == "mps")
@@ -173,4 +176,75 @@ def train_ivf_centroids_on_accelerator(
     logging.info("Training IVF partitions using GPU(%s)", accelerator)
     kmeans = KMeans(k, metric=metric_type, device=accelerator, centroids=init_centroids)
     kmeans.fit(ds)
-    return kmeans.centroids.cpu().numpy()
+
+    return kmeans.centroids.cpu().numpy(), compute_partitions(
+        dataset, column, kmeans, buffer_size=assignment_loader_buffer_size
+    )
+
+
+def _buffer_batches(
+    it: Iterable[Dict[str, "torch.Tensor"]],
+    buffer_size: int = 10,
+) -> Iterable[Dict[str, "torch.Tensor"]]:
+    import torch
+
+    buffer = []
+    for item in it:
+        buffer.append(item)
+        if len(buffer) >= buffer_size:
+            yield {key: torch.cat([b[key] for b in buffer], dim=0) for key in buffer[0]}
+            buffer = []
+    if buffer:
+        yield {key: torch.cat([b[key] for b in buffer], dim=0) for key in buffer[0]}
+
+
+def compute_partitions(
+    dataset: LanceDataset,
+    column: str,
+    kmeans: Any,  # KMeans
+    buffer_size: int = 10,
+) -> np.ndarray:
+    import torch
+
+    from .torch.data import LanceDataset as PytorchLanceDataset
+
+    torch_ds = PytorchLanceDataset(
+        dataset, batch_size=1024, with_row_id=True, columns=[column]
+    )
+
+    output_schema = pa.schema(
+        [pa.field("row_id", pa.uint64()), pa.field("partition", pa.uint32())]
+    )
+
+    def _f() -> Iterable[pa.RecordBatch]:
+        with torch.no_grad():
+            for batch in _buffer_batches(torch_ds, buffer_size=buffer_size):
+                batch: Dict[str, torch.Tensor] = batch
+                vecs = batch[column].reshape(-1, kmeans.centroids.shape[1])
+                ids = batch["_rowid"].reshape(-1)
+
+                # this is expect to be true, so just assert
+                assert vecs.shape[0] == ids.shape[0]
+
+                vecs.to(kmeans.device)
+                partitions = kmeans.transform(vecs)
+                batch = pa.RecordBatch.from_arrays(
+                    [ids.cpu().numpy(), partitions.cpu().numpy()], schema=output_schema
+                )
+
+                yield batch
+
+    rbr = pa.RecordBatchReader.from_batches(output_schema, tqdm(_f()))
+
+    fragments = write_fragments(
+        rbr,
+        dataset.uri,
+        schema=output_schema,
+        max_rows_per_file=dataset.count_rows(),
+    )
+    assert len(fragments) == 1
+
+    files = fragments[0].data_files()
+    assert len(files) == 1
+
+    return files[0].path()
