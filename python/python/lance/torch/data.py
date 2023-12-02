@@ -89,10 +89,12 @@ class TensorDataset(Dataset):
     def __repr__(self):
         return "LanceTensorDataset"
 
-    def __len__(self):
-        return math.ceil(self._data.shape[0])
+    def __len__(self) -> int:
+        return math.ceil(self._data.shape[0] / self._batch_size)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
+        if idx >= len(self):
+            raise StopIteration
         start = idx * self._batch_size
         end = min((idx + 1) * self._batch_size, self._data.shape[0])
         return self._data[start:end, :]
