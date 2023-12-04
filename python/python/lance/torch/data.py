@@ -112,6 +112,7 @@ class LanceDataset(IterableDataset):
         filter: Optional[str] = None,
         samples: Optional[int] = 0,
         cache: Optional[Union[str, bool]] = None,
+        pin_memory: bool = False,
         with_row_id: bool = False,
         **kwargs,
     ):
@@ -122,6 +123,7 @@ class LanceDataset(IterableDataset):
         self.samples: Optional[int] = samples
         self.filter = filter
         self.with_row_id = with_row_id
+        self.pin_memory = pin_memory
 
         if samples is not None and filter is not None:
             raise ValueError("Does not support sampling over filtered dataset")

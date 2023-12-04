@@ -14,10 +14,13 @@
 
 //! IVF - Inverted File Index
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use arrow_array::builder::UInt32Builder;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::UInt64Array;
 use arrow_array::{
     cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, Float32Array, RecordBatch,
     UInt32Array,
@@ -28,14 +31,14 @@ use arrow_select::take::take;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, ROW_ID};
 use lance_linalg::{
     distance::{
         cosine_distance_batch, dot_distance_batch, l2_distance_batch, Cosine, Dot, MetricType, L2,
     },
     MatrixView,
 };
-use log::info;
+use log::{debug, info};
 use snafu::{location, Location};
 use tracing::{instrument, Instrument};
 
@@ -55,9 +58,16 @@ fn new_ivf_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
     metric_type: MetricType,
     transforms: Vec<Arc<dyn Transformer>>,
     range: Option<Range<u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
 ) -> Arc<dyn Ivf> {
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
-    Arc::new(IvfImpl::<T>::new(mat, metric_type, transforms, range))
+    Arc::new(IvfImpl::<T>::new(
+        mat,
+        metric_type,
+        transforms,
+        range,
+        precomputed_partitions,
+    ))
 }
 
 /// Create an IVF from the flatten centroids.
@@ -75,6 +85,7 @@ pub fn new_ivf(
     metric_type: MetricType,
     transforms: Vec<Arc<dyn Transformer>>,
     range: Option<Range<u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
 ) -> Result<Arc<dyn Ivf>> {
     match centroids.data_type() {
         DataType::Float16 => Ok(new_ivf_impl::<Float16Type>(
@@ -83,6 +94,7 @@ pub fn new_ivf(
             metric_type,
             transforms,
             range,
+            precomputed_partitions,
         )),
         DataType::Float32 => Ok(new_ivf_impl::<Float32Type>(
             centroids.as_primitive(),
@@ -90,6 +102,7 @@ pub fn new_ivf(
             metric_type,
             transforms,
             range,
+            precomputed_partitions,
         )),
         DataType::Float64 => Ok(new_ivf_impl::<Float64Type>(
             centroids.as_primitive(),
@@ -97,6 +110,7 @@ pub fn new_ivf(
             metric_type,
             transforms,
             range,
+            precomputed_partitions,
         )),
         _ => Err(Error::Index {
             message: format!(
@@ -115,6 +129,7 @@ fn new_ivf_with_pq_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
     vector_column: &str,
     pq: Arc<dyn ProductQuantizer>,
     range: Option<Range<u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
 ) -> Arc<dyn Ivf> {
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
     Arc::new(IvfImpl::<T>::new_with_pq(
@@ -123,6 +138,7 @@ fn new_ivf_with_pq_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
         vector_column,
         pq,
         range,
+        precomputed_partitions,
     ))
 }
 
@@ -133,6 +149,7 @@ pub fn new_ivf_with_pq(
     vector_column: &str,
     pq: Arc<dyn ProductQuantizer>,
     range: Option<Range<u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
 ) -> Result<Arc<dyn Ivf>> {
     match centroids.data_type() {
         DataType::Float16 => Ok(new_ivf_with_pq_impl::<Float16Type>(
@@ -142,6 +159,7 @@ pub fn new_ivf_with_pq(
             vector_column,
             pq,
             range,
+            precomputed_partitions,
         )),
         DataType::Float32 => Ok(new_ivf_with_pq_impl::<Float32Type>(
             centroids.as_primitive(),
@@ -150,6 +168,7 @@ pub fn new_ivf_with_pq(
             vector_column,
             pq,
             range,
+            precomputed_partitions,
         )),
         DataType::Float64 => Ok(new_ivf_with_pq_impl::<Float64Type>(
             centroids.as_primitive(),
@@ -158,6 +177,7 @@ pub fn new_ivf_with_pq(
             vector_column,
             pq,
             range,
+            precomputed_partitions,
         )),
         _ => Err(Error::Index {
             message: format!(
@@ -234,6 +254,8 @@ pub struct IvfImpl<T: ArrowFloatType + Dot + L2 + Cosine> {
 
     /// Only covers a range of partitions.
     partition_range: Option<Range<u32>>,
+
+    precomputed_partitions: Option<HashMap<u64, u32>>,
 }
 
 impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
@@ -242,12 +264,14 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         metric_type: MetricType,
         transforms: Vec<Arc<dyn Transformer>>,
         range: Option<Range<u32>>,
+        precomputed_partitions: Option<HashMap<u64, u32>>,
     ) -> Self {
         Self {
             centroids,
             metric_type,
             transforms,
             partition_range: range,
+            precomputed_partitions,
         }
     }
 
@@ -257,6 +281,7 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         vector_column: &str,
         pq: Arc<dyn ProductQuantizer>,
         range: Option<Range<u32>>,
+        precomputed_partitions: Option<HashMap<u64, u32>>,
     ) -> Self {
         Self {
             centroids: centroids.clone(),
@@ -274,6 +299,7 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
                 )),
             ],
             partition_range: range,
+            precomputed_partitions,
         }
     }
 
@@ -446,7 +472,34 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
             ),
             location: location!(),
         })?;
-        let part_ids = self.compute_partitions(data).await?;
+
+        let part_ids = match (&self.precomputed_partitions, batch.column_by_name(ROW_ID)) {
+            (Some(partitions), Some(row_ids)) => {
+                debug!("Using precomputed partitions for partitions");
+                let mut builder = UInt32Builder::new();
+                for row in row_ids
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                {
+                    if let Some(part_id) = partitions.get(row) {
+                        builder.append_value(*part_id);
+                    } else {
+                        return Err(Error::Index {
+                            message: format!(
+                                "Row ID {} does not exist in the precomputed partitions",
+                                row
+                            ),
+                            location: location!(),
+                        });
+                    }
+                }
+                builder.finish()
+            }
+            _ => self.compute_partitions(data).await?,
+        };
 
         let (part_ids, batch) = if let Some(part_range) = self.partition_range.as_ref() {
             let idx_in_range: UInt32Array = part_ids

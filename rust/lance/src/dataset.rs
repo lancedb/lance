@@ -85,7 +85,7 @@ pub use write::{write_fragments, WriteMode, WriteParams};
 
 const INDICES_DIR: &str = "_indices";
 
-const DATA_DIR: &str = "data";
+pub const DATA_DIR: &str = "data";
 pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 

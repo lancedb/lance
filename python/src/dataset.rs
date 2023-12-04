@@ -698,6 +698,10 @@ impl Dataset {
                         let centroids = as_fixed_size_list_array(batch.column(0));
                         ivf_params.centroids = Some(Arc::new(centroids.clone()))
                     };
+
+                    if let Some(f) = kwargs.get_item("precomputed_partitions_file") {
+                        ivf_params.precomputed_partitons_file = Some(f.to_string());
+                    };
                 }
                 Box::new(VectorIndexParams::with_ivf_pq_params(
                     m_type, ivf_params, pq_params,
