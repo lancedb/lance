@@ -19,6 +19,7 @@ use lance_core::io::{
 };
 use object_store::{aws::AwsCredentialProvider, DynObjectStore};
 use snafu::{location, Location};
+use tracing::instrument;
 use url::Url;
 
 use super::{ReadParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
@@ -181,6 +182,7 @@ impl DatasetBuilder {
         }
     }
 
+    #[instrument(skip_all)]
     pub async fn load(mut self) -> Result<Dataset> {
         let session = match self.session.take() {
             Some(session) => session,

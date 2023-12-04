@@ -833,6 +833,7 @@ impl Dataset {
     /// Count the number of rows in the dataset.
     ///
     /// It offers a fast path of counting rows by just computing via metadata.
+    #[instrument(skip_all)]
     pub async fn count_rows(&self) -> Result<usize> {
         // Open file to read metadata.
         let counts = stream::iter(self.get_fragments())
