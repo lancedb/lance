@@ -1543,7 +1543,12 @@ class ScannerBuilder:
         return self
 
     def use_stats(self, use_stats: bool = True) -> ScannerBuilder:
-        """Enable use of statistics for query planning."""
+        """
+        Enable use of statistics for query planning.
+
+        Disabling statistics is used for debugging and benchmarking purposes.
+        This should be left on for normal use.
+        """
         self._use_stats = use_stats
         return self
 

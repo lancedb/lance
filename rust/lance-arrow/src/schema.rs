@@ -51,7 +51,7 @@ impl SchemaExt for Schema {
     ) -> std::result::Result<Schema, ArrowError> {
         if self.column_with_name(field.name()).is_some() {
             return Err(ArrowError::SchemaError(format!(
-                "Can not append column {} on schema: {:?}",
+                "Failed to modify schema: Inserting column {} would create a duplicate column in schema: {:?}",
                 field.name(),
                 self
             )));

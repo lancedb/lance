@@ -725,12 +725,9 @@ impl Scanner {
                     self.scalar_indexed_scan(&filter_schema, index_query)
                         .await?
                 }
-                (None, Some(_)) if self.use_stats => self.pushdown_scan(
-                    self.with_row_id,
-                    false,
-                    self.projections.clone().into(),
-                    filter_plan.refine_expr.take().unwrap(),
-                )?,
+                (None, Some(_)) if self.use_stats => {
+                    self.pushdown_scan(false, filter_plan.refine_expr.take().unwrap())?
+                }
                 (None, _) => {
                     // The source is a full scan of the table
                     self.scan(self.with_row_id, false, self.projections.clone().into())
@@ -1090,18 +1087,15 @@ impl Scanner {
 
     fn pushdown_scan(
         &self,
-        with_row_id: bool,
         make_deletions_null: bool,
-        projection: Arc<Schema>,
         predicate: Expr,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let config = ScanConfig {
             batch_readahead: self.batch_readahead,
             fragment_readahead: self.fragment_readahead,
-            with_row_id,
+            with_row_id: self.with_row_id,
             make_deletions_null,
             ordered_output: self.ordered,
-            ..Default::default()
         };
 
         let fragments = if let Some(fragment) = self.fragments.as_ref() {
@@ -1113,7 +1107,7 @@ impl Scanner {
         Ok(Arc::new(LancePushdownScanExec::try_new(
             self.dataset.clone(),
             fragments,
-            projection,
+            self.projections.clone().into(),
             predicate,
             config,
         )?))

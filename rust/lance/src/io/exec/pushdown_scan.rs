@@ -71,8 +71,6 @@ pub struct ScanConfig {
     /// If true (default), the scan will emit batches in the same order as the
     /// fragments. If false, the scan may emit batches in an arbitrary order.
     pub ordered_output: bool,
-    /// The number of rows to read per batch.
-    pub batch_size: usize, // TODO: respect batch size.
 }
 
 impl Default for ScanConfig {
@@ -83,7 +81,6 @@ impl Default for ScanConfig {
             with_row_id: false,
             make_deletions_null: false,
             ordered_output: true,
-            batch_size: 1024,
         }
     }
 }
@@ -304,7 +301,9 @@ impl FragmentScanner {
         let stream = if ordered_output {
             stream
                 .buffered(batch_readahead)
-                .try_filter_map(|res| futures::future::ready(Ok(res)))
+                // Batches that were completely skipped might be None, so we
+                // filter them out here.
+                .try_filter_map(|res: Option<RecordBatch>| futures::future::ready(Ok(res)))
                 .boxed()
         } else {
             stream
@@ -505,7 +504,7 @@ impl FragmentScanner {
         let mut max_values: HashMap<i32, Arc<dyn Array>> = HashMap::new();
 
         for field_id in predicate_projection.field_ids() {
-            let field_stats = stats.column_by_name(&format!("{field_id}"));
+            let field_stats = stats.column_by_name(&field_id.to_string());
             if let Some(field_stats) = field_stats {
                 if !matches!(field_stats.data_type(), DataType::Struct(_)) {
                     log::error!(
