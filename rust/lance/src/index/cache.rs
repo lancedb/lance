@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::mem;
 use std::sync::Arc;
 
 use lance_index::scalar::ScalarIndex;
@@ -46,9 +47,19 @@ pub struct IndexCache {
 
 impl IndexCache {
     pub(crate) fn new(capacity: usize) -> Self {
+        let vector_cache = Cache::builder()
+            .weigher(|k: &String, v: &Arc<dyn VectorIndex>| -> u32 { (k.len() + mem::size_of_val(v)) as u32 })
+            .max_capacity(capacity as u64)
+            .build();
+
+        let scalar_cache = Cache::builder()
+            .weigher(|k: &String, v: &Arc<dyn ScalarIndex>| -> u32 { (k.len() + mem::size_of_val(v)) as u32 })
+            .max_capacity(capacity as u64)
+            .build();
+
         Self {
-            scalar_cache: Arc::new(Cache::new(capacity as u64)),
-            vector_cache: Arc::new(Cache::new(capacity as u64)),
+            scalar_cache: Arc::new(scalar_cache),
+            vector_cache: Arc::new(vector_cache),
             cache_stats: Arc::new(CacheStats::default()),
         }
     }
@@ -62,7 +73,14 @@ impl IndexCache {
     pub(crate) fn get_size(&self) -> usize {
         self.scalar_cache.sync();
         self.vector_cache.sync();
-        self.scalar_cache.entry_count() as usize + self.vector_cache.entry_count() as usize
+        (self.scalar_cache.entry_count() + self.vector_cache.entry_count()) as usize
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn get_byte_size(&self) -> u64 {
+        self.scalar_cache.sync();
+        self.vector_cache.sync();
+        self.scalar_cache.weighted_size() + self.vector_cache.weighted_size()
     }
 
     /// Get an Index if present. Otherwise returns [None].
