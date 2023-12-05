@@ -999,7 +999,7 @@ async fn write_index_file(
     mut ivf: Ivf,
     pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
-    stream: impl RecordBatchStream + Unpin,
+    stream: impl RecordBatchStream + Unpin + 'static,
     precomputed_partitons: Option<IntMap<u64, u32>>,
 ) -> Result<()> {
     let object_store = dataset.object_store();

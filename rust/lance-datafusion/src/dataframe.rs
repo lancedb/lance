@@ -52,9 +52,10 @@ impl DataFrameExt for DataFrame {
         }
         for col in partition_columns {
             if self.schema().field_with_name(None, col).is_err() {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    format!("Partition column '{}' not found", col).into(),
-                ));
+                return Err(datafusion::error::DataFusionError::Execution(format!(
+                    "Partition column '{}' not found",
+                    col
+                )));
             }
         }
 
