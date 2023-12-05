@@ -40,7 +40,6 @@ pub trait DataFrameExt {
 #[async_trait::async_trait]
 impl DataFrameExt for DataFrame {
     async fn group_by_stream(self, partition_columns: &[&str]) -> DFResult<BatchStreamGrouper> {
-        // TODO: assert all partition columns exist in schema
         if partition_columns.is_empty() {
             return Err(datafusion::error::DataFusionError::Execution(
                 "No partition columns specified".into(),
@@ -51,6 +50,14 @@ impl DataFrameExt for DataFrame {
                 "Only one partition column supported".into(),
             ));
         }
+        for col in partition_columns {
+            if self.schema().field_with_name(None, col).is_err() {
+                return Err(datafusion::error::DataFusionError::Execution(
+                    format!("Partition column '{}' not found", col).into(),
+                ));
+            }
+        }
+
         Ok(BatchStreamGrouper::new(
             self.execute_stream().await?,
             partition_columns[0].into(),

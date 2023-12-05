@@ -93,9 +93,9 @@ impl OneShotExec {
 
 impl std::fmt::Debug for OneShotExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let val_guard = self.stream.lock().unwrap();
+        let stream = self.stream.lock().unwrap();
         f.debug_struct("OneShotExec")
-            .field("exhausted", &val_guard.is_none())
+            .field("exhausted", &stream.is_none())
             .field("schema", self.schema.as_ref())
             .finish()
     }
@@ -107,14 +107,10 @@ impl DisplayAs for OneShotExec {
         t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        let val_guard = self.stream.lock().unwrap();
+        let stream = self.stream.lock().unwrap();
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let exhausted = if val_guard.is_some() {
-                    ""
-                } else {
-                    "EXHUASTED "
-                };
+                let exhausted = if stream.is_some() { "" } else { "EXHUASTED " };
                 let columns = self
                     .schema
                     .field_names()
@@ -165,11 +161,11 @@ impl ExecutionPlan for OneShotExec {
         _partition: usize,
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
-        let mut val_guard = self
+        let stream = self
             .stream
             .lock()
-            .map_err(|err| DataFusionError::Execution(err.to_string()))?;
-        let stream = val_guard.take();
+            .map_err(|err| DataFusionError::Execution(err.to_string()))?
+            .take();
         if let Some(stream) = stream {
             Ok(stream)
         } else {
