@@ -83,42 +83,10 @@ if TYPE_CHECKING:
     ]
 
 
-class MergeInsertBuilder(object):
-    def __init__(self, dataset: LanceDataset, on: Union[str, Iterable[str]]):
-        self.dataset = dataset
-        self.builder = _MergeInsertBuilder(dataset._ds, on)
-
-    def when_matched_update_all(self) -> MergeInsertBuilder:
-        self.builder.when_matched(True)
-        return self
-
-    def when_matched_do_nothing(self) -> MergeInsertBuilder:
-        self.builder.when_matched(False)
-        return self
-
-    def when_not_matched_insert_all(self) -> MergeInsertBuilder:
-        self.builder.when_not_matched(True)
-        return self
-
-    def when_not_matched_do_nothing(self) -> MergeInsertBuilder:
-        self.builder.when_not_matched(False)
-        return self
-
-    def when_not_matched_by_source_delete(self) -> MergeInsertBuilder:
-        self.builder.when_not_matched_by_source_delete()
-        return self
-
-    def when_not_matched_by_source_do_nothing(self) -> MergeInsertBuilder:
-        self.builder.when_not_matched_by_source_do_nothing()
-        return self
-
-    def when_not_matched_by_source_delete_if(self, expr: str) -> MergeInsertBuilder:
-        self.builder.when_not_matched_by_source_delete_if(expr, self.dataset._ds)
-        return self
-
+class MergeInsertBuilder(_MergeInsertBuilder):
     def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
         reader = _coerce_reader(data_obj, schema)
-        self.builder.execute(reader, self.dataset._ds)
+        super(MergeInsertBuilder, self).execute(reader)
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -674,7 +642,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         on: Union[str, Iterable[str]],
     ):
-        return MergeInsertBuilder(self, on)
+        return MergeInsertBuilder(self._ds, on)
 
     def update(
         self,

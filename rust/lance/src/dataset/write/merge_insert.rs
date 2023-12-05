@@ -63,14 +63,14 @@ use super::write_fragments_internal;
 /// Describes how rows should be handled when there is no matching row in the source table
 ///
 /// These are old rows which do not match any new data
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WhenNotMatchedBySource {
-    /// Never delete rows from the target table
+    /// Do not delete rows from the target table
     ///
     /// This can be used for a find-or-create or an upsert operation
-    NeverDelete,
+    Keep,
     /// Delete all rows from target table that don't match a row in the source table
-    AlwaysDelete,
+    Delete,
     /// Delete rows from the target table if there is no match AND the expression evaluates to true
     ///
     /// This can be used to replace a region of data with new data
@@ -189,16 +189,22 @@ impl MergeInsertBuilder {
     ///  - rows in the old data that do not match will be left as-is
     ///
     /// Use the methods on this builder to customize that behavior
-    pub fn new(dataset: Arc<Dataset>, on: Vec<String>) -> Self {
-        Self {
+    pub fn try_new(dataset: Arc<Dataset>, on: Vec<String>) -> Result<Self> {
+        if on.is_empty() {
+            return Err(Error::invalid_input(
+                "A merge insert operation must specify at least one on key",
+                location!(),
+            ));
+        }
+        Ok(Self {
             dataset,
             params: MergeInsertParams {
                 on,
                 update_matched: false,
                 insert_not_matched: true,
-                delete_not_matched_by_source: WhenNotMatchedBySource::NeverDelete,
+                delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
             },
-        }
+        })
     }
 
     /// Specify what should happen when a target row matches a row in the source
@@ -230,11 +236,20 @@ impl MergeInsertBuilder {
     }
 
     /// Crate a merge insert job
-    pub fn build(&mut self) -> MergeInsertJob {
-        MergeInsertJob {
+    pub fn try_build(&mut self) -> Result<MergeInsertJob> {
+        if !self.params.insert_not_matched
+            && !self.params.update_matched
+            && self.params.delete_not_matched_by_source == WhenNotMatchedBySource::Keep
+        {
+            return Err(Error::invalid_input(
+                "The merge insert job is not configured to change the data in any way",
+                location!(),
+            ));
+        }
+        Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
             params: self.params.clone(),
-        }
+        })
     }
 }
 
@@ -247,6 +262,15 @@ impl MergeInsertJob {
         self.execute(source).await
     }
 
+    fn check_compatible_schema(&self, schema: &Schema) -> Result<()> {
+        let lance_schema: lance_core::datatypes::Schema = schema.try_into()?;
+        if *self.dataset.schema() == lance_schema {
+            Ok(())
+        } else {
+            Err(Error::invalid_input("The new data inserted during a merge insert operation must have the same schema as the dataset", location!()))
+        }
+    }
+
     /// Executes the merge insert job
     ///
     /// This will take in the source, merge it with the existing target data, and insert new
@@ -255,6 +279,7 @@ impl MergeInsertJob {
         let session_config = SessionConfig::default().with_target_partitions(1);
         let session_ctx = SessionContext::new_with_config(session_config);
         let schema = source.schema();
+        self.check_compatible_schema(&schema)?;
         let existing = session_ctx.read_lance(self.dataset.clone(), true)?;
         let new_data = session_ctx.read_one_shot(source)?;
         let merger = Merger::try_new(self.params, schema.clone())?;
@@ -396,7 +421,8 @@ impl Merger {
             &params.delete_not_matched_by_source
         {
             let planner = Planner::new(schema.clone());
-            let physical_expr = planner.create_physical_expr(expr)?;
+            let expr = planner.optimize_expr(expr.clone())?;
+            let physical_expr = planner.create_physical_expr(&expr)?;
             let data_type = physical_expr.data_type(&schema)?;
             if data_type != DataType::Boolean {
                 return Err(Error::invalid_input(format!("Merge insert conditions must be expressions that return a boolean value, received expression ({}) which has data type {}", expr, data_type), location!()));
@@ -502,7 +528,7 @@ impl Merger {
             batches.push(Ok(matched));
         }
         match self.params.delete_not_matched_by_source {
-            WhenNotMatchedBySource::AlwaysDelete => {
+            WhenNotMatchedBySource::Delete => {
                 let unmatched = arrow::compute::filter(batch.column(row_id_col), &left_only)?;
                 let row_ids = unmatched.as_primitive::<UInt64Type>();
                 deleted_row_ids.extend(row_ids.values());
@@ -527,7 +553,7 @@ impl Merger {
                     }
                 }
             }
-            WhenNotMatchedBySource::NeverDelete => {}
+            WhenNotMatchedBySource::Keep => {}
         }
         Ok(stream::iter(batches))
     }
@@ -636,56 +662,75 @@ mod tests {
         )
         .unwrap();
 
+        // Quick test that no on-keys is not valid and fails
+        assert!(MergeInsertBuilder::try_new(ds.clone(), vec![]).is_err());
+
         let keys = vec!["key".to_string()];
         // find-or-create, no delete
-        let job = MergeInsertBuilder::new(ds.clone(), keys.clone()).build();
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
+            .try_build()
+            .unwrap();
         check(new_batch.clone(), job, &[1, 2, 3, 4, 5, 6], &[7, 8, 9]).await;
 
         // upsert, no delete
-        let job = MergeInsertBuilder::new(ds.clone(), keys.clone())
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
             .when_matched(WhenMatched::UpdateAll)
-            .build();
+            .try_build()
+            .unwrap();
         check(new_batch.clone(), job, &[1, 2, 3], &[4, 5, 6, 7, 8, 9]).await;
 
         // update only, no delete (not real case, just use update)
-        let job = MergeInsertBuilder::new(ds.clone(), keys.clone())
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
             .when_matched(WhenMatched::UpdateAll)
             .when_not_matched(WhenNotMatched::DoNothing)
-            .build();
+            .try_build()
+            .unwrap();
         check(new_batch.clone(), job, &[1, 2, 3], &[4, 5, 6]).await;
 
-        // No-op (not real case but techncially possible
-        let job = MergeInsertBuilder::new(ds.clone(), keys.clone())
+        // No-op (will raise an error)
+        assert!(MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
             .when_not_matched(WhenNotMatched::DoNothing)
-            .build();
-        check(new_batch.clone(), job, &[1, 2, 3, 4, 5, 6], &[]).await;
+            .try_build()
+            .is_err());
 
         // find-or-create, with delete all
-        let job = MergeInsertBuilder::new(ds.clone(), keys.clone())
-            .when_not_matched_by_source(WhenNotMatchedBySource::AlwaysDelete)
-            .build();
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
+            .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+            .try_build()
+            .unwrap();
         check(new_batch.clone(), job, &[4, 5, 6], &[7, 8, 9]).await;
 
         // upsert, with delete all
-        let job = MergeInsertBuilder::new(ds.clone(), keys.clone())
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
             .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched_by_source(WhenNotMatchedBySource::AlwaysDelete)
-            .build();
+            .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+            .try_build()
+            .unwrap();
         check(new_batch.clone(), job, &[], &[4, 5, 6, 7, 8, 9]).await;
 
         // update only, with delete all (unusual)
-        let job = MergeInsertBuilder::new(ds.clone(), keys.clone())
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
             .when_matched(WhenMatched::UpdateAll)
             .when_not_matched(WhenNotMatched::DoNothing)
-            .when_not_matched_by_source(WhenNotMatchedBySource::AlwaysDelete)
-            .build();
+            .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+            .try_build()
+            .unwrap();
         check(new_batch.clone(), job, &[], &[4, 5, 6]).await;
 
         // just delete all (not real case, just use delete)
-        let job = MergeInsertBuilder::new(ds.clone(), keys.clone())
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
             .when_not_matched(WhenNotMatched::DoNothing)
-            .when_not_matched_by_source(WhenNotMatchedBySource::AlwaysDelete)
-            .build();
+            .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+            .try_build()
+            .unwrap();
         check(new_batch.clone(), job, &[4, 5, 6], &[]).await;
 
         // For the "delete some" tests we use key > 1
@@ -694,31 +739,39 @@ mod tests {
             Expr::Literal(ScalarValue::UInt32(Some(1))),
         );
         // find-or-create, with delete some
-        let job = MergeInsertBuilder::new(ds.clone(), keys.clone())
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
-            .build();
+            .try_build()
+            .unwrap();
         check(new_batch.clone(), job, &[1, 4, 5, 6], &[7, 8, 9]).await;
 
         // upsert, with delete some
-        let job = MergeInsertBuilder::new(ds.clone(), keys.clone())
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
             .when_matched(WhenMatched::UpdateAll)
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
-            .build();
+            .try_build()
+            .unwrap();
         check(new_batch.clone(), job, &[1], &[4, 5, 6, 7, 8, 9]).await;
 
         // update only, with delete some (unusual)
-        let job = MergeInsertBuilder::new(ds.clone(), keys.clone())
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
             .when_matched(WhenMatched::UpdateAll)
             .when_not_matched(WhenNotMatched::DoNothing)
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
-            .build();
+            .try_build()
+            .unwrap();
         check(new_batch.clone(), job, &[1], &[4, 5, 6]).await;
 
         // just delete some (not real case, just use delete)
-        let job = MergeInsertBuilder::new(ds.clone(), keys.clone())
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
             .when_not_matched(WhenNotMatched::DoNothing)
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
-            .build();
+            .try_build()
+            .unwrap();
         check(new_batch.clone(), job, &[1, 4, 5, 6], &[]).await;
     }
 }
