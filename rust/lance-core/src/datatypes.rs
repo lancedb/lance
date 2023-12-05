@@ -136,11 +136,20 @@ impl TryFrom<&DataType> for LogicalType {
                 DataType::Struct(_) => "large_list.struct".to_string(),
                 _ => "large_list".to_string(),
             },
-            DataType::FixedSizeList(dt, len) => format!(
-                "fixed_size_list:{}:{}",
-                Self::try_from(dt.data_type())?.0,
-                *len
-            ),
+            DataType::FixedSizeList(dt, len) => {
+                let child_type = if matches!(dt.data_type(), DataType::FixedSizeBinary(2))
+                    && dt
+                        .metadata()
+                        .get("ARROW:extension:name")
+                        .map(|s| s.as_str())
+                        == Some("lance.bfloat16")
+                {
+                    "bfloat16".to_string()
+                } else {
+                    Self::try_from(dt.data_type())?.0
+                };
+                format!("fixed_size_list:{}:{}", child_type, *len)
+            }
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
             _ => {
                 return Err(Error::Schema {
@@ -200,15 +209,31 @@ impl TryFrom<&LogicalType> for DataType {
                             location: location!(),
                         })
                     } else {
-                        let elem_type = (&LogicalType(splits[1].to_string())).try_into()?;
                         let size: i32 = splits[2].parse::<i32>().map_err(|e: _| Error::Schema {
                             message: e.to_string(),
                             location: location!(),
                         })?;
-                        Ok(FixedSizeList(
-                            Arc::new(ArrowField::new("item", elem_type, true)),
-                            size,
-                        ))
+                        if splits[1] == "bfloat16" {
+                            const EXPORT_METADATA: [(&str, &str); 2] = [
+                                ("ARROW:extension:name", "lance.bfloat16"),
+                                ("ARROW:extension:metadata", ""),
+                            ];
+                            let field = ArrowField::new("item", DataType::FixedSizeBinary(2), true)
+                                .with_metadata(
+                                    EXPORT_METADATA
+                                        .iter()
+                                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                                        .collect(),
+                                );
+                            Ok(FixedSizeList(Arc::new(field), size))
+                        } else {
+                            let elem_type = (&LogicalType(splits[1].to_string())).try_into()?;
+
+                            Ok(FixedSizeList(
+                                Arc::new(ArrowField::new("item", elem_type, true)),
+                                size,
+                            ))
+                        }
                     }
                 }
                 "fixed_size_binary" => {
