@@ -361,8 +361,8 @@ impl FileReader {
                         reader,
                         stats_meta.page_table_position,
                         stats_meta.leaf_field_ids.len() as i32,
-                        1,
-                        0,
+                        /*num_batches=*/ 1,
+                        /*field_id_offset=*/ 0,
                     )
                     .await?,
                 ))

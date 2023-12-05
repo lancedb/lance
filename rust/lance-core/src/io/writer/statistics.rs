@@ -593,13 +593,7 @@ pub fn collect_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
         DataType::Dictionary(_, _) => get_dictionary_statistics(arrays),
         // DataType::List(_) => get_list_statistics(arrays),
         // DataType::LargeList(_) => get_list_statistics(arrays),
-        _ => {
-            println!(
-                "Stats collection for {} is not supported yet",
-                arrays[0].data_type()
-            );
-            unreachable!()
-        }
+        _ => unreachable!(),
     }
 }
 
