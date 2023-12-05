@@ -82,7 +82,6 @@ use crate::{
 
 mod builder;
 mod io;
-mod shuffler;
 
 /// IVF Index.
 pub struct IVFIndex {
@@ -184,7 +183,7 @@ impl IVFIndex {
     pub(crate) async fn append(
         &self,
         dataset: &Dataset,
-        data: impl RecordBatchStream + Unpin,
+        data: impl RecordBatchStream + Unpin + 'static,
         metadata: &IndexMetadata,
         column: &str,
     ) -> Result<Uuid> {
@@ -215,10 +214,18 @@ impl IVFIndex {
             None,
             None,
         )?;
-        let shuffler = shuffle_dataset(data, column, ivf, pq_index.pq.num_sub_vectors()).await?;
+        let memory_limit = 4 * 1024 * 1024 * 1024; // 4GB TODO: customize this.
+        let shuffled = shuffle_dataset(
+            data,
+            column,
+            ivf,
+            pq_index.pq.num_sub_vectors(),
+            memory_limit,
+        )
+        .await?;
 
         let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
-        write_index_partitions(&mut writer, &mut ivf_mut, &shuffler, Some(self)).await?;
+        write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(self)).await?;
         let metadata = IvfPQIndexMetadata {
             name: metadata.name.clone(),
             column: column.to_string(),
@@ -992,7 +999,7 @@ async fn write_index_file(
     mut ivf: Ivf,
     pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
-    stream: impl RecordBatchStream + Unpin,
+    stream: impl RecordBatchStream + Unpin + 'static,
     precomputed_partitons: Option<IntMap<u64, u32>>,
 ) -> Result<()> {
     let object_store = dataset.object_store();

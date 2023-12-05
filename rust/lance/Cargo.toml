@@ -61,6 +61,7 @@ nohash-hasher.workspace = true
 num_cpus.workspace = true
 # TODO: use datafusion sub-modules to reduce build size?
 datafusion.workspace = true
+datafusion-physical-expr.workspace = true
 lapack = { version = "0.19.0", optional = true }
 cblas = { version = "0.4.0", optional = true }
 lru_time_cache = "0.11"
