@@ -55,7 +55,7 @@ use lance_index::{
 };
 use lance_linalg::distance::{Cosine, Dot, MetricType, L2};
 use log::{debug, info};
-use nohash_hasher::IntMap;
+use nohash_hasher::{BuildNoHashHasher, IntMap};
 use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -809,7 +809,8 @@ pub async fn build_ivf_pq_index(
             )
             .await?;
 
-            let mut partition_lookup = HashMap::with_capacity(reader.len());
+            let mut partition_lookup =
+                HashMap::with_capacity_and_hasher(reader.len(), BuildNoHashHasher::default());
 
             for i in 0..reader.num_batches() {
                 let batch = reader.read_batch(i as i32, RangeFull, &schema).await?;
@@ -992,7 +993,7 @@ async fn write_index_file(
     pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin,
-    precomputed_partitons: Option<HashMap<u64, u32>>,
+    precomputed_partitons: Option<IntMap<u64, u32>>,
 ) -> Result<()> {
     let object_store = dataset.object_store();
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
