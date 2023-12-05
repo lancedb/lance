@@ -1034,9 +1034,6 @@ class LanceDataset(pa.dataset.Dataset):
                     num_partitions,
                     metric,
                     accelerator,
-                    assignment_loader_buffer_size=kwargs.get(
-                        "assignment_loader_buffer_size", 10
-                    ),
                 )
                 kwargs["precomputed_partitions_file"] = partitions_file
 

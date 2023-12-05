@@ -100,6 +100,35 @@ class TensorDataset(Dataset):
         return self._data[start:end, :]
 
 
+def concat_batches(bs):
+    return pa.RecordBatch.from_arrays(
+        [
+            pa.concat_arrays([b.columns[i] for b in bs])
+            for i in range(bs[0].num_columns)
+        ],
+        schema=bs[0].schema,
+    )
+
+
+def _buffer_arrow_batches(
+    it: Iterable[pa.RecordBatch],
+    buffer_size: int = 10240,
+) -> Iterable[pa.RecordBatch]:
+    buffer = []
+    cur_size = 0
+    for item in it:
+        if cur_size > 0 and cur_size + item.num_rows > buffer_size:
+            yield concat_batches(buffer)
+            buffer = []
+            cur_size = 0
+
+        buffer.append(item)
+        cur_size += item.num_rows
+
+    if buffer:
+        yield concat_batches(buffer)
+
+
 class LanceDataset(IterableDataset):
     """PyTorch IterableDataset over LanceDataset."""
 
@@ -140,19 +169,21 @@ class LanceDataset(IterableDataset):
             stream = self.cached_ds
         else:
             if self.samples:
-                stream = maybe_sample(
+                raw_stream = maybe_sample(
                     self.dataset,
                     n=self.samples,
                     columns=self.columns,
                     batch_size=self.batch_size,
                 )
             else:
-                stream = self.dataset.to_batches(
+                raw_stream = self.dataset.to_batches(
                     columns=self.columns,
                     batch_size=self.batch_size,
                     filter=self.filter,
                     with_row_id=self.with_row_id,
                 )
+
+            stream = _buffer_arrow_batches(raw_stream, buffer_size=self.batch_size)
 
             if self.cache:
                 self.cached_ds = CachedDataset(stream, cache=self.cache)

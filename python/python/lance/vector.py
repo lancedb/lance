@@ -15,11 +15,14 @@
 
 import logging
 import re
+from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Union
 
 import numpy as np
 import pyarrow as pa
 from tqdm.auto import tqdm
+
+from lance.torch.async_dataset import AsyncDataset
 
 from . import LanceDataset
 from .fragment import write_fragments
@@ -137,7 +140,6 @@ def train_ivf_centroids_on_accelerator(
     accelerator: Union[str, "torch.Device"],
     *,
     sample_rate: int = 256,
-    assignment_loader_buffer_size: int = 10,
 ) -> (np.ndarray, str):
     """Use accelerator (GPU or MPS) to train kmeans."""
     if isinstance(accelerator, str) and (
@@ -165,7 +167,8 @@ def train_ivf_centroids_on_accelerator(
     init_centroids = torch.from_numpy(np.stack(fsl.to_numpy(zero_copy_only=False)))
     logging.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
-    ds = TorchDataset(
+    ds = partial(
+        TorchDataset,
         dataset,
         batch_size=20480,
         columns=[column],
@@ -173,44 +176,35 @@ def train_ivf_centroids_on_accelerator(
         cache=True,
     )
 
+    ds = AsyncDataset(ds)
+
     logging.info("Training IVF partitions using GPU(%s)", accelerator)
     kmeans = KMeans(k, metric=metric_type, device=accelerator, centroids=init_centroids)
     kmeans.fit(ds)
 
     return kmeans.centroids.cpu().numpy(), compute_partitions(
-        dataset, column, kmeans, buffer_size=assignment_loader_buffer_size
+        dataset, column, kmeans, batch_size=20480
     )
-
-
-def _buffer_batches(
-    it: Iterable[Dict[str, "torch.Tensor"]],
-    buffer_size: int = 10,
-) -> Iterable[Dict[str, "torch.Tensor"]]:
-    import torch
-
-    buffer = []
-    for item in it:
-        buffer.append(item)
-        if len(buffer) >= buffer_size:
-            yield {key: torch.cat([b[key] for b in buffer], dim=0) for key in buffer[0]}
-            buffer = []
-    if buffer:
-        yield {key: torch.cat([b[key] for b in buffer], dim=0) for key in buffer[0]}
 
 
 def compute_partitions(
     dataset: LanceDataset,
     column: str,
     kmeans: Any,  # KMeans
-    buffer_size: int = 10,
+    batch_size: int = 1024,
 ) -> np.ndarray:
     import torch
 
     from .torch.data import LanceDataset as PytorchLanceDataset
 
-    torch_ds = PytorchLanceDataset(
-        dataset, batch_size=1024, with_row_id=True, columns=[column]
+    torch_ds = partial(
+        PytorchLanceDataset,
+        dataset,
+        batch_size=batch_size,
+        with_row_id=True,
+        columns=[column],
     )
+    torch_ds = AsyncDataset(torch_ds)
 
     output_schema = pa.schema(
         [pa.field("row_id", pa.uint64()), pa.field("partition", pa.uint32())]
@@ -218,7 +212,7 @@ def compute_partitions(
 
     def _f() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
-            for batch in _buffer_batches(torch_ds, buffer_size=buffer_size):
+            for batch in torch_ds:
                 batch: Dict[str, torch.Tensor] = batch
                 vecs = batch[column].reshape(-1, kmeans.centroids.shape[1])
                 ids = batch["_rowid"].reshape(-1)
