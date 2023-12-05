@@ -21,6 +21,12 @@ pub trait SchemaExt {
     /// Create a new [`Schema`] with one extra field.
     fn try_with_column(&self, field: Field) -> std::result::Result<Schema, ArrowError>;
 
+    fn try_with_column_at(
+        &self,
+        index: usize,
+        field: Field,
+    ) -> std::result::Result<Schema, ArrowError>;
+
     fn field_names(&self) -> Vec<&String>;
 }
 
@@ -35,6 +41,23 @@ impl SchemaExt for Schema {
         };
         let mut fields: Vec<FieldRef> = self.fields().iter().cloned().collect();
         fields.push(FieldRef::new(field));
+        Ok(Self::new_with_metadata(fields, self.metadata.clone()))
+    }
+
+    fn try_with_column_at(
+        &self,
+        index: usize,
+        field: Field,
+    ) -> std::result::Result<Schema, ArrowError> {
+        if self.column_with_name(field.name()).is_some() {
+            return Err(ArrowError::SchemaError(format!(
+                "Failed to modify schema: Inserting column {} would create a duplicate column in schema: {:?}",
+                field.name(),
+                self
+            )));
+        };
+        let mut fields: Vec<FieldRef> = self.fields().iter().cloned().collect();
+        fields.insert(index, FieldRef::new(field));
         Ok(Self::new_with_metadata(fields, self.metadata.clone()))
     }
 

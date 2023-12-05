@@ -2756,6 +2756,24 @@ mod tests {
         assert_eq!(dataset.count_fragments(), 2);
         assert!(fragments[0].metadata.deletion_file.is_some());
         assert!(fragments[1].metadata.deletion_file.is_some());
+        assert_eq!(
+            fragments[0]
+                .metadata
+                .deletion_file
+                .as_ref()
+                .unwrap()
+                .num_deleted_rows,
+            Some(10)
+        );
+        assert_eq!(
+            fragments[1]
+                .metadata
+                .deletion_file
+                .as_ref()
+                .unwrap()
+                .num_deleted_rows,
+            Some(10)
+        );
 
         // The deletion file should contain 20 rows
         assert_eq!(dataset.count_deleted_rows().await.unwrap(), 20);

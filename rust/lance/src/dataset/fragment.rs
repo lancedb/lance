@@ -665,6 +665,7 @@ impl From<FileFragment> for Fragment {
 ///
 /// It opens the data files that contains the columns of the projection schema, and
 /// reconstruct the RecordBatch from columns read from each data file.
+#[derive(Debug, Clone)]
 pub struct FragmentReader {
     /// Readers and schema of each opened data file.
     readers: Vec<(FileReader, Schema)>,
@@ -731,11 +732,41 @@ impl FragmentReader {
     }
 
     pub(crate) fn num_batches(&self) -> usize {
-        self.readers[0].0.num_batches()
+        let num_batches = self.readers[0].0.num_batches();
+        assert!(
+            self.readers
+                .iter()
+                .all(|r| r.0.num_batches() == num_batches),
+            "Data files have varying number of batches, which is not yet supported."
+        );
+        num_batches
     }
 
     pub(crate) fn num_rows_in_batch(&self, batch_id: usize) -> usize {
         self.readers[0].0.num_rows_in_batch(batch_id as i32)
+    }
+
+    /// Read the page statistics of the fragment for the specified fields.
+    pub(crate) async fn read_page_stats(
+        &self,
+        projection: Option<&Schema>,
+    ) -> Result<Option<RecordBatch>> {
+        let mut stats_batches = vec![];
+        for (reader, schema) in self.readers.iter() {
+            let schema = match projection {
+                Some(projection) => schema.intersection(projection)?,
+                None => schema.clone(),
+            };
+            if let Some(stats_batch) = reader.read_page_stats(&schema.field_ids()).await? {
+                stats_batches.push(stats_batch);
+            }
+        }
+
+        if stats_batches.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(merge_batches(&stats_batches)?))
+        }
     }
 
     pub(crate) async fn read_batch(
@@ -752,6 +783,32 @@ impl FragmentReader {
             batches.push(batch);
         }
         merge_batches(&batches)
+    }
+
+    /// Read a batch of rows from the fragment, with a subset of columns.
+    ///
+    /// Note: the projection must be a subset of the schema the reader was created with.
+    /// Otherwise incorrect data will be returned.
+    pub(crate) async fn read_batch_projected(
+        &self,
+        batch_id: usize,
+        params: impl Into<ReadBatchParams> + Clone,
+        projection: &Schema,
+    ) -> Result<RecordBatch> {
+        let read_tasks = self.readers.iter().map(|(reader, schema)| {
+            let projection = schema.intersection(projection);
+            let params = params.clone();
+
+            async move {
+                reader
+                    .read_batch(batch_id as i32, params, &projection?)
+                    .await
+            }
+        });
+        let batches = try_join_all(read_tasks).await?;
+        let result = merge_batches(&batches)?;
+
+        Ok(result)
     }
 
     pub async fn read_range(&self, range: Range<usize>) -> Result<RecordBatch> {
