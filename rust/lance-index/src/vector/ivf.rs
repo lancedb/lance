@@ -14,6 +14,7 @@
 
 //! IVF - Inverted File Index
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -38,7 +39,6 @@ use lance_linalg::{
     MatrixView,
 };
 use log::{debug, info};
-use nohash_hasher::IntMap;
 use snafu::{location, Location};
 use tracing::{instrument, Instrument};
 
@@ -58,7 +58,7 @@ fn new_ivf_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
     metric_type: MetricType,
     transforms: Vec<Arc<dyn Transformer>>,
     range: Option<Range<u32>>,
-    precomputed_partitions: Option<IntMap<u64, u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
 ) -> Arc<dyn Ivf> {
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
     Arc::new(IvfImpl::<T>::new(
@@ -85,7 +85,7 @@ pub fn new_ivf(
     metric_type: MetricType,
     transforms: Vec<Arc<dyn Transformer>>,
     range: Option<Range<u32>>,
-    precomputed_partitions: Option<IntMap<u64, u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
 ) -> Result<Arc<dyn Ivf>> {
     match centroids.data_type() {
         DataType::Float16 => Ok(new_ivf_impl::<Float16Type>(
@@ -129,7 +129,7 @@ fn new_ivf_with_pq_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
     vector_column: &str,
     pq: Arc<dyn ProductQuantizer>,
     range: Option<Range<u32>>,
-    precomputed_partitions: Option<IntMap<u64, u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
 ) -> Arc<dyn Ivf> {
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
     Arc::new(IvfImpl::<T>::new_with_pq(
@@ -149,7 +149,7 @@ pub fn new_ivf_with_pq(
     vector_column: &str,
     pq: Arc<dyn ProductQuantizer>,
     range: Option<Range<u32>>,
-    precomputed_partitions: Option<IntMap<u64, u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
 ) -> Result<Arc<dyn Ivf>> {
     match centroids.data_type() {
         DataType::Float16 => Ok(new_ivf_with_pq_impl::<Float16Type>(
@@ -255,7 +255,7 @@ pub struct IvfImpl<T: ArrowFloatType + Dot + L2 + Cosine> {
     /// Only covers a range of partitions.
     partition_range: Option<Range<u32>>,
 
-    precomputed_partitions: Option<IntMap<u64, u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
 }
 
 impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
@@ -264,7 +264,7 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         metric_type: MetricType,
         transforms: Vec<Arc<dyn Transformer>>,
         range: Option<Range<u32>>,
-        precomputed_partitions: Option<IntMap<u64, u32>>,
+        precomputed_partitions: Option<HashMap<u64, u32>>,
     ) -> Self {
         Self {
             centroids,
@@ -281,7 +281,7 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         vector_column: &str,
         pq: Arc<dyn ProductQuantizer>,
         range: Option<Range<u32>>,
-        precomputed_partitions: Option<IntMap<u64, u32>>,
+        precomputed_partitions: Option<HashMap<u64, u32>>,
     ) -> Self {
         Self {
             centroids: centroids.clone(),

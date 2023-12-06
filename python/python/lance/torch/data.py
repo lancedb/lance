@@ -42,7 +42,10 @@ def _to_tensor(
         if pa.types.is_uint64(arr.type) and uint64_as_int64:
             arr = arr.cast(pa.int64())
 
-        if pa.types.is_fixed_size_list(arr.type) and pa.types.is_floating(
+        if (
+            pa.types.is_fixed_size_list(arr.type) or
+            isinstance(arr.type, pa.FixedShapeTensorType)
+        ) and pa.types.is_floating(
             arr.type.value_type
         ):
             np_arrs = arr.to_numpy(zero_copy_only=False)
