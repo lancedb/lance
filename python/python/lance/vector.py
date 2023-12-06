@@ -22,8 +22,6 @@ import numpy as np
 import pyarrow as pa
 from tqdm.auto import tqdm
 
-from lance.torch.async_dataset import AsyncDataset
-
 from . import LanceDataset
 from .fragment import write_fragments
 
@@ -155,6 +153,7 @@ def train_ivf_centroids_on_accelerator(
     # Pytorch installation warning will be raised here.
     import torch
 
+    from lance.torch.async_dataset import async_dataset
     from lance.torch.data import LanceDataset as TorchDataset
 
     from .torch.kmeans import KMeans
@@ -176,11 +175,12 @@ def train_ivf_centroids_on_accelerator(
         cache=True,
     )
 
-    ds = AsyncDataset(ds)
-
-    logging.info("Training IVF partitions using GPU(%s)", accelerator)
-    kmeans = KMeans(k, metric=metric_type, device=accelerator, centroids=init_centroids)
-    kmeans.fit(ds)
+    with async_dataset(ds) as ds:
+        logging.info("Training IVF partitions using GPU(%s)", accelerator)
+        kmeans = KMeans(
+            k, metric=metric_type, device=accelerator, centroids=init_centroids
+        )
+        kmeans.fit(ds)
 
     return kmeans.centroids.cpu().numpy(), compute_partitions(
         dataset, column, kmeans, batch_size=20480
@@ -195,7 +195,8 @@ def compute_partitions(
 ) -> np.ndarray:
     import torch
 
-    from .torch.data import LanceDataset as PytorchLanceDataset
+    from lance.torch.async_dataset import async_dataset
+    from lance.torch.data import LanceDataset as PytorchLanceDataset
 
     torch_ds = partial(
         PytorchLanceDataset,
@@ -204,38 +205,38 @@ def compute_partitions(
         with_row_id=True,
         columns=[column],
     )
-    torch_ds = AsyncDataset(torch_ds)
+    with async_dataset(torch_ds) as torch_ds:
+        output_schema = pa.schema(
+            [pa.field("row_id", pa.uint64()), pa.field("partition", pa.uint32())]
+        )
 
-    output_schema = pa.schema(
-        [pa.field("row_id", pa.uint64()), pa.field("partition", pa.uint32())]
-    )
+        def _f() -> Iterable[pa.RecordBatch]:
+            with torch.no_grad():
+                for batch in torch_ds:
+                    batch: Dict[str, torch.Tensor] = batch
+                    vecs = batch[column].reshape(-1, kmeans.centroids.shape[1])
+                    ids = batch["_rowid"].reshape(-1)
 
-    def _f() -> Iterable[pa.RecordBatch]:
-        with torch.no_grad():
-            for batch in torch_ds:
-                batch: Dict[str, torch.Tensor] = batch
-                vecs = batch[column].reshape(-1, kmeans.centroids.shape[1])
-                ids = batch["_rowid"].reshape(-1)
+                    # this is expect to be true, so just assert
+                    assert vecs.shape[0] == ids.shape[0]
 
-                # this is expect to be true, so just assert
-                assert vecs.shape[0] == ids.shape[0]
+                    vecs.to(kmeans.device)
+                    partitions = kmeans.transform(vecs)
+                    batch = pa.RecordBatch.from_arrays(
+                        [ids.cpu().numpy(), partitions.cpu().numpy()],
+                        schema=output_schema,
+                    )
 
-                vecs.to(kmeans.device)
-                partitions = kmeans.transform(vecs)
-                batch = pa.RecordBatch.from_arrays(
-                    [ids.cpu().numpy(), partitions.cpu().numpy()], schema=output_schema
-                )
+                    yield batch
 
-                yield batch
+        rbr = pa.RecordBatchReader.from_batches(output_schema, tqdm(_f()))
 
-    rbr = pa.RecordBatchReader.from_batches(output_schema, tqdm(_f()))
-
-    fragments = write_fragments(
-        rbr,
-        dataset.uri,
-        schema=output_schema,
-        max_rows_per_file=dataset.count_rows(),
-    )
+        fragments = write_fragments(
+            rbr,
+            dataset.uri,
+            schema=output_schema,
+            max_rows_per_file=dataset.count_rows(),
+        )
     assert len(fragments) == 1
 
     files = fragments[0].data_files()
