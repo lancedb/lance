@@ -823,14 +823,6 @@ class LanceDataset(pa.dataset.Dataset):
                 "category",
                 "BTREE",
             )
-
-        Experimental Status:
-
-        Scalar indices are experimental and only utilized if there is no new or deleted
-        data that has been uploaded since the index was created.  This limitation should
-        be addressed soon.  In the meantime, ``compact_files`` can be used to remove
-        deletion files and ``optimize_indices`` can be used to catch up the index with
-        new data.
         """
         if isinstance(column, str):
             column = [column]

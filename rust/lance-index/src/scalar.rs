@@ -20,8 +20,9 @@ use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion_common::scalar::ScalarValue;
+use datafusion_common::{scalar::ScalarValue, Column};
 
+use datafusion_expr::Expr;
 use lance_core::Result;
 use nohash_hasher::IntMap;
 
@@ -96,6 +97,49 @@ pub enum ScalarQuery {
 }
 
 impl ScalarQuery {
+    pub fn to_expr(&self, col: String) -> Expr {
+        let col_expr = Expr::Column(Column::new_unqualified(col));
+        match self {
+            Self::Range(lower, upper) => match (lower, upper) {
+                (Bound::Unbounded, Bound::Unbounded) => {
+                    Expr::Literal(ScalarValue::Boolean(Some(true)))
+                }
+                (Bound::Unbounded, Bound::Included(rhs)) => {
+                    col_expr.lt_eq(Expr::Literal(rhs.clone()))
+                }
+                (Bound::Unbounded, Bound::Excluded(rhs)) => col_expr.lt(Expr::Literal(rhs.clone())),
+                (Bound::Included(lhs), Bound::Unbounded) => {
+                    col_expr.gt_eq(Expr::Literal(lhs.clone()))
+                }
+                (Bound::Included(lhs), Bound::Included(rhs)) => {
+                    col_expr.between(Expr::Literal(lhs.clone()), Expr::Literal(rhs.clone()))
+                }
+                (Bound::Included(lhs), Bound::Excluded(rhs)) => col_expr
+                    .clone()
+                    .gt_eq(Expr::Literal(lhs.clone()))
+                    .and(col_expr.lt(Expr::Literal(rhs.clone()))),
+                (Bound::Excluded(lhs), Bound::Unbounded) => col_expr.gt(Expr::Literal(lhs.clone())),
+                (Bound::Excluded(lhs), Bound::Included(rhs)) => col_expr
+                    .clone()
+                    .gt(Expr::Literal(lhs.clone()))
+                    .and(col_expr.lt_eq(Expr::Literal(rhs.clone()))),
+                (Bound::Excluded(lhs), Bound::Excluded(rhs)) => col_expr
+                    .clone()
+                    .gt(Expr::Literal(lhs.clone()))
+                    .and(col_expr.lt(Expr::Literal(rhs.clone()))),
+            },
+            Self::IsIn(values) => col_expr.in_list(
+                values
+                    .iter()
+                    .map(|val| Expr::Literal(val.clone()))
+                    .collect::<Vec<_>>(),
+                false,
+            ),
+            Self::IsNull() => col_expr.is_null(),
+            Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone())),
+        }
+    }
+
     pub fn fmt_with_col(&self, col: &str) -> String {
         match self {
             Self::Range(lower, upper) => match (lower, upper) {

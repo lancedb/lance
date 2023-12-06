@@ -117,6 +117,9 @@ impl RowIdMask {
 
     /// Also block the given ids
     pub fn also_block(self, block_list: RowIdTreeMap) -> Self {
+        if block_list.is_empty() {
+            return self;
+        }
         if let Some(existing) = self.block_list {
             Self {
                 block_list: Some(existing | block_list),
@@ -290,6 +293,10 @@ impl RowIdTreeMap {
     /// Create an empty set
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 
     /// Add a bitmap for a single fragment

@@ -78,7 +78,7 @@ impl PreFilter {
         let dataset_clone = dataset.clone();
         let deleted_ids = if has_missing_fragments || has_deletion_vectors {
             Some(SharedPrerequisite::spawn(
-                Self::load_deleted_ids(dataset_clone, index).in_current_span(),
+                Self::load_deleted_ids(dataset_clone, index.fragment_bitmap).in_current_span(),
             ))
         } else {
             None
@@ -106,7 +106,10 @@ impl PreFilter {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn load_deleted_ids(dataset: Arc<Dataset>, index: Index) -> Result<Arc<RowIdTreeMap>> {
+    pub async fn load_deleted_ids(
+        dataset: Arc<Dataset>,
+        fragment_bitmap: Option<RoaringBitmap>,
+    ) -> Result<Arc<RowIdTreeMap>> {
         let fragments = dataset.get_fragments();
         let frag_id_deletion_vectors = stream::iter(fragments.iter())
             .map(|frag| async move {
@@ -137,7 +140,7 @@ impl PreFilter {
 
         let frag_ids_in_dataset: HashSet<u32> =
             HashSet::from_iter(fragments.iter().map(|frag| frag.id() as u32));
-        if let Some(fragment_bitmap) = index.fragment_bitmap {
+        if let Some(fragment_bitmap) = fragment_bitmap {
             for frag_id in fragment_bitmap.into_iter() {
                 if !frag_ids_in_dataset.contains(&frag_id) {
                     // Entire fragment has been deleted
