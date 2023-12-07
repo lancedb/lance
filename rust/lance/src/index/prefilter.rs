@@ -71,8 +71,8 @@ impl PreFilter {
             bitmap.insert_range(0..dataset.manifest.max_fragment_id);
             bitmap
         });
-        let deleted_ids = Self::create_deletion_mask(dataset.clone(), fragments)
-            .map(|deletion_mask_task| SharedPrerequisite::spawn(deletion_mask_task));
+        let deleted_ids =
+            Self::create_deletion_mask(dataset.clone(), fragments).map(SharedPrerequisite::spawn);
         let filtered_ids = filter
             .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
         Self {
@@ -111,7 +111,7 @@ impl PreFilter {
                 .map(|frag_id| (frag_id, frag_map.clone())),
         )
         .map(|(frag_id, frag_map)| async move {
-            let frag = frag_map.get(&frag_id).unwrap();
+            let frag = frag_map.get(frag_id).unwrap();
             frag.get_deletion_vector()
                 .await
                 .transpose()
