@@ -142,6 +142,14 @@ message Transaction {
     map<string, bytes> schema_metadata = 3;
   }
 
+  // An operation that projects a subset of columns, altering the schema.
+  message Project {
+    // These should all have existing fragment IDs.
+    repeated DataFragment fragments = 1;
+    // The new schema
+    repeated Field schema = 2;
+  }
+
   // An operation that restores a dataset to a previous version.
   message Restore {
     // The version to restore to
@@ -176,5 +184,6 @@ message Transaction {
     Restore restore = 106;
     ReserveFragments reserve_fragments = 107;
     Update update = 108;
+    Project project = 109;
   }
 }

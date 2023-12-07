@@ -825,6 +825,51 @@ impl Dataset {
         let stream = Box::new(stream);
         self.merge_impl(stream, left_on, right_on).await
     }
+
+    /// Drop columns from the dataset and return updated dataset. Note that this
+    /// is a zero-copy operation and column is not physically removed from the
+    /// dataset.
+    /// Parameters:
+    /// - `columns`: the list of column names to drop.
+    pub async fn drop(&mut self, columns: &[&str]) -> Result<()> {
+        // Check if columns are present in the dataset and construct the new schema.
+        let mut fields = vec![];
+        for col in columns {
+            let field = self.schema().field(col);
+            if field.is_none() {
+                return Err(Error::invalid_input(
+                    format!("Column {} does not exist in the dataset", col),
+                    location!(),
+                ));
+            } else if columns.contains(&field.unwrap().name.as_str()) {
+                fields.push(field.unwrap().name.as_str());
+            }
+        }
+        let new_schema = self.manifest.schema.project(&fields)?;
+
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Project {
+                fragments: self.fragments().to_vec(),
+                schema: new_schema,
+            },
+            None,
+        );
+
+        let manifest = commit_transaction(
+            self,
+            &self.object_store,
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+        )
+        .await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
+    }
+
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
         Scanner::new(Arc::new(self.clone()))
@@ -2588,6 +2633,97 @@ mod tests {
     async fn test_open_dataset_not_found() {
         let result = Dataset::open(".").await;
         assert!(matches!(result.unwrap_err(), Error::DatasetNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_drop() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("x", DataType::Float32, false),
+        ]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Float32Array::from(vec![1.0, 2.0])),
+            ],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 2])),
+                Arc::new(Float32Array::from(vec![3.0, 4.0])),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+
+        let batches = RecordBatchIterator::new(vec![batch1].into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+
+        let batches = RecordBatchIterator::new(vec![batch2].into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        dataset.drop(&vec!["x"].to_vec()).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        assert_eq!(dataset.version().version, 3);
+        assert_eq!(dataset.fragments().len(), 2);
+        assert_eq!(dataset.fragments()[0].files.len(), 1);
+        assert_eq!(dataset.fragments()[1].files.len(), 1);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
+
+        let actual_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+        let expected = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "i",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 2]))],
+        )
+        .unwrap();
+
+        assert_eq!(actual, expected);
+
+        // Validate we can still read after re-instantiating dataset, which
+        // clears the cache.
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let actual_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
