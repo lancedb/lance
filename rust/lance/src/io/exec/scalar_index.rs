@@ -260,9 +260,13 @@ impl MaterializeIndexExec {
         // The user-requested `fragments` is guaranteed to be stricter than the index's fragment
         // bitmap.  This node only runs on indexed fragments and any fragments that were deleted
         // when the index was trained will still be deleted when the index is queried.
-        let prefilter = PreFilter::load_deleted_ids(dataset.clone(), Some(fragment_bitmap));
-        let (mut mask, prefilter) = futures::try_join!(mask, prefilter)?;
-        mask = mask.also_block((*prefilter).clone());
+        let prefilter = PreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap);
+        let mask = if let Some(prefilter) = prefilter {
+            let (mask, prefilter) = futures::try_join!(mask, prefilter)?;
+            mask.also_block((*prefilter).clone())
+        } else {
+            mask.await?
+        };
         let ids = match (mask.allow_list, mask.block_list) {
             (None, None) => FragIdIter::new(fragments).collect::<Vec<_>>(),
             (Some(allow_list), None) => FragIdIter::new(fragments)

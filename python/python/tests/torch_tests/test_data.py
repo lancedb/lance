@@ -17,8 +17,10 @@ import shutil
 import lance
 import numpy as np
 import pyarrow as pa
-import torch
-from lance.torch.data import LanceDataset
+import pytest
+
+torch = pytest.importorskip("torch")
+from lance.torch.data import LanceDataset  # noqa: E402
 
 
 def test_iter_over_dataset(tmp_path):
