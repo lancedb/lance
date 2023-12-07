@@ -16,6 +16,7 @@
 //!
 
 use std::any::Any;
+use std::iter::repeat;
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
@@ -29,6 +30,7 @@ use lance_linalg::distance::{
 };
 use lance_linalg::kernels::{argmin, argmin_value_float};
 use lance_linalg::{distance::MetricType, MatrixView};
+use num_traits::{Float, Zero};
 use snafu::{location, Location};
 pub mod builder;
 pub mod transform;
@@ -482,13 +484,29 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
                             dot_distance_batch(sub_vector, centroids, sub_dim)
                         }
                     };
-                    let code = argmin(dist_iter).ok_or(Error::Index {
-                        message: format!(
-                            "Failed to assign PQ code: {}, sub-vector={:#?}",
-                            "it is likely that distance is NaN or Inf", sub_vector
-                        ),
-                        location: location!(),
-                    })? as u8;
+                    let code = argmin(dist_iter)
+                        .or_else(|| {
+                            if metric_type == lance_linalg::distance::DistanceType::Cosine
+                                && sub_vector.iter().all(|&v| v.is_zero())
+                            {
+                                argmin(cosine_distance_batch(
+                                    &repeat(T::Native::epsilon())
+                                        .take(sub_dim)
+                                        .collect::<Vec<_>>(),
+                                    centroids,
+                                    sub_dim,
+                                ))
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or(Error::Index {
+                            message: format!(
+                                "Failed to assign PQ code: metric={} {}, sub-vector={:#?}",
+                                metric_type, "it is likely that distance is NaN or Inf", sub_vector
+                            ),
+                            location: location!(),
+                        })? as u8;
                     builder[i * num_sub_vectors + sub_idx] = code as u8;
                 }
             }
