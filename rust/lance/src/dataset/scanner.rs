@@ -732,7 +732,8 @@ impl Scanner {
                 }
                 (None, _) => {
                     // The source is a full scan of the table
-                    self.scan(self.with_row_id, false, self.projections.clone().into())
+                    let with_row_id = filter_plan.has_refine() || self.with_row_id;
+                    self.scan(with_row_id, false, self.projections.clone().into())
                 }
             }
         };
@@ -1392,29 +1393,32 @@ mod test {
         scan.filter("i > 50").unwrap();
         assert_eq!(scan.filter, Some(col("i").gt(lit(50))));
 
-        let batches = scan
-            .project(&["s"])
-            .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+        for use_stats in [false, true] {
+            let batches = scan
+                .project(&["s"])
+                .unwrap()
+                .use_stats(use_stats)
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
 
-        let expected_batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "s",
-                DataType::Utf8,
-                true,
-            )])),
-            vec![Arc::new(StringArray::from_iter_values(
-                (51..100).map(|v| format!("s-{}", v)),
-            ))],
-        )
-        .unwrap();
-        assert_eq!(batch, expected_batch);
+            let expected_batch = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "s",
+                    DataType::Utf8,
+                    true,
+                )])),
+                vec![Arc::new(StringArray::from_iter_values(
+                    (51..100).map(|v| format!("s-{}", v)),
+                ))],
+            )
+            .unwrap();
+            assert_eq!(batch, expected_batch);
+        }
     }
 
     #[tokio::test]
