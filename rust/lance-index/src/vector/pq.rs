@@ -484,8 +484,8 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
                     };
                     let code = argmin(dist_iter).ok_or(Error::Index {
                         message: format!(
-                            "Failed to assign PQ code: {}, sub-vector={:#?}",
-                            "it is likely that distance is NaN or Inf", sub_vector
+                            "Failed to assign PQ code: metric={} {}, sub-vector={:#?}",
+                            metric_type, "it is likely that distance is NaN or Inf", sub_vector
                         ),
                         location: location!(),
                     })? as u8;
@@ -554,6 +554,7 @@ mod tests {
 
     use std::iter::repeat;
 
+    use arrow_array::types::UInt8Type;
     use arrow_array::{
         types::{Float16Type, Float32Type},
         Float16Array, Float32Array,
@@ -585,7 +586,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_empty_dist_iter() {
+    async fn test_empty_dist_iter_cosine() {
         let pq = ProductQuantizerImpl::<Float32Type> {
             num_bits: 8,
             num_sub_vectors: 4,
@@ -599,10 +600,13 @@ mod tests {
         let data = Float32Array::from_iter_values(repeat(0.0).take(16));
         let data = FixedSizeListArray::try_new_from_values(data, 16).unwrap();
         let rst = pq.transform(&data).await;
-        assert!(rst.is_err());
-        assert!(rst
-            .unwrap_err()
-            .to_string()
-            .contains("it is likely that distance is NaN"));
+        assert!(rst.is_ok());
+        let code = rst.unwrap();
+        assert!(code
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<UInt8Type>()
+            .iter()
+            .all(|v| v == Some(0)));
     }
 }
