@@ -14,10 +14,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
-#ifdef __X86_64__
 #include <immintrin.h>
-#endif // __X86_64__
 
 // See https://github.com/ashvardanian/SimSIMD/blob/main/include/simsimd/spatial.h
 // https://www.intel.com/content/www/us/en/developer/articles/technical/intel-deep-learning-boost-new-instruction-bfloat16.html
@@ -84,11 +81,12 @@ float cosine_bf16(__bf16 const* a, __bf16 const* b, size_t n) {
     __bf16 ab = _mm512_reduce_add_ph(ab_vec);
     __bf16 a2 = _mm512_reduce_add_ph(a2_vec);
     __bf16 b2 = _mm512_reduce_add_ph(b2_vec);
+    return 1 - ab / (a2 * b2);
 
     // Compute the reciprocal square roots of a2 and b2
     // __m128 rsqrts = __m128(_mm_set_ps(0.f, 0.f, a2 + 1.e-9f, b2 + 1.e-9f));
     // __m128 rsqrt_a2 = _mm_cvtss_f32(rsqrts);
     // f32_t rsqrt_b2 = _mm_cvtss_f32(_mm_shuffle_ps(rsqrts, rsqrts, _MM_SHUFFLE(0, 0, 0, 1)));
     // return 1 - ab * rsqrt_a2 * rsqrt_b2;
-    return 1;
+//    return 1;
 }
