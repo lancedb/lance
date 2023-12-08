@@ -57,7 +57,6 @@ futures.workspace = true
 uuid.workspace = true
 shellexpand.workspace = true
 arrow = { version = "47.0.0", features = ["prettyprint"] }
-nohash-hasher.workspace = true
 num_cpus.workspace = true
 # TODO: use datafusion sub-modules to reduce build size?
 datafusion.workspace = true

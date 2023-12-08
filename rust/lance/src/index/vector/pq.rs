@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::Any;
 use std::sync::Arc;
+use std::{any::Any, collections::HashMap};
 
 use arrow_array::{
     cast::{as_primitive_array, AsArray},
@@ -35,7 +35,6 @@ use lance_index::{
     Index, IndexType,
 };
 use lance_linalg::distance::MetricType;
-use nohash_hasher::IntMap;
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::{location, Location};
@@ -238,7 +237,7 @@ impl VectorIndex for PQIndex {
         Ok(())
     }
 
-    fn remap(&mut self, mapping: &IntMap<u64, Option<u64>>) -> Result<()> {
+    fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         let code = self
             .code
             .as_ref()
