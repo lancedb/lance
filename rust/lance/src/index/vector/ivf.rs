@@ -213,15 +213,7 @@ impl IVFIndex {
             None,
             None,
         )?;
-        let memory_limit = 4 * 1024 * 1024 * 1024; // 4GB TODO: customize this.
-        let shuffled = shuffle_dataset(
-            data,
-            column,
-            ivf,
-            pq_index.pq.num_sub_vectors(),
-            memory_limit,
-        )
-        .await?;
+        let shuffled = shuffle_dataset(data, column, ivf, pq_index.pq.num_sub_vectors()).await?;
 
         let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
         write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(self)).await?;
