@@ -19,18 +19,18 @@
 // See https://github.com/ashvardanian/SimSIMD/blob/main/include/simsimd/spatial.h
 // https://www.intel.com/content/www/us/en/developer/articles/technical/intel-deep-learning-boost-new-instruction-bfloat16.html
 
-/// Need avx512bf16 and avx512bw
-float l2_bf16(__bf16 const* a, __bf16 const* b, size_t d) {
-    __m512h d2_vec = _mm512_set1_ph(0);
+/// Needs avx512bf16 and avx512bw
+
+float norm_l2_bf16(__bf16 const* a, __bf16 const* b, size_t d) {
+    __m512h d_vec = _mm512_set1_ph(0);
     for (size_t i = 0; i < d; i += 32) {
 //        __mmask16 mask = d - i >= 32 ? 0xFFFFFFFF : ((1u << (d - i)) - 1u);
         __mmask16 mask = _bzhi_u32(0xFFFFFFFF, d);
         __m512i a_vec = _mm512_maskz_loadu_epi16(mask, a + i);
         __m512i b_vec = _mm512_maskz_loadu_epi16(mask, b + i);
-        __m512h d_vec = _mm512_sub_ph(_mm512_castsi512_ph(a_vec), _mm512_castsi512_ph(b_vec));
-        d2_vec = _mm512_fmadd_ph(d_vec, d_vec, d2_vec);
+        d_vec = _mm512_fmadd_ph(_mm512_castsi512_ph(a_vec), _mm512_castsi512_ph(b_vec));
     }
-    return _mm512_reduce_add_ph(d2_vec);
+    return _mm512_reduce_add_ph(d_vec);
 }
 
 float dot_bf16(__bf16 const* a, __bf16 const* b, size_t n) {
@@ -53,6 +53,19 @@ float dot_bf16(__bf16 const* a, __bf16 const* b, size_t n) {
     }
 
     return _mm512_reduce_add_ph(ab_vec);
+}
+
+float l2_bf16(__bf16 const* a, __bf16 const* b, size_t d) {
+    __m512h d2_vec = _mm512_set1_ph(0);
+    for (size_t i = 0; i < d; i += 32) {
+//        __mmask16 mask = d - i >= 32 ? 0xFFFFFFFF : ((1u << (d - i)) - 1u);
+        __mmask16 mask = _bzhi_u32(0xFFFFFFFF, d);
+        __m512i a_vec = _mm512_maskz_loadu_epi16(mask, a + i);
+        __m512i b_vec = _mm512_maskz_loadu_epi16(mask, b + i);
+        __m512h d_vec = _mm512_sub_ph(_mm512_castsi512_ph(a_vec), _mm512_castsi512_ph(b_vec));
+        d2_vec = _mm512_fmadd_ph(d_vec, d_vec, d2_vec);
+    }
+    return _mm512_reduce_add_ph(d2_vec);
 }
 
 float cosine_bf16(__bf16 const* a, __bf16 const* b, size_t n) {
