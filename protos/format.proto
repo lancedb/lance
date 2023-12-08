@@ -233,6 +233,10 @@ message DeletionFile {
 
 // Metadata of one Lance file.
 message Metadata {
+  // 4 was used for StatisticsMetadata in the past, but has been moved to prevent
+  // a bug in older readers.
+  reserved 4;
+
   // Position of the manifest in the file. If it is zero, the manifest is stored
   // externally.
   uint64 manifest_position = 1;
@@ -288,7 +292,7 @@ message Metadata {
 	  uint64 page_table_position = 3;
   }
 
-  StatisticsMetadata statistics = 4;
+  StatisticsMetadata statistics = 5;
 } // Metadata
 
 // Supported encodings.
