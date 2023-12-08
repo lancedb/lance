@@ -28,7 +28,7 @@ float norm_l2_bf16(__bf16 const* a, __bf16 const* b, size_t d) {
         __mmask16 mask = _bzhi_u32(0xFFFFFFFF, d);
         __m512i a_vec = _mm512_maskz_loadu_epi16(mask, a + i);
         __m512i b_vec = _mm512_maskz_loadu_epi16(mask, b + i);
-        d_vec = _mm512_fmadd_ph(_mm512_castsi512_ph(a_vec), _mm512_castsi512_ph(b_vec));
+        d_vec = _mm512_fmadd_ph(_mm512_castsi512_ph(a_vec), _mm512_castsi512_ph(b_vec), d_vec);
     }
     return _mm512_reduce_add_ph(d_vec);
 }
