@@ -147,7 +147,6 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         prefilter: bool = False,
         with_row_id: bool = False,
-        use_stats: bool = True,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -234,7 +233,6 @@ class LanceDataset(pa.dataset.Dataset):
             .scan_in_order(scan_in_order)
             .with_fragments(fragments)
             .with_row_id(with_row_id)
-            .use_stats(use_stats)
         )
         if nearest is not None:
             builder = builder.nearest(**nearest)
@@ -261,7 +259,6 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         prefilter: bool = False,
         with_row_id: bool = False,
-        use_stats: bool = True,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -321,7 +318,6 @@ class LanceDataset(pa.dataset.Dataset):
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
-            use_stats=use_stats,
         ).to_table()
 
     @property
@@ -373,7 +369,6 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         prefilter: bool = False,
         with_row_id: bool = False,
-        use_stats: bool = True,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -399,7 +394,6 @@ class LanceDataset(pa.dataset.Dataset):
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
-            use_stats=use_stats,
         ).to_batches()
 
     def sample(
@@ -1484,7 +1478,6 @@ class ScannerBuilder:
         self._scan_in_order = True
         self._fragments = None
         self._with_row_id = False
-        self._use_stats = True
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set batch size for Scanner"""
@@ -1545,16 +1538,6 @@ class ScannerBuilder:
     def with_row_id(self, with_row_id: bool = True) -> ScannerBuilder:
         """Enable returns with physical row IDs."""
         self._with_row_id = with_row_id
-        return self
-
-    def use_stats(self, use_stats: bool = True) -> ScannerBuilder:
-        """
-        Enable use of statistics for query planning.
-
-        Disabling statistics is used for debugging and benchmarking purposes.
-        This should be left on for normal use.
-        """
-        self._use_stats = use_stats
         return self
 
     def with_fragments(
@@ -1640,7 +1623,6 @@ class ScannerBuilder:
             self._scan_in_order,
             self._fragments,
             self._with_row_id,
-            self._use_stats,
         )
         return LanceScanner(scanner, self.ds)
 

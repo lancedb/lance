@@ -276,7 +276,6 @@ impl Dataset {
         scan_in_order: Option<bool>,
         fragments: Option<Vec<FileFragment>>,
         with_row_id: Option<bool>,
-        use_stats: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         if let Some(c) = columns {
@@ -312,10 +311,6 @@ impl Dataset {
 
         if with_row_id.unwrap_or(false) {
             scanner.with_row_id();
-        }
-
-        if let Some(use_stats) = use_stats {
-            scanner.use_stats(use_stats);
         }
 
         if let Some(fragments) = fragments {

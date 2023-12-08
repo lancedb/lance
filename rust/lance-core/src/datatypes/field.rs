@@ -551,14 +551,6 @@ impl fmt::Display for Field {
             write!(f, ", dictionary={:?}", dictionary)?;
         }
 
-        if !self.children.is_empty() {
-            write!(f, ", children=[")?;
-            for child in self.children.iter() {
-                write!(f, "{}, ", child)?;
-            }
-            write!(f, "]")?;
-        }
-
         write!(f, ")")
     }
 }

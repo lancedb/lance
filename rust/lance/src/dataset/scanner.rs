@@ -52,10 +52,7 @@ use crate::format::{Fragment, Index};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::{FilterPlan, MaterializeIndexExec, PreFilterSource, ScalarIndexExec};
 use crate::io::{
-    exec::{
-        KNNFlatExec, KNNIndexExec, LancePushdownScanExec, LanceScanExec, Planner, ProjectionExec,
-        ScanConfig, TakeExec,
-    },
+    exec::{KNNFlatExec, KNNIndexExec, LanceScanExec, Planner, ProjectionExec, TakeExec},
     RecordBatchStream,
 };
 use crate::{Error, Result};
@@ -64,10 +61,10 @@ use snafu::{location, Location};
 pub const DEFAULT_BATCH_SIZE: usize = 8192;
 
 // Same as pyarrow Dataset::scanner()
-pub const DEFAULT_BATCH_READAHEAD: usize = 16;
+const DEFAULT_BATCH_READAHEAD: usize = 16;
 
 // Same as pyarrow Dataset::scanner()
-pub const DEFAULT_FRAGMENT_READAHEAD: usize = 4;
+const DEFAULT_FRAGMENT_READAHEAD: usize = 4;
 
 /// Defines an ordering for a single column
 ///
@@ -164,11 +161,6 @@ pub struct Scanner {
     /// Scan the dataset with a meta column: "_rowid"
     with_row_id: bool,
 
-    /// Whether to use statistics to optimize the scan (default: true)
-    ///
-    /// This is used for debugging or benchmarking purposes.
-    use_stats: bool,
-
     /// Whether to scan in deterministic order (default: true)
     ///
     /// This field is ignored if `ordering` is defined
@@ -200,7 +192,6 @@ impl Scanner {
             offset: None,
             ordering: None,
             nearest: None,
-            use_stats: true,
             with_row_id: false,
             ordered: true,
             fragments: None,
@@ -208,9 +199,23 @@ impl Scanner {
     }
 
     pub fn from_fragment(dataset: Arc<Dataset>, fragment: Fragment) -> Self {
+        let projection = dataset.schema().clone();
+        let batch_size = std::cmp::max(dataset.object_store().block_size() / 4, DEFAULT_BATCH_SIZE);
         Self {
+            dataset,
+            projections: projection,
+            prefilter: false,
+            filter: None,
+            batch_size,
+            batch_readahead: DEFAULT_BATCH_READAHEAD,
+            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
+            limit: None,
+            offset: None,
+            ordering: None,
+            nearest: None,
+            with_row_id: false,
+            ordered: true,
             fragments: Some(vec![fragment]),
-            ..Self::new(dataset)
         }
     }
 
@@ -481,14 +486,6 @@ impl Scanner {
         self
     }
 
-    /// Set whether to use statistics to optimize the scan (default: true)
-    ///
-    /// This is used for debugging or benchmarking purposes.
-    pub fn use_stats(&mut self, use_stats: bool) -> &mut Self {
-        self.use_stats = use_stats;
-        self
-    }
-
     /// The Arrow schema of the output, including projections and vector / _distance
     pub fn schema(&self) -> Result<SchemaRef> {
         let schema = self
@@ -713,27 +710,23 @@ impl Scanner {
                 self.knn(&FilterPlan::default()).await?
             }
         } else {
-            match (&filter_plan.index_query, &mut filter_plan.refine_expr) {
-                (Some(index_query), None) => {
-                    self.scalar_indexed_scan(&self.projections, index_query)
-                        .await?
-                }
-                // TODO: support combined pushdown and scalar index scan
-                (Some(index_query), Some(_)) => {
-                    // If there is a filter then just load the filter
-                    // columns (we will `take` the remaining columns afterwards)
-                    let columns = filter_plan.refine_columns();
-                    let filter_schema = Arc::new(self.dataset.schema().project(&columns)?);
-                    self.scalar_indexed_scan(&filter_schema, index_query)
-                        .await?
-                }
-                (None, Some(_)) if self.use_stats => {
-                    self.pushdown_scan(false, filter_plan.refine_expr.take().unwrap())?
-                }
-                (None, _) => {
-                    // The source is a full scan of the table
-                    self.scan(self.with_row_id, false, self.projections.clone().into())
-                }
+            // The source is a scan
+            let (with_row_id, schema) = if filter_plan.has_refine() {
+                // If there is a filter then just load the filter
+                // columns (we will `take` the remaining columns afterwards)
+                let columns = filter_plan.refine_columns();
+                let filter_schema = Arc::new(self.dataset.schema().project(&columns)?);
+                (true, filter_schema)
+            } else {
+                // If there is no filter then load the user's desired columns
+                (self.with_row_id, self.projections.clone().into())
+            };
+            if let Some(index_query) = &filter_plan.index_query {
+                // The source is an indexed scan
+                self.scalar_indexed_scan(&schema, index_query).await?
+            } else {
+                // The source is a full scan of the table
+                self.scan(with_row_id, false, schema)
             }
         };
 
@@ -811,10 +804,7 @@ impl Scanner {
         if !remaining_schema.fields.is_empty() {
             plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
         }
-        let output_arrow_schema = output_schema.as_ref().into();
-        if plan.schema().as_ref() != &output_arrow_schema {
-            plan = Arc::new(ProjectionExec::try_new(plan, output_schema)?);
-        }
+        plan = Arc::new(ProjectionExec::try_new(plan, output_schema)?);
 
         debug!("Execution plan:\n{:?}", plan);
 
@@ -1101,34 +1091,6 @@ impl Scanner {
             with_make_deletions_null,
             ordered,
         ))
-    }
-
-    fn pushdown_scan(
-        &self,
-        make_deletions_null: bool,
-        predicate: Expr,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let config = ScanConfig {
-            batch_readahead: self.batch_readahead,
-            fragment_readahead: self.fragment_readahead,
-            with_row_id: self.with_row_id,
-            make_deletions_null,
-            ordered_output: self.ordered,
-        };
-
-        let fragments = if let Some(fragment) = self.fragments.as_ref() {
-            Arc::new(fragment.clone())
-        } else {
-            self.dataset.fragments().clone()
-        };
-
-        Ok(Arc::new(LancePushdownScanExec::try_new(
-            self.dataset.clone(),
-            fragments,
-            self.projections.clone().into(),
-            predicate,
-            config,
-        )?))
     }
 
     /// Add a knn search node to the input plan
@@ -1942,15 +1904,22 @@ mod test {
         let scan = dataset.scan();
         let plan = scan.create_plan().await.unwrap();
 
-        assert!(plan.as_any().is::<LanceScanExec>());
+        assert!(plan.as_any().is::<ProjectionExec>());
+        assert_eq!(plan.schema().field_names(), ["i", "s", "vec"]);
+
+        let scan = &plan.children()[0];
+        assert!(scan.as_any().is::<LanceScanExec>());
         assert_eq!(plan.schema().field_names(), ["i", "s", "vec"]);
 
         let mut scan = dataset.scan();
         scan.project(&["s"]).unwrap();
         let plan = scan.create_plan().await.unwrap();
-
-        assert!(plan.as_any().is::<LanceScanExec>());
+        assert!(plan.as_any().is::<ProjectionExec>());
         assert_eq!(plan.schema().field_names(), ["s"]);
+
+        let scan = &plan.children()[0];
+        assert!(scan.as_any().is::<LanceScanExec>());
+        assert_eq!(scan.schema().field_names(), ["s"]);
     }
 
     #[tokio::test]
@@ -2245,7 +2214,7 @@ mod test {
     /// ```
     ///
     /// Expected plan:
-    ///  pushdown_scan(i)
+    ///  scan(i) -> filter(i) -> take(s) -> projection(s)
     #[tokio::test]
     async fn test_scan_with_filter() {
         let test_dir = tempdir().unwrap();
@@ -2257,8 +2226,20 @@ mod test {
         scan.filter("i > 10 and i < 20").unwrap();
         let plan = scan.create_plan().await.unwrap();
 
-        assert!(plan.as_any().is::<LancePushdownScanExec>());
+        assert!(plan.as_any().is::<ProjectionExec>());
         assert_eq!(plan.schema().field_names(), ["s"]);
+
+        let take = &plan.children()[0];
+        assert!(take.as_any().is::<TakeExec>());
+        assert_eq!(take.schema().field_names(), ["i", ROW_ID, "s"]);
+
+        let filter = &take.children()[0];
+        assert!(filter.as_any().is::<FilterExec>());
+        assert_eq!(filter.schema().field_names(), ["i", ROW_ID]);
+
+        let scan = &filter.children()[0];
+        assert!(scan.as_any().is::<LanceScanExec>());
+        assert_eq!(filter.schema().field_names(), ["i", ROW_ID]);
     }
 
     /// Test KNN with index

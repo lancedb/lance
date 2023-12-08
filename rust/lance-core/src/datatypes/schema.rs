@@ -135,7 +135,7 @@ impl Schema {
     ///
     /// This is a DFS traversal where the parent is visited
     /// before its children
-    pub fn fields_pre_order(&self) -> impl Iterator<Item = &Field> {
+    fn fields_pre_order(&self) -> SchemaFieldIterPreOrder {
         SchemaFieldIterPreOrder::new(self)
     }
 
@@ -244,23 +244,7 @@ impl Schema {
         None
     }
 
-    /// Get the sequence of fields from the root to the field with the given id.
-    pub fn field_ancestry_by_id(&self, id: i32) -> Option<Vec<&Field>> {
-        let mut to_visit = self.fields.iter().map(|f| vec![f]).collect::<Vec<_>>();
-        while let Some(path) = to_visit.pop() {
-            let field = path.last().unwrap();
-            if field.id == id {
-                return Some(path);
-            }
-            for child in field.children.iter() {
-                let mut new_path = path.clone();
-                new_path.push(child);
-                to_visit.push(new_path);
-            }
-        }
-        None
-    }
-
+    // TODO: pub(crate)
     pub fn mut_field_by_id(&mut self, id: impl Into<i32>) -> Option<&mut Field> {
         let id = id.into();
         for field in self.fields.as_mut_slice() {

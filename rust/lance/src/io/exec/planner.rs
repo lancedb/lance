@@ -77,12 +77,12 @@ impl Planner {
         Self { schema }
     }
 
-    fn column(idents: &[Ident]) -> Expr {
+    fn column(&self, idents: &[Ident]) -> Result<Expr> {
         let mut column = col(&idents[0].value);
         for ident in &idents[1..] {
             column = column.field(&ident.value);
         }
-        column
+        Ok(column)
     }
 
     fn binary_op(&self, op: &BinaryOperator) -> Result<Operator> {
@@ -340,10 +340,10 @@ impl Planner {
                 } else if id.quote_style == Some('`') {
                     Ok(Expr::Column(Column::from_name(id.value.clone())))
                 } else {
-                    Ok(Self::column(vec![id.clone()].as_slice()))
+                    self.column(vec![id.clone()].as_slice())
                 }
             }
-            SQLExpr::CompoundIdentifier(ids) => Ok(Self::column(ids.as_slice())),
+            SQLExpr::CompoundIdentifier(ids) => self.column(ids.as_slice()),
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
             SQLExpr::Value(value) => self.value(value),
