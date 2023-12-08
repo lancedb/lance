@@ -14,6 +14,7 @@
 
 //! Scalar indices for metadata search & filtering
 
+use std::collections::HashMap;
 use std::{any::Any, ops::Bound, sync::Arc};
 
 use arrow_array::{RecordBatch, UInt64Array};
@@ -23,7 +24,6 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::scalar::ScalarValue;
 
 use lance_core::Result;
-use nohash_hasher::IntMap;
 
 use crate::Index;
 
@@ -154,7 +154,7 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index {
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        mapping: &IntMap<u64, Option<u64>>,
+        mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
     ) -> Result<()>;
 

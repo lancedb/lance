@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -30,7 +31,6 @@ use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_linalg::distance::MetricType;
 use log::info;
-use nohash_hasher::IntMap;
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -121,7 +121,7 @@ pub(super) async fn build_partitions(
     pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
     part_range: Range<u32>,
-    precomputed_partitons: Option<IntMap<u64, u32>>,
+    precomputed_partitons: Option<HashMap<u64, u32>>,
 ) -> Result<()> {
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
