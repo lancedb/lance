@@ -1,0 +1,19 @@
+[package]
+name = "arrow-shortcuts-macros"
+version = "47.0.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Shortcut macros for working with Arrow (don't use directly)"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+proc-macro2 = "1.0.67"
+quote = "1.0.33"
+syn = { version = "2.0.37", features = ["full"] }
+
+[lib]
+proc-macro = true

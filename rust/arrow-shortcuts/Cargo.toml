@@ -1,0 +1,18 @@
+[package]
+name = "arrow-shortcuts"
+version = "47.0.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Shortcuts for working with Arrow"
+keywords.workspace = true
+categories.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-shortcuts-macros.workspace = true
