@@ -55,7 +55,6 @@ use lance_index::{
 };
 use lance_linalg::distance::{Cosine, Dot, MetricType, L2};
 use log::{debug, info};
-use nohash_hasher::{BuildNoHashHasher, IntMap};
 use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -214,15 +213,7 @@ impl IVFIndex {
             None,
             None,
         )?;
-        let memory_limit = 4 * 1024 * 1024 * 1024; // 4GB TODO: customize this.
-        let shuffled = shuffle_dataset(
-            data,
-            column,
-            ivf,
-            pq_index.pq.num_sub_vectors(),
-            memory_limit,
-        )
-        .await?;
+        let shuffled = shuffle_dataset(data, column, ivf, pq_index.pq.num_sub_vectors()).await?;
 
         let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
         write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(self)).await?;
@@ -378,7 +369,7 @@ impl VectorIndex for IVFIndex {
         Ok(())
     }
 
-    fn remap(&mut self, _mapping: &IntMap<u64, Option<u64>>) -> Result<()> {
+    fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         // This will be needed if we want to clean up IVF to allow more than just
         // one layer (e.g. IVF -> IVF -> PQ).  We need to pass on the call to
         // remap to the lower layers.
@@ -816,8 +807,7 @@ pub async fn build_ivf_pq_index(
             )
             .await?;
 
-            let mut partition_lookup =
-                HashMap::with_capacity_and_hasher(reader.len(), BuildNoHashHasher::default());
+            let mut partition_lookup = HashMap::with_capacity(reader.len());
 
             for i in 0..reader.num_batches() {
                 let batch = reader.read_batch(i as i32, RangeFull, &schema).await?;
@@ -889,7 +879,7 @@ impl RemapPageTask {
         mut self,
         reader: &dyn Reader,
         index: &IVFIndex,
-        mapping: &IntMap<u64, Option<u64>>,
+        mapping: &HashMap<u64, Option<u64>>,
     ) -> Result<Self> {
         let mut page = index
             .sub_index
@@ -932,7 +922,7 @@ pub(crate) async fn remap_index_file(
     new_uuid: &str,
     old_version: u64,
     index: &IVFIndex,
-    mapping: &IntMap<u64, Option<u64>>,
+    mapping: &HashMap<u64, Option<u64>>,
     name: String,
     column: String,
     transforms: Vec<pb::Transform>,
@@ -1000,7 +990,7 @@ async fn write_index_file(
     pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin + 'static,
-    precomputed_partitons: Option<IntMap<u64, u32>>,
+    precomputed_partitons: Option<HashMap<u64, u32>>,
 ) -> Result<()> {
     let object_store = dataset.object_store();
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
@@ -1426,7 +1416,7 @@ mod tests {
         row_ids_to_modify: &[u64],
         row_ids_to_remove: &[u64],
         max_id: u64,
-    ) -> IntMap<u64, Option<u64>> {
+    ) -> HashMap<u64, Option<u64>> {
         // Some big number we can add to row ids so they are remapped but don't intersect with anything
         if max_id > BIG_OFFSET {
             panic!("This logic will only work if the max row id is less than BIG_OFFSET");

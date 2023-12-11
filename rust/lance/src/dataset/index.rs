@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -20,7 +20,6 @@ use lance_core::{
     format::{Fragment, Index},
     Error, Result,
 };
-use nohash_hasher::IntMap;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
@@ -51,7 +50,7 @@ impl DatasetIndexRemapper {
     async fn remap_index(
         &self,
         index: &Index,
-        mapping: &IntMap<u64, Option<u64>>,
+        mapping: &HashMap<u64, Option<u64>>,
     ) -> Result<RemappedIndex> {
         let new_uuid = remap_index(&self.dataset, &index.uuid, mapping).await?;
         Ok(RemappedIndex::new(index.uuid, new_uuid))
@@ -62,7 +61,7 @@ impl DatasetIndexRemapper {
 impl IndexRemapper for DatasetIndexRemapper {
     async fn remap_indices(
         &self,
-        mapping: IntMap<u64, Option<u64>>,
+        mapping: HashMap<u64, Option<u64>>,
         affected_fragment_ids: &[u64],
     ) -> Result<Vec<RemappedIndex>> {
         let affected_frag_ids = HashSet::<u64>::from_iter(affected_fragment_ids.iter().copied());

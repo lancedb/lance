@@ -15,7 +15,7 @@
 //! Traits for vector index.
 //!
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{types::Float32Type, FixedSizeListArray, RecordBatch};
 use async_trait::async_trait;
@@ -26,7 +26,6 @@ use lance_core::{
 };
 use lance_index::{vector::Query, Index};
 use lance_linalg::MatrixView;
-use nohash_hasher::IntMap;
 
 use crate::index::{pb::Transform, prefilter::PreFilter};
 
@@ -78,7 +77,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// If an old row id is not in the mapping then it should be
     /// left alone.
-    fn remap(&mut self, mapping: &IntMap<u64, Option<u64>>) -> Result<()>;
+    fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>;
 }
 
 /// Transformer on vectors.

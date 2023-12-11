@@ -15,7 +15,7 @@
 use std::{
     any::Any,
     cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap, HashSet},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -29,7 +29,6 @@ use lance_index::{
     vector::{Query, DIST_COL},
     Index, IndexType,
 };
-use nohash_hasher::IntMap;
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
 use roaring::RoaringBitmap;
@@ -304,7 +303,7 @@ impl VectorIndex for DiskANNIndex {
         })
     }
 
-    fn remap(&mut self, _mapping: &IntMap<u64, Option<u64>>) -> Result<()> {
+    fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         Err(Error::NotSupported {
             source: "DiskANNIndex does not yet support remap".into(),
             location: location!(),

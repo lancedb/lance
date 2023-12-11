@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
-use datafusion::execution::memory_pool::GreedyMemoryPool;
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool, UnboundedMemoryPool};
 use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
 use datafusion::logical_expr::col;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -30,7 +31,6 @@ use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_linalg::distance::MetricType;
 use log::info;
-use nohash_hasher::IntMap;
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -58,7 +58,6 @@ pub async fn shuffle_dataset(
     // TODO: Once the transformer can generate schema automatically,
     // we can remove `num_sub_vectors`.
     num_sub_vectors: usize,
-    memory_limit: usize,
 ) -> Result<BatchStreamGrouper> {
     let column: Arc<str> = column.into();
     let stream = data
@@ -96,8 +95,27 @@ pub async fn shuffle_dataset(
 
     info!("Building IVF shuffler");
 
-    let runtime_config =
-        RuntimeConfig::new().with_memory_pool(Arc::new(GreedyMemoryPool::new(memory_limit)));
+    let memory_limit = if let Ok(memory_limit) = std::env::var("LANCE_MEMORY_LIMIT") {
+        match memory_limit.parse::<usize>() {
+            Ok(memory_limit) => Some(memory_limit),
+            Err(err) => {
+                log::error!(
+                    "Failed to parse LANCE_MEMORY_LIMIT: {}, using default of unbounded.",
+                    err
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let memory_pool: Arc<dyn MemoryPool> = if let Some(memory_limit) = memory_limit {
+        Arc::new(GreedyMemoryPool::new(memory_limit))
+    } else {
+        Arc::new(UnboundedMemoryPool::default())
+    };
+    let runtime_config = RuntimeConfig::new().with_memory_pool(memory_pool);
     let runtime_env = RuntimeEnv::new(runtime_config)?;
     let context = SessionContext::new_with_config_rt(Default::default(), Arc::new(runtime_env));
 
@@ -121,7 +139,7 @@ pub(super) async fn build_partitions(
     pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
     part_range: Range<u32>,
-    precomputed_partitons: Option<IntMap<u64, u32>>,
+    precomputed_partitons: Option<HashMap<u64, u32>>,
 ) -> Result<()> {
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
@@ -147,10 +165,7 @@ pub(super) async fn build_partitions(
         precomputed_partitons,
     )?;
 
-    let memory_limit = 4 * 1024 * 1024 * 1024; // 4GB
-
-    let shuffled =
-        shuffle_dataset(data, column, ivf_model, pq.num_sub_vectors(), memory_limit).await?;
+    let shuffled = shuffle_dataset(data, column, ivf_model, pq.num_sub_vectors()).await?;
 
     write_index_partitions(writer, ivf, shuffled, None).await?;
 

@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.19"
+version = "0.8.20"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -36,15 +36,15 @@ categories = [
 rust-version = "1.70"
 
 [workspace.dependencies]
-lance = { version = "=0.8.19", path = "./lance" }
-lance-arrow = { version = "=0.8.19", path = "./lance-arrow" }
-lance-core = { version = "=0.8.19", path = "./lance-core" }
-lance-datafusion = { version = "=0.8.19", path = "./lance-datafusion" }
-lance-datagen = { version = "=0.8.19", path = "./lance-datagen" }
-lance-index = { version = "=0.8.19", path = "./lance-index" }
-lance-linalg = { version = "=0.8.19", path = "./lance-linalg" }
-lance-test-macros = { version = "=0.8.19", path = "./lance-test-macros" }
-lance-testing = { version = "=0.8.19", path = "./lance-testing" }
+lance = { version = "=0.8.20", path = "./lance" }
+lance-arrow = { version = "=0.8.20", path = "./lance-arrow" }
+lance-core = { version = "=0.8.20", path = "./lance-core" }
+lance-datafusion = { version = "=0.8.20", path = "./lance-datafusion" }
+lance-datagen = { version = "=0.8.20", path = "./lance-datagen" }
+lance-index = { version = "=0.8.20", path = "./lance-index" }
+lance-linalg = { version = "=0.8.20", path = "./lance-linalg" }
+lance-test-macros = { version = "=0.8.20", path = "./lance-test-macros" }
+lance-testing = { version = "=0.8.20", path = "./lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "48.0.0", optional = false }
@@ -85,7 +85,6 @@ lazy_static = "1"
 log = "0.4"
 mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = "0.11"
-nohash-hasher = { version = "0.2.0" }
 num_cpus = "1.0"
 num-traits = "0.2"
 object_store = { version = "0.7.1", features = ["aws", "gcp", "azure"] }

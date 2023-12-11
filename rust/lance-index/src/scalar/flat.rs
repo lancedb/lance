@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::{any::Any, ops::Bound, sync::Arc};
 
 use arrow_array::{
@@ -23,7 +24,6 @@ use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use lance_core::{format::RowAddress, Result};
-use nohash_hasher::IntMap;
 use roaring::RoaringBitmap;
 use serde::Serialize;
 
@@ -52,7 +52,7 @@ impl FlatIndex {
     }
 }
 
-fn remap_batch(batch: RecordBatch, mapping: &IntMap<u64, Option<u64>>) -> Result<RecordBatch> {
+fn remap_batch(batch: RecordBatch, mapping: &HashMap<u64, Option<u64>>) -> Result<RecordBatch> {
     let row_ids = batch.column(1).as_primitive::<UInt64Type>();
     let val_idx_and_new_id = row_ids
         .values()
@@ -123,7 +123,7 @@ impl BTreeSubIndex for FlatIndexMetadata {
     async fn remap_subindex(
         &self,
         serialized: RecordBatch,
-        mapping: &IntMap<u64, Option<u64>>,
+        mapping: &HashMap<u64, Option<u64>>,
     ) -> Result<RecordBatch> {
         remap_batch(serialized, mapping)
     }
@@ -254,7 +254,7 @@ impl ScalarIndex for FlatIndex {
     // Same as above, this is dead code at the moment but should work
     async fn remap(
         &self,
-        mapping: &IntMap<u64, Option<u64>>,
+        mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
         let remapped = remap_batch((*self.data).clone(), mapping)?;
@@ -362,7 +362,7 @@ mod tests {
         // 0 -> 2000
         // 3 -> delete
         // Keep remaining as is
-        let mapping = IntMap::<u64, Option<u64>>::from_iter(vec![(0, Some(2000)), (3, None)]);
+        let mapping = HashMap::<u64, Option<u64>>::from_iter(vec![(0, Some(2000)), (3, None)]);
         let metadata = FlatIndexMetadata::new(DataType::Int32);
         let remapped = metadata
             .remap_subindex((*index.data).clone(), &mapping)
@@ -388,7 +388,7 @@ mod tests {
     #[tokio::test]
     async fn test_remap_to_nothing() {
         let index = example_index();
-        let mapping = IntMap::<u64, Option<u64>>::from_iter(vec![
+        let mapping = HashMap::<u64, Option<u64>>::from_iter(vec![
             (5, None),
             (0, None),
             (3, None),
