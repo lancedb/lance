@@ -79,7 +79,16 @@ impl ExecutionPlan for TestingExec {
         todo!()
     }
 
-    fn statistics(&self) -> datafusion::physical_plan::Statistics {
-        todo!()
+    fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
+        // Statistics are loaded irrespective of whether they are requested or
+        // not, so, we need to return an Ok response here.
+        //
+        // This is a bug in DF and should be fixed upstream.
+        //
+        // See: https://github.com/apache/arrow-datafusion/blob/93b21bdcd3d465ed78b610b54edf1418a47fc497/datafusion/physical-plan/src/display.rs#L263-L266
+
+        Ok(datafusion::physical_plan::Statistics::new_unknown(
+            self.schema().as_ref(),
+        ))
     }
 }

@@ -277,60 +277,93 @@ fn maybe_indexed_column<'a, 'b>(
 }
 
 // Extract a literal scalar value from an expression, if it is a literal, or None
-fn maybe_scalar(expr: &Expr, expected_type: &DataType) -> Option<ScalarValue> {
-    match expr {
-        Expr::Literal(value) => safe_coerce_scalar(value, expected_type),
+fn maybe_scalar(expr: &Expr, expected_type: &DataType) -> Result<Option<ScalarValue>> {
+    Ok(match expr {
+        Expr::Literal(value) => safe_coerce_scalar(value, expected_type)?,
         _ => None,
-    }
+    })
 }
 
 // Extract a list of scalar values from an expression, if it is a list of scalar values, or None
-fn maybe_scalar_list(exprs: &Vec<Expr>, expected_type: &DataType) -> Option<Vec<ScalarValue>> {
+fn maybe_scalar_list(
+    exprs: &Vec<Expr>,
+    expected_type: &DataType,
+) -> Result<Option<Vec<ScalarValue>>> {
     let mut scalar_values = Vec::with_capacity(exprs.len());
     for expr in exprs {
-        match maybe_scalar(expr, expected_type) {
+        match maybe_scalar(expr, expected_type)? {
             Some(scalar_val) => {
                 scalar_values.push(scalar_val);
             }
             None => {
-                return None;
+                return Ok(None);
             }
         }
     }
-    Some(scalar_values)
+    Ok(Some(scalar_values))
 }
 
 fn visit_between(
     between: &Between,
     index_info: &dyn IndexInformationProvider,
-) -> Option<IndexedExpression> {
-    let (column, col_type) = maybe_indexed_column(&between.expr, index_info)?;
+) -> Result<Option<IndexedExpression>> {
+    let (column, col_type) = if let Some(col) = maybe_indexed_column(&between.expr, index_info) {
+        col
+    } else {
+        return Ok(None);
+    };
+
     let low = maybe_scalar(&between.low, col_type)?;
     let high = maybe_scalar(&between.high, col_type)?;
 
-    let query = ScalarQuery::Range(Bound::Included(low.clone()), Bound::Included(high.clone()));
-    let indexed_expr = IndexedExpression::index_query(column.to_string(), query);
-    if between.negated {
-        indexed_expr.maybe_not()
-    } else {
-        Some(indexed_expr)
+    fn visit_between_inner(
+        high: Option<ScalarValue>,
+        low: Option<ScalarValue>,
+        column: &str,
+        negated: bool,
+    ) -> Option<IndexedExpression> {
+        let high = high?;
+        let low = low?;
+        let query = ScalarQuery::Range(Bound::Included(low.clone()), Bound::Included(high.clone()));
+        let indexed_expr = IndexedExpression::index_query(column.to_string(), query);
+        if negated {
+            indexed_expr.maybe_not()
+        } else {
+            Some(indexed_expr)
+        }
     }
+
+    Ok(visit_between_inner(high, low, column, between.negated))
 }
 
 fn visit_in_list(
     in_list: &InList,
     index_info: &dyn IndexInformationProvider,
-) -> Option<IndexedExpression> {
-    let (column, col_type) = maybe_indexed_column(&in_list.expr, index_info)?;
+) -> Result<Option<IndexedExpression>> {
+    let (column, col_type) = if let Some(col) = maybe_indexed_column(&in_list.expr, index_info) {
+        col
+    } else {
+        return Ok(None);
+    };
+
     let values = maybe_scalar_list(&in_list.list, col_type)?;
 
-    let query = ScalarQuery::IsIn(values);
-    let indexed_expr = IndexedExpression::index_query(column.to_string(), query);
-    if in_list.negated {
-        indexed_expr.maybe_not()
-    } else {
-        Some(indexed_expr)
+    fn visit_in_list_inner(
+        values: Option<Vec<ScalarValue>>,
+        column: &str,
+        negated: bool,
+    ) -> Option<IndexedExpression> {
+        let values = values?;
+        let query = ScalarQuery::IsIn(values);
+        let indexed_expr = IndexedExpression::index_query(column.to_string(), query);
+        if negated {
+            indexed_expr.maybe_not()
+        } else {
+            Some(indexed_expr)
+        }
     }
+
+    Ok(visit_in_list_inner(values, column, in_list.negated))
 }
 
 fn visit_is_bool(
@@ -363,9 +396,15 @@ fn visit_is_null(
     }
 }
 
-fn visit_not(expr: &Expr, index_info: &dyn IndexInformationProvider) -> Option<IndexedExpression> {
-    let node = visit_node(expr, index_info)?;
-    node.maybe_not()
+fn visit_not(
+    expr: &Expr,
+    index_info: &dyn IndexInformationProvider,
+) -> Result<Option<IndexedExpression>> {
+    Ok(if let Some(node) = visit_node(expr, index_info)? {
+        node.maybe_not()
+    } else {
+        None
+    })
 }
 
 fn visit_comparison_normalized(scalar: ScalarValue, op: &Operator) -> ScalarQuery {
@@ -384,45 +423,53 @@ fn visit_comparison_normalized(scalar: ScalarValue, op: &Operator) -> ScalarQuer
 fn visit_comparison(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
-) -> Option<IndexedExpression> {
+) -> Result<Option<IndexedExpression>> {
     let left_col = maybe_indexed_column(&expr.left, index_info);
-    if let Some((column, col_type)) = left_col {
-        let scalar = maybe_scalar(&expr.right, col_type)?;
-        Some(IndexedExpression::index_query(
-            column.to_string(),
-            visit_comparison_normalized(scalar, &expr.op),
-        ))
+    let indexed_expr = if let Some((column, col_type)) = left_col {
+        if let Some(scalar) = maybe_scalar(&expr.right, col_type)? {
+            Some(IndexedExpression::index_query(
+                column.to_string(),
+                visit_comparison_normalized(scalar, &expr.op),
+            ))
+        } else {
+            None
+        }
+    } else if let Some((column, col_type)) = maybe_indexed_column(&expr.right, index_info) {
+        if let Some(scalar) = maybe_scalar(&expr.left, col_type)? {
+            Some(IndexedExpression::index_query(
+                column.to_string(),
+                visit_comparison_normalized(scalar, &expr.op),
+            ))
+        } else {
+            None
+        }
     } else {
-        let (column, col_type) = maybe_indexed_column(&expr.right, index_info)?;
-        let scalar = maybe_scalar(&expr.left, col_type)?;
-        Some(IndexedExpression::index_query(
-            column.to_string(),
-            visit_comparison_normalized(scalar, &expr.op),
-        ))
-    }
+        None
+    };
+    Ok(indexed_expr)
 }
 
 fn visit_and(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
-) -> Option<IndexedExpression> {
-    let left = visit_node(&expr.left, index_info);
-    let right = visit_node(&expr.right, index_info);
-    match (left, right) {
+) -> Result<Option<IndexedExpression>> {
+    let left = visit_node(&expr.left, index_info)?;
+    let right = visit_node(&expr.right, index_info)?;
+    Ok(match (left, right) {
         (Some(left), Some(right)) => Some(left.and(right)),
         (Some(left), None) => Some(left.refine((*expr.right).clone())),
         (None, Some(right)) => Some(right.refine((*expr.left).clone())),
         (None, None) => None,
-    }
+    })
 }
 
 fn visit_or(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
-) -> Option<IndexedExpression> {
-    let left = visit_node(&expr.left, index_info);
-    let right = visit_node(&expr.right, index_info);
-    match (left, right) {
+) -> Result<Option<IndexedExpression>> {
+    let left = visit_node(&expr.left, index_info)?;
+    let right = visit_node(&expr.right, index_info)?;
+    Ok(match (left, right) {
         (Some(left), Some(right)) => left.maybe_or(right),
         // If one side can use an index and the other side cannot then
         // we must abandon the entire thing.  For example, consider the
@@ -432,37 +479,40 @@ fn visit_or(
         (Some(_), None) => None,
         (None, Some(_)) => None,
         (None, None) => None,
-    }
+    })
 }
 
 fn visit_binary_expr(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
-) -> Option<IndexedExpression> {
-    match &expr.op {
+) -> Result<Option<IndexedExpression>> {
+    Ok(match &expr.op {
         Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq | Operator::Eq => {
-            visit_comparison(expr, index_info)
+            visit_comparison(expr, index_info)?
         }
         // visit_comparison will maybe create an Eq query which we negate
-        Operator::NotEq => visit_comparison(expr, index_info).and_then(|node| node.maybe_not()),
-        Operator::And => visit_and(expr, index_info),
-        Operator::Or => visit_or(expr, index_info),
+        Operator::NotEq => visit_comparison(expr, index_info)?.and_then(|node| node.maybe_not()),
+        Operator::And => visit_and(expr, index_info)?,
+        Operator::Or => visit_or(expr, index_info)?,
         _ => None,
-    }
+    })
 }
 
-fn visit_node(expr: &Expr, index_info: &dyn IndexInformationProvider) -> Option<IndexedExpression> {
-    match expr {
-        Expr::Between(between) => visit_between(between, index_info),
-        Expr::InList(in_list) => visit_in_list(in_list, index_info),
+fn visit_node(
+    expr: &Expr,
+    index_info: &dyn IndexInformationProvider,
+) -> Result<Option<IndexedExpression>> {
+    Ok(match expr {
+        Expr::Between(between) => visit_between(between, index_info)?,
+        Expr::InList(in_list) => visit_in_list(in_list, index_info)?,
         Expr::IsFalse(expr) => visit_is_bool(expr.as_ref(), index_info, false),
         Expr::IsTrue(expr) => visit_is_bool(expr.as_ref(), index_info, true),
         Expr::IsNull(expr) => visit_is_null(expr.as_ref(), index_info, false),
         Expr::IsNotNull(expr) => visit_is_null(expr.as_ref(), index_info, true),
-        Expr::Not(expr) => visit_not(expr.as_ref(), index_info),
-        Expr::BinaryExpr(binary_expr) => visit_binary_expr(binary_expr, index_info),
+        Expr::Not(expr) => visit_not(expr.as_ref(), index_info)?,
+        Expr::BinaryExpr(binary_expr) => visit_binary_expr(binary_expr, index_info)?,
         _ => None,
-    }
+    })
 }
 
 /// A trait to be used in `apply_scalar_indices` to inform the function which columns are indexeds
@@ -476,8 +526,10 @@ pub trait IndexInformationProvider {
 pub fn apply_scalar_indices(
     expr: Expr,
     index_info: &dyn IndexInformationProvider,
-) -> IndexedExpression {
-    visit_node(&expr, index_info).unwrap_or(IndexedExpression::refine_only(expr))
+) -> Result<IndexedExpression> {
+    let indexed_expr = visit_node(&expr, index_info)?;
+    let indexed_expr = indexed_expr.unwrap_or(IndexedExpression::refine_only(expr));
+    Ok(indexed_expr)
 }
 
 #[cfg(test)]
@@ -530,6 +582,13 @@ mod tests {
             todo!()
         }
 
+        fn get_table_source(
+            &self,
+            _: TableReference,
+        ) -> datafusion_common::Result<std::sync::Arc<dyn TableSource>> {
+            todo!()
+        }
+
         fn get_function_meta(&self, _: &str) -> Option<std::sync::Arc<ScalarUDF>> {
             todo!()
         }
@@ -574,7 +633,7 @@ mod tests {
             .sql_to_expr(expr, &df_schema, &mut planner_context)
             .unwrap();
 
-        let actual = apply_scalar_indices(expr.clone(), index_info);
+        let actual = apply_scalar_indices(expr.clone(), index_info).unwrap();
         if let Some(expected) = expected {
             assert_eq!(actual, expected);
         } else {

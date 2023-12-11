@@ -29,6 +29,7 @@ use lance_arrow::*;
 use object_store::path::Path;
 use snafu::{location, Location};
 
+use crate::io::writer::statistics::StatisticsBuilder;
 use crate::{
     datatypes::{Field, Schema},
     encodings::{
@@ -144,10 +145,19 @@ impl FileWriter {
         // Statistics need to traverse nested arrays, so it's a separate loop
         // from writing which is done on top-level arrays.
         if let Some(stats_collector) = &mut self.stats_collector {
+            fn collect_and_append_stats(
+                stats_builder: &mut StatisticsBuilder,
+                arrays: &[&ArrayRef],
+            ) -> Result<()> {
+                let stats_row = statistics::collect_statistics(arrays)?;
+                stats_builder.append(stats_row)
+            }
+
             for (field, arrays) in fields_in_batches(batches, &self.schema) {
                 if let Some(stats_builder) = stats_collector.get_builder(field.id) {
-                    let stats_row = statistics::collect_statistics(&arrays);
-                    stats_builder.append(stats_row);
+                    if let Err(_err) = collect_and_append_stats(stats_builder, &arrays) {
+                        // TODO: Handle this error.
+                    }
                 }
             }
         }

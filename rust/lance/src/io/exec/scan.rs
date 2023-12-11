@@ -20,10 +20,11 @@ use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema as ArrowSchema, SchemaRef};
+use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
-    SendableRecordBatchStream,
+    SendableRecordBatchStream, Statistics,
 };
 use futures::stream::Stream;
 use futures::{stream, Future};
@@ -327,22 +328,27 @@ impl ExecutionPlan for LanceScanExec {
         )?))
     }
 
-    fn statistics(&self) -> datafusion::physical_plan::Statistics {
+    fn statistics(&self) -> Result<Statistics> {
         let stats = self.fragments.iter().fold(
-            datafusion::physical_plan::Statistics::default(),
+            Statistics::new_unknown(self.schema().as_ref()),
             |mut stats, fragment| {
                 match stats.num_rows {
-                    Some(num_rows) => {
-                        stats.num_rows = Some(num_rows + fragment.num_rows().unwrap_or(0));
+                    Precision::Inexact(num_rows) => {
+                        stats.num_rows =
+                            Precision::Inexact(num_rows + fragment.num_rows().unwrap_or(0));
                     }
-                    None => {
-                        stats.num_rows = fragment.num_rows();
+                    Precision::Absent => {
+                        stats.num_rows = fragment
+                            .num_rows()
+                            .map(|num| Precision::Inexact(num))
+                            .unwrap_or(Precision::Absent);
                     }
+                    Precision::Exact(_) => unreachable!(),
                 }
                 stats
             },
         );
         // Statistics not yet fully implemented. currently only contains `num_rows`
-        stats
+        Ok(stats)
     }
 }

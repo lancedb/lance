@@ -32,7 +32,7 @@ use snafu::{location, Location};
 fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
     match expr {
         Expr::Literal(scalar_value) => {
-            Ok(Expr::Literal(safe_coerce_scalar(scalar_value, data_type).ok_or_else(|| Error::IO {
+            Ok(Expr::Literal(safe_coerce_scalar(scalar_value, data_type)?.ok_or_else(|| Error::IO {
                 message: format!("Received literal {expr} and could not convert to literal of type '{data_type:?}'"),
                 location: location!(),
             })?))

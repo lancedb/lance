@@ -17,7 +17,7 @@ use std::sync::{Arc, RwLock};
 
 use super::super::utils::make_rowid_capture_stream;
 use super::write_fragments_internal;
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch};
+use arrow_array::{Array, FixedSizeListArray, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
 use arrow_select::concat::concat;
 use datafusion::common::DFSchema;
@@ -136,10 +136,10 @@ impl UpdateBuilder {
         if dest_type != src_type {
             expr = match expr {
                 // TODO: remove this branch once DataFusion supports casting List to FSL
-                Expr::Literal(value @ ScalarValue::List(_, _))
+                Expr::Literal(value @ ScalarValue::List(_))
                     if matches!(dest_type, DataType::FixedSizeList(_, _)) =>
                 {
-                    Expr::Literal(safe_coerce_scalar(&value, &dest_type).ok_or_else(|| {
+                    Expr::Literal(safe_coerce_scalar(&value, &dest_type)?.ok_or_else(|| {
                         ArrowError::CastError(format!(
                             "Failed to cast {} to {} during planning",
                             value.data_type(),
@@ -279,8 +279,10 @@ impl UpdateJob {
                         if let ScalarValue::Fixedsizelist(values, field, size) = scalar {
                             if let Some(values) = values {
                                 // Convert each scalar to an array, then concat to get a single list.
-                                let values: Vec<ArrayRef> =
-                                    values.iter().map(|v| v.to_array()).collect();
+                                let values = values
+                                    .iter()
+                                    .map(|v| v.to_array())
+                                    .collect::<datafusion::error::Result<Vec<_>>>()?;
                                 let value_refs: Vec<&dyn Array> =
                                     values.iter().map(|v| v.as_ref()).collect();
                                 let values = concat(&value_refs).unwrap();
@@ -303,7 +305,7 @@ impl UpdateJob {
                     }
                 }
             } else {
-                new_values.into_array(batch.num_rows())
+                new_values.into_array(batch.num_rows())?
             };
             batch = batch.replace_column_by_name(column.as_str(), new_values)?;
         }

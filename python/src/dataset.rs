@@ -331,17 +331,17 @@ impl Dataset {
 
         if let Some(nearest) = nearest {
             let column = nearest
-                .get_item("column")
+                .get_item("column")?
                 .ok_or_else(|| PyKeyError::new_err("Need column for nearest"))?
                 .to_string();
 
             let qval = nearest
-                .get_item("q")
+                .get_item("q")?
                 .ok_or_else(|| PyKeyError::new_err("Need q for nearest"))?;
             let data = ArrayData::from_pyarrow(qval)?;
             let q = Float32Array::from(data);
 
-            let k: usize = if let Some(k) = nearest.get_item("k") {
+            let k: usize = if let Some(k) = nearest.get_item("k")? {
                 if k.is_none() {
                     // Use limit if k is not specified, default to 10.
                     limit.unwrap_or(10) as usize
@@ -352,7 +352,7 @@ impl Dataset {
                 10
             };
 
-            let nprobes: usize = if let Some(nprobes) = nearest.get_item("nprobes") {
+            let nprobes: usize = if let Some(nprobes) = nearest.get_item("nprobes")? {
                 if nprobes.is_none() {
                     DEFAULT_NPROBS
                 } else {
@@ -362,23 +362,24 @@ impl Dataset {
                 DEFAULT_NPROBS
             };
 
-            let metric_type: Option<MetricType> = if let Some(metric) = nearest.get_item("metric") {
-                if metric.is_none() {
-                    None
+            let metric_type: Option<MetricType> =
+                if let Some(metric) = nearest.get_item("metric")? {
+                    if metric.is_none() {
+                        None
+                    } else {
+                        Some(
+                            MetricType::try_from(metric.to_string().to_lowercase().as_str())
+                                .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                        )
+                    }
                 } else {
-                    Some(
-                        MetricType::try_from(metric.to_string().to_lowercase().as_str())
-                            .map_err(|err| PyValueError::new_err(err.to_string()))?,
-                    )
-                }
-            } else {
-                None
-            };
+                    None
+                };
 
             // When refine factor is specified, a final Refine stage will be added to the I/O plan,
             // and use Flat index over the raw vectors to refine the results.
             // By default, `refine_factor` is None to not involve extra I/O exec node and random access.
-            let refine_factor: Option<u32> = if let Some(rf) = nearest.get_item("refine_factor") {
+            let refine_factor: Option<u32> = if let Some(rf) = nearest.get_item("refine_factor")? {
                 if rf.is_none() {
                     None
                 } else {
@@ -388,7 +389,7 @@ impl Dataset {
                 None
             };
 
-            let use_index: bool = if let Some(idx) = nearest.get_item("use_index") {
+            let use_index: bool = if let Some(idx) = nearest.get_item("use_index")? {
                 PyAny::downcast::<PyBool>(idx)?.extract()?
             } else {
                 true
@@ -662,24 +663,24 @@ impl Dataset {
                 let mut pq_params = PQBuildParams::default();
                 let mut m_type = MetricType::L2;
                 if let Some(kwargs) = kwargs {
-                    if let Some(mt) = kwargs.get_item("metric_type") {
+                    if let Some(mt) = kwargs.get_item("metric_type")? {
                         m_type = MetricType::try_from(mt.to_string().to_lowercase().as_str())
                             .map_err(|err| PyValueError::new_err(err.to_string()))?;
                     }
 
-                    if let Some(n) = kwargs.get_item("num_partitions") {
+                    if let Some(n) = kwargs.get_item("num_partitions")? {
                         ivf_params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
                     };
 
-                    if let Some(n) = kwargs.get_item("num_bits") {
+                    if let Some(n) = kwargs.get_item("num_bits")? {
                         pq_params.num_bits = PyAny::downcast::<PyInt>(n)?.extract()?
                     };
 
-                    if let Some(n) = kwargs.get_item("num_sub_vectors") {
+                    if let Some(n) = kwargs.get_item("num_sub_vectors")? {
                         pq_params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
                     };
 
-                    if let Some(o) = kwargs.get_item("use_opq") {
+                    if let Some(o) = kwargs.get_item("use_opq")? {
                         #[cfg(not(feature = "opq"))]
                         if PyAny::downcast::<PyBool>(o)?.extract()? {
                             return Err(PyValueError::new_err(
@@ -689,11 +690,11 @@ impl Dataset {
                         pq_params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
                     };
 
-                    if let Some(o) = kwargs.get_item("max_opq_iterations") {
+                    if let Some(o) = kwargs.get_item("max_opq_iterations")? {
                         pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
                     };
 
-                    if let Some(c) = kwargs.get_item("ivf_centroids") {
+                    if let Some(c) = kwargs.get_item("ivf_centroids")? {
                         let batch = RecordBatch::from_pyarrow(c)?;
                         if "_ivf_centroids" != batch.schema().field(0).name() {
                             return Err(PyValueError::new_err(
@@ -704,7 +705,7 @@ impl Dataset {
                         ivf_params.centroids = Some(Arc::new(centroids.clone()))
                     };
 
-                    if let Some(f) = kwargs.get_item("precomputed_partitions_file") {
+                    if let Some(f) = kwargs.get_item("precomputed_partitions_file")? {
                         ivf_params.precomputed_partitons_file = Some(f.to_string());
                     };
                 }
@@ -716,20 +717,20 @@ impl Dataset {
                 let mut params = DiskANNParams::default();
                 let mut m_type = MetricType::L2;
                 if let Some(kwargs) = kwargs {
-                    if let Some(mt) = kwargs.get_item("metric_type") {
+                    if let Some(mt) = kwargs.get_item("metric_type")? {
                         m_type = MetricType::try_from(mt.to_string().to_lowercase().as_str())
                             .map_err(|err| PyValueError::new_err(err.to_string()))?;
                     }
 
-                    if let Some(n) = kwargs.get_item("r") {
+                    if let Some(n) = kwargs.get_item("r")? {
                         params.r = PyAny::downcast::<PyInt>(n)?.extract()?
                     };
 
-                    if let Some(n) = kwargs.get_item("alpha") {
+                    if let Some(n) = kwargs.get_item("alpha")? {
                         params.alpha = PyAny::downcast::<PyFloat>(n)?.extract()?
                     };
 
-                    if let Some(n) = kwargs.get_item("l") {
+                    if let Some(n) = kwargs.get_item("l")? {
                         params.l = PyAny::downcast::<PyInt>(n)?.extract()?
                     };
                 }
@@ -894,17 +895,17 @@ fn parse_write_mode(mode: &str) -> PyResult<WriteMode> {
     }
 }
 
-pub fn get_object_store_params(options: &PyDict) -> Option<ObjectStoreParams> {
-    if options.is_none() {
+pub fn get_object_store_params(options: &PyDict) -> PyResult<Option<ObjectStoreParams>> {
+    Ok(if options.is_none() {
         None
-    } else if let Some(commit_handler) = options.get_item("commit_handler") {
+    } else if let Some(commit_handler) = options.get_item("commit_handler")? {
         let py_commit_lock = PyCommitLock::new(commit_handler.to_object(options.py()));
         let mut object_store_params = ObjectStoreParams::default();
         object_store_params.set_commit_lock(Arc::new(py_commit_lock));
         Some(object_store_params)
     } else {
         None
-    }
+    })
 }
 
 pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
@@ -912,25 +913,25 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         None
     } else {
         let mut p = WriteParams::default();
-        if let Some(mode) = options.get_item("mode") {
+        if let Some(mode) = options.get_item("mode")? {
             p.mode = parse_write_mode(mode.extract::<String>()?.as_str())?;
         };
-        if let Some(maybe_nrows) = options.get_item("max_rows_per_file") {
+        if let Some(maybe_nrows) = options.get_item("max_rows_per_file")? {
             p.max_rows_per_file = usize::extract(maybe_nrows)?;
         }
-        if let Some(maybe_nrows) = options.get_item("max_rows_per_group") {
+        if let Some(maybe_nrows) = options.get_item("max_rows_per_group")? {
             p.max_rows_per_group = usize::extract(maybe_nrows)?;
         }
-        if let Some(maybe_nbytes) = options.get_item("max_bytes_per_file") {
+        if let Some(maybe_nbytes) = options.get_item("max_bytes_per_file")? {
             p.max_bytes_per_file = usize::extract(maybe_nbytes)?;
         }
-        if let Some(progress) = options.get_item("progress") {
+        if let Some(progress) = options.get_item("progress")? {
             if !progress.is_none() {
                 p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));
             }
         }
 
-        p.store_params = get_object_store_params(options);
+        p.store_params = get_object_store_params(options)?;
 
         Some(p)
     };

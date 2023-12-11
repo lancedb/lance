@@ -289,7 +289,7 @@ impl ExecutionPlan for TakeExec {
         )))
     }
 
-    fn statistics(&self) -> datafusion::physical_plan::Statistics {
+    fn statistics(&self) -> Result<datafusion::physical_plan::Statistics> {
         self.input.statistics()
     }
 }
