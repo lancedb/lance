@@ -551,7 +551,6 @@ impl TryFrom<&dyn ProductQuantizer> for pb::Pq {
             dimension: pq.dimension() as u32,
             codebook: vec![],
             codebook_tensor: Some(tensor),
-            use_residual: pq.use_residual(),
         })
     }
 }
