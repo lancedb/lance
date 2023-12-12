@@ -19,7 +19,7 @@ use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::{ToPyArrow, *};
 use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use chrono::Duration;
 
@@ -232,8 +232,21 @@ impl Dataset {
             .map(|idx| {
                 let dict = PyDict::new(py);
                 let schema = self_.ds.schema();
-                let field_names = schema
-                    .project_by_ids(idx.fields.as_slice())
+
+                let idx_schema = schema.project_by_ids(idx.fields.as_slice());
+
+                let is_vector = idx_schema
+                    .fields
+                    .iter()
+                    .any(|f| matches!(f.data_type(), DataType::FixedSizeList(_, _)));
+
+                let idx_type = if is_vector {
+                    IndexType::Vector
+                } else {
+                    IndexType::Scalar
+                };
+
+                let field_names = idx_schema
                     .fields
                     .iter()
                     .map(|f| f.name.clone())
@@ -250,8 +263,7 @@ impl Dataset {
                 // TODO: once we add more than vector indices, we need to:
                 // 1. Change protos and write path to persist index type
                 // 2. Use the new field from idx instead of hard coding it to Vector
-                dict.set_item("type", IndexType::Vector.to_string())
-                    .unwrap();
+                dict.set_item("type", idx_type.to_string()).unwrap();
                 dict.set_item("uuid", idx.uuid.to_string()).unwrap();
                 dict.set_item("fields", field_names).unwrap();
                 dict.set_item("version", idx.dataset_version).unwrap();

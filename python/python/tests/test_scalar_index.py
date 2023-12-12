@@ -63,6 +63,14 @@ def data_table(indexed_dataset: lance.LanceDataset):
     return indexed_dataset.scanner().to_table()
 
 
+def test_load_indices(indexed_dataset: lance.LanceDataset):
+    indices = indexed_dataset.list_indices()
+    vec_idx = next(idx for idx in indices if idx["type"] == "Vector")
+    scalar_idx = next(idx for idx in indices if idx["type"] == "Scalar")
+    assert vec_idx is not None
+    assert scalar_idx is not None
+
+
 def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa.Table):
     sample_meta = data_table["meta"][50]
     expected_price = data_table["price"][50]
