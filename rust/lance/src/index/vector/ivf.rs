@@ -779,7 +779,7 @@ pub async fn build_ivf_pq_index(
         let part_ids = ivf2.compute_partitions(&training_data).await?;
 
         let training_data = if metric_type == MetricType::Cosine {
-            // TODO: do not run residual distance for cosine distance.
+            // Do not run residual distance for cosine distance.
             training_data
         } else {
             span!(Level::INFO, "compute residual for PQ training")
