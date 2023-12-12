@@ -286,7 +286,7 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
         if pq.use_residual() {
             transforms.push(Arc::new(ResidualTransform::new(
-                centroids,
+                centroids.clone(),
                 PART_ID_COLUMN,
                 vector_column,
             )));
