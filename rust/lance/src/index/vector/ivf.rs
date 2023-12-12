@@ -170,12 +170,16 @@ impl IVFIndex {
     ) -> Result<RecordBatch> {
         let part_index = self.load_partition(partition_id, true).await?;
 
-        let partition_centroids = self.ivf.centroids.value(partition_id);
-        let residual_key = sub(&query.key, &partition_centroids)?;
-        // Query in partition.
-        let mut part_query = query.clone();
-        part_query.key = residual_key;
-        let batch = part_index.search(&part_query, pre_filter).await?;
+        let query = if self.sub_index.use_residual() {
+            let partition_centroids = self.ivf.centroids.value(partition_id);
+            let residual_key = sub(&query.key, &partition_centroids)?;
+            let mut part_query = query.clone();
+            part_query.key = residual_key;
+            part_query
+        } else {
+            query.clone()
+        };
+        let batch = part_index.search(&query, pre_filter).await?;
         Ok(batch)
     }
 
@@ -350,6 +354,10 @@ impl VectorIndex for IVFIndex {
     }
 
     fn is_loadable(&self) -> bool {
+        false
+    }
+
+    fn use_residual(&self) -> bool {
         false
     }
 

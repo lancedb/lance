@@ -210,6 +210,10 @@ impl VectorIndex for PQIndex {
         true
     }
 
+    fn use_residual(&self) -> bool {
+        self.pq.use_residual()
+    }
+
     /// Load a PQ index (page) from the disk.
     async fn load(
         &self,

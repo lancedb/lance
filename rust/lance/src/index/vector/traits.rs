@@ -57,6 +57,9 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// is loaded on demand by IVF.
     fn is_loadable(&self) -> bool;
 
+    /// Use residual vector to search.
+    fn use_residual(&self) -> bool;
+
     /// If the index can be remapped return Ok.  Else return an error
     /// explaining why not
     fn check_can_remap(&self) -> Result<()>;
