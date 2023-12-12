@@ -17,9 +17,11 @@ from pathlib import Path
 import lance
 import numpy as np
 import pyarrow as pa
-import torch
-from lance.torch.bench_utils import ground_truth, sort_tensors
-from lance.torch.distance import pairwise_l2
+import pytest
+
+torch = pytest.importorskip("torch")
+from lance.torch.bench_utils import ground_truth, sort_tensors  # noqa: E402
+from lance.torch.distance import pairwise_l2  # noqa: E402
 
 
 def test_sort_tensor():

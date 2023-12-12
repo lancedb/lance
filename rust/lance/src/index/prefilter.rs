@@ -18,20 +18,24 @@
 //! row ids can be excluded from the search.
 
 use std::cell::OnceCell;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use futures::future;
+use futures::future::BoxFuture;
 use futures::stream;
+use futures::FutureExt;
 use futures::StreamExt;
+use futures::TryStreamExt;
+use lance_core::format::Fragment;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::utils::mask::RowIdTreeMap;
 use roaring::RoaringBitmap;
 use tracing::instrument;
 use tracing::Instrument;
 
+use crate::dataset::fragment::FileFragment;
 use crate::error::Result;
 use crate::format::Index;
 use crate::utils::future::SharedPrerequisite;
@@ -59,30 +63,16 @@ pub struct PreFilter {
 
 impl PreFilter {
     pub fn new(dataset: Arc<Dataset>, index: Index, filter: Option<Box<dyn FilterLoader>>) -> Self {
-        let dataset_ref = dataset.as_ref();
-        let mut has_fragment = Vec::new();
-        let mut has_deletion_vectors = false;
-        has_fragment.resize(
-            (dataset
-                .manifest
-                .max_fragment_id()
-                .map(|id| id + 1)
-                .unwrap_or(0)) as usize,
-            false,
-        );
-        for frag in dataset_ref.manifest.fragments.iter() {
-            has_fragment[frag.id as usize] = true;
-            has_deletion_vectors |= frag.deletion_file.is_some();
-        }
-        let has_missing_fragments = has_fragment.iter().any(|&x| !x);
-        let dataset_clone = dataset.clone();
-        let deleted_ids = if has_missing_fragments || has_deletion_vectors {
-            Some(SharedPrerequisite::spawn(
-                Self::load_deleted_ids(dataset_clone, index).in_current_span(),
-            ))
-        } else {
-            None
-        };
+        let fragments = index.fragment_bitmap.unwrap_or_else(|| {
+            // If the index doesn't have a fragment bitmap then we don't know which fragments were covered
+            // by the index so we have to be very conservative and figure that any fragment that has ever
+            // been deleted might be part of the index
+            let mut bitmap = RoaringBitmap::new();
+            bitmap.insert_range(0..dataset.manifest.max_fragment_id);
+            bitmap
+        });
+        let deleted_ids =
+            Self::create_deletion_mask(dataset.clone(), fragments).map(SharedPrerequisite::spawn);
         let filtered_ids = filter
             .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
         Self {
@@ -106,46 +96,79 @@ impl PreFilter {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn load_deleted_ids(dataset: Arc<Dataset>, index: Index) -> Result<Arc<RowIdTreeMap>> {
+    async fn do_create_deletion_mask(
+        dataset: Arc<Dataset>,
+        missing_frags: Vec<u32>,
+        frags_with_deletion_files: Vec<u32>,
+    ) -> Result<Arc<RowIdTreeMap>> {
         let fragments = dataset.get_fragments();
-        let frag_id_deletion_vectors = stream::iter(fragments.iter())
-            .map(|frag| async move {
-                let id = frag.id() as u32;
-                let deletion_vector = frag.get_deletion_vector().await;
-                (id, deletion_vector)
-            })
-            .collect::<Vec<_>>()
-            .await;
-        let mut frag_id_deletion_vectors = stream::iter(frag_id_deletion_vectors)
-            .buffer_unordered(num_cpus::get())
-            .filter_map(|(id, maybe_deletion_vector)| {
-                let val = if let Ok(deletion_vector) = maybe_deletion_vector {
-                    deletion_vector.map(|deletion_vector| {
-                        Ok((id, RoaringBitmap::from(deletion_vector.as_ref())))
-                    })
-                } else {
-                    Some(Err(maybe_deletion_vector.unwrap_err()))
-                };
-                future::ready(val)
-            });
+        let frag_map: Arc<HashMap<u32, &FileFragment>> = Arc::new(HashMap::from_iter(
+            fragments.iter().map(|frag| (frag.id() as u32, frag)),
+        ));
+        let frag_id_deletion_vectors = stream::iter(
+            frags_with_deletion_files
+                .iter()
+                .map(|frag_id| (frag_id, frag_map.clone())),
+        )
+        .map(|(frag_id, frag_map)| async move {
+            let frag = frag_map.get(frag_id).unwrap();
+            frag.get_deletion_vector()
+                .await
+                .transpose()
+                .unwrap()
+                .map(|deletion_vector| (*frag_id, RoaringBitmap::from(deletion_vector.as_ref())))
+        })
+        .collect::<Vec<_>>()
+        .await;
+        let mut frag_id_deletion_vectors =
+            stream::iter(frag_id_deletion_vectors).buffer_unordered(num_cpus::get());
 
         let mut deleted_ids = RowIdTreeMap::new();
-        while let Some(res) = frag_id_deletion_vectors.next().await {
-            let (id, deletion_vector) = res?;
+        while let Some((id, deletion_vector)) = frag_id_deletion_vectors.try_next().await? {
             deleted_ids.insert_bitmap(id, deletion_vector);
         }
 
-        let frag_ids_in_dataset: HashSet<u32> =
-            HashSet::from_iter(fragments.iter().map(|frag| frag.id() as u32));
-        if let Some(fragment_bitmap) = index.fragment_bitmap {
-            for frag_id in fragment_bitmap.into_iter() {
-                if !frag_ids_in_dataset.contains(&frag_id) {
-                    // Entire fragment has been deleted
-                    deleted_ids.insert_fragment(frag_id);
-                }
-            }
+        for frag_id in missing_frags.into_iter() {
+            deleted_ids.insert_fragment(frag_id);
         }
         Ok(Arc::new(deleted_ids))
+    }
+
+    /// Creates a task to load deleted row ids in `fragments`
+    ///
+    /// If it can be synchronously determined that there are no missing row ids then
+    /// this function return None
+    pub fn create_deletion_mask(
+        dataset: Arc<Dataset>,
+        fragments: RoaringBitmap,
+    ) -> Option<BoxFuture<'static, Result<Arc<RowIdTreeMap>>>> {
+        let mut missing_frags = Vec::new();
+        let mut frags_with_deletion_files = Vec::new();
+        let frag_map: HashMap<u32, &Fragment> = HashMap::from_iter(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .map(|frag| (frag.id as u32, frag)),
+        );
+        for frag_id in fragments.iter() {
+            let frag = frag_map.get(&frag_id);
+            if let Some(frag) = frag {
+                if frag.deletion_file.is_some() {
+                    frags_with_deletion_files.push(frag_id);
+                }
+            } else {
+                missing_frags.push(frag_id);
+            }
+        }
+        if missing_frags.is_empty() && frags_with_deletion_files.is_empty() {
+            None
+        } else {
+            Some(
+                Self::do_create_deletion_mask(dataset, missing_frags, frags_with_deletion_files)
+                    .boxed(),
+            )
+        }
     }
 
     /// Waits for the prefilter to be fully loaded

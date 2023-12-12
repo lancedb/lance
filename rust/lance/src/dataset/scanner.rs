@@ -595,15 +595,6 @@ impl Scanner {
         }
     }
 
-    fn need_to_handle_delete_files(&self) -> bool {
-        let fragments = if let Some(fragments) = self.fragments.as_ref() {
-            fragments
-        } else {
-            self.dataset.fragments()
-        };
-        fragments.iter().any(|frag| frag.deletion_file.is_some())
-    }
-
     /// Create [`ExecutionPlan`] for Scan.
     ///
     /// An ExecutionPlan is a graph of operators that can be executed.
@@ -650,12 +641,9 @@ impl Scanner {
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
     async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        // TODO: Currently, if any of the fragments have a deletion file, we
-        // cannot use scalar indices.  This is fixable, but deferring for a
-        // future PR.
-        //
-        // Also, we do not use scalar indices if there is a post-filter.
-        let use_scalar_index = self.prefilter && !self.need_to_handle_delete_files();
+        // Scalar indices are only used when prefiltering
+        // TODO: Should we use them when postfiltering if there is no vector search?
+        let use_scalar_index = self.prefilter;
 
         // NOTE: we only support node that have one partition. So any nodes that
         // produce multiple need to be repartitioned to 1.
@@ -665,29 +653,22 @@ impl Scanner {
             let filter_plan =
                 planner.create_filter_plan(filter.clone(), &index_info, use_scalar_index)?;
 
-            // TODO: Remove this check once we handle indexed scans with new data
-            // This check is testing to see if we have an indexed query and new data
-            // and, if we do, falling back to a filter plan that does not use scalar indices
-            if let Some(index_query) = filter_plan.index_query.as_ref() {
-                let covered_frags = self.fragments_covered_by_index_query(index_query).await?;
+            // This tests if any of the fragments are missing the physical_rows property (old style)
+            // If they are then we cannot use scalar indices
+            if filter_plan.index_query.is_some() {
                 let fragments = if let Some(fragments) = self.fragments.as_ref() {
                     fragments
                 } else {
                     self.dataset.fragments()
                 };
-                let mut has_new_data = false;
                 let mut has_missing_row_count = false;
                 for frag in fragments {
-                    if !covered_frags.contains(frag.id as u32) {
-                        has_new_data = true;
-                        break;
-                    }
                     if frag.physical_rows.is_none() {
                         has_missing_row_count = true;
                         break;
                     }
                 }
-                if has_new_data || has_missing_row_count {
+                if has_missing_row_count {
                     // We need row counts to use scalar indices.  If we don't have them then
                     // fallback to a non-indexed filter
                     planner.create_filter_plan(filter.clone(), &index_info, false)?
@@ -1028,29 +1009,67 @@ impl Scanner {
             }
         }
 
-        if !missing_frags.is_empty() {
-            // TODO: If there is new data then we need this:
-            //
-            // MaterializeIndexExec(old_frags) -> Take -> Union
-            // Scan(new_frags) -> Filter -> Project    -|
-            //
-            // The project is to drop any columns we had to include
-            // in the full scan merely for the sake of fulfilling the
-            // filter (there may not be any and project can be skipped).
-            //
-            // This is TODO because we need to go from:
-            //   ScalarIndexExpr -> Expr -> PhysicalExpr
-            // which is doable but complex enough to defer to a future PR.
-            panic!("Indexed scans including new data not yet supported (and we should not be able to reach this point)");
-        }
-
         let plan = Arc::new(MaterializeIndexExec::new(
             self.dataset.clone(),
             index_expr.clone(),
             Arc::new(relevant_frags),
         ));
 
-        self.take(plan, projection, self.batch_readahead)
+        let taken = self.take(plan, projection, self.batch_readahead)?;
+
+        let new_data_path: Option<Arc<dyn ExecutionPlan>> = if !missing_frags.is_empty() {
+            // If there is new data then we need this:
+            //
+            // MaterializeIndexExec(old_frags) -> Take -> Union
+            // Scan(new_frags) -> Filter -> Project    -|
+            //
+            // The project is to drop any columns we had to include
+            // in the full scan merely for the sake of fulfilling the
+            // filter.
+            //
+            // If there were no extra columns then we still need the project
+            // because Materialize -> Take puts the row id at the left and
+            // Scan puts the row id at the right
+            let filter_expr = index_expr.to_expr();
+            let filter_cols = Planner::column_names_in_expr(&filter_expr);
+            let full_schema = self
+                .calc_new_fields(projection, &filter_cols)?
+                .map(|filter_only_schema| projection.merge(&filter_only_schema))
+                .transpose()?;
+            let schema = full_schema.as_ref().unwrap_or(projection);
+
+            let planner = Planner::new(Arc::new(schema.into()));
+            let optimized_filter = planner.optimize_expr(filter_expr)?;
+            let physical_refine_expr = planner.create_physical_expr(&optimized_filter)?;
+
+            let new_data_scan = self.scan_fragments(
+                true,
+                false,
+                Arc::new(schema.clone()),
+                missing_frags.into(),
+                false,
+            );
+            let filtered = Arc::new(FilterExec::try_new(physical_refine_expr, new_data_scan)?);
+            let projection = Schema::try_from(taken.schema().as_ref())?;
+            Some(Arc::new(ProjectionExec::try_new(
+                filtered,
+                projection.into(),
+            )?))
+        } else {
+            None
+        };
+
+        if let Some(new_data_path) = new_data_path {
+            let unioned = UnionExec::new(vec![taken, new_data_path]);
+            // Enforce only 1 partition.
+            let unioned = RepartitionExec::try_new(
+                Arc::new(unioned),
+                datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
+            )?;
+            Ok(Arc::new(unioned))
+        } else {
+            Ok(taken)
+        }
     }
 
     /// Create an Execution plan with a scan node
@@ -3177,11 +3196,8 @@ mod test {
                     params,
                 )
                 .await;
-            // TODO: Remove below check once we support new data in scalar index scan
-            if !params.use_new_data && !params.use_deleted_data {
-                // Materialization is always required if there is a refine
-                assert!(query_plan.contains("MaterializeIndex"));
-            }
+            // Materialization is always required if there is a refine
+            assert!(query_plan.contains("MaterializeIndex"));
             // The result should not include the sample query
             self.assert_none(
                 &batch,
@@ -3210,15 +3226,13 @@ mod test {
             let (query_plan, batch) = self
                 .run_query("indexed != 50", Some(self.sample_query()), params)
                 .await;
-            // TODO: Remove below check once we support new data in scalar index scan
-            if !params.use_new_data && !params.use_deleted_data {
-                if params.use_index {
-                    // An ANN search whose prefilter is fully satisfied by the index should be
-                    // able to use a ScalarIndexQuery
-                    assert!(query_plan.contains("ScalarIndexQuery"));
-                } else {
-                    assert!(query_plan.contains("MaterializeIndex"));
-                }
+            if params.use_index {
+                // An ANN search whose prefilter is fully satisfied by the index should be
+                // able to use a ScalarIndexQuery
+                assert!(query_plan.contains("ScalarIndexQuery"));
+            } else {
+                // A KNN search requires materialization of the index
+                assert!(query_plan.contains("MaterializeIndex"));
             }
             // The result should not include the sample query
             self.assert_none(
@@ -3258,11 +3272,8 @@ mod test {
 
         async fn check_simple_indexed_only(&self, params: &ScalarTestParams) {
             let (query_plan, batch) = self.run_query("indexed != 50", None, params).await;
-            // TODO: Remove below check once we support new data in scalar index scan
-            if !params.use_new_data && !params.use_deleted_data {
-                // Materialization is always required for non-vector search
-                assert!(query_plan.contains("MaterializeIndex"));
-            }
+            // Materialization is always required for non-vector search
+            assert!(query_plan.contains("MaterializeIndex"));
             // The result should not include the targeted row
             self.assert_none(
                 &batch,
@@ -3298,11 +3309,8 @@ mod test {
                 None,
                 params
             ).await;
-            // TODO: Remove below check once we support new data in scalar index scan
-            if !params.use_new_data && !params.use_deleted_data {
-                // Materialization is always required for non-vector search
-                assert!(query_plan.contains("MaterializeIndex"));
-            }
+            // Materialization is always required for non-vector search
+            assert!(query_plan.contains("MaterializeIndex"));
             // The result should not include the targeted row
             self.assert_none(
                 &batch,

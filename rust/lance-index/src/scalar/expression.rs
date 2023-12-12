@@ -256,6 +256,23 @@ impl ScalarIndexExpr {
             }
         }
     }
+
+    pub fn to_expr(&self) -> Expr {
+        match self {
+            Self::Not(inner) => Expr::Not(inner.to_expr().into()),
+            Self::And(lhs, rhs) => {
+                let lhs = lhs.to_expr();
+                let rhs = rhs.to_expr();
+                lhs.and(rhs)
+            }
+            Self::Or(lhs, rhs) => {
+                let lhs = lhs.to_expr();
+                let rhs = rhs.to_expr();
+                lhs.or(rhs)
+            }
+            Self::Query(column, query) => query.to_expr(column.clone()),
+        }
+    }
 }
 
 // Extract a column from the expression, if it is a column, or None

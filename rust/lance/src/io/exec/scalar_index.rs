@@ -30,10 +30,14 @@ use lance_index::scalar::{
     ScalarIndex,
 };
 use pin_project::pin_project;
+use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use crate::{index::DatasetIndexInternalExt, Dataset};
+use crate::{
+    index::{prefilter::PreFilter, DatasetIndexInternalExt},
+    Dataset,
+};
 
 lazy_static::lazy_static! {
     pub static ref SCALAR_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![Field::new("result".to_string(), DataType::Binary, true)]));
@@ -251,7 +255,18 @@ impl MaterializeIndexExec {
         fragments: Arc<Vec<Fragment>>,
     ) -> Result<RecordBatch> {
         // TODO: multiple batches, stream without materializing all row ids in memory
-        let mask = expr.evaluate(dataset.as_ref()).await?;
+        let mask = expr.evaluate(dataset.as_ref());
+        let fragment_bitmap = RoaringBitmap::from_iter(fragments.iter().map(|frag| frag.id as u32));
+        // The user-requested `fragments` is guaranteed to be stricter than the index's fragment
+        // bitmap.  This node only runs on indexed fragments and any fragments that were deleted
+        // when the index was trained will still be deleted when the index is queried.
+        let prefilter = PreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap);
+        let mask = if let Some(prefilter) = prefilter {
+            let (mask, prefilter) = futures::try_join!(mask, prefilter)?;
+            mask.also_block((*prefilter).clone())
+        } else {
+            mask.await?
+        };
         let ids = match (mask.allow_list, mask.block_list) {
             (None, None) => FragIdIter::new(fragments).collect::<Vec<_>>(),
             (Some(allow_list), None) => FragIdIter::new(fragments)
