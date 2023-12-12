@@ -593,6 +593,27 @@ mod tests {
         assert_eq!(tensor.shape, vec![256, 16]);
     }
 
+    #[test]
+    fn test_cosine_pq_does_not_use_residual() {
+        let pq = ProductQuantizerImpl::<Float32Type> {
+            num_bits: 8,
+            num_sub_vectors: 4,
+            dimension: 16,
+            codebook: Arc::new(Float32Array::from_iter_values(repeat(0.0).take(128))),
+            metric_type: MetricType::Cosine,
+        };
+        assert!(!pq.use_residual());
+
+        let pq = ProductQuantizerImpl::<Float32Type> {
+            num_bits: 8,
+            num_sub_vectors: 4,
+            dimension: 16,
+            codebook: Arc::new(Float32Array::from_iter_values(repeat(0.0).take(128))),
+            metric_type: MetricType::L2,
+        };
+        assert!(pq.use_residual());
+    }
+
     #[tokio::test]
     async fn test_empty_dist_iter_cosine() {
         let pq = ProductQuantizerImpl::<Float32Type> {

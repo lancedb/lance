@@ -283,19 +283,26 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         range: Option<Range<u32>>,
         precomputed_partitions: Option<HashMap<u64, u32>>,
     ) -> Self {
-        let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
-        if pq.use_residual() {
-            transforms.push(Arc::new(ResidualTransform::new(
-                centroids.clone(),
-                PART_ID_COLUMN,
+        let transforms: Vec<Arc<dyn Transformer>> = if pq.use_residual() {
+            vec![
+                Arc::new(ResidualTransform::new(
+                    centroids.clone(),
+                    PART_ID_COLUMN,
+                    vector_column,
+                )),
+                Arc::new(PQTransformer::new(
+                    pq.clone(),
+                    RESIDUAL_COLUMN,
+                    PQ_CODE_COLUMN,
+                )),
+            ]
+        } else {
+            vec![Arc::new(PQTransformer::new(
+                pq.clone(),
                 vector_column,
-            )));
-        }
-        transforms.push(Arc::new(PQTransformer::new(
-            pq.clone(),
-            RESIDUAL_COLUMN,
-            PQ_CODE_COLUMN,
-        )));
+                PQ_CODE_COLUMN,
+            ))]
+        };
         Self {
             centroids: centroids.clone(),
             metric_type,
