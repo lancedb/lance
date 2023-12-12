@@ -770,11 +770,16 @@ pub async fn build_ivf_pq_index(
         // the time to compute them is not that bad.
         let part_ids = ivf2.compute_partitions(&training_data).await?;
 
-        let residuals = span!(Level::INFO, "compute residual for PQ training")
-            .in_scope(|| ivf2.compute_residual(&training_data, Some(&part_ids)))
-            .await?;
+        let training_data = if metric_type == MetricType::Cosine {
+            // TODO: do not run residual distance for cosine distance.
+            training_data
+        } else {
+            span!(Level::INFO, "compute residual for PQ training")
+                .in_scope(|| ivf2.compute_residual(&training_data, Some(&part_ids)))
+                .await?
+        };
         info!("Start train PQ: params={:#?}", pq_params);
-        pq_params.build(&residuals, metric_type).await?
+        pq_params.build(&training_data, metric_type).await?
     };
     info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
 

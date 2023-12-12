@@ -99,6 +99,9 @@ message PQ {
 
   // Tensor of codebook. `2 ^ num_bits * dimension` of floats.
   Tensor codebook_tensor = 5;
+
+  // If set true, use residual vector to calculate PQ distance.
+  bool use_residual = 6;
 }
 
 // Transform type
