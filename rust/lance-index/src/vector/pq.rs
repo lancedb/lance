@@ -61,6 +61,9 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
 
     // TODO: move to pub(crate) once the refactor of lance::index to lance-index is done.
     fn codebook_as_fsl(&self) -> FixedSizeListArray;
+
+    /// Whether to use residual as input or not.
+    fn use_residual(&self) -> bool;
 }
 
 /// Product Quantization, optimized for [Apache Arrow] buffer memory layout.
@@ -529,6 +532,10 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
         )
         .unwrap()
     }
+
+    fn use_residual(&self) -> bool {
+        self.metric_type != MetricType::Cosine
+    }
 }
 
 #[allow(clippy::fallible_impl_from)]
@@ -583,6 +590,27 @@ mod tests {
         let tensor = proto.codebook_tensor.as_ref().unwrap();
         assert_eq!(tensor.data_type, pb::tensor::DataType::Float16 as i32);
         assert_eq!(tensor.shape, vec![256, 16]);
+    }
+
+    #[test]
+    fn test_cosine_pq_does_not_use_residual() {
+        let pq = ProductQuantizerImpl::<Float32Type> {
+            num_bits: 8,
+            num_sub_vectors: 4,
+            dimension: 16,
+            codebook: Arc::new(Float32Array::from_iter_values(repeat(0.0).take(128))),
+            metric_type: MetricType::Cosine,
+        };
+        assert!(!pq.use_residual());
+
+        let pq = ProductQuantizerImpl::<Float32Type> {
+            num_bits: 8,
+            num_sub_vectors: 4,
+            dimension: 16,
+            codebook: Arc::new(Float32Array::from_iter_values(repeat(0.0).take(128))),
+            metric_type: MetricType::L2,
+        };
+        assert!(pq.use_residual());
     }
 
     #[tokio::test]

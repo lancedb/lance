@@ -284,6 +284,10 @@ impl VectorIndex for DiskANNIndex {
         false
     }
 
+    fn use_residual(&self) -> bool {
+        false
+    }
+
     async fn load(
         &self,
         _reader: &dyn Reader,

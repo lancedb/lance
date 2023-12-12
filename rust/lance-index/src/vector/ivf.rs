@@ -283,12 +283,10 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         range: Option<Range<u32>>,
         precomputed_partitions: Option<HashMap<u64, u32>>,
     ) -> Self {
-        Self {
-            centroids: centroids.clone(),
-            metric_type,
-            transforms: vec![
+        let transforms: Vec<Arc<dyn Transformer>> = if pq.use_residual() {
+            vec![
                 Arc::new(ResidualTransform::new(
-                    centroids,
+                    centroids.clone(),
                     PART_ID_COLUMN,
                     vector_column,
                 )),
@@ -297,7 +295,18 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
                     RESIDUAL_COLUMN,
                     PQ_CODE_COLUMN,
                 )),
-            ],
+            ]
+        } else {
+            vec![Arc::new(PQTransformer::new(
+                pq.clone(),
+                vector_column,
+                PQ_CODE_COLUMN,
+            ))]
+        };
+        Self {
+            centroids: centroids.clone(),
+            metric_type,
+            transforms,
             partition_range: range,
             precomputed_partitions,
         }

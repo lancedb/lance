@@ -170,12 +170,16 @@ impl IVFIndex {
     ) -> Result<RecordBatch> {
         let part_index = self.load_partition(partition_id, true).await?;
 
-        let partition_centroids = self.ivf.centroids.value(partition_id);
-        let residual_key = sub(&query.key, &partition_centroids)?;
-        // Query in partition.
-        let mut part_query = query.clone();
-        part_query.key = residual_key;
-        let batch = part_index.search(&part_query, pre_filter).await?;
+        let query = if self.sub_index.use_residual() {
+            let partition_centroids = self.ivf.centroids.value(partition_id);
+            let residual_key = sub(&query.key, &partition_centroids)?;
+            let mut part_query = query.clone();
+            part_query.key = residual_key;
+            part_query
+        } else {
+            query.clone()
+        };
+        let batch = part_index.search(&query, pre_filter).await?;
         Ok(batch)
     }
 
@@ -350,6 +354,10 @@ impl VectorIndex for IVFIndex {
     }
 
     fn is_loadable(&self) -> bool {
+        false
+    }
+
+    fn use_residual(&self) -> bool {
         false
     }
 
@@ -770,11 +778,16 @@ pub async fn build_ivf_pq_index(
         // the time to compute them is not that bad.
         let part_ids = ivf2.compute_partitions(&training_data).await?;
 
-        let residuals = span!(Level::INFO, "compute residual for PQ training")
-            .in_scope(|| ivf2.compute_residual(&training_data, Some(&part_ids)))
-            .await?;
+        let training_data = if metric_type == MetricType::Cosine {
+            // Do not run residual distance for cosine distance.
+            training_data
+        } else {
+            span!(Level::INFO, "compute residual for PQ training")
+                .in_scope(|| ivf2.compute_residual(&training_data, Some(&part_ids)))
+                .await?
+        };
         info!("Start train PQ: params={:#?}", pq_params);
-        pq_params.build(&residuals, metric_type).await?
+        pq_params.build(&training_data, metric_type).await?
     };
     info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
 
