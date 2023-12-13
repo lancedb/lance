@@ -396,6 +396,10 @@ fn make_chunked_requests(
     //    indices[i] * byte_width + block_size < indices[i+1] * byte_width
     // It might allow slightly larger sequential reads.
     for i in 0..indices.len() - 1 {
+        // If contiguous, continue
+        if indices[i + 1] == indices[i] {
+            continue;
+        }
         if indices[i + 1] as usize * byte_width > indices[start] as usize * byte_width + block_size
         {
             chunked_ranges.push(start..i + 1);
