@@ -120,7 +120,7 @@ class KMeans:
 
     def fit(
         self,
-        data: Union[IterableDataset, np.ndarray, torch.Tensor],
+        data: Union[IterableDataset, np.ndarray, torch.Tensor, pa.FixedSizeListArray],
     ) -> None:
         """Fit - Train the kmeans model.
 
