@@ -46,6 +46,26 @@ def test_cosine_distance():
     assert np.allclose(dist.cpu(), expect_dists)
 
 
+def test_pairwise_cosine():
+    from lance.torch.distance import pairwise_cosine
+
+    x = np.random.randn(20, 256).astype(np.float32)
+    y = np.random.rand(100, 256).astype(np.float32)
+
+    dist = pairwise_cosine(torch.from_numpy(x), torch.from_numpy(y))
+    assert dist.shape == (20, 100)
+
+    expect = np.array(
+        [
+            1 - np.dot(x_row, y_row) / np.linalg.norm(x_row) / np.linalg.norm(y_row)
+            for x_row in x
+            for y_row in y
+        ],
+        dtype=np.float32,
+    ).reshape(20, 100)
+    assert np.allclose(dist.cpu(), expect)
+
+
 def test_l2_distance():
     from lance.torch.distance import l2_distance
 

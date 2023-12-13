@@ -17,6 +17,48 @@ from typing import Optional, Tuple
 
 import torch
 
+__all__ = [
+    "pairwise_cosine",
+    "cosine_distance",
+    "pairwise_l2",
+    "l2_distance",
+    "dot_distance",
+]
+
+
+@torch.jit.script
+def _pairwise_cosine(
+    x: torch.Tensor, y: torch.Tensor, y2: torch.Tensor
+) -> torch.Tensor:
+    x2 = torch.linalg.norm(x, dim=1).reshape((-1, 1))
+    return 1 - (x @ y.T).div_(x2).div_(y2)
+
+
+def pairwise_cosine(
+    x: torch.Tensor, y: torch.Tensor, *, y2: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Compute pair-wise cosine distance between x and y.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        A 2-D ``[M, D]`` tensor, containing `M` vectors.
+    y : torch.Tensor
+        A 2-D ``[N, D]`` tensor, containing `N` vectors.
+
+    Returns
+    -------
+    A ``[M, N]`` tensor with pair-wise cosine distance between x and y.
+    """
+    if len(x.shape) != 2 or len(y.shape) != 2:
+        raise ValueError(
+            f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
+        )
+    if y2 is None:
+        y2 = torch.linalg.norm(y, dim=1)
+
+    return _pairwise_cosine(x, y, y2)
+
 
 @torch.jit.script
 def _cosine_distance(
@@ -34,8 +76,7 @@ def _cosine_distance(
     distances = []
 
     for sub_vectors in torch.split(vectors, split_size):
-        x2 = torch.linalg.norm(sub_vectors, dim=1, keepdim=True)
-        dists = 1 - (sub_vectors @ centroids.T).div_(x2 * y2)
+        dists = _pairwise_cosine(sub_vectors, centroids, y2)
         part_ids = torch.argmin(dists, dim=1, keepdim=True)
         partitions.append(part_ids)
         distances.append(dists.take_along_dim(part_ids, dim=1))
@@ -84,7 +125,9 @@ def cosine_distance(
     raise RuntimeError("Cosine distance out of memory")
 
 
-def pairwise_l2(x: torch.Tensor, y: torch.Tensor, y2: Optional[torch.Tensor] = None):
+def pairwise_l2(
+    x: torch.Tensor, y: torch.Tensor, y2: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     """Compute pair-wise L2 distance between x and y.
 
     Parameters
