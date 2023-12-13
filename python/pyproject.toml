@@ -67,7 +67,7 @@ torch = [
 ]
 
 [tool.ruff]
-select = ["F", "E", "W", "I", "G", "TCH", "PERF"]
+select = ["F", "E", "W", "I", "G", "TCH", "PERF", "CPY001"]
 
 [tool.mypy]
 python_version = "3.11"
