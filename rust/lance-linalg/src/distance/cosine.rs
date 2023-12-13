@@ -211,7 +211,7 @@ where
     let y_sq = dot(y, y);
     let xy = dot(x, y);
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
-    1.0 - xy / x_norm * y_sq.sqrt()
+    1.0 - xy / (x_norm * y_sq.sqrt())
 }
 
 #[inline]
