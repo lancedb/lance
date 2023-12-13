@@ -34,7 +34,7 @@ use datafusion::{
     },
     prelude::Expr,
 };
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::io::ReadBatchParams;
 use lance_core::ROW_ID_FIELD;
@@ -294,7 +294,12 @@ impl FragmentScanner {
         let stream = futures::stream::iter(simplified_predicates.into_iter().enumerate()).map(
             move |(batch_id, predicate)| {
                 let scanner_ref = scanner.clone();
-                async move { scanner_ref.read_batch(batch_id, predicate).await }
+                tokio::task::spawn(async move { scanner_ref.read_batch(batch_id, predicate).await })
+                    .map(|res| match res {
+                        Ok(Ok(batch)) => Ok(batch),
+                        Ok(Err(err)) => Err(err),
+                        Err(err) => Err(DataFusionError::Execution(err.to_string())),
+                    })
             },
         );
 

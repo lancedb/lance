@@ -56,7 +56,9 @@ fn get_filter(level: Option<&str>) -> PyResult<filter::LevelFilter> {
 
 #[pyfunction]
 pub fn trace_to_chrome(path: Option<&str>, level: Option<&str>) -> PyResult<TraceGuard> {
-    let mut builder = ChromeLayerBuilder::new().trace_style(TraceStyle::Async);
+    let mut builder = ChromeLayerBuilder::new()
+        .trace_style(TraceStyle::Async)
+        .include_args(true);
     if let Some(path) = path {
         builder = builder.file(path);
     }
