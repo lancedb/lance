@@ -48,7 +48,7 @@ def pairwise_cosine(
 
     Returns
     -------
-    A ``[M, N]`` tensor with pair-wise cosine distance between x and y.
+    A ``[M, N]`` tensor with pair-wise cosine distances between x and y.
     """
     if len(x.shape) != 2 or len(y.shape) != 2:
         raise ValueError(
