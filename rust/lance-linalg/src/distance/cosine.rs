@@ -28,7 +28,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
-use num_traits::{AsPrimitive, Float, FromPrimitive};
+use num_traits::{AsPrimitive, FromPrimitive};
 
 use super::dot::dot;
 use super::norm_l2::norm_l2;
@@ -140,7 +140,7 @@ impl Cosine for Float32Type {
             y_norm16.reduce_sum() + y_norm8.reduce_sum() + norm_l2(&other[aligned_len..]).powi(2);
         let xy =
             xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &other[aligned_len..]);
-        1.0 - xy / (x_norm * y_norm.sqrt() + f32::epsilon())
+        1.0 - xy / x_norm / y_norm.sqrt()
     }
 
     #[inline]
@@ -211,7 +211,7 @@ where
     let y_sq = dot(y, y);
     let xy = dot(x, y);
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
-    1.0 - xy / (x_norm * y_sq.sqrt() + f32::epsilon())
+    1.0 - xy / (x_norm * y_sq.sqrt())
 }
 
 #[inline]
@@ -227,7 +227,7 @@ where
     let xy = dot(x, y);
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
     // use f64 for overflow protection.
-    1.0 - (xy / (x_norm * y_norm + f32::epsilon()))
+    1.0 - (xy / (x_norm * y_norm))
 }
 
 /// Cosine distance function between two vectors.
