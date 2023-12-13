@@ -227,7 +227,7 @@ where
     let xy = dot(x, y);
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
     // use f64 for overflow protection.
-    1.0 - (xy / x_norm * y_norm)
+    1.0 - (xy / (x_norm * y_norm))
 }
 
 /// Cosine distance function between two vectors.
