@@ -918,12 +918,15 @@ impl Dataset {
             sub_requests.push((current_fragment, start..end));
         }
 
-        let batches = futures::stream::iter(sub_requests.into_iter())
-            .then(|(fragment, indices_range)| {
+        let take_tasks = sub_requests
+            .into_iter()
+            .map(|(fragment, indices_range)| {
                 let local_ids = &local_ids_buffer[indices_range];
                 fragment.take(local_ids, projection)
             })
-            // .buffered(num_cpus::get() * 4)
+            .collect::<Vec<_>>();
+        let batches = stream::iter(take_tasks)
+            .buffered(num_cpus::get() * 4)
             .try_collect::<Vec<RecordBatch>>()
             .await?;
 
