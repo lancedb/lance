@@ -121,16 +121,17 @@ class KMeans:
     def fit(
         self,
         data: Union[IterableDataset, np.ndarray, torch.Tensor],
-    ):
+    ) -> None:
         """Fit - Train the kmeans model.
 
         Parameters
         ----------
         data : pa.FixedSizeListArray, np.ndarray, or torch.Tensor
-            2-D input data to train kmeans.
-
+            2-D vectors to train kmeans.
         """
         start = time.time()
+        if isinstance(data, pa.FixedSizeListArray):
+            data = np.stack(data.to_numpy(zero_copy_only=False))
         if isinstance(data, (np.ndarray, torch.Tensor)):
             self._random_init(data)
             data = TensorDataset(data, batch_size=4096)
