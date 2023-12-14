@@ -397,7 +397,7 @@ fn make_chunked_requests(
     // It might allow slightly larger sequential reads.
     for i in 0..indices.len() - 1 {
         // If contiguous, continue
-        if indices[i + 1] == indices[i] {
+        if indices[i + 1] == indices[i] + 1 {
             continue;
         }
         if indices[i + 1] as usize * byte_width > indices[start] as usize * byte_width + block_size

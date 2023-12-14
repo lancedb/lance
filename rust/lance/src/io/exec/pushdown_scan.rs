@@ -291,8 +291,17 @@ impl FragmentScanner {
 
         let scanner = Arc::new(self);
 
-        let stream = futures::stream::iter(simplified_predicates.into_iter().enumerate()).map(
-            move |(batch_id, predicate)| {
+        let stream = futures::stream::iter(simplified_predicates.into_iter().enumerate())
+            // We can skip any batches where the predicate is guaranteed to be unsatisfied.
+            // By skipping at this point, we prevent these batches from taking a slot in
+            // the batch readahead buffer.
+            .filter(|(_, predicate)| {
+                futures::future::ready(!matches!(
+                    predicate,
+                    Expr::Literal(ScalarValue::Boolean(Some(false)))
+                ))
+            })
+            .map(move |(batch_id, predicate)| {
                 let scanner_ref = scanner.clone();
                 tokio::task::spawn(async move { scanner_ref.read_batch(batch_id, predicate).await })
                     .map(|res| match res {
@@ -300,8 +309,7 @@ impl FragmentScanner {
                         Ok(Err(err)) => Err(err),
                         Err(err) => Err(DataFusionError::Execution(err.to_string())),
                     })
-            },
-        );
+            });
 
         let stream = if ordered_output {
             stream
