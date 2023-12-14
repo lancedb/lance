@@ -175,12 +175,12 @@ pub fn hash(array: &dyn Array) -> Result<UInt64Array> {
 mod tests {
     use super::*;
 
-    use approx::assert_relative_eq;
     use std::{
         collections::HashSet,
         f32::{INFINITY, NAN, NEG_INFINITY},
     };
 
+    use approx::assert_relative_eq;
     use arrow_array::{
         Float32Array, Int16Array, Int8Array, LargeStringArray, StringArray, UInt32Array, UInt8Array,
     };
