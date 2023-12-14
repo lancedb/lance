@@ -115,8 +115,10 @@ pub fn argmin_opt<T: Num + Bounded + PartialOrd>(
 }
 
 /// L2 normalize a vector.
+///
+/// Returns an iterator of normalized values.
 pub fn normalize<T: Float + Sum>(v: &[T]) -> impl Iterator<Item = T> + '_ {
-    let l2_norm = v.iter().map(|x| x.powi(2)).sum::<T>();
+    let l2_norm = v.iter().map(|x| x.powi(2)).sum::<T>().sqrt();
     v.iter().map(move |&x| x / l2_norm)
 }
 
@@ -279,11 +281,14 @@ mod tests {
 
     #[test]
     fn test_normalize_vector() {
-        let v = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let v = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0];
+        let l2_norm = v.iter().map(|&x| x.powi(2)).sum::<f32>().sqrt();
+        assert_relative_eq!(l2_norm, 55_f32.sqrt());
         let normalized = normalize(&v).collect::<Vec<f32>>();
         normalized
             .iter()
             .enumerate()
-            .for_each(|(idx, &x)| assert_relative_eq!(x, (idx + 1) as f32 / 55.0));
+            .for_each(|(idx, &x)| assert_relative_eq!(x, (idx + 1) as f32 / 55.0_f32.sqrt()));
+        assert_relative_eq!(1.0, normalized.iter().map(|&x| x.powi(2)).sum::<f32>());
     }
 }
