@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
+use std::iter::Sum;
 use std::{collections::hash_map::DefaultHasher, hash::Hash, hash::Hasher};
 
 use arrow_array::{
@@ -113,6 +114,12 @@ pub fn argmin_opt<T: Num + Bounded + PartialOrd>(
     argmin_value_opt(iter).map(|(idx, _)| idx)
 }
 
+/// L2 normalize a vector.
+pub fn normalize<T: Float + Sum>(v: &[T]) -> impl Iterator<Item = T> + '_ {
+    let l2_norm = v.iter().map(|x| x.powi(2)).sum::<T>();
+    v.iter().map(move |&x| x / l2_norm)
+}
+
 fn hash_numeric_type<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Result<UInt64Array>
 where
     T::Native: Hash,
@@ -168,6 +175,7 @@ pub fn hash(array: &dyn Array) -> Result<UInt64Array> {
 mod tests {
     use super::*;
 
+    use approx::assert_relative_eq;
     use std::{
         collections::HashSet,
         f32::{INFINITY, NAN, NEG_INFINITY},
@@ -267,5 +275,15 @@ mod tests {
     fn test_hash_unsupported_type() {
         let a = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
         assert!(hash(&a).is_err());
+    }
+
+    #[test]
+    fn test_normalize_vector() {
+        let v = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let normalized = normalize(&v).collect::<Vec<f32>>();
+        normalized
+            .iter()
+            .enumerate()
+            .for_each(|(idx, &x)| assert_relative_eq!(x, (idx + 1) as f32 / 55.0));
     }
 }
