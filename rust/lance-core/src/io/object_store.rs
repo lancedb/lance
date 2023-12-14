@@ -49,7 +49,7 @@ use crate::io::commit::external_manifest::{ExternalManifestCommitHandler, Extern
 
 mod scheduler;
 mod tracing;
-use self::scheduler::Scheduler;
+use self::scheduler::{ScheduledReader, Scheduler};
 use self::tracing::ObjectStoreTracingExt;
 use crate::{
     error::{Error, Result},
@@ -58,6 +58,9 @@ use crate::{
         CloudObjectReader, ObjectWriter, Reader,
     },
 };
+
+const DEFAULT_LOCAL_IO_LIMIT: usize = 100;
+const DEFAULT_OBJECT_STORE_IO_LIMIT: usize = 100;
 
 #[async_trait]
 pub trait ObjectStoreExt {
@@ -108,7 +111,7 @@ pub struct ObjectStore {
     base_path: Path,
     block_size: usize,
     pub commit_handler: Arc<dyn CommitHandler>,
-    scheduler: Scheduler,
+    scheduler: Arc<Scheduler>,
 }
 
 impl std::fmt::Display for ObjectStore {
@@ -301,8 +304,7 @@ pub struct ObjectStoreParams {
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub storage_options: Option<HashMap<String, String>>,
-    pub max_concurrent_requests: usize,
-    pub max_queue_size: usize,
+    pub max_concurrent_requests: Option<usize>,
 }
 
 impl Default for ObjectStoreParams {
@@ -315,8 +317,7 @@ impl Default for ObjectStoreParams {
             aws_credentials: None,
             object_store_wrapper: None,
             storage_options: None,
-            max_concurrent_requests: 40,
-            max_queue_size: 1000,
+            max_concurrent_requests: None,
         }
     }
 }
@@ -420,11 +421,12 @@ impl ObjectStore {
                     .commit_handler
                     .clone()
                     .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
-                scheduler: Scheduler::new(
+                scheduler: Arc::new(Scheduler::new(
                     inner,
-                    params.max_concurrent_requests,
-                    params.max_queue_size,
-                ),
+                    params
+                        .max_concurrent_requests
+                        .unwrap_or(DEFAULT_LOCAL_IO_LIMIT),
+                )),
             },
             Path::from_filesystem_path(&expanded_path)?,
         ))
@@ -437,11 +439,12 @@ impl ObjectStore {
     pub fn local() -> Self {
         let inner = Arc::new(LocalFileSystem::new()).traced();
         let params = ObjectStoreParams::default();
-        let scheduler = Scheduler::new(
+        let scheduler = Arc::new(Scheduler::new(
             inner.clone(),
-            params.max_concurrent_requests,
-            params.max_queue_size,
-        );
+            params
+                .max_concurrent_requests
+                .unwrap_or(DEFAULT_LOCAL_IO_LIMIT),
+        ));
         Self {
             inner: Arc::new(LocalFileSystem::new()).traced(),
             scheme: String::from("file"),
@@ -456,11 +459,12 @@ impl ObjectStore {
     pub fn memory() -> Self {
         let inner = Arc::new(InMemory::new()).traced();
         let params = ObjectStoreParams::default();
-        let scheduler = Scheduler::new(
+        let scheduler = Arc::new(Scheduler::new(
             inner.clone(),
-            params.max_concurrent_requests,
-            params.max_queue_size,
-        );
+            params
+                .max_concurrent_requests
+                .unwrap_or(DEFAULT_LOCAL_IO_LIMIT),
+        ));
         Self {
             inner,
             scheme: String::from("memory"),
@@ -501,9 +505,11 @@ impl ObjectStore {
                 self.block_size,
             )?),
         };
-        Ok(Box::new(
-            self.scheduler.open_reader(Arc::new(path.clone()), inner),
-        ))
+        Ok(Box::new(ScheduledReader::new(
+            self.scheduler.clone(),
+            Arc::new(path.clone()),
+            inner,
+        )))
     }
 
     /// Create an [ObjectWriter] from local [std::path::Path]
@@ -828,11 +834,12 @@ async fn configure_store(url: &str, mut options: ObjectStoreParams) -> Result<Ob
                 .with_allow_http(true);
             let inner = Arc::new(builder.build()?);
 
-            let scheduler = Scheduler::new(
+            let scheduler = Arc::new(Scheduler::new(
                 inner.clone(),
-                options.max_concurrent_requests,
-                options.max_queue_size,
-            );
+                options
+                    .max_concurrent_requests
+                    .unwrap_or(DEFAULT_OBJECT_STORE_IO_LIMIT),
+            ));
 
             Ok(ObjectStore {
                 inner,
@@ -848,11 +855,12 @@ async fn configure_store(url: &str, mut options: ObjectStoreParams) -> Result<Ob
             storage_options.with_env_gcs();
             let (store, _) = parse_url_opts(&url, storage_options.as_gcs_options())?;
             let inner = Arc::new(store);
-            let scheduler = Scheduler::new(
+            let scheduler = Arc::new(Scheduler::new(
                 inner.clone(),
-                options.max_concurrent_requests,
-                options.max_queue_size,
-            );
+                options
+                    .max_concurrent_requests
+                    .unwrap_or(DEFAULT_OBJECT_STORE_IO_LIMIT),
+            ));
             Ok(ObjectStore {
                 inner,
                 scheme: String::from("gs"),
@@ -870,11 +878,12 @@ async fn configure_store(url: &str, mut options: ObjectStoreParams) -> Result<Ob
 
             let (store, _) = parse_url_opts(&url, storage_options.as_azure_options())?;
             let inner = Arc::new(store);
-            let scheduler = Scheduler::new(
+            let scheduler = Arc::new(Scheduler::new(
                 inner.clone(),
-                options.max_concurrent_requests,
-                options.max_queue_size,
-            );
+                options
+                    .max_concurrent_requests
+                    .unwrap_or(DEFAULT_OBJECT_STORE_IO_LIMIT),
+            ));
 
             Ok(ObjectStore {
                 inner,
@@ -891,11 +900,12 @@ async fn configure_store(url: &str, mut options: ObjectStoreParams) -> Result<Ob
         "file" => Ok(ObjectStore::from_path(url.path(), &options)?.0),
         "memory" => {
             let inner = Arc::new(InMemory::new()).traced();
-            let scheduler = Scheduler::new(
+            let scheduler = Arc::new(Scheduler::new(
                 inner.clone(),
-                options.max_concurrent_requests,
-                options.max_queue_size,
-            );
+                options
+                    .max_concurrent_requests
+                    .unwrap_or(DEFAULT_OBJECT_STORE_IO_LIMIT),
+            ));
 
             Ok(ObjectStore {
                 inner,
@@ -934,7 +944,7 @@ impl ObjectStore {
             None => store,
         };
 
-        let scheduler = Scheduler::new(store.clone(), 40, 1000);
+        let scheduler = Arc::new(Scheduler::new(store.clone(), 40));
 
         Self {
             inner: store,

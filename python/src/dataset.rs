@@ -156,30 +156,27 @@ pub struct Dataset {
 #[pymethods]
 impl Dataset {
     #[new]
+    #[pyo3(signature = (
+        uri,
+        version = None,
+        index_cache_size = None,
+        metadata_cache_size = None,
+        **object_store_params
+    ))]
     fn new(
         uri: String,
         version: Option<u64>,
-        block_size: Option<usize>,
         index_cache_size: Option<usize>,
         metadata_cache_size: Option<usize>,
-        commit_handler: Option<PyObject>,
+        object_store_params: Option<PyObjectStoreParams>,
     ) -> PyResult<Self> {
-        let mut params = ReadParams {
+        let params = ReadParams {
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
             metadata_cache_size: metadata_cache_size.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
             session: None,
-            store_options: Some(ObjectStoreParams {
-                block_size,
-                ..Default::default()
-            }),
+            store_options: object_store_params.map(ObjectStoreParams::from),
         };
 
-        if let Some(commit_handler) = commit_handler {
-            let py_commit_lock = PyCommitLock::new(commit_handler);
-            let mut object_store_params = ObjectStoreParams::default();
-            object_store_params.set_commit_lock(Arc::new(py_commit_lock));
-            params.store_options = Some(object_store_params);
-        }
         let dataset = if let Some(ver) = version {
             RT.runtime
                 .block_on(LanceDataset::checkout_with_params(&uri, ver, &params))
@@ -994,5 +991,28 @@ impl WriteFragmentProgress for PyWriteProgress {
             location: location!(),
         })?;
         Ok(())
+    }
+}
+
+#[derive(FromPyObject)]
+pub struct PyObjectStoreParams {
+    #[pyo3(item)]
+    pub block_size: Option<usize>,
+    #[pyo3(item)]
+    pub commit_handler: Option<PyObject>,
+    #[pyo3(item)]
+    pub max_concurrent_requests: Option<usize>,
+}
+
+impl From<PyObjectStoreParams> for ObjectStoreParams {
+    fn from(py_params: PyObjectStoreParams) -> Self {
+        let mut params = ObjectStoreParams::default();
+        params.block_size = py_params.block_size;
+        params.max_concurrent_requests = py_params.max_concurrent_requests;
+        if let Some(commit_handler) = py_params.commit_handler.clone() {
+            let py_commit_lock = PyCommitLock::new(commit_handler);
+            params.set_commit_lock(Arc::new(py_commit_lock));
+        }
+        params
     }
 }

@@ -58,6 +58,7 @@ def dataset(
     block_size: Optional[int] = None,
     commit_lock: Optional[CommitLock] = None,
     index_cache_size: Optional[int] = None,
+    max_concurrent_requests: Optional[int] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -88,6 +89,9 @@ def dataset(
         and the row ids (``nd.array([n], dtype=uint64)``).
         Approximately, ``n = Total Rows / number of IVF partitions``.
         ``pq = number of PQ sub-vectors``.
+    max_concurrent_requests: optional, int
+        Maximum number of concurrent requests to the object store. Default value is
+        ``100`` for local file systems.
     """
     ds = LanceDataset(
         uri,
@@ -95,6 +99,7 @@ def dataset(
         block_size,
         commit_lock=commit_lock,
         index_cache_size=index_cache_size,
+        max_concurrent_requests=max_concurrent_requests,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
