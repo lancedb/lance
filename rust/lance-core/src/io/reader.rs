@@ -37,6 +37,7 @@ use arrow_select::{
 use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
+use futures::future::try_join_all;
 use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::*;
 
@@ -499,14 +500,12 @@ impl FileReader {
         projection: &Schema,
     ) -> Result<RecordBatch> {
         let range_in_batches = self.metadata.range_to_batches(range)?;
-        let batches =
-            stream::iter(range_in_batches)
+        let futures =
+            range_in_batches.into_iter()
                 .map(|(batch_id, range)| async move {
                     self.read_batch(batch_id, range, projection).await
-                })
-                .buffered(num_cpus::get())
-                .try_collect::<Vec<_>>()
-                .await?;
+                });
+        let batches = try_join_all(futures).await?;
         if batches.len() == 1 {
             return Ok(batches[0].clone());
         }
@@ -520,14 +519,12 @@ impl FileReader {
     #[instrument(level = "debug", skip_all)]
     pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
         let indices_in_batches = self.metadata.group_indices_to_batches(indices);
-        let batches = stream::iter(indices_in_batches)
+        let futures = indices_in_batches.into_iter()
             .map(|batch| async move {
                 self.read_batch(batch.batch_id, batch.offsets.as_slice(), projection)
                     .await
-            })
-            .buffered(num_cpus::get() * 4)
-            .try_collect::<Vec<_>>()
-            .await?;
+            });
+        let batches = try_join_all(futures).await?;
 
         let mut schema = ArrowSchema::from(projection);
         if self.with_row_id {
@@ -564,7 +561,7 @@ impl FileReader {
             if projection.fields.is_empty() {
                 return Ok(None);
             }
-            let arrays = futures::stream::iter(projection.fields.iter().cloned())
+            let futures = projection.fields.iter().cloned()
                 .map(|field| async move {
                     read_array(
                         self,
@@ -574,10 +571,8 @@ impl FileReader {
                         &ReadBatchParams::RangeFull,
                     )
                     .await
-                })
-                .buffered(num_cpus::get())
-                .try_collect::<Vec<_>>()
-                .await?;
+                });
+            let arrays = try_join_all(futures).await?;
 
             let schema = ArrowSchema::from(&projection);
             let batch = RecordBatch::try_new(Arc::new(schema), arrays)?;
@@ -638,13 +633,9 @@ async fn read_batch(
     deletion_vector: Option<Arc<DeletionVector>>,
 ) -> Result<RecordBatch> {
     let batch = if !schema.fields.is_empty() {
-        // We box this because otherwise we get a higher-order lifetime error.
-        let arrs = stream::iter(&schema.fields)
-            .map(|f| async { read_array(reader, f, batch_id, &reader.page_table, params).await })
-            .buffered(num_cpus::get() * 4)
-            .try_collect::<Vec<_>>()
-            .boxed();
-        let arrs = arrs.await?;
+        let futures = schema.fields.iter()
+            .map(|f| async { read_array(reader, f, batch_id, &reader.page_table, params).await });
+        let arrs = try_join_all(futures).await?;
         Some(RecordBatch::try_new(Arc::new(schema.into()), arrs)?)
     } else {
         // If the schema is empty, we are just fetching row ids.

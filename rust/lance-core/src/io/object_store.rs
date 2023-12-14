@@ -47,7 +47,9 @@ use super::local::LocalObjectReader;
 #[cfg(feature = "dynamodb")]
 use crate::io::commit::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore};
 
+mod scheduler;
 mod tracing;
+use self::scheduler::Scheduler;
 use self::tracing::ObjectStoreTracingExt;
 use crate::{
     error::{Error, Result},
@@ -106,6 +108,7 @@ pub struct ObjectStore {
     base_path: Path,
     block_size: usize,
     pub commit_handler: Arc<dyn CommitHandler>,
+    scheduler: Scheduler,
 }
 
 impl std::fmt::Display for ObjectStore {
@@ -298,6 +301,8 @@ pub struct ObjectStoreParams {
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub storage_options: Option<HashMap<String, String>>,
+    pub max_concurrent_requests: usize,
+    pub max_queue_size: usize,
 }
 
 impl Default for ObjectStoreParams {
@@ -310,6 +315,8 @@ impl Default for ObjectStoreParams {
             aws_credentials: None,
             object_store_wrapper: None,
             storage_options: None,
+            max_concurrent_requests: 40,
+            max_queue_size: 1000,
         }
     }
 }
@@ -401,10 +408,11 @@ impl ObjectStore {
         }
 
         let expanded_path = expanded_path.canonicalize()?;
+        let inner = Arc::new(LocalFileSystem::new()).traced();
 
         Ok((
             Self {
-                inner: Arc::new(LocalFileSystem::new()).traced(),
+                inner: inner.clone(),
                 scheme: String::from("file"),
                 base_path: Path::from_absolute_path(&expanded_path)?,
                 block_size: 4 * 1024, // 4KB block size
@@ -412,31 +420,11 @@ impl ObjectStore {
                     .commit_handler
                     .clone()
                     .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
-            },
-            Path::from_filesystem_path(&expanded_path)?,
-        ))
-    }
-
-    fn new_from_path(
-        str_path: &str,
-        commit_handler: Option<Arc<dyn CommitHandler>>,
-    ) -> Result<(Self, Path)> {
-        let expanded = tilde(str_path).to_string();
-        let expanded_path = StdPath::new(&expanded);
-
-        if !expanded_path.try_exists()? {
-            std::fs::create_dir_all(expanded_path)?;
-        }
-
-        let expanded_path = expanded_path.canonicalize()?;
-
-        Ok((
-            Self {
-                inner: Arc::new(LocalFileSystem::new()).traced(),
-                scheme: String::from("file"),
-                base_path: Path::from_absolute_path(&expanded_path)?,
-                block_size: 4 * 1024, // 4KB block size
-                commit_handler: commit_handler.unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+                scheduler: Scheduler::new(
+                    inner,
+                    params.max_concurrent_requests,
+                    params.max_queue_size,
+                ),
             },
             Path::from_filesystem_path(&expanded_path)?,
         ))
@@ -447,23 +435,39 @@ impl ObjectStore {
     }
     /// Local object store.
     pub fn local() -> Self {
+        let inner = Arc::new(LocalFileSystem::new()).traced();
+        let params = ObjectStoreParams::default();
+        let scheduler = Scheduler::new(
+            inner.clone(),
+            params.max_concurrent_requests,
+            params.max_queue_size,
+        );
         Self {
             inner: Arc::new(LocalFileSystem::new()).traced(),
             scheme: String::from("file"),
             base_path: Path::from("/"),
             block_size: 4 * 1024, // 4KB block size
             commit_handler: Arc::new(RenameCommitHandler),
+            scheduler,
         }
     }
 
     /// Create a in-memory object store directly for testing.
     pub fn memory() -> Self {
+        let inner = Arc::new(InMemory::new()).traced();
+        let params = ObjectStoreParams::default();
+        let scheduler = Scheduler::new(
+            inner.clone(),
+            params.max_concurrent_requests,
+            params.max_queue_size,
+        );
         Self {
-            inner: Arc::new(InMemory::new()).traced(),
+            inner,
             scheme: String::from("memory"),
             base_path: Path::from("/"),
             block_size: 64 * 1024,
             commit_handler: Arc::new(RenameCommitHandler),
+            scheduler,
         }
     }
 
@@ -489,14 +493,17 @@ impl ObjectStore {
     /// Parameters
     /// - ``path``: Absolute path to the file.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
-        match self.scheme.as_str() {
-            "file" => LocalObjectReader::open(path, self.block_size),
-            _ => Ok(Box::new(CloudObjectReader::new(
+        let inner = match self.scheme.as_str() {
+            "file" => LocalObjectReader::open(path, self.block_size)?,
+            _ => Box::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
                 self.block_size,
-            )?)),
-        }
+            )?),
+        };
+        Ok(Box::new(
+            self.scheduler.open_reader(Arc::new(path.clone()), inner),
+        ))
     }
 
     /// Create an [ObjectWriter] from local [std::path::Path]
@@ -713,8 +720,8 @@ impl From<HashMap<String, String>> for StorageOptions {
     }
 }
 
-async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<ObjectStore> {
-    let mut storage_options = StorageOptions(options.storage_options.unwrap_or_default());
+async fn configure_store(url: &str, mut options: ObjectStoreParams) -> Result<ObjectStore> {
+    let mut storage_options = StorageOptions(options.storage_options.take().unwrap_or_default());
     let mut url = ensure_table_uri(url)?;
     // Block size: On local file systems, we use 4KB block size. On cloud
     // object stores, we use 64KB block size. This is generally the largest
@@ -819,23 +826,35 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 .with_credentials(aws_creds)
                 .with_region(region)
                 .with_allow_http(true);
-            let store = builder.build()?;
+            let inner = Arc::new(builder.build()?);
+
+            let scheduler = Scheduler::new(
+                inner.clone(),
+                options.max_concurrent_requests,
+                options.max_queue_size,
+            );
 
             Ok(ObjectStore {
-                inner: Arc::new(store),
+                inner,
                 scheme: String::from(url.scheme()),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
                 commit_handler,
+                scheduler,
             })
         }
 
         "gs" => {
             storage_options.with_env_gcs();
             let (store, _) = parse_url_opts(&url, storage_options.as_gcs_options())?;
-            let store = Arc::new(store);
+            let inner = Arc::new(store);
+            let scheduler = Scheduler::new(
+                inner.clone(),
+                options.max_concurrent_requests,
+                options.max_queue_size,
+            );
             Ok(ObjectStore {
-                inner: store,
+                inner,
                 scheme: String::from("gs"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
@@ -843,16 +862,22 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                     .commit_handler
                     .clone()
                     .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+                scheduler,
             })
         }
         "az" => {
             storage_options.with_env_azure();
 
             let (store, _) = parse_url_opts(&url, storage_options.as_azure_options())?;
-            let store = Arc::new(store);
+            let inner = Arc::new(store);
+            let scheduler = Scheduler::new(
+                inner.clone(),
+                options.max_concurrent_requests,
+                options.max_queue_size,
+            );
 
             Ok(ObjectStore {
-                inner: store,
+                inner,
                 scheme: String::from("az"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
@@ -860,19 +885,30 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                     .commit_handler
                     .clone()
                     .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+                scheduler,
             })
         }
-        "file" => Ok(ObjectStore::new_from_path(url.path(), options.commit_handler)?.0),
-        "memory" => Ok(ObjectStore {
-            inner: Arc::new(InMemory::new()).traced(),
-            scheme: String::from("memory"),
-            base_path: Path::from(url.path()),
-            block_size: 64 * 1024,
-            commit_handler: options
-                .commit_handler
-                .clone()
-                .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
-        }),
+        "file" => Ok(ObjectStore::from_path(url.path(), &options)?.0),
+        "memory" => {
+            let inner = Arc::new(InMemory::new()).traced();
+            let scheduler = Scheduler::new(
+                inner.clone(),
+                options.max_concurrent_requests,
+                options.max_queue_size,
+            );
+
+            Ok(ObjectStore {
+                inner,
+                scheme: String::from("memory"),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+                commit_handler: options
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RenameCommitHandler)),
+                scheduler,
+            })
+        }
         s => Err(Error::IO {
             message: format!("Unsupported URI scheme: {}", s),
             location: location!(),
@@ -898,12 +934,15 @@ impl ObjectStore {
             None => store,
         };
 
+        let scheduler = Scheduler::new(store.clone(), 40, 1000);
+
         Self {
             inner: store,
             scheme: scheme.into(),
             base_path: location.path().into(),
             block_size,
             commit_handler,
+            scheduler,
         }
     }
 }

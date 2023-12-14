@@ -27,7 +27,7 @@ use arrow_select::{concat::concat_batches, take::take};
 use chrono::{prelude::*, Duration};
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, try_join_all};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt, Stream};
 use lance_core::io::{
@@ -923,12 +923,8 @@ impl Dataset {
             .map(|(fragment, indices_range)| {
                 let local_ids = &local_ids_buffer[indices_range];
                 fragment.take(local_ids, projection)
-            })
-            .collect::<Vec<_>>();
-        let batches = stream::iter(take_tasks)
-            .buffered(num_cpus::get() * 4)
-            .try_collect::<Vec<RecordBatch>>()
-            .await?;
+            });
+        let batches = try_join_all(take_tasks).await?;
 
         let struct_arrs: Vec<StructArray> = batches.into_iter().map(StructArray::from).collect();
         let refs: Vec<_> = struct_arrs.iter().map(|x| x as &dyn Array).collect();
@@ -1020,10 +1016,7 @@ impl Dataset {
                 let batch_fut = do_take(fragment, row_ids, projection.clone(), false);
                 batches.push(batch_fut);
             }
-            let batches: Vec<RecordBatch> = futures::stream::iter(batches)
-                .buffered(4 * num_cpus::get())
-                .try_collect()
-                .await?;
+            let batches: Vec<RecordBatch> = try_join_all(batches).await?;
             Ok(concat_batches(&batches[0].schema(), &batches)?)
         } else {
             let projection_with_row_id = Schema::merge(
@@ -1056,11 +1049,9 @@ impl Dataset {
                 Some((f, local_row_ids))
             });
 
-            let mut batches = stream::iter(fragment_and_indices)
-                .map(|(fragment, indices)| do_take(fragment, indices, projection.clone(), true))
-                .buffered(4 * num_cpus::get())
-                .try_collect::<Vec<_>>()
-                .await?;
+            let futures = fragment_and_indices
+                .map(|(fragment, indices)| do_take(fragment, indices, projection.clone(), true));
+            let mut batches = try_join_all(futures).await?;
 
             let one_batch = if batches.len() > 1 {
                 concat_batches(&schema_with_row_id, &batches)?
@@ -1393,7 +1384,7 @@ impl Dataset {
     pub async fn num_small_files(&self, max_rows_per_group: usize) -> usize {
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.physical_rows().await })
-            .buffered(num_cpus::get() * 4)
+            .buffer_unordered(num_cpus::get() * 4)
             .try_filter(|row_count| futures::future::ready(*row_count < max_rows_per_group))
             .count()
             .await

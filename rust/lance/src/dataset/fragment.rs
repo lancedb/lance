@@ -825,12 +825,9 @@ impl FragmentReader {
 
     /// Take rows from this fragment.
     pub async fn take(&self, indices: &[u32]) -> Result<RecordBatch> {
-        // Boxed to avoid lifetime issue.
-        let stream: BoxStream<_> = futures::stream::iter(&self.readers)
-            .map(|(reader, schema)| reader.take(indices, schema))
-            .buffered(num_cpus::get())
-            .boxed();
-        let batches: Vec<RecordBatch> = stream.try_collect::<Vec<_>>().await?;
+        let futures = self.readers.iter()
+            .map(|(reader, schema)| reader.take(indices, schema));
+        let batches = try_join_all(futures).await?;
 
         merge_batches(&batches)
     }

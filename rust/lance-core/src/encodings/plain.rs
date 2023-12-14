@@ -34,6 +34,7 @@ use arrow_select::{concat::concat, take::take};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::future::try_join_all;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use snafu::{location, Location};
@@ -430,7 +431,8 @@ impl<'a> Decoder for PlainDecoder<'a> {
 
         let chunked_ranges = make_chunked_requests(indices.values(), byte_width, block_size);
 
-        let arrays = stream::iter(chunked_ranges)
+        let futures = chunked_ranges
+            .into_iter()
             .map(|cr| async move {
                 let request = indices.slice(cr.start, cr.len());
 
@@ -439,10 +441,8 @@ impl<'a> Decoder for PlainDecoder<'a> {
                 let array = self.get(start as usize..end as usize + 1).await?;
                 let adjusted_offsets = sub(&request, &UInt32Array::new_scalar(start))?;
                 Ok::<ArrayRef, Error>(take(&array, &adjusted_offsets, None)?)
-            })
-            .buffered(num_cpus::get() * PARALLELISM_FACTOR)
-            .try_collect::<Vec<_>>()
-            .await?;
+            });
+        let arrays = try_join_all(futures).await?;
         let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
         Ok(concat(&references)?)
     }
