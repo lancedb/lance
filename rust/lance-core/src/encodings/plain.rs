@@ -44,11 +44,6 @@ use crate::encodings::{AsyncIndex, Decoder};
 use crate::io::{ReadBatchParams, Reader, Writer};
 use crate::{Error, Result};
 
-/// Parallelism factor decides how many run parallel I/O issued per CPU core.
-/// This is a heuristic value, with the assumption NVME and S3/GCS can
-/// handles large mount of parallel I/O & large disk-queue.
-const PARALLELISM_FACTOR: usize = 4;
-
 /// Encoder for plain encoding.
 ///
 pub struct PlainEncoder<'a> {
@@ -431,17 +426,15 @@ impl<'a> Decoder for PlainDecoder<'a> {
 
         let chunked_ranges = make_chunked_requests(indices.values(), byte_width, block_size);
 
-        let futures = chunked_ranges
-            .into_iter()
-            .map(|cr| async move {
-                let request = indices.slice(cr.start, cr.len());
+        let futures = chunked_ranges.into_iter().map(|cr| async move {
+            let request = indices.slice(cr.start, cr.len());
 
-                let start = request.value(0);
-                let end = request.value(request.len() - 1);
-                let array = self.get(start as usize..end as usize + 1).await?;
-                let adjusted_offsets = sub(&request, &UInt32Array::new_scalar(start))?;
-                Ok::<ArrayRef, Error>(take(&array, &adjusted_offsets, None)?)
-            });
+            let start = request.value(0);
+            let end = request.value(request.len() - 1);
+            let array = self.get(start as usize..end as usize + 1).await?;
+            let adjusted_offsets = sub(&request, &UInt32Array::new_scalar(start))?;
+            Ok::<ArrayRef, Error>(take(&array, &adjusted_offsets, None)?)
+        });
         let arrays = try_join_all(futures).await?;
         let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
         Ok(concat(&references)?)

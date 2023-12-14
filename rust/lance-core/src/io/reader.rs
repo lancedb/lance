@@ -38,7 +38,7 @@ use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
 use futures::future::try_join_all;
-use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
+use futures::{stream, Future, StreamExt};
 use lance_arrow::*;
 
 use object_store::path::Path;
@@ -501,7 +501,8 @@ impl FileReader {
     ) -> Result<RecordBatch> {
         let range_in_batches = self.metadata.range_to_batches(range)?;
         let futures =
-            range_in_batches.into_iter()
+            range_in_batches
+                .into_iter()
                 .map(|(batch_id, range)| async move {
                     self.read_batch(batch_id, range, projection).await
                 });
@@ -519,11 +520,10 @@ impl FileReader {
     #[instrument(level = "debug", skip_all)]
     pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
         let indices_in_batches = self.metadata.group_indices_to_batches(indices);
-        let futures = indices_in_batches.into_iter()
-            .map(|batch| async move {
-                self.read_batch(batch.batch_id, batch.offsets.as_slice(), projection)
-                    .await
-            });
+        let futures = indices_in_batches.into_iter().map(|batch| async move {
+            self.read_batch(batch.batch_id, batch.offsets.as_slice(), projection)
+                .await
+        });
         let batches = try_join_all(futures).await?;
 
         let mut schema = ArrowSchema::from(projection);
@@ -561,17 +561,16 @@ impl FileReader {
             if projection.fields.is_empty() {
                 return Ok(None);
             }
-            let futures = projection.fields.iter().cloned()
-                .map(|field| async move {
-                    read_array(
-                        self,
-                        &field,
-                        0,
-                        stats_page_table,
-                        &ReadBatchParams::RangeFull,
-                    )
-                    .await
-                });
+            let futures = projection.fields.iter().cloned().map(|field| async move {
+                read_array(
+                    self,
+                    &field,
+                    0,
+                    stats_page_table,
+                    &ReadBatchParams::RangeFull,
+                )
+                .await
+            });
             let arrays = try_join_all(futures).await?;
 
             let schema = ArrowSchema::from(&projection);
@@ -633,7 +632,9 @@ async fn read_batch(
     deletion_vector: Option<Arc<DeletionVector>>,
 ) -> Result<RecordBatch> {
     let batch = if !schema.fields.is_empty() {
-        let futures = schema.fields.iter()
+        let futures = schema
+            .fields
+            .iter()
             .map(|f| async { read_array(reader, f, batch_id, &reader.page_table, params).await });
         let arrs = try_join_all(futures).await?;
         Some(RecordBatch::try_new(Arc::new(schema.into()), arrs)?)
@@ -1092,6 +1093,7 @@ mod tests {
         NullArray, StringArray, StructArray, UInt32Array, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
+    use futures::TryStreamExt;
     use rand::{distributions::Alphanumeric, Rng};
     use roaring::RoaringBitmap;
     use tokio::io::AsyncWriteExt;

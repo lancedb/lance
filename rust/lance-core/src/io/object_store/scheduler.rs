@@ -24,6 +24,7 @@ use object_store::{path::Path, ObjectStore};
 use snafu::{location, Location};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::Instrument;
 
 use crate::{io::Reader, Error, Result};
 
@@ -59,23 +60,30 @@ impl Scheduler {
                 .map(|request| {
                     let store = store_ref.clone();
                     async move {
-                        let result =
-                            store
+                        // Make sure the receiver still wants this request. If it
+                        // has been cancelled, then the reciever will have been dropped.
+                        if !request.result_sender.is_closed() {
+                            let result = store
                                 .get_range(&request.path, request.range)
                                 .await
                                 .map_err(|err| Error::IO {
                                     message: err.to_string(),
                                     location: location!(),
                                 });
-                        request.result_sender.send(result)
+                            request.result_sender.send(result)
+                        } else {
+                            Ok(())
+                        }
                     }
+                    .instrument(request.span)
                 })
                 .buffer_unordered(max_concurrent_requests);
 
             while let Some(res) = stream.next().await {
                 if res.is_err() {
-                    log::error!("Read task failed");
-                    break;
+                    // This might happen if the listening end of the channel is dropped,
+                    // due to cancellation.
+                    log::info!("Read task failed");
                 }
             }
         });
@@ -101,6 +109,7 @@ impl Scheduler {
             path,
             range,
             result_sender,
+            span: tracing::Span::current(),
         };
         self.queue
             .send(request)
@@ -121,7 +130,10 @@ impl Scheduler {
 
 impl Drop for Scheduler {
     fn drop(&mut self) {
-        self.handle.lock().unwrap().abort();
+        // If we're the last reference to the handle, abort the task.
+        if Arc::strong_count(&self.handle) == 1 {
+            self.handle.lock().unwrap().abort();
+        }
     }
 }
 
@@ -154,4 +166,5 @@ struct Request {
     path: Arc<Path>,
     range: Range<usize>,
     result_sender: oneshot::Sender<Result<Bytes>>,
+    span: tracing::Span,
 }

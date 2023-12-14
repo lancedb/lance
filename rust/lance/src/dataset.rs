@@ -27,7 +27,7 @@ use arrow_select::{concat::concat_batches, take::take};
 use chrono::{prelude::*, Duration};
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::future::{BoxFuture, try_join_all};
+use futures::future::{try_join_all, BoxFuture};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt, Stream};
 use lance_core::io::{
@@ -918,12 +918,10 @@ impl Dataset {
             sub_requests.push((current_fragment, start..end));
         }
 
-        let take_tasks = sub_requests
-            .into_iter()
-            .map(|(fragment, indices_range)| {
-                let local_ids = &local_ids_buffer[indices_range];
-                fragment.take(local_ids, projection)
-            });
+        let take_tasks = sub_requests.into_iter().map(|(fragment, indices_range)| {
+            let local_ids = &local_ids_buffer[indices_range];
+            fragment.take(local_ids, projection)
+        });
         let batches = try_join_all(take_tasks).await?;
 
         let struct_arrs: Vec<StructArray> = batches.into_iter().map(StructArray::from).collect();

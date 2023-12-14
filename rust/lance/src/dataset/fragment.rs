@@ -23,7 +23,6 @@ use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
-use futures::stream::BoxStream;
 use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::format::DeletionFile;
 use lance_core::{
@@ -825,7 +824,9 @@ impl FragmentReader {
 
     /// Take rows from this fragment.
     pub async fn take(&self, indices: &[u32]) -> Result<RecordBatch> {
-        let futures = self.readers.iter()
+        let futures = self
+            .readers
+            .iter()
             .map(|(reader, schema)| reader.take(indices, schema));
         let batches = try_join_all(futures).await?;
 
