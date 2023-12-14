@@ -255,7 +255,9 @@ mod tests {
             object_writer.shutdown().await.unwrap();
         }
 
-        let reader = LocalObjectReader::open_local_path(&path, 2048).unwrap();
+        let reader = LocalObjectReader::open_local_path(&path, 2048)
+            .await
+            .unwrap();
         let decoder = DictionaryDecoder::new(
             reader.as_ref(),
             pos,
