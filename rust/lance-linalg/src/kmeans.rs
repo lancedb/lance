@@ -690,8 +690,7 @@ mod tests {
         const DIM: usize = 2;
         let data = Float32Array::from(vec![1.0, 0.0, 0.0, 1.0, -1.0, -1.0, -2.0, -2.5_f32]);
         let vectors = FixedSizeListArray::try_new_from_values(data, DIM as i32).unwrap();
-        let mut params: KMeansParams<Float32Type> = KMeansParams::default();
-        params.metric_type = MetricType::Cosine;
+        let params: KMeansParams<Float32Type> = KMeansParams::cosine();
 
         let expected_x = 0.5_f32.powf(0.5);
 
