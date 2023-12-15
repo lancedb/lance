@@ -29,7 +29,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field};
 use arrow_select::take::take;
 use async_trait::async_trait;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, StreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result, ROW_ID};
 use lance_linalg::{
@@ -349,23 +349,22 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
             // wouldn't cover all rows but 13-element chunks (13 * 32 = 416) would
             // have one empty chunk at the end. This filter removes those empty chunks.
             .filter(|range| futures::future::ready(range.start < range.end))
-            .map(|range| {
+            .map(|range| async {
                 let centroids = centroids.clone();
                 let data = data.clone();
-                tokio::task::spawn_blocking(move || {
-                    compute_partitions::<T>(
-                        centroids.as_slice(),
-                        &data.as_slice()[range],
-                        dimension,
-                        metric_type,
-                    )
-                })
+
+                compute_partitions::<T>(
+                    centroids.as_slice(),
+                    &data.as_slice()[range],
+                    dimension,
+                    metric_type,
+                )
                 .in_current_span()
+                .await
             })
             .buffered(chunks)
-            .try_collect()
-            .await
-            .expect("compute_partitions: schedule CPU task");
+            .collect::<Vec<_>>()
+            .await;
 
         UInt32Array::from_iter(result.iter().flatten().copied())
     }

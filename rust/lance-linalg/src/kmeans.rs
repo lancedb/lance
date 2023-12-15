@@ -209,7 +209,7 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
                 let norm = norm_l2(&new_centroids[i * dimension..(i + 1) * dimension]);
                 new_centroids[i * dimension..(i + 1) * dimension]
                     .iter_mut()
-                    .for_each(|v| *v = *v / T::Native::from_f32(norm).unwrap());
+                    .for_each(|v| *v /= T::Native::from_f32(norm).unwrap());
             }
         }
 
