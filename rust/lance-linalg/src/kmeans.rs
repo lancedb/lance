@@ -524,7 +524,7 @@ where
         };
 
         let dists_arr = Float32Array::from(dists);
-        Ok(sort_to_indices(&dists_arr, None, Some(nprobes))?)
+        sort_to_indices(&dists_arr, None, Some(nprobes))
     }
 }
 
