@@ -11,6 +11,7 @@ categories = { workspace = true }
 
 [dependencies]
 arrow-array = { workspace = true }
+arrow-ord = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 futures = { workspace = true }
