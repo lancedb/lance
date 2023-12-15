@@ -371,7 +371,6 @@ impl Scanner {
             message: format!("Column {} not found", column),
             location: location!(),
         })?;
-        dbg!(&field.data_type());
         let key = match field.data_type() {
             DataType::FixedSizeList(dt, _) => {
                 if dt.data_type().is_floating() {
