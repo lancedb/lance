@@ -64,38 +64,46 @@ pub struct LocalObjectReader {
 }
 
 impl LocalObjectReader {
-    pub fn open_local_path(
+    pub async fn open_local_path(
         path: impl AsRef<std::path::Path>,
         block_size: usize,
     ) -> Result<Box<dyn Reader>> {
-        let local_file = File::open(&path)?;
-        let object_store_path = Path::from_filesystem_path(path)?;
-        Ok(Box::new(Self {
-            file: Arc::new(local_file),
-            path: object_store_path,
-            block_size,
-        }))
+        let path = path.as_ref().to_owned();
+        let object_store_path = Path::from_filesystem_path(&path)?;
+        tokio::task::spawn_blocking(move || {
+            let local_file = File::open(&path)?;
+            Ok(Box::new(Self {
+                file: Arc::new(local_file),
+                path: object_store_path,
+                block_size,
+            }) as Box<dyn Reader>)
+        })
+        .await?
     }
 
     /// Open a local object reader, with default prefetch size.
     #[instrument(level = "debug")]
-    pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn Reader>> {
-        let local_path = to_local_path(path);
-        let file = File::open(local_path).map_err(|e| match e.kind() {
-            ErrorKind::NotFound => Error::NotFound {
-                uri: path.to_string(),
-                location: location!(),
-            },
-            _ => Error::IO {
-                message: e.to_string(),
-                location: location!(),
-            },
-        })?;
-        Ok(Box::new(Self {
-            file: Arc::new(file),
-            block_size,
-            path: path.clone(),
-        }))
+    pub async fn open(path: &Path, block_size: usize) -> Result<Box<dyn Reader>> {
+        let path = path.clone();
+        let local_path = to_local_path(&path);
+        tokio::task::spawn_blocking(move || {
+            let file = File::open(&local_path).map_err(|e| match e.kind() {
+                ErrorKind::NotFound => Error::NotFound {
+                    uri: path.to_string(),
+                    location: location!(),
+                },
+                _ => Error::IO {
+                    message: e.to_string(),
+                    location: location!(),
+                },
+            })?;
+            Ok(Box::new(Self {
+                file: Arc::new(file),
+                block_size,
+                path: path.clone(),
+            }) as Box<dyn Reader>)
+        })
+        .await?
     }
 }
 

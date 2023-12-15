@@ -590,7 +590,9 @@ mod tests {
             writer.flush().await.unwrap();
         }
 
-        let reader = LocalObjectReader::open_local_path(&path, 1024).unwrap();
+        let reader = LocalObjectReader::open_local_path(&path, 1024)
+            .await
+            .unwrap();
         assert!(reader.size().await.unwrap() > 0);
         // Expected size is the total of all arrays
         let expected_size = expected.iter().map(|e| e.len()).sum();
@@ -712,7 +714,9 @@ mod tests {
             writer.flush().await.unwrap();
         }
 
-        let reader = LocalObjectReader::open_local_path(&path, 2048).unwrap();
+        let reader = LocalObjectReader::open_local_path(&path, 2048)
+            .await
+            .unwrap();
         assert!(reader.size().await.unwrap() > 0);
         let decoder =
             PlainDecoder::new(reader.as_ref(), array.data_type(), 0, array.len()).unwrap();
@@ -758,7 +762,9 @@ mod tests {
             writer.shutdown().await.unwrap();
         }
 
-        let reader = LocalObjectReader::open_local_path(&path, 2048).unwrap();
+        let reader = LocalObjectReader::open_local_path(&path, 2048)
+            .await
+            .unwrap();
         assert!(reader.size().await.unwrap() > 0);
         let decoder =
             PlainDecoder::new(reader.as_ref(), array.data_type(), 0, array.len()).unwrap();
