@@ -12,6 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! KMeans implementation for Apache Arrow Arrays.
+//!
+//! Support ``l2``, ``cosine`` and ``dot`` distances, see [MetricType].
+//!
+//! ``Cosine`` distance are calculated by normalizing the vectors to unit length,
+//! and run ``l2`` distance on the unit vectors.
+//!
+
 use std::cmp::min;
 use std::ops::DivAssign;
 use std::sync::Arc;
