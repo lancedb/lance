@@ -21,19 +21,20 @@ use arrow_schema::ArrowError;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 use log::{info, warn};
-use num_traits::{AsPrimitive, Float, FromPrimitive, Zero};
+use num_traits::{AsPrimitive, Float, FromPrimitive, One, Zero};
 use rand::prelude::*;
 use rand::Rng;
 use tracing::instrument;
 
-use crate::kernels::{argmin_value_float, normalize};
+use crate::distance::norm_l2;
+use crate::kernels::{argmax, argmin_value_float, normalize};
 use crate::{
     distance::{
         dot_distance,
         l2::{l2, l2_distance_batch, L2},
-        norm_l2, Cosine, Dot, MetricType,
+        Cosine, Dot, MetricType,
     },
-    kernels::{argmin, argmin_value},
+    kernels::argmin_value,
     matrix::MatrixView,
 };
 use crate::{Error, Result};
@@ -173,6 +174,10 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
         cluster_cnts.iter().enumerate().for_each(|(i, &cnt)| {
             if cnt == 0 {
                 warn!("KMeans: cluster {} is empty", i);
+                new_centroids[i * dimension..(i + 1) * dimension]
+                    .iter_mut()
+                    .for_each(|v| *v = T::Native::nan());
+                // TODO: find the largest one to split.
             } else {
                 // TODO: simd
                 new_centroids[i * dimension..(i + 1) * dimension]
@@ -180,6 +185,31 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
                     .for_each(|v| *v /= T::Native::from_u64(cnt).unwrap());
             }
         });
+
+        // Split the largest one
+        for i in 0..cluster_cnts.len() {
+            if cluster_cnts[i] == 0 {
+                let largest_idx = argmax(cluster_cnts.iter().copied()).unwrap() as usize;
+                cluster_cnts[i] = cluster_cnts[largest_idx] / 2;
+                cluster_cnts[largest_idx] /= 2;
+                for j in 0..dimension {
+                    new_centroids[i * dimension + j] = new_centroids[largest_idx * dimension + j]
+                        * (T::Native::one() + T::Native::epsilon());
+                    new_centroids[largest_idx * dimension + j] /=
+                        T::Native::one() + T::Native::epsilon();
+                }
+            }
+        }
+
+        if self.metric_type == MetricType::Cosine {
+            // Need normalize centroids
+            for i in 0..self.k {
+                let norm = norm_l2(&new_centroids[i * dimension..(i + 1) * dimension]);
+                new_centroids[i * dimension..(i + 1) * dimension]
+                    .iter_mut()
+                    .for_each(|v| *v = *v / T::Native::from_f32(norm).unwrap());
+            }
+        }
 
         Ok(KMeans {
             centroids: Arc::new(new_centroids.into()),
@@ -241,10 +271,10 @@ where
     /// It is useful for continuing training.
     fn with_centroids(
         centroids: Arc<T::ArrayType>,
-        k: usize,
         dimension: usize,
         metric_type: MetricType,
     ) -> Self {
+        let k = centroids.len() / dimension;
         Self {
             centroids,
             dimension,
@@ -328,7 +358,7 @@ where
         for redo in 1..=params.redos {
             let mut kmeans = if let Some(centroids) = params.centroids.as_ref() {
                 // Use existing centroids.
-                Self::with_centroids(centroids.clone(), k, dimension, params.metric_type)
+                Self::with_centroids(centroids.clone(), dimension, params.metric_type)
             } else {
                 match params.init {
                     KMeanInit::Random => {
@@ -538,28 +568,7 @@ where
     Box::new(stream)
 }
 
-fn compute_partitions_dot<T: FloatToArrayType>(
-    centroids: &[T],
-    data: &[T],
-    dimension: usize,
-) -> Vec<u32>
-where
-    <T as FloatToArrayType>::ArrowType: Dot,
-{
-    data.chunks(dimension)
-        .map(|row| {
-            argmin(
-                centroids
-                    .chunks(dimension)
-                    .map(|centroid| dot_distance(row, centroid)),
-            )
-            .unwrap()
-        })
-        .collect()
-}
-
-#[inline]
-pub fn compute_partitions<T: ArrowFloatType>(
+pub async fn compute_partitions<T: ArrowFloatType>(
     centroids: &[T::Native],
     data: &[T::Native],
     dimension: usize,
@@ -568,29 +577,29 @@ pub fn compute_partitions<T: ArrowFloatType>(
 where
     <T::Native as FloatToArrayType>::ArrowType: Dot + Cosine + L2,
 {
-    match metric_type {
-        MetricType::L2 => compute_partitions_l2(centroids, data, dimension)
-            .map(|(c, _)| c)
-            .collect(),
-        MetricType::Cosine => {
-            let normalized = data
-                .chunks(dimension)
-                .flat_map(normalize)
-                .collect::<Vec<_>>();
-            compute_partitions_l2(centroids, &normalized, dimension).collect()
-        }
-        MetricType::Dot => compute_partitions_dot(centroids, data, dimension),
-    }
+    let kmeans: KMeans<T> =
+        KMeans::with_centroids(Arc::new(centroids.to_vec().into()), dimension, metric_type);
+    let membership = kmeans
+        .compute_membership(Arc::new(data.to_vec().into()))
+        .await;
+    membership
+        .cluster_id_and_distances
+        .iter()
+        .map(|(c, _)| *c)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::{assert_relative_eq, relative_eq};
 
     use arrow_array::types::Float32Type;
     use arrow_array::Float32Array;
     use lance_arrow::*;
     use lance_testing::datagen::generate_random_array;
+
+    use crate::kernels::argmin;
 
     #[tokio::test]
     async fn test_train_with_small_dataset() {
@@ -604,8 +613,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_compute_partitions() {
+    #[tokio::test]
+    async fn test_compute_partitions() {
         const DIM: usize = 256;
         let centroids = generate_random_array(DIM * 18);
         let data = generate_random_array(DIM * 20);
@@ -628,7 +637,31 @@ mod tests {
             data.values(),
             DIM,
             MetricType::L2,
-        );
+        )
+        .await;
         assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn test_cosine_kmeans() {
+        const DIM: usize = 2;
+        let data = Float32Array::from(vec![1.0, 0.0, 0.0, 1.0, -1.0, -1.0, -2.0, -2.5_f32]);
+        let vectors = FixedSizeListArray::try_new_from_values(data, DIM as i32).unwrap();
+        let mut params: KMeansParams<Float32Type> = KMeansParams::default();
+        params.metric_type = MetricType::Cosine;
+
+        let expected_x = 0.5_f32.powf(0.5);
+
+        let kmeans = KMeans::new_with_params(&vectors, 2, &params).await.unwrap();
+        assert!(kmeans
+            .centroids
+            .as_slice()
+            .iter()
+            .any(|&v| relative_eq!(expected_x, v) || relative_eq!(-0.7808688, v)));
+
+        // All centroids are normalized
+        kmeans.centroids.as_slice().chunks(DIM).for_each(|cent| {
+            assert_relative_eq!(1.0, cent.iter().map(|&x| x.powi(2)).sum::<f32>());
+        })
     }
 }
