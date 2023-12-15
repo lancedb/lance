@@ -22,10 +22,8 @@ use arrow_array::builder::UInt32Builder;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::UInt64Array;
 use arrow_array::{
-    cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, Float32Array, RecordBatch,
-    UInt32Array,
+    cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
-use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field};
 use arrow_select::take::take;
 use async_trait::async_trait;
@@ -33,9 +31,7 @@ use futures::{stream, StreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result, ROW_ID};
 use lance_linalg::{
-    distance::{
-        cosine_distance_batch, dot_distance_batch, l2_distance_batch, Cosine, Dot, MetricType, L2,
-    },
+    distance::{Cosine, Dot, MetricType, L2},
     MatrixView,
 };
 use log::{debug, info};
@@ -51,6 +47,7 @@ use crate::vector::{
     transform::Transformer,
 };
 pub use builder::IvfBuildParams;
+use lance_linalg::kmeans::KMeans;
 
 fn new_ivf_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
     centroids: &T::ArrayType,
@@ -427,16 +424,6 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
     }
 
     fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array> {
-        if query.len() != self.dimension() {
-            return Err(Error::IO {
-                message: format!(
-                    "Ivf::find_partition: dimension mismatch: {} != {}",
-                    query.len(),
-                    self.dimension()
-                ),
-                location: location!(),
-            });
-        }
         let query = query
             .as_any()
             .downcast_ref::<T::ArrayType>()
@@ -448,23 +435,13 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
                 ),
                 location: Default::default(),
             })?;
-        let centroid_values = self.centroids.data();
-        let centroids = centroid_values.as_slice();
-        let dim = query.len();
-        let distances = Float32Array::from_iter_values(match self.metric_type {
-            lance_linalg::distance::DistanceType::L2 => {
-                l2_distance_batch(query.as_slice(), centroids, dim)
-            }
-            lance_linalg::distance::DistanceType::Cosine => {
-                cosine_distance_batch(query.as_slice(), centroids, dim)
-            }
-            lance_linalg::distance::DistanceType::Dot => {
-                dot_distance_batch(query.as_slice(), centroids, dim)
-            }
-        });
-
-        let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;
-        Ok(top_k_partitions)
+        // TODO: hold kmeans in this struct.
+        let kmeans = KMeans::<T>::with_centroids(
+            self.centroids.data().clone(),
+            self.dimension(),
+            self.metric_type,
+        );
+        Ok(kmeans.find_partitions(query.as_slice(), nprobes)?)
     }
 
     async fn partition_transform(&self, batch: &RecordBatch, column: &str) -> Result<RecordBatch> {

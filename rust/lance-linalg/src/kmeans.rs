@@ -272,7 +272,7 @@ where
 
     /// Create a [`KMeans`] with existing centroids.
     /// It is useful for continuing training.
-    fn with_centroids(
+    pub fn with_centroids(
         centroids: Arc<T::ArrayType>,
         dimension: usize,
         metric_type: MetricType,
