@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 from . import preferred_device
 from .data import TensorDataset
-from .distance import cosine_distance, dot_distance, l2_distance
+from .distance import dot_distance, l2_distance
 
 __all__ = ["KMeans"]
 
@@ -71,10 +71,9 @@ class KMeans:
 
         metric = metric.lower()
         self.metric = metric
-        if metric in ["l2", "euclidean"]:
+        if metric in ["l2", "euclidean", "cosine"]:
+            # Cosine uses normalized unit vector and calculate l2 distance
             self.dist_func = l2_distance
-        elif metric == "cosine":
-            self.dist_func = cosine_distance
         elif metric == "dot":
             self.dist_func = dot_distance
         else:
@@ -136,6 +135,9 @@ class KMeans:
             self._random_init(data)
             data = TensorDataset(data, batch_size=4096)
 
+        if self.metric == "cosine":
+            # Normalize the data
+            data = torch.nn.functional.normalize(data)
         assert self.centroids is not None
         self.centroids = self.centroids.to(self.device)
 
@@ -215,11 +217,14 @@ class KMeans:
         return total_dist
 
     def _transform(self, data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.metric == "cosine":
+            data = torch.nn.functional.normalize(data)
         return self.dist_func(data, self.centroids)
 
     def transform(
         self, data: Union[pa.Array, np.ndarray, torch.Tensor]
     ) -> torch.Tensor:
+        """Transform the input data to cluster ids for each row."""
         assert self.centroids is not None
 
         data = self._to_tensor(data)
