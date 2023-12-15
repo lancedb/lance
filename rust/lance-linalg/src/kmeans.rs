@@ -17,7 +17,8 @@ use std::ops::DivAssign;
 use std::sync::Arc;
 use std::vec;
 
-use arrow_array::{Array, FixedSizeListArray};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, UInt32Array};
+use arrow_ord::sort::sort_to_indices;
 use arrow_schema::ArrowError;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
@@ -27,7 +28,7 @@ use rand::prelude::*;
 use rand::Rng;
 use tracing::instrument;
 
-use crate::distance::norm_l2;
+use crate::distance::{dot_distance_batch, norm_l2};
 use crate::kernels::{argmax, argmin_value_float, normalize};
 use crate::{
     distance::{
@@ -487,6 +488,32 @@ where
             k: self.k,
             metric_type: self.metric_type,
         }
+    }
+
+    pub fn find_partitions(&self, query: &[T::Native], nprobes: usize) -> Result<UInt32Array> {
+        if query.len() != self.dimension {
+            return Err(Error::InvalidArgumentError(format!(
+                "KMeans::find_partitions: query dimension mismatch: {} != {}",
+                query.len(),
+                self.dimension
+            )));
+        };
+
+        let dists: Vec<f32> = match self.metric_type {
+            MetricType::L2 => {
+                l2_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
+            }
+            MetricType::Cosine => {
+                let normalized = normalize(query).collect::<Vec<_>>();
+                l2_distance_batch(&normalized, self.centroids.as_slice(), self.dimension).collect()
+            }
+            MetricType::Dot => {
+                dot_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
+            }
+        };
+
+        let dists_arr = Float32Array::from(dists);
+        Ok(sort_to_indices(&dists_arr, None, Some(nprobes))?)
     }
 }
 
