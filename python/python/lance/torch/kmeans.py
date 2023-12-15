@@ -224,6 +224,7 @@ class KMeans:
     def transform(
         self, data: Union[pa.Array, np.ndarray, torch.Tensor]
     ) -> torch.Tensor:
+        """Transform the input data to cluster ids for each row."""
         assert self.centroids is not None
 
         data = self._to_tensor(data)
