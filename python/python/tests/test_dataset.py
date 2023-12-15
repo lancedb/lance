@@ -240,6 +240,21 @@ def test_take(tmp_path: Path):
     assert table2 == table1
 
 
+def test_take_duplicate_index(tmp_path: Path):
+    base_dir = tmp_path / "test"
+    arr1 = pa.array(["x", "y", "z"], pa.binary())
+    arr2 = pa.array(["y", "y"], pa.binary())
+
+    table1 = pa.Table.from_arrays([arr1], names=["b"])
+    lance.write_dataset(table1, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    table2 = dataset.take([1, 1])
+
+    assert isinstance(table2, pa.Table)
+    assert table2 == pa.Table.from_arrays([arr2], names=["b"])
+
+
 def test_take_with_columns(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"

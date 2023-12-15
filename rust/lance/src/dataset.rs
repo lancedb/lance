@@ -873,8 +873,9 @@ impl Dataset {
         let mut current_fragment_end = current_fragment_len as u64;
         let mut start = 0;
         let mut end = 0;
+        let mut previous_row_index = row_indices[sorted_indices[0]];
 
-        for index in sorted_indices {
+        for (i, &index) in sorted_indices.iter().enumerate() {
             // Get the index
             let row_index = row_indices[index];
 
@@ -906,11 +907,18 @@ impl Dataset {
             // since it is possible for the global index to be larger than
             // u32::MAX.
             let local_index = (row_index - curr_fragment_offset) as u32;
-            local_ids_buffer.push(local_index);
+            // local_ids_buffer.push(local_index);
 
-            remap_index[index] = (sub_requests.len(), end - start);
-
-            end += 1;
+            if (i == 0) || (previous_row_index != row_index) {
+                remap_index[index] = (sub_requests.len(), end - start);
+                local_ids_buffer.push(local_index);
+                previous_row_index = row_indices[sorted_indices[i]];
+                end += 1;
+            } else {
+                // If we have a duplicate, we don't increment the end
+                // index, but we still need to add it to the sub-request.
+                sub_requests.push((current_fragment, start..end));
+            }
         }
 
         // flush last batch
@@ -2271,6 +2279,7 @@ mod tests {
             .take(
                 &[
                     200, // 200
+                    200, // 200
                     199, // 199
                     39,  // 39
                     40,  // 40
@@ -2284,9 +2293,9 @@ mod tests {
             RecordBatch::try_new(
                 schema.clone(),
                 vec![
-                    Arc::new(Int32Array::from_iter_values([200, 199, 39, 40, 125])),
+                    Arc::new(Int32Array::from_iter_values([200, 39, 199, 39, 40, 125])),
                     Arc::new(StringArray::from_iter_values(
-                        [200, 199, 39, 40, 125].iter().map(|v| format!("str-{v}"))
+                        [200, 39, 199, 39, 40, 125].iter().map(|v| format!("str-{v}"))
                     )),
                 ],
             )
