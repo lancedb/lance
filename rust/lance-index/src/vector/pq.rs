@@ -27,7 +27,7 @@ use lance_core::{Error, Result};
 use lance_linalg::distance::{
     cosine_distance_batch, dot_distance_batch, l2_distance_batch, norm_l2, Cosine, Dot, L2,
 };
-use lance_linalg::kernels::{argmin, argmin_value_float};
+use lance_linalg::kernels::{argmin, argmin_value_float, normalize};
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 pub mod builder;
@@ -46,6 +46,14 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
     fn as_any(&self) -> &dyn Any;
 
     /// Transform a vector column to PQ code column.
+    ///
+    /// Parameters
+    /// ----------
+    /// *data*: vector array, must be a `FixedSizeListArray`
+    ///
+    /// Returns
+    /// -------
+    ///   PQ code column
     async fn transform(&self, data: &dyn Array) -> Result<ArrayRef>;
 
     /// Build the distance lookup in `f32`.
@@ -430,6 +438,29 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
             })?
             .clone();
 
+        let fsl = if self.metric_type == MetricType::Cosine {
+            // Normalize cosine vectors to unit length.
+            let values = fsl
+                .values()
+                .as_any()
+                .downcast_ref::<T::ArrayType>()
+                .ok_or(Error::Index {
+                    message: format!(
+                        "Expect to be a float vector array, got: {:?}",
+                        fsl.value_type()
+                    ),
+                    location: location!(),
+                })?
+                .as_slice()
+                .chunks(self.dimension)
+                .flat_map(normalize)
+                .collect::<Vec<_>>();
+            let data = T::ArrayType::from(values);
+            FixedSizeListArray::try_new_from_values(data, self.dimension as i32)?
+        } else {
+            fsl
+        };
+
         let num_sub_vectors = self.num_sub_vectors;
         let dim = self.dimension;
         let num_rows = fsl.len();
@@ -475,15 +506,10 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
                     let centroids = all_centroids[sub_idx];
 
                     let dist_iter = match metric_type {
-                        lance_linalg::distance::DistanceType::L2 => {
+                        MetricType::L2 | MetricType::Cosine => {
                             l2_distance_batch(sub_vector, centroids, sub_dim)
                         }
-                        lance_linalg::distance::DistanceType::Cosine => {
-                            cosine_distance_batch(sub_vector, centroids, sub_dim)
-                        }
-                        lance_linalg::distance::DistanceType::Dot => {
-                            dot_distance_batch(sub_vector, centroids, sub_dim)
-                        }
+                        MetricType::Dot => dot_distance_batch(sub_vector, centroids, sub_dim),
                     };
                     let code = argmin(dist_iter).ok_or(Error::Index {
                         message: format!(
