@@ -1987,7 +1987,6 @@ def _coerce_reader(
 
 
 def _coerce_query_vector(query: QueryVectorLike):
-    print(query)
     if isinstance(query, pa.Scalar):
         if isinstance(query, pa.ExtensionScalar):
             # If it's an extension scalar then convert to storage
