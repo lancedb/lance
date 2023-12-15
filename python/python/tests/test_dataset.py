@@ -1062,3 +1062,27 @@ def test_dataset_progress(tmp_path: Path):
     assert len(ds.get_fragments()) == 2
     assert progress.begin_called == 2
     assert progress.complete_called == 2
+
+
+def test_tensor_type(tmp_path: Path):
+    arr = [[1, 2, 3, 4], [10, 20, 30, 40], [100, 200, 300, 400]]
+    storage = pa.array(arr, pa.list_(pa.float32(), 4))
+    tensor_type = pa.fixed_shape_tensor(pa.float32(), [4])
+    ext_arr = pa.ExtensionArray.from_storage(tensor_type, storage)
+    data = pa.table({"tensor": ext_arr})
+
+    ds = lance.write_dataset(data, tmp_path)
+
+    query_arr = [[10, 20, 30, 40]]
+    storage = pa.array(query_arr, pa.list_(pa.float32(), 4))
+    ext_arr = pa.ExtensionArray.from_storage(tensor_type, storage)
+    ext_scalar = ext_arr[0]
+
+    results = ds.to_table(
+        nearest={
+            "column": "tensor",
+            "k": 1,
+            "q": ext_scalar,
+        }
+    )
+    assert results.num_rows == 1
