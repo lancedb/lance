@@ -26,7 +26,7 @@ use rand::prelude::*;
 use rand::Rng;
 use tracing::instrument;
 
-use crate::kernels::argmin_value_float;
+use crate::kernels::{argmin_value_float, normalize};
 use crate::{
     distance::{
         dot_distance,
@@ -133,6 +133,8 @@ where
     T::Native: Float + Zero,
 {
     /// Reference to the input vectors, with dimension `dimension`.
+    ///
+    /// If [MetricType] is [MetricType::Cosine], the vectors are L2 normalized.
     data: Arc<T::ArrayType>,
 
     dimension: usize,
@@ -385,27 +387,16 @@ where
     /// }
     /// ```
     #[instrument(level = "debug", skip_all)]
-    pub async fn train_once(&self, data: &MatrixView<T>) -> KMeanMembership<T> {
-        match self.metric_type {
-            MetricType::Cosine => self.train_cosine_once(data).await,
-            _ => self.compute_membership(data.data().clone(), None).await,
-        }
-    }
-
-    async fn train_cosine_once(&self, data: &MatrixView<T>) -> KMeanMembership<T> {
-        let norm_data = Some(Arc::new(
-            data.iter().map(norm_l2).collect::<Vec<_>>().into(),
-        ));
-        self.compute_membership(data.data().clone(), norm_data)
-            .await
+    async fn train_once(&self, data: &MatrixView<T>) -> KMeanMembership<T> {
+        self.compute_membership(data.data().clone(), None).await
     }
 
     /// Recompute the membership of each vector.
     ///
     /// Parameters:
     ///
-    /// - *data*: a `N * dimension` float32 array.
-    /// - *dist_fn*: the function to compute distances.
+    /// - *data*: a `N * dimension` float32 array. Not necessarily normalized.
+    ///
     pub async fn compute_membership(
         &self,
         data: Arc<T::ArrayType>,
@@ -416,93 +407,47 @@ where
         let metric_type = self.metric_type;
         const CHUNK_SIZE: usize = 1024;
 
-        // Normalized centroids for fast cosine. cosine(A, B) = A * B / (|A| * |B|).
-        // So here, norm_centroids = |B| for each centroid B.
-        let norm_centroids = if matches!(metric_type, MetricType::Cosine) {
-            Arc::new(Some(
-                self.centroids
-                    .as_slice()
-                    .chunks_exact(dimension)
-                    .map(norm_l2)
-                    .collect::<Vec<_>>(),
-            ))
-        } else {
-            Arc::new(None)
-        };
-
         let cluster_with_distances = stream::iter((0..n).step_by(CHUNK_SIZE))
             // make tiles of input data to split between threads.
             .zip(repeat_with(|| {
-                (
-                    data.clone(),
-                    self.centroids.clone(),
-                    norm_centroids.clone(),
-                    norm_data.clone(),
-                )
+                (data.clone(), self.centroids.clone(), norm_data.clone())
             }))
-            .map(
-                |(start_idx, (data, centroids, norms, norm_data))| async move {
-                    let data = tokio::task::spawn_blocking(move || {
-                        let last_idx = min(start_idx + CHUNK_SIZE, n);
+            .map(|(start_idx, (data, centroids, norm_data))| async move {
+                let data = tokio::task::spawn_blocking(move || {
+                    let last_idx = min(start_idx + CHUNK_SIZE, n);
 
-                        let centroids_array = centroids.as_slice();
-                        let values = &data.as_slice()[start_idx * dimension..last_idx * dimension];
+                    let centroids_array = centroids.as_slice();
+                    let values = &data.as_slice()[start_idx * dimension..last_idx * dimension];
 
-                        if metric_type == MetricType::L2 {
+                    match metric_type {
+                        MetricType::L2 => {
                             return compute_partitions_l2(centroids_array, values, dimension)
                                 .collect();
                         }
-
-                        values
+                        MetricType::Cosine => {
+                            let values = values
+                                .chunks(dimension)
+                                .flat_map(normalize)
+                                .collect::<Vec<_>>();
+                            return compute_partitions_l2(centroids_array, &values, dimension)
+                                .collect();
+                        }
+                        MetricType::Dot => values
                             .chunks_exact(dimension)
-                            .enumerate()
-                            .map(|(idx, vector)| {
+                            .map(|vector| {
                                 let centroid_stream = centroids_array.chunks_exact(dimension);
-                                match metric_type {
-                                    MetricType::L2 => {
-                                        panic!("L2 is handled above")
-                                    }
-                                    MetricType::Cosine => {
-                                        let centroid_norms = norms.as_ref().as_ref().unwrap();
-                                        if let Some(norm_vectors) = norm_data.as_ref() {
-                                            let norm_vec = norm_vectors.as_slice()[idx];
-                                            argmin_value(
-                                                centroid_stream.zip(centroid_norms.iter()).map(
-                                                    |(cent, &cent_norm)| {
-                                                        T::cosine_with_norms(
-                                                            cent, cent_norm, norm_vec, vector,
-                                                        )
-                                                    },
-                                                ),
-                                            )
-                                        } else {
-                                            argmin_value(
-                                                centroid_stream.zip(centroid_norms.iter()).map(
-                                                    |(cent, &cent_norm)| {
-                                                        T::cosine_fast(cent, cent_norm, vector)
-                                                    },
-                                                ),
-                                            )
-                                        }
-                                    }
-                                    crate::distance::DistanceType::Dot => argmin_value(
-                                        centroid_stream.map(|cent| dot_distance(vector, cent)),
-                                    ),
-                                }
-                                .unwrap()
+                                argmin_value(centroid_stream.map(|cent| dot_distance(vector, cent)))
+                                    .unwrap()
                             })
-                            .collect::<Vec<_>>()
-                    })
-                    .await
-                    .map_err(|e| {
-                        ArrowError::ComputeError(format!(
-                            "KMeans: failed to compute membership: {}",
-                            e
-                        ))
-                    })?;
-                    Ok::<Vec<_>, Error>(data)
-                },
-            )
+                            .collect::<Vec<_>>(),
+                    }
+                })
+                .await
+                .map_err(|e| {
+                    ArrowError::ComputeError(format!("KMeans: failed to compute membership: {}", e))
+                })?;
+                Ok::<Vec<_>, Error>(data)
+            })
             .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await
