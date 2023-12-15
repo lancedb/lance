@@ -22,8 +22,8 @@ async-recursion.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 datafusion-common.workspace = true
-datafusion-expr = "32.0.0"
-datafusion-physical-expr = { version = "32.0.0", default-features = false }
+datafusion-expr.workspace = true
+datafusion-physical-expr.workspace = true
 futures.workspace = true
 half.workspace = true
 lance-arrow.workspace = true
@@ -52,7 +52,8 @@ lance-testing.workspace = true
 pprof.workspace = true
 tempfile.workspace = true
 sqlparser = "0.39.0"
-datafusion-sql = "32.0.0"
+# datafusion-sql = "34.0.0"
+datafusion-sql = { git = "https://github.com/apache/arrow-datafusion.git", tag = "34.0.0-rc3" }
 
 [build-dependencies]
 prost-build.workspace = true

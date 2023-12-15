@@ -47,17 +47,17 @@ lance-test-macros = { version = "=0.8.21", path = "./lance-test-macros" }
 lance-testing = { version = "=0.8.21", path = "./lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
-arrow = { version = "47.0.0", optional = false }
-arrow-arith = "47.0"
-arrow-array = "47.0"
-arrow-buffer = "47.0"
-arrow-cast = "47.0"
-arrow-data = "47.0"
-arrow-ipc = { version = "47.0", features = ["zstd"] }
-arrow-ord = "47.0"
-arrow-row = "47.0"
-arrow-schema = "47.0"
-arrow-select = "47.0"
+arrow = { version = "49.0.0", optional = false, features = ["prettyprint"] }
+arrow-arith = "49.0"
+arrow-array = "49.0"
+arrow-buffer = "49.0"
+arrow-cast = "49.0"
+arrow-data = "49.0"
+arrow-ipc = { version = "49.0", features = ["zstd"] }
+arrow-ord = "49.0"
+arrow-row = "49.0"
+arrow-schema = "49.0"
+arrow-select = "49.0"
 async-recursion = "1.0"
 async-trait = "0.1"
 aws-config = "0.56"
@@ -71,13 +71,19 @@ bytes = "1.4"
 byteorder = "1.5"
 chrono = "0.4.23"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
-datafusion = { version = "32.0.0", default-features = false, features = [
+# datafusion = { version = "34.0.0", default-features = false, features = [
+#     "regex_expressions",
+# ] }
+# datafusion-common = "34.0"
+# datafusion-sql = "34.0"
+# datafusion-expr = "34.0"
+datafusion = { git = "https://github.com/apache/arrow-datafusion.git", tag = "34.0.0-rc3", default-features = false, features = [
     "regex_expressions",
 ] }
-datafusion-common = "32.0"
-datafusion-sql = "32.0"
-datafusion-expr = "32.0"
-datafusion-physical-expr = { version = "32.0.0", default-features = false }
+datafusion-common = { git = "https://github.com/apache/arrow-datafusion.git", tag = "34.0.0-rc3" }
+datafusion-sql = { git = "https://github.com/apache/arrow-datafusion.git", tag = "34.0.0-rc3" }
+datafusion-expr = { git = "https://github.com/apache/arrow-datafusion.git", tag = "34.0.0-rc3" }
+datafusion-physical-expr = { git = "https://github.com/apache/arrow-datafusion.git", tag = "34.0.0-rc3", default-features = false }
 either = "1.0"
 futures = "0.3"
 http = "0.2.9"
@@ -87,8 +93,8 @@ mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = "0.11"
 num_cpus = "1.0"
 num-traits = "0.2"
-object_store = { version = "0.7.1", features = ["aws", "gcp", "azure"] }
-parquet = "47.0"
+object_store = { version = "0.8.0", features = ["aws", "gcp", "azure"] }
+parquet = "49.0"
 pin-project = "1.0"
 pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
 prost = "0.12"

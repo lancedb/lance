@@ -23,7 +23,7 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{
     Error as OSError, GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore,
-    Result as OSResult,
+    PutOptions, PutResult, Result as OSResult,
 };
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -136,9 +136,19 @@ impl std::fmt::Display for ProxyObjectStore {
 
 #[async_trait]
 impl ObjectStore for ProxyObjectStore {
-    async fn put(&self, location: &Path, bytes: Bytes) -> OSResult<()> {
+    async fn put(&self, location: &Path, bytes: Bytes) -> OSResult<PutResult> {
         self.before_method("put", location)?;
         self.target.put(location, bytes).await
+    }
+
+    async fn put_opts(
+        &self,
+        location: &Path,
+        bytes: Bytes,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.before_method("put", location)?;
+        self.target.put_opts(location, bytes, opts).await
     }
 
     async fn put_multipart(
@@ -152,11 +162,6 @@ impl ObjectStore for ProxyObjectStore {
     async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> OSResult<()> {
         self.before_method("abort_multipart", location)?;
         self.target.abort_multipart(location, multipart_id).await
-    }
-
-    async fn append(&self, location: &Path) -> OSResult<Box<dyn AsyncWrite + Unpin + Send>> {
-        self.before_method("append", location)?;
-        self.target.append(location).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
@@ -185,14 +190,11 @@ impl ObjectStore for ProxyObjectStore {
         self.target.delete(location).await
     }
 
-    async fn list(&self, prefix: Option<&Path>) -> OSResult<BoxStream<'_, OSResult<ObjectMeta>>> {
-        OSResult::Ok(
-            self.target
-                .list(prefix)
-                .await?
-                .and_then(|meta| future::ready(self.transform_meta("list", meta)))
-                .boxed(),
-        )
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
+        self.target
+            .list(prefix)
+            .and_then(|meta| future::ready(self.transform_meta("list", meta)))
+            .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {

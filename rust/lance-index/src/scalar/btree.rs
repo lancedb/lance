@@ -281,8 +281,8 @@ impl Ord for OrderableScalarValue {
                 }
             }
             (LargeBinary(_), _) => panic!("Attempt to compare LargeBinary with non-LargeBinary"),
-            (Fixedsizelist(_v1, t1, l1), Fixedsizelist(_v2, t2, l2)) => {
-                if t1.eq(t2) && l1.eq(l2) {
+            (FixedSizeList(left), FixedSizeList(right)) => {
+                if left.eq(right) {
                     todo!()
                 } else {
                     panic!(
@@ -290,27 +290,28 @@ impl Ord for OrderableScalarValue {
                     )
                 }
             }
-            (Fixedsizelist(v1, _, _), Null) => {
-                if v1.is_none() {
+            (FixedSizeList(left), Null) => {
+                if left.is_null(0) {
                     Ordering::Equal
                 } else {
                     Ordering::Greater
                 }
             }
-            (Fixedsizelist(_, _, _), _) => {
-                panic!("Attempt to compare Fixedsizelist with non-Fixedsizelist")
+            (FixedSizeList(_), _) => {
+                panic!("Attempt to compare FixedSizeList with non-FixedSizeList")
             }
-            (List(_, _), List(_, _)) => todo!(),
-            (List(v1, _), Null) => {
-                if v1.is_none() {
+            (List(_), List(_)) => todo!(),
+            (List(left), Null) => {
+                if left.is_null(0) {
                     Ordering::Equal
                 } else {
                     Ordering::Greater
                 }
             }
-            (List(_, _), _) => {
+            (List(_), _) => {
                 panic!("Attempt to compare List with non-List")
             }
+            (LargeList(_), _) => todo!(),
             (Date32(v1), Date32(v2)) => v1.cmp(v2),
             (Date32(v1), Null) => {
                 if v1.is_none() {

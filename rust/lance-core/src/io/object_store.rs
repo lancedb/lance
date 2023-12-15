@@ -79,7 +79,7 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
         dir_path: impl Into<&Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
     ) -> Result<BoxStream<Result<ObjectMeta>>> {
-        let mut output = self.list(Some(dir_path.into())).await?;
+        let mut output = self.list(Some(dir_path.into()));
         if let Some(unmodified_since_val) = unmodified_since {
             output = output
                 .try_filter(move |file| future::ready(file.last_modified < unmodified_since_val))
@@ -571,7 +571,6 @@ impl ObjectStore {
         let sub_entries = self
             .inner
             .list(Some(&path))
-            .await?
             .map(|m| m.map(|meta| meta.location))
             .boxed();
         self.inner
