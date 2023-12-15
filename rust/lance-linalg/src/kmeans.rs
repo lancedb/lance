@@ -85,6 +85,17 @@ impl<T: ArrowFloatType> Default for KMeansParams<T> {
     }
 }
 
+impl<T: ArrowFloatType> KMeansParams<T> {
+    /// Create a new KMeansParams with cosine distance.
+    #[allow(dead_code)]
+    fn cosine() -> Self {
+        Self {
+            metric_type: MetricType::Cosine,
+            ..Default::default()
+        }
+    }
+}
+
 /// KMeans implementation for Apache Arrow Arrays.
 #[derive(Debug, Clone)]
 pub struct KMeans<T: ArrowFloatType>
@@ -625,6 +636,7 @@ mod tests {
     use super::*;
     use approx::{assert_relative_eq, relative_eq};
 
+    use crate::distance::cosine_distance_batch;
     use arrow_array::types::Float32Type;
     use arrow_array::Float32Array;
     use lance_arrow::*;
@@ -694,5 +706,28 @@ mod tests {
         kmeans.centroids.as_slice().chunks(DIM).for_each(|cent| {
             assert_relative_eq!(1.0, cent.iter().map(|&x| x.powi(2)).sum::<f32>());
         })
+    }
+
+    #[tokio::test]
+    async fn test_cosine_find_partitions() {
+        const DIM: usize = 8;
+        const K: usize = 16;
+        let data = generate_random_array(DIM * K * 100);
+        let vectors = FixedSizeListArray::try_new_from_values(data.clone(), DIM as i32).unwrap();
+        let params = KMeansParams::<Float32Type>::cosine();
+        let kmeans = KMeans::new_with_params(&vectors, K, &params).await.unwrap();
+
+        // Use cosine distance to brute-force to find the nearest neighbors.
+        // without normalization.
+        let query = &data.as_slice()[0..DIM];
+        let dists = Float32Array::from_iter_values(cosine_distance_batch(
+            query,
+            kmeans.centroids.as_slice(),
+            DIM,
+        ));
+        let expected = sort_to_indices(&dists, None, Some(4)).unwrap();
+
+        let actual = kmeans.find_partitions(query, 4).unwrap();
+        assert_eq!(expected, actual);
     }
 }
