@@ -425,7 +425,9 @@ where
     ///
     /// Parameters:
     ///
-    /// - *data*: a `N * dimension` float32 array. Not necessarily normalized.
+    /// - *data*: a `N * dimension` floating array. Not necessarily normalized.
+    ///
+    /// If the metric type is cosine, the vector will be normalized internally.
     ///
     pub async fn compute_membership(&self, data: Arc<T::ArrayType>) -> KMeanMembership<T> {
         let dimension = self.dimension;
