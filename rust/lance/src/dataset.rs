@@ -2295,7 +2295,9 @@ mod tests {
                 vec![
                     Arc::new(Int32Array::from_iter_values([200, 39, 199, 39, 40, 125])),
                     Arc::new(StringArray::from_iter_values(
-                        [200, 39, 199, 39, 40, 125].iter().map(|v| format!("str-{v}"))
+                        [200, 39, 199, 39, 40, 125]
+                            .iter()
+                            .map(|v| format!("str-{v}"))
                     )),
                 ],
             )
