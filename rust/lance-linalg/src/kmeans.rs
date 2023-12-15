@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::cmp::min;
+use std::ops::DivAssign;
 use std::sync::Arc;
 use std::vec;
 
@@ -21,7 +22,7 @@ use arrow_schema::ArrowError;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 use log::{info, warn};
-use num_traits::{AsPrimitive, Float, FromPrimitive, One, Zero};
+use num_traits::{AsPrimitive, Float, FromPrimitive, Zero};
 use rand::prelude::*;
 use rand::Rng;
 use tracing::instrument;
@@ -149,6 +150,20 @@ where
     metric_type: MetricType,
 }
 
+fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], dimension: usize) {
+    for i in 0..cnts.len() {
+        if cnts[i] == 0 {
+            let largest_idx = argmax(cnts.iter().copied()).unwrap() as usize;
+            cnts[i] = cnts[largest_idx] / 2;
+            cnts[largest_idx] /= 2;
+            for j in 0..dimension {
+                centroids[i * dimension + j] =
+                    centroids[largest_idx * dimension + j] * (T::one() + T::epsilon());
+                centroids[largest_idx * dimension + j] /= T::one() + T::epsilon();
+            }
+        }
+    }
+}
 impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
     /// Reconstruct a KMeans model from the membership.
     async fn to_kmeans(&self) -> Result<KMeans<T>> {
@@ -186,20 +201,7 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
             }
         });
 
-        // Split the largest one
-        for i in 0..cluster_cnts.len() {
-            if cluster_cnts[i] == 0 {
-                let largest_idx = argmax(cluster_cnts.iter().copied()).unwrap() as usize;
-                cluster_cnts[i] = cluster_cnts[largest_idx] / 2;
-                cluster_cnts[largest_idx] /= 2;
-                for j in 0..dimension {
-                    new_centroids[i * dimension + j] = new_centroids[largest_idx * dimension + j]
-                        * (T::Native::one() + T::Native::epsilon());
-                    new_centroids[largest_idx * dimension + j] /=
-                        T::Native::one() + T::Native::epsilon();
-                }
-            }
-        }
+        split_clusters(&mut cluster_cnts, &mut new_centroids, dimension);
 
         if self.metric_type == MetricType::Cosine {
             // Need normalize centroids
