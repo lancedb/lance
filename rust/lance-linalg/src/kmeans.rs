@@ -16,7 +16,7 @@ use std::cmp::min;
 use std::sync::Arc;
 use std::vec;
 
-use arrow_array::{Array, FixedSizeListArray, Float32Array};
+use arrow_array::{Array, FixedSizeListArray};
 use arrow_schema::ArrowError;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
@@ -388,7 +388,7 @@ where
     /// ```
     #[instrument(level = "debug", skip_all)]
     async fn train_once(&self, data: &MatrixView<T>) -> KMeanMembership<T> {
-        self.compute_membership(data.data().clone(), None).await
+        self.compute_membership(data.data().clone()).await
     }
 
     /// Recompute the membership of each vector.
@@ -397,11 +397,7 @@ where
     ///
     /// - *data*: a `N * dimension` float32 array. Not necessarily normalized.
     ///
-    pub async fn compute_membership(
-        &self,
-        data: Arc<T::ArrayType>,
-        norm_data: Option<Arc<Float32Array>>,
-    ) -> KMeanMembership<T> {
+    pub async fn compute_membership(&self, data: Arc<T::ArrayType>) -> KMeanMembership<T> {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let metric_type = self.metric_type;
@@ -409,10 +405,8 @@ where
 
         let cluster_with_distances = stream::iter((0..n).step_by(CHUNK_SIZE))
             // make tiles of input data to split between threads.
-            .zip(repeat_with(|| {
-                (data.clone(), self.centroids.clone(), norm_data.clone())
-            }))
-            .map(|(start_idx, (data, centroids, norm_data))| async move {
+            .zip(repeat_with(|| (data.clone(), self.centroids.clone())))
+            .map(|(start_idx, (data, centroids))| async move {
                 let data = tokio::task::spawn_blocking(move || {
                     let last_idx = min(start_idx + CHUNK_SIZE, n);
 
@@ -425,11 +419,11 @@ where
                                 .collect();
                         }
                         MetricType::Cosine => {
-                            let values = values
+                            let normalized = values
                                 .chunks(dimension)
                                 .flat_map(normalize)
                                 .collect::<Vec<_>>();
-                            return compute_partitions_l2(centroids_array, &values, dimension)
+                            return compute_partitions_l2(centroids_array, &normalized, dimension)
                                 .collect();
                         }
                         MetricType::Dot => values
@@ -604,7 +598,13 @@ where
         MetricType::L2 => compute_partitions_l2(centroids, data, dimension)
             .map(|(c, _)| c)
             .collect(),
-        MetricType::Cosine => compute_partitions_cosine(centroids, data, dimension),
+        MetricType::Cosine => {
+            let normalized = data
+                .chunks(dimension)
+                .flat_map(normalize)
+                .collect::<Vec<_>>();
+            compute_partitions_cosine(centroids, &normalized, dimension)
+        }
         MetricType::Dot => compute_partitions_dot(centroids, data, dimension),
     }
 }
