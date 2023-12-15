@@ -538,32 +538,6 @@ where
     Box::new(stream)
 }
 
-fn compute_partitions_cosine<T: FloatToArrayType + AsPrimitive<f64>>(
-    centroids: &[T],
-    data: &[T],
-    dimension: usize,
-) -> Vec<u32>
-where
-    T::ArrowType: Cosine,
-    <T as FloatToArrayType>::ArrowType: Dot,
-{
-    let centroid_norms = centroids
-        .chunks(dimension)
-        .map(|centroid| norm_l2(centroid))
-        .collect::<Vec<_>>();
-    data.chunks(dimension)
-        .map(|row| {
-            argmin(
-                centroids
-                    .chunks(dimension)
-                    .zip(centroid_norms.iter())
-                    .map(|(centroid, &norm)| T::ArrowType::cosine_fast(centroid, norm, row)),
-            )
-            .unwrap()
-        })
-        .collect()
-}
-
 fn compute_partitions_dot<T: FloatToArrayType>(
     centroids: &[T],
     data: &[T],
@@ -603,7 +577,7 @@ where
                 .chunks(dimension)
                 .flat_map(normalize)
                 .collect::<Vec<_>>();
-            compute_partitions_cosine(centroids, &normalized, dimension)
+            compute_partitions_l2(centroids, &normalized, dimension).collect()
         }
         MetricType::Dot => compute_partitions_dot(centroids, data, dimension),
     }
