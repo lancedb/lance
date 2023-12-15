@@ -25,7 +25,7 @@ use lance_arrow::floats::FloatArray;
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{
-    cosine_distance_batch, dot_distance_batch, l2_distance_batch, norm_l2, Cosine, Dot, L2,
+    cosine_distance_batch, dot_distance_batch, l2_distance_batch, Cosine, Dot, L2,
 };
 use lance_linalg::kernels::{argmin, argmin_value_float, normalize};
 use lance_linalg::{distance::MetricType, MatrixView};
@@ -478,7 +478,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
 
                 // Normalized query vector.
                 let query = T::ArrayType::from(normalize(query.as_slice()).collect::<Vec<_>>());
-                self.l2_distance_table(query, code)
+                self.l2_distance_table(&query, code)
             }
             MetricType::Dot => self.dot_distance_table(query, code),
         }
