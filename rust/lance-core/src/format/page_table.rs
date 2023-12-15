@@ -192,7 +192,9 @@ mod tests {
             .unwrap();
         writer.shutdown().await.unwrap();
 
-        let reader = LocalObjectReader::open_local_path(&path, 1024).unwrap();
+        let reader = LocalObjectReader::open_local_path(&path, 1024)
+            .await
+            .unwrap();
         let actual = PageTable::load(
             reader.as_ref(),
             pos,
