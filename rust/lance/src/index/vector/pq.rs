@@ -17,7 +17,7 @@ use std::{any::Any, collections::HashMap};
 
 use arrow_array::{
     cast::{as_primitive_array, AsArray},
-    Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
+    FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
