@@ -135,9 +135,6 @@ class KMeans:
             self._random_init(data)
             data = TensorDataset(data, batch_size=4096)
 
-        if self.metric == "cosine":
-            # Normalize the data
-            data = torch.nn.functional.normalize(data)
         assert self.centroids is not None
         self.centroids = self.centroids.to(self.device)
 

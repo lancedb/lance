@@ -23,6 +23,7 @@ from typing import Iterable, Optional, Union
 
 import numpy as np
 import pyarrow as pa
+import semver
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
@@ -30,6 +31,8 @@ from ..cache import CachedDataset
 from ..sampler import maybe_sample
 
 __all__ = ["LanceDataset"]
+
+_is_pa_12_or_later = semver.Version.parse(pa.__version__).major >= 12
 
 
 def _to_tensor(
@@ -42,9 +45,10 @@ def _to_tensor(
         if pa.types.is_uint64(arr.type) and uint64_as_int64:
             arr = arr.cast(pa.int64())
 
-        if pa.types.is_fixed_size_list(arr.type) and pa.types.is_floating(
-            arr.type.value_type
-        ):
+        if (
+            pa.types.is_fixed_size_list(arr.type)
+            or (_is_pa_12_or_later and isinstance(arr.type, pa.FixedShapeTensorType))
+        ) and pa.types.is_floating(arr.type.value_type):
             np_arrs = arr.to_numpy(zero_copy_only=False)
             np_tensor = np.stack(np_arrs)
             del np_arrs

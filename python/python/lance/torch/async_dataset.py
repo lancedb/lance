@@ -69,7 +69,10 @@ class AsyncDataset(IterableDataset):
 
     def close(self):
         self.shutdown.value = True
-        for _ in self:
+        try:
+            for _ in self:
+                pass
+        except Exception:
             pass
         self.queue.close()
         self.worker.join()
