@@ -228,6 +228,9 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         Ok(total_distortion / data.num_rows() as f64)
     }
 
+    /// Pre-compute L2 distance from the query to all code.
+    ///
+    /// It returns the squared L2 distance.
     fn l2_distance_table(&self, key: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
         let key: &T::ArrayType = key.as_any().downcast_ref().ok_or(Error::Index {
             message: format!(
