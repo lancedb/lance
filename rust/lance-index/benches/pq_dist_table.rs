@@ -18,7 +18,7 @@ use std::iter::repeat;
 use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
-use arrow_array::{Array, UInt8Array};
+use arrow_array::UInt8Array;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use lance_index::vector::pq::{ProductQuantizer, ProductQuantizerImpl};
 use lance_linalg::distance::MetricType;
