@@ -23,6 +23,7 @@ use lance_arrow::{ArrowFloatType, FloatArray, FloatType};
 use num_traits::{AsPrimitive, Float, FromPrimitive, ToPrimitive};
 use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
 
+use crate::kernels::normalize;
 use crate::{Error, Result};
 
 /// Transpose a matrix.
@@ -196,6 +197,22 @@ impl<T: ArrowFloatType> MatrixView<T> {
             num_columns: self.num_columns,
             transpose: !self.transpose,
         }
+    }
+
+    pub fn normalize(&self) -> Self {
+        let data = self
+            .data
+            .as_slice()
+            .chunks(self.num_columns)
+            .flat_map(normalize)
+            .collect::<Vec<_>>();
+        let data = Arc::new(data.into());
+        Self {
+            data,
+            num_columns: self.num_columns,
+            transpose: self.transpose,
+        }
+        // todo!("normalize")
     }
 
     /// Dot multiply

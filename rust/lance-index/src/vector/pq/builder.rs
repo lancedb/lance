@@ -100,13 +100,19 @@ impl PQBuildParams {
         data: &MatrixView<T>,
         metric_type: MetricType,
     ) -> Result<Arc<dyn ProductQuantizer + 'static>> {
-        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
+        let (data, mt) = if metric_type == MetricType::Cosine {
+            // Use normalize L2 to train for cosine distance.
+            (data.normalize(), MetricType::L2)
+        } else {
+            (data.clone(), metric_type)
+        };
+
+        let sub_vectors = divide_to_subvectors(&data, self.num_sub_vectors);
         let num_centroids = 2_usize.pow(self.num_bits as u32);
         let dimension = data.num_columns();
         let sub_vector_dimension = dimension / self.num_sub_vectors;
         const REDOS: usize = 1;
 
-        // TODO: parallel training.
         let d = stream::iter(sub_vectors.into_iter())
             .map(|sub_vec| async move {
                 let rng = rand::rngs::SmallRng::from_entropy();
@@ -118,7 +124,7 @@ impl PQBuildParams {
                     self.max_iters as u32,
                     REDOS,
                     rng.clone(),
-                    metric_type,
+                    mt,
                     self.sample_rate,
                 )
                 .await
