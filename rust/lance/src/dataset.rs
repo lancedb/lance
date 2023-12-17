@@ -850,6 +850,7 @@ impl Dataset {
             let schema = Arc::new(projection.into());
             return Ok(RecordBatch::new_empty(schema));
         }
+
         let mut sorted_indices: Vec<usize> = (0..row_indices.len()).collect();
         sorted_indices.sort_by_key(|&i| row_indices[i]);
 
@@ -872,21 +873,19 @@ impl Dataset {
         let mut current_fragment_end = current_fragment_len as u64;
         let mut start = 0;
         let mut end = 0;
-        let mut previous_row_index: u64 = u64::MAX;
-        let mut previous_sorted_index: usize = usize::MAX;
+        let mut previous_sorted_index: usize = 0;
 
         for index in sorted_indices {
             // Get the index
             let row_index = row_indices[index];
 
-            if previous_row_index == row_index {
-                // If we have a duplicate index request, we just add a remap index
-                // entry that points to the previous one.
+            if !sub_requests.is_empty() && row_indices[previous_sorted_index] == row_index {
+                // If we have a duplicate index request we add a remap_index
+                // entry that points to the original index request.
                 remap_index[index] = remap_index[previous_sorted_index];
                 continue;
             } else {
                 previous_sorted_index = index;
-                previous_row_index = row_index;
             }
 
             // If the row index is beyond the current fragment, iterate
