@@ -850,7 +850,10 @@ impl Dataset {
             let schema = Arc::new(projection.into());
             return Ok(RecordBatch::new_empty(schema));
         }
-
+        let num_unique_row_indices = row_indices
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         let mut sorted_indices: Vec<usize> = (0..row_indices.len()).collect();
         sorted_indices.sort_by_key(|&i| row_indices[i]);
 
@@ -861,7 +864,7 @@ impl Dataset {
         // We will remap the row indices to the original row indices, using a pair
         // of (request position, position in request)
         let mut remap_index: Vec<(usize, usize)> = vec![(0, 0); row_indices.len()];
-        let mut local_ids_buffer: Vec<u32> = Vec::with_capacity(row_indices.len());
+        let mut local_ids_buffer: Vec<u32> = Vec::with_capacity(num_unique_row_indices);
 
         let mut fragments_iter = fragments.iter();
         let mut current_fragment = fragments_iter.next().ok_or_else(|| Error::InvalidInput {
@@ -873,11 +876,23 @@ impl Dataset {
         let mut current_fragment_end = current_fragment_len as u64;
         let mut start = 0;
         let mut end = 0;
-        let mut previous_row_index = row_indices[sorted_indices[0]];
+        let mut previous_row_index: u64 = u64::MAX;
+        let mut previous_sorted_index: usize = usize::MAX;
+        let mut num_segments = 0;
 
-        for (i, &index) in sorted_indices.iter().enumerate() {
+        for index in sorted_indices {
             // Get the index
             let row_index = row_indices[index];
+
+            if previous_row_index == row_index {
+                // If we have a duplicate index request, we just add a remap index
+                // entry that points to the previous one.
+                remap_index[index] = remap_index[previous_sorted_index];
+                continue;
+            } else {
+                previous_sorted_index = index;
+                previous_row_index = row_index;
+            }
 
             // If the row index is beyond the current fragment, iterate
             // until we find the fragment that contains it.
@@ -907,18 +922,12 @@ impl Dataset {
             // since it is possible for the global index to be larger than
             // u32::MAX.
             let local_index = (row_index - curr_fragment_offset) as u32;
-            // local_ids_buffer.push(local_index);
+            local_ids_buffer.push(local_index);
 
-            if (i == 0) || (previous_row_index != row_index) {
-                remap_index[index] = (sub_requests.len(), end - start);
-                local_ids_buffer.push(local_index);
-                previous_row_index = row_indices[sorted_indices[i]];
-                end += 1;
-            } else {
-                // If we have a duplicate, we don't increment the end
-                // index, but we still need to add it to the sub-request.
-                sub_requests.push((current_fragment, start..end));
-            }
+            remap_index[index] = (num_segments, end - start);
+
+            num_segments += 1;
+            end += 1;
         }
 
         // flush last batch
@@ -2279,9 +2288,10 @@ mod tests {
             .take(
                 &[
                     200, // 200
-                    200, // 200
                     199, // 199
                     39,  // 39
+                    40,  // 40
+                    199, // 40
                     40,  // 40
                     125, // 125
                 ],
@@ -2293,9 +2303,11 @@ mod tests {
             RecordBatch::try_new(
                 schema.clone(),
                 vec![
-                    Arc::new(Int32Array::from_iter_values([200, 39, 199, 39, 40, 125])),
+                    Arc::new(Int32Array::from_iter_values([
+                        200, 199, 39, 40, 199, 40, 125
+                    ])),
                     Arc::new(StringArray::from_iter_values(
-                        [200, 39, 199, 39, 40, 125]
+                        [200, 199, 39, 40, 199, 40, 125]
                             .iter()
                             .map(|v| format!("str-{v}"))
                     )),
