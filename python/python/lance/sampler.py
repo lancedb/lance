@@ -112,7 +112,7 @@ def maybe_sample(
     n: int,
     columns: Union[list[str], str],
     batch_size: int = 10240,
-    max_takes: int = 512,
+    max_takes: int = 1024,
 ) -> Generator[pa.RecordBatch, None, None]:
     """Sample n records from the dataset.
 
