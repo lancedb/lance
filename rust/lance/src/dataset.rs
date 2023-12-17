@@ -873,19 +873,21 @@ impl Dataset {
         let mut current_fragment_end = current_fragment_len as u64;
         let mut start = 0;
         let mut end = 0;
+        let mut previous_row_index: u64 = row_indices[sorted_indices[0]] + 1;
         let mut previous_sorted_index: usize = 0;
 
         for index in sorted_indices {
             // Get the index
             let row_index = row_indices[index];
 
-            if !sub_requests.is_empty() && row_indices[previous_sorted_index] == row_index {
+            if previous_row_index == row_index {
                 // If we have a duplicate index request we add a remap_index
                 // entry that points to the original index request.
                 remap_index[index] = remap_index[previous_sorted_index];
                 continue;
             } else {
                 previous_sorted_index = index;
+                previous_row_index = row_index;
             }
 
             // If the row index is beyond the current fragment, iterate
