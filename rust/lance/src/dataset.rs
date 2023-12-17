@@ -850,10 +850,6 @@ impl Dataset {
             let schema = Arc::new(projection.into());
             return Ok(RecordBatch::new_empty(schema));
         }
-        let num_unique_row_indices = row_indices
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len();
         let mut sorted_indices: Vec<usize> = (0..row_indices.len()).collect();
         sorted_indices.sort_by_key(|&i| row_indices[i]);
 
@@ -864,7 +860,7 @@ impl Dataset {
         // We will remap the row indices to the original row indices, using a pair
         // of (request position, position in request)
         let mut remap_index: Vec<(usize, usize)> = vec![(0, 0); row_indices.len()];
-        let mut local_ids_buffer: Vec<u32> = Vec::with_capacity(num_unique_row_indices);
+        let mut local_ids_buffer: Vec<u32> = Vec::with_capacity(row_indices.len());
 
         let mut fragments_iter = fragments.iter();
         let mut current_fragment = fragments_iter.next().ok_or_else(|| Error::InvalidInput {
@@ -878,7 +874,6 @@ impl Dataset {
         let mut end = 0;
         let mut previous_row_index: u64 = u64::MAX;
         let mut previous_sorted_index: usize = usize::MAX;
-        let mut num_segments = 0;
 
         for index in sorted_indices {
             // Get the index
@@ -924,9 +919,8 @@ impl Dataset {
             let local_index = (row_index - curr_fragment_offset) as u32;
             local_ids_buffer.push(local_index);
 
-            remap_index[index] = (num_segments, end - start);
+            remap_index[index] = (sub_requests.len(), end - start);
 
-            num_segments += 1;
             end += 1;
         }
 
