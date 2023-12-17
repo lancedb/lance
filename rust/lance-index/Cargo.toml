@@ -43,6 +43,7 @@ serde.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 approx.workspace = true

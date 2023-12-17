@@ -14,13 +14,14 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
-use arrow_array::{Array, FixedSizeListArray};
+use arrow_array::{Array, FixedSizeListArray, RecordBatch};
+use datafusion::error::Result as DFResult;
 use datafusion::scalar::ScalarValue;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use lance_arrow::*;
 use lance_core::io::Writer;
-use lance_datafusion::dataframe::BatchStreamGrouper;
 use lance_index::vector::PQ_CODE_COLUMN;
 
 use super::{IVFIndex, Ivf};
@@ -35,13 +36,14 @@ use crate::Result;
 pub(super) async fn write_index_partitions(
     writer: &mut dyn Writer,
     ivf: &mut Ivf,
-    new_data: BatchStreamGrouper,
+    new_data: impl Stream<Item = DFResult<(Vec<ScalarValue>, Vec<RecordBatch>)>> + Unpin,
     existing_partitions: Option<&IVFIndex>,
 ) -> Result<()> {
     let mut new_data = new_data.peekable();
     let mut new_data_ref = Pin::new(&mut new_data);
 
     for part_id in 0..ivf.num_partitions() as u32 {
+        let start = Instant::now();
         let mut pq_array = Vec::<Arc<dyn Array>>::new();
         let mut row_id_array = Vec::<Arc<dyn Array>>::new();
 
@@ -95,6 +97,11 @@ pub(super) async fn write_index_partitions(
             let row_ids_refs = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
             PlainEncoder::write(writer, row_ids_refs.as_slice()).await?;
         }
+        log::info!(
+            "Wrote partition {} in {} ms",
+            part_id,
+            start.elapsed().as_millis()
+        );
     }
     Ok(())
 }
