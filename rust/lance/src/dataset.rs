@@ -833,25 +833,21 @@ impl Dataset {
     /// - `columns`: the list of column names to drop.
     pub async fn drop(&mut self, columns: &[&str]) -> Result<()> {
         // Check if columns are present in the dataset and construct the new schema.
-        let mut fields = vec![];
         for col in columns {
-            let field = self.schema().field(col);
-            if field.is_none() {
+            if self.schema().field(col).is_none() {
                 return Err(Error::invalid_input(
                     format!("Column {} does not exist in the dataset", col),
                     location!(),
                 ));
-            } else if columns.contains(&field.unwrap().name.as_str()) {
-                fields.push(field.unwrap().name.as_str());
             }
         }
-        let new_schema = self.manifest.schema.project(&fields)?;
+
+        let columns_to_remove = self.manifest.schema.project(columns)?;
+        let new_schema = self.manifest.schema.exclude(columns_to_remove)?;
 
         let transaction = Transaction::new(
             self.manifest.version,
-            Operation::Project {
-                schema: new_schema.clone(),
-            },
+            Operation::Project { schema: new_schema },
             None,
         );
 
@@ -2759,6 +2755,15 @@ mod tests {
         dataset.drop(&vec!["i"].to_vec()).await.unwrap();
         dataset.validate().await.unwrap();
 
+        let actual_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
         assert_eq!(actual, expected_keep_x);
     }
 
