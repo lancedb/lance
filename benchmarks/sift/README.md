@@ -27,7 +27,7 @@ Generate Lance datasets using the `datagen.py` script:
 #### Database vectors
 
 ```sh
- ./datagen.py ./sift/sift_base.fvecs sift1m.lance -d 128
+./datagen.py ./sift/sift_base.fvecs ./.lancedb/sift1m.lance -d 128
 ```
 
 #### Query vectors
@@ -40,7 +40,7 @@ Generate Lance datasets using the `datagen.py` script:
 
 ```sh
 # -i is ivf partitions and -p is pq subvectors
-./index.py ~/.lancedb/sift1m.lance -i 256 -p 16
+./index.py ./.lancedb/sift1m.lance -i 256 -p 16
 ```
 
 ### Run benchmark
