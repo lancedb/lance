@@ -103,14 +103,14 @@ impl IvfShuffler {
         Ok(())
     }
 
-    pub async fn total_batches(&self) -> Result<usize> {
+    async fn total_batches(&self) -> Result<usize> {
         let object_store = ObjectStore::local();
         let path = self.output_dir.child(UNSORTED_BUFFER);
         let reader = FileReader::try_new(&object_store, &path).await?;
         Ok(reader.num_batches())
     }
 
-    pub async fn count_partition_size(&self, start: usize, end: usize) -> Result<Vec<u64>> {
+    async fn count_partition_size(&self, start: usize, end: usize) -> Result<Vec<u64>> {
         let object_store = ObjectStore::local();
         let path = self.output_dir.child(UNSORTED_BUFFER);
         let reader = FileReader::try_new(&object_store, &path).await?;
@@ -137,7 +137,7 @@ impl IvfShuffler {
         Ok(partition_sizes)
     }
 
-    pub async fn shuffle_to_partitions(
+    async fn shuffle_to_partitions(
         &self,
         partition_size: Vec<u64>,
         start: usize,
@@ -206,7 +206,7 @@ impl IvfShuffler {
         Ok((row_id_buffers, pq_code_buffers))
     }
 
-    pub async fn write_partitoned_shuffles(
+    pub async fn write_partitioned_shuffles(
         &self,
         batches_per_partition: usize,
         concurrent_jobs: usize,
@@ -258,12 +258,12 @@ impl IvfShuffler {
                         let batch = RecordBatch::try_new(
                             schema.clone(),
                             vec![
-                                Arc::new(UInt64Array::from_iter_values(row_ids.into_iter())),
+                                Arc::new(UInt64Array::from(row_ids)),
                                 Arc::new(UInt32Array::from_iter_values(
                                     std::iter::repeat(part_id as u32).take(length),
                                 )),
                                 Arc::new(FixedSizeListArray::try_new_from_values(
-                                    UInt8Array::from_iter_values(pq_codes.into_iter()),
+                                    UInt8Array::from(pq_codes),
                                     self.pq_width as i32,
                                 )?),
                             ],
@@ -311,4 +311,11 @@ impl IvfShuffler {
 
         Ok(streams)
     }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[tokio::test]
+    async fn test_shuffle_pq() {}
 }

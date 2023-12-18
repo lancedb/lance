@@ -191,7 +191,7 @@ pub async fn shuffle_dataset_v2(
     info!("wrote raw stream: {:?}", start.elapsed());
 
     let start = std::time::Instant::now();
-    let partition_files = shuffler.write_partitoned_shuffles(10000, 2).await?;
+    let partition_files = shuffler.write_partitioned_shuffles(10000, 2).await?;
     info!("counted partition sizes: {:?}", start.elapsed());
 
     let start = std::time::Instant::now();
