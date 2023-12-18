@@ -65,6 +65,7 @@ def main():
         metric=args.metric,
         num_partitions=args.ivf_partitions,  # IVF
         num_sub_vectors=args.pq_subvectors,
+        replace=True
     )  # PQ
     end = time.time()
 
