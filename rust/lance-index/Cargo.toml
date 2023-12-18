@@ -52,8 +52,7 @@ lance-testing.workspace = true
 pprof.workspace = true
 tempfile.workspace = true
 sqlparser = "0.39.0"
-# datafusion-sql = "34.0.0"
-datafusion-sql = { git = "https://github.com/apache/arrow-datafusion.git", tag = "34.0.0-rc3" }
+datafusion-sql = "34.0.0"
 
 [build-dependencies]
 prost-build.workspace = true

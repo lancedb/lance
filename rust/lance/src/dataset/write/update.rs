@@ -18,7 +18,7 @@ use std::sync::{Arc, RwLock};
 use super::super::utils::make_rowid_capture_stream;
 use super::write_fragments_internal;
 use arrow_array::RecordBatch;
-use arrow_schema::{Schema as ArrowSchema, DataType, ArrowError};
+use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;

@@ -71,19 +71,13 @@ bytes = "1.4"
 byteorder = "1.5"
 chrono = "0.4.23"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
-# datafusion = { version = "34.0.0", default-features = false, features = [
-#     "regex_expressions",
-# ] }
-# datafusion-common = "34.0"
-# datafusion-sql = "34.0"
-# datafusion-expr = "34.0"
-datafusion = { git = "https://github.com/apache/arrow-datafusion.git", tag = "34.0.0-rc3", default-features = false, features = [
+datafusion = { version = "34.0.0", default-features = false, features = [
     "regex_expressions",
 ] }
-datafusion-common = { git = "https://github.com/apache/arrow-datafusion.git", tag = "34.0.0-rc3" }
-datafusion-sql = { git = "https://github.com/apache/arrow-datafusion.git", tag = "34.0.0-rc3" }
-datafusion-expr = { git = "https://github.com/apache/arrow-datafusion.git", tag = "34.0.0-rc3" }
-datafusion-physical-expr = { git = "https://github.com/apache/arrow-datafusion.git", tag = "34.0.0-rc3", default-features = false }
+datafusion-common = "34.0"
+datafusion-sql = "34.0"
+datafusion-expr = "34.0"
+datafusion-physical-expr = "34.0"
 either = "1.0"
 futures = "0.3"
 http = "0.2.9"
