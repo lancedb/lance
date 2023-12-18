@@ -2698,7 +2698,7 @@ mod tests {
         assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
 
         let mut dataset = Dataset::open(test_uri).await.unwrap();
-        dataset.drop(&vec!["x"].to_vec()).await.unwrap();
+        dataset.drop(&["x"]).await.unwrap();
         dataset.validate().await.unwrap();
 
         assert_eq!(dataset.version().version, 3);
@@ -2752,7 +2752,7 @@ mod tests {
             .unwrap();
 
         let mut dataset = Dataset::open(test_uri).await.unwrap();
-        dataset.drop(&vec!["i"].to_vec()).await.unwrap();
+        dataset.drop(&["i"]).await.unwrap();
         dataset.validate().await.unwrap();
 
         let actual_batches = dataset
