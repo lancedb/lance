@@ -1583,7 +1583,7 @@ class ScannerBuilder:
     def nearest(
         self,
         column: str,
-        q: pa.FloatingPointArray | List[float] | np.ndarray,
+        q: QueryVectorLike,
         k: Optional[int] = None,
         metric: Optional[str] = None,
         nprobes: Optional[int] = None,
