@@ -144,10 +144,8 @@ message Transaction {
 
   // An operation that projects a subset of columns, altering the schema.
   message Project {
-    // These should all have existing fragment IDs.
-    repeated DataFragment fragments = 1;
     // The new schema
-    repeated Field schema = 2;
+    repeated Field schema = 1;
   }
 
   // An operation that restores a dataset to a previous version.

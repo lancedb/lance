@@ -850,8 +850,7 @@ impl Dataset {
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::Project {
-                fragments: self.fragments().to_vec(),
-                schema: new_schema,
+                schema: new_schema.clone(),
             },
             None,
         );
@@ -2666,15 +2665,37 @@ mod tests {
             ..Default::default()
         };
 
-        let batches = RecordBatchIterator::new(vec![batch1].into_iter().map(Ok), schema.clone());
+        let batches =
+            RecordBatchIterator::new(vec![batch1.clone()].into_iter().map(Ok), schema.clone());
         Dataset::write(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
-        let batches = RecordBatchIterator::new(vec![batch2].into_iter().map(Ok), schema.clone());
+        let batches =
+            RecordBatchIterator::new(vec![batch2.clone()].into_iter().map(Ok), schema.clone());
         Dataset::write(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
+
+        let expected_keep_i = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "i",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 2]))],
+        )
+        .unwrap();
+
+        let expected_keep_x = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "x",
+                DataType::Float32,
+                false,
+            )])),
+            vec![Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]))],
+        )
+        .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(dataset.fragments().len(), 2);
@@ -2699,17 +2720,8 @@ mod tests {
             .await
             .unwrap();
         let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
-        let expected = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![Field::new(
-                "i",
-                DataType::Int32,
-                false,
-            )])),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 2]))],
-        )
-        .unwrap();
 
-        assert_eq!(actual, expected);
+        assert_eq!(actual, expected_keep_i);
 
         // Validate we can still read after re-instantiating dataset, which
         // clears the cache.
@@ -2723,7 +2735,31 @@ mod tests {
             .await
             .unwrap();
         let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
-        assert_eq!(actual, expected);
+
+        assert_eq!(actual, expected_keep_i);
+
+        let overwrite_params = WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        };
+
+        let batches =
+            RecordBatchIterator::new(vec![batch1.clone()].into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(overwrite_params.clone()))
+            .await
+            .unwrap();
+
+        let batches =
+            RecordBatchIterator::new(vec![batch2.clone()].into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        dataset.drop(&vec!["i"].to_vec()).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        assert_eq!(actual, expected_keep_x);
     }
 
     #[tokio::test]

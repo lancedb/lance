@@ -143,10 +143,7 @@ pub enum Operation {
     },
 
     /// Project to a new schema. This only changes the schema, not the data.
-    Project {
-        fragments: Vec<Fragment>,
-        schema: Schema,
-    },
+    Project { schema: Schema },
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +365,7 @@ impl Transaction {
         let schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
             Operation::Merge { ref schema, .. } => schema.clone(),
+            Operation::Project { ref schema, .. } => schema.clone(),
             _ => {
                 if let Some(current_manifest) = current_manifest {
                     current_manifest.schema.clone()
@@ -488,13 +486,8 @@ impl Transaction {
             Operation::Merge { ref fragments, .. } => {
                 final_fragments.extend(fragments.clone());
             }
-            Operation::Project {
-                ref fragments,
-                ref schema,
-                ..
-            } => {
+            Operation::Project { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
-                schema;
             }
             Operation::Restore { .. } => {
                 unreachable!()
@@ -733,13 +726,11 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 updated_fragments: updated_fragments.iter().map(Fragment::from).collect(),
                 new_fragments: new_fragments.iter().map(Fragment::from).collect(),
             },
-            Some(pb::transaction::Operation::Project(pb::transaction::Project {
-                fragments,
-                schema,
-            })) => Operation::Project {
-                fragments: fragments.iter().map(Fragment::from).collect(),
-                schema: Schema::from(schema),
-            },
+            Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
+                Operation::Project {
+                    schema: Schema::from(schema),
+                }
+            }
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),
@@ -871,9 +862,8 @@ impl From<&Transaction> for pb::Transaction {
                     .collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
             }),
-            Operation::Project { fragments, schema } => {
+            Operation::Project { schema } => {
                 pb::transaction::Operation::Project(pb::transaction::Project {
-                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
                     schema: schema.into(),
                 })
             }
