@@ -2632,10 +2632,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop() {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("i", DataType::Int32, false),
-            Field::new("x", DataType::Float32, false),
-        ]));
+        let mut metadata: HashMap<String, String> = HashMap::new();
+        metadata.insert(String::from("k1"), String::from("v1"));
+
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![
+                Field::new("i", DataType::Int32, false),
+                Field::new("x", DataType::Float32, false),
+            ],
+            metadata.clone(),
+        ));
+
         let batch1 = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -2674,21 +2681,19 @@ mod tests {
             .unwrap();
 
         let expected_keep_i = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![Field::new(
-                "i",
-                DataType::Int32,
-                false,
-            )])),
+            Arc::new(ArrowSchema::new_with_metadata(
+                vec![Field::new("i", DataType::Int32, false)],
+                metadata.clone(),
+            )),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3, 2]))],
         )
         .unwrap();
 
         let expected_keep_x = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![Field::new(
-                "x",
-                DataType::Float32,
-                false,
-            )])),
+            Arc::new(ArrowSchema::new_with_metadata(
+                vec![Field::new("x", DataType::Float32, false)],
+                metadata.clone(),
+            )),
             vec![Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]))],
         )
         .unwrap();
@@ -2701,6 +2706,8 @@ mod tests {
         dataset.drop(&["x"]).await.unwrap();
         dataset.validate().await.unwrap();
 
+        assert_eq!(dataset.schema().fields.len(), 1);
+        assert_eq!(dataset.schema().metadata, metadata.clone());
         assert_eq!(dataset.version().version, 3);
         assert_eq!(dataset.fragments().len(), 2);
         assert_eq!(dataset.fragments()[0].files.len(), 1);
