@@ -71,7 +71,7 @@ use crate::{
         pb,
         prefilter::PreFilter,
         vector::{
-            ivf::{builder::shuffle_dataset, io::write_index_partitions},
+            ivf::{builder::shuffle_dataset_v2, io::write_index_partitions},
             Transformer,
         },
         INDEX_FILE_NAME,
@@ -217,8 +217,15 @@ impl IVFIndex {
             None,
             None,
         )?;
-        let shuffled = shuffle_dataset(data, column, ivf, pq_index.pq.num_sub_vectors()).await?;
 
+        let shuffled = shuffle_dataset_v2(
+            data,
+            column,
+            ivf,
+            self.ivf.num_partitions() as u32,
+            pq_index.pq.num_sub_vectors(),
+        )
+        .await?;
         let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
         write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(self)).await?;
         let metadata = IvfPQIndexMetadata {
