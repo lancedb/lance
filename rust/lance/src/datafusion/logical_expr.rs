@@ -16,6 +16,7 @@
 
 use arrow_schema::DataType;
 
+use datafusion::logical_expr::ScalarFunctionDefinition;
 use datafusion::logical_expr::{
     expr::ScalarFunction, BinaryExpr, BuiltinScalarFunction, GetFieldAccess, GetIndexedField,
     Operator,
@@ -203,8 +204,8 @@ pub fn coerce_filter_type_to_boolean(expr: Expr) -> Result<Expr> {
         // TODO: consider making this dispatch more generic, i.e. fun.output_type -> coerce
         // instead of hardcoding coerce method for each function
         Expr::ScalarFunction(ScalarFunction {
-            fun: BuiltinScalarFunction::RegexpMatch,
-            args: _,
+            func_def: ScalarFunctionDefinition::BuiltIn(BuiltinScalarFunction::RegexpMatch),
+            ..
         }) => Ok(Expr::IsNotNull(Box::new(expr))),
 
         _ => Ok(expr),

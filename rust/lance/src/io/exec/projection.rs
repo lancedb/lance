@@ -194,7 +194,7 @@ impl ExecutionPlan for ProjectionExec {
         Ok(Box::pin(ProjectionStream::new(input_stream, &self.project)))
     }
 
-    fn statistics(&self) -> datafusion::physical_plan::Statistics {
+    fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
         self.input.statistics()
     }
 }

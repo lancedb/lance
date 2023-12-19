@@ -104,8 +104,8 @@ where
     let (min_value, max_value, null_count) = compute_primitive_statistics::<T>(arrays);
     StatisticsRow {
         null_count,
-        min_value: ScalarValue::new_primitive::<T>(Some(min_value), arrays[0].data_type()),
-        max_value: ScalarValue::new_primitive::<T>(Some(max_value), arrays[0].data_type()),
+        min_value: ScalarValue::new_primitive::<T>(Some(min_value), arrays[0].data_type()).unwrap(),
+        max_value: ScalarValue::new_primitive::<T>(Some(max_value), arrays[0].data_type()).unwrap(),
     }
 }
 
@@ -832,6 +832,7 @@ impl StatisticsBuilder {
         let min_value = row
             .min_value
             .to_array()
+            .unwrap()
             .as_any()
             .downcast_ref::<PrimitiveArray<T>>()
             .unwrap()
@@ -839,6 +840,7 @@ impl StatisticsBuilder {
         let max_value = row
             .max_value
             .to_array()
+            .unwrap()
             .as_any()
             .downcast_ref::<PrimitiveArray<T>>()
             .unwrap()
@@ -1976,7 +1978,7 @@ mod tests {
         value: ScalarValue,
         with_nulls: bool,
     ) -> std::result::Result<(), TestCaseError> {
-        let array_scalar = value.to_scalar();
+        let array_scalar = value.to_scalar().unwrap();
         let (array, _) = array_scalar.get();
         let array = make_array(array.to_data());
 
@@ -2090,21 +2092,25 @@ mod tests {
         runner.run(&results, |(subset, stats)| {
             // Assert min is <= all values
             prop_assert!(subset.iter().all(|val| val.is_nan()
-                || stats.min_value <= ScalarValue::new_primitive::<F>(Some(*val), &F::DATA_TYPE)));
+                || stats.min_value
+                    <= ScalarValue::new_primitive::<F>(Some(*val), &F::DATA_TYPE).unwrap()));
 
             // Assert max is >= all values
             prop_assert!(subset.iter().all(|val| val.is_nan()
-                || stats.max_value >= ScalarValue::new_primitive::<F>(Some(*val), &F::DATA_TYPE)));
+                || stats.max_value
+                    >= ScalarValue::new_primitive::<F>(Some(*val), &F::DATA_TYPE).unwrap()));
 
             // If array is empty, assert min and max are -inf, +inf, respectively
             if subset.is_empty() {
                 prop_assert_eq!(
                     stats.min_value,
                     ScalarValue::new_primitive::<F>(Some(F::Native::neg_infinity()), &F::DATA_TYPE)
+                        .unwrap()
                 );
                 prop_assert_eq!(
                     stats.max_value,
                     ScalarValue::new_primitive::<F>(Some(F::Native::infinity()), &F::DATA_TYPE)
+                        .unwrap()
                 );
             }
 

@@ -17,14 +17,13 @@ use std::sync::{Arc, RwLock};
 
 use super::super::utils::make_rowid_capture_stream;
 use super::write_fragments_internal;
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch};
+use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
-use arrow_select::concat::concat;
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{ColumnarValue, PhysicalExpr};
+use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
@@ -136,7 +135,8 @@ impl UpdateBuilder {
         if dest_type != src_type {
             expr = match expr {
                 // TODO: remove this branch once DataFusion supports casting List to FSL
-                Expr::Literal(value @ ScalarValue::List(_, _))
+                // This should happen in Arrow 51.0.0
+                Expr::Literal(value @ ScalarValue::List(_))
                     if matches!(dest_type, DataType::FixedSizeList(_, _)) =>
                 {
                     Expr::Literal(safe_coerce_scalar(&value, &dest_type).ok_or_else(|| {
@@ -269,42 +269,7 @@ impl UpdateJob {
     ) -> DFResult<RecordBatch> {
         let mut batch = batch.clone();
         for (column, expr) in updates.iter() {
-            let new_values = expr.evaluate(&batch)?;
-            // TODO: once datafusion implements ColumnarValue::into_array() for
-            // FixedSizeList, we can remove this branch.
-            let new_values = if matches!(new_values.data_type(), DataType::FixedSizeList(_, _)) {
-                match new_values {
-                    ColumnarValue::Array(array) => array,
-                    ColumnarValue::Scalar(scalar) => {
-                        if let ScalarValue::Fixedsizelist(values, field, size) = scalar {
-                            if let Some(values) = values {
-                                // Convert each scalar to an array, then concat to get a single list.
-                                let values: Vec<ArrayRef> =
-                                    values.iter().map(|v| v.to_array()).collect();
-                                let value_refs: Vec<&dyn Array> =
-                                    values.iter().map(|v| v.as_ref()).collect();
-                                let values = concat(&value_refs).unwrap();
-
-                                // Repeat the list num_rows times, and concat again.
-                                let value_refs = std::iter::repeat(values.as_ref())
-                                    .take(batch.num_rows())
-                                    .collect::<Vec<_>>();
-                                let values = concat(&value_refs).unwrap();
-
-                                Arc::new(FixedSizeListArray::new(field, size, values, None))
-                            } else {
-                                return Err(DataFusionError::NotImplemented(
-                                    "FixedSizeList null literals".into(),
-                                ));
-                            }
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                }
-            } else {
-                new_values.into_array(batch.num_rows())
-            };
+            let new_values = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
             batch = batch.replace_column_by_name(column.as_str(), new_values)?;
         }
         Ok(batch)

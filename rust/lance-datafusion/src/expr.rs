@@ -14,6 +14,10 @@
 
 //! Utilities for working with datafusion expressions
 
+use std::sync::Arc;
+
+use arrow::compute::cast;
+use arrow_array::{cast::AsArray, FixedSizeListArray};
 use arrow_schema::DataType;
 use datafusion_common::ScalarValue;
 
@@ -241,36 +245,25 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             _ => None,
         },
         ScalarValue::Null => Some(value.clone()),
-        ScalarValue::List(vals, _) => {
-            if let DataType::FixedSizeList(_, size) = ty {
-                if let Some(vals) = vals {
-                    if vals.len() as i32 != *size {
-                        return None;
-                    }
-                }
+        // In Arrow 50.0.0, we will have support to cast from list -> FSL, and we
+        // can remove the special case below.
+        ScalarValue::List(values) if matches!(ty, DataType::FixedSizeList(_, _)) => {
+            let values = values.as_list::<i32>().values();
+            if let DataType::FixedSizeList(field, size) = ty {
+                let new_values = cast(values, field.data_type()).ok()?;
+                Some(ScalarValue::FixedSizeList(Arc::new(
+                    FixedSizeListArray::new(field.clone(), *size, new_values, None),
+                )))
+            } else {
+                unreachable!()
             }
-            let (new_values, field) = match ty {
-                DataType::List(field)
-                | DataType::LargeList(field)
-                | DataType::FixedSizeList(field, _) => {
-                    if let Some(vals) = vals {
-                        let values = vals
-                            .iter()
-                            .map(|val| safe_coerce_scalar(val, field.data_type()))
-                            .collect::<Option<Vec<_>>>();
-                        (values, field)
-                    } else {
-                        (None, field)
-                    }
-                }
-                _ => return None,
-            };
-
+        }
+        ScalarValue::List(values) | ScalarValue::FixedSizeList(values) => {
+            let new_values = cast(values, ty).ok()?;
             match ty {
-                DataType::List(_) => Some(ScalarValue::List(new_values, field.clone())),
-                DataType::FixedSizeList(_, size) => {
-                    Some(ScalarValue::Fixedsizelist(new_values, field.clone(), *size))
-                }
+                DataType::List(_) => Some(ScalarValue::List(new_values)),
+                DataType::LargeList(_) => Some(ScalarValue::LargeList(new_values)),
+                DataType::FixedSizeList(_, _) => Some(ScalarValue::FixedSizeList(new_values)),
                 _ => None,
             }
         }

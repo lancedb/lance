@@ -21,6 +21,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
+use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
@@ -242,11 +243,11 @@ impl ExecutionPlan for KNNFlatExec {
         )))
     }
 
-    fn statistics(&self) -> Statistics {
-        Statistics {
-            num_rows: Some(self.query.k),
-            ..Default::default()
-        }
+    fn statistics(&self) -> DataFusionResult<Statistics> {
+        Ok(Statistics {
+            num_rows: Precision::Exact(self.query.k),
+            ..Statistics::new_unknown(self.schema().as_ref())
+        })
     }
 }
 
@@ -519,11 +520,13 @@ impl ExecutionPlan for KNNIndexExec {
         )))
     }
 
-    fn statistics(&self) -> datafusion::physical_plan::Statistics {
-        Statistics {
-            num_rows: Some(self.query.k * self.query.refine_factor.unwrap_or(1) as usize),
-            ..Default::default()
-        }
+    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
+        Ok(Statistics {
+            num_rows: Precision::Exact(
+                self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
+            ),
+            ..Statistics::new_unknown(self.schema().as_ref())
+        })
     }
 }
 

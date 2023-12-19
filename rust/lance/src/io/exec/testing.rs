@@ -79,7 +79,7 @@ impl ExecutionPlan for TestingExec {
         todo!()
     }
 
-    fn statistics(&self) -> datafusion::physical_plan::Statistics {
+    fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
         todo!()
     }
 }

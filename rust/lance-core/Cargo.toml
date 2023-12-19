@@ -55,7 +55,7 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-arrow = "47.0"
+arrow = "49.0"
 rand.workspace = true
 tempfile.workspace = true
 lance-testing.workspace = true

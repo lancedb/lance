@@ -17,11 +17,14 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
+use arrow_array::ListArray;
+use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
+use arrow_select::concat::concat;
 use datafusion::common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion};
 use datafusion::common::DFSchema;
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::{GetFieldAccess, GetIndexedField};
+use datafusion::logical_expr::{GetFieldAccess, GetIndexedField, ScalarFunctionDefinition};
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::sqlparser::ast::{
     Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr,
@@ -221,7 +224,7 @@ impl Planner {
                 .collect::<Vec<_>>();
 
             return Ok(Expr::ScalarFunction(ScalarFunction {
-                fun: BuiltinScalarFunction::RegexpMatch,
+                func_def: ScalarFunctionDefinition::BuiltIn(BuiltinScalarFunction::RegexpMatch),
                 args: args_vec,
             }));
         }
@@ -248,7 +251,7 @@ impl Planner {
             "boolean",
         ];
         match data_type {
-            SQLDataType::String => Ok(ArrowDataType::Utf8),
+            SQLDataType::String(_) => Ok(ArrowDataType::Utf8),
             SQLDataType::Binary(_) => Ok(ArrowDataType::Binary),
             SQLDataType::Float(_) => Ok(ArrowDataType::Float32),
             SQLDataType::Double => Ok(ArrowDataType::Float64),
@@ -379,15 +382,25 @@ impl Planner {
                             })?;
                         }
                     }
-                    Field::new("item", data_type, true)
+                    Field::new("item", data_type.clone(), true)
                 } else {
                     Field::new("item", ArrowDataType::Null, true)
                 };
 
-                Ok(Expr::Literal(ScalarValue::List(
-                    Some(values),
-                    Arc::new(field),
-                )))
+                let values = values
+                    .into_iter()
+                    .map(|v| v.to_array().map_err(Error::from))
+                    .collect::<Result<Vec<_>>>()?;
+                let array_refs = values.iter().map(|v| v.as_ref()).collect::<Vec<_>>();
+                let values = concat(&array_refs)?;
+                let values = ListArray::try_new(
+                    field.into(),
+                    OffsetBuffer::from_lengths([values.len()]),
+                    values,
+                    None,
+                )?;
+
+                Ok(Expr::Literal(ScalarValue::List(Arc::new(values))))
             }
             // For example, DATE '2020-01-01'
             SQLExpr::TypedString { data_type, value } => {
@@ -440,7 +453,9 @@ impl Planner {
                 *escape_char,
                 false,
             ))),
-            SQLExpr::Cast { expr, data_type } => Ok(Expr::Cast(datafusion::logical_expr::Cast {
+            SQLExpr::Cast {
+                expr, data_type, ..
+            } => Ok(Expr::Cast(datafusion::logical_expr::Cast {
                 expr: Box::new(self.parse_sql_expr(expr)?),
                 data_type: self.parse_type(data_type)?,
             })),
@@ -659,7 +674,7 @@ mod tests {
         .unwrap();
         let predicates = physical_expr.evaluate(&batch).unwrap();
         assert_eq!(
-            predicates.into_array(0).as_ref(),
+            predicates.into_array(0).unwrap().as_ref(),
             &BooleanArray::from(vec![
                 false, false, false, false, true, true, false, false, false, false
             ])
@@ -767,7 +782,7 @@ mod tests {
         .unwrap();
         let predicates = physical_expr.evaluate(&batch).unwrap();
         assert_eq!(
-            predicates.into_array(0).as_ref(),
+            predicates.into_array(0).unwrap().as_ref(),
             &BooleanArray::from(vec![
                 false, false, false, true, true, true, true, false, false, false
             ])
@@ -795,7 +810,7 @@ mod tests {
         .unwrap();
         let predicates = physical_expr.evaluate(&batch).unwrap();
         assert_eq!(
-            predicates.into_array(0).as_ref(),
+            predicates.into_array(0).unwrap().as_ref(),
             &BooleanArray::from(vec![
                 false, false, false, false, true, false, false, false, false, false
             ])
@@ -823,7 +838,7 @@ mod tests {
         .unwrap();
         let predicates = physical_expr.evaluate(&batch).unwrap();
         assert_eq!(
-            predicates.into_array(0).as_ref(),
+            predicates.into_array(0).unwrap().as_ref(),
             &BooleanArray::from(vec![
                 true, true, true, true, false, true, true, true, true, true
             ])
@@ -851,7 +866,7 @@ mod tests {
         .unwrap();
         let predicates = physical_expr.evaluate(&batch).unwrap();
         assert_eq!(
-            predicates.into_array(0).as_ref(),
+            predicates.into_array(0).unwrap().as_ref(),
             &BooleanArray::from(vec![
                 false, false, false, false, true, true, false, false, false, false
             ])
@@ -882,7 +897,7 @@ mod tests {
         .unwrap();
         let predicates = physical_expr.evaluate(&batch).unwrap();
         assert_eq!(
-            predicates.into_array(0).as_ref(),
+            predicates.into_array(0).unwrap().as_ref(),
             &BooleanArray::from(vec![
                 false, true, true, false, true, true, false, true, true, false
             ])
@@ -892,7 +907,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
         let predicates = physical_expr.evaluate(&batch).unwrap();
         assert_eq!(
-            predicates.into_array(0).as_ref(),
+            predicates.into_array(0).unwrap().as_ref(),
             &BooleanArray::from(vec![
                 true, false, false, true, false, false, true, false, false, true,
             ])
@@ -917,7 +932,7 @@ mod tests {
         .unwrap();
         let predicates = physical_expr.evaluate(&batch).unwrap();
         assert_eq!(
-            predicates.into_array(0).as_ref(),
+            predicates.into_array(0).unwrap().as_ref(),
             &BooleanArray::from(vec![
                 false, true, true, false, true, true, false, true, true, false
             ])
@@ -1137,7 +1152,7 @@ mod tests {
 
             // Evaluate and assert they have correct results
             let result = physical_expr.evaluate(&batch).unwrap();
-            let result = result.into_array(batch.num_rows());
+            let result = result.into_array(batch.num_rows()).unwrap();
             assert_eq!(&expected, &result, "unexpected result for {}", expression);
         }
     }

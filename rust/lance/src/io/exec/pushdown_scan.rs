@@ -22,9 +22,9 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::col;
+use datafusion::logical_expr::interval_arithmetic::{Interval, NullableInterval};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::physical_expr::intervals::{Interval, IntervalBound, NullableInterval};
 use datafusion::physical_plan::ColumnarValue;
 use datafusion::scalar::ScalarValue;
 use datafusion::{
@@ -167,7 +167,7 @@ impl ExecutionPlan for LancePushdownScanExec {
         todo!()
     }
 
-    fn statistics(&self) -> datafusion::physical_plan::Statistics {
+    fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
         todo!()
     }
 
@@ -588,10 +588,7 @@ impl FragmentScanner {
                         }
                     };
 
-                    let values = Interval::new(
-                        IntervalBound::new_closed(min_value),
-                        IntervalBound::new_closed(max_value)
-                    );
+                    let values = Interval::try_new(min_value, max_value).unwrap();
                     let batch_size = batch_sizes[batch_id];
                     let interval = match (null_count, batch_size) {
                         (0, _) => NullableInterval::NotNull { values },
@@ -1052,7 +1049,8 @@ mod test {
                 let mask = physical_expr
                     .evaluate(&result)
                     .unwrap()
-                    .into_array(result.num_rows());
+                    .into_array(result.num_rows())
+                    .unwrap();
                 result = filter_record_batch(&result, mask.as_boolean()).unwrap();
             }
 
