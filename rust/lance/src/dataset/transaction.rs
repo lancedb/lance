@@ -33,14 +33,15 @@
 //! a conflict. Some operations have additional conditions that must be met for
 //! them to be compatible.
 //!
-//! |                  | Append | Delete | Overwrite/Create | Create Index | Rewrite | Merge |
-//! |------------------|--------|--------|------------------|--------------|---------|-------|
-//! | Append           | ✅     | ✅     | ❌               | ✅           | ✅      | ❌    |
-//! | Delete           | ❌     | (1)    | ❌               | ✅           | (1)     | ❌    |
-//! | Overwrite/Create | ✅     | ✅     | ✅               | ✅           | ✅      | ✅    |
-//! | Create index     | ✅     | ✅     | ❌               | ✅           | ✅      | ✅    |
-//! | Rewrite          | ✅     | (1)    | ❌               | ❌           | (1)     | ❌    |
-//! | Merge            | ❌     | ❌     | ❌               | ❌           | ✅      | ❌    |
+//! |                  | Append | Delete | Overwrite/Create | Create Index | Rewrite | Merge | Project |
+//! |------------------|--------|--------|------------------|--------------|---------|-------|---------|
+//! | Append           | ✅     | ✅     | ❌               | ✅           | ✅      | ❌    | ❌      |
+//! | Delete           | ❌     | (1)    | ❌               | ✅           | (1)     | ❌    | ❌      |
+//! | Overwrite/Create | ✅     | ✅     | ✅               | ✅           | ✅      | ✅    | ✅      |
+//! | Create index     | ✅     | ✅     | ❌               | ✅           | ✅      | ✅    | ✅      |
+//! | Rewrite          | ✅     | (1)    | ❌               | ❌           | (1)     | ❌    | ❌      |
+//! | Merge            | ❌     | ❌     | ❌               | ❌           | ✅      | ❌    | ❌      |
+//! | Project          | ✅     | ✅     | ❌               | ❌           | ✅      | ❌    | ✅      |
 //!
 //! (1) Delete and rewrite are compatible with each other and themselves only if
 //! they affect distinct fragments. Otherwise, they conflict.
@@ -140,6 +141,9 @@ pub enum Operation {
         /// Fragments that have been added
         new_fragments: Vec<Fragment>,
     },
+
+    /// Project to a new schema. This only changes the schema, not the data.
+    Project { schema: Schema },
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +169,7 @@ impl Operation {
             | Self::Overwrite { .. }
             | Self::CreateIndex { .. }
             | Self::ReserveFragments { .. }
+            | Self::Project { .. }
             | Self::Restore { .. } => Box::new(std::iter::empty()),
             Self::Delete {
                 updated_fragments,
@@ -213,6 +218,7 @@ impl Operation {
             Self::ReserveFragments { .. } => "ReserveFragments",
             Self::Restore { .. } => "Restore",
             Self::Update { .. } => "Update",
+            Self::Project { .. } => "Project",
         }
     }
 }
@@ -243,6 +249,7 @@ impl Transaction {
                 Operation::CreateIndex { .. } => false,
                 Operation::Delete { .. } | Operation::Update { .. } => false,
                 Operation::ReserveFragments { .. } => false,
+                Operation::Project { .. } => false,
                 _ => true,
             },
             Operation::Rewrite { .. } => match &other.operation {
@@ -256,6 +263,7 @@ impl Transaction {
                     // As long as they rewrite disjoint fragments they shouldn't conflict.
                     self.operation.modifies_same_ids(&other.operation)
                 }
+                Operation::Project { .. } => false,
                 _ => true,
             },
             // Overwrite and Restore always succeed
@@ -291,6 +299,7 @@ impl Transaction {
                     // If we update the same fragments, we conflict.
                     self.operation.modifies_same_ids(&other.operation)
                 }
+                Operation::Project { .. } => false,
                 _ => true,
             },
             // Merge changes the schema, but preserves row ids, so the only operations
@@ -299,6 +308,12 @@ impl Transaction {
                 &other.operation,
                 Operation::CreateIndex { .. } | Operation::ReserveFragments { .. }
             ),
+            Operation::Project { .. } => match &other.operation {
+                // Project is compatible with anything that doesn't change the schema
+                Operation::CreateIndex { .. } => false,
+                Operation::Overwrite { .. } => false,
+                _ => true,
+            },
         }
     }
 
@@ -350,6 +365,7 @@ impl Transaction {
         let schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
             Operation::Merge { ref schema, .. } => schema.clone(),
+            Operation::Project { ref schema, .. } => schema.clone(),
             _ => {
                 if let Some(current_manifest) = current_manifest {
                     current_manifest.schema.clone()
@@ -469,6 +485,9 @@ impl Transaction {
             }
             Operation::Merge { ref fragments, .. } => {
                 final_fragments.extend(fragments.clone());
+            }
+            Operation::Project { .. } => {
+                final_fragments.extend(maybe_existing_fragments?.clone());
             }
             Operation::Restore { .. } => {
                 unreachable!()
@@ -707,6 +726,11 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 updated_fragments: updated_fragments.iter().map(Fragment::from).collect(),
                 new_fragments: new_fragments.iter().map(Fragment::from).collect(),
             },
+            Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
+                Operation::Project {
+                    schema: Schema::from(schema),
+                }
+            }
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),
@@ -838,6 +862,11 @@ impl From<&Transaction> for pb::Transaction {
                     .collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
             }),
+            Operation::Project { schema } => {
+                pb::transaction::Operation::Project(pb::transaction::Project {
+                    schema: schema.into(),
+                })
+            }
         };
 
         Self {
