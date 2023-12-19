@@ -92,12 +92,13 @@ pub(super) async fn write_index_partitions(
         }
 
         // Merge all streams with the same partition id.
-        while let Some((stream_part_id, stream_idx)) = streams_heap.peek() {
-            if stream_part_id != &part_id {
+        while let Some((stream_part_id, stream_idx)) = streams_heap.pop() {
+            if stream_part_id != part_id {
+                streams_heap.push((stream_part_id, stream_idx));
                 break;
             }
 
-            let mut stream = new_streams[*stream_idx].as_mut();
+            let mut stream = new_streams[stream_idx].as_mut();
             let batch = match stream.next().await {
                 Some(Ok(batch)) => batch,
                 Some(Err(e)) => {
@@ -135,8 +136,9 @@ pub(super) async fn write_index_partitions(
                         .column_by_name(PART_ID_COLUMN)
                         .expect("part id column not found")
                         .as_primitive();
-                    let part_id = part_ids.values()[0];
-                    streams_heap.push((part_id, *stream_idx));
+                    if !part_ids.is_empty() {
+                        streams_heap.push((part_ids.value(0), stream_idx));
+                    }
                 }
                 Some(Err(e)) => {
                     return Err(Error::IO {
