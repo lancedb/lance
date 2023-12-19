@@ -1580,7 +1580,7 @@ mod tests {
         cast::{as_string_array, as_struct_array},
         types::Int32Type,
         ArrayRef, DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array,
-        Int8DictionaryArray, RecordBatch, RecordBatchIterator, StringArray, UInt16Array,
+        Int8DictionaryArray, ListArray, RecordBatch, RecordBatchIterator, StringArray, UInt16Array,
         UInt32Array,
     };
     use arrow_ord::sort::sort_to_indices;
@@ -2638,15 +2638,137 @@ mod tests {
         let schema = Arc::new(ArrowSchema::new_with_metadata(
             vec![
                 Field::new("i", DataType::Int32, false),
+                Field::new(
+                    "s",
+                    DataType::Struct(ArrowFields::from(vec![
+                        Field::new(
+                            "d",
+                            DataType::Dictionary(
+                                Box::new(DataType::UInt32),
+                                Box::new(DataType::Utf8),
+                            ),
+                            true,
+                        ),
+                        ArrowField::new(
+                            "l",
+                            DataType::List(Arc::new(ArrowField::new(
+                                "item",
+                                DataType::Int32,
+                                true,
+                            ))),
+                            true,
+                        ),
+                    ])),
+                    true,
+                ),
                 Field::new("x", DataType::Float32, false),
             ],
             metadata.clone(),
         ));
 
+        let struct_array_1 = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new(
+                    "d",
+                    DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                    true,
+                )),
+                Arc::new(
+                    DictionaryArray::try_new(
+                        UInt32Array::from(vec![1, 0]),
+                        Arc::new(StringArray::from(vec!["A", "C", "G", "T"])),
+                    )
+                    .unwrap(),
+                ) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new(
+                    "l",
+                    DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+                    true,
+                )),
+                Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                    Some(vec![Some(1i32), Some(2), Some(3)]),
+                    Some(vec![Some(4), Some(5)]),
+                ])),
+            ),
+        ]));
+        let struct_array_2 = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new(
+                    "d",
+                    DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                    true,
+                )),
+                Arc::new(
+                    DictionaryArray::try_new(
+                        UInt32Array::from(vec![2, 1]),
+                        Arc::new(StringArray::from(vec!["A", "C", "G", "T"])),
+                    )
+                    .unwrap(),
+                ) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new(
+                    "l",
+                    DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+                    true,
+                )),
+                Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                    Some(vec![Some(4), Some(5)]),
+                    Some((0..2_000).map(Some).collect::<Vec<_>>()),
+                ])),
+            ),
+        ]));
+        let struct_array_full_1 = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new(
+                    "d",
+                    DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                    true,
+                )),
+                Arc::new(
+                    DictionaryArray::try_new(
+                        UInt32Array::from(vec![1, 0, 2, 1]),
+                        Arc::new(StringArray::from(vec!["A", "C", "G", "T"])),
+                    )
+                    .unwrap(),
+                ) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new(
+                    "l",
+                    DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+                    true,
+                )),
+                Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                    Some(vec![Some(1i32), Some(2), Some(3)]),
+                    Some(vec![Some(4), Some(5)]),
+                    Some(vec![Some(4), Some(5)]),
+                    Some((0..2_000).map(Some).collect::<Vec<_>>()),
+                ])),
+            ),
+        ]));
+
+        let struct_array_full_2 = Arc::new(StructArray::from(vec![(
+            Arc::new(ArrowField::new(
+                "l",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+                true,
+            )),
+            Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                Some(vec![Some(1i32), Some(2), Some(3)]),
+                Some(vec![Some(4), Some(5)]),
+                Some(vec![Some(4), Some(5)]),
+                Some((0..2_000).map(Some).collect::<Vec<_>>()),
+            ])) as ArrayRef,
+        )]));
+
         let batch1 = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(Int32Array::from(vec![1, 2])),
+                struct_array_1.clone(),
                 Arc::new(Float32Array::from(vec![1.0, 2.0])),
             ],
         )
@@ -2655,6 +2777,7 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(Int32Array::from(vec![3, 2])),
+                struct_array_2.clone(),
                 Arc::new(Float32Array::from(vec![3.0, 4.0])),
             ],
         )
@@ -2682,19 +2805,45 @@ mod tests {
 
         let expected_keep_i = RecordBatch::try_new(
             Arc::new(ArrowSchema::new_with_metadata(
-                vec![Field::new("i", DataType::Int32, false)],
+                vec![
+                    Field::new("i", DataType::Int32, false),
+                    schema.fields[1].as_ref().clone(),
+                ],
                 metadata.clone(),
             )),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 2]))],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 2])),
+                struct_array_full_1.clone(),
+            ],
         )
         .unwrap();
 
-        let expected_keep_x = RecordBatch::try_new(
+        let expected_drop_s_d = RecordBatch::try_new(
             Arc::new(ArrowSchema::new_with_metadata(
-                vec![Field::new("x", DataType::Float32, false)],
+                vec![
+                    Field::new("i", DataType::Int32, false),
+                    Field::new(
+                        "s",
+                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                            "l",
+                            DataType::List(Arc::new(ArrowField::new(
+                                "item",
+                                DataType::Int32,
+                                true,
+                            ))),
+                            true,
+                        )])),
+                        true,
+                    ),
+                    Field::new("x", DataType::Float32, false),
+                ],
                 metadata.clone(),
             )),
-            vec![Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]))],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 2])),
+                struct_array_full_2.clone(),
+                Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0])),
+            ],
         )
         .unwrap();
 
@@ -2706,7 +2855,7 @@ mod tests {
         dataset.drop(&["x"]).await.unwrap();
         dataset.validate().await.unwrap();
 
-        assert_eq!(dataset.schema().fields.len(), 1);
+        assert_eq!(dataset.schema().fields.len(), 2);
         assert_eq!(dataset.schema().metadata, metadata.clone());
         assert_eq!(dataset.version().version, 3);
         assert_eq!(dataset.fragments().len(), 2);
@@ -2759,7 +2908,7 @@ mod tests {
             .unwrap();
 
         let mut dataset = Dataset::open(test_uri).await.unwrap();
-        dataset.drop(&["i"]).await.unwrap();
+        dataset.drop(&["s.d"]).await.unwrap();
         dataset.validate().await.unwrap();
 
         let actual_batches = dataset
@@ -2771,7 +2920,7 @@ mod tests {
             .await
             .unwrap();
         let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
-        assert_eq!(actual, expected_keep_x);
+        assert_eq!(actual, expected_drop_s_d);
     }
 
     #[tokio::test]
