@@ -22,15 +22,19 @@
 //! 1. while groupby column will stay the same, we may want to include extra data columns in the future
 //! 2. shuffling into memory is fast but we should add disk buffer to support bigger datasets
 
+use std::sync::Arc;
+
 use arrow_array::cast::AsArray;
-use arrow_array::{UInt32Array, UInt64Array, UInt8Array};
-use futures::{stream, StreamExt};
+use arrow_array::{FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array, UInt8Array};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use futures::{stream, Stream, StreamExt, TryStreamExt};
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::datatypes::Schema;
 use lance_core::io::{FileReader, FileWriter, ReadBatchParams, RecordBatchStream};
 
 use crate::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_core::io::object_store::ObjectStore;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use log::info;
 use object_store::path::Path;
 use snafu::{location, Location};
@@ -99,7 +103,14 @@ impl IvfShuffler {
         Ok(())
     }
 
-    pub async fn count_partition_size(&self) -> Result<Vec<u64>> {
+    async fn total_batches(&self) -> Result<usize> {
+        let object_store = ObjectStore::local();
+        let path = self.output_dir.child(UNSORTED_BUFFER);
+        let reader = FileReader::try_new(&object_store, &path).await?;
+        Ok(reader.num_batches())
+    }
+
+    async fn count_partition_size(&self, start: usize, end: usize) -> Result<Vec<u64>> {
         let object_store = ObjectStore::local();
         let path = self.output_dir.child(UNSORTED_BUFFER);
         let reader = FileReader::try_new(&object_store, &path).await?;
@@ -111,7 +122,7 @@ impl IvfShuffler {
             .project(&[PART_ID_COLUMN])
             .expect("part id should exist");
 
-        let mut stream = stream::iter(0..reader.num_batches())
+        let mut stream = stream::iter(start..end)
             .map(|i| reader.read_batch(i as i32, ReadBatchParams::RangeFull, &lance_schema))
             .buffered(64);
 
@@ -126,9 +137,11 @@ impl IvfShuffler {
         Ok(partition_sizes)
     }
 
-    pub async fn shuffle_to_partitions(
+    async fn shuffle_to_partitions(
         &self,
         partition_size: Vec<u64>,
+        start: usize,
+        end: usize,
     ) -> Result<(Vec<Vec<u64>>, Vec<Vec<u8>>)> {
         let mut row_id_buffers = partition_size
             .iter()
@@ -146,7 +159,7 @@ impl IvfShuffler {
 
         info!("Shuffling into memory");
 
-        let mut stream = stream::iter(0..reader.num_batches())
+        let mut stream = stream::iter(start..end)
             .map(|i| reader.read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema()))
             .buffered(16)
             .enumerate();
@@ -191,5 +204,111 @@ impl IvfShuffler {
         }
 
         Ok((row_id_buffers, pq_code_buffers))
+    }
+
+    pub async fn write_partitioned_shuffles(
+        &self,
+        batches_per_partition: usize,
+        concurrent_jobs: usize,
+    ) -> Result<Vec<String>> {
+        let total_batches = self.total_batches().await?;
+
+        stream::iter((0..total_batches).step_by(batches_per_partition))
+            .map(|i| async move {
+                let start = i;
+                let end = std::cmp::min(i + batches_per_partition, total_batches);
+
+                let size_counts = self.count_partition_size(start, end).await?;
+
+                let (row_id_buffers, pq_code_buffers) =
+                    self.shuffle_to_partitions(size_counts, start, end).await?;
+
+                let object_store = ObjectStore::local();
+                let output_file = format!("sorted_{}.lance", i);
+                let path = self.output_dir.child(output_file.clone());
+                let writer = object_store.create(&path).await?;
+
+                // TODO: dynamically detect schema from the transforms.
+                let schema = Arc::new(ArrowSchema::new(vec![
+                    ROW_ID_FIELD.clone(),
+                    ArrowField::new(PART_ID_COLUMN, DataType::UInt32, false),
+                    ArrowField::new(
+                        PQ_CODE_COLUMN,
+                        DataType::FixedSizeList(
+                            Arc::new(ArrowField::new("item", DataType::UInt8, true)),
+                            self.pq_width as i32,
+                        ),
+                        false,
+                    ),
+                ]));
+
+                let mut file_writer = FileWriter::with_object_writer(
+                    writer,
+                    self.schema.clone(),
+                    &Default::default(),
+                )?;
+
+                let shuffled = row_id_buffers
+                    .into_iter()
+                    .zip(pq_code_buffers.into_iter())
+                    .enumerate()
+                    .filter(|(_, (row_ids, _))| !row_ids.is_empty())
+                    .map(|(part_id, (row_ids, pq_codes))| {
+                        let length = row_ids.len();
+                        let batch = RecordBatch::try_new(
+                            schema.clone(),
+                            vec![
+                                Arc::new(UInt64Array::from(row_ids)),
+                                Arc::new(UInt32Array::from_iter_values(
+                                    std::iter::repeat(part_id as u32).take(length),
+                                )),
+                                Arc::new(FixedSizeListArray::try_new_from_values(
+                                    UInt8Array::from(pq_codes),
+                                    self.pq_width as i32,
+                                )?),
+                            ],
+                        )?;
+
+                        Ok(batch) as Result<_>
+                    });
+
+                for batch in shuffled {
+                    file_writer.write(&[batch?]).await?;
+                }
+
+                file_writer.finish().await?;
+
+                Ok(output_file) as Result<String>
+            })
+            .buffered(concurrent_jobs)
+            .try_collect()
+            .await
+    }
+
+    pub async fn load_partitioned_shuffles(
+        &self,
+        files: Vec<String>,
+    ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
+        // impl RecordBatchStream
+        let mut streams = vec![];
+
+        for file in files {
+            let object_store = ObjectStore::local();
+            let path = self.output_dir.child(file);
+            let reader = FileReader::try_new(&object_store, &path).await?;
+            let reader = Arc::new(reader);
+
+            let stream = stream::iter(0..reader.num_batches())
+                .zip(stream::repeat(reader))
+                .map(|(i, reader)| async move {
+                    reader
+                        .read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema())
+                        .await
+                })
+                .buffered(16);
+            streams.push(stream);
+        }
+
+        Ok(streams)
     }
 }

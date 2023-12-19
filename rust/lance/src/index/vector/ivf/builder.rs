@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
+use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
@@ -24,10 +24,8 @@ use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool, Unbounded
 use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
 use datafusion::logical_expr::col;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::scalar::ScalarValue;
-use futures::stream;
+use futures::Stream;
 use futures::{stream::repeat_with, StreamExt};
-use lance_arrow::FixedSizeListArrayExt;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{io::Writer, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::dataframe::{BatchStreamGrouper, DataFrameExt};
@@ -139,7 +137,7 @@ pub async fn shuffle_dataset_v2(
     ivf: Arc<dyn lance_index::vector::ivf::Ivf>,
     num_partitions: u32,
     num_sub_vectors: usize,
-) -> Result<(Vec<Vec<u64>>, Vec<Vec<u8>>)> {
+) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
     let column: Arc<str> = column.into();
     let stream = data
         .zip(repeat_with(move || ivf.clone()))
@@ -193,14 +191,14 @@ pub async fn shuffle_dataset_v2(
     info!("wrote raw stream: {:?}", start.elapsed());
 
     let start = std::time::Instant::now();
-    let partition_size = shuffler.count_partition_size().await?;
+    let partition_files = shuffler.write_partitioned_shuffles(10000, 2).await?;
     info!("counted partition sizes: {:?}", start.elapsed());
 
     let start = std::time::Instant::now();
-    let partitions = shuffler.shuffle_to_partitions(partition_size).await?;
-    info!("shuffled: {:?}", start.elapsed());
+    let stream = shuffler.load_partitioned_shuffles(partition_files).await?;
+    info!("merged partitioned shuffles: {:?}", start.elapsed());
 
-    Ok(partitions)
+    Ok(stream)
 }
 
 /// Build specific partitions of IVF index.
@@ -242,7 +240,7 @@ pub(super) async fn build_partitions(
         precomputed_partitons,
     )?;
 
-    let (row_id_buffers, pq_code_buffers) = shuffle_dataset_v2(
+    let stream = shuffle_dataset_v2(
         data,
         column,
         ivf_model,
@@ -251,40 +249,7 @@ pub(super) async fn build_partitions(
     )
     .await?;
 
-    let shuffled = stream::iter(
-        row_id_buffers
-            .into_iter()
-            .zip(pq_code_buffers.into_iter())
-            .enumerate(),
-    )
-    .map(|(idx, (row_ids, pq_codes))| {
-        let schema = Arc::new(Schema::new(vec![
-            ROW_ID_FIELD.clone(),
-            Field::new(
-                PQ_CODE_COLUMN,
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::UInt8, true)),
-                    pq.num_sub_vectors() as i32,
-                ),
-                false,
-            ),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(UInt64Array::from_iter_values(row_ids.into_iter())),
-                Arc::new(FixedSizeListArray::try_new_from_values(
-                    UInt8Array::from_iter_values(pq_codes.into_iter()),
-                    pq.num_sub_vectors() as i32,
-                )?),
-            ],
-        )?;
-
-        Ok((vec![ScalarValue::UInt32(Some(idx as u32))], vec![batch]))
-    });
-
-    write_index_partitions(writer, ivf, shuffled, None).await?;
+    write_index_partitions(writer, ivf, stream, None).await?;
 
     Ok(())
 }
