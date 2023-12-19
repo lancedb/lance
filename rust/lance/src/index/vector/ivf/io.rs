@@ -91,20 +91,13 @@ pub(super) async fn write_index_partitions(
             }
         }
 
-        loop {
-            let (_, stream_idx) = match streams_heap.pop() {
-                Some((stream_part_id, stream_idx)) => {
-                    if stream_part_id == part_id {
-                        (stream_part_id, stream_idx)
-                    } else {
-                        streams_heap.push((stream_part_id, stream_idx));
-                        break;
-                    }
-                }
-                None => break,
-            };
+        // Merge all streams with the same partition id.
+        while let Some((stream_part_id, stream_idx)) = streams_heap.peek() {
+            if stream_part_id != &part_id {
+                break;
+            }
 
-            let mut stream = new_streams[stream_idx].as_mut();
+            let mut stream = new_streams[*stream_idx].as_mut();
             let batch = match stream.next().await {
                 Some(Ok(batch)) => batch,
                 Some(Err(e)) => {
@@ -115,7 +108,7 @@ pub(super) async fn write_index_partitions(
                 }
                 None => {
                     return Err(Error::IO {
-                        message: "failed to read batch: end of stream".to_string(),
+                        message: "failed to read batch: unexpected end of stream".to_string(),
                         location: location!(),
                     });
                 }
@@ -143,11 +136,11 @@ pub(super) async fn write_index_partitions(
                         .expect("part id column not found")
                         .as_primitive();
                     let part_id = part_ids.values()[0];
-                    streams_heap.push((part_id, stream_idx));
+                    streams_heap.push((part_id, *stream_idx));
                 }
                 Some(Err(e)) => {
                     return Err(Error::IO {
-                        message: format!("failed to read batch: {}", e),
+                        message: format!("IVF Shuffler::failed to read batch: {}", e),
                         location: location!(),
                     });
                 }
