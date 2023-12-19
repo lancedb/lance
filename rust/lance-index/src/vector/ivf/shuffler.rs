@@ -312,10 +312,3 @@ impl IvfShuffler {
         Ok(streams)
     }
 }
-
-#[cfg(test)]
-mod tests {
-
-    #[tokio::test]
-    async fn test_shuffle_pq() {}
-}
