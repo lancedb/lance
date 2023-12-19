@@ -2720,6 +2720,7 @@ mod tests {
                 ])),
             ),
         ]));
+
         let struct_array_full_1 = Arc::new(StructArray::from(vec![
             (
                 Arc::new(ArrowField::new(
@@ -2803,7 +2804,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected_keep_i = RecordBatch::try_new(
+        let expected_drop_x = RecordBatch::try_new(
             Arc::new(ArrowSchema::new_with_metadata(
                 vec![
                     Field::new("i", DataType::Int32, false),
@@ -2873,7 +2874,7 @@ mod tests {
             .unwrap();
         let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
 
-        assert_eq!(actual, expected_keep_i);
+        assert_eq!(actual, expected_drop_x);
 
         // Validate we can still read after re-instantiating dataset, which
         // clears the cache.
@@ -2888,7 +2889,7 @@ mod tests {
             .unwrap();
         let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
 
-        assert_eq!(actual, expected_keep_i);
+        assert_eq!(actual, expected_drop_x);
 
         let overwrite_params = WriteParams {
             mode: WriteMode::Overwrite,
@@ -2910,6 +2911,14 @@ mod tests {
         let mut dataset = Dataset::open(test_uri).await.unwrap();
         dataset.drop(&["s.d"]).await.unwrap();
         dataset.validate().await.unwrap();
+
+        assert_eq!(dataset.schema().fields.len(), 3);
+        assert_eq!(dataset.schema().metadata, metadata.clone());
+        assert_eq!(dataset.version().version, 6);
+        assert_eq!(dataset.fragments().len(), 2);
+        assert_eq!(dataset.fragments()[0].files.len(), 1);
+        assert_eq!(dataset.fragments()[1].files.len(), 1);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
 
         let actual_batches = dataset
             .scan()
