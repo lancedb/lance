@@ -873,6 +873,9 @@ impl Dataset {
         let mut current_fragment_end = current_fragment_len as u64;
         let mut start = 0;
         let mut end = 0;
+        // We want to keep track of the previous row_index to detect duplicates
+        // inex takes. To start we pick a value that is guaranteed to be different
+        // from the first row_index.
         let mut previous_row_index: u64 = row_indices[sorted_indices[0]] + 1;
         let mut previous_sorted_index: usize = 0;
 
