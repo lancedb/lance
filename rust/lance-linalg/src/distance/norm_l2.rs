@@ -91,8 +91,8 @@ impl Normalize<f16> for &[f16] {
 // `avx512bf16` is not supported in rustc yet. Once it is supported, we can
 // move it to target_feture.
 #[cfg(any(
-all(target_os = "macos", target_feature = "neon"),
-feature = "avx512bf16",
+    all(target_os = "macos", target_feature = "neon"),
+    feature = "avx512bf16",
 ))]
 mod kernel {
     use super::*;
