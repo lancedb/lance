@@ -503,6 +503,7 @@ mod tests {
     use std::ops::Bound;
 
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::error::Result as DFResult;
     use datafusion_common::{config::ConfigOptions, TableReference};
     use datafusion_common::{Column, DFSchema, ScalarValue};
     use datafusion_expr::{AggregateUDF, Expr, ScalarUDF, TableSource, WindowUDF};
@@ -540,10 +541,7 @@ mod tests {
 
     // We're just compiling simple expressions (not entire statements) and so this is unused
     impl ContextProvider for MockContextProvider {
-        fn get_table_provider(
-            &self,
-            _: TableReference,
-        ) -> datafusion_common::Result<std::sync::Arc<dyn TableSource>> {
+        fn get_table_source(&self, _name: TableReference) -> DFResult<Arc<dyn TableSource>> {
             todo!()
         }
 

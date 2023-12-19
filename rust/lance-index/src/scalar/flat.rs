@@ -178,7 +178,7 @@ impl ScalarIndex for FlatIndex {
         // Since we have all the values in memory we can use basic arrow-rs compute
         // functions to satisfy scalar queries.
         let predicate = match query {
-            ScalarQuery::Equals(value) => arrow_ord::cmp::eq(self.values(), &value.to_scalar())?,
+            ScalarQuery::Equals(value) => arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?,
             ScalarQuery::IsNull() => arrow::compute::is_null(self.values())?,
             ScalarQuery::IsIn(values) => {
                 let choices = values
@@ -193,7 +193,7 @@ impl ScalarIndex for FlatIndex {
                 )?;
                 let result_col = in_list_expr.evaluate(&self.data)?;
                 result_col
-                    .into_array(self.data.num_rows())
+                    .into_array(self.data.num_rows())?
                     .as_any()
                     .downcast_ref::<BooleanArray>()
                     .expect("InList evaluation should return boolean array")
@@ -204,32 +204,32 @@ impl ScalarIndex for FlatIndex {
                     panic!("Scalar range query received with no upper or lower bound")
                 }
                 (Bound::Unbounded, Bound::Included(upper)) => {
-                    arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar())?
+                    arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar()?)?
                 }
                 (Bound::Unbounded, Bound::Excluded(upper)) => {
-                    arrow_ord::cmp::lt(self.values(), &upper.to_scalar())?
+                    arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?
                 }
                 (Bound::Included(lower), Bound::Unbounded) => {
-                    arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar())?
+                    arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar()?)?
                 }
                 (Bound::Included(lower), Bound::Included(upper)) => arrow::compute::and(
-                    &arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar())?,
-                    &arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar())?,
+                    &arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar()?)?,
+                    &arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar()?)?,
                 )?,
                 (Bound::Included(lower), Bound::Excluded(upper)) => arrow::compute::and(
-                    &arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar())?,
-                    &arrow_ord::cmp::lt(self.values(), &upper.to_scalar())?,
+                    &arrow_ord::cmp::gt_eq(self.values(), &lower.to_scalar()?)?,
+                    &arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?,
                 )?,
                 (Bound::Excluded(lower), Bound::Unbounded) => {
-                    arrow_ord::cmp::gt(self.values(), &lower.to_scalar())?
+                    arrow_ord::cmp::gt(self.values(), &lower.to_scalar()?)?
                 }
                 (Bound::Excluded(lower), Bound::Included(upper)) => arrow::compute::and(
-                    &arrow_ord::cmp::gt(self.values(), &lower.to_scalar())?,
-                    &arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar())?,
+                    &arrow_ord::cmp::gt(self.values(), &lower.to_scalar()?)?,
+                    &arrow_ord::cmp::lt_eq(self.values(), &upper.to_scalar()?)?,
                 )?,
                 (Bound::Excluded(lower), Bound::Excluded(upper)) => arrow::compute::and(
-                    &arrow_ord::cmp::gt(self.values(), &lower.to_scalar())?,
-                    &arrow_ord::cmp::lt(self.values(), &upper.to_scalar())?,
+                    &arrow_ord::cmp::gt(self.values(), &lower.to_scalar()?)?,
+                    &arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?,
                 )?,
             },
         };

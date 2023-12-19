@@ -21,7 +21,8 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, Result as OSResult,
+    GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, PutOptions, PutResult,
+    Result as OSResult,
 };
 use pin_project::pin_project;
 use tokio::io::AsyncWrite;
@@ -83,8 +84,18 @@ impl std::fmt::Display for TracedObjectStore {
 #[async_trait::async_trait]
 impl object_store::ObjectStore for TracedObjectStore {
     #[instrument(level = "debug", skip(self, bytes))]
-    async fn put(&self, location: &Path, bytes: Bytes) -> OSResult<()> {
+    async fn put(&self, location: &Path, bytes: Bytes) -> OSResult<PutResult> {
         self.target.put(location, bytes).await
+    }
+
+    #[instrument(level = "debug", skip(self, bytes))]
+    async fn put_opts(
+        &self,
+        location: &Path,
+        bytes: Bytes,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.target.put_opts(location, bytes, opts).await
     }
 
     async fn put_multipart(
@@ -105,11 +116,6 @@ impl object_store::ObjectStore for TracedObjectStore {
     #[instrument(level = "debug", skip(self))]
     async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> OSResult<()> {
         self.target.abort_multipart(location, multipart_id).await
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn append(&self, location: &Path) -> OSResult<Box<dyn AsyncWrite + Unpin + Send>> {
-        self.target.append(location).await
     }
 
     #[instrument(level = "debug", skip(self, options))]
@@ -138,8 +144,8 @@ impl object_store::ObjectStore for TracedObjectStore {
     }
 
     #[instrument(level = "debug", skip(self))]
-    async fn list(&self, prefix: Option<&Path>) -> OSResult<BoxStream<'_, OSResult<ObjectMeta>>> {
-        self.target.list(prefix).await
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
+        self.target.list(prefix)
     }
 
     #[instrument(level = "debug", skip(self))]

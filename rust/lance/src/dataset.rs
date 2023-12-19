@@ -873,10 +873,25 @@ impl Dataset {
         let mut current_fragment_end = current_fragment_len as u64;
         let mut start = 0;
         let mut end = 0;
+        // We want to keep track of the previous row_index to detect duplicates
+        // index takes. To start, we pick a value that is guaranteed to be different
+        // from the first row_index.
+        let mut previous_row_index: u64 = row_indices[sorted_indices[0]] + 1;
+        let mut previous_sorted_index: usize = 0;
 
         for index in sorted_indices {
             // Get the index
             let row_index = row_indices[index];
+
+            if previous_row_index == row_index {
+                // If we have a duplicate index request we add a remap_index
+                // entry that points to the original index request.
+                remap_index[index] = remap_index[previous_sorted_index];
+                continue;
+            } else {
+                previous_sorted_index = index;
+                previous_row_index = row_index;
+            }
 
             // If the row index is beyond the current fragment, iterate
             // until we find the fragment that contains it.
@@ -2274,6 +2289,8 @@ mod tests {
                     199, // 199
                     39,  // 39
                     40,  // 40
+                    199, // 40
+                    40,  // 40
                     125, // 125
                 ],
                 &projection,
@@ -2284,9 +2301,13 @@ mod tests {
             RecordBatch::try_new(
                 schema.clone(),
                 vec![
-                    Arc::new(Int32Array::from_iter_values([200, 199, 39, 40, 125])),
+                    Arc::new(Int32Array::from_iter_values([
+                        200, 199, 39, 40, 199, 40, 125
+                    ])),
                     Arc::new(StringArray::from_iter_values(
-                        [200, 199, 39, 40, 125].iter().map(|v| format!("str-{v}"))
+                        [200, 199, 39, 40, 199, 40, 125]
+                            .iter()
+                            .map(|v| format!("str-{v}"))
                     )),
                 ],
             )

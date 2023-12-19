@@ -165,7 +165,7 @@ impl ExecutionPlan for ScalarIndexExec {
         }))
     }
 
-    fn statistics(&self) -> datafusion::physical_plan::Statistics {
+    fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
         todo!()
     }
 }
@@ -336,7 +336,7 @@ impl ExecutionPlan for MaterializeIndexExec {
         }))
     }
 
-    fn statistics(&self) -> datafusion::physical_plan::Statistics {
+    fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
         todo!()
     }
 }

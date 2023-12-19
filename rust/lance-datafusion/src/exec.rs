@@ -175,7 +175,7 @@ impl ExecutionPlan for OneShotExec {
         }
     }
 
-    fn statistics(&self) -> datafusion_common::Statistics {
+    fn statistics(&self) -> datafusion_common::Result<datafusion_common::Statistics> {
         todo!()
     }
 }

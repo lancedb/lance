@@ -20,10 +20,11 @@ use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema as ArrowSchema, SchemaRef};
+use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
-    SendableRecordBatchStream,
+    SendableRecordBatchStream, Statistics,
 };
 use futures::stream::Stream;
 use futures::{stream, Future};
@@ -327,22 +328,26 @@ impl ExecutionPlan for LanceScanExec {
         )?))
     }
 
-    fn statistics(&self) -> datafusion::physical_plan::Statistics {
-        let stats = self.fragments.iter().fold(
-            datafusion::physical_plan::Statistics::default(),
-            |mut stats, fragment| {
-                match stats.num_rows {
-                    Some(num_rows) => {
-                        stats.num_rows = Some(num_rows + fragment.num_rows().unwrap_or(0));
-                    }
-                    None => {
-                        stats.num_rows = fragment.num_rows();
-                    }
-                }
-                stats
-            },
-        );
-        // Statistics not yet fully implemented. currently only contains `num_rows`
-        stats
+    fn statistics(&self) -> datafusion::error::Result<Statistics> {
+        // Some fragments from older datasets might have the row count stats missing.
+        let (row_count, is_exact) =
+            self.fragments
+                .iter()
+                .fold(
+                    (0, true),
+                    |(row_count, is_exact), fragment| match fragment.num_rows() {
+                        Some(num_rows) => (row_count + num_rows, is_exact),
+                        None => (row_count, false),
+                    },
+                );
+        let num_rows = match is_exact {
+            true => Precision::Exact(row_count),
+            false => Precision::Absent,
+        };
+
+        Ok(Statistics {
+            num_rows,
+            ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
+        })
     }
 }
