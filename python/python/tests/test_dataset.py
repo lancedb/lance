@@ -21,6 +21,7 @@ import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import List
 from unittest import mock
 
 import lance
@@ -238,6 +239,17 @@ def test_take(tmp_path: Path):
 
     assert isinstance(table2, pa.Table)
     assert table2 == table1
+
+
+@pytest.mark.parametrize("indices", [[], [1, 1], [1, 1, 20, 20, 21], [21, 0, 21, 1, 0]])
+def test_take_duplicate_index(tmp_path: Path, indices: List[int]):
+    table = pa.table({"x": range(24)})
+    dataset = lance.write_dataset(
+        table, tmp_path, max_rows_per_group=3, max_rows_per_file=9
+    )
+    expected = table.take(pa.array(indices, pa.int64()))
+
+    assert dataset.take(indices) == expected
 
 
 def test_take_with_columns(tmp_path: Path):
