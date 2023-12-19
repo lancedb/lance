@@ -60,6 +60,13 @@ try:
         Iterable[RecordBatch],
         pa.RecordBatchReader,
     ]
+    QueryVectorLike = Union[
+        pd.Series,
+        pa.Array,
+        pa.Scalar,
+        np.ndarray,
+        Iterable[float],
+    ]
 except ImportError:
     pd = None
     ReaderLike = Union[
@@ -68,6 +75,12 @@ except ImportError:
         pa.dataset.Scanner,
         Iterable[RecordBatch],
         pa.RecordBatchReader,
+    ]
+    QueryVectorLike = Union[
+        pa.Array,
+        pa.Scalar,
+        np.ndarray,
+        Iterable[float],
     ]
 
 if TYPE_CHECKING:
@@ -1570,37 +1583,32 @@ class ScannerBuilder:
     def nearest(
         self,
         column: str,
-        q: pa.FloatingPointArray | List[float] | np.ndarray,
+        q: QueryVectorLike,
         k: Optional[int] = None,
         metric: Optional[str] = None,
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
         use_index: bool = True,
     ) -> ScannerBuilder:
-        column_field = self.ds.schema.field(column)
-        q_size = q.size if isinstance(q, np.ndarray) else len(q)
+        q = _coerce_query_vector(q)
 
         if self.ds.schema.get_field_index(column) < 0:
-            raise ValueError(f"Embedding column {column} not in dataset")
-        if not (
-            isinstance(
-                column_field.type, (pa.FloatingPointArray, np.ndarray, list, tuple)
-            )
-            or pa.types.is_fixed_size_list(column_field.type)
-        ):
+            raise ValueError(f"Embedding column {column} is not in the dataset")
+
+        column_field = self.ds.schema.field(column)
+        column_type = column_field.type
+        if hasattr(column_type, "storage_type"):
+            column_type = column_type.storage_type
+        if not pa.types.is_fixed_size_list(column_type):
             raise TypeError(
                 f"Query column {column} must be a vector. Got {column_field.type}."
             )
-        if q_size != column_field.type.list_size:
+        if len(q) != column_type.list_size:
             raise ValueError(
-                f"Query vector size {q_size} does not match index column size"
-                f" {column_field.type.list_size}"
+                f"Query vector size {len(q)} does not match index column size"
+                f" {column_type.list_size}"
             )
-        if isinstance(q, (np.ndarray, list, tuple)):
-            q = np.array(q).astype("float64")  # workaround for GH-608
-            q = pa.FloatingPointArray.from_pandas(q, type=pa.float32())
-        if not isinstance(q, pa.FloatingPointArray):
-            raise TypeError("query vector must be list-like or pa.FloatingPointArray")
+
         if k is not None and int(k) <= 0:
             raise ValueError(f"Nearest-K must be > 0 but got {k}")
         if nprobes is not None and int(nprobes) <= 0:
@@ -1976,6 +1984,39 @@ def _coerce_reader(
             "https://lancedb.github.io/lance/read_and_write.html "
             "to see supported types."
         )
+
+
+def _coerce_query_vector(query: QueryVectorLike):
+    if isinstance(query, pa.Scalar):
+        if isinstance(query, pa.ExtensionScalar):
+            # If it's an extension scalar then convert to storage
+            query = query.value
+        if isinstance(query.type, pa.FixedSizeListType):
+            query = query.values
+    elif isinstance(query, (np.ndarray, list, tuple)):
+        query = np.array(query).astype("float64")  # workaround for GH-608
+        query = pa.FloatingPointArray.from_pandas(query, type=pa.float32())
+    elif not isinstance(query, pa.Array):
+        try:
+            query = pa.array(query)
+        except:  # noqa: E722
+            raise TypeError(
+                "Query vectors should be an array of floats, "
+                f"got {type(query)} which we cannot coerce to a "
+                "float array"
+            )
+
+    # At this point `query` should be an arrow array
+    if not isinstance(query, pa.FloatingPointArray):
+        if pa.types.is_integer(query.type):
+            query = query.cast(pa.float32())
+        else:
+            raise TypeError(
+                "query vector must be list-like or pa.FloatingPointArray "
+                f"but received {query.type}"
+            )
+
+    return query
 
 
 def _validate_schema(schema: pa.Schema):
