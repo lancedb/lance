@@ -13,7 +13,7 @@ inputs:
     description: "Build for arm64 instead of x86_64"
     # Note: this does *not* mean the host is arm64, since we might be cross-compiling.
     required: false
-    default: 'false'
+    default: "false"
 runs:
   using: "composite"
   steps:
@@ -42,13 +42,10 @@ runs:
         command: build
         working-directory: python
         target: aarch64-unknown-linux-gnu
-        manylinux: "2_17"
+        manylinux: "2_24"
         args: ${{ inputs.args }}
         before-script-linux: |
           set -e
-          # We can remove this once we upgrade to 2_28.
-          # https://github.com/briansmith/ring/issues/1728
-          export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
           apt install -y unzip
           if [ $(uname -m) = "x86_64" ]; then
             PROTOC_ARCH="x86_64"
