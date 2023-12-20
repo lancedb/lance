@@ -124,3 +124,20 @@ def ground_truth(
         all_dists, all_ids = sort_tensors(all_dists, all_ids, k)
 
     return all_ids
+
+
+def recall(expected: np.ndarray, actual: np.ndarray) -> np.ndarray:
+    """Recalls
+
+    Parameters
+    ----------
+    expected: ndarray
+        The ground truth
+    results: ndarray
+        The ANN results
+    """
+    assert expected.shape == actual.shape
+    recalls = np.array(
+        [np.isin(exp, act).sum() / exp.shape[0] for exp, act in zip(expected, actual)]
+    )
+    return recalls

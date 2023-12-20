@@ -22,25 +22,7 @@ import duckdb
 import lance
 import numpy as np
 import pandas as pd
-from lance.torch.bench_utils import ground_truth as gt_func
-
-
-def recall(actual_sorted: np.ndarray, results: np.ndarray):
-    """
-    Recall-at-k
-
-    Parameters
-    ----------
-    actual_sorted: ndarray
-        The ground truth
-    results: ndarray
-        The ANN results
-    """
-    len = results.shape[1]
-    recall_at_k = np.array(
-        [np.isin(row, results[i, :]).sum() / len for i, row in enumerate(actual_sorted)]
-    )
-    return (recall_at_k.mean(), recall_at_k.std(), recall_at_k)
+from lance.torch.bench_utils import ground_truth as gt_func, recall
 
 
 def get_query_vectors(uri, nsamples=1000, normalize=False):
@@ -115,7 +97,8 @@ def test_dataset(
         if i % 100 == 0:
             print(f"Done {i}")
     avg_latency = tot / ground_truth.shape[0]
-    return recall(np.array(actual_sorted), np.array(results)), avg_latency
+    recalls = recall(np.array(actual_sorted), np.array(results))
+    return recalls.mean(), avg_latency
 
 
 if __name__ == "__main__":
@@ -190,10 +173,10 @@ if __name__ == "__main__":
             queries.append(args.queries)
             topk.append(args.top_k)
             refine_factor.append(rf)
-            recall_at_k.append(recalls[0])
+            recall_at_k.append(recalls)
             mean_time.append(times)
             print(
-                f"nprobes: {n}, refine={rf}, recall@{args.top_k}={recalls[0]:0.3f}, mean(s)={times}"
+                f"nprobes: {n}, refine={rf}, recall@{args.top_k}={recalls:0.3f}, mean(s)={times}"
             )
 
     df = pd.DataFrame(
