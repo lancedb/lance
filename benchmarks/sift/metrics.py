@@ -46,22 +46,6 @@ def recall(actual_sorted: np.ndarray, results: np.ndarray):
     return (recall_at_k.mean(), recall_at_k.std(), recall_at_k)
 
 
-def cosine_argsort(mat, q):
-    """
-    argsort of cosine distances
-    Parameters
-    ----------
-    mat: ndarray
-        shape is (n, d) where n is number of vectors and d is number of dims
-    q: ndarray
-        shape is d, this is the query vector
-    """
-    mat = mat / np.linalg.norm(mat, axis=1)[:, None]
-    q = q / np.linalg.norm(q)
-    scores = np.dot(mat, q)
-    return np.argsort(1 - scores)
-
-
 def get_query_vectors(uri, nsamples=1000, normalize=False):
     """
     Get the query vectors as a 2d numpy array
