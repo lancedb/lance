@@ -158,7 +158,7 @@ impl Cosine for Float16Type {
             all(target_os = "linux", feature = "avx512fp16")
         )))]
         {
-            1.0 - (dot(x, y) / (x_norm * y_norm + f32::epsilon()))
+            1.0 - (dot(x, y) / (x_norm * y_norm + f32::EPSILON))
         }
     }
 }

@@ -64,8 +64,8 @@ float l2_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
 /// @param dimension The dimension of the vectors
 /// @return The cosine distance of the two vectors.
 float cosine_fast_f16(const _Float16 *x, const float x_norm, const _Float16 *y, uint32_t dimension) {
-  _Float16 xy = 0.0;
-  _Float16 y_sq = 0.0;
+  float xy = 0.0;
+  float y_sq = 0.0;
 
 #pragma clang loop unroll(enable) interleave(enable) vectorize_width(32)
   for (uint32_t i = 0; i < dimension; i++) {
@@ -78,4 +78,3 @@ float cosine_fast_f16(const _Float16 *x, const float x_norm, const _Float16 *y, 
   }
   return (float) (1 - xy / x_norm / sqrt(y_sq));
 }
-
