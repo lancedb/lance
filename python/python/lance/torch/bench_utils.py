@@ -22,7 +22,7 @@ import torch
 from .. import LanceDataset
 from . import preferred_device
 from .data import LanceDataset as PytorchLanceDataset
-from .distance import pairwise_l2
+from .distance import pairwise_cosine, pairwise_l2
 
 __all__ = ["ground_truth"]
 
@@ -106,7 +106,9 @@ def ground_truth(
         if metric_type == "l2":
             dists = pairwise_l2(query, vectors)
         elif metric_type == "cosine":
-            raise NotImplementedError("Cosine distance is not implemented yet.")
+            dists = pairwise_cosine(query, vectors, device=device)
+        else:
+            raise ValueError(f"Unknown metric type: {metric_type}")
 
         dists, row_ids = sort_tensors(dists, row_ids, k)
 

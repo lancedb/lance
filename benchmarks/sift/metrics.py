@@ -22,6 +22,7 @@ import duckdb
 import lance
 import numpy as np
 import pandas as pd
+from lance.torch.bench_utils import ground_truth as gt_func
 
 
 def recall(actual_sorted: np.ndarray, results: np.ndarray):
@@ -35,22 +36,14 @@ def recall(actual_sorted: np.ndarray, results: np.ndarray):
     results: ndarray
         The ANN results
     """
-    len = results.shape[1]    
-    recall_at_k = np.array([np.sum([1 if id in results[i, :] else 0 for id in row]) * 1.0 / len
-                            for i, row in enumerate(actual_sorted)])
+    len = results.shape[1]
+    recall_at_k = np.array(
+        [
+            np.sum([1 if id in results[i, :] else 0 for id in row]) * 1.0 / len
+            for i, row in enumerate(actual_sorted)
+        ]
+    )
     return (recall_at_k.mean(), recall_at_k.std(), recall_at_k)
-
-
-def l2_argsort(mat, q):
-    """
-    Parameters
-    ----------
-    mat: ndarray
-        shape is (n, d) where n is number of vectors and d is number of dims
-    q: ndarray
-        shape is d, this is the query vector
-    """
-    return np.argsort(((mat - q) ** 2).sum(axis=1))
 
 
 def cosine_argsort(mat, q):
@@ -84,14 +77,19 @@ def get_query_vectors(uri, nsamples=1000, normalize=False):
     query_vectors = duckdb.query(
         f"SELECT vector FROM tbl USING SAMPLE {nsamples}"
     ).to_df()
-    query_vectors = np.array([np.array(x) for x in query_vectors.vector.values])        
+    query_vectors = np.array([np.array(x) for x in query_vectors.vector.values])
     if normalize:
         query_vectors = query_vectors / np.linalg.norm(query_vectors, axis=1)[:, None]
-    return query_vectors
+    return query_vectors.astype(np.float32)
 
 
 def test_dataset(
-    uri, query_vectors, ground_truth, k=10, nprobes=1, refine_factor: Optional[int] = None
+    uri,
+    query_vectors,
+    ground_truth,
+    k=10,
+    nprobes=1,
+    refine_factor: Optional[int] = None,
 ):
     """
     Compute the recall for a given query configuration
@@ -109,9 +107,9 @@ def test_dataset(
     nprobes: int
         Number of probes during search
     refine_factor: int
-        Refine factor during search    
+        Refine factor during search
     """
-    dataset = lance.dataset(uri)        
+    dataset = lance.dataset(uri)
     actual_sorted = []
     results = []
 
@@ -146,7 +144,14 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--ivf-partitions", type=int, metavar="N")
     parser.add_argument("-p", "--pq", type=int, metavar="N")
     parser.add_argument("-s", "--samples", default=1000, type=int, metavar="N")
-    parser.add_argument("-q", "--queries", type=str, default=None, help="lance dataset uri containing query vectors", metavar="URI")
+    parser.add_argument(
+        "-q",
+        "--queries",
+        type=str,
+        default=None,
+        help="lance dataset uri containing query vectors",
+        metavar="URI",
+    )
     parser.add_argument("-k", "--top_k", default=10, type=int, metavar="N")
     parser.add_argument("-n", "--normalize", action="store_true")
     args = parser.parse_args()
@@ -171,21 +176,28 @@ if __name__ == "__main__":
     refine_factor = []
     recall_at_k = []
     mean_time = []
-    query_vectors = get_query_vectors(args.queries, nsamples=args.samples,
-                                      normalize=args.normalize)
-    tbl = lance.dataset(args.uri).to_table()
-    v = tbl["vector"].combine_chunks()    
-    all_vectors = v.values.to_numpy().reshape(len(tbl), v.type.list_size)    
+    query_vectors = get_query_vectors(
+        args.queries, nsamples=args.samples, normalize=args.normalize
+    )
+    ds = lance.dataset(args.uri)
+    tbl = ds.to_table()
+    v = tbl["vector"].combine_chunks()
+    all_vectors = v.values.to_numpy().reshape(len(tbl), v.type.list_size)
     print("Computing ground truth")
-    ground_truth = np.array([l2_argsort(all_vectors, query_vectors[i, :])
-                             for i in range(args.samples)])
+    start = time.time()
+    gt = (
+        gt_func(ds, "vector", query_vectors.astype(np.float32), k=args.top_k)
+        .cpu()
+        .numpy()
+    )
+    print(f"Get ground truth in: {time.time() - start:0.3f}s")
     print("Starting benchmarks")
     for n in [1, 10, 25, 50, 75, 100]:
         for rf in [None, 1, 10, 20, 30, 40, 50]:
             recalls, times = test_dataset(
                 args.uri,
                 query_vectors,
-                ground_truth,
+                gt,
                 k=args.top_k,
                 nprobes=n,
                 refine_factor=rf,
