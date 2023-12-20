@@ -151,7 +151,7 @@ impl Cosine for Float16Type {
         ))]
         unsafe {
             1.0 - (kernel::dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32) / x_norm / y_norm
-                + f32::epsilon())
+                + f32::EPSILON)
         }
         #[cfg(not(any(
             all(target_os = "macos", target_feature = "neon"),
