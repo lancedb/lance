@@ -186,7 +186,7 @@ impl Cosine for Float32Type {
     #[inline]
     fn cosine_fast(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
         let dim = x.len();
-        let unrolled_len = dim / 16 / 16;
+        let unrolled_len = dim / 16 * 16;
         let mut y_norm16 = f32x16::zeros();
         let mut xy16 = f32x16::zeros();
         for i in (0..unrolled_len).step_by(16) {
@@ -197,7 +197,7 @@ impl Cosine for Float32Type {
                 y_norm16.multiply_add(y, y);
             }
         }
-        let aligned_len = dim / 8 / 8;
+        let aligned_len = dim / 8 * 8;
         let mut y_norm8 = f32x8::zeros();
         let mut xy8 = f32x8::zeros();
         for i in (unrolled_len..aligned_len).step_by(8) {
@@ -218,7 +218,7 @@ impl Cosine for Float32Type {
     #[inline]
     fn cosine_with_norms(x: &[f32], x_norm: f32, y_norm: f32, y: &[f32]) -> Self::Native {
         let dim = x.len();
-        let unrolled_len = dim / 16 / 16;
+        let unrolled_len = dim / 16 * 16;
         let mut xy16 = f32x16::zeros();
         for i in (0..unrolled_len).step_by(16) {
             unsafe {
@@ -227,7 +227,7 @@ impl Cosine for Float32Type {
                 xy16.multiply_add(x, y);
             }
         }
-        let aligned_len = dim / 8 / 8;
+        let aligned_len = dim / 8 * 8;
         let mut xy8 = f32x8::zeros();
         for i in (unrolled_len..aligned_len).step_by(8) {
             unsafe {

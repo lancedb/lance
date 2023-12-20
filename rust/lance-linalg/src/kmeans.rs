@@ -178,8 +178,8 @@ fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], d
             cnts[largest_idx] /= 2;
             for j in 0..dimension {
                 centroids[i * dimension + j] =
-                    centroids[largest_idx * dimension + j] * (T::one() + T::EPSILON);
-                centroids[largest_idx * dimension + j] /= T::one() + T::EPSILON;
+                    centroids[largest_idx * dimension + j] * (T::one() + T::epsilon());
+                centroids[largest_idx * dimension + j] /= T::one() + T::epsilon();
             }
         }
     }
