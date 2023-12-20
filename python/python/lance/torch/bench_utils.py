@@ -22,7 +22,7 @@ import torch
 from .. import LanceDataset
 from . import preferred_device
 from .data import LanceDataset as PytorchLanceDataset
-from .distance import pairwise_l2
+from .distance import pairwise_cosine, pairwise_l2
 
 __all__ = ["ground_truth"]
 
@@ -106,7 +106,9 @@ def ground_truth(
         if metric_type == "l2":
             dists = pairwise_l2(query, vectors)
         elif metric_type == "cosine":
-            raise NotImplementedError("Cosine distance is not implemented yet.")
+            dists = pairwise_cosine(query, vectors, device=device)
+        else:
+            raise ValueError(f"Unknown metric type: {metric_type}")
 
         dists, row_ids = sort_tensors(dists, row_ids, k)
 
@@ -122,3 +124,20 @@ def ground_truth(
         all_dists, all_ids = sort_tensors(all_dists, all_ids, k)
 
     return all_ids
+
+
+def recall(expected: np.ndarray, actual: np.ndarray) -> np.ndarray:
+    """Recalls
+
+    Parameters
+    ----------
+    expected: ndarray
+        The ground truth
+    results: ndarray
+        The ANN results
+    """
+    assert expected.shape == actual.shape
+    recalls = np.array(
+        [np.isin(exp, act).sum() / exp.shape[0] for exp, act in zip(expected, actual)]
+    )
+    return recalls
