@@ -15,19 +15,6 @@ fn main() {
             .flag("-Wpedantic")
             .compile("f16");
     }
-    if cfg!(all(target_os = "macos", feature = "FEAT_BF16")) {
-        cc::Build::new()
-            .compiler("clang")
-            .file("src/simd/bf16.c")
-            .flag("-mtune=apple-m1")
-            .flag("-ffast-math")
-            .flag("-O3")
-            .flag("-Wall")
-            .flag("-Werror")
-            .flag("-Wextra")
-            .flag("-Wpedantic")
-            .compile("bf16");
-    }
 
     if cfg!(all(target_os = "linux", feature = "avx512fp16")) {
         // No fp16 without AVX512fp16

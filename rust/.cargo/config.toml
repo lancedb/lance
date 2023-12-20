@@ -35,6 +35,3 @@ rustflags = ["-C", "target-feature=+avx2,+fma,+f16c,+avx512bf16"]
 
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=apple-m1", "-C", "target-feature=+neon,+fp16,+fhm,+dotprod"]
-
-[target.aarch64-apple-darwin-m2]
-rustflags = ["-C", "target-cpu=apple-m2", "-C", "target-feature=+neon,+fp16,+fhm,+dotprod,+bf16"]
