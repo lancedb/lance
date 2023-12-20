@@ -51,6 +51,14 @@ fn dist_table(c: &mut Criterion) {
         })
     });
 
+    let dot_pq =
+        ProductQuantizerImpl::<Float32Type>::new(PQ, 8, DIM, codebook.clone(), MetricType::Dot);
+    c.bench_function("dot", |b| {
+        b.iter(|| {
+            black_box(dot_pq.build_distance_table(&query, &code).unwrap().len());
+        })
+    });
+
     let cosine_pq =
         ProductQuantizerImpl::<Float32Type>::new(PQ, 8, DIM, codebook.clone(), MetricType::Cosine);
 

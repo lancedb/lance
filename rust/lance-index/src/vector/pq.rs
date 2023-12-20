@@ -37,6 +37,7 @@ pub(crate) mod utils;
 pub use self::utils::num_centroids;
 use super::pb;
 pub use builder::PQBuildParams;
+use lance_linalg::distance::norm_l2;
 use lance_linalg::simd::{f32::f32x8, SIMD};
 
 /// Product Quantization
@@ -353,6 +354,129 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                     .sum::<f32>()
             }),
         ))
+    }
+
+    /// Pre-compute cosine distance to each sub-centroids.
+    ///
+    /// Parameters
+    ///  - query: the query vector, with shape (dimension, )
+    ///  - code: the PQ code in one partition.
+    ///
+    fn cosine_distances(&self, key: &dyn Array, code: &UInt8Array) -> Result<ArrayRef> {
+        let query: &T::ArrayType = key.as_any().downcast_ref().ok_or(Error::Index {
+            message: format!(
+                "Build Dot distance table, type mismatch: {}",
+                key.data_type()
+            ),
+            location: Default::default(),
+        })?;
+
+        // Build two tables for cosine distance.
+        //
+        // xy table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
+        // y_norm table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
+        let num_centroids = num_centroids(self.num_bits);
+        let mut xy_table: Vec<f32> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
+        let mut y2_table: Vec<f32> = Vec::with_capacity(self.num_sub_vectors * num_centroids);
+
+        let x_norm = norm_l2(query.as_slice());
+        let sub_vector_length = self.dimension / self.num_sub_vectors;
+        query
+            .as_slice()
+            .chunks_exact(sub_vector_length)
+            .enumerate()
+            .for_each(|(i, sub_vector)| {
+                let sub_vector_centroids = self.centroids(i);
+                xy_table.extend(dot_distance_batch(
+                    sub_vector,
+                    sub_vector_centroids,
+                    sub_vector_length,
+                ));
+                y2_table.extend(
+                    sub_vector_centroids
+                        .chunks_exact(sub_vector_length)
+                        .map(|cent| norm_l2(cent).powi(2)),
+                );
+            });
+
+        // Compute distance from the pre-compute table.
+        #[cfg(target_feature = "avx512f")]
+        {
+            if self.num_sub_vectors % 16 == 0 {
+                use std::arch::x86_64::*;
+                return Ok(Arc::new(Float32Array::from_iter_values(
+                    code.values()
+                        .chunks_exact(self.num_sub_vectors)
+                        .map(|c| unsafe {
+                            let mut xy = _mm512_setzero_ps();
+                            let mut y2 = _mm512_setzero_ps();
+                            c.chunks_exact(16)
+                                .enumerate()
+                                .for_each(|(idx, lane_chunk)| {
+                                    let mut offsets: [i32; 16] = [0; 16];
+                                    lane_chunk.iter().enumerate().for_each(|(j, &code)| {
+                                        offsets[j] = ((idx * 8 + j) * 256 + code as usize) as i32
+                                    });
+                                    let simd_offsets = _mm512_loadu_epi32(offsets.as_ptr());
+                                    let xy_v = _mm512_i32gather_ps(
+                                        simd_offsets,
+                                        xy_table.as_ptr() as *const u8,
+                                        4,
+                                    );
+                                    let y2_v = _mm512_i32gather_ps(
+                                        simd_offsets,
+                                        y2_table.as_ptr() as *const u8,
+                                        4,
+                                    );
+                                    xy = _mm512_add_ps(xy, xy_v);
+                                    y2 = _mm512_add_ps(y2, y2_v);
+                                });
+                            1 - _mm512_reduce_add_ps(xy)
+                                / (_mm512_reduce_add_ps(y2).sqrt() * x_norm)
+                        }),
+                )));
+            }
+        }
+
+        if cfg!(target_feature = "avx2") && self.num_sub_vectors % 8 == 0 {
+            Ok(Arc::new(Float32Array::from_iter_values(
+                code.values().chunks_exact(self.num_sub_vectors).map(|c| {
+                    let mut xy = f32x8::zeros();
+                    let mut y2 = f32x8::zeros();
+                    c.chunks_exact(8).enumerate().for_each(|(idx, lane_chunk)| {
+                        let mut offsets: [i32; 8] = [0; 8];
+                        lane_chunk.iter().enumerate().for_each(|(j, &code)| {
+                            offsets[j] = ((idx * 8 + j) * 256 + code as usize) as i32
+                        });
+                        xy += f32x8::gather(&xy_table, &offsets);
+                        y2 += f32x8::gather(&y2_table, &offsets);
+                    });
+                    1.0 - xy.reduce_sum() / (x_norm * y2.reduce_sum().sqrt())
+                }),
+            )))
+        } else {
+            Ok(Arc::new(Float32Array::from_iter_values(
+                code.values().chunks_exact(self.num_sub_vectors).map(|c| {
+                    let xy = c
+                        .iter()
+                        .enumerate()
+                        .map(|(sub_vec_idx, centroid)| {
+                            let idx = sub_vec_idx * num_centroids + *centroid as usize;
+                            xy_table[idx]
+                        })
+                        .sum::<f32>();
+                    let y2 = c
+                        .iter()
+                        .enumerate()
+                        .map(|(sub_vec_idx, centroid)| {
+                            let idx = sub_vec_idx * num_centroids + *centroid as usize;
+                            y2_table[idx]
+                        })
+                        .sum::<f32>();
+                    1.0 - xy / (x_norm * y2.sqrt())
+                }),
+            )))
+        }
     }
 }
 
