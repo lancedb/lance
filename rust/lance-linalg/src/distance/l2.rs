@@ -99,15 +99,11 @@ pub fn l2_scalar<T: Float + Sum + AddAssign + AsPrimitive<f32>, const LANES: usi
 impl L2 for BFloat16Type {
     #[inline]
     fn l2(x: &[bf16], y: &[bf16]) -> f32 {
-        #[cfg(any(
-            all(target_os = "linux", target_feature = "avx512bf16"),
-        ))]
+        #[cfg(all(target_os = "linux", target_feature = "avx512bf16"))]
         unsafe {
             kernel::l2_bf16(x.as_ptr(), y.as_ptr(), x.len() as u32)
         }
-        #[cfg(not(any(
-            all(target_os = "linux", target_feature = "avx512bf16"),
-        )))]
+        #[cfg(not(all(target_os = "linux", target_feature = "avx512bf16")))]
         {
             l2_scalar::<bf16, 16>(x, y)
         }

@@ -90,9 +90,7 @@ impl Normalize<f16> for &[f16] {
 
 // `avx512bf16` is not supported in rustc yet. Once it is supported, we can
 // move it to target_feture.
-#[cfg(any(
-    all(target_os = "linux", target_feature = "avx512bf16"),
-))]
+#[cfg(any(all(target_os = "linux", target_feature = "avx512bf16"),))]
 mod kernel {
     use super::*;
 
@@ -103,15 +101,11 @@ mod kernel {
 
 impl Normalize<bf16> for &[bf16] {
     fn norm_l2(&self) -> f32 {
-        #[cfg(any(
-            all(target_os = "linux", target_feature = "avx512bf16"),
-        ))]
+        #[cfg(all(target_os = "linux", target_feature = "avx512bf16"))]
         unsafe {
             kernel::norm_l2_bf16(self.as_ptr(), self.len() as u32)
         }
-        #[cfg(not(any(
-            all(target_os = "linux", target_feature = "avx512bf16"),
-        )))]
+        #[cfg(not(all(target_os = "linux", target_feature = "avx512bf16")))]
         norm_l2_impl::<bf16, 32>(self)
     }
 }

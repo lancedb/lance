@@ -93,7 +93,14 @@ pub trait Dot: ArrowFloatType {
 impl Dot for BFloat16Type {
     #[inline]
     fn dot(x: &[bf16], y: &[bf16]) -> f32 {
-        dot_scalar::<bf16, 32>(x, y)
+        #[cfg(all(target_os = "linux", target_feature = "avx512bf16"))]
+        unsafe {
+            kernel::dot_bf16(x.as_ptr(), y.as_ptr(), x.len() as u32)
+        }
+        #[cfg(not(all(target_os = "linux", target_feature = "avx512bf16")))]
+        {
+            dot_scalar::<bf16, 32>(x, y)
+        }
     }
 }
 
@@ -106,6 +113,7 @@ mod kernel {
 
     extern "C" {
         pub fn dot_f16(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        pub fn dot_bf16(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
     }
 }
 
