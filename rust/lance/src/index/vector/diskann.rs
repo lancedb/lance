@@ -148,7 +148,7 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write_to_uri(reader, test_uri, None).await.unwrap();
 
         // Make sure valid arguments should create index successfully
         let params =

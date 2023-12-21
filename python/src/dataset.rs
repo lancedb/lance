@@ -656,7 +656,7 @@ impl Dataset {
         name: Option<String>,
         replace: Option<bool>,
         kwargs: Option<&PyDict>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Dataset> {
         let idx_type = match index_type.to_uppercase().as_str() {
             "BTREE" => IndexType::Scalar,
             "IVF_PQ" | "DISKANN" => IndexType::Vector,
@@ -765,7 +765,7 @@ impl Dataset {
         .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
 
-        Ok(())
+        Ok(self.clone())
     }
 
     fn count_fragments(&self) -> usize {
@@ -869,16 +869,60 @@ impl Dataset {
         RT.block_on(None, self.ds.validate())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
+
+    fn write_data(&mut self, reader: &PyAny, options: &PyDict) -> PyResult<()> {
+        let params = get_write_params(options)?;
+        let py = options.py();
+        if reader.is_instance_of::<Scanner>() {
+            let scanner: Scanner = reader.extract()?;
+            let batches = RT
+                .block_on(Some(py), scanner.to_reader())?
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+            RT.block_on(Some(py), self.write_impl(batches, params))?
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        } else {
+            let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
+            RT.block_on(Some(py), self.write_impl(batches, params))?
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 impl Dataset {
     fn list_versions(&self) -> ::lance::error::Result<Vec<Version>> {
         RT.runtime.block_on(self.ds.versions())
     }
+
+    async fn write_impl(
+        &mut self,
+        batches: impl RecordBatchReader + Send + 'static,
+        params: Option<WriteParams>,
+    ) -> ::lance::error::Result<()> {
+        let ds = Arc::get_mut(&mut self.ds).ok_or_else(|| {
+            ::lance::error::Error::invalid_input(
+                "Failed to get mutable reference to Dataset",
+                location!(),
+            )
+        })?;
+        match &params {
+            Some(p) => match p.mode {
+                WriteMode::Create => unreachable!("Dataset already exists"),
+                WriteMode::Append => ds.append(batches, params).await,
+                WriteMode::Overwrite => ds.overwrite(batches, params).await,
+            },
+            None => {
+                let mut params = WriteParams::default();
+                params.mode = WriteMode::Append;
+                ds.append(batches, Some(params)).await
+            }
+        }
+    }
 }
 
 #[pyfunction(name = "_write_dataset")]
-pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<bool> {
+pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<Dataset> {
     let params = get_write_params(options)?;
     let py = options.py();
     if reader.is_instance_of::<Scanner>() {
@@ -887,14 +931,22 @@ pub fn write_dataset(reader: &PyAny, uri: String, options: &PyDict) -> PyResult<
             .block_on(Some(py), scanner.to_reader())?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
+        let ds = RT
+            .block_on(Some(py), LanceDataset::write_to_uri(batches, &uri, params))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(true)
+        Ok(Dataset {
+            uri,
+            ds: (Arc::new(ds)),
+        })
     } else {
         let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
-        RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
+        let ds = RT
+            .block_on(Some(py), LanceDataset::write_to_uri(batches, &uri, params))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(true)
+        Ok(Dataset {
+            uri,
+            ds: (Arc::new(ds)),
+        })
     }
 }
 

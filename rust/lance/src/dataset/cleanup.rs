@@ -577,7 +577,7 @@ mod tests {
             data: impl RecordBatchReader + Send + 'static,
             mode: WriteMode,
         ) -> Result<()> {
-            Dataset::write(
+            Dataset::write_to_uri(
                 data,
                 &self.dataset_path,
                 Some(WriteParams {
@@ -1115,7 +1115,7 @@ mod tests {
 
         let schema = ArrowSchema::new(vec![Field::new("a", DataType::Int32, false)]);
         let reader = RecordBatchIterator::new(vec![], Arc::new(schema));
-        let dataset = Dataset::write(reader, test_uri, Default::default())
+        let dataset = Dataset::write_to_uri(reader, test_uri, Default::default())
             .await
             .unwrap();
         let store = dataset.object_store();

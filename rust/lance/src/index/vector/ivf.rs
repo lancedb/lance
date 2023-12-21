@@ -1292,7 +1292,7 @@ mod tests {
 
         async fn generate_dataset(&mut self, test_uri: &str) -> Result<Dataset> {
             let batches = self.generate_batches();
-            Dataset::write(batches, test_uri, None).await
+            Dataset::write_to_uri(batches, test_uri, None).await
         }
 
         async fn check_index<F: Fn(u64) -> Option<u64>>(
@@ -1361,7 +1361,9 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let dataset = Dataset::write_to_uri(batches, test_uri, None)
+            .await
+            .unwrap();
         (dataset, array)
     }
 
@@ -1691,7 +1693,9 @@ mod tests {
         let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write_to_uri(batches, test_uri, None)
+            .await
+            .unwrap();
 
         let params = VectorIndexParams::with_ivf_pq_params(
             MetricType::L2,

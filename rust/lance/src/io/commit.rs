@@ -445,7 +445,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let dataset = Dataset::write(reader, "memory://test", Some(options))
+        let dataset = Dataset::write_to_uri(reader, "memory://test", Some(options))
             .await
             .unwrap();
 
@@ -619,7 +619,7 @@ mod tests {
             ];
 
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let dataset = Dataset::write_to_uri(reader, test_uri, None).await.unwrap();
         dataset.validate().await.unwrap();
 
         // From initial version, concurrently call create index 3 times,
@@ -685,7 +685,7 @@ mod tests {
                 false,
             )]));
 
-            let dataset = Dataset::write(
+            let dataset = Dataset::write_to_uri(
                 RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
                 test_uri,
                 None,
@@ -708,7 +708,7 @@ mod tests {
                     let uri = test_uri.to_string();
                     tokio::spawn(async move {
                         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-                        Dataset::write(
+                        Dataset::write_to_uri(
                             reader,
                             &uri,
                             Some(WriteParams {

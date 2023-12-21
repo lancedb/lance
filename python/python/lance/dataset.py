@@ -94,8 +94,13 @@ if TYPE_CHECKING:
 class LanceDataset(pa.dataset.Dataset):
     """A dataset in Lance format where the data is stored at the given uri."""
 
-    def __init__(
-        self,
+    def __init__(self, _ds: _Dataset):
+        self._uri = _ds.uri
+        self._ds = _ds
+
+    @classmethod
+    def create(
+        cls,
         uri: Union[str, Path],
         version: Optional[int] = None,
         block_size: Optional[int] = None,
@@ -104,13 +109,13 @@ class LanceDataset(pa.dataset.Dataset):
         commit_lock: Optional[CommitLock] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
-        self._uri = uri
-        self._ds = _Dataset(
+        _ds = _Dataset(
             uri, version, block_size, index_cache_size, metadata_cache_size, commit_lock
         )
+        return LanceDataset(_ds)
 
     def __reduce__(self):
-        return LanceDataset, (self.uri, self._ds.version())
+        return LanceDataset.create, (self.uri, self._ds.version())
 
     def __getstate__(self):
         return self.uri, self._ds.version()
@@ -1072,8 +1077,73 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 kwargs["ivf_centroids"] = ivf_centroids_batch
 
-        self._ds.create_index(column, index_type, name, replace, kwargs)
-        return LanceDataset(self.uri, index_cache_size=index_cache_size)
+        return LanceDataset(
+            self._ds.create_index(column, index_type, name, replace, kwargs)
+        )
+
+    def write(
+        self,
+        data_obj: ReaderLike,
+        schema: Optional[Schema] = None,
+        mode: str = "append",
+        *,
+        max_rows_per_file: int = 1024 * 1024,
+        max_rows_per_group: int = 1024,
+        max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
+        commit_lock: Optional[CommitLock] = None,
+        progress: Optional[FragmentWriteProgress] = None,
+    ) -> LanceDataset:
+        """Append to or overwrite this dataset
+
+        Parameters
+        ----------
+        data_obj: Reader-like
+            The data to be written. Acceptable types are:
+            - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, or RecordBatchReader
+        schema: Schema, optional
+            The schema of the incoming data. If not provided, the dataset schema will be used
+        mode: str
+            **overwrite** - create a new snapshot version
+            **append** - create a new version that is the concat of the input the
+            latest version (raises if uri does not exist)
+        max_rows_per_file: int, default 1024 * 1024
+            The max number of rows to write before starting a new file
+        max_rows_per_group: int, default 1024
+            The max number of rows before starting a new group (in the same file)
+        max_bytes_per_file: int, default 90 * 1024 * 1024 * 1024
+            The max number of bytes to write before starting a new file. This is a
+            soft limit. This limit is checked after each group is written, which
+            means larger groups may cause this to be overshot meaningfully. This
+            defaults to 90 GB, since we have a hard limit of 100 GB per file on
+            object stores.
+        commit_lock : CommitLock, optional
+            A custom commit lock.  Only needed if your object store does not support
+            atomic commits.  See the user guide for more details.
+        progress: FragmentWriteProgress, optional
+            *Experimental API*. Progress tracking for writing the fragment. Pass
+            a custom class that defines hooks to be called when each fragment is
+            starting to write and finishing writing.
+        """
+        reader = _coerce_reader(data_obj, schema or self.schema)
+        _validate_schema(reader.schema)
+        # TODO add support for passing in LanceDataset and LanceScanner here
+
+        params = {
+            "mode": mode,
+            "max_rows_per_file": max_rows_per_file,
+            "max_rows_per_group": max_rows_per_group,
+            "max_bytes_per_file": max_bytes_per_file,
+            "progress": progress,
+        }
+
+        if commit_lock:
+            if not callable(commit_lock):
+                raise TypeError(
+                    f"commit_lock must be a function, got {type(commit_lock)}"
+                )
+            params["commit_handler"] = commit_lock
+        self._ds.write_data(reader, params)
+        return self
 
     @staticmethod
     def _commit(
@@ -1167,7 +1237,7 @@ class LanceDataset(pa.dataset.Dataset):
                 )
 
         _Dataset.commit(base_uri, operation._to_inner(), read_version, commit_lock)
-        return LanceDataset(base_uri)
+        return LanceDataset.create(base_uri)
 
     def validate(self):
         """
@@ -1942,8 +2012,7 @@ def write_dataset(
         params["commit_handler"] = commit_lock
 
     uri = os.fspath(uri) if isinstance(uri, Path) else uri
-    _write_dataset(reader, uri, params)
-    return LanceDataset(uri)
+    return LanceDataset(_write_dataset(reader, uri, params))
 
 
 def _coerce_reader(

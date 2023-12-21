@@ -597,7 +597,7 @@ mod tests {
         let q = as_fixed_size_list_array(&vector_arr).value(5);
 
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(reader, test_uri, Some(write_params))
+        Dataset::write_to_uri(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 

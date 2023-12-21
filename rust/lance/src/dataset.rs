@@ -337,7 +337,7 @@ impl Dataset {
     }
 
     #[instrument(skip(batches, params))]
-    async fn write_impl(
+    async fn write_to_uri_impl(
         batches: Box<dyn RecordBatchReader + Send>,
         uri: &str,
         params: Option<WriteParams>,
@@ -359,8 +359,6 @@ impl Dataset {
             Err(e) => return Err(e),
         };
 
-        let (stream, schema) = reader_to_stream(batches)?;
-
         // Running checks for the different write modes
         // create + dataset already exists = error
         if dataset_exists && matches!(params.mode, WriteMode::Create) {
@@ -381,7 +379,6 @@ impl Dataset {
                 ..params
             };
         }
-        let params = params; // discard mut
 
         let dataset = if matches!(params.mode, WriteMode::Create) {
             None
@@ -397,7 +394,12 @@ impl Dataset {
                     .await?,
             )
         };
+        let object_store = dataset
+            .as_ref()
+            .map_or(Arc::new(object_store), |ds| ds.object_store.clone());
 
+        let params = params; // discard mut
+        let (stream, schema) = reader_to_stream(batches)?;
         // append + input schema different from existing schema = error
         if matches!(params.mode, WriteMode::Append) {
             if let Some(d) = dataset.as_ref() {
@@ -425,7 +427,6 @@ impl Dataset {
             }
         }
 
-        let object_store = Arc::new(object_store);
         let fragments =
             write_fragments_internal(object_store.clone(), &base, &schema, stream, params.clone())
                 .await?;
@@ -467,7 +468,7 @@ impl Dataset {
     /// Returns the newly created [`Dataset`].
     /// Or Returns [Error] if the dataset already exists.
     ///
-    pub async fn write(
+    pub async fn write_to_uri(
         batches: impl RecordBatchReader + Send + 'static,
         uri: &str,
         params: Option<WriteParams>,
@@ -475,20 +476,21 @@ impl Dataset {
         // Box it so we don't monomorphize for every one. We take the generic
         // parameter for API ergonomics.
         let batches = Box::new(batches);
-        Self::write_impl(batches, uri, params).await
+        Self::write_to_uri_impl(batches, uri, params).await
     }
 
-    async fn append_impl(
+    async fn write_impl(
         &mut self,
         batches: Box<dyn RecordBatchReader + Send>,
-        params: Option<WriteParams>,
+        params: WriteParams,
     ) -> Result<()> {
-        // Force append mode
-        let params = WriteParams {
-            mode: WriteMode::Append,
-            ..params.unwrap_or_default()
-        };
-
+        // return error if mode is create
+        if matches!(params.mode, WriteMode::Create) {
+            return Err(Error::InvalidInput {
+                source: "Cannot create a dataset that already exists".into(),
+                location: location!(),
+            });
+        }
         // Need to include params here because it might include a commit mechanism.
         let object_store = Arc::new(
             self.object_store()
@@ -498,7 +500,7 @@ impl Dataset {
         let (stream, schema) = reader_to_stream(batches)?;
 
         // Return Error if append and input schema differ
-        if self.manifest.schema != schema {
+        if matches!(params.mode, WriteMode::Append) && self.manifest.schema != schema {
             return Err(Error::SchemaMismatch {
                 // original: self.manifest.schema.clone(),
                 // new: schema,
@@ -514,8 +516,13 @@ impl Dataset {
         )
         .await?;
 
-        let transaction =
-            Transaction::new(self.manifest.version, Operation::Append { fragments }, None);
+        let op = match params.mode {
+            WriteMode::Overwrite => Operation::Overwrite { schema, fragments },
+            WriteMode::Append => Operation::Append { fragments },
+            _ => unreachable!(),
+        };
+
+        let transaction = Transaction::new(self.manifest.version, op, None);
 
         let new_manifest = commit_transaction(
             self,
@@ -542,7 +549,31 @@ impl Dataset {
         // Box it so we don't monomorphize for every one. We take the generic
         // parameter for API ergonomics.
         let batches = Box::new(batches);
-        self.append_impl(batches, params).await
+        let params = params.unwrap_or_else(|| {
+            let mut inner = WriteParams::default();
+            inner.mode = WriteMode::Append;
+            inner
+        });
+        self.write_impl(batches, params).await
+    }
+
+    /// Overwrite this [Dataset] with a stream of [RecordBatch]s
+    ///
+    /// Returns void result or Returns [Error]
+    pub async fn overwrite(
+        &mut self,
+        batches: impl RecordBatchReader + Send + 'static,
+        params: Option<WriteParams>,
+    ) -> Result<()> {
+        // Box it so we don't monomorphize for every one. We take the generic
+        // parameter for API ergonomics.
+        let batches = Box::new(batches);
+        let params = params.unwrap_or_else(|| {
+            let mut inner = WriteParams::default();
+            inner.mode = WriteMode::Overwrite;
+            inner
+        });
+        self.write_impl(batches, params).await
     }
 
     pub async fn latest_manifest(&self) -> Result<Manifest> {
@@ -1653,7 +1684,7 @@ mod tests {
             ..WriteParams::default()
         };
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(reader, test_uri, Some(write_params))
+        Dataset::write_to_uri(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -1723,7 +1754,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone());
         // check schema of reader and original is same
         assert_eq!(schema.as_ref(), reader.schema().as_ref());
-        let result = Dataset::write(reader, test_uri, None).await.unwrap();
+        let result = Dataset::write_to_uri(reader, test_uri, None).await.unwrap();
         // check dataset empty
         assert_eq!(result.count_rows().await.unwrap(), 0);
         // Since the dataset is empty, will return None.
@@ -1749,7 +1780,7 @@ mod tests {
         .unwrap()];
         write_params.mode = WriteMode::Append;
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params))
+        Dataset::write_to_uri(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -1811,7 +1842,7 @@ mod tests {
             max_rows_per_group: 10,
             ..Default::default()
         };
-        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+        let dataset = Dataset::write_to_uri(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -1847,7 +1878,7 @@ mod tests {
         .unwrap()];
 
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let write_fut = Dataset::write(batches, test_uri, None);
+        let write_fut = Dataset::write_to_uri(batches, test_uri, None);
         let write_fut = require_send(write_fut);
         let mut dataset = write_fut.await.unwrap();
 
@@ -1919,7 +1950,7 @@ mod tests {
         )
         .unwrap()];
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let write_result = Dataset::write(
+        let write_result = Dataset::write_to_uri(
             batches,
             test_uri,
             Some(WriteParams {
@@ -1954,7 +1985,7 @@ mod tests {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
+        Dataset::write_to_uri(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -1965,7 +1996,7 @@ mod tests {
         .unwrap()];
         write_params.mode = WriteMode::Append;
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
+        Dataset::write_to_uri(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -2031,7 +2062,7 @@ mod tests {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let mut ds = Dataset::write(batches, test_uri, Some(write_params.clone()))
+        let mut ds = Dataset::write_to_uri(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -2123,7 +2154,7 @@ mod tests {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let mut ds = Dataset::write(batches, test_uri, Some(write_params.clone()))
+        let mut ds = Dataset::write_to_uri(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -2164,7 +2195,7 @@ mod tests {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
+        Dataset::write_to_uri(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -2181,7 +2212,7 @@ mod tests {
         // Write to dataset (successful)
         write_params.mode = WriteMode::Append;
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
+        Dataset::write_to_uri(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -2198,7 +2229,7 @@ mod tests {
 
         // Try write to dataset (fail)
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let result = Dataset::write(batches, test_uri, Some(write_params)).await;
+        let result = Dataset::write_to_uri(batches, test_uri, Some(write_params)).await;
         assert!(result.is_err());
     }
 
@@ -2224,7 +2255,7 @@ mod tests {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let dataset = Dataset::write(batches, test_uri, Some(write_params.clone()))
+        let dataset = Dataset::write_to_uri(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -2247,7 +2278,7 @@ mod tests {
         write_params.mode = WriteMode::Overwrite;
         let new_batch_reader =
             RecordBatchIterator::new(new_batches.into_iter().map(Ok), new_schema.clone());
-        let dataset = Dataset::write(new_batch_reader, test_uri, Some(write_params.clone()))
+        let dataset = Dataset::write_to_uri(new_batch_reader, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -2315,7 +2346,7 @@ mod tests {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params))
+        Dataset::write_to_uri(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -2385,7 +2416,7 @@ mod tests {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(batches, test_uri, Some(write_params))
+        let mut dataset = Dataset::write_to_uri(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -2463,7 +2494,7 @@ mod tests {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params))
+        Dataset::write_to_uri(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -2500,7 +2531,7 @@ mod tests {
 
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write_to_uri(reader, test_uri, None).await.unwrap();
         dataset.validate().await.unwrap();
 
         // Make sure valid arguments should create index successfully
@@ -2527,7 +2558,7 @@ mod tests {
         };
         let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let dataset = Dataset::write(reader, test_uri, Some(write_params))
+        let dataset = Dataset::write_to_uri(reader, test_uri, Some(write_params))
             .await
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
@@ -2567,7 +2598,7 @@ mod tests {
         };
         let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()];
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let dataset = Dataset::write(reader, test_uri, Some(write_params))
+        let dataset = Dataset::write_to_uri(reader, test_uri, Some(write_params))
             .await
             .unwrap();
         assert!(dataset.manifest.index_section.is_none());
@@ -2586,7 +2617,7 @@ mod tests {
 
         let data = gen().col(Some("int".to_string()), array::step::<Int32Type>());
         // Write 64Ki rows.  We should get 16 4Ki pages
-        let mut dataset = Dataset::write(
+        let mut dataset = Dataset::write_to_uri(
             data.into_reader_rows(RowCount::from(16 * 1024), BatchCount::from(4)),
             test_uri,
             None,
@@ -2636,7 +2667,7 @@ mod tests {
             .collect();
         let test_uri = test_dir.path().to_str().unwrap();
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(reader, test_uri, None).await
+        Dataset::write_to_uri(reader, test_uri, None).await
     }
 
     #[tokio::test]
@@ -2815,13 +2846,13 @@ mod tests {
 
         let batches =
             RecordBatchIterator::new(vec![batch1.clone()].into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
+        Dataset::write_to_uri(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
         let batches =
             RecordBatchIterator::new(vec![batch2.clone()].into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
+        Dataset::write_to_uri(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -2919,13 +2950,13 @@ mod tests {
 
         let batches =
             RecordBatchIterator::new(vec![batch1.clone()].into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(overwrite_params.clone()))
+        Dataset::write_to_uri(batches, test_uri, Some(overwrite_params.clone()))
             .await
             .unwrap();
 
         let batches =
             RecordBatchIterator::new(vec![batch2.clone()].into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
+        Dataset::write_to_uri(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -2985,12 +3016,12 @@ mod tests {
         };
 
         let batches = RecordBatchIterator::new(vec![batch1].into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
+        Dataset::write_to_uri(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
         let batches = RecordBatchIterator::new(vec![batch2].into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
+        Dataset::write_to_uri(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -3094,7 +3125,7 @@ mod tests {
             max_rows_per_file: 50, // Split over two files.
             ..Default::default()
         };
-        let mut dataset = Dataset::write(batches, test_uri, Some(write_params))
+        let mut dataset = Dataset::write_to_uri(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -3213,7 +3244,7 @@ mod tests {
             mode: WriteMode::Append,
             ..Default::default()
         };
-        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+        let dataset = Dataset::write_to_uri(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -3245,7 +3276,7 @@ mod tests {
             vec![Arc::new(UInt32Array::from_iter_values(0..100))],
         );
         let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write_to_uri(reader, test_uri, None).await.unwrap();
         assert_eq!(dataset.manifest.version, 1);
         let original_manifest = dataset.manifest.clone();
 
@@ -3299,7 +3330,7 @@ mod tests {
 
         let data = RecordBatch::try_new(schema.clone(), vec![vectors]);
         let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
-        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let dataset = Dataset::write_to_uri(reader, test_uri, None).await.unwrap();
 
         let mut stream = dataset
             .scan()
@@ -3356,7 +3387,7 @@ mod tests {
 
         let data = RecordBatch::try_new(schema.clone(), vec![vectors]);
         let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write_to_uri(reader, test_uri, None).await.unwrap();
         dataset.delete("true").await.unwrap();
 
         let mut stream = dataset
@@ -3453,7 +3484,7 @@ mod tests {
             RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
 
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write_to_uri(reader, test_uri, None).await.unwrap();
         dataset.validate().await.unwrap();
 
         // Make sure it returns None if there's no index with the passed identifier
@@ -3534,7 +3565,7 @@ mod tests {
             RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
 
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let dataset = Dataset::write_to_uri(reader, test_uri, None).await.unwrap();
         dataset.validate().await.unwrap();
 
         assert!(dataset.num_small_files(1024).await > 0);
@@ -3581,7 +3612,7 @@ mod tests {
 
         let batch_reader =
             RecordBatchIterator::new(batches.clone().into_iter().map(Ok), arrow_schema.clone());
-        Dataset::write(batch_reader, test_uri, Some(WriteParams::default()))
+        Dataset::write_to_uri(batch_reader, test_uri, Some(WriteParams::default()))
             .await
             .unwrap();
 
@@ -3625,7 +3656,7 @@ mod tests {
         };
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
+        Dataset::write_to_uri(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -3727,7 +3758,7 @@ mod tests {
             mode: WriteMode::Append,
             ..Default::default()
         };
-        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+        let dataset = Dataset::write_to_uri(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -3796,7 +3827,7 @@ mod tests {
             mode: WriteMode::Append,
             ..Default::default()
         };
-        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+        let dataset = Dataset::write_to_uri(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 

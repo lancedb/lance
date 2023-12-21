@@ -472,7 +472,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write_to_uri(reader, test_uri, None).await.unwrap();
 
         let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
         dataset

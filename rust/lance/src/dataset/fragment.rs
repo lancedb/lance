@@ -877,7 +877,7 @@ mod tests {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params))
+        Dataset::write_to_uri(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
