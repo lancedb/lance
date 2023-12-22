@@ -623,7 +623,8 @@ impl Dataset {
     }
 
     fn checkout(&mut self, version: u64) -> PyResult<()> {
-        let ds = RT.block_on(None, self.ds.checkout_version(version))?
+        let ds = RT
+            .block_on(None, self.ds.checkout_version(version))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(ds);
         Ok(())
