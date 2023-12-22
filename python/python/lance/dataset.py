@@ -1109,7 +1109,8 @@ class LanceDataset(pa.dataset.Dataset):
             The data to be written. Acceptable types are:
             - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, or RecordBatchReader
         schema: Schema, optional
-            The schema of the incoming data. If not provided, the dataset schema will be used
+            The schema of the incoming data. If not provided,
+            the dataset schema will be used
         mode: str
             **overwrite** - create a new snapshot version
             **append** - create a new version that is the concat of the input the
