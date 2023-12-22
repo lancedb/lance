@@ -26,7 +26,7 @@ def test_f16_embeddings(tmp_path: Path):
     data = pa.Table.from_arrays([fsl, np.arange(TOTAL)], names=["vec", "id"])
 
     ds = lance.write_dataset(data, tmp_path)
-    assert ds.schema.field_by_name("vec").type.value_type == pa.float16()
+    assert ds.schema.field("vec").type.value_type == pa.float16()
 
     ds = ds.create_index(
         "vec", "IVF_PQ", replace=True, num_partitions=2, num_sub_vectors=2
