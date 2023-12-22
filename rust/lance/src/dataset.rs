@@ -549,8 +549,9 @@ impl Dataset {
         // Box it so we don't monomorphize for every one. We take the generic
         // parameter for API ergonomics.
         let batches = Box::new(batches);
-        let params = params.unwrap_or_else(|| {
-            WriteParams { mode: WriteMode::Append, ..Default::default() }
+        let params = params.unwrap_or_else(|| WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
         });
         self.write_impl(batches, params).await
     }
@@ -566,8 +567,9 @@ impl Dataset {
         // Box it so we don't monomorphize for every one. We take the generic
         // parameter for API ergonomics.
         let batches = Box::new(batches);
-        let params = params.unwrap_or_else(|| {
-            WriteParams { mode: WriteMode::Overwrite, ..Default::default() }
+        let params = params.unwrap_or_else(|| WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
         });
         self.write_impl(batches, params).await
     }
