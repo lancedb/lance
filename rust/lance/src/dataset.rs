@@ -550,9 +550,7 @@ impl Dataset {
         // parameter for API ergonomics.
         let batches = Box::new(batches);
         let params = params.unwrap_or_else(|| {
-            let mut inner = WriteParams::default();
-            inner.mode = WriteMode::Append;
-            inner
+            WriteParams { mode: WriteMode::Append, ..Default::default() }
         });
         self.write_impl(batches, params).await
     }
@@ -569,9 +567,7 @@ impl Dataset {
         // parameter for API ergonomics.
         let batches = Box::new(batches);
         let params = params.unwrap_or_else(|| {
-            let mut inner = WriteParams::default();
-            inner.mode = WriteMode::Overwrite;
-            inner
+            WriteParams { mode: WriteMode::Overwrite, ..Default::default() }
         });
         self.write_impl(batches, params).await
     }
