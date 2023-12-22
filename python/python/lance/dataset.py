@@ -702,7 +702,7 @@ class LanceDataset(pa.dataset.Dataset):
         Returns the lastest version of the dataset
         """
         return self._ds.latest_version()
-    
+
     def checkout(self, version: int):
         """
         Checkout a specific version of the dataset.
