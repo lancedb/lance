@@ -921,8 +921,10 @@ impl Dataset {
                 WriteMode::Overwrite => ds.overwrite(batches, params).await,
             },
             None => {
-                let mut params = WriteParams::default();
-                params.mode = WriteMode::Append;
+                let params = WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                };
                 ds.append(batches, Some(params)).await
             }
         }
