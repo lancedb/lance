@@ -121,7 +121,7 @@ pub fn reader_to_pyarrow(
 ///
 /// TODO: replace this method once arrow-rs 47.0.0 is released.
 pub fn record_batch_to_pyarrow(py: Python<'_>, batch: &RecordBatch) -> PyResult<PyObject> {
-    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema().clone());
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
     let reader: Box<dyn RecordBatchReader + Send> = Box::new(reader);
     let py_reader = reader_to_pyarrow(py, reader)?;
     py_reader.call_method0(py, "read_next_batch")
