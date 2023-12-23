@@ -165,8 +165,9 @@ impl IvfShuffler {
             .enumerate();
 
         while let Some((idx, batch)) = stream.next().await {
-            if idx % 100 == 0 {
-                info!("Shuffle Progress {}/{}", idx, total_batch);
+            partition_id = idx / partition_size;
+            if partition_id % 100 == 0 {
+                info!("Shuffle Progress {}/{}", partition_id, end - start);
             }
 
             let batch = batch?;
