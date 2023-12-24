@@ -19,7 +19,6 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as pa_ds
 import pytest
-from helper import requires_pyarrow_12
 from lance.vector import vec_to_table
 
 
@@ -219,7 +218,6 @@ def sample_data_all_types():
     )
 
 
-@requires_pyarrow_12
 def test_roundtrip_types(tmp_path, sample_data_all_types):
     dataset = lance.write_dataset(sample_data_all_types, tmp_path)
     roundtripped = dataset.to_table()

@@ -16,7 +16,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from helper import PYARROW_VERSION, requires_pyarrow_12
+from helper import PYARROW_VERSION
 from numpy.linalg import norm
 
 
@@ -46,7 +46,6 @@ def test_train_cosine():
     assert np.allclose(pred, expected)
 
 
-@requires_pyarrow_12
 def test_invalid_inputs():
     kmeans = lance.util.KMeans(32)
     data = pa.FixedShapeTensorArray.from_numpy_ndarray(
