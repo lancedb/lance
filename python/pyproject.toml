@@ -43,14 +43,12 @@ classifiers = [
 python-source = "python"
 
 [build-system]
-requires = ["maturin>=0.14,<0.15"]
+requires = ["maturin>=1.4"]
 build-backend = "maturin"
 
 [project.optional-dependencies]
 tests = [
-    # Can't use pandas 2.1 in tests until this duckdb bug is fixed:
-    # https://github.com/duckdb/duckdb/issues/8735
-    "pandas>=1.4,<2.1",
+    "pandas",
     "pytest",
     "duckdb",
     "ml_dtypes",
