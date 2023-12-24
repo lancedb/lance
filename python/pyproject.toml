@@ -53,7 +53,6 @@ tests = [
     "duckdb",
     "ml_dtypes",
     "polars[pyarrow,pandas]",
-    "semver",
     "tensorflow",
     "tqdm",
 ]

@@ -14,12 +14,8 @@
 
 from typing import Optional
 
-import pyarrow as pa
-import semver
 from lance.fragment import FragmentMetadata
 from lance.progress import FragmentWriteProgress
-
-PYARROW_VERSION = semver.VersionInfo.parse(pa.__version__)
 
 
 class ProgressForTest(FragmentWriteProgress):
