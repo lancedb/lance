@@ -599,9 +599,7 @@ else:
                 return self.data[item].as_py()
             elif isinstance(item, slice):
                 return PandasBFloat16Array(self.data[item])
-            elif isinstance(item, np.ndarray) and isinstance(
-                item.dtype, (bool, np.dtypes.BoolDType)
-            ):
+            elif isinstance(item, np.ndarray) and np.issubdtype(item.dtype, np.bool_):
                 return PandasBFloat16Array(self.data.filter(pa.array(item)))
             else:
                 raise NotImplementedError()
