@@ -16,7 +16,6 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from helper import PYARROW_VERSION, requires_pyarrow_12
 from numpy.linalg import norm
 
 
@@ -27,10 +26,7 @@ def test_train_cosine():
     assert kmeans.centroids is None
     kmeans.fit(data)
     assert kmeans.centroids is not None
-    if PYARROW_VERSION.major < 12:
-        centroids = np.stack(kmeans.centroids.to_numpy(zero_copy_only=False))
-    else:
-        centroids = kmeans.centroids.to_numpy_ndarray()
+    centroids = kmeans.centroids.to_numpy_ndarray()
     assert centroids.shape == (32, 128)
 
     # test predict
@@ -46,7 +42,6 @@ def test_train_cosine():
     assert np.allclose(pred, expected)
 
 
-@requires_pyarrow_12
 def test_invalid_inputs():
     kmeans = lance.util.KMeans(32)
     data = pa.FixedShapeTensorArray.from_numpy_ndarray(

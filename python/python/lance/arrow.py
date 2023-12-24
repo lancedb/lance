@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Union
 
+import numpy as np
 import pyarrow as pa
 
 from .lance import BFloat16
@@ -496,15 +497,18 @@ class BFloat16Array(pa.ExtensionArray):
         return array
 
     @classmethod
-    def from_numpy(cls, array):
+    def from_numpy(cls, array: np.ndarray):
         """Create a BFloat16Array from a NumPy array.
 
         Can only convert from a NumPy array of dtype bfloat16 from the ml_dtypes
-        module."""
+        module.
+        """
         from ml_dtypes import bfloat16
 
         if array.dtype != bfloat16:
             raise ValueError("Cannot convert non-bfloat16 values to BFloat16Array")
+        if array.ndim != 1:
+            raise ValueError("Cannot convert multi-dimensional array to BFloat16Array")
         data = pa.py_buffer(array.tobytes())
         return pa.Array.from_buffers(BFloat16Type(), len(array), [None, data])
 
@@ -595,7 +599,7 @@ else:
                 return self.data[item].as_py()
             elif isinstance(item, slice):
                 return PandasBFloat16Array(self.data[item])
-            elif isinstance(item, np.ndarray) and item.dtype == bool:
+            elif isinstance(item, np.ndarray) and np.issubdtype(item.dtype, np.bool_):
                 return PandasBFloat16Array(self.data.filter(pa.array(item)))
             else:
                 raise NotImplementedError()

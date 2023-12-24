@@ -20,7 +20,6 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pytest
-from helper import requires_pyarrow_12
 from lance.arrow import (
     BFloat16,
     BFloat16Array,
@@ -125,7 +124,6 @@ def test_bf16_numpy():
     np.testing.assert_array_equal(arr_arrow.to_numpy(), expected)
 
 
-@requires_pyarrow_12
 def test_roundtrip_take_ext_types(tmp_path: Path):
     tensor_type = pa.fixed_shape_tensor(pa.float32(), [2, 3])
     inner = pa.array([float(x) for x in range(0, 18)], pa.float32())
@@ -229,7 +227,6 @@ def test_image_arrays(tmp_path: Path):
     )
 
 
-@requires_pyarrow_12
 def test_roundtrip_image_tensor(tmp_path: Path):
     import os
 

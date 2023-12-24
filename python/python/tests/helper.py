@@ -14,17 +14,8 @@
 
 from typing import Optional
 
-import pyarrow as pa
-import pytest
-import semver
 from lance.fragment import FragmentMetadata
 from lance.progress import FragmentWriteProgress
-
-PYARROW_VERSION = semver.VersionInfo.parse(pa.__version__)
-
-requires_pyarrow_12 = pytest.mark.skipif(
-    PYARROW_VERSION.major < 12, reason="requires arrow 12+"
-)
 
 
 class ProgressForTest(FragmentWriteProgress):
