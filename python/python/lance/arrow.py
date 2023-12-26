@@ -469,3 +469,11 @@ class EncodedImageScalar(ImageScalar):
 
 class FixedShapeImageTensorScalar(ImageScalar):
     pass
+
+
+def cast(arr: pa.Array, dtype: pa.DataType) -> pa.Array:
+    """Cast data types.
+
+    Simplar to `pyarrow.compute.cast`, but supports Lance defined extension arrays.
+    """
+    pass
