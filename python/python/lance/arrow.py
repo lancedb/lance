@@ -16,10 +16,9 @@ import json
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Union
 
-import numpy as np
 import pyarrow as pa
 
-from .lance import BFloat16
+from ._arrow.bf16 import BFloat16, BFloat16Array, PandasBFloat16Array  # noqa: F401
 from .lance import bfloat16_array as bfloat16_array
 
 

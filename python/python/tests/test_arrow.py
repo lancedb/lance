@@ -67,7 +67,11 @@ def test_bf16_repr():
     assert arr.to_pylist() == expected
 
     expected_re = r"""<lance.arrow.BFloat16Array object at 0x[\w\d]+>
-\[1.1015625, None, 3.40625\]"""
+\[
+  1.1015625,
+  None,
+  3.40625
+\]"""
     assert re.match(expected_re, repr(arr))
 
     # TODO: uncomment tests once fixed upstream.
@@ -80,6 +84,14 @@ def test_bf16_repr():
 # ---
 # x: \[\[1.1015625, None, 3.40625\]\]"""
 #     assert re.match(expected_re, repr(tab))
+
+
+def test_bf16_array_str():
+    from ml_dtypes import bfloat16
+
+    np_arr = np.array([1.0, 2.0, 3.0], dtype=bfloat16)
+    arr = BFloat16Array.from_numpy(np_arr)
+    assert str(arr) == "[\n  1,\n  2,\n  3\n]"
 
 
 def test_bf16_pandas(provide_pandas):
@@ -249,3 +261,5 @@ def test_roundtrip_image_tensor(tmp_path: Path):
     tensor_image_array_2 = tbl2.take(indices).column(2)
 
     assert tensor_image_array_2.type == tensor_image_array.type
+
+

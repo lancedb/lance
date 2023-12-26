@@ -25,17 +25,17 @@ class BFloat16Array(pa.ExtensionArray):
     def __repr__(self):
         return "<lance.arrow.BFloat16Array object at 0x%016x>\n%s" % (
             id(self),
-            repr(self.to_pylist()),
+            str(self),
         )
 
     def __str__(self):
-        if len(self) < 21:
-            return "[\n" + "\n".join([f"  {v}," for v in self]) + "\n]"
+        if len(self) < 22:
+            return "[\n" + ",\n".join([f"  {v}" for v in self]) + "\n]"
         return (
             "[\n"
-            + "\n".join([f"  {v}," for v in self[:10]])
-            + "\n...,\n"
-            + "\n".join([f"  {v}," for v in self[-10:]])
+            + ",\n".join([f"  {v}" for v in self[:10]])
+            + "\n...\n"
+            + ",\n".join([f"  {v}," for v in self[-10:]])
             + "\n]"
         )
 
