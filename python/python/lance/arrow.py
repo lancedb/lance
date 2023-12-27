@@ -21,7 +21,12 @@ from typing import Callable, Iterable, Optional, Union
 
 import pyarrow as pa
 
-from ._arrow.bf16 import BFloat16, BFloat16Array, PandasBFloat16Array  # noqa: F401
+from ._arrow.bf16 import (  # noqa: F401
+    BFloat16,
+    BFloat16Array,
+    BFloat16Type,
+    PandasBFloat16Array,
+)
 from .lance import bfloat16_array as bfloat16_array
 
 
@@ -488,14 +493,16 @@ def cast(
     - Cast between floating (``float16``, ``float32``, ``float64``) arrays
       and ``bfloat16`` arrays.
     """
-    if arr.type == BFloat16:
+    if isinstance(arr.type, BFloat16Type):
         # Casting bf16 to other float types
         if not pa.types.is_floating(target_type):
             raise ValueError(
                 "Only support casting bfloat16 array to floating array,"
                 + f"got: {target_type}"
             )
-        raise NotImplementedError
+        np_arr = arr.to_numpy()
+        float_arr = np_arr.astype(target_type.to_pandas_dtype())
+        return pa.array(float_arr)
     if target_type == BFloat16 or target_type in ["bfloat16", "bf16"]:
         if not pa.types.is_floating(arr.type):
             raise ValueError(

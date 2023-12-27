@@ -145,6 +145,8 @@ def test_bf16_array_cast():
         assert bf16_arr[0] == BFloat16(1.0)
         assert bf16_arr[0] == bfloat16(1.0)
 
+        casted = lance.arrow.cast(bf16_arr, floats.type)
+        assert casted == floats
 
 def test_roundtrip_take_ext_types(tmp_path: Path):
     tensor_type = pa.fixed_shape_tensor(pa.float32(), [2, 3])
