@@ -12,6 +12,9 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+"""Extensions to PyArrows.
+"""
+
 import json
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Union
@@ -471,9 +474,30 @@ class FixedShapeImageTensorScalar(ImageScalar):
     pass
 
 
-def cast(arr: pa.Array, dtype: pa.DataType) -> pa.Array:
+def cast(
+    arr: pa.Array, target_type: Union[pa.DataType, str], *args, **kwargs
+) -> pa.Array:
     """Cast data types.
 
-    Simplar to `pyarrow.compute.cast`, but supports Lance defined extension arrays.
+    Extends `pyarrow.compute.cast()` to Lance defined extension types.
+
+    Supported operations:
+    - Cast between floating arrays and ``bfloat16`` arrays.
     """
-    pass
+    if arr.type == BFloat16:
+        """Casting bf16 to other types"""
+        raise NotImplementedError
+    if target_type == BFloat16 or target_type in ["bfloat16", "bf16"]:
+        if not pa.types.is_floating(arr.type):
+            raise ValueError(
+                "Only support casting floating array to bfloat16 array,"
+                + f"got: {arr.type}"
+            )
+        from ml_dtypes import bfloat16
+
+        np_arr = arr.to_numpy()
+        bf16_arr = np_arr.astype(bfloat16)
+        return BFloat16Array.from_numpy(bf16_arr)
+
+    # Fallback to normal cast.
+    return pa.compute.cast(arr, target_type, *args, **kwargs)

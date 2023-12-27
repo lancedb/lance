@@ -136,6 +136,14 @@ def test_bf16_numpy():
     np.testing.assert_array_equal(arr_arrow.to_numpy(), expected)
 
 
+def test_bf16_array_cast():
+    for dt in [np.float16, np.float32, np.float64]:
+        floats = pa.array(np.array([1.0, 2.0, 3.0, 4.0], dtype=dt))
+        bf16_arr = lance.arrow.cast(floats, "bfloat16")
+        assert isinstance(bf16_arr, BFloat16Array)
+        assert bf16_arr[0] == 1.0
+
+
 def test_roundtrip_take_ext_types(tmp_path: Path):
     tensor_type = pa.fixed_shape_tensor(pa.float32(), [2, 3])
     inner = pa.array([float(x) for x in range(0, 18)], pa.float32())
