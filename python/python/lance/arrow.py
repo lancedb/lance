@@ -518,6 +518,8 @@ def cast(
         :py:class:`~lance._arrow.bf16.BFloat16Type`.
 
     """
+    from ml_dtypes import bfloat16
+
     if isinstance(arr.type, BFloat16Type):
         # Casting bf16 to other float types
         if not pa.types.is_floating(target_type):
@@ -528,17 +530,28 @@ def cast(
         np_arr = arr.to_numpy()
         float_arr = np_arr.astype(target_type.to_pandas_dtype())
         return pa.array(float_arr)
-    if target_type == BFloat16Type or target_type in ["bfloat16", "bf16"]:
+    elif isinstance(target_type, BFloat16Type) or target_type in ["bfloat16", "bf16"]:
         if not pa.types.is_floating(arr.type):
             raise ValueError(
                 "Only support casting floating array to bfloat16 array,"
                 + f"got: {arr.type}"
             )
-        from ml_dtypes import bfloat16
-
         np_arr = arr.to_numpy()
         bf16_arr = np_arr.astype(bfloat16)
         return BFloat16Array.from_numpy(bf16_arr)
+    elif pa.types.is_fixed_size_list(arr.type) and pa.types.is_fixed_size_list(
+        target_type
+    ):
+        # Casting fixed size list to fixed size list
+        if arr.type.list_size != target_type.list_size:
+            raise ValueError(
+                "Only support casting fixed size list to fixed size list with the same size,"
+                + f"got: {arr.type} to {target_type}"
+            )
+        values = cast(arr.values, target_type.value_type)
+        return pa.FixedSizeListArray.from_arrays(
+            values=values, list_size=target_type.list_size
+        )
 
     # Fallback to normal cast.
     return pa.compute.cast(arr, target_type, *args, **kwargs)

@@ -28,6 +28,7 @@ from lance.arrow import (
     PandasBFloat16Array,
     bfloat16_array,
 )
+from ml_dtypes import bfloat16
 
 
 def test_bf16_value():
@@ -137,8 +138,6 @@ def test_bf16_numpy():
 
 
 def test_bf16_array_cast():
-    from ml_dtypes import bfloat16
-
     for dt in [np.float16, np.float32, np.float64]:
         floats = pa.array(np.array([1.0, 2.0, 3.0, 4.0], dtype=dt))
         bf16_arr = lance.arrow.cast(floats, "bfloat16")
@@ -148,6 +147,19 @@ def test_bf16_array_cast():
 
         casted = lance.arrow.cast(bf16_arr, floats.type)
         assert casted == floats
+
+
+def test_bf16_fixed_size_list_cast():
+    for dt in [np.float16, np.float32, np.float64]:
+        floats = pa.array(np.array([1.0, 2.0, 3.0, 4.0], dtype=dt))
+        fsl = pa.FixedSizeListArray.from_arrays(floats, 2)
+        bf16_fsl = lance.arrow.cast(fsl, pa.list_(lance.arrow.BFloat16Type(), 2))
+        assert bf16_fsl.values == BFloat16Array.from_numpy(
+            np.array([1.0, 2.0, 3.0, 4.0], dtype=bfloat16)
+        )
+
+        casted = lance.arrow.cast(bf16_fsl, fsl.type)
+        assert casted == fsl
 
 
 def test_roundtrip_take_ext_types(tmp_path: Path):
