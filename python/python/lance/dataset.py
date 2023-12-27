@@ -161,6 +161,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool = False,
         with_row_id: bool = False,
         use_stats: bool = True,
+        use_late_materialization: bool = True,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -248,6 +249,7 @@ class LanceDataset(pa.dataset.Dataset):
             .with_fragments(fragments)
             .with_row_id(with_row_id)
             .use_stats(use_stats)
+            .use_late_materialization(use_late_materialization)
         )
         if nearest is not None:
             builder = builder.nearest(**nearest)
@@ -1490,6 +1492,7 @@ class ScannerBuilder:
         self._fragments = None
         self._with_row_id = False
         self._use_stats = True
+        self._use_late_materialization = True
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set batch size for Scanner"""
@@ -1560,6 +1563,12 @@ class ScannerBuilder:
         This should be left on for normal use.
         """
         self._use_stats = use_stats
+        return self
+
+    def use_late_materialization(
+        self, use_late_materialization: bool = True
+    ) -> ScannerBuilder:
+        self._use_late_materialization = use_late_materialization
         return self
 
     def with_fragments(
@@ -1641,6 +1650,7 @@ class ScannerBuilder:
             self._fragments,
             self._with_row_id,
             self._use_stats,
+            self._use_late_materialization,
         )
         return LanceScanner(scanner, self.ds)
 

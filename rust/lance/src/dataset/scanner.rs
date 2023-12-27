@@ -169,6 +169,11 @@ pub struct Scanner {
     /// This is used for debugging or benchmarking purposes.
     use_stats: bool,
 
+    /// Whether to use late materialization (default: true)
+    ///
+    /// This is used for debugging or benchmarking purposes.
+    use_late_materialization: bool,
+
     /// Whether to scan in deterministic order (default: true)
     ///
     /// This field is ignored if `ordering` is defined
@@ -201,6 +206,7 @@ impl Scanner {
             ordering: None,
             nearest: None,
             use_stats: true,
+            use_late_materialization: true,
             with_row_id: false,
             ordered: true,
             fragments: None,
@@ -489,6 +495,14 @@ impl Scanner {
         self
     }
 
+    /// Set whether to use late materialization (default: true)
+    ///
+    /// This is used for debugging or benchmarking purposes.
+    pub fn use_late_materialization(&mut self, use_late_materialization: bool) -> &mut Self {
+        self.use_late_materialization = use_late_materialization;
+        self
+    }
+
     /// The Arrow schema of the output, including projections and vector / _distance
     pub fn schema(&self) -> Result<SchemaRef> {
         let schema = self
@@ -708,13 +722,34 @@ impl Scanner {
                     self.scalar_indexed_scan(&filter_schema, index_query)
                         .await?
                 }
-                (None, Some(_)) if self.use_stats => {
+                (None, Some(_)) if self.use_stats && self.use_late_materialization => {
                     self.pushdown_scan(false, filter_plan.refine_expr.take().unwrap())?
+                }
+                (None, Some(_)) if self.use_late_materialization => {
+                    // If there is a filter then just load the filter
+                    // columns (we will `take` the remaining columns afterwards)
+                    let columns = filter_plan.refine_columns();
+                    let filter_schema = Arc::new(self.dataset.schema().project(&columns)?);
+                    self.scan(true, true, filter_schema)
                 }
                 (None, _) => {
                     // The source is a full scan of the table
-                    let with_row_id = filter_plan.has_refine() || self.with_row_id;
-                    self.scan(with_row_id, false, self.projections.clone().into())
+                    let columns = filter_plan.refine_columns();
+                    let predicate_ids = self
+                        .dataset
+                        .schema()
+                        .project(columns.as_slice())?
+                        .field_ids();
+                    let projection_ids = self.projections.field_ids();
+                    let mut ids = predicate_ids
+                        .into_iter()
+                        .chain(projection_ids)
+                        .collect::<Vec<i32>>();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    let projection = self.dataset.schema().project_by_ids(&ids);
+
+                    self.scan(self.with_row_id, false, Arc::new(projection))
                 }
             }
         };
@@ -3387,5 +3422,48 @@ mod test {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_plan_filter_options() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_vector_dataset(test_uri, true).await;
+
+        let mut scan = dataset.scan();
+
+        scan.filter("i = 1").unwrap().project(&["s"]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert_eq!(plan, format!("LancePushdownScan: uri={}/data, projection=[s], predicate=i = Int32(1), row_id=[false], ordered=true\n", dataset.base.to_string()));
+
+        // Turning off stats switches to a late materialization plan
+        scan.use_stats(false);
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert_eq!(
+            plan,
+            format!(
+                "\
+Projection: fields=[s]
+  Take: columns=\"i, _rowid, s\"
+    FilterExec: i@0 = 1
+      LanceScan: uri={}/data, projection=[i], row_id=true, ordered=true\n",
+                dataset.base.to_string()
+            )
+        );
+
+        // Turning off late materialization switches to a simple scan, filter, then project.
+        scan.use_late_materialization(false);
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert_eq!(
+            plan,
+            format!(
+                "\
+Projection: fields=[s]
+  FilterExec: i@0 = 1
+    LanceScan: uri={}/data, projection=[i, s], row_id=false, ordered=true\n",
+                dataset.base.to_string()
+            )
+        );
     }
 }

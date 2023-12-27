@@ -289,6 +289,7 @@ impl Dataset {
         fragments: Option<Vec<FileFragment>>,
         with_row_id: Option<bool>,
         use_stats: Option<bool>,
+        use_late_materialization: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         if let Some(c) = columns {
@@ -328,6 +329,10 @@ impl Dataset {
 
         if let Some(use_stats) = use_stats {
             scanner.use_stats(use_stats);
+        }
+
+        if let Some(use_late_materialization) = use_late_materialization {
+            scanner.use_late_materialization(use_late_materialization);
         }
 
         if let Some(fragments) = fragments {
