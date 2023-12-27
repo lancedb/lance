@@ -138,6 +138,7 @@ def test_bf16_numpy():
 
 def test_bf16_array_cast():
     from ml_dtypes import bfloat16
+
     for dt in [np.float16, np.float32, np.float64]:
         floats = pa.array(np.array([1.0, 2.0, 3.0, 4.0], dtype=dt))
         bf16_arr = lance.arrow.cast(floats, "bfloat16")
@@ -147,6 +148,7 @@ def test_bf16_array_cast():
 
         casted = lance.arrow.cast(bf16_arr, floats.type)
         assert casted == floats
+
 
 def test_roundtrip_take_ext_types(tmp_path: Path):
     tensor_type = pa.fixed_shape_tensor(pa.float32(), [2, 3])

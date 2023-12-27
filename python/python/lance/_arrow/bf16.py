@@ -26,6 +26,7 @@ from ..lance import bfloat16_array as bfloat16_array
 
 class BFloat16Array(pa.ExtensionArray):
     """Bfloat16 PyArrow Array."""
+
     def __repr__(self):
         return "<lance.arrow.BFloat16Array object at 0x%016x>\n%s" % (
             id(self),
