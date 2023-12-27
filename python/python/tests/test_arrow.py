@@ -67,7 +67,11 @@ def test_bf16_repr():
     assert arr.to_pylist() == expected
 
     expected_re = r"""<lance.arrow.BFloat16Array object at 0x[\w\d]+>
-\[1.1015625, None, 3.40625\]"""
+\[
+  1.1015625,
+  None,
+  3.40625
+\]"""
     assert re.match(expected_re, repr(arr))
 
     # TODO: uncomment tests once fixed upstream.
@@ -80,6 +84,14 @@ def test_bf16_repr():
 # ---
 # x: \[\[1.1015625, None, 3.40625\]\]"""
 #     assert re.match(expected_re, repr(tab))
+
+
+def test_bf16_array_str():
+    from ml_dtypes import bfloat16
+
+    np_arr = np.array([1.0, 2.0, 3.0], dtype=bfloat16)
+    arr = BFloat16Array.from_numpy(np_arr)
+    assert str(arr) == "[\n  1,\n  2,\n  3\n]"
 
 
 def test_bf16_pandas(provide_pandas):
@@ -122,6 +134,20 @@ def test_bf16_numpy():
     arr_arrow = BFloat16Array.from_numpy(arr_numpy)
     assert arr == arr_arrow
     np.testing.assert_array_equal(arr_arrow.to_numpy(), expected)
+
+
+def test_bf16_array_cast():
+    from ml_dtypes import bfloat16
+
+    for dt in [np.float16, np.float32, np.float64]:
+        floats = pa.array(np.array([1.0, 2.0, 3.0, 4.0], dtype=dt))
+        bf16_arr = lance.arrow.cast(floats, "bfloat16")
+        assert isinstance(bf16_arr, BFloat16Array)
+        assert bf16_arr[0] == BFloat16(1.0)
+        assert bf16_arr[0] == bfloat16(1.0)
+
+        casted = lance.arrow.cast(bf16_arr, floats.type)
+        assert casted == floats
 
 
 def test_roundtrip_take_ext_types(tmp_path: Path):
