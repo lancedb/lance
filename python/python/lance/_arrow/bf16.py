@@ -75,7 +75,12 @@ class BFloat16Array(pa.ExtensionArray):
         >>> from ml_dtypes import bfloat16
         >>> from lance.arrow import BFloat16Array
         >>> arr = np.array([1.0, 2.0, 3.0], dtype=bfloat16)
-        >>> BFloat16Array.from_numpy(arr)
+        >>> print(BFloat16Array.from_numpy(arr))
+        [
+          1,
+          2,
+          3
+        ]
         """
         from ml_dtypes import bfloat16
 
