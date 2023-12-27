@@ -477,12 +477,14 @@ class FixedShapeImageTensorScalar(ImageScalar):
 def cast(
     arr: pa.Array, target_type: Union[pa.DataType, str], *args, **kwargs
 ) -> pa.Array:
-    """Cast data types.
+    """Cast an array to another data type.
 
-    Extends `pyarrow.compute.cast()` to Lance defined extension types.
+    Extends :meth:`pyarrow.compute.cast` for lance defined extension types.
 
     Supported operations:
-    - Cast between floating arrays and ``bfloat16`` arrays.
+
+    - Cast between floating (``float16``, ``float32``, ``float64``) arrays
+      and ``bfloat16`` arrays.
     """
     if arr.type == BFloat16:
         """Casting bf16 to other types"""
