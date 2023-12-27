@@ -137,11 +137,13 @@ def test_bf16_numpy():
 
 
 def test_bf16_array_cast():
+    from ml_dtypes import bfloat16
     for dt in [np.float16, np.float32, np.float64]:
         floats = pa.array(np.array([1.0, 2.0, 3.0, 4.0], dtype=dt))
         bf16_arr = lance.arrow.cast(floats, "bfloat16")
         assert isinstance(bf16_arr, BFloat16Array)
-        assert bf16_arr[0] == 1.0
+        assert bf16_arr[0] == BFloat16(1.0)
+        assert bf16_arr[0] == bfloat16(1.0)
 
 
 def test_roundtrip_take_ext_types(tmp_path: Path):

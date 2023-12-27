@@ -15,7 +15,7 @@
 """Bfloat16 support.
 """
 
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import numpy as np
 import pyarrow as pa
@@ -82,6 +82,18 @@ class BFloat16Scalar(pa.ExtensionScalar):
             return None
         else:
             return BFloat16.from_bytes(self.value.as_py())
+
+    def __eq__(self, other: Any):
+        from ml_dtypes import bfloat16
+
+        if isinstance(other, BFloat16):
+            return self.as_py() == other
+        elif isinstance(other, BFloat16Scalar):
+            return self.as_py() == other.as_py()
+        elif isinstance(other, bfloat16):
+            return self.as_py() == BFloat16.from_bytes(other.tobytes())
+        else:
+            return False
 
 
 class BFloat16Type(pa.ExtensionType):

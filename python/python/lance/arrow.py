@@ -480,6 +480,8 @@ def cast(
     """Cast an array to another data type.
 
     Extends :meth:`pyarrow.compute.cast` for lance defined extension types.
+    In case where the casting can be handled by pyarrow natively, it falls back
+    to pyarrow.
 
     Supported operations:
 
@@ -487,7 +489,12 @@ def cast(
       and ``bfloat16`` arrays.
     """
     if arr.type == BFloat16:
-        """Casting bf16 to other types"""
+        # Casting bf16 to other float types
+        if not pa.types.is_floating(target_type):
+            raise ValueError(
+                "Only support casting bfloat16 array to floating array,"
+                + f"got: {target_type}"
+            )
         raise NotImplementedError
     if target_type == BFloat16 or target_type in ["bfloat16", "bf16"]:
         if not pa.types.is_floating(arr.type):
