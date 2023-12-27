@@ -25,6 +25,7 @@ from ..lance import bfloat16_array as bfloat16_array
 
 
 class BFloat16Array(pa.ExtensionArray):
+    """Bfloat16 PyArrow Array."""
     def __repr__(self):
         return "<lance.arrow.BFloat16Array object at 0x%016x>\n%s" % (
             id(self),
@@ -61,10 +62,19 @@ class BFloat16Array(pa.ExtensionArray):
 
     @classmethod
     def from_numpy(cls, array: np.ndarray):
-        """Create a BFloat16Array from a NumPy array.
+        """Create a :class:`BFloat16Array` from a NumPy array.
 
-        Can only convert from a NumPy array of dtype bfloat16 from the ml_dtypes
+        Can only convert from a NumPy array of dtype ``bfloat16`` from the ``ml_dtypes``
         module.
+
+        Examples
+        --------
+
+        >>> import numpy as np
+        >>> from ml_dtypes import bfloat16
+        >>> from lance.arrow import BFloat16Array
+        >>> arr = np.array([1.0, 2.0, 3.0], dtype=bfloat16)
+        >>> BFloat16Array.from_numpy(arr)
         """
         from ml_dtypes import bfloat16
 

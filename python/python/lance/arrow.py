@@ -27,7 +27,20 @@ from ._arrow.bf16 import (  # noqa: F401
     BFloat16Type,
     PandasBFloat16Array,
 )
-from .lance import bfloat16_array as bfloat16_array
+from .lance import bfloat16_array
+
+__all__ = [
+    "BFloat16Array",
+    "BFloat16Type",
+    "bfloat16_array",
+    "cast",
+    "EncodedImageType",
+    "FixedShapeImageTensorType",
+    "ImageArray",
+    "ImageScalar",
+    "ImageURIArray",
+    "ImageURIType",
+]
 
 
 class ImageURIType(pa.ExtensionType):
@@ -492,6 +505,16 @@ def cast(
 
     - Cast between floating (``float16``, ``float32``, ``float64``) arrays
       and ``bfloat16`` arrays.
+
+    Parameters
+    ----------
+    arr : pyarrow.Array
+        Array to cast.
+    target_type : pyarrow.DataType or str
+        Target data type. Accepts anything :meth:`pyarrow.compute.cast` accepts.
+        Additionally, accepts strings ``"bfloat16"``, ``"bf16"`` or
+        :py:class:`~lance._arrow.bf16.BFloat16Type`.
+
     """
     if isinstance(arr.type, BFloat16Type):
         # Casting bf16 to other float types
@@ -503,7 +526,7 @@ def cast(
         np_arr = arr.to_numpy()
         float_arr = np_arr.astype(target_type.to_pandas_dtype())
         return pa.array(float_arr)
-    if target_type == BFloat16 or target_type in ["bfloat16", "bf16"]:
+    if target_type == BFloat16Type or target_type in ["bfloat16", "bf16"]:
         if not pa.types.is_floating(arr.type):
             raise ValueError(
                 "Only support casting floating array to bfloat16 array,"
