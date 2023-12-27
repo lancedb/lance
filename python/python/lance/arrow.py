@@ -507,6 +507,8 @@ def cast(
 
     - Cast between floating (``float16``, ``float32``, ``float64``) arrays
       and ``bfloat16`` arrays.
+    - Cast between FixedSizeListArray of floats (``float16``, ``float32``, ``float64``,
+      ``bfloat16``) with the same list size.
 
     Parameters
     ----------
