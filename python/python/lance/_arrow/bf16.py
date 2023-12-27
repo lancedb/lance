@@ -39,8 +39,8 @@ class BFloat16Array(pa.ExtensionArray):
         return (
             "[\n"
             + ",\n".join([f"  {v}" for v in self[:10]])
-            + "\n...\n"
-            + ",\n".join([f"  {v}," for v in self[-10:]])
+            + ",\n...\n"
+            + ",\n".join([f"  {v}" for v in self[-10:]])
             + "\n]"
         )
 
