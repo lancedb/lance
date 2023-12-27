@@ -492,6 +492,8 @@ class FixedShapeImageTensorScalar(ImageScalar):
     pass
 
 
+# TODO: Deprecate this method once the upstream work (apache/arrow#33103)
+# is merged and released.
 def cast(
     arr: pa.Array, target_type: Union[pa.DataType, str], *args, **kwargs
 ) -> pa.Array:
