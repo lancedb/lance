@@ -547,8 +547,8 @@ def cast(
         # Casting fixed size list to fixed size list
         if arr.type.list_size != target_type.list_size:
             raise ValueError(
-                "Only support casting fixed size list to fixed size list with the same size,"
-                + f"got: {arr.type} to {target_type}"
+                "Only support casting fixed size list to fixed size list "
+                f"with the same size, got: {arr.type} to {target_type}"
             )
         values = cast(arr.values, target_type.value_type)
         return pa.FixedSizeListArray.from_arrays(
