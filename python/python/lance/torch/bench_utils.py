@@ -17,6 +17,7 @@
 from typing import Optional, Tuple, Union
 
 import numpy as np
+import pyarrow as pa
 import torch
 
 from .. import LanceDataset
@@ -99,29 +100,33 @@ def ground_truth(
     tds = PytorchLanceDataset(
         ds, batch_size=batch_size, columns=[column], with_row_id=True
     )
+    from tqdm import tqdm
 
-    for batch in tds:
-        vectors = batch[column].to(device)
-        row_ids = batch["_rowid"].to(device).broadcast_to((query.shape[0], -1))
-        if metric_type == "l2":
-            dists = pairwise_l2(query, vectors)
-        elif metric_type == "cosine":
-            dists = pairwise_cosine(query, vectors, device=device)
-        else:
-            raise ValueError(f"Unknown metric type: {metric_type}")
+    total = ds.count_rows()
+    with tqdm(total=total) as progress_bar:
+        for batch in tds:
+            vectors = batch[column].to(device)
+            row_ids = batch["_rowid"].to(device).broadcast_to((query.shape[0], -1))
+            if metric_type == "l2":
+                dists = pairwise_l2(query, vectors)
+            elif metric_type == "cosine":
+                dists = pairwise_cosine(query, vectors)
+            else:
+                raise ValueError(f"Unknown metric type: {metric_type}")
 
-        dists, row_ids = sort_tensors(dists, row_ids, k)
+            dists, row_ids = sort_tensors(dists, row_ids, k)
 
-        if all_ids is None:
-            all_ids = row_ids
-        else:
-            all_ids = torch.cat([all_ids, row_ids], 1)
+            if all_ids is None:
+                all_ids = row_ids
+            else:
+                all_ids = torch.cat([all_ids, row_ids], 1)
 
-        if all_dists is None:
-            all_dists = dists
-        else:
-            all_dists = torch.cat([all_dists, dists], 1)
-        all_dists, all_ids = sort_tensors(all_dists, all_ids, k)
+            if all_dists is None:
+                all_dists = dists
+            else:
+                all_dists = torch.cat([all_dists, dists], 1)
+            all_dists, all_ids = sort_tensors(all_dists, all_ids, k)
+            progress_bar.update(vectors.shape[0])
 
     return all_ids
 
@@ -141,3 +146,17 @@ def recall(expected: np.ndarray, actual: np.ndarray) -> np.ndarray:
         [np.isin(exp, act).sum() / exp.shape[0] for exp, act in zip(expected, actual)]
     )
     return recalls
+
+
+def infer_vector_column(ds: LanceDataset) -> Optional[str]:
+    """Infer vector column from dataset."""
+    for field in ds.schema:
+        if pa.types.is_fixed_size_list(field.type):
+            return field.name
+        elif (
+            isinstance(field.type, pa.FixedShapeTensorType)
+            and len(field.type.shape) == 1
+        ):
+            return field.name
+
+    return None
