@@ -101,6 +101,7 @@ def ground_truth(
         ds, batch_size=batch_size, columns=[column], with_row_id=True
     )
     from tqdm import tqdm
+
     total = ds.count_rows()
     with tqdm(total=total) as progress_bar:
         for batch in tds:
