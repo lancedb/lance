@@ -56,7 +56,6 @@ def pairwise_cosine(
         )
     if y2 is None:
         y2 = torch.linalg.norm(y, dim=1)
-
     return _pairwise_cosine(x, y, y2)
 
 
