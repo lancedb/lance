@@ -17,9 +17,13 @@
 """Generate ground truth from a dataset"""
 
 import argparse
+from pathlib import Path
+import shutil
 
 import lance
 import numpy as np
+import pyarrow as pa
+
 from lance.torch.bench_utils import infer_vector_column, ground_truth
 
 
@@ -36,9 +40,24 @@ def generate_gt(args):
     samples = ds.sample(args.samples, columns=[col])[col]
     queries = np.stack(samples.to_numpy())
 
-    gt = ground_truth(
-        ds, col, queries, metric_type=args.metric, k=args.k, batch_size=args.batch
+    gt_rows = (
+        ground_truth(
+            ds, col, queries, metric_type=args.metric, k=args.k, batch_size=args.batch
+        )
+        .cpu()
+        .numpy()
     )
+
+    rows_col = pa.FixedShapeTensorArray.from_numpy_ndarray(gt_rows)
+
+    query_col = pa.FixedShapeTensorArray.from_numpy_ndarray(queries)
+
+    gt_table = pa.Table.from_arrays(
+        [query_col, rows_col], names=["query", "ground_truth"]
+    )
+    if Path(args.out).exists():
+        shutil.rmtree(args.out)
+    lance.write_dataset(gt_table, args.out)
 
 
 def main():
@@ -62,7 +81,9 @@ def main():
     parser.add_argument(
         "-m", "--metric", choices=["l2", "cosine"], default="l2", help="metric type"
     )
-    parser.add_argument("--batch", help="batch size", metavar="NUM", default=1024 * 80, type=int)
+    parser.add_argument(
+        "--batch", help="batch size", metavar="NUM", default=1024 * 80, type=int
+    )
     args = parser.parse_args()
 
     generate_gt(args)
