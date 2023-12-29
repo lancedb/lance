@@ -3435,7 +3435,7 @@ mod test {
         scan.filter("i = 1").unwrap().project(&["s"]).unwrap();
 
         let plan = scan.explain_plan(false).await.unwrap();
-        assert_eq!(plan, format!("LancePushdownScan: uri={}/data, projection=[s], predicate=i = Int32(1), row_id=[false], ordered=true\n", dataset.base.to_string()));
+        assert_eq!(plan, format!("LancePushdownScan: uri={}/data, projection=[s], predicate=i = Int32(1), row_id=[false], ordered=true\n", dataset.base));
 
         // Turning off stats switches to a late materialization plan
         scan.use_stats(false);
@@ -3448,7 +3448,7 @@ Projection: fields=[s]
   Take: columns=\"i, _rowid, s\"
     FilterExec: i@0 = 1
       LanceScan: uri={}/data, projection=[i], row_id=true, ordered=true\n",
-                dataset.base.to_string()
+                dataset.base
             )
         );
 
@@ -3462,7 +3462,7 @@ Projection: fields=[s]
 Projection: fields=[s]
   FilterExec: i@0 = 1
     LanceScan: uri={}/data, projection=[i, s], row_id=false, ordered=true\n",
-                dataset.base.to_string()
+                dataset.base
             )
         );
     }
