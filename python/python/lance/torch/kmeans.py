@@ -196,6 +196,8 @@ class KMeans:
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
                 logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
+            chunk: torch.Tensor = chunk
+            dtype = chunk.dtype
             chunk = chunk.to(self.device)
             ids, dists = self._transform(chunk)
             total_dist += dists.sum().item()
@@ -210,7 +212,10 @@ class KMeans:
         if abs(total_dist - last_dist) / total_dist < self.tolerance:
             raise StopIteration("kmeans: converged")
 
-        self.centroids = self._updated_centroids(new_centroids, counts_per_part)
+        # cast to the type we get the data in
+        self.centroids = self._updated_centroids(new_centroids, counts_per_part).type(
+            dtype
+        )
         return total_dist
 
     def _transform(self, data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
