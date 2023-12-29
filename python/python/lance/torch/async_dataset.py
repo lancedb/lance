@@ -27,6 +27,9 @@ def _worker_ep(
     dataset = dataset_creator()
     while not shutdown.value:
         for item in dataset:
+            # this helps us stop the worker process as soon as possible
+            if shutdown.value:
+                break
             queue.put(item)
         queue.put(None)
 

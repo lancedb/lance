@@ -153,9 +153,8 @@ class KMeans:
                 logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
         logging.info("Finish KMean training in %s", time.time() - start)
 
-    @staticmethod
     def _updated_centroids(
-        centroids: torch.Tensor, counts: torch.Tensor
+        self, centroids: torch.Tensor, counts: torch.Tensor
     ) -> torch.Tensor:
         for idx, cnt in enumerate(counts.cpu()):
             # split the largest cluster and remove empty cluster
@@ -165,7 +164,12 @@ class KMeans:
                 counts[idx], counts[max_idx] = half_cnt, half_cnt
                 centroids[idx] = centroids[max_idx] * 1.05
                 centroids[max_idx] = centroids[max_idx] / 1.05
-        return centroids / counts[:, None]
+
+        centroids = centroids / counts[:, None]
+        if self.metric == "cosine":
+            # normalize the centroids
+            centroids = torch.nn.functional.normalize(centroids)
+        return centroids
 
     @staticmethod
     def _count_rows_in_clusters(part_ids: List[torch.Tensor], k: int) -> torch.Tensor:
