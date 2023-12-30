@@ -31,38 +31,31 @@ def gen_vectors(num_vectors, num_dimensions) -> pa.Table:
 
 def gen_index(ds, ivf, pq):
     ds.create_index(
-        "vector",
-        index_type="IVF_PQ",
-        num_partitions=ivf,
-        num_sub_vectors=pq
+        "vector", index_type="IVF_PQ", num_partitions=ivf, num_sub_vectors=pq
     )
 
 
 def sample(ds, nsamples):
-    vec = duckdb.query(
-        f"SELECT vector FROM ds USING SAMPLE {nsamples}"
-        ).to_arrow_table()["vector"].to_numpy()
+    vec = (
+        duckdb.query(f"SELECT vector FROM ds USING SAMPLE {nsamples}")
+        .to_arrow_table()["vector"]
+        .to_numpy()
+    )
     return [np.array(v) for v in vec]
 
 
 class Suite:
-
     def __init__(self, benchmark_names):
-        self._benchmarks = {
-            k: Benchmark(k) for k in benchmark_names
-        }
+        self._benchmarks = {k: Benchmark(k) for k in benchmark_names}
 
     def __getitem__(self, item):
         return self._benchmarks[item]
 
     def summary(self):
-        return {
-            k: v.summary() for k, v in self._benchmarks.items()
-        }
+        return {k: v.summary() for k, v in self._benchmarks.items()}
 
 
 class Benchmark:
-
     def __init__(self, name):
         self.name = name
         self._configs = {}
@@ -90,7 +83,6 @@ class Benchmark:
 
 
 class Timer:
-
     def __init__(self):
         self.runs = []
 
@@ -106,15 +98,17 @@ class Timer:
         return runs.describe()
 
 
-def run_test(nvecs, ndims, ivf_range, pq_range, nprobe_range, refine_factor_range, nsamples=100):
+def run_test(
+    nvecs, ndims, ivf_range, pq_range, nprobe_range, refine_factor_range, nsamples=100
+):
     print(f"Generating {nvecs} vectors of {ndims}d")
     vectors = gen_vectors(nvecs, ndims)
     uri = f"test_base_{nvecs}_by_{ndims}.lance"
     print(f"Writing to {uri}")
     shutil.rmtree(uri, ignore_errors=True)
-    lance.write_dataset(vectors, uri,
-                        max_rows_per_group=8192,
-                        max_rows_per_file=1024*1024*10)
+    lance.write_dataset(
+        vectors, uri, max_rows_per_group=8192, max_rows_per_file=1024 * 1024 * 10
+    )
     suite = Suite(["create_index", "query"])
 
     for ivf in ivf_range:
@@ -125,12 +119,20 @@ def run_test(nvecs, ndims, ivf_range, pq_range, nprobe_range, refine_factor_rang
             shutil.copytree(uri, dest)
             ds = lance.dataset(dest)
             bench = suite["create_index"]
-            config = {"num_vectors": nvecs,
-                      "num_dimensions": ndims,
-                      "ivf": ivf,
-                      "pq": pq}
+            config = {
+                "num_vectors": nvecs,
+                "num_dimensions": ndims,
+                "ivf": ivf,
+                "pq": pq,
+            }
             timer = bench.timer(config)
-            ds = timer.time(ds.create_index, "vector", index_type="IVF_PQ", num_partitions=ivf, num_sub_vectors=pq)
+            ds = timer.time(
+                ds.create_index,
+                "vector",
+                index_type="IVF_PQ",
+                num_partitions=ivf,
+                num_sub_vectors=pq,
+            )
 
             for nprobes in nprobe_range:
                 for rf in refine_factor_range:
@@ -147,7 +149,7 @@ def run_test(nvecs, ndims, ivf_range, pq_range, nprobe_range, refine_factor_rang
                         "column": "vector",
                         "k": 10,
                         "nprobes": nprobes,
-                        "refine_factor": rf
+                        "refine_factor": rf,
                     }
                     for q in queries:
                         nearest["q"] = q

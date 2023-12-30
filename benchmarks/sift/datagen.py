@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 #
-
 import argparse
 import struct
 
 import lance
 import numpy as np
 import pyarrow as pa
+from ml_dtypes import bfloat16
 
 
 def main():
@@ -40,6 +40,13 @@ def main():
         metavar="NUM",
     )
     parser.add_argument(
+        "-t",
+        "--datatype",
+        help="data type of the vector column",
+        choices=["f32", "f16", "bf16"],
+        default="f32",
+    )
+    parser.add_argument(
         "-n",
         "--num-vectors",
         type=int,
@@ -49,22 +56,38 @@ def main():
     )
     args = parser.parse_args()
 
+    dt = {"f32": pa.float32(), "f16": pa.float16(), "bf16": lance.arrow.BFloat16Type()}[
+        args.datatype
+    ]
+    vector_dt = pa.list_(dt, args.dimension)
+
     with open(args.data, mode="rb") as fobj:
         buf = fobj.read()
-        data = np.array(struct.unpack(f"<{args.dimension * args.num_vectors}f", 
-                                      buf[4 : 4 + 4 * args.num_vectors * args.dimension]))
+        data = np.array(
+            struct.unpack(
+                f"<{args.dimension * args.num_vectors}f",
+                buf[4 : 4 + 4 * args.num_vectors * args.dimension],
+            )
+        )
+
+        if args.datatype == "f16":
+            data = data.astype(np.float16)
+        elif args.datatype == "bf16":
+            data = data.astype(bfloat16)
+        elif args.datatype == "f32":
+            data = data.astype(np.float32)
 
         schema = pa.schema(
             [
                 pa.field("id", pa.uint32(), False),
-                pa.field("vector", pa.list_(pa.float32(), args.dimension), False),
+                pa.field("vector", vector_dt, False),
             ]
         )
         table = pa.Table.from_arrays(
             [
                 pa.array(range(args.num_vectors), type=pa.uint32()),
                 pa.FixedSizeListArray.from_arrays(
-                    pa.array(data, type=pa.float32()), list_size=args.dimension
+                    pa.array(data, type=dt), list_size=args.dimension
                 ),
             ],
             schema=schema,
