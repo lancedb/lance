@@ -91,8 +91,6 @@ def test_dataset(
         end = time.time()
         tot += end - start
         results.append(rs["id"].combine_chunks().to_numpy())
-        if i % 100 == 0:
-            print(f"Done {i}")
     avg_latency = tot / ground_truth.shape[0]
     recalls = recall(np.array(actual_sorted), np.array(results))
     return recalls.mean(), avg_latency
