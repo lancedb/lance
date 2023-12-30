@@ -177,8 +177,7 @@ impl KNNFlatExec {
                 location: location!(),
             })?;
         match field.data_type() {
-            DataType::FixedSizeList(list_field, _)
-                if matches!(list_field.data_type(), DataType::Float32) => {}
+            DataType::FixedSizeList(list_field, _) if list_field.data_type().is_floating() => {}
             _ => {
                 return Err(Error::IO {
                     message: format!(

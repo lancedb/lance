@@ -20,7 +20,6 @@ import time
 from subprocess import check_output
 
 import lance
-import numpy as np
 import pyarrow as pa
 
 
@@ -81,6 +80,7 @@ def main():
         "arch": platform.machine(),
         "params": {
             "type": args.index_type,
+            "metric": args.metric,
         },
         "duration": end - start,
     }
