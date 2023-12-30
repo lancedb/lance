@@ -29,6 +29,7 @@ use lance_index::{
     vector::{Query, DIST_COL},
     Index, IndexType,
 };
+use lance_linalg::distance::MetricType;
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
 use roaring::RoaringBitmap;
@@ -312,6 +313,10 @@ impl VectorIndex for DiskANNIndex {
             source: "DiskANNIndex does not yet support remap".into(),
             location: location!(),
         })
+    }
+
+    fn metric_type(&self) -> MetricType {
+        todo!()
     }
 }
 

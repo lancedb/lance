@@ -368,6 +368,10 @@ impl VectorIndex for IVFIndex {
         false
     }
 
+    fn check_can_remap(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn load(
         &self,
         _reader: &dyn Reader,
@@ -378,10 +382,6 @@ impl VectorIndex for IVFIndex {
             message: "Flat index does not support load".to_string(),
             location: location!(),
         })
-    }
-
-    fn check_can_remap(&self) -> Result<()> {
-        Ok(())
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
@@ -395,6 +395,10 @@ impl VectorIndex for IVFIndex {
             message: "Remapping IVF in this way not supported".to_string(),
             location: location!(),
         })
+    }
+
+    fn metric_type(&self) -> MetricType {
+        self.metric_type
     }
 }
 
