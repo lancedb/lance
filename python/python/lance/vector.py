@@ -173,7 +173,7 @@ def train_ivf_centroids_on_accelerator(
         batch_size=20480,
         columns=[column],
         samples=sample_size,
-        cache=False,
+        cache=True,
     )
 
     with async_dataset(ds) as ds:
