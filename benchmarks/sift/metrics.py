@@ -18,7 +18,6 @@ import argparse
 import time
 from typing import Optional
 
-import duckdb
 import lance
 import numpy as np
 import pandas as pd
@@ -26,8 +25,7 @@ from lance.torch.bench_utils import ground_truth as gt_func, recall
 
 
 def get_query_vectors(uri, nsamples=1000, normalize=False):
-    """
-    Get the query vectors as a 2d numpy array
+    """Get the query vectors as a 2d numpy array
 
     Parameters
     ----------
@@ -37,10 +35,9 @@ def get_query_vectors(uri, nsamples=1000, normalize=False):
         Number of samples to read from the dataset
     """
     tbl = lance.dataset(uri)
-    query_vectors = duckdb.query(
-        f"SELECT vector FROM tbl USING SAMPLE {nsamples}"
-    ).to_df()
-    query_vectors = np.array([np.array(x) for x in query_vectors.vector.values])
+    query_vectors = np.stack(
+        tbl.sample(nsamples, columns=["vector"])["vector"].to_numpy()
+    )
     if normalize:
         query_vectors = query_vectors / np.linalg.norm(query_vectors, axis=1)[:, None]
     return query_vectors.astype(np.float32)
