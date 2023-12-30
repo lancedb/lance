@@ -15,6 +15,7 @@
 
 import logging
 import re
+import tempfile
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Union
 
@@ -182,9 +183,13 @@ def train_ivf_centroids_on_accelerator(
         )
         kmeans.fit(ds)
 
-    return kmeans.centroids.cpu().float().numpy(), compute_partitions(
-        dataset, column, kmeans, batch_size=20480
-    )
+    centroids = kmeans.centroids.cpu().float().numpy()
+
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        np.save(f, centroids)
+    logging.info("Saved centroids to %s", f.name)
+
+    return centroids, compute_partitions(dataset, column, kmeans, batch_size=20480)
 
 
 def compute_partitions(

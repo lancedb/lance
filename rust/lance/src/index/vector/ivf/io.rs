@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -54,7 +55,7 @@ pub(super) async fn write_index_partitions(
                     .expect("part id column not found")
                     .as_primitive();
                 let part_id = part_ids.values()[0];
-                streams_heap.push((part_id, new_streams.len()));
+                streams_heap.push((Reverse(part_id), new_streams.len()));
                 new_streams.push(stream);
             }
             Some(Err(e)) => {
@@ -92,9 +93,9 @@ pub(super) async fn write_index_partitions(
         }
 
         // Merge all streams with the same partition id.
-        while let Some((stream_part_id, stream_idx)) = streams_heap.pop() {
+        while let Some((Reverse(stream_part_id), stream_idx)) = streams_heap.pop() {
             if stream_part_id != part_id {
-                streams_heap.push((stream_part_id, stream_idx));
+                streams_heap.push((Reverse(stream_part_id), stream_idx));
                 break;
             }
 
@@ -137,7 +138,7 @@ pub(super) async fn write_index_partitions(
                         .expect("part id column not found")
                         .as_primitive();
                     if !part_ids.is_empty() {
-                        streams_heap.push((part_ids.value(0), stream_idx));
+                        streams_heap.push((Reverse(part_ids.value(0)), stream_idx));
                     }
                 }
                 Some(Err(e)) => {
