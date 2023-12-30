@@ -267,6 +267,10 @@ impl VectorIndex for PQIndex {
         )));
         Ok(())
     }
+
+    fn metric_type(&self) -> MetricType {
+        self.metric_type
+    }
 }
 
 #[cfg(test)]

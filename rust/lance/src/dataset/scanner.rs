@@ -859,7 +859,13 @@ impl Scanner {
             let with_vector = self.dataset.schema().project(&[&q.column])?;
             let knn_node_with_vector = self.take(ann_node, &with_vector, self.batch_readahead)?;
             let mut knn_node = if q.refine_factor.is_some() {
-                self.flat_knn(knn_node_with_vector, q)?
+                let idx = self
+                    .dataset
+                    .open_vector_index(q.column.as_str(), &index.uuid.to_string())
+                    .await?;
+                let mut q = q.clone();
+                q.metric_type = idx.metric_type();
+                self.flat_knn(knn_node_with_vector, &q)?
             } else {
                 knn_node_with_vector
             }; // vector, _distance, _rowid

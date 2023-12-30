@@ -25,7 +25,7 @@ use lance_core::{
     Result,
 };
 use lance_index::{vector::Query, Index};
-use lance_linalg::MatrixView;
+use lance_linalg::{distance::MetricType, MatrixView};
 
 use crate::index::{pb::Transform, prefilter::PreFilter};
 
@@ -81,6 +81,9 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// If an old row id is not in the mapping then it should be
     /// left alone.
     fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>;
+
+    /// The metric type of this vector index.
+    fn metric_type(&self) -> MetricType;
 }
 
 /// Transformer on vectors.
