@@ -305,7 +305,7 @@ impl IvfShuffler {
                         .read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema())
                         .await
                 })
-                .buffered(16);
+                .buffered(4);
             streams.push(stream);
         }
 
