@@ -182,7 +182,7 @@ def train_ivf_centroids_on_accelerator(
         )
         kmeans.fit(ds)
 
-    return kmeans.centroids.cpu().float().numpy(), compute_partitions(
+    return kmeans.centroids.cpu().numpy(), compute_partitions(
         dataset, column, kmeans, batch_size=20480
     )
 
