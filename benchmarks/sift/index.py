@@ -80,6 +80,7 @@ def main():
         "arch": platform.machine(),
         "params": {
             "type": args.index_type,
+            "metric": args.metric,
         },
         "duration": end - start,
     }
