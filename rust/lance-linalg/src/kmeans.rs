@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -150,15 +150,7 @@ where
     Ok(kmeans)
 }
 
-pub struct KMeanMembership<T: ArrowFloatType + Dot + Cosine + L2>
-where
-    T::Native: Float + Zero,
-{
-    /// Reference to the input vectors, with dimension `dimension`.
-    ///
-    /// If [MetricType] is [MetricType::Cosine], the vectors are L2 normalized.
-    data: Arc<T::ArrayType>,
-
+pub struct KMeanMembership {
     dimension: usize,
 
     /// Cluster Id and distances for each vector.
@@ -187,16 +179,17 @@ fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], d
     }
 }
 
-impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
+impl KMeanMembership {
     /// Reconstruct a KMeans model from the membership.
-    async fn to_kmeans(&self) -> Result<KMeans<T>> {
+    async fn to_kmeans<T: ArrowFloatType + Dot + Cosine + L2>(
+        &self,
+        data: &[T::Native],
+    ) -> Result<KMeans<T>> {
         let dimension = self.dimension;
 
         let mut cluster_cnts = vec![0_u64; self.k];
         let mut new_centroids = vec![T::Native::zero(); self.k * dimension];
-        self.data
-            .as_slice()
-            .chunks_exact(dimension)
+        data.chunks_exact(dimension)
             .zip(self.cluster_id_and_distances.iter())
             .for_each(|(vector, (cluster_id, dist))| {
                 if dist.is_finite() {
@@ -409,7 +402,7 @@ where
                 let last_membership = kmeans.train_once(&mat).await;
                 let last_dist_sum = last_membership.distance_sum();
                 stddev = last_membership.hist_stddev();
-                kmeans = last_membership.to_kmeans().await.unwrap();
+                kmeans = last_membership.to_kmeans(data.as_slice()).await.unwrap();
                 if (dist_sum - last_dist_sum).abs() / last_dist_sum < params.tolerance {
                     info!(
                         "KMeans training: converged at iteration {} / {}, redo={}",
@@ -444,7 +437,7 @@ where
     /// }
     /// ```
     #[instrument(level = "debug", skip_all)]
-    async fn train_once(&self, data: &MatrixView<T>) -> KMeanMembership<T> {
+    async fn train_once(&self, data: &MatrixView<T>) -> KMeanMembership {
         self.compute_membership(data.data().clone()).await
     }
 
@@ -456,7 +449,7 @@ where
     ///
     /// If the metric type is cosine, the vector will be normalized internally.
     ///
-    pub async fn compute_membership(&self, data: Arc<T::ArrayType>) -> KMeanMembership<T> {
+    pub async fn compute_membership(&self, data: Arc<T::ArrayType>) -> KMeanMembership {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let metric_type = self.metric_type;
@@ -506,7 +499,6 @@ where
             .await
             .unwrap();
         KMeanMembership {
-            data,
             dimension,
             cluster_id_and_distances: cluster_with_distances.iter().flatten().copied().collect(),
             k: self.k,
@@ -761,6 +753,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_l2_with_nans() {
+        const DIM: usize = 8;
+        const K: usize = 32;
+        const NUM_CENTROIDS: usize = 16 * 2048;
+        let centroids = generate_random_array(DIM * NUM_CENTROIDS);
+        let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
+
+        compute_partitions_l2(centroids.values(), values.values(), DIM).for_each(|(cent, dist)| {
+            assert_eq!(cent, u32::MAX);
+            assert_eq!(dist, f32::INFINITY);
+        });
+    }
+
+    #[tokio::test]
+    async fn test_train_kmeans_with_nans() {
         const DIM: usize = 8;
         const K: usize = 32;
         const NUM_CENTROIDS: usize = 16 * 2048;
