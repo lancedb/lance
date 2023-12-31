@@ -766,16 +766,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_train_kmeans_with_nans() {
+    async fn test_train_l2_kmeans_with_nans() {
         const DIM: usize = 8;
         const K: usize = 32;
         const NUM_CENTROIDS: usize = 16 * 2048;
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
         let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
 
-        compute_partitions_l2(centroids.values(), values.values(), DIM).for_each(|(cent, dist)| {
-            assert_eq!(cent, u32::MAX);
-            assert_eq!(dist, f32::INFINITY);
-        });
+        let kmeans = KMeans::<Float32Type>::with_centroids(centroids.into(), DIM, MetricType::L2);
+        let membership = kmeans.compute_membership(values.into()).await;
+
+        membership
+            .cluster_id_and_distances
+            .iter()
+            .for_each(|(cent, dist)| {
+                assert_eq!(*cent, u32::MAX);
+                assert_eq!(*dist, f32::INFINITY);
+            });
+    }
+
+    #[tokio::test]
+    async fn test_train_cosine_kmeans_with_invalid_values() {
+        const DIM: usize = 8;
+        const K: usize = 32;
+        const NUM_CENTROIDS: usize = 16 * 2048;
+        let centroids = Arc::new(generate_random_array(DIM * NUM_CENTROIDS));
+        for val in vec![0.0, f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
+            let values = Float32Array::from_iter_values(repeat(val).take(DIM * K));
+            let kmeans =
+                KMeans::<Float32Type>::with_centroids(centroids.clone(), DIM, MetricType::Cosine);
+            let membership = kmeans.compute_membership(values.into()).await;
+            membership
+                .cluster_id_and_distances
+                .iter()
+                .for_each(|(cent, dist)| {
+                    assert_eq!(*cent, u32::MAX);
+                    assert_eq!(*dist, f32::INFINITY);
+                });
+        }
     }
 }
