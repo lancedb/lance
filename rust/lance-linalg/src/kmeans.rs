@@ -791,7 +791,7 @@ mod tests {
         const K: usize = 32;
         const NUM_CENTROIDS: usize = 16 * 2048;
         let centroids = Arc::new(generate_random_array(DIM * NUM_CENTROIDS));
-        for val in vec![0.0, f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
+        for val in [0.0, f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
             let values = Float32Array::from_iter_values(repeat(val).take(DIM * K));
             let kmeans =
                 KMeans::<Float32Type>::with_centroids(centroids.clone(), DIM, MetricType::Cosine);
