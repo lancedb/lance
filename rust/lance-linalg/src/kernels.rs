@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -59,7 +59,7 @@ pub fn argmax_opt<T: Num + Bounded + PartialOrd>(
     max_idx
 }
 
-/// Argmin on an iterator. Fused the operation in iterator to avoid memory allocation.
+/// Argmin over an iterator. Fused the operation in iterator to avoid memory allocation.
 ///
 /// Returns the index of the min value in the array.
 ///
@@ -70,6 +70,12 @@ where
     argmin_value(iter).map(|(idx, _)| idx)
 }
 
+/// Return both argmin and minimal value over an iterator.
+///
+/// Return
+/// ------
+/// - `Some(idx, min_value)` or
+/// - `None` if iterator is empty or all are `Nan/Inf`.
 pub fn argmin_value<T: Num + Bounded + PartialOrd + Copy>(
     iter: impl Iterator<Item = T>,
 ) -> Option<(u32, T)> {
@@ -79,7 +85,7 @@ pub fn argmin_value<T: Num + Bounded + PartialOrd + Copy>(
 /// Returns the minimal value (float) and the index (argmin) from an Iterator.
 pub fn argmin_value_float<T: Float>(iter: impl Iterator<Item = T>) -> (u32, T) {
     let mut min_idx: usize = 0;
-    let mut min_value = T::max_value();
+    let mut min_value = T::infinity();
     for (idx, value) in iter.enumerate() {
         if value < min_value {
             min_value = value;

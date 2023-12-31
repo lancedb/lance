@@ -170,6 +170,8 @@ where
     metric_type: MetricType,
 }
 
+/// Split one big cluster into two smaller clusters. After split, each
+/// cluster has approximately half of the vectors.
 fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], dimension: usize) {
     for i in 0..cnts.len() {
         if cnts[i] == 0 {
@@ -184,6 +186,7 @@ fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], d
         }
     }
 }
+
 impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
     /// Reconstruct a KMeans model from the membership.
     async fn to_kmeans(&self) -> Result<KMeans<T>> {
@@ -194,16 +197,18 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
         self.data
             .as_slice()
             .chunks_exact(dimension)
-            .zip(self.cluster_id_and_distances.iter().map(|(c, _)| c))
-            .for_each(|(vector, cluster_id)| {
-                cluster_cnts[*cluster_id as usize] += 1;
-                // TODO: simd
-                for (old, &new) in new_centroids
-                    [*cluster_id as usize * dimension..(1 + *cluster_id as usize) * dimension]
-                    .iter_mut()
-                    .zip(vector)
-                {
-                    *old += new;
+            .zip(self.cluster_id_and_distances.iter())
+            .for_each(|(vector, (cluster_id, dist))| {
+                if dist.is_finite() {
+                    cluster_cnts[*cluster_id as usize] += 1;
+                    // TODO: simd
+                    for (old, &new) in new_centroids
+                        [*cluster_id as usize * dimension..(1 + *cluster_id as usize) * dimension]
+                        .iter_mut()
+                        .zip(vector)
+                    {
+                        *old += new;
+                    }
                 }
             });
         cluster_cnts.iter().enumerate().for_each(|(i, &cnt)| {
@@ -555,6 +560,19 @@ where
 }
 
 /// Fast partition computation for L2 distance.
+///
+/// Parameters
+/// ----------
+/// *centroids*: the flat array of the centroids to run against to.
+/// *data*: the flat array of the vectors.
+/// *dim*: the dimension of centroids / vectors.
+///
+/// Returns
+/// -------
+/// An iterator of ``(partition_id, dist)`` pairs.
+///
+/// If the distance is not valid, returns ``(u32::MAX, f32::NAN)`` as placeholder.
+///
 fn compute_partitions_l2<'a, T: FloatToArrayType>(
     centroids: &'a [T],
     data: &'a [T],
@@ -580,7 +598,7 @@ where
         // s is the index of value in each vector.
         let num_rows_in_tile = data_tile.len() / dim;
         let mut min_dists = vec![f32::infinity(); num_rows_in_tile];
-        let mut partitions = vec![0_u32; num_rows_in_tile];
+        let mut partitions = vec![u32::MAX; num_rows_in_tile];
 
         for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
             // 4B * 16 * 16 = 1 KB
@@ -606,7 +624,7 @@ where
                         .iter()
                         .copied(),
                 )
-                .unwrap();
+                .unwrap_or((u32::MAX, f32::NAN));
                 if dist < min_dists[i] {
                     min_dists[i] = dist;
                     partitions[i] = centroid_start as u32 + part_id;
@@ -641,6 +659,9 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    use std::iter::repeat;
+
     use super::*;
     use approx::{assert_relative_eq, relative_eq};
 
@@ -736,5 +757,19 @@ mod tests {
 
         let actual = kmeans.find_partitions(query, 4).unwrap();
         assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn test_l2_with_nans() {
+        const DIM: usize = 8;
+        const K: usize = 32;
+        const NUM_CENTROIDS: usize = 16 * 2048;
+        let centroids = generate_random_array(DIM * NUM_CENTROIDS);
+        let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
+
+        compute_partitions_l2(centroids.values(), values.values(), DIM).for_each(|(cent, dist)| {
+            assert_eq!(cent, u32::MAX);
+            assert_eq!(dist, f32::INFINITY);
+        });
     }
 }
