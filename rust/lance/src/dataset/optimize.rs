@@ -1116,7 +1116,7 @@ mod tests {
         let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
 
         let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), Arc::new(schema));
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write_to_uri(reader, test_uri, None).await.unwrap();
 
         let plan = plan_compaction(&dataset, &CompactionOptions::default())
             .await
@@ -1144,7 +1144,7 @@ mod tests {
             max_rows_per_file: 10_000,
             ..Default::default()
         };
-        let dataset = Dataset::write(reader, test_uri, Some(write_params))
+        let dataset = Dataset::write_to_uri(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -1162,7 +1162,7 @@ mod tests {
             mode: WriteMode::Overwrite,
             ..Default::default()
         };
-        let dataset = Dataset::write(reader, test_uri, Some(write_params))
+        let dataset = Dataset::write_to_uri(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -1224,7 +1224,7 @@ mod tests {
             max_rows_per_file: 400,
             ..Default::default()
         };
-        Dataset::write(reader, test_uri, Some(write_params))
+        Dataset::write_to_uri(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -1235,7 +1235,7 @@ mod tests {
             mode: WriteMode::Append,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+        let mut dataset = Dataset::write_to_uri(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -1252,7 +1252,7 @@ mod tests {
             mode: WriteMode::Append,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+        let mut dataset = Dataset::write_to_uri(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -1371,7 +1371,7 @@ mod tests {
             max_rows_per_group: 1_000,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+        let mut dataset = Dataset::write_to_uri(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -1454,7 +1454,7 @@ mod tests {
             max_rows_per_file: 1000,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+        let mut dataset = Dataset::write_to_uri(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -1505,7 +1505,7 @@ mod tests {
             max_rows_per_file: 1000,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+        let mut dataset = Dataset::write_to_uri(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 

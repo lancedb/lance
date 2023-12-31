@@ -1233,6 +1233,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_inmemory_paths() {
+        let store = ObjectStore::memory();
+        let os_path = Path::from("test_file");
+        let mut writer = store.create(&os_path).await.unwrap();
+        writer.write_all(b"MEMORY").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let reader = store.open(&os_path).await.unwrap();
+        let buf = reader.get_range(0..6).await.unwrap();
+        assert_eq!(buf.as_bytes(), b"MEMORY");
+    }
+
+    #[tokio::test]
     #[cfg(windows)]
     async fn test_windows_paths() {
         use std::path::Component;

@@ -684,7 +684,9 @@ mod test {
         .unwrap()];
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
-        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let dataset = Dataset::write_to_uri(batches, test_uri, None)
+            .await
+            .unwrap();
 
         let fragments = dataset.fragments().clone();
         let projection = Arc::new(dataset.schema().clone());
@@ -749,7 +751,11 @@ mod test {
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let dataset = Arc::new(Dataset::write(batches, test_uri, None).await.unwrap());
+        let dataset = Arc::new(
+            Dataset::write_to_uri(batches, test_uri, None)
+                .await
+                .unwrap(),
+        );
 
         let fragments = dataset.fragments().clone();
         // [x.b, y.a]
@@ -834,7 +840,7 @@ mod test {
             ..Default::default()
         };
         let dataset = Arc::new(
-            Dataset::write(batches, test_uri, Some(write_params))
+            Dataset::write_to_uri(batches, test_uri, Some(write_params))
                 .await
                 .unwrap(),
         );
@@ -967,7 +973,7 @@ mod test {
             max_rows_per_group: 3,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(reader, "memory://test", Some(params))
+        let mut dataset = Dataset::write_to_uri(reader, "memory://test", Some(params))
             .await
             .unwrap();
 
@@ -1172,7 +1178,7 @@ mod test {
                 max_rows_per_group: 3,
                 ..Default::default()
             };
-            Dataset::write(reader, uri, Some(write_params))
+            Dataset::write_to_uri(reader, uri, Some(write_params))
                 .await
                 .unwrap()
         }
@@ -1295,7 +1301,7 @@ mod test {
             max_rows_per_group: 10,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+        let mut dataset = Dataset::write_to_uri(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -1357,7 +1363,7 @@ mod test {
             max_rows_per_group: 4,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+        let mut dataset = Dataset::write_to_uri(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 

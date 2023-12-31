@@ -66,7 +66,7 @@ async fn create_dataset(path: &std::path::Path, dim: usize, mode: WriteMode) {
     };
 
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-    Dataset::write(reader, path.to_str().unwrap(), Some(write_params))
+    Dataset::write_to_uri(reader, path.to_str().unwrap(), Some(write_params))
         .await
         .unwrap();
 }

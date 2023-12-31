@@ -89,7 +89,7 @@ def dataset(
         Approximately, ``n = Total Rows / number of IVF partitions``.
         ``pq = number of PQ sub-vectors``.
     """
-    ds = LanceDataset(
+    ds = LanceDataset.create(
         uri,
         version,
         block_size,
@@ -107,7 +107,7 @@ def dataset(
                 f"{ts_cutoff} is earlier than the first version of this dataset"
             )
         else:
-            return LanceDataset(
+            return LanceDataset.create(
                 uri,
                 ver_cutoff,
                 block_size,

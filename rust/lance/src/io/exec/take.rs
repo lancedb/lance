@@ -336,7 +336,7 @@ mod tests {
         };
         let reader =
             RecordBatchIterator::new(expected_batches.clone().into_iter().map(Ok), schema.clone());
-        Dataset::write(reader, test_uri, Some(params))
+        Dataset::write_to_uri(reader, test_uri, Some(params))
             .await
             .unwrap();
 

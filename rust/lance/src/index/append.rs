@@ -154,7 +154,9 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write_to_uri(batches, test_uri, None)
+            .await
+            .unwrap();
 
         let ivf_params = IvfBuildParams::new(IVF_PARTITIONS);
         let pq_params = PQBuildParams {

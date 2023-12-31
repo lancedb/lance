@@ -66,7 +66,7 @@ impl BenchmarkFixture {
     async fn write_baseline_data(tempdir: &TempDir) -> Arc<Dataset> {
         let test_path = tempdir.path().as_os_str().to_str().unwrap();
         Arc::new(
-            Dataset::write(BenchmarkDataSource::test_data(), test_path, None)
+            Dataset::write_to_uri(BenchmarkDataSource::test_data(), test_path, None)
                 .await
                 .unwrap(),
         )

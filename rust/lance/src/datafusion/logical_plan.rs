@@ -141,7 +141,7 @@ mod tests {
         let batch_reader =
             RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone());
 
-        Dataset::write(batch_reader, test_uri, Some(WriteParams::default()))
+        Dataset::write_to_uri(batch_reader, test_uri, Some(WriteParams::default()))
             .await
             .unwrap();
 
@@ -181,7 +181,7 @@ mod tests {
         let batch_reader =
             RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone());
 
-        Dataset::write(batch_reader, test_uri, Some(WriteParams::default()))
+        Dataset::write_to_uri(batch_reader, test_uri, Some(WriteParams::default()))
             .await
             .unwrap();
 
