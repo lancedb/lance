@@ -108,7 +108,7 @@ impl<T: ArrowFloatType> KMeansParams<T> {
 #[derive(Debug, Clone)]
 pub struct KMeans<T: ArrowFloatType>
 where
-    T: L2 + Dot + Cosine,
+    T: L2 + Dot,
 {
     /// Centroids for each of the k clusters.
     ///
@@ -127,7 +127,7 @@ where
 /// Randomly initialize kmeans centroids.
 ///
 ///
-async fn kmeans_random_init<T: ArrowFloatType + Dot + Cosine + L2>(
+async fn kmeans_random_init<T: ArrowFloatType + Dot + L2>(
     data: &T::ArrayType,
     dimension: usize,
     k: usize,
@@ -153,8 +153,11 @@ where
 pub struct KMeanMembership {
     dimension: usize,
 
-    /// Cluster Id and distances for each vector.
-    pub cluster_id_and_distances: Vec<(u32, f32)>,
+    /// Cluster Id and distance for each vector.
+    ///
+    /// If it is None, means the assignment is not valid, i.e., input vectors might
+    /// be all `NaN`.
+    pub cluster_id_and_distances: Vec<Option<(u32, f32)>>,
 
     /// Number of centroids.
     k: usize,
@@ -181,7 +184,7 @@ fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], d
 
 impl KMeanMembership {
     /// Reconstruct a KMeans model from the membership.
-    async fn to_kmeans<T: ArrowFloatType + Dot + Cosine + L2>(
+    async fn to_kmeans<T: ArrowFloatType + Dot + L2>(
         &self,
         data: &[T::Native],
     ) -> Result<KMeans<T>> {
@@ -191,17 +194,22 @@ impl KMeanMembership {
         let mut new_centroids = vec![T::Native::zero(); self.k * dimension];
         data.chunks_exact(dimension)
             .zip(self.cluster_id_and_distances.iter())
-            .for_each(|(vector, (cluster_id, dist))| {
-                if dist.is_finite() {
-                    cluster_cnts[*cluster_id as usize] += 1;
-                    // TODO: simd
-                    for (old, &new) in new_centroids
-                        [*cluster_id as usize * dimension..(1 + *cluster_id as usize) * dimension]
-                        .iter_mut()
-                        .zip(vector)
-                    {
-                        *old += new;
-                    }
+            .filter_map(|(vec, cd)| {
+                if cd.is_some() {
+                    Some((vec, cd.unwrap()))
+                } else {
+                    None
+                }
+            })
+            .for_each(|(vector, (cluster_id, _))| {
+                cluster_cnts[cluster_id as usize] += 1;
+                // TODO: simd
+                for (old, &new) in new_centroids
+                    [cluster_id as usize * dimension..(1 + cluster_id as usize) * dimension]
+                    .iter_mut()
+                    .zip(vector)
+                {
+                    *old += new;
                 }
             });
         cluster_cnts.iter().enumerate().for_each(|(i, &cnt)| {
@@ -242,7 +250,13 @@ impl KMeanMembership {
     fn distance_sum(&self) -> f64 {
         self.cluster_id_and_distances
             .iter()
-            .map(|(_, d)| *d as f64)
+            .flat_map(|cd| {
+                if let Some((_, d)) = cd {
+                    Some(*d as f64)
+                } else {
+                    None
+                }
+            })
             .sum::<f64>()
     }
 
@@ -254,9 +268,12 @@ impl KMeanMembership {
     /// Histogram of the size of each cluster.
     fn histogram(&self) -> Vec<usize> {
         let mut hist: Vec<usize> = vec![0; self.k];
-        for (cluster_id, _) in self.cluster_id_and_distances.iter() {
-            hist[*cluster_id as usize] += 1;
-        }
+        self.cluster_id_and_distances.iter().for_each(|cd| {
+            if let Some((cluster_id, _)) = cd {
+                hist[*cluster_id as usize] += 1;
+            }
+        });
+
         hist
     }
 
@@ -275,7 +292,7 @@ impl KMeanMembership {
 
 impl<T: ArrowFloatType> KMeans<T>
 where
-    T: L2 + Dot + Cosine,
+    T: L2 + Dot,
     T::Native: AsPrimitive<f32>,
 {
     fn empty(k: usize, dimension: usize, metric_type: MetricType) -> Self {
@@ -483,7 +500,6 @@ where
                             .map(|vector| {
                                 let centroid_stream = centroids_array.chunks_exact(dimension);
                                 argmin_value(centroid_stream.map(|cent| dot_distance(vector, cent)))
-                                    .unwrap()
                             })
                             .collect::<Vec<_>>(),
                     }
@@ -539,11 +555,12 @@ fn get_slice<T: Float>(data: &[T], x: usize, y: usize, dim: usize, strip: usize)
     &data[x * dim + y..x * dim + y + strip]
 }
 
+/// Compute L2 kmeans partitions with small number of centroids, while the tiling overhead is big.
 fn compute_partitions_l2_small<'a, T: FloatToArrayType>(
     centroids: &'a [T],
     data: &'a [T],
     dim: usize,
-) -> impl Iterator<Item = (u32, f32)> + 'a
+) -> impl Iterator<Item = Option<(u32, f32)>> + 'a
 where
     T::ArrowType: L2,
 {
@@ -563,13 +580,13 @@ where
 /// -------
 /// An iterator of ``(partition_id, dist)`` pairs.
 ///
-/// If the distance is not valid, returns ``(u32::MAX, f32::NAN)`` as placeholder.
+/// If the distance is not valid, returns ``None`` as placeholder.
 ///
 fn compute_partitions_l2<'a, T: FloatToArrayType>(
     centroids: &'a [T],
     data: &'a [T],
     dim: usize,
-) -> Box<dyn Iterator<Item = (u32, f32)> + 'a>
+) -> Box<dyn Iterator<Item = Option<(u32, f32)>> + 'a>
 where
     T::ArrowType: L2,
 {
@@ -584,13 +601,13 @@ where
     // stay in L1 cache.
     let num_centroids = centroids.len() / dim;
 
-    // Read a tile of data, `data[idx..idx+TILE_SIZE]`
+    // Read a tile of vectors, `data[idx..idx+TILE_SIZE]`
     let stream = data.chunks(TILE_SIZE * dim).flat_map(move |data_tile| {
         // Loop over each strip.
         // s is the index of value in each vector.
         let num_rows_in_tile = data_tile.len() / dim;
         let mut min_dists = vec![f32::infinity(); num_rows_in_tile];
-        let mut partitions = vec![u32::MAX; num_rows_in_tile];
+        let mut partitions: Vec<Option<u32>> = vec![None; num_rows_in_tile];
 
         for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
             // 4B * 16 * 16 = 1 KB
@@ -611,41 +628,47 @@ where
             }
 
             for i in 0..num_rows_in_tile {
-                let (part_id, dist) = argmin_value(
+                if let Some((part_id, dist)) = argmin_value(
                     dists[i * TILE_SIZE..(i * TILE_SIZE + num_centroids_in_tile)]
                         .iter()
                         .copied(),
-                )
-                .unwrap_or((u32::MAX, f32::NAN));
-                if dist < min_dists[i] {
-                    min_dists[i] = dist;
-                    partitions[i] = centroid_start as u32 + part_id;
+                ) {
+                    if dist < min_dists[i] {
+                        min_dists[i] = dist;
+                        partitions[i] = Some(centroid_start as u32 + part_id);
+                    }
                 }
             }
         }
-        partitions.into_iter().zip(min_dists)
+        partitions
+            .into_iter()
+            .zip(min_dists)
+            .map(|(p, d)| p.map(|p| (p, d)))
     });
     Box::new(stream)
 }
 
+/// Compute partition ID of each vector in the KMeans.
+///
+/// If returns `None`, means the vector is not valid, i.e., all `NaN`.
 pub async fn compute_partitions<T: ArrowFloatType>(
     centroids: &[T::Native],
-    data: &[T::Native],
+    vectors: &[T::Native],
     dimension: usize,
     metric_type: MetricType,
-) -> Vec<u32>
+) -> Vec<Option<u32>>
 where
     <T::Native as FloatToArrayType>::ArrowType: Dot + Cosine + L2,
 {
     let kmeans: KMeans<T> =
         KMeans::with_centroids(Arc::new(centroids.to_vec().into()), dimension, metric_type);
     let membership = kmeans
-        .compute_membership(Arc::new(data.to_vec().into()))
+        .compute_membership(Arc::new(vectors.to_vec().into()))
         .await;
     membership
         .cluster_id_and_distances
         .iter()
-        .map(|(c, _)| *c)
+        .map(|cluster_and_dist| cluster_and_dist.map(|(cluster, _)| cluster))
         .collect()
 }
 
