@@ -716,7 +716,6 @@ mod tests {
                         .chunks(DIM)
                         .map(|centroid| l2(row, centroid)),
                 )
-                .unwrap()
             })
             .collect::<Vec<_>>();
         let actual = compute_partitions::<Float32Type>(
@@ -782,9 +781,8 @@ mod tests {
         let centroids = generate_random_array(DIM * NUM_CENTROIDS);
         let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
 
-        compute_partitions_l2(centroids.values(), values.values(), DIM).for_each(|(cent, dist)| {
-            assert_eq!(cent, u32::MAX);
-            assert_eq!(dist, f32::INFINITY);
+        compute_partitions_l2(centroids.values(), values.values(), DIM).for_each(|cd| {
+            assert!(cd.is_none());
         });
     }
 
@@ -802,10 +800,7 @@ mod tests {
         membership
             .cluster_id_and_distances
             .iter()
-            .for_each(|(cent, dist)| {
-                assert_eq!(*cent, u32::MAX);
-                assert_eq!(*dist, f32::INFINITY);
-            });
+            .for_each(|cd| assert!(cd.is_none()));
     }
 
     #[tokio::test]
@@ -822,10 +817,7 @@ mod tests {
             membership
                 .cluster_id_and_distances
                 .iter()
-                .for_each(|(cent, dist)| {
-                    assert_eq!(*cent, u32::MAX);
-                    assert_eq!(*dist, f32::INFINITY);
-                });
+                .for_each(|cd| assert!(cd.is_none()));
         }
     }
 }
