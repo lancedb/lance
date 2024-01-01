@@ -14,7 +14,7 @@
 
 import logging
 import time
-from typing import List, Optional, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -58,8 +58,8 @@ class KMeans:
         self,
         k: int,
         *,
-        metric: str = "l2",
-        init: str = "random",
+        metric: Literal["l2", "euclidean", "cosine", "dot"] = "l2",
+        init: Literal["random"] = "random",
         max_iters: int = 50,
         tolerance: float = 1e-4,
         centroids: Optional[torch.Tensor] = None,
