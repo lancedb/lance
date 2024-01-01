@@ -1,4 +1,4 @@
-#  Copyright (c) 2023. Lance Developers
+#  Copyright (c) 2024. Lance Developers
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -45,8 +45,10 @@ class KMeans:
     max_iters: int
         Max number of iterations to train the kmean model.
     tolerance: float
-        Relative tolerance with regards to Frobenius norm of the difference in
+        Relative tolerance in regard to Frobenius norm of the difference in
         the cluster centers of two consecutive iterations to declare convergence.
+    centroids : torch.Tensor, optional.
+        Provide existing centroids.
     seed: int, optional
         Random seed
     device: str, optional
@@ -180,13 +182,19 @@ class KMeans:
             num_rows.scatter_add_(0, part_id, ones)
         return num_rows
 
-    def _fit_once(self, data: IterableDataset, epoch: int, last_dist=0) -> float:
+    def _fit_once(
+        self, data: IterableDataset, epoch: int, last_dist: float = 0.0
+    ) -> float:
         """Train KMean once and return the total distance.
 
         Parameters
         ----------
-        chunks : List[torch.Tensor]
+        data : List[torch.Tensor]
             A list of 2-D tensors, each tensor is a chunk of the input data.
+        epoch : int
+            The epoch of this training process
+        last_dist : float
+            The total distance of the last epoch.
 
         Returns
         -------

@@ -174,8 +174,10 @@ def _l2_distance(
     for sub_vectors in x.split(split_size):
         dists = pairwise_l2(sub_vectors, y, y2)
         idx = torch.argmin(dists, dim=1, keepdim=True)
+        min_dists = dists.take_along_dim(idx, dim=1)
+        idx = torch.where(min_dists.isnan(), torch.nan, idx)
         part_ids.append(idx)
-        distances.append(dists.take_along_dim(idx, dim=1))
+        distances.append(min_dists)
 
     return torch.cat(part_ids).reshape(-1), torch.cat(distances).reshape(-1)
 
