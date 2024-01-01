@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -108,7 +108,7 @@ impl<T: ArrowFloatType> KMeansParams<T> {
 #[derive(Debug, Clone)]
 pub struct KMeans<T: ArrowFloatType>
 where
-    T: L2 + Dot + Cosine,
+    T: L2 + Dot,
 {
     /// Centroids for each of the k clusters.
     ///
@@ -127,7 +127,7 @@ where
 /// Randomly initialize kmeans centroids.
 ///
 ///
-async fn kmeans_random_init<T: ArrowFloatType + Dot + Cosine + L2>(
+async fn kmeans_random_init<T: ArrowFloatType + Dot + L2>(
     data: &T::ArrayType,
     dimension: usize,
     k: usize,
@@ -150,19 +150,14 @@ where
     Ok(kmeans)
 }
 
-pub struct KMeanMembership<T: ArrowFloatType + Dot + Cosine + L2>
-where
-    T::Native: Float + Zero,
-{
-    /// Reference to the input vectors, with dimension `dimension`.
-    ///
-    /// If [MetricType] is [MetricType::Cosine], the vectors are L2 normalized.
-    data: Arc<T::ArrayType>,
-
+pub struct KMeanMembership {
     dimension: usize,
 
-    /// Cluster Id and distances for each vector.
-    pub cluster_id_and_distances: Vec<(u32, f32)>,
+    /// Cluster Id and distance for each vector.
+    ///
+    /// If it is None, means the assignment is not valid, i.e., input vectors might
+    /// be all `NaN`.
+    pub cluster_id_and_distances: Vec<Option<(u32, f32)>>,
 
     /// Number of centroids.
     k: usize,
@@ -170,6 +165,8 @@ where
     metric_type: MetricType,
 }
 
+/// Split one big cluster into two smaller clusters. After split, each
+/// cluster has approximately half of the vectors.
 fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], dimension: usize) {
     for i in 0..cnts.len() {
         if cnts[i] == 0 {
@@ -184,22 +181,31 @@ fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], d
         }
     }
 }
-impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
+
+impl KMeanMembership {
     /// Reconstruct a KMeans model from the membership.
-    async fn to_kmeans(&self) -> Result<KMeans<T>> {
+    async fn to_kmeans<T: ArrowFloatType + Dot + L2>(
+        &self,
+        data: &[T::Native],
+    ) -> Result<KMeans<T>> {
         let dimension = self.dimension;
 
         let mut cluster_cnts = vec![0_u64; self.k];
         let mut new_centroids = vec![T::Native::zero(); self.k * dimension];
-        self.data
-            .as_slice()
-            .chunks_exact(dimension)
-            .zip(self.cluster_id_and_distances.iter().map(|(c, _)| c))
-            .for_each(|(vector, cluster_id)| {
-                cluster_cnts[*cluster_id as usize] += 1;
+        data.chunks_exact(dimension)
+            .zip(self.cluster_id_and_distances.iter())
+            .filter_map(|(vec, cd)| {
+                if cd.is_some() {
+                    Some((vec, cd.unwrap()))
+                } else {
+                    None
+                }
+            })
+            .for_each(|(vector, (cluster_id, _))| {
+                cluster_cnts[cluster_id as usize] += 1;
                 // TODO: simd
                 for (old, &new) in new_centroids
-                    [*cluster_id as usize * dimension..(1 + *cluster_id as usize) * dimension]
+                    [cluster_id as usize * dimension..(1 + cluster_id as usize) * dimension]
                     .iter_mut()
                     .zip(vector)
                 {
@@ -244,7 +250,13 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
     fn distance_sum(&self) -> f64 {
         self.cluster_id_and_distances
             .iter()
-            .map(|(_, d)| *d as f64)
+            .flat_map(|cd| {
+                if let Some((_, d)) = cd {
+                    Some(*d as f64)
+                } else {
+                    None
+                }
+            })
             .sum::<f64>()
     }
 
@@ -256,9 +268,12 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
     /// Histogram of the size of each cluster.
     fn histogram(&self) -> Vec<usize> {
         let mut hist: Vec<usize> = vec![0; self.k];
-        for (cluster_id, _) in self.cluster_id_and_distances.iter() {
-            hist[*cluster_id as usize] += 1;
-        }
+        self.cluster_id_and_distances.iter().for_each(|cd| {
+            if let Some((cluster_id, _)) = cd {
+                hist[*cluster_id as usize] += 1;
+            }
+        });
+
         hist
     }
 
@@ -277,7 +292,7 @@ impl<T: ArrowFloatType + Dot + Cosine + L2> KMeanMembership<T> {
 
 impl<T: ArrowFloatType> KMeans<T>
 where
-    T: L2 + Dot + Cosine,
+    T: L2 + Dot,
     T::Native: AsPrimitive<f32>,
 {
     fn empty(k: usize, dimension: usize, metric_type: MetricType) -> Self {
@@ -404,7 +419,7 @@ where
                 let last_membership = kmeans.train_once(&mat).await;
                 let last_dist_sum = last_membership.distance_sum();
                 stddev = last_membership.hist_stddev();
-                kmeans = last_membership.to_kmeans().await.unwrap();
+                kmeans = last_membership.to_kmeans(data.as_slice()).await.unwrap();
                 if (dist_sum - last_dist_sum).abs() / last_dist_sum < params.tolerance {
                     info!(
                         "KMeans training: converged at iteration {} / {}, redo={}",
@@ -439,7 +454,7 @@ where
     /// }
     /// ```
     #[instrument(level = "debug", skip_all)]
-    async fn train_once(&self, data: &MatrixView<T>) -> KMeanMembership<T> {
+    async fn train_once(&self, data: &MatrixView<T>) -> KMeanMembership {
         self.compute_membership(data.data().clone()).await
     }
 
@@ -451,7 +466,7 @@ where
     ///
     /// If the metric type is cosine, the vector will be normalized internally.
     ///
-    pub async fn compute_membership(&self, data: Arc<T::ArrayType>) -> KMeanMembership<T> {
+    pub async fn compute_membership(&self, data: Arc<T::ArrayType>) -> KMeanMembership {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let metric_type = self.metric_type;
@@ -485,7 +500,6 @@ where
                             .map(|vector| {
                                 let centroid_stream = centroids_array.chunks_exact(dimension);
                                 argmin_value(centroid_stream.map(|cent| dot_distance(vector, cent)))
-                                    .unwrap()
                             })
                             .collect::<Vec<_>>(),
                     }
@@ -501,7 +515,6 @@ where
             .await
             .unwrap();
         KMeanMembership {
-            data,
             dimension,
             cluster_id_and_distances: cluster_with_distances.iter().flatten().copied().collect(),
             k: self.k,
@@ -542,11 +555,12 @@ fn get_slice<T: Float>(data: &[T], x: usize, y: usize, dim: usize, strip: usize)
     &data[x * dim + y..x * dim + y + strip]
 }
 
+/// Compute L2 kmeans partitions with small number of centroids, while the tiling overhead is big.
 fn compute_partitions_l2_small<'a, T: FloatToArrayType>(
     centroids: &'a [T],
     data: &'a [T],
     dim: usize,
-) -> impl Iterator<Item = (u32, f32)> + 'a
+) -> impl Iterator<Item = Option<(u32, f32)>> + 'a
 where
     T::ArrowType: L2,
 {
@@ -555,11 +569,24 @@ where
 }
 
 /// Fast partition computation for L2 distance.
+///
+/// Parameters
+/// ----------
+/// *centroids*: the flat array of the centroids to run against to.
+/// *data*: the flat array of the vectors.
+/// *dim*: the dimension of centroids / vectors.
+///
+/// Returns
+/// -------
+/// An iterator of ``(partition_id, dist)`` pairs.
+///
+/// If the distance is not valid, returns ``None`` as placeholder.
+///
 fn compute_partitions_l2<'a, T: FloatToArrayType>(
     centroids: &'a [T],
     data: &'a [T],
     dim: usize,
-) -> Box<dyn Iterator<Item = (u32, f32)> + 'a>
+) -> Box<dyn Iterator<Item = Option<(u32, f32)>> + 'a>
 where
     T::ArrowType: L2,
 {
@@ -574,13 +601,13 @@ where
     // stay in L1 cache.
     let num_centroids = centroids.len() / dim;
 
-    // Read a tile of data, `data[idx..idx+TILE_SIZE]`
+    // Read a tile of vectors, `data[idx..idx+TILE_SIZE]`
     let stream = data.chunks(TILE_SIZE * dim).flat_map(move |data_tile| {
         // Loop over each strip.
         // s is the index of value in each vector.
         let num_rows_in_tile = data_tile.len() / dim;
         let mut min_dists = vec![f32::infinity(); num_rows_in_tile];
-        let mut partitions = vec![0_u32; num_rows_in_tile];
+        let mut partitions: Vec<Option<u32>> = vec![None; num_rows_in_tile];
 
         for centroid_start in (0..num_centroids).step_by(TILE_SIZE) {
             // 4B * 16 * 16 = 1 KB
@@ -601,46 +628,55 @@ where
             }
 
             for i in 0..num_rows_in_tile {
-                let (part_id, dist) = argmin_value(
+                if let Some((part_id, dist)) = argmin_value(
                     dists[i * TILE_SIZE..(i * TILE_SIZE + num_centroids_in_tile)]
                         .iter()
                         .copied(),
-                )
-                .unwrap();
-                if dist < min_dists[i] {
-                    min_dists[i] = dist;
-                    partitions[i] = centroid_start as u32 + part_id;
+                ) {
+                    if dist < min_dists[i] {
+                        min_dists[i] = dist;
+                        partitions[i] = Some(centroid_start as u32 + part_id);
+                    }
                 }
             }
         }
-        partitions.into_iter().zip(min_dists)
+        partitions
+            .into_iter()
+            .zip(min_dists)
+            .map(|(p, d)| p.map(|p| (p, d)))
     });
     Box::new(stream)
 }
 
+/// Compute partition ID of each vector in the KMeans.
+///
+/// If returns `None`, means the vector is not valid, i.e., all `NaN`.
 pub async fn compute_partitions<T: ArrowFloatType>(
     centroids: &[T::Native],
-    data: &[T::Native],
+    vectors: &[T::Native],
     dimension: usize,
     metric_type: MetricType,
-) -> Vec<u32>
+) -> Vec<Option<u32>>
 where
     <T::Native as FloatToArrayType>::ArrowType: Dot + Cosine + L2,
 {
     let kmeans: KMeans<T> =
         KMeans::with_centroids(Arc::new(centroids.to_vec().into()), dimension, metric_type);
     let membership = kmeans
-        .compute_membership(Arc::new(data.to_vec().into()))
+        .compute_membership(Arc::new(vectors.to_vec().into()))
         .await;
     membership
         .cluster_id_and_distances
         .iter()
-        .map(|(c, _)| *c)
+        .map(|cluster_and_dist| cluster_and_dist.map(|(cluster, _)| cluster))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
+
+    use std::iter::repeat;
+
     use super::*;
     use approx::{assert_relative_eq, relative_eq};
 
@@ -680,7 +716,6 @@ mod tests {
                         .chunks(DIM)
                         .map(|centroid| l2(row, centroid)),
                 )
-                .unwrap()
             })
             .collect::<Vec<_>>();
         let actual = compute_partitions::<Float32Type>(
@@ -736,5 +771,53 @@ mod tests {
 
         let actual = kmeans.find_partitions(query, 4).unwrap();
         assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn test_l2_with_nans() {
+        const DIM: usize = 8;
+        const K: usize = 32;
+        const NUM_CENTROIDS: usize = 16 * 2048;
+        let centroids = generate_random_array(DIM * NUM_CENTROIDS);
+        let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
+
+        compute_partitions_l2(centroids.values(), values.values(), DIM).for_each(|cd| {
+            assert!(cd.is_none());
+        });
+    }
+
+    #[tokio::test]
+    async fn test_train_l2_kmeans_with_nans() {
+        const DIM: usize = 8;
+        const K: usize = 32;
+        const NUM_CENTROIDS: usize = 16 * 2048;
+        let centroids = generate_random_array(DIM * NUM_CENTROIDS);
+        let values = Float32Array::from_iter_values(repeat(f32::NAN).take(DIM * K));
+
+        let kmeans = KMeans::<Float32Type>::with_centroids(centroids.into(), DIM, MetricType::L2);
+        let membership = kmeans.compute_membership(values.into()).await;
+
+        membership
+            .cluster_id_and_distances
+            .iter()
+            .for_each(|cd| assert!(cd.is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_train_cosine_kmeans_with_invalid_values() {
+        const DIM: usize = 8;
+        const K: usize = 32;
+        const NUM_CENTROIDS: usize = 16 * 2048;
+        let centroids = Arc::new(generate_random_array(DIM * NUM_CENTROIDS));
+        for val in [0.0, f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
+            let values = Float32Array::from_iter_values(repeat(val).take(DIM * K));
+            let kmeans =
+                KMeans::<Float32Type>::with_centroids(centroids.clone(), DIM, MetricType::Cosine);
+            let membership = kmeans.compute_membership(values.into()).await;
+            membership
+                .cluster_id_and_distances
+                .iter()
+                .for_each(|cd| assert!(cd.is_none()));
+        }
     }
 }

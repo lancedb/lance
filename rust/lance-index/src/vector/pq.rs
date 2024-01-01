@@ -220,7 +220,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                                 dot_distance_batch(sub_vec, centroids, sub_vector_width)
                             }
                         };
-                        argmin_value_float(distances).1
+                        argmin_value_float(distances).map(|(_, v)| v).unwrap_or(0.0)
                     })
                     .sum::<f32>() as f64
             })

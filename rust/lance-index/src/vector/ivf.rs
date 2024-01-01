@@ -338,7 +338,7 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         let chunk_size = num_rows / chunks + if num_rows % chunks > 0 { 1 } else { 0 };
         let stride = chunk_size * dimension;
 
-        let result: Vec<Vec<u32>> = stream::iter(0..chunks)
+        let result: Vec<Vec<Option<u32>>> = stream::iter(0..chunks)
             .map(|chunk_id| stride * chunk_id..std::cmp::min(stride * (chunk_id + 1), data.len()))
             // When there are a large number of CPUs and a small number of rows,
             // it's possible there isn't an split of rows that there isn't

@@ -105,7 +105,7 @@ impl KMeans {
         let cluster_ids: UInt32Array = membership
             .cluster_id_and_distances
             .iter()
-            .map(|(c, _)| *c)
+            .map(|cd| cd.map(|(c, _)| c))
             .collect();
         cluster_ids.into_data().to_pyarrow(py)
     }
