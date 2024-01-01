@@ -234,4 +234,5 @@ def dot_distance(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.
     dists = 1 - x @ y.T
     idx = torch.argmin(dists, dim=1, keepdim=True)
     dists = dists.take_along_dim(idx, dim=1).reshape(-1)
+    idx = torch.where(dists.isnan(), torch.nan, idx)
     return idx.reshape(-1), dists.reshape(-1)
