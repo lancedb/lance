@@ -56,9 +56,9 @@ use crate::format::{DeletionFile, Fragment};
 use crate::index::DatasetIndexInternalExt;
 use crate::Dataset;
 
-#[cfg(all(target_feature = "dynamodb", tests))]
+#[cfg(all(target_feature = "dynamodb", test))]
 mod dynamodb;
-#[cfg(tests)]
+#[cfg(test)]
 mod external_manifest;
 pub use lance_core::io::commit::latest_manifest_path;
 

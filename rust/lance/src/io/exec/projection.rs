@@ -46,7 +46,7 @@ impl ProjectionStream {
     fn new(input: SendableRecordBatchStream, projection: &Schema) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
-        let schema = Arc::new(ArrowSchema::try_from(projection).unwrap());
+        let schema = Arc::new(ArrowSchema::from(projection));
         let schema_clone = schema.clone();
         let bg_thread = tokio::spawn(async move {
             if let Err(e) = input
@@ -158,8 +158,7 @@ impl ExecutionPlan for ProjectionExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        let arrow_schema =
-            ArrowSchema::try_from(self.project.as_ref()).expect("convert to arrow schema");
+        let arrow_schema = ArrowSchema::from(self.project.as_ref());
         arrow_schema.into()
     }
 

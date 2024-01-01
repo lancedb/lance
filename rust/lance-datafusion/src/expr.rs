@@ -149,12 +149,8 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             DataType::Int16 => {
                 val.and_then(|v| i16::try_from(v).map(|v| ScalarValue::Int16(Some(v))).ok())
             }
-            DataType::Int32 => {
-                val.and_then(|v| i32::try_from(v).map(|v| ScalarValue::Int32(Some(v))).ok())
-            }
-            DataType::Int64 => {
-                val.and_then(|v| i64::try_from(v).map(|v| ScalarValue::Int64(Some(v))).ok())
-            }
+            DataType::Int32 => val.map(|v| ScalarValue::Int32(Some(v.into()))),
+            DataType::Int64 => val.map(|v| ScalarValue::Int64(Some(v.into()))),
             DataType::UInt8 => {
                 val.and_then(|v| u8::try_from(v).map(|v| ScalarValue::UInt8(Some(v))).ok())
             }
@@ -175,9 +171,7 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             DataType::Int32 => {
                 val.and_then(|v| i32::try_from(v).map(|v| ScalarValue::Int32(Some(v))).ok())
             }
-            DataType::Int64 => {
-                val.and_then(|v| i64::try_from(v).map(|v| ScalarValue::Int64(Some(v))).ok())
-            }
+            DataType::Int64 => val.map(|v| ScalarValue::Int64(Some(v.into()))),
             DataType::UInt8 => {
                 val.and_then(|v| u8::try_from(v).map(|v| ScalarValue::UInt8(Some(v))).ok())
             }

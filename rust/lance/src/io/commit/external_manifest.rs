@@ -292,8 +292,6 @@ mod test {
         // set the store back to dataset path with -{uuid} suffix
         let mut version_six = localfs
             .list(Some(&ds.base))
-            .await
-            .unwrap()
             .try_filter(|p| {
                 let p = p.clone();
                 async move { p.location.filename().unwrap().starts_with("6.manifest-") }

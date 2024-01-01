@@ -246,7 +246,7 @@ impl ExecutionPlan for TakeExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        ArrowSchema::try_from(&self.output_schema).unwrap().into()
+        ArrowSchema::from(&self.output_schema).into()
     }
 
     fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {

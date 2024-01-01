@@ -508,10 +508,7 @@ impl Scanner {
                 message: format!("Column {} not found", q.column),
                 location: location!(),
             })?;
-            let vector_field = ArrowField::try_from(vector_field).map_err(|e| Error::IO {
-                message: format!("Failed to convert vector field: {}", e),
-                location: location!(),
-            })?;
+            let vector_field = ArrowField::from(vector_field);
             extra_columns.push(vector_field);
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
         };
