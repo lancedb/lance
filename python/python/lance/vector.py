@@ -229,8 +229,8 @@ def compute_partitions(
                     partitions = kmeans.transform(vecs).cpu().numpy()
 
                     # Ignore any invalid vectors.
-                    ids = ids[partitions != -1]
-                    partitions = partitions[partitions != -1]
+                    ids = ids[partitions >= 0]
+                    partitions = partitions[partitions >= 0]
                     part_batch = pa.RecordBatch.from_arrays(
                         [ids, partitions],
                         schema=output_schema,

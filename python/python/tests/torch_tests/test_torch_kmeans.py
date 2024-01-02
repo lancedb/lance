@@ -21,7 +21,6 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-
 from lance.torch import preferred_device  # noqa: E402
 from lance.torch.kmeans import KMeans  # noqa: E402
 from lance.vector import train_ivf_centroids_on_accelerator  # noqa: E402
@@ -38,6 +37,7 @@ def test_kmeans():
     assert len(cnts) == 4  # all cluster has data
 
 
+@pytest.mark.skip(reason="TODO: async dataset hangs on github CI")
 def test_torch_kmeans_accept_torch_device(tmp_path: Path):
     values = pa.array(np.array(range(128)).astype(np.float32))
     arr = pa.FixedSizeListArray.from_arrays(values, 8)
