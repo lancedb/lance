@@ -222,13 +222,13 @@ def compute_partitions(
                 for batch in torch_ds:
                     batch: Dict[str, torch.Tensor] = batch
                     vecs = batch[column].reshape(-1, kmeans.centroids.shape[1])
+
+                    vecs.to(kmeans.device)
+                    partitions = kmeans.transform(vecs).cpu().numpy()
                     ids = batch["_rowid"].reshape(-1).cpu().numpy()
 
                     # this is expected to be true, so just assert
                     assert vecs.shape[0] == ids.shape[0]
-
-                    vecs.to(kmeans.device)
-                    partitions = kmeans.transform(vecs).cpu().numpy()
 
                     # Ignore any invalid vectors.
                     ids = ids[partitions >= 0]
