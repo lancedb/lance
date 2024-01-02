@@ -228,6 +228,16 @@ class LanceFragment(pa.dataset.Fragment):
         """
         return self._fragment.physical_rows
 
+    @property
+    def physical_schema(self) -> pa.Schema:
+        # override the pyarrow super class method otherwise causes segfault
+        raise NotImplementedError("Not implemented yet for LanceFragment")
+
+    @property
+    def partition_expression(self) -> pa.Schema:
+        # override the pyarrow super class method otherwise causes segfault
+        raise NotImplementedError("Not implemented yet for LanceFragment")
+
     def head(self, num_rows: int) -> pa.Table:
         return self.scanner(limit=num_rows).to_table()
 
