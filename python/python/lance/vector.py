@@ -215,26 +215,37 @@ def compute_partitions(
             [pa.field("row_id", pa.uint64()), pa.field("partition", pa.uint32())]
         )
 
-        def _f() -> Iterable[pa.RecordBatch]:
+        def _partition_assignment() -> Iterable[pa.RecordBatch]:
             with torch.no_grad():
                 for batch in torch_ds:
                     batch: Dict[str, torch.Tensor] = batch
                     vecs = batch[column].reshape(-1, kmeans.centroids.shape[1])
-                    ids = batch["_rowid"].reshape(-1)
+                    ids = batch["_rowid"].reshape(-1).cpu().numpy()
 
-                    # this is expect to be true, so just assert
+                    # this is expected to be true, so just assert
                     assert vecs.shape[0] == ids.shape[0]
 
                     vecs.to(kmeans.device)
-                    partitions = kmeans.transform(vecs)
-                    batch = pa.RecordBatch.from_arrays(
-                        [ids.cpu().numpy(), partitions.cpu().numpy()],
+                    partitions = kmeans.transform(vecs).cpu().numpy()
+
+                    # Ignore any invalid vectors.
+                    ids = ids[partitions != -1]
+                    partitions = partitions[partitions != -1]
+                    part_batch = pa.RecordBatch.from_arrays(
+                        [ids, partitions],
                         schema=output_schema,
                     )
+                    if len(part_batch) < len(ids):
+                        logging.warning(
+                            "%s vectors are ignored during partition assignment",
+                            len(part_batch) - len(ids),
+                        )
 
-                    yield batch
+                    yield part_batch
 
-        rbr = pa.RecordBatchReader.from_batches(output_schema, tqdm(_f()))
+        rbr = pa.RecordBatchReader.from_batches(
+            output_schema, tqdm(_partition_assignment())
+        )
 
         fragments = write_fragments(
             rbr,
