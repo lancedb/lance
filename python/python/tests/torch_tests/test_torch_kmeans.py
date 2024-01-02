@@ -21,6 +21,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+
 from lance.torch import preferred_device  # noqa: E402
 from lance.torch.kmeans import KMeans  # noqa: E402
 from lance.vector import train_ivf_centroids_on_accelerator  # noqa: E402
@@ -44,7 +45,11 @@ def test_torch_kmeans_accept_torch_device(tmp_path: Path):
     ds = lance.write_dataset(tbl, tmp_path)
     # Not raising exception if pass a `torch.device()` directly
     train_ivf_centroids_on_accelerator(
-        ds, "vector", 2, metric_type="L2", accelerator=preferred_device()
+        ds,
+        "vector",
+        2,
+        metric_type="L2",
+        accelerator=preferred_device(),
     )
 
 
@@ -56,7 +61,6 @@ def test_torch_kmeans_nans(tmp_path: Path):
     fsl = pa.FixedSizeListArray.from_arrays(values, 8)
 
     part_ids = kmeans.transform(fsl)
-    print(part_ids.dtype, part_ids)
     for idx, part_id in enumerate(part_ids):
         if idx == 1:
             assert part_ids[1] == -1

@@ -26,6 +26,7 @@ def _worker_ep(
 ) -> None:
     dataset = dataset_creator()
     while not shutdown.value:
+        # Allow to reuse the dataset to be iterated multiple times.
         for item in dataset:
             # this helps us stop the worker process as soon as possible
             if shutdown.value:
@@ -33,8 +34,8 @@ def _worker_ep(
             queue.put(item)
         queue.put(None)
 
-    # put one last None so that the iterator knows to stop
-    queue.put(None)
+    # No more data to the queue.
+    queue.close()
 
 
 # This class is similar to torch.utils.data.Dataloader
