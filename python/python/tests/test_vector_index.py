@@ -537,3 +537,31 @@ def test_f16_index(tmp_path: Path):
 
     assert rst.schema.field("vector").type.value_type == pa.float16()
     assert len(rst) == 10
+
+
+def test_vector_with_nans(tmp_path: Path):
+    DIM = 32
+    TOTAL = 2048
+    data = np.random.uniform(0, 1, TOTAL * DIM).astype(np.float32)
+
+    # Put the 1st vector as NaN.
+    np.put(data, range(DIM, 2 * DIM), np.nan)
+    fsl = pa.FixedSizeListArray.from_arrays(data, DIM)
+    tbl = pa.Table.from_pydict({"vector": fsl})
+
+    dataset = lance.write_dataset(tbl, tmp_path)
+    row = dataset._take_rows([1])
+    assert row["vector"]
+
+    ds = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=2,
+    )
+    tbl = ds.to_table(
+        nearest={"column": "vector", "q": data[0:DIM], "k": TOTAL, "nprobes": 2},
+        with_row_id=True,
+    )
+    assert len(tbl) == TOTAL - 1
+    assert 1 not in tbl["_rowid"].to_numpy(), "Row with ID 1 is not in the index"

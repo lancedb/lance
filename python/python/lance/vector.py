@@ -196,8 +196,10 @@ def compute_partitions(
     dataset: LanceDataset,
     column: str,
     kmeans: Any,  # KMeans
+    *,
     batch_size: int = 1024,
-) -> np.ndarray:
+) -> str:
+    """Compute partitions using GPU kmeans."""
     import torch
 
     from lance.torch.async_dataset import async_dataset

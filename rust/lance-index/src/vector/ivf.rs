@@ -19,7 +19,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::builder::UInt32Builder;
-use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::types::{Float16Type, Float32Type, Float64Type, UInt64Type};
 use arrow_array::UInt64Array;
 use arrow_array::{
     cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
@@ -34,7 +34,7 @@ use lance_linalg::{
     distance::{Cosine, Dot, MetricType, L2},
     MatrixView,
 };
-use log::{debug, info};
+use log::{debug, info, warn};
 use snafu::{location, Location};
 use tracing::{instrument, Instrument};
 
@@ -463,23 +463,11 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
             (Some(partitions), Some(row_ids)) => {
                 debug!("Using precomputed partitions for partitions");
                 let mut builder = UInt32Builder::new();
-                for row in row_ids
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .unwrap()
-                    .values()
-                    .iter()
-                {
+                for row in row_ids.as_primitive::<UInt64Type>().values().iter() {
                     if let Some(part_id) = partitions.get(row) {
                         builder.append_value(*part_id);
                     } else {
-                        return Err(Error::Index {
-                            message: format!(
-                                "Row ID {} does not exist in the precomputed partitions",
-                                row
-                            ),
-                            location: location!(),
-                        });
+                        builder.append_null();
                     }
                 }
                 builder.finish()
@@ -489,10 +477,9 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
 
         let (part_ids, batch) = if let Some(part_range) = self.partition_range.as_ref() {
             let idx_in_range: UInt32Array = part_ids
-                .values()
                 .iter()
                 .enumerate()
-                .filter(|(_, part_id)| part_range.contains(*part_id))
+                .filter(|(_idx, part_id)| part_id.map(|r| part_range.contains(&r)).unwrap_or(false))
                 .map(|(idx, _)| idx as u32)
                 .collect();
             let part_ids = take(&part_ids, &idx_in_range, None)?
