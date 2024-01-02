@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, List, Optional, Union
 
 try:
     import pandas as pd
@@ -64,7 +64,7 @@ class FragmentMetadata:
         """Reconstruct :class:`FragmentMetadata` from a JSON blob"""
         return FragmentMetadata(json_data)
 
-    def data_files(self) -> Iterator[str]:
+    def data_files(self) -> Iterable[str]:
         """Return the data files of the fragment"""
         return self._metadata.data_files()
 
