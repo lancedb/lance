@@ -56,8 +56,9 @@ def test_torch_kmeans_nans(tmp_path: Path):
     fsl = pa.FixedSizeListArray.from_arrays(values, 8)
 
     part_ids = kmeans.transform(fsl)
+    print(part_ids.dtype, part_ids)
     for idx, part_id in enumerate(part_ids):
         if idx == 1:
-            assert part_ids[1].isnan()
+            assert part_ids[1] == -1
         else:
-            assert not part_ids[idx].isnan()
+            assert part_ids[idx] != -1

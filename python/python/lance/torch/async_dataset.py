@@ -23,7 +23,7 @@ def _worker_ep(
     dataset_creator: Callable[[], IterableDataset],
     queue: Queue,
     shutdown: Value,
-):
+) -> None:
     dataset = dataset_creator()
     while not shutdown.value:
         for item in dataset:
@@ -71,7 +71,9 @@ class AsyncDataset(IterableDataset):
             yield val
 
     def close(self):
-        self.shutdown.value = True
+        with self.shutdown.get_lock():
+            self.shutdown.value = True
+
         try:
             for _ in self:
                 pass
