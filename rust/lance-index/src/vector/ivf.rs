@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use arrow_array::builder::UInt32Builder;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type, UInt64Type};
-use arrow_array::UInt64Array;
 use arrow_array::{
     cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
@@ -34,7 +33,7 @@ use lance_linalg::{
     distance::{Cosine, Dot, MetricType, L2},
     MatrixView,
 };
-use log::{debug, info, warn};
+use log::{debug, info};
 use snafu::{location, Location};
 use tracing::{instrument, Instrument};
 
