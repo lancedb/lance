@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 import contextlib
+import logging
 from multiprocessing import Process, Queue, Value
 from typing import Callable, Iterable
 
@@ -78,7 +79,8 @@ class AsyncDataset(IterableDataset):
         try:
             for _ in self:
                 pass
-        except Exception:
+        except Exception as e:
+            logging.exception(e)
             pass
         self.queue.close()
         self.worker.join()
