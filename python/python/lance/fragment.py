@@ -237,11 +237,16 @@ class LanceFragment(pa.dataset.Fragment):
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
         offset: Optional[int] = None,
+        with_row_id: bool = False,
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
         filter_str = str(filter) if filter is not None else None
         s = self._fragment.scanner(
-            columns=columns, filter=filter_str, limit=limit, offset=offset
+            columns=columns,
+            filter=filter_str,
+            limit=limit,
+            offset=offset,
+            with_row_id=with_row_id,
         )
         from .dataset import LanceScanner
 
@@ -256,9 +261,14 @@ class LanceFragment(pa.dataset.Fragment):
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
         offset: Optional[int] = None,
+        with_row_id: bool = False,
     ) -> Iterator[pa.RecordBatch]:
         return self.scanner(
-            columns=columns, filter=filter, limit=limit, offset=offset
+            columns=columns,
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            with_row_id=with_row_id,
         ).to_batches()
 
     def to_table(
@@ -267,9 +277,14 @@ class LanceFragment(pa.dataset.Fragment):
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
         offset: Optional[int] = None,
+        with_row_id: bool = False,
     ) -> pa.Table:
         return self.scanner(
-            columns=columns, filter=filter, limit=limit, offset=offset
+            columns=columns,
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            with_row_id=with_row_id,
         ).to_table()
 
     def add_columns(
