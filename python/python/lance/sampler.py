@@ -127,7 +127,7 @@ def maybe_sample(
     batch_size : int, optional
         The batch size to use when loading the data, by default 10240.
     max_takes : int, optional
-        The maximum number of takes to perform, by default 8194.
+        The maximum number of takes to perform, by default 2048.
         This is employed to minimize the number of random reads necessary for sampling.
         A sufficiently large value can provide an effective random sample without
         the need for excessive random reads.
@@ -151,8 +151,12 @@ def maybe_sample(
             yield from _efficient_sample(dataset, n, columns, batch_size, max_takes)
         else:
             choices = np.random.choice(len(dataset), n, replace=False)
-            tbl = dataset.take(choices, columns=columns).combine_chunks()
-            yield tbl.to_batches()[0]
+            idx = 0
+            while idx < len(choices):
+                end = min(idx + batch_size, len(choices))
+                tbl = dataset.take(choices[idx:end], columns=columns).combine_chunks()
+                yield tbl.to_batches()[0]
+                idx += batch_size
 
 
 T = TypeVar("T")
