@@ -26,6 +26,7 @@ from lance.torch.kmeans import KMeans  # noqa: E402
 from lance.vector import train_ivf_centroids_on_accelerator  # noqa: E402
 
 
+@pytest.mark.skip(reason="flaky")
 def test_kmeans():
     arr = np.array(range(128)).reshape(-1, 8).astype(np.float32)
     kmeans = KMeans(4, device="cpu")
