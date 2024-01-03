@@ -17,6 +17,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from lance.torch.distance import pairwise_l2  # noqa: E402
+
 
 def test_cosine_distance():
     from lance.torch.distance import cosine_distance
@@ -125,3 +127,33 @@ def test_large_l2_distance_cuda():
     )
     assert part_ids.shape == (1024 * 100,)
     assert dist.shape == (1024 * 100,)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.cuda is not available")
+def test_l2_distance_f16_bf16_cuda():
+    DIM = 32
+    x = torch.rand(128, DIM, dtype=torch.float16).to("cuda")
+    y = torch.rand(512, DIM, dtype=torch.float16).to("cuda")
+
+    dists = pairwise_l2(x, y)
+    assert dists.shape == (128, 512)
+
+    x = x.type(torch.bfloat16)
+    y = y.type(torch.bfloat16)
+    dists = pairwise_l2(x, y)
+    assert dists.shape == (128, 512)
+
+
+def test_l2_distance_f16_bf16_cpu():
+    DIM = 32
+    # Make sure it happens on CPU
+    x = torch.rand(128, DIM, dtype=torch.float16).to("cpu")
+    y = torch.rand(512, DIM, dtype=torch.float16).to("cpu")
+
+    dists = pairwise_l2(x, y)
+    assert dists.shape == (128, 512)
+
+    x = x.type(torch.bfloat16)
+    y = y.type(torch.bfloat16)
+    dists = pairwise_l2(x, y)
+    assert dists.shape == (128, 512)
