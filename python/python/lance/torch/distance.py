@@ -55,7 +55,7 @@ def pairwise_cosine(
             f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
         )
     if y2 is None:
-        y2 = torch.linalg.norm(y, dim=1)
+        y2: torch.Tensor = torch.linalg.norm(y, dim=1)
     return _pairwise_cosine(x, y, y2)
 
 
@@ -127,7 +127,7 @@ def cosine_distance(
 def pairwise_l2(
     x: torch.Tensor, y: torch.Tensor, y2: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    """Compute pair-wise L2 distance between x and y.
+    """Compute pair-wise L2 distances between x and y.
 
     Parameters
     ----------
@@ -146,6 +146,16 @@ def pairwise_l2(
         raise ValueError(
             f"x and y must be 2-D matrix, got: x.shape={x.shape}, y.shape={y.shape}"
         )
+    if x.dtype != y.dtype or (y2 is not None and x.dtype != y2.dtype):
+        raise ValueError("pairwise_l2 data types do not match")
+    origin_dtype = x.dtype
+    if x.device == torch.device("cpu") and x.dtype in [torch.float16]:
+        # Pytorch does not support `x @ y.T` for float16 on CPU
+        x = x.type(torch.float32)
+        y = y.type(torch.float32)
+        if y2 is not None:
+            y2 = y2.type(torch.float32)
+
     if y2 is None:
         y2 = (y * y).sum(dim=1)
     x2 = (x * x).sum(dim=1)
@@ -155,7 +165,7 @@ def pairwise_l2(
         + y2.broadcast_to(x2.shape[0], y2.shape[0])
         - 2 * xy
     )
-    return dists
+    return dists.type(origin_dtype)
 
 
 @torch.jit.script
