@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 import contextlib
+import logging
 from multiprocessing import Process, Queue, Value
 from typing import Callable, Iterable
 
@@ -23,9 +24,10 @@ def _worker_ep(
     dataset_creator: Callable[[], IterableDataset],
     queue: Queue,
     shutdown: Value,
-):
+) -> None:
     dataset = dataset_creator()
     while not shutdown.value:
+        # Allow to reuse the dataset to be iterated multiple times.
         for item in dataset:
             # this helps us stop the worker process as soon as possible
             if shutdown.value:
@@ -33,8 +35,8 @@ def _worker_ep(
             queue.put(item)
         queue.put(None)
 
-    # put one last None so that the iterator knows to stop
-    queue.put(None)
+    # No more data to the queue.
+    queue.close()
 
 
 # This class is similar to torch.utils.data.Dataloader
@@ -71,11 +73,14 @@ class AsyncDataset(IterableDataset):
             yield val
 
     def close(self):
-        self.shutdown.value = True
+        with self.shutdown.get_lock():
+            self.shutdown.value = True
+
         try:
             for _ in self:
                 pass
-        except Exception:
+        except Exception as e:
+            logging.exception(e)
             pass
         self.queue.close()
         self.worker.join()

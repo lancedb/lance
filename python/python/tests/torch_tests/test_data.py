@@ -33,8 +33,24 @@ def test_iter_over_dataset(tmp_path):
 
     ds = lance.write_dataset(tbl, tmp_path / "data.lance", max_rows_per_group=32)
 
+    # test when sample size is smaller than max_takes
+    torch_ds_small = LanceDataset(
+        ds, batch_size=256, samples=1024, columns=["ids", "vec"], cache=True
+    )
+
+    total_rows = 0
+    for batch in torch_ds_small:
+        assert set(batch.keys()) == {"ids", "vec"}
+        # row groups of 32 can be batched into 256 exactly.
+        assert batch["vec"].shape[0] == 256
+        total_rows += batch["vec"].shape[0]
+        assert batch["ids"].dtype == torch.int32
+        assert batch["vec"].shape[1] == 32
+    assert total_rows == 1024
+
+    # test when sample size is greater than max_takes
     torch_ds = LanceDataset(
-        ds, batch_size=256, samples=2048, columns=["ids", "vec"], cache=True
+        ds, batch_size=256, samples=4096, columns=["ids", "vec"], cache=True
     )
 
     total_rows = 0
@@ -45,9 +61,18 @@ def test_iter_over_dataset(tmp_path):
         total_rows += batch["vec"].shape[0]
         assert batch["ids"].dtype == torch.int32
         assert batch["vec"].shape[1] == 32
-    assert total_rows == 2048
+    assert total_rows == 4096
 
     shutil.rmtree(tmp_path / "data.lance")
+
+    total_rows = 0
+    # it should read from cache this time.
+    for batch in torch_ds_small:
+        assert set(batch.keys()) == {"ids", "vec"}
+        assert batch["ids"].dtype == torch.int32
+        total_rows += batch["vec"].shape[0]
+        assert batch["vec"].shape[1] == 32
+    assert total_rows == 1024
 
     total_rows = 0
     # it should read from cache this time.
@@ -56,4 +81,4 @@ def test_iter_over_dataset(tmp_path):
         assert batch["ids"].dtype == torch.int32
         total_rows += batch["vec"].shape[0]
         assert batch["vec"].shape[1] == 32
-    assert total_rows == 2048
+    assert total_rows == 4096

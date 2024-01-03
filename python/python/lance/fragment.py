@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, List, Optional, Union
 
 try:
     import pandas as pd
@@ -64,7 +64,7 @@ class FragmentMetadata:
         """Reconstruct :class:`FragmentMetadata` from a JSON blob"""
         return FragmentMetadata(json_data)
 
-    def data_files(self) -> Iterator[str]:
+    def data_files(self) -> Iterable[str]:
         """Return the data files of the fragment"""
         return self._metadata.data_files()
 
@@ -227,6 +227,16 @@ class LanceFragment(pa.dataset.Fragment):
         :meth:`count_rows` instead.
         """
         return self._fragment.physical_rows
+
+    @property
+    def physical_schema(self) -> pa.Schema:
+        # override the pyarrow super class method otherwise causes segfault
+        raise NotImplementedError("Not implemented yet for LanceFragment")
+
+    @property
+    def partition_expression(self) -> pa.Schema:
+        # override the pyarrow super class method otherwise causes segfault
+        raise NotImplementedError("Not implemented yet for LanceFragment")
 
     def head(self, num_rows: int) -> pa.Table:
         return self.scanner(limit=num_rows).to_table()

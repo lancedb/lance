@@ -315,12 +315,18 @@ class LanceDataset(pa.dataset.Dataset):
             Whether to read the fragments and batches in order. If false,
             throughput may be higher, but batches will be returned out of order
             and memory use might increase.
+        prefilter: bool, default False
+            Run filter before the vector search.
+        with_row_id: bool, default False
+            Return physical row ID.
+        use_stats: bool, default True
+            Use stats pushdown during filters.
 
         Notes
         -----
-        For now, if BOTH filter and nearest is specified, then:
+        If BOTH filter and nearest is specified, then:
         1. nearest is executed first.
-        2. The results are filtered afterwards.
+        2. The results are filtered afterward, unless pre-filter sets to True.
         """
         return self.scanner(
             columns=columns,
