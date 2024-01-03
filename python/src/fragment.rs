@@ -180,6 +180,7 @@ impl FileFragment {
         filter: Option<String>,
         limit: Option<i64>,
         offset: Option<i64>,
+        with_row_id: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
         if let Some(cols) = columns {
@@ -196,6 +197,10 @@ impl FileFragment {
         scanner
             .limit(limit, offset)
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        if with_row_id.unwrap_or(false) {
+            scanner.with_row_id();
+        }
 
         let scn = Arc::new(scanner);
         Ok(Scanner::new(scn))
