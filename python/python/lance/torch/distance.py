@@ -149,7 +149,7 @@ def pairwise_l2(
     if x.dtype != y.dtype or (y2 is not None and x.dtype != y2.dtype):
         raise ValueError("pairwise_l2 data types do not match")
     origin_dtype = x.dtype
-    if x.device == torch.device("cpu") and x.dtype in [torch.float16]:
+    if x.device == torch.device("cpu") and x.dtype == torch.float16:
         # Pytorch does not support `x @ y.T` for float16 on CPU
         x = x.type(torch.float32)
         y = y.type(torch.float32)
