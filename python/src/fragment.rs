@@ -197,7 +197,7 @@ impl FileFragment {
         scanner
             .limit(limit, offset)
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        
+
         if with_row_id.unwrap_or(false) {
             scanner.with_row_id();
         }
