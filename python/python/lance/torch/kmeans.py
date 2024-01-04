@@ -240,7 +240,9 @@ class KMeans:
         return total_dist
 
     def _transform(
-        self, data: torch.Tensor, y2: Optional[torch.Tensor]
+        self,
+        data: torch.Tensor,
+        y2: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.metric == "cosine":
             data = torch.nn.functional.normalize(data)
