@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 
+import logging
 from typing import Optional, Tuple
 
 import torch
@@ -124,6 +125,7 @@ def cosine_distance(
     raise RuntimeError("Cosine distance out of memory")
 
 
+@torch.jit.script
 def pairwise_l2(
     x: torch.Tensor, y: torch.Tensor, y2: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
@@ -214,6 +216,7 @@ def l2_distance(
             return _l2_distance(vectors, centroids, split_size=split)
         except RuntimeError as e:  # noqa: PERF203
             if "CUDA out of memory" in str(e):
+                logging.warning("L2: batch split=%s out of memory", split)
                 split //= 2
                 continue
             raise

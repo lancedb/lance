@@ -114,10 +114,14 @@ class KMeans:
 
     def _random_init(self, data: Union[torch.Tensor, np.ndarray]):
         """Random centroid initialization."""
-        indices = np.random.choice(data.shape[0], self.k)
-        if isinstance(data, np.ndarray):
-            data = torch.from_numpy(data)
-        self.centroids = data[indices]
+        if self.centroids is not None:
+            logging.debug("KMeans centroids already initialized")
+            return
+        if isinstance(data, (np.ndarray, torch.Tensor)):
+            indices = np.random.choice(data.shape[0], self.k)
+            if isinstance(data, np.ndarray):
+                data = torch.from_numpy(data)
+            self.centroids = data[indices]
 
     def fit(
         self,
@@ -133,6 +137,8 @@ class KMeans:
         start = time.time()
         if isinstance(data, pa.FixedSizeListArray):
             data = np.stack(data.to_numpy(zero_copy_only=False))
+        elif isinstance(data, pa.FixedShapeTensorArray):
+            data = data.to_numpy_ndarray()
         if isinstance(data, (np.ndarray, torch.Tensor)):
             self._random_init(data)
             data = TensorDataset(data, batch_size=4096)
