@@ -114,10 +114,14 @@ class KMeans:
 
     def _random_init(self, data: Union[torch.Tensor, np.ndarray]):
         """Random centroid initialization."""
-        indices = np.random.choice(data.shape[0], self.k)
-        if isinstance(data, np.ndarray):
-            data = torch.from_numpy(data)
-        self.centroids = data[indices]
+        if self.centroids is not None:
+            logging.debug("KMeans centroids already initialized")
+            return
+        if isinstance(data, (np.ndarray, torch.Tensor)):
+            indices = np.random.choice(data.shape[0], self.k)
+            if isinstance(data, np.ndarray):
+                data = torch.from_numpy(data)
+            self.centroids = data[indices]
 
     def fit(
         self,
@@ -133,9 +137,11 @@ class KMeans:
         start = time.time()
         if isinstance(data, pa.FixedSizeListArray):
             data = np.stack(data.to_numpy(zero_copy_only=False))
+        elif isinstance(data, pa.FixedShapeTensorArray):
+            data = data.to_numpy_ndarray()
         if isinstance(data, (np.ndarray, torch.Tensor)):
             self._random_init(data)
-            data = TensorDataset(data, batch_size=4096)
+            data = TensorDataset(data, batch_size=10240)
 
         assert self.centroids is not None
         self.centroids = self.centroids.to(self.device)
@@ -176,8 +182,8 @@ class KMeans:
     @staticmethod
     def _count_rows_in_clusters(part_ids: List[torch.Tensor], k: int) -> torch.Tensor:
         max_len = max([len(ids) for ids in part_ids])
-        ones = torch.ones(max_len).to(part_ids[0].device)
-        num_rows = torch.zeros(k).to(part_ids[0].device)
+        ones = torch.ones(max_len, device=part_ids[0].device)
+        num_rows = torch.zeros(k, device=part_ids[0].device)
         for part_id in part_ids:
             num_rows.scatter_add_(0, part_id, ones)
         return num_rows
@@ -205,6 +211,7 @@ class KMeans:
 
         new_centroids = torch.zeros_like(self.centroids, device=self.device)
         counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
+        ones = torch.ones(1024 * 16, device=self.device)
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
                 logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
@@ -213,10 +220,11 @@ class KMeans:
             chunk = chunk.to(self.device)
             ids, dists = self._transform(chunk)
             total_dist += dists.sum().item()
-            ones = torch.ones(len(ids), device=self.device)
+            if ones.shape[0] < ids.shape[0]:
+                ones = torch.ones(len(ids), out=ones, device=self.device)
 
             new_centroids.index_add_(0, ids, chunk)
-            counts_per_part.index_add_(0, ids, ones)
+            counts_per_part.index_add_(0, ids, ones[: ids.shape[0]])
             del ids
             del dists
             del chunk
