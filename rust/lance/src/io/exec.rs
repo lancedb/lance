@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod knn;
+mod optimizer;
 mod planner;
 mod projection;
 mod pushdown_scan;

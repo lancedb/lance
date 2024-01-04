@@ -26,6 +26,7 @@ use datafusion::common::DFSchema;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{GetFieldAccess, GetIndexedField, ScalarFunctionDefinition};
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::sql::sqlparser::ast::{
     Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr,
     Function, FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
@@ -557,6 +558,10 @@ impl Planner {
                 refine_expr: Some(logical_expr),
             })
         }
+    }
+
+    pub fn get_physical_optimizer() -> PhysicalOptimizer {
+        PhysicalOptimizer::with_rules(vec![Arc::new(crate::io::exec::optimizer::CoalesceTake)])
     }
 }
 

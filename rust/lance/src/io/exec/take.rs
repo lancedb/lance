@@ -263,12 +263,17 @@ impl ExecutionPlan for TakeExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(
+                "TakeExec wrong number of children".to_string(),
+            ));
+        }
         Ok(Arc::new(Self {
             dataset: self.dataset.clone(),
             extra_schema: self.extra_schema.clone(),
-            input: _children[0].clone(),
+            input: children[0].clone(),
             output_schema: self.output_schema.clone(),
             batch_readahead: self.batch_readahead,
         }))
