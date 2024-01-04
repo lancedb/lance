@@ -212,14 +212,15 @@ class KMeans:
         new_centroids = torch.zeros_like(self.centroids, device=self.device)
         counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
         ones = torch.ones(1024 * 16, device=self.device)
+        y2 = (self.centroids * self.centroids).sum(dim=1)
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
                 logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
             chunk: torch.Tensor = chunk
             dtype = chunk.dtype
             chunk = chunk.to(self.device)
-            ids, dists = self._transform(chunk)
-            total_dist += dists.sum().item()
+            ids, dists = self._transform(chunk, y2=y2)
+            total_dist += dists.nansum().item()
             if ones.shape[0] < ids.shape[0]:
                 ones = torch.ones(len(ids), out=ones, device=self.device)
 
@@ -238,10 +239,12 @@ class KMeans:
         )
         return total_dist
 
-    def _transform(self, data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _transform(
+        self, data: torch.Tensor, y2: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.metric == "cosine":
             data = torch.nn.functional.normalize(data)
-        return self.dist_func(data, self.centroids)
+        return self.dist_func(data, self.centroids, y2=y2)
 
     def transform(
         self, data: Union[pa.Array, np.ndarray, torch.Tensor]
