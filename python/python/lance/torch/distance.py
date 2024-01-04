@@ -216,7 +216,11 @@ def l2_distance(
             return _l2_distance(vectors, centroids, split_size=split)
         except RuntimeError as e:  # noqa: PERF203
             if "CUDA out of memory" in str(e):
-                logging.warning("L2: batch split=%s out of memory", split)
+                logging.warning(
+                    "L2: batch split=%s out of memory, attempt to use reduced split %s",
+                    split,
+                    split // 2,
+                )
                 split //= 2
                 continue
             raise
