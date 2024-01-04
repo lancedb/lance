@@ -190,7 +190,7 @@ class LanceDataset(pa.dataset.Dataset):
                     "refine_factor": 1
                 }
         batch_size: int, default None
-            The number of rows to fetch per batch.
+            The max size of batches returned.
         batch_readahead: int, optional
             The number of batches to read ahead.
         fragment_readahead: int, optional
