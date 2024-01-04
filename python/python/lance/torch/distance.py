@@ -172,7 +172,10 @@ def pairwise_l2(
 
 @torch.jit.script
 def _l2_distance(
-    x: torch.Tensor, y: torch.Tensor, split_size: int
+    x: torch.Tensor,
+    y: torch.Tensor,
+    split_size: int,
+    y2: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if len(x.shape) != 2 or len(y.shape) != 2:
         raise ValueError(
@@ -182,20 +185,27 @@ def _l2_distance(
     part_ids = []
     distances = []
 
-    y2 = (y * y).sum(dim=1)
+    if y2 is None:
+        y2 = (y * y).sum(dim=1)
     for sub_vectors in x.split(split_size):
         dists = pairwise_l2(sub_vectors, y, y2)
-        idx = torch.argmin(dists, dim=1, keepdim=True)
-        min_dists = dists.take_along_dim(idx, dim=1)
-        idx = torch.where(min_dists.isnan(), -1, idx)
+        min_dists, idx = torch.min(dists, dim=1, keepdim=True)
         part_ids.append(idx)
         distances.append(min_dists)
 
-    return torch.cat(part_ids).reshape(-1), torch.cat(distances).reshape(-1)
+    if len(part_ids) == 1:
+        idx, dists = part_ids[0].reshape(-1), distances[0].reshape(-1)
+    else:
+        idx, dists = torch.cat(part_ids).reshape(-1), torch.cat(distances).reshape(-1)
+
+    idx = torch.where(dists.isnan(), -1, idx)
+    return idx, dists
 
 
 def l2_distance(
-    vectors: torch.Tensor, centroids: torch.Tensor
+    vectors: torch.Tensor,
+    centroids: torch.Tensor,
+    y2: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pair-wise L2 / Euclidean distance between two 2-D Tensors.
 
@@ -213,7 +223,7 @@ def l2_distance(
     split = _suggest_batch_size(centroids)
     while split >= 256:
         try:
-            return _l2_distance(vectors, centroids, split_size=split)
+            return _l2_distance(vectors, centroids, split_size=split, y2=y2)
         except RuntimeError as e:  # noqa: PERF203
             if "CUDA out of memory" in str(e):
                 logging.warning(
