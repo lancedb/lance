@@ -1065,12 +1065,13 @@ class LanceDataset(pa.dataset.Dataset):
                             f"Ivf centroids must be 2D array: (clusters, dim), "
                             f"got {ivf_centroids.shape}"
                         )
-                    if ivf_centroids.dtype != np.float32:
+                    if ivf_centroids.dtype not in [np.float16, np.float32, np.float64]:
                         raise TypeError(
-                            f"IVF centroids must be float32, got {ivf_centroids.dtype}"
+                            "IVF centroids must be floating number"
+                            + f"got {ivf_centroids.dtype}"
                         )
                     dim = ivf_centroids.shape[1]
-                    values = pa.array(ivf_centroids.reshape(-1), type=pa.float32())
+                    values = pa.array(ivf_centroids.reshape(-1))
                     ivf_centroids = pa.FixedSizeListArray.from_arrays(values, dim)
                 # Convert it to RecordBatch because Rust side only accepts RecordBatch.
                 ivf_centroids_batch = pa.RecordBatch.from_arrays(
