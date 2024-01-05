@@ -183,7 +183,7 @@ def train_ivf_centroids_on_accelerator(
         )
         kmeans.fit(ds)
 
-    centroids = kmeans.centroids.cpu().float().numpy()
+    centroids = kmeans.centroids.cpu().numpy()
 
     with tempfile.NamedTemporaryFile(delete=False) as f:
         np.save(f, centroids)
