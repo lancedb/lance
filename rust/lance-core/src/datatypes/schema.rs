@@ -363,44 +363,6 @@ impl Schema {
         schema.set_field_id();
         Ok(schema)
     }
-
-    /// Create a new schema that is a union of the fields of these two schemas.
-    ///
-    /// Unlike merge, this preserves the field ids on both sides.
-    ///
-    /// Will error if there is a conflict in the schemas. For example, if the
-    /// two schemas have a field with the same id but different types. Also
-    /// disallows different ids for the same name.
-    pub fn union(&self, other: Self) -> Result<Self> {
-        let mut merged_fields: Vec<Field> = vec![];
-        for mut field in self.fields.iter().cloned() {
-            if let Some(other_field) = other.field(&field.name) {
-                // if both are struct types, then merge the fields
-                field.merge(other_field)?;
-            }
-            merged_fields.push(field);
-        }
-
-        // we already checked for overlap so just need to add new top-level fields
-        // in the incoming schema
-        for field in other.fields.as_slice() {
-            if !merged_fields.iter().any(|f| f.name == field.name) {
-                merged_fields.push(field.clone());
-            }
-        }
-        let metadata = self
-            .metadata
-            .iter()
-            .chain(other.metadata.iter())
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let schema = Self {
-            fields: merged_fields,
-            metadata,
-        };
-        schema.validate()?;
-        Ok(schema)
-    }
 }
 
 impl PartialEq for Schema {

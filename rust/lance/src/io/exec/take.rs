@@ -208,7 +208,6 @@ impl DisplayAs for TakeExec {
 }
 
 impl TakeExec {
-    // TODO: refactor this so it's easy to merge two TakeExecs.
     /// Create a [`TakeExec`] node.
     ///
     /// - dataset: the dataset to read from
@@ -229,9 +228,11 @@ impl TakeExec {
         let input_schema = Schema::try_from(input.schema().as_ref())?;
         let output_schema = input_schema.merge(extra_schema.as_ref())?;
 
+        let remaining_schema = extra_schema.exclude(&input_schema)?;
+
         Ok(Self {
             dataset,
-            extra_schema,
+            extra_schema: Arc::new(remaining_schema),
             input,
             output_schema,
             batch_readahead,
@@ -291,13 +292,9 @@ impl ExecutionPlan for TakeExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
-
-        let input_schema = Schema::try_from(self.input.schema().as_ref())?;
-        let remaining_schema = self.extra_schema.exclude(&input_schema)?;
-
         Ok(Box::pin(Take::new(
             self.dataset.clone(),
-            Arc::new(remaining_schema),
+            self.extra_schema.clone(),
             self.schema(),
             input_stream,
             self.batch_readahead,
