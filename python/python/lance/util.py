@@ -12,8 +12,10 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from __future__ import annotations
+
 from datetime import datetime, timedelta
-from typing import Literal, Optional, Union
+from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import pyarrow as pa
 
@@ -22,7 +24,8 @@ from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .lance import _KMeans
 
-ts_types = Union[datetime, pd.Timestamp, str]
+if TYPE_CHECKING:
+    ts_types = Union[datetime, pd.Timestamp, str]
 
 try:
     from pyarrow import FixedShapeTensorType

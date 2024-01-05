@@ -51,29 +51,28 @@ from .lance import __version__ as __version__
 from .optimize import Compaction
 from .util import td_to_micros
 
-ReaderLike = Union[
-    pd.Timestamp,
-    pa.Table,
-    pa.dataset.Dataset,
-    pa.dataset.Scanner,
-    Iterable[RecordBatch],
-    pa.RecordBatchReader,
-]
-
-QueryVectorLike = Union[
-    pd.Series,
-    pa.Array,
-    pa.Scalar,
-    np.ndarray,
-    Iterable[float],
-]
-
-
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
 
     from .commit import CommitLock
     from .progress import FragmentWriteProgress
+
+    ReaderLike = Union[
+        pd.Timestamp,
+        pa.Table,
+        pa.dataset.Dataset,
+        pa.dataset.Scanner,
+        Iterable[RecordBatch],
+        pa.RecordBatchReader,
+    ]
+
+    QueryVectorLike = Union[
+        pd.Series,
+        pa.Array,
+        pa.Scalar,
+        np.ndarray,
+        Iterable[float],
+    ]
 
 
 class LanceDataset(pa.dataset.Dataset):

@@ -12,12 +12,9 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from datetime import datetime
-from pathlib import Path
-from typing import Optional, Union
+from __future__ import annotations
 
-from lance.commit import CommitLock
-from lance.dependencies import pandas as pd
+from typing import TYPE_CHECKING, Optional, Union
 
 from .dataset import (
     LanceDataset,
@@ -30,7 +27,14 @@ from .fragment import FragmentMetadata, LanceFragment
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
-ts_types = Union[datetime, pd.Timestamp, str]
+if TYPE_CHECKING:
+    from datetime import datetime
+    from pathlib import Path
+
+    from lance.commit import CommitLock
+    from lance.dependencies import pandas as pd
+
+    ts_types = Union[datetime, pd.Timestamp, str]
 
 
 __all__ = [
