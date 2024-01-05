@@ -207,54 +207,54 @@ def compute_partitions(
 
     from lance.torch.data import LanceDataset as PytorchLanceDataset
 
-    with PytorchLanceDataset(
+    torch_ds = PytorchLanceDataset(
         dataset,
         batch_size=batch_size,
         with_row_id=True,
         columns=[column],
-    ) as torch_ds:
-        output_schema = pa.schema(
-            [pa.field("row_id", pa.uint64()), pa.field("partition", pa.uint32())]
-        )
+    )
+    output_schema = pa.schema(
+        [pa.field("row_id", pa.uint64()), pa.field("partition", pa.uint32())]
+    )
 
-        def _partition_assignment() -> Iterable[pa.RecordBatch]:
-            with torch.no_grad():
-                for batch in torch_ds:
-                    batch: Dict[str, torch.Tensor] = batch
-                    vecs = batch[column].reshape(-1, kmeans.centroids.shape[1])
+    def _partition_assignment() -> Iterable[pa.RecordBatch]:
+        with torch.no_grad():
+            for batch in torch_ds:
+                batch: Dict[str, torch.Tensor] = batch
+                vecs = batch[column].reshape(-1, kmeans.centroids.shape[1])
 
-                    vecs.to(kmeans.device)
-                    partitions = kmeans.transform(vecs).cpu().numpy()
-                    ids = batch["_rowid"].reshape(-1).cpu().numpy()
+                vecs.to(kmeans.device)
+                partitions = kmeans.transform(vecs).cpu().numpy()
+                ids = batch["_rowid"].reshape(-1).cpu().numpy()
 
-                    # this is expected to be true, so just assert
-                    assert vecs.shape[0] == ids.shape[0]
+                # this is expected to be true, so just assert
+                assert vecs.shape[0] == ids.shape[0]
 
-                    # Ignore any invalid vectors.
-                    ids = ids[partitions >= 0]
-                    partitions = partitions[partitions >= 0]
-                    part_batch = pa.RecordBatch.from_arrays(
-                        [ids, partitions],
-                        schema=output_schema,
+                # Ignore any invalid vectors.
+                ids = ids[partitions >= 0]
+                partitions = partitions[partitions >= 0]
+                part_batch = pa.RecordBatch.from_arrays(
+                    [ids, partitions],
+                    schema=output_schema,
+                )
+                if len(part_batch) < len(ids):
+                    logging.warning(
+                        "%s vectors are ignored during partition assignment",
+                        len(part_batch) - len(ids),
                     )
-                    if len(part_batch) < len(ids):
-                        logging.warning(
-                            "%s vectors are ignored during partition assignment",
-                            len(part_batch) - len(ids),
-                        )
 
-                    yield part_batch
+                yield part_batch
 
-        rbr = pa.RecordBatchReader.from_batches(
-            output_schema, tqdm(_partition_assignment())
-        )
+    rbr = pa.RecordBatchReader.from_batches(
+        output_schema, tqdm(_partition_assignment())
+    )
 
-        fragments = write_fragments(
-            rbr,
-            dataset.uri,
-            schema=output_schema,
-            max_rows_per_file=dataset.count_rows(),
-        )
+    fragments = write_fragments(
+        rbr,
+        dataset.uri,
+        schema=output_schema,
+        max_rows_per_file=dataset.count_rows(),
+    )
     assert len(fragments) == 1
 
     files = fragments[0].data_files()
