@@ -209,7 +209,11 @@ class KMeans:
         """
         total_dist = 0
 
-        new_centroids = torch.zeros_like(self.centroids, device=self.device)
+        # Use float32 to accumulate centroids, esp. if the vectors are
+        # float16 / bfloat16 types.
+        new_centroids = torch.zeros_like(
+            self.centroids, device=self.device, dtype=torch.float32
+        )
         counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
         ones = torch.ones(1024 * 16, device=self.device)
         y2 = (self.centroids * self.centroids).sum(dim=1)
@@ -220,6 +224,12 @@ class KMeans:
             dtype = chunk.dtype
             chunk = chunk.to(self.device)
             ids, dists = self._transform(chunk, y2=y2)
+
+            valid_mask = ids >= 0
+            if torch.any(valid_mask):
+                chunk = chunk[ids >= 0]
+                ids = ids[ids >= 0]
+
             total_dist += dists.nansum().item()
             if ones.shape[0] < ids.shape[0]:
                 ones = torch.ones(len(ids), out=ones, device=self.device)
