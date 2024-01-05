@@ -3271,7 +3271,7 @@ mod test {
         dataset.append_new_data().await?;
         assert_plan_equals(
             &dataset.dataset,
-            |scan| Ok(scan.nearest("vec", &q, 5)?),
+            |scan| scan.nearest("vec", &q, 5),
             // TODO: we could write an optimizer rule to eliminate the last Projection
             // by doing it as part of the last Take. This would likely have minimal impact though.
             "Projection: fields=[i, s, vec, _distance]
