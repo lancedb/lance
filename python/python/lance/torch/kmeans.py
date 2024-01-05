@@ -227,8 +227,8 @@ class KMeans:
 
             valid_mask = ids >= 0
             if torch.any(valid_mask):
-                chunk = chunk[ids >= 0]
-                ids = ids[ids >= 0]
+                chunk = chunk[valid_mask]
+                ids = ids[valid_mask]
 
             total_dist += dists.nansum().item()
             if ones.shape[0] < ids.shape[0]:
