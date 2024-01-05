@@ -17,7 +17,7 @@ import logging
 import re
 import tempfile
 from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Literal, Optional, Union
 
 import numpy as np
 import pyarrow as pa
@@ -135,10 +135,11 @@ def train_ivf_centroids_on_accelerator(
     dataset: LanceDataset,
     column: str,
     k: int,
-    metric_type: str,
+    metric_type: Literal["l2", "cosine", "dot"],
     accelerator: Union[str, "torch.Device"],
     *,
     sample_rate: int = 256,
+    max_iters: int = 50,
 ) -> (np.ndarray, str):
     """Use accelerator (GPU or MPS) to train kmeans."""
     if isinstance(accelerator, str) and (
@@ -154,7 +155,6 @@ def train_ivf_centroids_on_accelerator(
     # Pytorch installation warning will be raised here.
     import torch
 
-    from lance.torch.async_dataset import async_dataset
     from lance.torch.data import LanceDataset as TorchDataset
 
     from .torch.kmeans import KMeans
@@ -176,12 +176,15 @@ def train_ivf_centroids_on_accelerator(
         cache=True,
     )
 
-    with async_dataset(ds) as ds:
-        logging.info("Training IVF partitions using GPU(%s)", accelerator)
-        kmeans = KMeans(
-            k, metric=metric_type, device=accelerator, centroids=init_centroids
-        )
-        kmeans.fit(ds)
+    logging.info("Training IVF partitions using GPU(%s)", accelerator)
+    kmeans = KMeans(
+        k,
+        max_iters=max_iters,
+        metric=metric_type,
+        device=accelerator,
+        centroids=init_centroids,
+    )
+    kmeans.fit(ds)
 
     centroids = kmeans.centroids.cpu().numpy()
 
@@ -202,17 +205,14 @@ def compute_partitions(
     """Compute partitions using GPU kmeans."""
     import torch
 
-    from lance.torch.async_dataset import async_dataset
     from lance.torch.data import LanceDataset as PytorchLanceDataset
 
-    torch_ds = partial(
-        PytorchLanceDataset,
+    with PytorchLanceDataset(
         dataset,
         batch_size=batch_size,
         with_row_id=True,
         columns=[column],
-    )
-    with async_dataset(torch_ds) as torch_ds:
+    ) as torch_ds:
         output_schema = pa.schema(
             [pa.field("row_id", pa.uint64()), pa.field("partition", pa.uint32())]
         )
