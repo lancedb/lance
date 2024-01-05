@@ -208,6 +208,7 @@ impl DisplayAs for TakeExec {
 }
 
 impl TakeExec {
+    // TODO: refactor this so it's easy to merge two TakeExecs.
     /// Create a [`TakeExec`] node.
     ///
     /// - dataset: the dataset to read from
@@ -228,11 +229,9 @@ impl TakeExec {
         let input_schema = Schema::try_from(input.schema().as_ref())?;
         let output_schema = input_schema.merge(extra_schema.as_ref())?;
 
-        let remaining_schema = extra_schema.exclude(&input_schema)?;
-
         Ok(Self {
             dataset,
-            extra_schema: Arc::new(remaining_schema),
+            extra_schema,
             input,
             output_schema,
             batch_readahead,
@@ -261,6 +260,7 @@ impl ExecutionPlan for TakeExec {
         vec![self.input.clone()]
     }
 
+    /// This preserves the output schema.
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -270,13 +270,19 @@ impl ExecutionPlan for TakeExec {
                 "TakeExec wrong number of children".to_string(),
             ));
         }
-        Ok(Arc::new(Self {
-            dataset: self.dataset.clone(),
-            extra_schema: self.extra_schema.clone(),
-            input: children[0].clone(),
-            output_schema: self.output_schema.clone(),
-            batch_readahead: self.batch_readahead,
-        }))
+
+        let child = &children[0];
+
+        let extra_schema = self.output_schema.exclude(child.schema().as_ref())?;
+
+        let plan = Self::try_new(
+            self.dataset.clone(),
+            children[0].clone(),
+            Arc::new(extra_schema),
+            self.batch_readahead,
+        )?;
+
+        Ok(Arc::new(plan))
     }
 
     fn execute(
@@ -285,9 +291,13 @@ impl ExecutionPlan for TakeExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
+
+        let input_schema = Schema::try_from(self.input.schema().as_ref())?;
+        let remaining_schema = self.extra_schema.exclude(&input_schema)?;
+
         Ok(Box::pin(Take::new(
             self.dataset.clone(),
-            self.extra_schema.clone(),
+            Arc::new(remaining_schema),
             self.schema(),
             input_stream,
             self.batch_readahead,
@@ -437,5 +447,45 @@ mod tests {
             true,
         ));
         assert!(TakeExec::try_new(dataset, input, extra_schema, 10).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_with_new_children() -> Result<()> {
+        let dataset = create_dataset().await;
+
+        let input = Arc::new(LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            Arc::new(dataset.schema().project(&["i"])?),
+            10,
+            10,
+            4,
+            true,
+            false,
+            true,
+        ));
+        assert_eq!(input.schema().field_names(), vec!["i", ROW_ID],);
+        let take_exec = TakeExec::try_new(
+            dataset.clone(),
+            input.clone(),
+            Arc::new(dataset.schema().project(&["s"])?),
+            10,
+        )?;
+        assert_eq!(take_exec.schema().field_names(), vec!["i", ROW_ID, "s"],);
+        let outer_take = Arc::new(TakeExec::try_new(
+            dataset.clone(),
+            Arc::new(take_exec),
+            Arc::new(dataset.schema().project(&["f"])?),
+            10,
+        )?);
+        assert_eq!(
+            outer_take.schema().field_names(),
+            vec!["i", ROW_ID, "s", "f"],
+        );
+
+        // with_new_children should preserve the output schema.
+        let edited = outer_take.with_new_children(vec![input])?;
+        assert_eq!(edited.schema().field_names(), vec!["i", ROW_ID, "s", "f"],);
+        Ok(())
     }
 }

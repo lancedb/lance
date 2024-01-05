@@ -3237,11 +3237,13 @@ mod test {
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
-                scan.nearest("vec", &q, 17)?
+                Ok(scan
+                    .nearest("vec", &q, 17)?
                     .filter("i > 10")?
-                    .project(&["s", "vec"])
+                    .project(&["s", "vec"])?
+                    .with_row_id())
             },
-            "Projection: fields=[s, vec, _distance]
+            "Projection: fields=[s, vec, _distance, _rowid]
   Take: columns=\"_distance, _rowid, vec, i, s\"
     FilterExec: i@3 > 10
       Take: columns=\"_distance, _rowid, vec, i\"
