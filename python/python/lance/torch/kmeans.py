@@ -226,7 +226,7 @@ class KMeans:
             ids, dists = self._transform(chunk, y2=y2)
 
             valid_mask = ids >= 0
-            if torch.any(valid_mask):
+            if torch.any(~valid_mask):
                 chunk = chunk[valid_mask]
                 ids = ids[valid_mask]
 
@@ -234,7 +234,7 @@ class KMeans:
             if ones.shape[0] < ids.shape[0]:
                 ones = torch.ones(len(ids), out=ones, device=self.device)
 
-            new_centroids.index_add_(0, ids, chunk)
+            new_centroids.index_add_(0, ids, chunk.type(torch.float32))
             counts_per_part.index_add_(0, ids, ones[: ids.shape[0]])
             del ids
             del dists
