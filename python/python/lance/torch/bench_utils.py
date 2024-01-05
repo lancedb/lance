@@ -16,9 +16,10 @@
 
 from typing import Optional, Tuple, Union
 
-import numpy as np
 import pyarrow as pa
-import torch
+
+from lance.dependencies import _check_for_numpy, torch
+from lance.dependencies import numpy as np
 
 from .. import LanceDataset
 from . import preferred_device
@@ -89,7 +90,7 @@ def ground_truth(
     """
     device = preferred_device(device=device)
 
-    if isinstance(query, np.ndarray):
+    if _check_for_numpy(query) and isinstance(query, np.ndarray):
         query = torch.from_numpy(query)
     query = query.to(device)
     metric_type = metric_type.lower()

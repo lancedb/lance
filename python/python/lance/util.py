@@ -15,19 +15,14 @@
 from datetime import datetime, timedelta
 from typing import Literal, Optional, Union
 
-import numpy as np
 import pyarrow as pa
 
+from .dependencies import _check_for_numpy, _check_for_pandas
+from .dependencies import numpy as np
+from .dependencies import pandas as pd
 from .lance import _KMeans
 
-try:
-    import pandas as pd
-
-    ts_types = Union[datetime, pd.Timestamp, str]
-except ImportError:
-    pd = None
-    ts_types = Union[datetime, str]
-
+ts_types = Union[datetime, pd.Timestamp, str]
 
 try:
     from pyarrow import FixedShapeTensorType
@@ -41,7 +36,7 @@ except ImportError:
 
 def sanitize_ts(ts: ts_types) -> datetime:
     """Returns a python datetime object from various timestamp input types."""
-    if pd and isinstance(ts, str):
+    if _check_for_pandas(ts) and isinstance(ts, str):
         ts = pd.to_datetime(ts).to_pydatetime()
     elif isinstance(ts, str):
         try:
@@ -50,7 +45,7 @@ def sanitize_ts(ts: ts_types) -> datetime:
             raise ValueError(
                 f"Failed to parse timestamp string {ts}. Try installing Pandas."
             )
-    elif pd and isinstance(ts, pd.Timestamp):
+    elif _check_for_pandas(ts) and isinstance(ts, pd.Timestamp):
         ts = ts.to_pydatetime()
     elif not isinstance(ts, datetime):
         raise TypeError(f"Unrecognized version timestamp {ts} of type {type(ts)}")
@@ -146,7 +141,7 @@ class KMeans:
                     f"got {len(data.type.shape)}-D"
                 )
             return self._to_fixed_size_list(data.storage)
-        elif isinstance(data, np.ndarray):
+        elif _check_for_numpy(data) and isinstance(data, np.ndarray):
             if len(data.shape) != 2:
                 raise ValueError(
                     f"Numpy array must be a 2-D array, got {len(data.shape)}-D"

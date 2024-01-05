@@ -17,17 +17,15 @@ import logging
 import re
 import tempfile
 from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Union
+from typing import Any, Dict, Iterable, Optional, Union
 
-import numpy as np
 import pyarrow as pa
 from tqdm.auto import tqdm
 
 from . import LanceDataset
+from .dependencies import _check_for_numpy, torch
+from .dependencies import numpy as np
 from .fragment import write_fragments
-
-if TYPE_CHECKING:
-    import torch
 
 
 def _normalize_vectors(vectors, ndim):
@@ -110,7 +108,9 @@ def vec_to_table(
         vectors = _normalize_vectors(values, ndim)
         ids = pa.array(data.keys())
         arrays = [ids, vectors]
-    elif isinstance(data, (list, np.ndarray)):
+    elif isinstance(data, list) or (
+        _check_for_numpy(data) and isinstance(data, np.ndarray)
+    ):
         if names is None:
             names = ["vector"]
         elif isinstance(names, str):
@@ -123,7 +123,8 @@ def vec_to_table(
         arrays = [vectors]
     else:
         raise NotImplementedError(
-            f"data must be dict, list, or ndarray, got {type(data)} instead"
+            f"data must be dict, list, or ndarray (require numpy installed), \
+            got {type(data)} instead"
         )
     return pa.Table.from_arrays(arrays, names=names)
 
@@ -150,9 +151,6 @@ def train_ivf_centroids_on_accelerator(
         )
 
     sample_size = k * sample_rate
-
-    # Pytorch installation warning will be raised here.
-    import torch
 
     from lance.torch.async_dataset import async_dataset
     from lance.torch.data import LanceDataset as TorchDataset
@@ -200,7 +198,6 @@ def compute_partitions(
     batch_size: int = 1024,
 ) -> str:
     """Compute partitions using GPU kmeans."""
-    import torch
 
     from lance.torch.async_dataset import async_dataset
     from lance.torch.data import LanceDataset as PytorchLanceDataset

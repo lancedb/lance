@@ -37,11 +37,13 @@ from typing import (
     Union,
 )
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 
+from .dependencies import _check_for_numpy, _check_for_pandas, torch
+from .dependencies import numpy as np
+from .dependencies import pandas as pd
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import CleanupStats, _Dataset, _Operation, _Scanner, _write_dataset
 from .lance import CompactionMetrics as CompactionMetrics
@@ -49,42 +51,25 @@ from .lance import __version__ as __version__
 from .optimize import Compaction
 from .util import td_to_micros
 
-try:
-    import pandas as pd
+ReaderLike = Union[
+    pd.Timestamp,
+    pa.Table,
+    pa.dataset.Dataset,
+    pa.dataset.Scanner,
+    Iterable[RecordBatch],
+    pa.RecordBatchReader,
+]
 
-    ReaderLike = Union[
-        pd.Timestamp,
-        pa.Table,
-        pa.dataset.Dataset,
-        pa.dataset.Scanner,
-        Iterable[RecordBatch],
-        pa.RecordBatchReader,
-    ]
-    QueryVectorLike = Union[
-        pd.Series,
-        pa.Array,
-        pa.Scalar,
-        np.ndarray,
-        Iterable[float],
-    ]
-except ImportError:
-    pd = None
-    ReaderLike = Union[
-        pa.Table,
-        pa.dataset.Dataset,
-        pa.dataset.Scanner,
-        Iterable[RecordBatch],
-        pa.RecordBatchReader,
-    ]
-    QueryVectorLike = Union[
-        pa.Array,
-        pa.Scalar,
-        np.ndarray,
-        Iterable[float],
-    ]
+QueryVectorLike = Union[
+    pd.Series,
+    pa.Array,
+    pa.Scalar,
+    np.ndarray,
+    Iterable[float],
+]
+
 
 if TYPE_CHECKING:
-    import torch
     from pyarrow._compute import Expression
 
     from .commit import CommitLock
@@ -1056,7 +1041,9 @@ class LanceDataset(pa.dataset.Dataset):
 
             if ivf_centroids is not None:
                 # User provided IVF centroids
-                if isinstance(ivf_centroids, np.ndarray):
+                if _check_for_numpy(ivf_centroids) and isinstance(
+                    ivf_centroids, np.ndarray
+                ):
                     if (
                         len(ivf_centroids.shape) != 2
                         or ivf_centroids.shape[0] != num_partitions
@@ -1956,7 +1943,7 @@ def write_dataset(
 def _coerce_reader(
     data_obj: ReaderLike, schema: Optional[pa.Schema] = None
 ) -> pa.RecordBatchReader:
-    if pd and isinstance(data_obj, pd.DataFrame):
+    if _check_for_pandas(data_obj) and isinstance(data_obj, pd.DataFrame):
         return pa.Table.from_pandas(data_obj, schema=schema).to_reader()
     elif isinstance(data_obj, pa.Table):
         return data_obj.to_reader()
@@ -2000,7 +1987,10 @@ def _coerce_query_vector(query: QueryVectorLike):
             query = query.value
         if isinstance(query.type, pa.FixedSizeListType):
             query = query.values
-    elif isinstance(query, (np.ndarray, list, tuple)):
+    elif isinstance(query, (list, tuple)) or (
+        _check_for_numpy(query),
+        isinstance(query, np.ndarray),
+    ):
         query = np.array(query).astype("float64")  # workaround for GH-608
         query = pa.FloatingPointArray.from_pandas(query, type=pa.float32())
     elif not isinstance(query, pa.Array):

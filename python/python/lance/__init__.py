@@ -17,14 +17,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from lance.commit import CommitLock
-
-try:
-    import pandas as pd
-
-    ts_types = Union[datetime, pd.Timestamp, str]
-except ImportError:
-    pd = None
-    ts_types = Union[datetime, str]
+from lance.dependencies import pandas as pd
 
 from .dataset import (
     LanceDataset,
@@ -36,6 +29,9 @@ from .dataset import (
 from .fragment import FragmentMetadata, LanceFragment
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
+
+ts_types = Union[datetime, pd.Timestamp, str]
+
 
 __all__ = [
     "LanceDataset",
