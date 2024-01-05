@@ -52,10 +52,11 @@ use crate::{
     Result,
 };
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct FilterPlan {
     pub index_query: Option<ScalarIndexExpr>,
     pub refine_expr: Option<Expr>,
+    pub full_expr: Option<Expr>,
 }
 
 impl FilterPlan {
@@ -547,15 +548,17 @@ impl Planner {
     ) -> Result<FilterPlan> {
         let logical_expr = self.optimize_expr(filter)?;
         if use_scalar_index {
-            let indexed_expr = apply_scalar_indices(logical_expr, index_info);
+            let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info);
             Ok(FilterPlan {
                 index_query: indexed_expr.scalar_query,
                 refine_expr: indexed_expr.refine_expr,
+                full_expr: Some(logical_expr),
             })
         } else {
             Ok(FilterPlan {
                 index_query: None,
-                refine_expr: Some(logical_expr),
+                refine_expr: Some(logical_expr.clone()),
+                full_expr: Some(logical_expr),
             })
         }
     }

@@ -652,7 +652,7 @@ impl Scanner {
     async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         // Scalar indices are only used when prefiltering
         // TODO: Should we use them when postfiltering if there is no vector search?
-        let use_scalar_index = self.prefilter;
+        let use_scalar_index = self.prefilter || self.nearest.is_none();
 
         // NOTE: we only support node that have one partition. So any nodes that
         // produce multiple need to be repartitioned to 1.
@@ -924,8 +924,8 @@ impl Scanner {
         if !unindexed_fragments.is_empty() {
             let mut columns = vec![q.column.clone()];
             let mut num_filter_columns = 0;
-            if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
-                let filter_columns = Planner::column_names_in_expr(refine_expr);
+            if let Some(expr) = filter_plan.full_expr.as_ref() {
+                let filter_columns = Planner::column_names_in_expr(expr);
                 num_filter_columns = filter_columns.len();
                 columns.extend(filter_columns);
             }
@@ -943,10 +943,10 @@ impl Scanner {
                 false,
             );
 
-            if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+            if let Some(expr) = filter_plan.full_expr.as_ref() {
                 // If there is a prefilter we need to manually apply it to the new data
                 let planner = Planner::new(scan_node.schema());
-                let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
+                let physical_refine_expr = planner.create_physical_expr(expr)?;
                 scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
             }
             // first we do flat search on just the new data
@@ -1425,13 +1425,10 @@ mod test {
             let batch = concat_batches(&batches[0].schema(), &batches)?;
 
             let expected_batch = RecordBatch::try_new(
-                Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                    "s",
-                    DataType::Utf8,
-                    true,
-                )])),
+                // Projected just "s"
+                Arc::new(test_ds.schema.project(&[1])?),
                 vec![Arc::new(StringArray::from_iter_values(
-                    (51..100).map(|v| format!("s-{}", v)),
+                    (51..400).map(|v| format!("s-{}", v)),
                 ))],
             )?;
             assert_eq!(batch, expected_batch);
@@ -1444,7 +1441,7 @@ mod test {
         let test_ds = TestVectorDataset::new().await?;
         let dataset = &test_ds.dataset;
 
-        let full_data = dataset.scan().try_into_batch().await?.slice(2, 19);
+        let full_data = dataset.scan().try_into_batch().await?.slice(19, 2);
 
         let actual = dataset
             .scan()
@@ -2864,22 +2861,7 @@ mod test {
             scan.prefilter(true);
 
             let plan = scan.explain_plan(true).await.unwrap();
-            let output_schema = scan.schema().unwrap();
-            let batches = scan
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-
-            let batch = if batches.is_empty() {
-                RecordBatch::new_empty(output_schema)
-            } else {
-                concat_batches(&batches[0].schema(), batches.iter())
-                    .map_err(ArrowError::from)
-                    .unwrap()
-            };
+            let batch = scan.try_into_batch().await.unwrap();
 
             if params.use_projection {
                 // 1 projected column
@@ -3381,17 +3363,17 @@ mod test {
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
-            Take: columns=\"_distance, _rowid, vec, i, s\"
-              KNNFlat: k=5 metric=l2
-                RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-                  UnionExec
-                    Projection: fields=[_distance, _rowid, vec]
-                      KNNFlat: k=5 metric=l2
-                        FilterExec: i@0 > 10
-                            LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
-                    Take: columns=\"_distance, _rowid, vec\"
-                      KNNIndex: name=..., k=5
-                        ScalarIndexQuery: query=i > 10",
+  Take: columns=\"_distance, _rowid, vec, i, s\"
+    KNNFlat: k=5 metric=l2
+      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+        UnionExec
+          Projection: fields=[_distance, _rowid, vec]
+            KNNFlat: k=5 metric=l2
+              FilterExec: i@1 > 10
+                LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
+          Take: columns=\"_distance, _rowid, vec\"
+            KNNIndex: name=..., k=5
+              ScalarIndexQuery: query=i > 10",
         )
         .await?;
 
@@ -3406,17 +3388,17 @@ mod test {
                     .prefilter(true))
             },
             "Projection: fields=[i, s, vec, _distance]
-            Take: columns=\"_distance, _rowid, vec, i, s\"
-              KNNFlat: k=5 metric=l2
-                RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-                  UnionExec
-                    Projection: fields=[_distance, _rowid, vec]
-                      KNNFlat: k=5 metric=l2
-                        FilterExec: i@0 > 10
-                            LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
-                    Take: columns=\"_distance, _rowid, vec\"
-                      KNNIndex: name=..., k=5
-                        ScalarIndexQuery: query=i > 10",
+  Take: columns=\"_distance, _rowid, vec, i, s\"
+    KNNFlat: k=5 metric=l2
+      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+        UnionExec
+          Projection: fields=[_distance, _rowid, vec]
+            KNNFlat: k=5 metric=l2
+              FilterExec: i@1 > 10
+                LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
+          Take: columns=\"_distance, _rowid, vec\"
+            KNNIndex: name=..., k=5
+              ScalarIndexQuery: query=i > 10",
         )
         .await?;
 
@@ -3424,9 +3406,27 @@ mod test {
         // ---------------------------------------------------------------------
         assert_plan_equals(
             &dataset.dataset,
-            |scan| scan.project(&["s"])?.filter("i > 10 and i < 20"),
-            "LancePushdownScan: uri=..., projection=[s], predicate=i > Int32(10) AND i < Int32(20), row_id=false, ordered=true"
-        ).await?;
+            |scan| scan.project(&["s"])?.filter("i > 10"),
+            "Projection: fields=[s]
+  Take: columns=\"_rowid, s\"
+    MaterializeIndex: query=i > 10",
+        )
+        .await?;
+
+        dataset.append_new_data().await?;
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| scan.project(&["s"])?.filter("i > 10"),
+            "Projection: fields=[s]
+  RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+    UnionExec
+      Take: columns=\"_rowid, s\"
+        MaterializeIndex: query=i > 10
+      Projection: fields=[_rowid, s]
+        FilterExec: i@1 > 10
+          LanceScan: uri=..., projection=[s, i], row_id=true, ordered=false",
+        )
+        .await?;
 
         Ok(())
     }
