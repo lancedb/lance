@@ -88,10 +88,10 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
 }
 
 impl Manifest {
-    pub fn new(schema: &Schema, fragments: Arc<Vec<Fragment>>) -> Self {
+    pub fn new(schema: Schema, fragments: Arc<Vec<Fragment>>) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
         Self {
-            schema: schema.clone(),
+            schema,
             version: 1,
             writer_version: Some(WriterVersion::default()),
             fragments,
@@ -109,13 +109,13 @@ impl Manifest {
 
     pub fn new_from_previous(
         previous: &Self,
-        schema: &Schema,
+        schema: Schema,
         fragments: Arc<Vec<Fragment>>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
 
         Self {
-            schema: schema.clone(),
+            schema,
             version: previous.version + 1,
             writer_version: Some(WriterVersion::default()),
             fragments,
