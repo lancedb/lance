@@ -174,6 +174,7 @@ impl FileFragment {
         batch.to_pyarrow(self_.py())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
