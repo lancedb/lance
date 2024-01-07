@@ -91,14 +91,22 @@ def test_shard_torch_dataset(tmp_path):
     # Write 10 files
     ds = lance.write_dataset(tbl, tmp_path, max_rows_per_file=100)
     assert len(ds.get_fragments()) == 10
+    for f in ds.get_fragments():
+        assert f.count_rows() == 100
+        print(f.fragment_id)
 
     ds = LanceDataset(
         tmp_path, batch_size=10, columns=["ids"], rank=1, world_size=2, with_row_id=True
     )
 
     all_ids = []
+    row_ids = []
     for batch in ds:
         assert set(batch.keys()) == {"ids", "_rowid"}
         all_ids.extend(batch["ids"].tolist())
+        row_ids.extend(batch["_rowid"].tolist())
 
     assert all_ids == [i for i in range(1000) if i // 100 % 2 == 1]
+    assert set(row_ids) == {
+        i % 100 + (i // 100 << 32) for i in range(1000) if i // 100 % 2 == 1
+    }

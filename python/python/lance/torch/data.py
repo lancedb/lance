@@ -191,14 +191,14 @@ class LanceDataset(IterableDataset):
                 )
             elif self.rank is not None and self.world_size is not None:
                 raw_stream = ShardDataset(
-                        self.dataset,
-                        self.rank,
-                        self.world_size,
-                        columns=self.columns,
-                        batch_size=self.batch_size,
-                        with_row_id=self.with_row_id,
-                        granularity=self.shard_granularity,
-                    )
+                    self.dataset,
+                    self.rank,
+                    self.world_size,
+                    columns=self.columns,
+                    batch_size=self.batch_size,
+                    with_row_id=self.with_row_id,
+                    granularity=self.shard_granularity,
+                )
             else:
                 raw_stream = self.dataset.to_batches(
                     columns=self.columns,
