@@ -1125,10 +1125,22 @@ def test_shard_dataset_batches(tmp_path: Path):
     # Write about 10 files
     lance.write_dataset(tbl, tmp_path, max_rows_per_group=20, max_rows_per_file=100)
 
+    RANK = 1
+    WORLD_SIZE = 2
+    BATCH_SIZE = 15
     shard_datast = ShardDataset(
-        tmp_path, 1, 2, columns=["a"], batch_size=15, granularity="batch"
+        tmp_path,
+        RANK,
+        WORLD_SIZE,
+        columns=["a"],
+        batch_size=BATCH_SIZE,
+        granularity="batch",
     )
     batches = pa.concat_arrays([b["a"] for b in shard_datast])
     assert batches == pa.array(
-        [j for i in range(15, 1000, 30) for j in range(i, i + 15)]
+        [
+            j
+            for i in range(RANK * BATCH_SIZE, 1000, WORLD_SIZE * BATCH_SIZE)
+            for j in range(i, i + BATCH_SIZE)
+        ]
     )
