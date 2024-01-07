@@ -18,6 +18,7 @@
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
 
+import logging
 import math
 from typing import TYPE_CHECKING, Iterable, Literal, Optional, Union
 
@@ -27,7 +28,7 @@ import torch
 from torch.utils.data import Dataset, IterableDataset
 
 from lance._dataset.cache import CachedDataset
-from lance._dataset.shard_dataset import ShardDataset
+from lance._dataset.sharded_dataset import ShardedDataset
 
 from ..sampler import maybe_sample
 
@@ -187,7 +188,13 @@ class LanceDataset(IterableDataset):
                     batch_size=self.batch_size,
                 )
             elif self.rank is not None and self.world_size is not None:
-                raw_stream = ShardDataset(
+                logging.info(
+                    "Sharded Torch Dataset: rank=%s, world_size=%s, granularity=%s",
+                    self.rank,
+                    self.world_size,
+                    self.shard_granularity,
+                )
+                raw_stream = ShardedDataset(
                     self.dataset,
                     self.rank,
                     self.world_size,

@@ -84,7 +84,7 @@ def test_iter_over_dataset(tmp_path):
     assert total_rows == 4096
 
 
-def test_shard_torch_dataset(tmp_path):
+def test_sharded_torch_dataset(tmp_path):
     arr = pa.array(range(1000))
     tbl = pa.Table.from_arrays([arr], ["ids"])
 
