@@ -720,6 +720,16 @@ impl Dataset {
                     if let Some(f) = kwargs.get_item("precomputed_partitions_file")? {
                         ivf_params.precomputed_partitons_file = Some(f.to_string());
                     };
+
+                    if let Some(o) = kwargs.get_item("shuffle_partition_batches")? {
+                        ivf_params.shuffle_partition_batches =
+                            PyAny::downcast::<PyInt>(o)?.extract()?;
+                    };
+
+                    if let Some(o) = kwargs.get_item("shuffle_partition_concurrency")? {
+                        ivf_params.shuffle_partition_concurrency =
+                            PyAny::downcast::<PyInt>(o)?.extract()?;
+                    };
                 }
                 Box::new(VectorIndexParams::with_ivf_pq_params(
                     m_type, ivf_params, pq_params,

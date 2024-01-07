@@ -37,6 +37,10 @@ pub struct IvfBuildParams {
     pub sample_rate: usize,
 
     pub precomputed_partitons_file: Option<String>,
+
+    pub shuffle_partition_batches: usize,
+
+    pub shuffle_partition_concurrency: usize,
 }
 
 impl Default for IvfBuildParams {
@@ -47,6 +51,8 @@ impl Default for IvfBuildParams {
             centroids: None,
             sample_rate: 256, // See faiss
             precomputed_partitons_file: None,
+            shuffle_partition_batches: 1024 * 10,
+            shuffle_partition_concurrency: 2,
         }
     }
 }

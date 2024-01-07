@@ -886,6 +886,8 @@ class LanceDataset(pa.dataset.Dataset):
         num_sub_vectors: Optional[int] = None,
         accelerator: Optional[Union[str, "torch.Device"]] = None,
         index_cache_size: Optional[int] = None,
+        shuffle_partition_batches: Optional[int] = None,
+        shuffle_partition_concurrency: Optional[int] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -919,6 +921,18 @@ class LanceDataset(pa.dataset.Dataset):
             If not set, use the CPU.
         index_cache_size : int, optional
             The size of the index cache in number of entries. Default value is 256.
+        shuffle_partition_batches : int, optional
+            The number of batches, using the row group size of the dataset, to include
+            in each shuffle partition. Default value is 10240.
+
+            Assuming the row group size is 1024, each shuffle partition will hold
+            10240 * 1024 = 10,485,760 rows. By making this value smaller, this shuffle
+            will consume less memory but will take longer to complete, and vice versa.
+        shuffle_partition_concurrency : int, optional
+            The number of shuffle partitions to process concurrently. Default value is 2
+
+            By making this value smaller, this shuffle will consume less memory but will
+            take longer to complete, and vice versa.
         kwargs :
             Parameters passed to the index building process.
 
@@ -1075,6 +1089,10 @@ class LanceDataset(pa.dataset.Dataset):
                     [ivf_centroids], ["_ivf_centroids"]
                 )
                 kwargs["ivf_centroids"] = ivf_centroids_batch
+        if shuffle_partition_batches is not None:
+            kwargs["shuffle_partition_batches"] = shuffle_partition_batches
+        if shuffle_partition_concurrency is not None:
+            kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
         self._ds.create_index(column, index_type, name, replace, kwargs)
         return LanceDataset(self.uri, index_cache_size=index_cache_size)
