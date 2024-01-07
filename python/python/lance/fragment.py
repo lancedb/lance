@@ -250,6 +250,7 @@ class LanceFragment(pa.dataset.Fragment):
         limit: int = 0,
         offset: Optional[int] = None,
         with_row_id: bool = False,
+        batch_readahead: int = 16,
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
         filter_str = str(filter) if filter is not None else None
@@ -260,6 +261,7 @@ class LanceFragment(pa.dataset.Fragment):
             limit=limit,
             offset=offset,
             with_row_id=with_row_id,
+            batch_readahead=batch_readahead,
         )
         from .dataset import LanceScanner
 
@@ -277,6 +279,7 @@ class LanceFragment(pa.dataset.Fragment):
         limit: int = 0,
         offset: Optional[int] = None,
         with_row_id: bool = False,
+        batch_readahead: int = 16,
     ) -> Iterator[pa.RecordBatch]:
         return self.scanner(
             columns=columns,
@@ -285,6 +288,7 @@ class LanceFragment(pa.dataset.Fragment):
             limit=limit,
             offset=offset,
             with_row_id=with_row_id,
+            batch_readahead=batch_readahead,
         ).to_batches()
 
     def to_table(

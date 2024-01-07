@@ -34,15 +34,33 @@ def _shard_fragments(
     fragments = ds.get_fragments()
     for idx in range(rank, len(fragments), world_size):
         frag = fragments[idx]
-        # print(frag)
         for batch in frag.to_batches(
             columns=columns, batch_size=batch_size, with_row_id=with_row_id
         ):
             yield batch
 
 
-def _shard_batches(ds: LanceDataset, batch_size: int, rank: int, world_size: int):
-    pass
+def _shard_batches(
+    ds: LanceDataset,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+    columns: Optional[List[str]] = None,
+    with_row_id: bool = False,
+) -> Generator[pa.RecordBatch, None, None]:
+    if with_row_id:
+        raise NotImplementedError("with_row_id is not supported for batch sharding yet")
+
+    total = ds.count_rows()
+
+    def _gen_ranges():
+        for start in range(rank * batch_size, total, world_size * batch_size):
+            yield start, start + batch_size
+
+    return ds._ds.take_scan(
+        _gen_ranges(),
+        columns=columns,
+    )
 
 
 class ShardDataset:
@@ -58,6 +76,11 @@ class ShardDataset:
         Total number of shards.
     columns: list of strs, optional
         Select columns to scan.
+    batch_size: int, optional
+        The batch size of each shard.
+    granularity: str, optional
+        The granularity of the sharding, either "fragment" or "batch".
+        Defaults to "fragment", which is more performant.
 
     Examples
     --------
@@ -82,6 +105,7 @@ class ShardDataset:
         columns: List[str] = None,
         batch_size: int = 1024 * 10,
         granularity: Literal["fragment", "batch"] = "fragment",
+        batch_readahead: int = 8,
     ):
         self._rank = rank
         self._world_size = world_size
