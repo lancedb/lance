@@ -568,7 +568,7 @@ impl FileWriter {
         self.metadata.stats_metadata = self.write_statistics().await?;
 
         // Step 3. Write manifest and dictionary values.
-        let mut manifest = Manifest::new(&self.schema, Arc::new(vec![]));
+        let mut manifest = Manifest::new(self.schema.clone(), Arc::new(vec![]));
         let pos = write_manifest(&mut self.object_writer, &mut manifest, None).await?;
 
         // Step 4. Write metadata.

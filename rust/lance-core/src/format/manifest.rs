@@ -1,21 +1,19 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2024 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use chrono::prelude::*;
@@ -26,6 +24,7 @@ use crate::datatypes::Schema;
 use crate::error::{Error, Result};
 use crate::format::{pb, ProtoStruct};
 use snafu::{location, Location};
+
 /// Manifest of a dataset
 ///
 ///  * Schema
@@ -69,12 +68,30 @@ pub struct Manifest {
 
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
+
+    /// Precomputed logic offset of each fragment
+    /// accelerating the fragment search using offset ranges.
+    fragment_offsets: Vec<usize>,
+}
+
+fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
+    fragments
+        .iter()
+        .map(|f| f.num_rows().unwrap_or_default())
+        .chain([0]) // Make the last offset to be the full-length of the dataset.
+        .scan(0_usize, |offset, len| {
+            let start = *offset;
+            *offset += len;
+            Some(start)
+        })
+        .collect()
 }
 
 impl Manifest {
-    pub fn new(schema: &Schema, fragments: Arc<Vec<Fragment>>) -> Self {
+    pub fn new(schema: Schema, fragments: Arc<Vec<Fragment>>) -> Self {
+        let fragment_offsets = compute_fragment_offsets(&fragments);
         Self {
-            schema: schema.clone(),
+            schema,
             version: 1,
             writer_version: Some(WriterVersion::default()),
             fragments,
@@ -86,16 +103,19 @@ impl Manifest {
             writer_feature_flags: 0,
             max_fragment_id: 0,
             transaction_file: None,
+            fragment_offsets,
         }
     }
 
     pub fn new_from_previous(
         previous: &Self,
-        schema: &Schema,
+        schema: Schema,
         fragments: Arc<Vec<Fragment>>,
     ) -> Self {
+        let fragment_offsets = compute_fragment_offsets(&fragments);
+
         Self {
-            schema: schema.clone(),
+            schema,
             version: previous.version + 1,
             writer_version: Some(WriterVersion::default()),
             fragments,
@@ -107,6 +127,7 @@ impl Manifest {
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
+            fragment_offsets,
         }
     }
 
@@ -150,7 +171,7 @@ impl Manifest {
             // it from the fragment list.
             self.fragments.iter().map(|f| f.id).max()
         } else {
-            self.max_fragment_id.try_into().ok()
+            Some(self.max_fragment_id.into())
         }
     }
 
@@ -173,6 +194,43 @@ impl Manifest {
             .filter(|&f| start.map(|s| f.id > s).unwrap_or(true))
             .cloned()
             .collect())
+    }
+
+    /// Find the fragments that contain the rows, identified by the offset range.
+    ///
+    /// Note that the offsets are the logical offsets of rows, not row IDs.
+    ///
+    ///
+    /// Parameters
+    /// ----------
+    /// range: Range<usize>
+    ///     Offset range
+    ///
+    /// Returns
+    /// -------
+    /// Vec<(usize, Fragment)>
+    ///    A vector of `(starting_offset_of_fragment, fragment)` pairs.
+    ///
+    pub fn fragments_by_offset_range(&self, range: Range<usize>) -> Vec<(usize, &Fragment)> {
+        let start = range.start;
+        let end = range.end;
+        let idx = self
+            .fragment_offsets
+            .binary_search(&start)
+            .unwrap_or_else(|idx| idx - 1);
+
+        let mut fragments = vec![];
+        for i in idx..self.fragments.len() {
+            if self.fragment_offsets[i] >= end
+                || self.fragment_offsets[i] + self.fragments[i].num_rows().unwrap_or_default()
+                    <= start
+            {
+                break;
+            }
+            fragments.push((self.fragment_offsets[i], &self.fragments[i]));
+        }
+
+        fragments
     }
 }
 
@@ -270,11 +328,13 @@ impl From<pb::Manifest> for Manifest {
             }
             _ => None,
         };
+        let fragments = Arc::new(p.fragments.iter().map(Fragment::from).collect::<Vec<_>>());
+        let fragment_offsets = compute_fragment_offsets(fragments.as_slice());
         Self {
             schema: Schema::from((&p.fields, p.metadata)),
             version: p.version,
             writer_version,
-            fragments: Arc::new(p.fragments.iter().map(Fragment::from).collect()),
+            fragments,
             version_aux_data: p.version_aux_data as usize,
             index_section: p.index_section.map(|i| i as usize),
             timestamp_nanos: timestamp_nanos.unwrap_or(0),
@@ -287,6 +347,7 @@ impl From<pb::Manifest> for Manifest {
             } else {
                 Some(p.transaction_file)
             },
+            fragment_offsets,
         }
     }
 }
@@ -332,6 +393,10 @@ impl From<&Manifest> for pb::Manifest {
 mod tests {
     use super::*;
 
+    use super::Fragment;
+    use crate::datatypes::Schema;
+    use arrow_schema::{Field, Schema as ArrowSchema};
+
     #[test]
     fn test_writer_version() {
         let wv = WriterVersion::default();
@@ -356,5 +421,43 @@ mod tests {
             let bumped_parts = bumped.semver_or_panic();
             assert!(wv.older_than(bumped_parts.0, bumped_parts.1, bumped_parts.2));
         }
+    }
+
+    #[test]
+    fn test_fragments_by_offset_range() {
+        let arrow_schema =
+            ArrowSchema::new(vec![Field::new("a", arrow_schema::DataType::Int64, false)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let fragments = vec![
+            Fragment::with_file(0, "path1", &schema, Some(10)),
+            Fragment::with_file(1, "path2", &schema, Some(15)),
+            Fragment::with_file(2, "path3", &schema, Some(20)),
+        ];
+        let manifest = Manifest::new(schema, Arc::new(fragments));
+
+        let actual = manifest.fragments_by_offset_range(0..10);
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].0, 0);
+        assert_eq!(actual[0].1.id, 0);
+
+        let actual = manifest.fragments_by_offset_range(5..15);
+        assert_eq!(actual.len(), 2);
+        assert_eq!(actual[0].0, 0);
+        assert_eq!(actual[0].1.id, 0);
+        assert_eq!(actual[1].0, 10);
+        assert_eq!(actual[1].1.id, 1);
+
+        let actual = manifest.fragments_by_offset_range(15..50);
+        assert_eq!(actual.len(), 2);
+        assert_eq!(actual[0].0, 10);
+        assert_eq!(actual[0].1.id, 1);
+        assert_eq!(actual[1].0, 25);
+        assert_eq!(actual[1].1.id, 2);
+
+        // Out of range
+        let actual = manifest.fragments_by_offset_range(45..100);
+        assert!(actual.is_empty());
+
+        assert!(manifest.fragments_by_offset_range(200..400).is_empty());
     }
 }
