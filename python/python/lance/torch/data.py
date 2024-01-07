@@ -28,7 +28,7 @@ import torch
 from torch.utils.data import Dataset, IterableDataset
 
 from lance._dataset.cache import CachedDataset
-from lance._dataset.sharded_dataset import ShardedDataset
+from lance._dataset.sharded_dataset import ShardedBatchIterator
 
 from ..sampler import maybe_sample
 
@@ -194,7 +194,7 @@ class LanceDataset(IterableDataset):
                     self.world_size,
                     self.shard_granularity,
                 )
-                raw_stream = ShardedDataset(
+                raw_stream = ShardedBatchIterator(
                     self.dataset,
                     self.rank,
                     self.world_size,

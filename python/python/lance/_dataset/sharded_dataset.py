@@ -13,62 +13,18 @@
 #  limitations under the License.
 
 from pathlib import Path
-from typing import Generator, List, Literal, Optional, Union
+from typing import Generator, List, Literal, Union
 
 import pyarrow as pa
 
 import lance
 from lance.dataset import LanceDataset
 
-__all__ = ["ShardedDataset"]
+__all__ = ["ShardedBatchIterator"]
 
 
-def _sharded_fragments(
-    ds: LanceDataset,
-    batch_size: int,
-    rank: int,
-    world_size: int,
-    columns: Optional[List[str]] = None,
-    batch_readahead: int = 8,
-    with_row_id: bool = False,
-) -> Generator[pa.RecordBatch, None, None]:
-    fragments = ds.get_fragments()
-    for idx in range(rank, len(fragments), world_size):
-        frag = fragments[idx]
-        for batch in frag.to_batches(
-            columns=columns,
-            batch_size=batch_size,
-            with_row_id=with_row_id,
-            batch_readahead=batch_readahead,
-        ):
-            yield batch
-
-
-def _sharded_batches(
-    ds: LanceDataset,
-    batch_size: int,
-    rank: int,
-    world_size: int,
-    columns: Optional[List[str]] = None,
-    with_row_id: bool = False,
-) -> Generator[pa.RecordBatch, None, None]:
-    if with_row_id:
-        raise NotImplementedError("with_row_id is not supported for batch sharding yet")
-
-    total = ds.count_rows()
-
-    def _gen_ranges():
-        for start in range(rank * batch_size, total, world_size * batch_size):
-            yield start, start + batch_size
-
-    return ds._ds.take_scan(
-        _gen_ranges(),
-        columns=columns,
-    )
-
-
-class ShardedDataset:
-    """A dataset that is sharded over the full dataset.
+class ShardedBatchIterator:
+    """An iterator of RecordBatches, over the sharded dataset.
 
     Parmeters
     ---------
@@ -125,19 +81,43 @@ class ShardedDataset:
             data if isinstance(data, LanceDataset) else lance.dataset(data)
         )
 
+    def _iter_over_fragments(self) -> Generator[pa.RecordBatch, None, None]:
+        fragments = self._ds.get_fragments()
+        for idx in range(self._rank, len(fragments), self._world_size):
+            frag = fragments[idx]
+            for batch in frag.to_batches(
+                columns=self._columns,
+                batch_size=self._batch_size,
+                with_row_id=self._with_row_id,
+                batch_readahead=self._batch_readahead,
+            ):
+                yield batch
+
+    def _iter_over_batches(self) -> Generator[pa.RecordBatch, None, None]:
+        if self._with_row_id:
+            raise NotImplementedError(
+                "with_row_id is not supported for batch sharding yet"
+            )
+
+        total = self._ds.count_rows()
+
+        def _gen_ranges():
+            for start in range(
+                self._rank * self._batch_size,
+                total,
+                self._world_size * self._batch_size,
+            ):
+                yield start, start + self._batch_size
+
+        return self._ds._ds.take_scan(
+            _gen_ranges(),
+            columns=self._columns,
+        )
+
     def __iter__(self):
         if self._granularity == "fragment":
-            return _sharded_fragments(
-                self._ds,
-                self._batch_size,
-                self._rank,
-                self._world_size,
-                batch_readahead=self._batch_readahead,
-                with_row_id=self._with_row_id,
-            )
+            return self._iter_over_fragments()
         elif self._granularity == "batch":
-            return _sharded_batches(
-                self._ds, self._batch_size, self._rank, self._world_size
-            )
+            return self._iter_over_batches()
         else:
             raise ValueError(f"Unrecognized granularity: {self._granularity}")
