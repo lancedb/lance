@@ -154,9 +154,7 @@ class LanceDataset(IterableDataset):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.dataset = (
-            dataset if isinstance(dataset, Dataset) else lance.dataset(dataset)
-        )
+        self.dataset = dataset
         self.columns = columns
         self.batch_size = batch_size
         self.samples: Optional[int] = samples
