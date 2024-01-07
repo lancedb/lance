@@ -358,9 +358,8 @@ class LanceDataset(pa.dataset.Dataset):
 
     def get_fragments(
         self, filter: Optional[Expression] = None
-    ) -> Iterator[pa.dataset.Fragment]:
+    ) -> List[LanceFragment]:
         """Get all fragments from the dataset.
-
 
         Note: filter is not supported yet.
         """

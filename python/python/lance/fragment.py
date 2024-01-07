@@ -243,7 +243,9 @@ class LanceFragment(pa.dataset.Fragment):
 
     def scanner(
         self,
+        *,
         columns: Optional[list[str]] = None,
+        batch_size: Optional[int] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
         offset: Optional[int] = None,
@@ -253,6 +255,7 @@ class LanceFragment(pa.dataset.Fragment):
         filter_str = str(filter) if filter is not None else None
         s = self._fragment.scanner(
             columns=columns,
+            batch_size=batch_size,
             filter=filter_str,
             limit=limit,
             offset=offset,
@@ -267,7 +270,9 @@ class LanceFragment(pa.dataset.Fragment):
 
     def to_batches(
         self,
+        *,
         columns: Optional[list[str]] = None,
+        batch_size: Optional[int] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
         offset: Optional[int] = None,
@@ -275,6 +280,7 @@ class LanceFragment(pa.dataset.Fragment):
     ) -> Iterator[pa.RecordBatch]:
         return self.scanner(
             columns=columns,
+            batch_size=batch_size,
             filter=filter,
             limit=limit,
             offset=offset,
