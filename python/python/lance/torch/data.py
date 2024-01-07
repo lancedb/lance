@@ -26,7 +26,6 @@ import pyarrow as pa
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
-import lance
 from lance._dataset.cache import CachedDataset
 from lance._dataset.shard_dataset import ShardDataset
 
