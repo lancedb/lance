@@ -131,7 +131,6 @@ def _buffer_arrow_batches(
 
         buffer.append(item)
         cur_size += item.num_rows
-
     if buffer:
         yield concat_batches(buffer)
 
@@ -163,8 +162,11 @@ class LanceDataset(IterableDataset):
         self.samples: Optional[int] = samples
         self.filter = filter
         self.with_row_id = with_row_id
+
+        # As Shared Dataset
         self.rank = rank
         self.world_size = world_size
+        self.shard_granularity = shard_granularity
 
         if samples is not None and filter is not None:
             raise ValueError("Does not support sampling over filtered dataset")
@@ -189,14 +191,14 @@ class LanceDataset(IterableDataset):
                 )
             elif self.rank is not None and self.world_size is not None:
                 raw_stream = ShardDataset(
-                    self.dataset,
-                    self.rank,
-                    self.world_size,
-                    columns=self.columns,
-                    batch_size=self.batch_size,
-                    with_row_id=self.with_row_id,
-                    granularity=self.shard_granularity,
-                )
+                        self.dataset,
+                        self.rank,
+                        self.world_size,
+                        columns=self.columns,
+                        batch_size=self.batch_size,
+                        with_row_id=self.with_row_id,
+                        granularity=self.shard_granularity,
+                    )
             else:
                 raw_stream = self.dataset.to_batches(
                     columns=self.columns,

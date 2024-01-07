@@ -1123,13 +1123,13 @@ def test_shard_dataset_batches(tmp_path: Path):
     arr = pa.array(range(1000))
     tbl = pa.table({"a": arr})
     # Write about 10 files
-    lance.write_dataset(tbl, tmp_path, max_rows_per_group=20, max_rows_per_file=100)
+    ds = lance.write_dataset(tbl, tmp_path, max_rows_per_file=100)
 
     RANK = 1
     WORLD_SIZE = 2
     BATCH_SIZE = 15
     shard_datast = ShardDataset(
-        tmp_path,
+        ds,
         RANK,
         WORLD_SIZE,
         columns=["a"],

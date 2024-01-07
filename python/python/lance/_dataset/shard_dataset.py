@@ -29,13 +29,17 @@ def _shard_fragments(
     rank: int,
     world_size: int,
     columns: Optional[List[str]] = None,
+    batch_readahead: int = 8,
     with_row_id: bool = False,
 ) -> Generator[pa.RecordBatch, None, None]:
     fragments = ds.get_fragments()
     for idx in range(rank, len(fragments), world_size):
         frag = fragments[idx]
         for batch in frag.to_batches(
-            columns=columns, batch_size=batch_size, with_row_id=with_row_id
+            columns=columns,
+            batch_size=batch_size,
+            with_row_id=with_row_id,
+            batch_readahead=batch_readahead,
         ):
             yield batch
 
@@ -81,6 +85,7 @@ class ShardDataset:
     granularity: str, optional
         The granularity of the sharding, either "fragment" or "batch".
         Defaults to "fragment", which is more performant.
+    with_row_id: bool, optional
 
     Examples
     --------
@@ -106,12 +111,15 @@ class ShardDataset:
         batch_size: int = 1024 * 10,
         granularity: Literal["fragment", "batch"] = "fragment",
         batch_readahead: int = 8,
+        with_row_id: bool = False,
     ):
         self._rank = rank
         self._world_size = world_size
         self._batch_size = batch_size
         self._granularity = granularity
         self._columns = columns
+        self._with_row_id = with_row_id
+        self._batch_readahead = batch_readahead
 
         self._ds: LanceDataset = (
             data if isinstance(data, LanceDataset) else lance.dataset(data)
@@ -120,7 +128,12 @@ class ShardDataset:
     def __iter__(self):
         if self._granularity == "fragment":
             return _shard_fragments(
-                self._ds, self._batch_size, self._rank, self._world_size
+                self._ds,
+                self._batch_size,
+                self._rank,
+                self._world_size,
+                batch_readahead=self._batch_readahead,
+                with_row_id=self._with_row_id,
             )
         elif self._granularity == "batch":
             return _shard_batches(
