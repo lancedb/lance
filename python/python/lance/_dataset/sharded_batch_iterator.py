@@ -14,13 +14,15 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Generator, List, Literal, Union
-
-import pyarrow as pa
+from typing import TYPE_CHECKING, Generator, List, Literal, Union
 
 import lance
 from lance.dataset import LanceDataset
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    import pyarrow as pa
 
 __all__ = ["ShardedBatchIterator"]
 
