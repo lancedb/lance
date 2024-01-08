@@ -28,7 +28,7 @@ import torch
 from torch.utils.data import Dataset, IterableDataset
 
 from lance._dataset.cache import CachedDataset
-from lance._dataset.sharded_dataset import ShardedBatchIterator
+from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 
 from ..sampler import maybe_sample
 
