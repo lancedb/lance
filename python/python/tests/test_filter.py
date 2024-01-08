@@ -187,6 +187,21 @@ def test_escaped_name(tmp_path: Path, provide_pandas: bool):
     )
 
 
+def test_functions(tmp_path: Path):
+    # Ensure that we can use complex functions
+    table = pa.table(
+        {"genres": [["action", "comedy"], ["anime", "drama"], ["adventure"]]}
+    )
+    expected = table.slice(1, 2)
+    dataset = lance.write_dataset(table, tmp_path / "test_neg_expr")
+    assert (
+        dataset.scanner(
+            filter="array_has_any(genres, Array['anime', 'adventure'])"
+        ).to_table()
+        == expected
+    )
+
+
 def test_negative_expressions(tmp_path: Path):
     table = pa.table({"x": [-1, 0, 1, 1], "y": [1, 2, 3, 4]})
     dataset = lance.write_dataset(table, tmp_path / "test_neg_expr")
