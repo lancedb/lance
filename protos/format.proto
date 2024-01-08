@@ -97,6 +97,7 @@ message Manifest {
   //
   // Known flags:
   // * 1: deletion files are present
+  // * 2: list columns have child fields
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -322,15 +323,24 @@ message Dictionary {
 }
 
 // Field metadata for a column.
+//
+// 
 message Field {
+  // TODO: why do we even have these if we have the type field?
+  // Why is default value PARENT?
   enum Type {
+    // A struct column. Will have one or more children pointing to it.
     PARENT = 0;
+    // A list column. May have one child pointing to it.
     REPEATED = 1;
+    // A leaf column. Will have no children pointing to it.
     LEAF = 2;
   }
   Type type = 1;
 
   // Fully qualified name.
+  //
+  // TODO: What does this mean?? Give an example.
   string name = 2;
   /// Field Id.
   ///
@@ -339,20 +349,37 @@ message Field {
   /// Parent Field ID. If not set, this is a top-level column.
   int32 parent_id = 4;
 
-  // Logical types, support parameterized Arrow Type.
+  // Logical types.
+  //
+  // Some of these are encoded (like dictionary), to indicate what Arrow data type
+  // the column should be output as.
+  //
+  // This field may be missing on older tables, which will instead use the
+  // legacy_logical_type field. The feature flag (2) indicates that this field
+  // should be used instead of the legacy_logical_type field.
+  //
+  // The valid logical types depend on the type of field.
   //
   // PARENT types will always have logical type "struct".
   //
-  // REPEATED types may have logical types:
-  // * "list"
-  // * "large_list"
-  // * "list.struct"
-  // * "large_list.struct"
-  // The final two are used if the list values are structs, and therefore the
-  // field is both implicitly REPEATED and PARENT.
+  // REPEATED types will always have logical type "list", "large_list", or
+  // "fixed_size_list", corresponding to the Arrow data types. Some older
+  // versions may use the logical type "list.struct" or "large_list.struct" to
+  // indicate that the list values are structs, but these fields can be safely
+  // rewritten simply as "list" or "large_list".
+  //
+  // The "fixed_size_list" logical type has two variants: a legacy variant with
+  // two parameters in the format "fixed_size_list:{value_type}:{list_size}",
+  // and a new variant with one parameter in the format "fixed_size_list:{list_size}".
+  // To enable compatibility with older versions, writers should use the legacy
+  // variant when it can be used. In some cases, like when the list values are
+  // an extension type or not a primitive type, the legacy variant cannot be
+  // used, and the new variant must be used instead. When the new variant is
+  // used, the feature flag (2) must be set.
   //
   // LEAF types may have logical types:
   // * "null"
+  // * "bool"
   // * "bool"
   // * "int8" / "uint8"
   // * "int16" / "uint16"
@@ -366,7 +393,26 @@ message Field {
   // * "decimal:128:{precision}:{scale}" / "decimal:256:{precision}:{scale}"
   // * "time:{unit}" / "timestamp:{unit}" / "duration:{unit}", where unit is "s", "ms", "us", "ns"
   // * "dict:{value_type}:{index_type}:false"
+  // string logical_type = 11;
+
+  // Legacy logical type field. Use the logical_type field instead.
+  //
+  // This field is the same as the logical_type field, except for the handling
+  // of REPEATED fields. Whereas repeated types have child fields in new scheme,
+  // in this field the child types of repeated fields are encoded in the logical
+  // type of the repeated field itself.
+  //
+  // The legacy REPEATED types encode the value type in the logical type. This
+  // can be:
+  // * "list:{value_type}"
+  // * "large_list:{value_type}"
+  // * "fixed_size_list:{value_type}:{list_size}"
+  // * "list.struct"
+  // * "large_list.struct"
+  // The final two are used if the list values are structs, and therefore the
+  // field is both implicitly REPEATED and PARENT.
   string logical_type = 5;
+
   // If this field is nullable.
   bool nullable = 6;
 

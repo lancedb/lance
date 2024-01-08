@@ -42,8 +42,8 @@ use crate::{
 pub struct Field {
     pub name: String,
     pub id: i32,
-    parent_id: i32,
-    logical_type: LogicalType,
+    pub(crate) parent_id: i32,
+    pub(crate) logical_type: LogicalType,
     metadata: HashMap<String, String>,
     pub encoding: Option<Encoding>,
     pub nullable: bool,
@@ -65,6 +65,11 @@ impl Field {
             lt if lt.is_struct() => {
                 DataType::Struct(self.children.iter().map(ArrowField::from).collect())
             }
+            // TODO: make sure we materialize the field when loading.
+            lt if lt.is_fsl() => DataType::FixedSizeList(
+                Arc::new(ArrowField::from(&self.children[0])),
+                lt.fsl_size().unwrap(),
+            ),
             lt => DataType::try_from(lt).unwrap(),
         }
     }
@@ -574,6 +579,7 @@ impl TryFrom<&ArrowField> for Field {
                 .collect::<Result<_>>()?,
             DataType::List(item) => vec![Self::try_from(item.as_ref())?],
             DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
+            DataType::FixedSizeList(item, _) => vec![Self::try_from(item.as_ref())?],
             _ => vec![],
         };
         Ok(Self {
@@ -628,11 +634,39 @@ impl From<&pb::Field> for Field {
                 field.extension_name.clone(),
             );
         }
+
+        let logical_type = LogicalType(field.logical_type.clone());
+        // In older versions, FixedSizeList was written as `fixed_size_list:{child_type}:{size}`.
+        // In those versions, the child field was not saved, so we have to create it here.
+        let children = if logical_type.is_fsl() {
+            if let Some((value_type, _size)) =
+                logical_type.0.split_once(':').unwrap().1.split_once(':')
+            {
+                vec![Field {
+                    name: "item".to_string(),
+                    id: -1,
+                    parent_id: field.id,
+                    logical_type: LogicalType(value_type.to_string()),
+                    metadata: HashMap::new(),
+                    encoding: None,
+                    nullable: false,
+                    children: vec![],
+                    dictionary: None,
+                }]
+            } else {
+                vec![]
+            }
+        } else {
+            // For other cases, children is left empty and is filled in later in the
+            // impl From<&Vec<pb::Field>> for Schema implementation.
+            vec![]
+        };
+
         Self {
             name: field.name.clone(),
             id: field.id,
             parent_id: field.parent_id,
-            logical_type: LogicalType(field.logical_type.clone()),
+            logical_type,
             metadata: lance_metadata,
             encoding: match field.encoding {
                 1 => Some(Encoding::Plain),
@@ -642,7 +676,7 @@ impl From<&pb::Field> for Field {
                 _ => None,
             },
             nullable: field.nullable,
-            children: vec![],
+            children,
             dictionary: field.dictionary.as_ref().map(Dictionary::from),
         }
     }
@@ -683,6 +717,8 @@ impl From<&Field> for pb::Field {
 impl From<&Field> for Vec<pb::Field> {
     fn from(field: &Field) -> Self {
         let mut protos = vec![pb::Field::from(field)];
+        // TODO: map the relevant FSL fields to compatible layout
+        // (use three-part logical type and remove child field.)
         protos.extend(field.children.iter().flat_map(Self::from));
         protos
     }

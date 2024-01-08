@@ -3922,4 +3922,66 @@ mod tests {
         let row_count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
         assert_eq!(row_count, 1900);
     }
+
+    #[tokio::test]
+    async fn test_v0_8_19_list_type_compatibility() {
+        let test_dir = copy_test_data_to_tmp("v0.8.19/list_columns").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+
+        let fields: Vec<_> = dataset
+            .schema()
+            .fields_pre_order()
+            .map(|f| (f.id, f.name.as_str(), f.data_type()))
+            .collect();
+        assert_eq!(
+            &fields,
+            &[
+                (
+                    0,
+                    "fsl",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Int32, true)),
+                        10
+                    )
+                ),
+                (1, "item", DataType::Int32), // What is this id
+                (
+                    2,
+                    "list",
+                    DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+                ),
+                (3, "item", DataType::Int32),
+                (
+                    4,
+                    "list_of_struct",
+                    DataType::List(Arc::new(Field::new(
+                        "item",
+                        DataType::Struct(
+                            vec![
+                                Field::new("a", DataType::Int32, true),
+                                Field::new("b", DataType::Int32, true),
+                            ]
+                            .into()
+                        ),
+                        true
+                    )))
+                ),
+                (
+                    5,
+                    "struct",
+                    DataType::Struct(
+                        vec![
+                            Field::new("a", DataType::Int32, true),
+                            Field::new("b", DataType::Int32, true),
+                        ]
+                        .into()
+                    )
+                ),
+                (6, "a", DataType::Int32),
+                (7, "b", DataType::Int32),
+            ]
+        );
+    }
 }

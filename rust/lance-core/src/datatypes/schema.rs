@@ -125,6 +125,9 @@ impl Schema {
             }
         }
 
+        // TODO: check for duplicate field names
+        // TODO: check for field names in repeated fields
+
         Ok(())
     }
 
@@ -149,6 +152,14 @@ impl Schema {
     /// before its children
     pub fn fields_pre_order(&self) -> impl Iterator<Item = &Field> {
         SchemaFieldIterPreOrder::new(self)
+    }
+
+    fn visit_fields_mut(&mut self, mut f: impl FnMut(&mut Field)) {
+        let mut to_visit = self.fields.iter_mut().rev().collect::<Vec<_>>();
+        while let Some(field) = to_visit.pop() {
+            f(field);
+            to_visit.extend(field.children.iter_mut().rev());
+        }
     }
 
     /// Returns a new schema that only contains the fields in `column_ids`.
@@ -435,6 +446,16 @@ impl From<&Vec<pb::Field>> for Schema {
             }
         });
 
+        // When migrating list fields from old files, we might have fields that
+        // need to be assigned ids.
+        let mut max_id = schema.max_field_id().unwrap_or(-1);
+        schema.visit_fields_mut(move |f| {
+            if f.id == -1 {
+                f.id = max_id + 1;
+                max_id += 1
+            }
+        });
+
         schema
     }
 }
@@ -523,6 +544,121 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
+    }
+
+    #[test]
+    fn test_list_fields() {
+        let extension_metadata1 = HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "my_extension".to_string(),
+        )]);
+        let extension_metadata2 = HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "my_list_extension".to_string(),
+        )]);
+        let arrow_schema = ArrowSchema::new(vec![
+            // FixedSizeList of an extension type
+            ArrowField::new(
+                "fsl_ext",
+                DataType::FixedSizeList(
+                    Arc::new(
+                        ArrowField::new("item", DataType::Utf8, true)
+                            .with_metadata(extension_metadata1),
+                    ),
+                    2,
+                ),
+                false,
+            )
+            .with_metadata(extension_metadata2),
+            // List of List
+            ArrowField::new(
+                "l_l",
+                DataType::List(Arc::new(ArrowField::new(
+                    "item",
+                    DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
+                    false,
+                ))),
+                false,
+            ),
+            // FixedSizeList of FixedSizeList
+            ArrowField::new(
+                "fsl_fsl",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new(
+                        "item",
+                        DataType::FixedSizeList(
+                            Arc::new(ArrowField::new("item", DataType::Utf8, true)),
+                            2,
+                        ),
+                        false,
+                    )),
+                    2,
+                ),
+                false,
+            ),
+            // List of Struct
+            ArrowField::new(
+                "l_s",
+                DataType::List(Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(ArrowFields::from(vec![
+                        ArrowField::new("f1", DataType::Utf8, true),
+                        ArrowField::new("f2", DataType::Boolean, false),
+                    ])),
+                    false,
+                ))),
+                false,
+            ),
+            // LargeList of Struct
+            ArrowField::new(
+                "ll_s",
+                DataType::LargeList(Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(ArrowFields::from(vec![
+                        ArrowField::new("f1", DataType::Utf8, true),
+                        ArrowField::new("f2", DataType::Boolean, false),
+                    ])),
+                    false,
+                ))),
+                false,
+            ),
+        ]);
+
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let field_ids_names = schema
+            .fields_pre_order()
+            .map(|f| (f.id, f.name.clone(), f.parent_id, f.logical_type.0.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            field_ids_names,
+            [
+                (0, "fsl_ext".to_string(), -1, "fixed_size_list:2"),
+                (1, "item".to_string(), 0, "string"),
+                (2, "l_l".to_string(), -1, "list"),
+                (3, "item".to_string(), 2, "list"),
+                (4, "item".to_string(), 3, "string"),
+                (5, "fsl_fsl".to_string(), -1, "fixed_size_list:2"),
+                (6, "item".to_string(), 5, "fixed_size_list:2"),
+                (7, "item".to_string(), 6, "string"),
+                (8, "l_s".to_string(), -1, "list"),
+                (9, "item".to_string(), 8, "struct"),
+                (10, "f1".to_string(), 9, "string"),
+                (11, "f2".to_string(), 9, "bool"),
+                (12, "ll_s".to_string(), -1, "large_list"),
+                (13, "item".to_string(), 12, "struct"),
+                (14, "f1".to_string(), 13, "string"),
+                (15, "f2".to_string(), 13, "bool"),
+            ]
+        );
+
+        assert_eq!(
+            schema.field_by_id(0).unwrap().extension_name().unwrap(),
+            "my_list_extension"
+        );
+        assert_eq!(
+            schema.field_by_id(1).unwrap().extension_name().unwrap(),
+            "my_extension"
+        );
     }
 
     #[test]
@@ -932,5 +1068,109 @@ mod tests {
 
         let field = schema.field_by_id(3).unwrap();
         assert_eq!(field.name, "f2");
+    }
+
+    #[test]
+    fn protobuf_fsl_conversion_legacy() {
+        // When we read, we need to create a field for FSL children.
+        let pb_field = pb::Field {
+            id: 0,
+            parent_id: -1,
+            name: "fsl".to_string(),
+            logical_type: "fixed_size_list:int32:2".to_string(),
+            encoding: 0,
+            nullable: false,
+            dictionary: None,
+            metadata: HashMap::new(),
+            extension_name: "".to_string(),
+            r#type: 1,
+        };
+        let pb_schema = vec![pb_field.clone()];
+
+        let schema = Schema::from(&pb_schema);
+
+        let fields = schema.fields_pre_order().collect::<Vec<_>>();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "fsl");
+        // The legacy format is preserved in-memory for now, to make it easier
+        // to serialize back to protobuf.
+        assert_eq!(fields[0].logical_type.0.as_str(), "fixed_size_list:int32:2");
+        assert_eq!(
+            fields[0].data_type(),
+            DataType::FixedSizeList(Arc::new(ArrowField::new("item", DataType::Int32, false)), 2)
+        );
+
+        assert_eq!(fields[1].id, 1);
+        assert_eq!(fields[1].name, "item");
+        assert_eq!(fields[1].logical_type.0.as_str(), "int32");
+        assert_eq!(fields[1].data_type(), DataType::Int32);
+        assert_eq!(fields[1].parent_id, 0);
+
+        // When we write, we need to omit FSL children if the child type is
+        // written in the parent field.
+        let roundtripped: Vec<pb::Field> = (&schema).into();
+        assert_eq!(&roundtripped, &pb_schema);
+
+        // TODO: we should also be able to convert to arrow, back to Schema, then back to protobuf and get the same thing.
+    }
+
+    #[test]
+    fn protobuf_fsl_conversion_new() {
+        // When we read, we need to create a field for FSL children.
+        let pb_schema = vec![
+            pb::Field {
+                id: 0,
+                parent_id: -1,
+                name: "fsl".to_string(),
+                logical_type: "fixed_size_list:2".to_string(),
+                encoding: 0,
+                nullable: false,
+                dictionary: None,
+                metadata: HashMap::new(),
+                extension_name: "".to_string(),
+                r#type: 1,
+            },
+            pb::Field {
+                id: 1,
+                parent_id: 0,
+                // List fields don't have to have a serialized name.
+                name: "".to_string(),
+                logical_type: "int32".to_string(),
+                encoding: 0,
+                nullable: false,
+                dictionary: None,
+                metadata: HashMap::new(),
+                // Giving the child type an extension should ensure we serialize
+                // using new variant.
+                extension_name: "test".to_string(),
+                r#type: 2,
+            },
+        ];
+
+        let schema = Schema::from(&pb_schema);
+
+        let fields = schema.fields_pre_order().collect::<Vec<_>>();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "fsl");
+        // The legacy format is preserved in-memory for now, to make it easier
+        // to serialize back to protobuf.
+        assert_eq!(fields[0].logical_type.0.as_str(), "fixed_size_list:2");
+        assert_eq!(
+            fields[0].data_type(),
+            DataType::FixedSizeList(Arc::new(ArrowField::new("item", DataType::Int32, false)), 2)
+        );
+
+        assert_eq!(fields[1].id, 1);
+        // Name of list fields should always be "item" for arrow-rs compatibility.
+        assert_eq!(fields[1].name, "item");
+        assert_eq!(fields[1].logical_type.0.as_str(), "int32");
+        assert_eq!(fields[1].data_type(), DataType::Int32);
+        assert_eq!(fields[1].extension_name().unwrap(), "test");
+        assert_eq!(fields[1].parent_id, 0);
+
+        // When we write, we need to omit FSL children if the child type is
+        // written in the parent field.
+        let roundtripped: Vec<pb::Field> = (&schema).into();
+        assert_eq!(&roundtripped, &pb_schema);
     }
 }

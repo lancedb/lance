@@ -52,6 +52,23 @@ impl LogicalType {
     fn is_struct(&self) -> bool {
         self.0 == "struct"
     }
+
+    /// Check whether the logical type is a FixedSizeList.
+    fn is_fsl(&self) -> bool {
+        self.0.starts_with("fixed_size_list:")
+    }
+
+    /// Check whether the logical type is a FixedSizeList, and if so, return the size.
+    fn fsl_size(&self) -> Option<i32> {
+        // Might be of format "fixed_size_list:{size}" or (legacy)
+        // "fixed_size_list:{child_type}:{size}".
+        if self.0.starts_with("fixed_size_list:") {
+            let (_, size) = self.0.rsplit_once(':').unwrap();
+            size.parse::<i32>().ok()
+        } else {
+            None
+        }
+    }
 }
 
 impl From<&str> for LogicalType {
@@ -129,18 +146,12 @@ impl TryFrom<&DataType> for LogicalType {
                 )
             }
             DataType::List(elem) => match elem.data_type() {
-                DataType::Struct(_) => "list.struct".to_string(),
                 _ => "list".to_string(),
             },
             DataType::LargeList(elem) => match elem.data_type() {
-                DataType::Struct(_) => "large_list.struct".to_string(),
                 _ => "large_list".to_string(),
             },
-            DataType::FixedSizeList(dt, len) => format!(
-                "fixed_size_list:{}:{}",
-                Self::try_from(dt.data_type())?.0,
-                *len
-            ),
+            DataType::FixedSizeList(_dt, len) => format!("fixed_size_list:{}", *len),
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
             _ => {
                 return Err(Error::Schema {
@@ -193,24 +204,6 @@ impl TryFrom<&LogicalType> for DataType {
         } else {
             let splits = lt.0.split(':').collect::<Vec<_>>();
             match splits[0] {
-                "fixed_size_list" => {
-                    if splits.len() != 3 {
-                        Err(Error::Schema {
-                            message: format!("Unsupported logical type: {}", lt),
-                            location: location!(),
-                        })
-                    } else {
-                        let elem_type = (&LogicalType(splits[1].to_string())).try_into()?;
-                        let size: i32 = splits[2].parse::<i32>().map_err(|e: _| Error::Schema {
-                            message: e.to_string(),
-                            location: location!(),
-                        })?;
-                        Ok(FixedSizeList(
-                            Arc::new(ArrowField::new("item", elem_type, true)),
-                            size,
-                        ))
-                    }
-                }
                 "fixed_size_binary" => {
                     if splits.len() != 2 {
                         Err(Error::Schema {
