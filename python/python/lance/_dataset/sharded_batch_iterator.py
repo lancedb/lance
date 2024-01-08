@@ -120,7 +120,6 @@ class ShardedBatchIterator:
             with_row_id=with_row_id,
         )
 
-
     def _iter_over_fragments(self) -> Generator[pa.RecordBatch, None, None]:
         fragments = self._ds.get_fragments()
         for idx in range(self._rank, len(fragments), self._world_size):
