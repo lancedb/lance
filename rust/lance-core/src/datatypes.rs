@@ -145,12 +145,8 @@ impl TryFrom<&DataType> for LogicalType {
                     false
                 )
             }
-            DataType::List(elem) => match elem.data_type() {
-                _ => "list".to_string(),
-            },
-            DataType::LargeList(elem) => match elem.data_type() {
-                _ => "large_list".to_string(),
-            },
+            DataType::List(_) => "list".to_string(),
+            DataType::LargeList(_) => "large_list".to_string(),
             DataType::FixedSizeList(_dt, len) => format!("fixed_size_list:{}", *len),
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
             _ => {

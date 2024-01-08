@@ -81,6 +81,10 @@ impl BFloat16Array {
         let binary_value = self.inner.value_unchecked(i);
         bf16::from_bits(u16::from_le_bytes([binary_value[0], binary_value[1]]))
     }
+
+    pub fn into_inner(self) -> FixedSizeBinaryArray {
+        self.inner
+    }
 }
 
 impl<'a> ArrayAccessor for &'a BFloat16Array {

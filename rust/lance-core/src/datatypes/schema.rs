@@ -24,7 +24,7 @@ use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use lance_arrow::*;
 use snafu::{location, Location};
 
-use super::field::Field;
+use super::field::{is_legacy_compatible_fsl, Field};
 use crate::{format::pb, io::Reader, Error, Result};
 
 /// Lance Schema.
@@ -373,6 +373,12 @@ impl Schema {
         };
         schema.set_field_id();
         Ok(schema)
+    }
+
+    #[doc(hidden)]
+    pub fn contains_fsl_fields(&self) -> bool {
+        self.fields_pre_order()
+            .any(|f| f.logical_type.is_fsl() && !is_legacy_compatible_fsl(f))
     }
 }
 

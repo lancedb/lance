@@ -648,7 +648,7 @@ impl From<&pb::Field> for Field {
                 logical_type.0.split_once(':').unwrap().1.split_once(':')
             {
                 let new_logical_type = LogicalType(format!("fixed_size_list:{}", size));
-                let children = vec![Field {
+                let children = vec![Self {
                     name: "item".to_string(),
                     id: -1,
                     parent_id: field.id,
@@ -733,7 +733,7 @@ impl From<&Field> for pb::Field {
 /// Check whether the field is compatible with the legacy FSL format.
 ///
 /// This is true if the child field is a primitive field and is not an extension type.
-fn is_legacy_compatible_fsl(field: &Field) -> bool {
+pub fn is_legacy_compatible_fsl(field: &Field) -> bool {
     if !field.logical_type.is_fsl() {
         return false;
     }

@@ -312,9 +312,12 @@ impl<'a> PlainDecoder<'a> {
         let item_array = item_decoder
             .get(start * list_size as usize..end * list_size as usize)
             .await?;
-        Ok(Arc::new(FixedSizeListArray::try_new_from_values(
-            item_array, list_size,
-        )?) as ArrayRef)
+        Ok(Arc::new(FixedSizeListArray::new(
+            Arc::new(items.clone()),
+            list_size,
+            item_array,
+            None,
+        )) as ArrayRef)
     }
 
     async fn decode_fixed_size_binary(

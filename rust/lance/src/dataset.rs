@@ -1591,6 +1591,7 @@ mod tests {
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
     use crate::io::deletion::read_deletion_file;
 
+    use arrow_array::FixedSizeListArray;
     use arrow_array::{
         builder::StringDictionaryBuilder,
         cast::{as_string_array, as_struct_array},
@@ -1603,6 +1604,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
+    use lance_arrow::bfloat16;
     use lance_core::format::WriterVersion;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::vector::DIST_COL;
@@ -4019,5 +4021,49 @@ mod tests {
                 (12, "b", DataType::Int32),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_fsl_field_flag() -> Result<()> {
+        let inner_field = Arc::new(
+            Field::new("item", DataType::FixedSizeBinary(2), true)
+                .with_metadata([("ARROW:extension:name".into(), "lance.bfloat16".into())].into()),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "fsl",
+            DataType::FixedSizeList(inner_field.clone(), 2),
+            false,
+        )]));
+
+        let values = bfloat16::BFloat16Array::from_iter_values(
+            (0..6).map(|i| i as f32).map(half::bf16::from_f32),
+        );
+        let vectors = FixedSizeListArray::new(inner_field, 2, Arc::new(values.into_inner()), None);
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            test_uri,
+            None,
+        )
+        .await?;
+
+        assert_eq!(
+            dataset.manifest.reader_feature_flags,
+            feature_flags::FLAG_FSL_FIELDS
+        );
+        assert_eq!(
+            dataset.manifest.writer_feature_flags,
+            feature_flags::FLAG_FSL_FIELDS
+        );
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(batch, data);
+
+        Ok(())
     }
 }

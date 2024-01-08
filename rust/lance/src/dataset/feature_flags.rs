@@ -15,7 +15,11 @@
 // Feature flags
 use crate::format::Manifest;
 
+/// Flag to indicate that the dataset contains deletion files.
 pub const FLAG_DELETION_FILES: u64 = 1;
+/// Flag to indicate that the dataset contains FixedSizeList fields that have
+/// child fields saved as part of the schema.
+pub const FLAG_FSL_FIELDS: u64 = 2;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(manifest: &mut Manifest) {
@@ -32,14 +36,20 @@ pub fn apply_feature_flags(manifest: &mut Manifest) {
         manifest.reader_feature_flags |= FLAG_DELETION_FILES;
         manifest.writer_feature_flags |= FLAG_DELETION_FILES;
     }
+
+    if manifest.schema.contains_fsl_fields() {
+        // Both readers and writers need to be able to read FSL fields
+        manifest.reader_feature_flags |= FLAG_FSL_FIELDS;
+        manifest.writer_feature_flags |= FLAG_FSL_FIELDS;
+    }
 }
 
 pub fn can_read_dataset(reader_flags: u64) -> bool {
-    reader_flags <= 1
+    reader_flags <= FLAG_FSL_FIELDS
 }
 
 pub fn can_write_dataset(writer_flags: u64) -> bool {
-    writer_flags <= 1
+    writer_flags <= FLAG_FSL_FIELDS
 }
 
 #[cfg(test)]
