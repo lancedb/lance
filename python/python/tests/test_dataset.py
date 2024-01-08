@@ -35,7 +35,7 @@ import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
 from helper import ProgressForTest
-from lance._dataset.sharded_dataset import ShardedBatchIterator
+from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
 
 # Various valid inputs for write_dataset
