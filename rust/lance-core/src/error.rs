@@ -18,6 +18,8 @@
 use arrow_schema::ArrowError;
 use snafu::{Location, Snafu};
 
+use crate::datatypes::Schema;
+
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
@@ -34,9 +36,8 @@ pub enum Error {
     },
     #[snafu(display("Dataset already exists: {uri}, {location}"))]
     DatasetAlreadyExists { uri: String, location: Location },
-    // #[snafu(display("Append with different schema: original={original} new={new}"))]
-    #[snafu(display("Append with different schema:"))]
-    SchemaMismatch {},
+    #[snafu(display("Append with different schema: original={original} new={new}"))]
+    SchemaMismatch { original: Schema, new: Schema },
     #[snafu(display("Dataset at path {path} was not found: {source}, {location}"))]
     DatasetNotFound {
         path: String,

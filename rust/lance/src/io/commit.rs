@@ -659,7 +659,7 @@ mod tests {
         if indices.len() == 2 {
             let mut fields: Vec<i32> = indices.iter().flat_map(|i| i.fields.clone()).collect();
             fields.sort();
-            assert_eq!(fields, vec![0, 1]);
+            assert_eq!(fields, vec![0, 2]);
         } else {
             assert_eq!(indices[0].fields, vec![0]);
         }
@@ -669,7 +669,7 @@ mod tests {
         assert_eq!(indices.len(), 2);
         let mut fields: Vec<i32> = indices.iter().flat_map(|i| i.fields.clone()).collect();
         fields.sort();
-        assert_eq!(fields, vec![0, 1]);
+        assert_eq!(fields, vec![0, 2]);
     }
 
     #[tokio::test]

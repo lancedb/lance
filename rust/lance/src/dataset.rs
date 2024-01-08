@@ -404,8 +404,8 @@ impl Dataset {
                 let m = d.manifest.as_ref();
                 if schema != m.schema {
                     return Err(Error::SchemaMismatch {
-                        // original: m.schema.clone(),
-                        // new: schema,
+                        original: m.schema.clone(),
+                        new: schema,
                     });
                 }
             }
@@ -495,20 +495,21 @@ impl Dataset {
                 .with_params(&params.store_params.clone().unwrap_or_default()),
         );
 
-        let (stream, schema) = reader_to_stream(batches)?;
+        let (stream, in_schema) = reader_to_stream(batches)?;
 
-        // Return Error if append and input schema differ
-        if self.manifest.schema != schema {
+        // Return Error if append and input schema differ. We need to check Arrow schemas
+        // and not Lance schemas because Lance field ids might differ.
+        if &ArrowSchema::from(self.schema()) != stream.schema().as_ref() {
             return Err(Error::SchemaMismatch {
-                // original: self.manifest.schema.clone(),
-                // new: schema,
+                original: self.manifest.schema.clone(),
+                new: in_schema,
             });
         }
 
         let fragments = write_fragments_internal(
             object_store.clone(),
             &self.base,
-            &schema,
+            self.schema(),
             stream,
             params.clone(),
         )
@@ -3943,7 +3944,7 @@ mod tests {
                     0,
                     "fsl",
                     DataType::FixedSizeList(
-                        Arc::new(Field::new("item", DataType::Float32, false)),
+                        Arc::new(Field::new("item", DataType::Float32, true)),
                         10
                     )
                 ),

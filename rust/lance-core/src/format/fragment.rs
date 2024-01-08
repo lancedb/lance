@@ -281,6 +281,8 @@ impl std::fmt::Display for RowAddress {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
@@ -300,18 +302,31 @@ mod tests {
                 ])),
                 true,
             ),
+            ArrowField::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, false)),
+                    128,
+                ),
+                false,
+            ),
+            ArrowField::new(
+                "tags",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, false))),
+                true,
+            ),
             ArrowField::new("bool", DataType::Boolean, true),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let fragment = Fragment::with_file(123, path, &schema, Some(10));
 
         assert_eq!(123, fragment.id);
-        assert_eq!(fragment.field_ids(), [0, 1, 2, 3]);
+        assert_eq!(fragment.field_ids(), [0, 1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(
             fragment.files,
             vec![DataFile {
                 path: path.to_string(),
-                fields: vec![0, 1, 2, 3]
+                fields: vec![0, 1, 2, 3, 4, 5, 6, 7]
             }]
         )
     }

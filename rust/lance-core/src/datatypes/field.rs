@@ -65,7 +65,6 @@ impl Field {
             lt if lt.is_struct() => {
                 DataType::Struct(self.children.iter().map(ArrowField::from).collect())
             }
-            // TODO: make sure we materialize the field when loading.
             lt if lt.is_fsl() => DataType::FixedSizeList(
                 Arc::new(ArrowField::from(&self.children[0])),
                 lt.fsl_size().unwrap(),
@@ -200,16 +199,22 @@ impl Field {
     /// Create a new field by removing all fields that do not match the filter.
     ///
     /// If a child field matches the filter then the parent will be kept even if
-    /// it does not match the filter.
+    /// it does not match the filter. If the parent matches the filter, then all
+    /// children will be kept.
     ///
     /// Returns None if the field itself does not match the filter.
     pub fn project_by_filter<F: Fn(&Self) -> bool>(&self, filter: &F) -> Option<Self> {
+        if filter(self) {
+            return Some(self.clone());
+        }
+
         let children = self
             .children
             .iter()
             .filter_map(|c| c.project_by_filter(filter))
             .collect::<Vec<_>>();
-        if !children.is_empty() || filter(self) {
+
+        if !children.is_empty() {
             Some(Self {
                 name: self.name.clone(),
                 id: self.id,
@@ -414,7 +419,7 @@ impl Field {
                 DataType::FixedSizeList(_, self_list_size),
                 DataType::FixedSizeList(_, other_list_size),
             ) if self_list_size == other_list_size => {
-                // do nothing
+                self.children[0].merge(&other.children[0])?;
             }
             (DataType::FixedSizeBinary(self_size), DataType::FixedSizeBinary(other_size))
                 if self_size == other_size =>
@@ -638,28 +643,30 @@ impl From<&pb::Field> for Field {
         let logical_type = LogicalType(field.logical_type.clone());
         // In older versions, FixedSizeList was written as `fixed_size_list:{child_type}:{size}`.
         // In those versions, the child field was not saved, so we have to create it here.
-        let children = if logical_type.is_fsl() {
-            if let Some((value_type, _size)) =
+        let (children, logical_type) = if logical_type.is_fsl() {
+            if let Some((value_type, size)) =
                 logical_type.0.split_once(':').unwrap().1.split_once(':')
             {
-                vec![Field {
+                let new_logical_type = LogicalType(format!("fixed_size_list:{}", size));
+                let children = vec![Field {
                     name: "item".to_string(),
                     id: -1,
                     parent_id: field.id,
                     logical_type: LogicalType(value_type.to_string()),
                     metadata: HashMap::new(),
-                    encoding: None,
-                    nullable: false,
+                    encoding: Some(Encoding::Plain),
+                    nullable: true,
                     children: vec![],
                     dictionary: None,
-                }]
+                }];
+                (children, new_logical_type)
             } else {
-                vec![]
+                (vec![], logical_type)
             }
         } else {
             // For other cases, children is left empty and is filled in later in the
             // impl From<&Vec<pb::Field>> for Schema implementation.
-            vec![]
+            (vec![], logical_type)
         };
 
         Self {
@@ -709,18 +716,50 @@ impl From<&Field> for pb::Field {
                 .extension_name()
                 .map(|name| name.to_owned())
                 .unwrap_or_default(),
-            r#type: 0,
+            r#type: if field.logical_type.is_struct() {
+                pb::field::Type::Parent.into()
+            } else if field.logical_type.is_fsl()
+                || field.logical_type.is_list()
+                || field.logical_type.is_large_list()
+            {
+                pb::field::Type::Repeated.into()
+            } else {
+                pb::field::Type::Leaf.into()
+            },
         }
     }
 }
 
+/// Check whether the field is compatible with the legacy FSL format.
+///
+/// This is true if the child field is a primitive field and is not an extension type.
+fn is_legacy_compatible_fsl(field: &Field) -> bool {
+    if !field.logical_type.is_fsl() {
+        return false;
+    }
+
+    let child = &field.children[0];
+    child.data_type().is_primitive() && child.extension_name().is_none()
+}
+
 impl From<&Field> for Vec<pb::Field> {
     fn from(field: &Field) -> Self {
-        let mut protos = vec![pb::Field::from(field)];
-        // TODO: map the relevant FSL fields to compatible layout
-        // (use three-part logical type and remove child field.)
-        protos.extend(field.children.iter().flat_map(Self::from));
-        protos
+        // For backwards-compatibility, we write FixedSizeList in legacy format
+        // whenever possible.
+        if is_legacy_compatible_fsl(field) {
+            vec![pb::Field {
+                logical_type: format!(
+                    "fixed_size_list:{}:{}",
+                    field.children[0].logical_type,
+                    field.logical_type.fsl_size().unwrap()
+                ),
+                ..pb::Field::from(field)
+            }]
+        } else {
+            let mut protos = vec![pb::Field::from(field)];
+            protos.extend(field.children.iter().flat_map(Self::from));
+            protos
+        }
     }
 }
 

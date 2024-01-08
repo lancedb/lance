@@ -514,6 +514,8 @@ mod tests {
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
 
+    use pretty_assertions::assert_eq;
+
     #[test]
     fn test_schema_projection() {
         let arrow_schema = ArrowSchema::new(vec![
@@ -675,9 +677,17 @@ mod tests {
                 true,
             ),
             ArrowField::new("c", DataType::Float64, false),
+            ArrowField::new(
+                "d",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Int32, false)),
+                    4,
+                ),
+                false,
+            ),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let projected = schema.project_by_ids(&[1, 2, 4, 5]);
+        let projected = schema.project_by_ids(&[2, 4, 5]);
 
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
@@ -702,6 +712,14 @@ mod tests {
             )])),
             true,
         )]);
+        assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
+
+        // Can project either list or its elements and result will be the same.
+        let projected = schema.project_by_ids(&[6]);
+        let expected_arrow_schema = arrow_schema.project(&[3]).unwrap();
+        assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
+
+        let projected = schema.project_by_ids(&[7]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
     }
 
@@ -1078,8 +1096,8 @@ mod tests {
             parent_id: -1,
             name: "fsl".to_string(),
             logical_type: "fixed_size_list:int32:2".to_string(),
-            encoding: 0,
-            nullable: false,
+            encoding: pb::Encoding::Plain.into(),
+            nullable: true,
             dictionary: None,
             metadata: HashMap::new(),
             extension_name: "".to_string(),
@@ -1092,12 +1110,10 @@ mod tests {
         let fields = schema.fields_pre_order().collect::<Vec<_>>();
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].name, "fsl");
-        // The legacy format is preserved in-memory for now, to make it easier
-        // to serialize back to protobuf.
-        assert_eq!(fields[0].logical_type.0.as_str(), "fixed_size_list:int32:2");
+        assert_eq!(fields[0].logical_type.0.as_str(), "fixed_size_list:2");
         assert_eq!(
             fields[0].data_type(),
-            DataType::FixedSizeList(Arc::new(ArrowField::new("item", DataType::Int32, false)), 2)
+            DataType::FixedSizeList(Arc::new(ArrowField::new("item", DataType::Int32, true)), 2)
         );
 
         assert_eq!(fields[1].id, 1);
@@ -1111,7 +1127,10 @@ mod tests {
         let roundtripped: Vec<pb::Field> = (&schema).into();
         assert_eq!(&roundtripped, &pb_schema);
 
-        // TODO: we should also be able to convert to arrow, back to Schema, then back to protobuf and get the same thing.
+        // Also check roundtrip to Arrow
+        let arrow_schema = ArrowSchema::from(&schema);
+        let roundtripped = Schema::try_from(&arrow_schema).unwrap();
+        assert_eq!(roundtripped, schema);
     }
 
     #[test]
@@ -1123,27 +1142,29 @@ mod tests {
                 parent_id: -1,
                 name: "fsl".to_string(),
                 logical_type: "fixed_size_list:2".to_string(),
-                encoding: 0,
+                encoding: pb::Encoding::None.into(),
                 nullable: false,
                 dictionary: None,
                 metadata: HashMap::new(),
                 extension_name: "".to_string(),
-                r#type: 1,
+                r#type: pb::field::Type::Repeated.into(),
             },
             pb::Field {
                 id: 1,
                 parent_id: 0,
                 // List fields don't have to have a serialized name.
-                name: "".to_string(),
+                name: "test_name".to_string(),
                 logical_type: "int32".to_string(),
-                encoding: 0,
+                encoding: pb::Encoding::Plain.into(),
                 nullable: false,
                 dictionary: None,
-                metadata: HashMap::new(),
                 // Giving the child type an extension should ensure we serialize
                 // using new variant.
+                metadata: [("ARROW:extension:name".into(), "test".into())].into(),
+                // This field is deprecated, but filled in for the sake of
+                // round-trip equality.
                 extension_name: "test".to_string(),
-                r#type: 2,
+                r#type: pb::field::Type::Leaf.into(),
             },
         ];
 
@@ -1157,19 +1178,23 @@ mod tests {
         assert_eq!(fields[0].logical_type.0.as_str(), "fixed_size_list:2");
         assert_eq!(
             fields[0].data_type(),
-            DataType::FixedSizeList(Arc::new(ArrowField::new("item", DataType::Int32, false)), 2)
+            DataType::FixedSizeList(
+                Arc::new(
+                    ArrowField::new("test_name", DataType::Int32, false).with_metadata(
+                        [("ARROW:extension:name".to_string(), "test".to_string())].into()
+                    )
+                ),
+                2
+            )
         );
 
         assert_eq!(fields[1].id, 1);
-        // Name of list fields should always be "item" for arrow-rs compatibility.
-        assert_eq!(fields[1].name, "item");
+        assert_eq!(fields[1].name, "test_name");
         assert_eq!(fields[1].logical_type.0.as_str(), "int32");
         assert_eq!(fields[1].data_type(), DataType::Int32);
         assert_eq!(fields[1].extension_name().unwrap(), "test");
         assert_eq!(fields[1].parent_id, 0);
 
-        // When we write, we need to omit FSL children if the child type is
-        // written in the parent field.
         let roundtripped: Vec<pb::Field> = (&schema).into();
         assert_eq!(&roundtripped, &pb_schema);
     }

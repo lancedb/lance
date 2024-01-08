@@ -18,7 +18,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
 use arrow_array::ArrayRef;
-use arrow_schema::{DataType, Field as ArrowField, TimeUnit};
+use arrow_schema::{DataType, TimeUnit};
 use snafu::{location, Location};
 
 mod field;
