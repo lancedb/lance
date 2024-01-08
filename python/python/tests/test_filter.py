@@ -195,11 +195,12 @@ def test_functions(tmp_path: Path):
     expected = table.slice(1, 2)
     dataset = lance.write_dataset(table, tmp_path / "test_neg_expr")
     assert (
-        dataset.scanner(
-            filter="array_has_any(genres, Array['anime', 'adventure'])"
-        ).to_table()
+        dataset.to_table(filter="array_has_any(genres, Array['anime', 'adventure'])")
         == expected
     )
+
+    expected = table.slice(0, 1)
+    assert dataset.to_table(filter="array_contains(genres, 'comedy')") == expected
 
 
 def test_negative_expressions(tmp_path: Path):
