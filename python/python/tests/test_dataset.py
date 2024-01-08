@@ -1,4 +1,4 @@
-#  Copyright (c) 2023. Lance Developers
+#  Copyright (c) 2024. Lance Developers
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+
 import base64
 import contextlib
 import os
@@ -34,6 +35,7 @@ import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
 from helper import ProgressForTest
+from lance._dataset.sharded_dataset import ShardedBatchIterator
 from lance.commit import CommitConflictError
 
 # Various valid inputs for write_dataset
@@ -1098,3 +1100,47 @@ def test_tensor_type(tmp_path: Path):
         }
     )
     assert results.num_rows == 1
+
+
+def test_sharded_iterator_fragments(tmp_path: Path):
+    arr = pa.array(range(1000))
+    tbl = pa.table({"a": arr})
+    # Write about 10 files
+    lance.write_dataset(tbl, tmp_path, max_rows_per_group=20, max_rows_per_file=100)
+
+    shard_datast = ShardedBatchIterator(tmp_path, 1, 2, columns=["a"])
+    batches = pa.concat_arrays([b["a"] for b in shard_datast])
+    assert batches == pa.array(
+        list(range(100, 200))
+        + list(range(300, 400))
+        + list(range(500, 600))
+        + list(range(700, 800))
+        + list(range(900, 1000))
+    )
+
+
+def test_sharded_iterator_batches(tmp_path: Path):
+    arr = pa.array(range(1000))
+    tbl = pa.table({"a": arr})
+    # Write about 10 files
+    ds = lance.write_dataset(tbl, tmp_path, max_rows_per_file=100)
+
+    RANK = 1
+    WORLD_SIZE = 2
+    BATCH_SIZE = 15
+    shard_datast = ShardedBatchIterator(
+        ds,
+        RANK,
+        WORLD_SIZE,
+        columns=["a"],
+        batch_size=BATCH_SIZE,
+        granularity="batch",
+    )
+    batches = pa.concat_arrays([b["a"] for b in shard_datast])
+    assert batches == pa.array(
+        [
+            j
+            for i in range(RANK * BATCH_SIZE, 1000, WORLD_SIZE * BATCH_SIZE)
+            for j in range(i, i + BATCH_SIZE)
+        ]
+    )

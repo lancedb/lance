@@ -1,4 +1,4 @@
-#  Copyright (c) 2023. Lance Developers
+#  Copyright (c) 2024. Lance Developers
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -18,16 +18,22 @@
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
 
+import logging
 import math
-from typing import Iterable, Optional, Union
+from typing import TYPE_CHECKING, Iterable, Literal, Optional, Union
 
 import numpy as np
 import pyarrow as pa
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
-from ..cache import CachedDataset
+from lance._dataset.cache import CachedDataset
+from lance._dataset.sharded_dataset import ShardedBatchIterator
+
 from ..sampler import maybe_sample
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 __all__ = ["LanceDataset"]
 
@@ -125,7 +131,6 @@ def _buffer_arrow_batches(
 
         buffer.append(item)
         cur_size += item.num_rows
-
     if buffer:
         yield concat_batches(buffer)
 
@@ -135,15 +140,17 @@ class LanceDataset(IterableDataset):
 
     def __init__(
         self,
-        dataset: Dataset,
+        dataset: Union[Dataset, str, Path],
         batch_size: int,
         *args,
         columns: Optional[list[str]] = None,
         filter: Optional[str] = None,
         samples: Optional[int] = 0,
         cache: Optional[Union[str, bool]] = None,
-        pin_memory: bool = False,
         with_row_id: bool = False,
+        rank: Optional[int] = None,
+        world_size: Optional[int] = None,
+        shard_granularity: Optional[Literal["fragment", "batch"]] = "fragment",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -153,7 +160,11 @@ class LanceDataset(IterableDataset):
         self.samples: Optional[int] = samples
         self.filter = filter
         self.with_row_id = with_row_id
-        self.pin_memory = pin_memory
+
+        # As Shared Dataset
+        self.rank = rank
+        self.world_size = world_size
+        self.shard_granularity = shard_granularity
 
         if samples is not None and filter is not None:
             raise ValueError("Does not support sampling over filtered dataset")
@@ -175,6 +186,22 @@ class LanceDataset(IterableDataset):
                     n=self.samples,
                     columns=self.columns,
                     batch_size=self.batch_size,
+                )
+            elif self.rank is not None and self.world_size is not None:
+                logging.info(
+                    "Sharded Torch Dataset: rank=%s, world_size=%s, granularity=%s",
+                    self.rank,
+                    self.world_size,
+                    self.shard_granularity,
+                )
+                raw_stream = ShardedBatchIterator(
+                    self.dataset,
+                    self.rank,
+                    self.world_size,
+                    columns=self.columns,
+                    batch_size=self.batch_size,
+                    with_row_id=self.with_row_id,
+                    granularity=self.shard_granularity,
                 )
             else:
                 raw_stream = self.dataset.to_batches(

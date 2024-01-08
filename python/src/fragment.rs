@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -174,19 +174,25 @@ impl FileFragment {
         batch.to_pyarrow(self_.py())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
+        batch_size: Option<usize>,
         filter: Option<String>,
         limit: Option<i64>,
         offset: Option<i64>,
         with_row_id: Option<bool>,
+        batch_readahead: Option<usize>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
         if let Some(cols) = columns {
             scanner
                 .project(&cols)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(batch_size) = batch_size {
+            scanner.batch_size(batch_size);
         }
         if let Some(f) = filter {
             scanner
@@ -200,6 +206,9 @@ impl FileFragment {
 
         if with_row_id.unwrap_or(false) {
             scanner.with_row_id();
+        }
+        if let Some(batch_readahead) = batch_readahead {
+            scanner.batch_readahead(batch_readahead);
         }
 
         let scn = Arc::new(scanner);

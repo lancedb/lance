@@ -356,11 +356,8 @@ class LanceDataset(pa.dataset.Dataset):
         """
         raise NotImplementedError("not changing schemas yet")
 
-    def get_fragments(
-        self, filter: Optional[Expression] = None
-    ) -> Iterator[pa.dataset.Fragment]:
+    def get_fragments(self, filter: Optional[Expression] = None) -> List[LanceFragment]:
         """Get all fragments from the dataset.
-
 
         Note: filter is not supported yet.
         """
