@@ -1608,6 +1608,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
+    use pretty_assertions::assert_eq;
     use tempfile::{tempdir, TempDir};
 
     // Used to validate that futures returned are Send.
@@ -3942,19 +3943,25 @@ mod tests {
                     0,
                     "fsl",
                     DataType::FixedSizeList(
-                        Arc::new(Field::new("item", DataType::Int32, true)),
+                        Arc::new(Field::new("item", DataType::Float32, false)),
                         10
                     )
                 ),
-                (1, "item", DataType::Int32), // What is this id
+                (13, "item", DataType::Float32),
                 (
-                    2,
+                    1,
                     "list",
                     DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
                 ),
-                (3, "item", DataType::Int32),
+                (2, "item", DataType::Int32),
                 (
-                    4,
+                    3,
+                    "large_list",
+                    DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true)))
+                ),
+                (4, "item", DataType::Int32),
+                (
+                    5,
                     "list_of_struct",
                     DataType::List(Arc::new(Field::new(
                         "item",
@@ -3969,8 +3976,8 @@ mod tests {
                     )))
                 ),
                 (
-                    5,
-                    "struct",
+                    6,
+                    "item",
                     DataType::Struct(
                         vec![
                             Field::new("a", DataType::Int32, true),
@@ -3979,8 +3986,36 @@ mod tests {
                         .into()
                     )
                 ),
-                (6, "a", DataType::Int32),
-                (7, "b", DataType::Int32),
+                (7, "a", DataType::Int32),
+                (8, "b", DataType::Int32),
+                (
+                    9,
+                    "large_list_of_struct",
+                    DataType::LargeList(Arc::new(Field::new(
+                        "item",
+                        DataType::Struct(
+                            vec![
+                                Field::new("a", DataType::Int32, true),
+                                Field::new("b", DataType::Int32, true),
+                            ]
+                            .into()
+                        ),
+                        true
+                    )))
+                ),
+                (
+                    10,
+                    "item",
+                    DataType::Struct(
+                        vec![
+                            Field::new("a", DataType::Int32, true),
+                            Field::new("b", DataType::Int32, true),
+                        ]
+                        .into()
+                    )
+                ),
+                (11, "a", DataType::Int32),
+                (12, "b", DataType::Int32),
             ]
         );
     }

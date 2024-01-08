@@ -102,6 +102,7 @@ prost-build.workspace = true
 
 [dev-dependencies]
 lance-test-macros = { workspace = true }
+pretty_assertions = { workspace = true }
 
 clap = { version = "4.1.1", features = ["derive"] }
 criterion = { workspace = true }
