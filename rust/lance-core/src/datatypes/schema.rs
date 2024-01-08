@@ -15,7 +15,7 @@
 //! Schema
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::{self, Debug, Formatter},
 };
 
@@ -104,7 +104,7 @@ impl Schema {
     /// Check that the top level fields don't contain `.` in their names
     /// to distinguish from nested fields.
     // TODO: pub(crate)
-    pub fn validate(&self) -> Result<bool> {
+    pub fn validate(&self) -> Result<()> {
         for field in self.fields.iter() {
             if field.name.contains('.') {
                 return Err(Error::Schema{message:format!(
@@ -113,7 +113,19 @@ impl Schema {
                 ), location: location!(),});
             }
         }
-        Ok(true)
+
+        // Check for duplicate field ids
+        let mut seen_ids = HashSet::new();
+        for field in self.fields_pre_order() {
+            if !seen_ids.insert(field.id) {
+                return Err(Error::Schema {
+                    message: format!("Duplicate field id {} in schema {:?}", field.id, self),
+                    location: location!(),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Intersection between two [`Schema`].

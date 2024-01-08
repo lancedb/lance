@@ -229,7 +229,7 @@ impl DisplayAs for LancePushdownScanExec {
                     .join(", ");
                 write!(
                     f,
-                    "LancePushdownScan: uri={}, projection=[{}], predicate={}, row_id=[{}], ordered={}",
+                    "LancePushdownScan: uri={}, projection=[{}], predicate={}, row_id={}, ordered={}",
                     self.dataset.data_dir(),
                     columns,
                     self.predicate,

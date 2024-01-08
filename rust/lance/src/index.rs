@@ -119,6 +119,7 @@ pub(crate) async fn remap_index(
     Ok(new_id)
 }
 
+#[derive(Debug)]
 pub struct ScalarIndexInfo {
     indexed_columns: HashMap<String, DataType>,
 }

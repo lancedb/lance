@@ -425,7 +425,12 @@ impl DisplayAs for KNNIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "KNNIndex: name={}, k={}", self.index.uuid, self.query.k)
+                write!(
+                    f,
+                    "KNNIndex: name={}, k={}",
+                    self.index.uuid,
+                    self.query.k * self.query.refine_factor.unwrap_or(1) as usize
+                )
             }
         }
     }
