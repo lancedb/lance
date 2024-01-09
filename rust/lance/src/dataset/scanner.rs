@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -649,7 +649,7 @@ impl Scanner {
     /// 3. Sort
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
-    async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         // Scalar indices are only used when prefiltering
         // TODO: Should we use them when postfiltering if there is no vector search?
         let use_scalar_index = self.prefilter || self.nearest.is_none();

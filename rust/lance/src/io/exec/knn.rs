@@ -140,11 +140,11 @@ impl DFRecordBatchStream for KNNFlatStream {
 /// - `input` schema does not have "_distance" column.
 #[derive(Debug)]
 pub struct KNNFlatExec {
-    /// Input node.
-    input: Arc<dyn ExecutionPlan>,
+    /// Inner input node.
+    pub input: Arc<dyn ExecutionPlan>,
 
-    /// The query to execute.
-    query: Query,
+    /// The vector query to execute.
+    pub query: Query,
 }
 
 impl DisplayAs for KNNFlatExec {
