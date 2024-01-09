@@ -71,7 +71,7 @@ use crate::{
         pb,
         prefilter::PreFilter,
         vector::{
-            ivf::{builder::shuffle_dataset_v2, io::write_index_partitions},
+            ivf::{builder::shuffle_dataset, io::write_index_partitions},
             Transformer,
         },
         INDEX_FILE_NAME,
@@ -218,7 +218,7 @@ impl IVFIndex {
             None,
         )?;
 
-        let shuffled = shuffle_dataset_v2(
+        let shuffled = shuffle_dataset(
             data,
             column,
             ivf,
