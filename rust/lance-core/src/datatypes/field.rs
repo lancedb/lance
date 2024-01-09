@@ -553,8 +553,8 @@ impl fmt::Display for Field {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Field(id={}, name={}, type={}",
-            self.id, self.name, self.logical_type.0,
+            "Field(id={}, name={}, type={}, nullable={}",
+            self.id, self.name, self.logical_type.0, self.nullable
         )?;
 
         if let Some(dictionary) = &self.dictionary {

@@ -359,7 +359,7 @@ impl Dataset {
             Err(e) => return Err(e),
         };
 
-        let (stream, schema) = reader_to_stream(batches)?;
+        let (stream, new_schema) = reader_to_stream(batches)?;
 
         // Running checks for the different write modes
         // create + dataset already exists = error
@@ -398,18 +398,33 @@ impl Dataset {
             )
         };
 
-        // append + input schema different from existing schema = error
-        if matches!(params.mode, WriteMode::Append) {
-            if let Some(d) = dataset.as_ref() {
-                let m = d.manifest.as_ref();
-                if schema != m.schema {
-                    return Err(Error::SchemaMismatch {
-                        original: m.schema.clone(),
-                        new: schema,
-                    });
+        let schema = match params.mode {
+            WriteMode::Create | WriteMode::Overwrite => new_schema.clone(),
+            WriteMode::Append => {
+                let existing_schema = dataset.as_ref().map(|ds| ds.schema().clone());
+                // append + input schema different from existing schema = error
+                if let Some(schema) = &existing_schema {
+                    // We need to compare as Arrow schemas, because Lance field ids might differ.
+                    // We reset the metadata since we don't want that as part of comparison.
+                    let input_schema_arrow = stream
+                        .schema()
+                        .as_ref()
+                        .clone()
+                        .with_metadata(HashMap::new());
+                    let current_schema_arrow =
+                        ArrowSchema::from(schema).with_metadata(HashMap::new());
+                    if input_schema_arrow != current_schema_arrow {
+                        return Err(Error::SchemaMismatch {
+                            original: schema.clone(),
+                            new: new_schema,
+                        });
+                    }
                 }
+                // Prefer using existing schema so we keep the metadata the table
+                // was created with.
+                existing_schema.unwrap_or_else(|| new_schema.clone())
             }
-        }
+        };
 
         if let Some(d) = dataset.as_ref() {
             if !can_write_dataset(d.manifest.writer_feature_flags) {
