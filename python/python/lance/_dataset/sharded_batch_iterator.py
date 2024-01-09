@@ -12,13 +12,17 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from pathlib import Path
-from typing import Generator, List, Literal, Union
+from __future__ import annotations
 
-import pyarrow as pa
+from typing import TYPE_CHECKING, Generator, List, Literal, Union
 
 import lance
 from lance.dataset import LanceDataset
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    import pyarrow as pa
 
 __all__ = ["ShardedBatchIterator"]
 
@@ -79,6 +83,41 @@ class ShardedBatchIterator:
 
         self._ds: LanceDataset = (
             data if isinstance(data, LanceDataset) else lance.dataset(data)
+        )
+
+    @staticmethod
+    def from_torch(
+        data: Union[str, Path, LanceDataset],
+        *,
+        columns: List[str] = None,
+        batch_size: int = 1024 * 10,
+        granularity: Literal["fragment", "batch"] = "fragment",
+        batch_readahead: int = 8,
+        with_row_id: bool = False,
+    ) -> ShardedBatchIterator:
+        """Use from a PyTorch distributed environment.
+
+        Automatically infer `rank` and `world_size` from `torch.distributed`.
+
+        Other parameters, see :py:meth:`ShardedBatchIterator.__init__`.
+        """
+        try:
+            import torch
+        except ImportError:
+            raise ImportError(
+                "PyTorch is not installed, please install torch first before using ."
+            )
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        return ShardedBatchIterator(
+            data,
+            rank,
+            world_size,
+            columns=columns,
+            batch_size=batch_size,
+            granularity=granularity,
+            batch_readahead=batch_readahead,
+            with_row_id=with_row_id,
         )
 
     def _iter_over_fragments(self) -> Generator[pa.RecordBatch, None, None]:
