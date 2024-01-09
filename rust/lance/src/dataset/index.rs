@@ -83,7 +83,7 @@ impl IndexRemapper for DatasetIndexRemapper {
 }
 
 /// Returns the fragment ids that are not indexed by this index.
-pub async fn unindexed_fragments(index: &Index, dataset: &Dataset) -> Result<Vec<Fragment>> {
+pub(crate) async fn unindexed_fragments(index: &Index, dataset: &Dataset) -> Result<Vec<Fragment>> {
     if index.dataset_version == dataset.version().version {
         return Ok(vec![]);
     }
