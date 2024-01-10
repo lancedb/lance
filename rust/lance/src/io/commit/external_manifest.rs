@@ -29,6 +29,7 @@ mod test {
     use snafu::{location, Location};
     use tokio::sync::Mutex;
 
+    use crate::dataset::builder::DatasetBuilder;
     use crate::{
         dataset::{ReadParams, WriteMode, WriteParams},
         io::object_store::ObjectStoreParams,
@@ -157,9 +158,11 @@ mod test {
             external_manifest_store: Arc::new(sleepy_store),
         });
         let options = read_params(handler.clone());
-        Dataset::open_with_params(ds_uri, &options).await.expect(
-            "If this fails, it means the external store handler does not correctly handle the case when a dataset exist, but it has never used external store before."
-        );
+        DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(options)
+            .load()
+            .await
+            .unwrap();
 
         Dataset::write(
             data_gen.batch(100),
@@ -195,7 +198,9 @@ mod test {
             .unwrap();
 
         // load the data and check the content
-        let ds = Dataset::open_with_params(ds_uri, &read_params(handler))
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(read_params(handler))
+            .load()
             .await
             .unwrap();
         assert_eq!(ds.count_rows().await.unwrap(), 100);
@@ -246,7 +251,9 @@ mod test {
             assert!(errors.is_empty(), "{:?}", errors);
 
             // load the data and check the content
-            let ds = Dataset::open_with_params(ds_uri, &read_params(handler))
+            let ds = DatasetBuilder::from_uri(ds_uri)
+                .with_read_params(read_params(handler))
+                .load()
                 .await
                 .unwrap();
             assert_eq!(ds.count_rows().await.unwrap(), 60);
@@ -309,21 +316,21 @@ mod test {
         }
 
         // Open without external store handler, should not see the out-of-sync commit
-        let params = ReadParams::default();
-        let ds = Dataset::open_with_params(ds_uri, &params).await.unwrap();
+        let ds = DatasetBuilder::from_uri(ds_uri).load().await.unwrap();
         assert_eq!(ds.version().version, 5);
         assert_eq!(ds.count_rows().await.unwrap(), 50);
 
         // Open with external store handler, should sync the out-of-sync commit on open
-        let ds = Dataset::open_with_params(ds_uri, &read_params(handler))
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_commit_handler(handler.clone())
+            .load()
             .await
             .unwrap();
         assert_eq!(ds.version().version, 6);
         assert_eq!(ds.count_rows().await.unwrap(), 60);
 
         // Open without external store handler again, should see the newly sync'd commit
-        let params = ReadParams::default();
-        let ds = Dataset::open_with_params(ds_uri, &params).await.unwrap();
+        let ds = DatasetBuilder::from_uri(ds_uri).load().await.unwrap();
         assert_eq!(ds.version().version, 6);
         assert_eq!(ds.count_rows().await.unwrap(), 60);
     }
