@@ -136,11 +136,24 @@ impl TryFrom<&DataType> for LogicalType {
                 DataType::Struct(_) => "large_list.struct".to_string(),
                 _ => "large_list".to_string(),
             },
-            DataType::FixedSizeList(dt, len) => format!(
-                "fixed_size_list:{}:{}",
-                Self::try_from(dt.data_type())?.0,
-                *len
-            ),
+            DataType::FixedSizeList(field, len) => {
+                if field
+                    .metadata()
+                    .get("ARROW:extension:name")
+                    .map(|name| name == "lance.bfloat16")
+                    .unwrap_or_default()
+                {
+                    // Don't want to directly use `blfoat16`, in case a built-in type is added
+                    // that isn't identical to our extension type.
+                    format!("fixed_size_list:lance.bfloat16:{}", *len)
+                } else {
+                    format!(
+                        "fixed_size_list:{}:{}",
+                        Self::try_from(field.data_type())?.0,
+                        *len
+                    )
+                }
+            }
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
             _ => {
                 return Err(Error::Schema {
@@ -195,20 +208,37 @@ impl TryFrom<&LogicalType> for DataType {
             match splits[0] {
                 "fixed_size_list" => {
                     if splits.len() != 3 {
-                        Err(Error::Schema {
+                        return Err(Error::Schema {
                             message: format!("Unsupported logical type: {}", lt),
                             location: location!(),
-                        })
-                    } else {
-                        let elem_type = (&LogicalType(splits[1].to_string())).try_into()?;
-                        let size: i32 = splits[2].parse::<i32>().map_err(|e: _| Error::Schema {
-                            message: e.to_string(),
-                            location: location!(),
-                        })?;
-                        Ok(FixedSizeList(
-                            Arc::new(ArrowField::new("item", elem_type, true)),
-                            size,
-                        ))
+                        });
+                    }
+
+                    let size: i32 = splits[2].parse::<i32>().map_err(|e: _| Error::Schema {
+                        message: e.to_string(),
+                        location: location!(),
+                    })?;
+
+                    match splits[1] {
+                        "lance.bfloat16" => {
+                            let field = ArrowField::new("item", Self::FixedSizeBinary(2), true)
+                                .with_metadata(
+                                    [
+                                        ("ARROW:extension:name".into(), "lance.bfloat16".into()),
+                                        ("ARROW:extension:metadata".into(), "".into()),
+                                    ]
+                                    .into(),
+                                );
+                            Ok(FixedSizeList(Arc::new(field), size))
+                        }
+                        data_type => {
+                            let elem_type = (&LogicalType(data_type.to_string())).try_into()?;
+
+                            Ok(FixedSizeList(
+                                Arc::new(ArrowField::new("item", elem_type, true)),
+                                size,
+                            ))
+                        }
                     }
                 }
                 "fixed_size_binary" => {

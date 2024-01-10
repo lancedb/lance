@@ -1590,6 +1590,7 @@ mod tests {
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
     use crate::io::deletion::read_deletion_file;
 
+    use arrow_array::FixedSizeListArray;
     use arrow_array::{
         builder::StringDictionaryBuilder,
         cast::{as_string_array, as_struct_array},
@@ -1602,12 +1603,14 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
+    use lance_arrow::bfloat16;
     use lance_core::format::WriterVersion;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::vector::DIST_COL;
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
+    use pretty_assertions::assert_eq;
     use tempfile::{tempdir, TempDir};
 
     // Used to validate that futures returned are Send.
@@ -3921,5 +3924,45 @@ mod tests {
 
         let row_count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
         assert_eq!(row_count, 1900);
+    }
+
+    #[tokio::test]
+    async fn test_bfloat16_roundtrip() -> Result<()> {
+        let inner_field = Arc::new(
+            Field::new("item", DataType::FixedSizeBinary(2), true).with_metadata(
+                [
+                    ("ARROW:extension:name".into(), "lance.bfloat16".into()),
+                    ("ARROW:extension:metadata".into(), "".into()),
+                ]
+                .into(),
+            ),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "fsl",
+            DataType::FixedSizeList(inner_field.clone(), 2),
+            false,
+        )]));
+
+        let values = bfloat16::BFloat16Array::from_iter_values(
+            (0..6).map(|i| i as f32).map(half::bf16::from_f32),
+        );
+        let vectors = FixedSizeListArray::new(inner_field, 2, Arc::new(values.into_inner()), None);
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            test_uri,
+            None,
+        )
+        .await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(batch, data);
+
+        Ok(())
     }
 }
