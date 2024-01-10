@@ -199,7 +199,9 @@ message DataFile {
   // with one file of N columns, the field ids will be 1, 2, ..., N. If a second,
   // fragment is created with M columns, the field ids will be N+1, N+2, ..., N+M.
   //
-  // These ids must be sorted and contiguous.
+  // These ids must be sorted.
+  //
+  // 
   repeated int32 fields = 2;
 } // DataFile
 
@@ -257,6 +259,15 @@ message Metadata {
   // Every field that is a part of the file will have a run in the page table.
   // This includes struct columns, which will have a run of length 0 since 
   // they don't store any actual data.
+  //
+  // For FixedSizeList columns, there are no buffers at the list-level, only at
+  // the child level. However, how this is handled depends on the presense of
+  // the feature flag 2 (fields in fixed size list). If that flag is missing, then
+  // the page table will use the list-level field id for value pages in the page
+  // table, and the field id of the value field may be missing. If the flag is
+  // present, then the entries for the list-level field id will be zero length
+  // (just like struct columns), and the value pages will be stored under the
+  // child field id.
   //
   // For example, for the column 5 and batch 4, we have:
   // ```text

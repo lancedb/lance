@@ -61,6 +61,7 @@ pub struct FileWriter {
     page_table: PageTable,
     metadata: Metadata,
     stats_collector: Option<statistics::StatisticsCollector>,
+    // fsl_has_fields: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -70,6 +71,7 @@ pub struct FileWriterOptions {
     /// If None, will collect for all fields in the schema (that support stats).
     /// If an empty vector, will not collect any statistics.
     pub collect_stats_for_fields: Option<Vec<i32>>,
+    // pub fsl_has_fields: bool,
 }
 
 impl FileWriter {
@@ -114,6 +116,7 @@ impl FileWriter {
             page_table: PageTable::default(),
             metadata: Metadata::default(),
             stats_collector,
+            // fsl_has_fields: options.fsl_has_fields,
         })
     }
 
@@ -224,6 +227,7 @@ impl FileWriter {
         arrs: &[&ArrayRef],
         batch_id: i32,
         page_table: &mut PageTable,
+        // fsl_has_fields: bool,
     ) -> Result<()> {
         assert!(!arrs.is_empty());
         let data_type = arrs[0].data_type();
@@ -240,6 +244,37 @@ impl FileWriter {
                 )
                 .await
             }
+            // TODO: conditionally use separate branch for FSL array
+            // DataType::FixedSizeList(_, _) if fsl_has_fields => {
+            //     Self::write_fixed_size_list_array(
+            //         object_writer,
+            //         field,
+            //         arrs_ref.as_slice(),
+            //         batch_id,
+            //         page_table,
+            //     )
+            // }
+            // Legacy method of writing FSL arrays. The values are written with
+            // the field id of the parent list field.
+            // DataType::FixedSizeList(child_field, _) if !fsl_has_fields => {
+            //     if !child_field.data_type().is_primitive() {
+            //         return Err(Error::Internal {
+            //             message: format!(
+            //                 "FileWriter asked to write FixedSizeList with non-primitive child: {:?}",
+            //                 data_type
+            //             ),
+            //             location: location!(),
+            //         })
+            //     }
+            //     Self::write_fixed_stride_array(
+            //         object_writer,
+            //         field,
+            //         arrs_ref.as_slice(),
+            //         batch_id,
+            //         page_table,
+            //     )
+            //     .await
+            // }
             dt if dt.is_fixed_stride() => {
                 Self::write_fixed_stride_array(
                     object_writer,
@@ -277,16 +312,6 @@ impl FileWriter {
                     object_writer,
                     field,
                     struct_arrays.as_slice(),
-                    batch_id,
-                    page_table,
-                )
-                .await
-            }
-            DataType::FixedSizeList(_, _) | DataType::FixedSizeBinary(_) => {
-                Self::write_fixed_stride_array(
-                    object_writer,
-                    field,
-                    arrs_ref.as_slice(),
                     batch_id,
                     page_table,
                 )
@@ -332,7 +357,7 @@ impl FileWriter {
         Ok(())
     }
 
-    /// Write fixed size array, including, primtiives, fixed size binary, and fixed size list.
+    /// Write fixed size array, including, primitives, fixed size binary, and fixed size list.
     async fn write_fixed_stride_array(
         object_writer: &mut ObjectWriter,
         field: &Field,
@@ -418,6 +443,16 @@ impl FileWriter {
             Self::write_array(object_writer, child, arrs.as_slice(), batch_id, page_table).await?;
         }
         Ok(())
+    }
+
+    async fn write_fixed_size_list_array(
+        object_writer: &mut ObjectWriter,
+        field: &Field,
+        arrs: &[&dyn Array],
+        batch_id: i32,
+        page_table: &mut PageTable,
+    ) -> Result<()> {
+        todo!()
     }
 
     async fn write_list_array(

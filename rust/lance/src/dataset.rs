@@ -4079,6 +4079,34 @@ mod tests {
         let data = dataset.scan().try_into_batch().await?;
         assert_eq!(batch, data);
 
+        // Now with legacy one
+        let inner_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "fsl",
+            DataType::FixedSizeList(inner_field.clone(), 2),
+            false,
+        )]));
+        let values = Float32Array::from_iter_values((0..6).map(|i| i as f32));
+        let vectors = FixedSizeListArray::new(inner_field, 2, Arc::new(values), None);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        assert_eq!(dataset.manifest.reader_feature_flags, 0);
+        assert_eq!(dataset.manifest.writer_feature_flags, 0);
+        let dataset = Dataset::open(test_uri).await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(batch, data);
+
         Ok(())
     }
 }

@@ -50,8 +50,13 @@ impl PageTable {
     ///
     /// The field_ids that are loaded are `field_id_offset` to `field_id_offset + num_columns`.
     /// `field_id_offset` should be the smallest field_id in the schema. `num_columns` should
-    /// be the total unique number of field ids, including struct fields despite the fact
-    /// they have no data pages.
+    /// be the difference between the max field_id in the schema and `field_id_offset`. `num_columns`
+    /// might be greater than the actual number of fields if there are gaps in the field ids.
+    /// Failure to specify these parameters correctly can lead to incorrect data being loaded
+    /// or attempting to read past the end of the file.
+    ///
+    /// Non-existent fields as well as those that don't have data buffers (such as struct fields)
+    /// will not be loaded into the page table.
     pub async fn load<'a>(
         reader: &dyn Reader,
         position: usize,
@@ -67,18 +72,23 @@ impl PageTable {
         let mut pages = BTreeMap::default();
         for col in 0..num_columns {
             let field_id = col + field_id_offset;
-            pages.insert(field_id, BTreeMap::default());
             for batch in 0..num_batches {
                 let idx = col * num_batches + batch;
                 let batch_position = &arr.value((idx * 2) as usize);
                 let batch_length = &arr.value((idx * 2 + 1) as usize);
-                pages.get_mut(&field_id).unwrap().insert(
-                    batch,
-                    PageInfo {
-                        position: *batch_position as usize,
-                        length: *batch_length as usize,
-                    },
-                );
+                if batch_position == &0 && batch_length == &0 {
+                    continue;
+                }
+                pages
+                    .entry(field_id)
+                    .or_insert_with(BTreeMap::default)
+                    .insert(
+                        batch,
+                        PageInfo {
+                            position: *batch_position as usize,
+                            length: *batch_length as usize,
+                        },
+                    );
             }
         }
 
