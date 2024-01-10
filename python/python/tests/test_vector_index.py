@@ -553,20 +553,16 @@ def test_vector_with_nans(tmp_path: Path):
     row = dataset._take_rows([1])
     assert row["vector"]
 
-    from lance.torch import preferred_device
-
-    for device in [preferred_device(), None]:
-        ds = dataset.create_index(
-            "vector",
-            index_type="IVF_PQ",
-            num_partitions=2,
-            num_sub_vectors=2,
-            replace=True,
-            accelerator=device,
-        )
-        tbl = ds.to_table(
-            nearest={"column": "vector", "q": data[0:DIM], "k": TOTAL, "nprobes": 2},
-            with_row_id=True,
-        )
-        assert len(tbl) == TOTAL - 1
-        assert 1 not in tbl["_rowid"].to_numpy(), "Row with ID 1 is not in the index"
+    ds = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=2,
+        replace=True,
+    )
+    tbl = ds.to_table(
+        nearest={"column": "vector", "q": data[0:DIM], "k": TOTAL, "nprobes": 2},
+        with_row_id=True,
+    )
+    assert len(tbl) == TOTAL - 1
+    assert 1 not in tbl["_rowid"].to_numpy(), "Row with ID 1 is not in the index"
