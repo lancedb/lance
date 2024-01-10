@@ -565,8 +565,7 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> R
         .map(Arc::new)
         .zip(columns.iter().cloned())
         .collect::<Vec<_>>();
-    StructArray::try_from(zipped)
-        .map_err(|e| ArrowError::ComputeError(format!("Failed to merge RecordBatch: {}", e)))
+    Ok(StructArray::from(zipped))
 }
 
 fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a ArrayRef> {
