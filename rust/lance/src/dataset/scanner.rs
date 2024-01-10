@@ -2753,7 +2753,7 @@ mod test {
 
             // UPDATE
 
-            dataset.optimize_indices().await.unwrap();
+            dataset.optimize_indices(None).await.unwrap();
             let updated_version = dataset.version().version;
 
             // APPEND -> DELETE
