@@ -21,14 +21,13 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use datafusion::optimizer::OptimizerConfig;
 use lance_core::io::{read_message, read_message_from_buf, read_metadata_offset, Reader};
-use lance_index::optimize::OptimizeAction;
-use lance_index::pb::index::Implementation;
 use lance_index::scalar::{
     expression::IndexInformationProvider, lance_format::LanceIndexStore, ScalarIndex,
 };
-use lance_index::{pb, Index, IndexType, INDEX_FILE_NAME};
+use lance_index::{
+    optimize::OptimizeAction, pb, pb::index::Implementation, Index, IndexType, INDEX_FILE_NAME,
+};
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
@@ -287,7 +286,7 @@ impl DatasetIndexExt for Dataset {
         let dataset = Arc::new(self.clone());
         let indices = self.load_indices().await?;
 
-        let mut indices_by_column = HashMap::<i32, Vec<&dyn Index>>::new();
+        let mut indices_by_column = HashMap::<i32, Vec<&lance_core::format::Index>>::new();
         indices.iter().try_for_each(|idx| {
             if idx.fields.len() != 1 {
                 return Err(Error::Index {
@@ -296,21 +295,27 @@ impl DatasetIndexExt for Dataset {
                     location: location!(),
                 });
             }
-            indices_by_column[&idx.fields[0]].push(idx);
+            indices_by_column
+                .entry(idx.fields[0])
+                .or_default()
+                .push(idx);
             Ok(())
         })?;
+        for (_, indices) in indices_by_column.iter_mut() {
+            indices.sort_by_key(|idx| idx.dataset_version);
+        }
 
         for (&column_id, indices) in indices_by_column.iter() {
             let column = dataset
                 .schema()
                 .field_by_id(column_id)
-                .ok_or(Err(Error::Index {
+                .ok_or(Error::Index {
                     message: format!(
                         "Optimize indices: column {} does not exist in dataset.",
                         column_id
                     ),
                     location: location!(),
-                }))?;
+                })?;
 
             match action {
                 Some(OptimizeAction::CreateDelta) => {

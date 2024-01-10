@@ -24,3 +24,9 @@ pub enum OptimizeAction {
     /// Merge existing indices
     Merge(MergeIndex),
 }
+
+impl Default for OptimizeAction {
+    fn default() -> Self {
+        Self::Append
+    }
+}
