@@ -39,7 +39,7 @@ pub(super) async fn build_partitions(
     pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
     part_range: Range<u32>,
-    precomputed_partitons: Option<HashMap<u64, u32>>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
 ) -> Result<()> {

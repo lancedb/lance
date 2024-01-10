@@ -333,9 +333,9 @@ impl DatasetIndexExt for Dataset {
                 None | Some(OptimizeAction::Append) => {
                     // Default action is append to existing index.
                     // For backward compatibility.
-                    let idx = indices.last().expect(
-                        format!("Must has more than 1 index for column: {}", column.name).as_str(),
-                    );
+                    let idx = indices.last().unwrap_or_else(|| {
+                        panic!("Must has more than 1 index for column: {}", column.name)
+                    });
                     let Some((new_id, new_frag_ids)) = append_index(dataset.clone(), idx).await?
                     else {
                         continue;
