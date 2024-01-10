@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use object_store::path::Path;
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -42,6 +43,7 @@ pub(super) async fn build_partitions(
     precomputed_partitons: Option<HashMap<u64, u32>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
+    precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
@@ -75,6 +77,7 @@ pub(super) async fn build_partitions(
         pq.num_sub_vectors(),
         shuffle_partition_batches,
         shuffle_partition_concurrency,
+        precomputed_shuffle_buffers,
     )
     .await?;
 
