@@ -30,7 +30,6 @@ from .fragment import write_fragments
 from . import write_dataset
 
 if TYPE_CHECKING:
-
     import torch
 
     from . import LanceDataset
@@ -276,11 +275,11 @@ def compute_partitions(
     if spill_dir is None:
         spill_dir = tempfile.mkdtemp()
 
-    split_uri = Path(spill_dir) / "precomputed_partitions.lance"
+    spill_uri = Path(spill_dir) / "precomputed_partitions.lance"
 
     ds = write_dataset(
         rbr,
-        split_uri,
+        spill_uri,
         schema=output_schema,
         max_rows_per_file=dataset.count_rows(),
     )
@@ -288,4 +287,4 @@ def compute_partitions(
     files = ds.get_fragments()[0].data_files()
     assert len(files) == 1
 
-    return str(split_uri)
+    return str(spill_uri)
