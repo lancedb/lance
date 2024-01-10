@@ -57,6 +57,8 @@ pub async fn shuffle_dataset(
     ivf: Arc<dyn lance_index::vector::ivf::Ivf>,
     num_partitions: u32,
     num_sub_vectors: usize,
+    shuffle_partition_batches: usize,
+    shuffle_partition_concurrency: usize,
 ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
     let column: Arc<str> = column.into();
     let stream = data
@@ -111,7 +113,9 @@ pub async fn shuffle_dataset(
     info!("wrote raw stream: {:?}", start.elapsed());
 
     let start = std::time::Instant::now();
-    let partition_files = shuffler.write_partitioned_shuffles(10000, 2).await?;
+    let partition_files = shuffler
+        .write_partitioned_shuffles(shuffle_partition_batches, shuffle_partition_concurrency)
+        .await?;
     info!("counted partition sizes: {:?}", start.elapsed());
 
     let start = std::time::Instant::now();
@@ -135,6 +139,8 @@ pub(super) async fn build_partitions(
     metric_type: MetricType,
     part_range: Range<u32>,
     precomputed_partitons: Option<HashMap<u64, u32>>,
+    shuffle_partition_batches: usize,
+    shuffle_partition_concurrency: usize,
 ) -> Result<()> {
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
@@ -166,6 +172,8 @@ pub(super) async fn build_partitions(
         ivf_model,
         ivf.num_partitions() as u32,
         pq.num_sub_vectors(),
+        shuffle_partition_batches,
+        shuffle_partition_concurrency,
     )
     .await?;
 

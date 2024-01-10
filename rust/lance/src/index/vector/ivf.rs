@@ -224,6 +224,8 @@ impl IVFIndex {
             ivf,
             self.ivf.num_partitions() as u32,
             pq_index.pq.num_sub_vectors(),
+            10000,
+            2,
         )
         .await?;
         let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
@@ -878,6 +880,8 @@ pub async fn build_ivf_pq_index(
         metric_type,
         stream,
         precomputed_partitions,
+        ivf_params.shuffle_partition_batches,
+        ivf_params.shuffle_partition_concurrency,
     )
     .await
 }
@@ -1015,6 +1019,8 @@ async fn write_index_file(
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin + 'static,
     precomputed_partitons: Option<HashMap<u64, u32>>,
+    shuffle_partition_batches: usize,
+    shuffle_partition_concurrency: usize,
 ) -> Result<()> {
     let object_store = dataset.object_store();
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
@@ -1031,6 +1037,8 @@ async fn write_index_file(
         metric_type,
         0..num_partitions,
         precomputed_partitons,
+        shuffle_partition_batches,
+        shuffle_partition_concurrency,
     )
     .await?;
     info!("Built IVF partitions: {}s", start.elapsed().as_secs_f32());
