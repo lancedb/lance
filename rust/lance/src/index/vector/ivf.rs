@@ -929,7 +929,7 @@ impl RemapPageTask {
     }
 }
 
-fn generate_remap_tasks(offsets: &Vec<usize>, lengths: &[u32]) -> Result<Vec<RemapPageTask>> {
+fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapPageTask>> {
     let mut tasks: Vec<RemapPageTask> = Vec::with_capacity(offsets.len() * 2 + 1);
 
     for (offset, length) in offsets.iter().zip(lengths.iter()) {
