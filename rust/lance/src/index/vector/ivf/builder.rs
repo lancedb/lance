@@ -18,18 +18,10 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
-use datafusion::error::DataFusionError;
-use datafusion::execution::context::SessionContext;
-use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool, UnboundedMemoryPool};
-use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
-use datafusion::logical_expr::col;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::Stream;
 use futures::{stream::repeat_with, StreamExt};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{io::Writer, ROW_ID, ROW_ID_FIELD};
-use lance_datafusion::dataframe::{BatchStreamGrouper, DataFrameExt};
-use lance_datafusion::exec::SessionContextExt;
 use lance_index::vector::ivf::shuffler::IvfShuffler;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
@@ -41,97 +33,25 @@ use tracing::instrument;
 use crate::index::vector::ivf::{io::write_index_partitions, Ivf};
 use crate::{io::RecordBatchStream, Error, Result};
 
-/// Disk-based shuffle a stream of [RecordBatch] into each IVF partition.
+/// Disk-based shuffle for a stream of [RecordBatch] into each IVF partition.
 /// Sub-quantizer will be applied if provided.
 ///
 /// Parameters
 /// ----------
 ///   *data*: input data stream.
+///   *column*: column name of the vector column.
 ///   *ivf*: IVF model.
+///   *num_partitions*: number of IVF partitions.
+///   *num_sub_vectors*: number of PQ sub-vectors.
 ///
 /// Returns
 /// -------
-///   BatchStreamGrouper: a stream of `Vec<RecordBatch>` each associated with
-///   a partition id. The stream is sorted by partition id.
+///   Result<Vec<impl Stream<Item = Result<RecordBatch>>>>: a vector of streams
+///   of shuffled partitioned data. Each stream corresponds to a partition and
+///   is sorted within the stream. Consumer of these streams is expected to merge
+///   the streams into a single stream by k-list mergo algo.
 ///
-/// TODO: move this to `lance-index` crate.
-#[allow(dead_code)]
 pub async fn shuffle_dataset(
-    data: impl RecordBatchStream + Unpin + 'static,
-    column: &str,
-    ivf: Arc<dyn lance_index::vector::ivf::Ivf>,
-    // TODO: Once the transformer can generate schema automatically,
-    // we can remove `num_sub_vectors`.
-    num_sub_vectors: usize,
-) -> Result<BatchStreamGrouper> {
-    let column: Arc<str> = column.into();
-    let stream = data
-        .zip(repeat_with(move || ivf.clone()))
-        .map(move |(b, ivf)| {
-            let col_ref = column.clone();
-
-            tokio::task::spawn(async move {
-                let batch = b?;
-                ivf.partition_transform(&batch, col_ref.as_ref()).await
-            })
-        })
-        .buffer_unordered(num_cpus::get())
-        .map(|res| match res {
-            Ok(Ok(batch)) => Ok(batch),
-            Ok(Err(err)) => Err(DataFusionError::External(Box::new(err))),
-            Err(err) => Err(DataFusionError::Execution(err.to_string())),
-        })
-        .boxed();
-
-    // TODO: dynamically detect schema from the transforms.
-    let schema = Arc::new(Schema::new(vec![
-        ROW_ID_FIELD.clone(),
-        Field::new(PART_ID_COLUMN, DataType::UInt32, false),
-        Field::new(
-            PQ_CODE_COLUMN,
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::UInt8, true)),
-                num_sub_vectors as i32,
-            ),
-            false,
-        ),
-    ]));
-    let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
-
-    info!("Building IVF shuffler");
-
-    let memory_limit = if let Ok(memory_limit) = std::env::var("LANCE_MEMORY_LIMIT") {
-        match memory_limit.parse::<usize>() {
-            Ok(memory_limit) => Some(memory_limit),
-            Err(err) => {
-                log::error!(
-                    "Failed to parse LANCE_MEMORY_LIMIT: {}, using default of unbounded.",
-                    err
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let memory_pool: Arc<dyn MemoryPool> = if let Some(memory_limit) = memory_limit {
-        Arc::new(GreedyMemoryPool::new(memory_limit))
-    } else {
-        Arc::new(UnboundedMemoryPool::default())
-    };
-    let runtime_config = RuntimeConfig::new().with_memory_pool(memory_pool);
-    let runtime_env = RuntimeEnv::new(runtime_config)?;
-    let context = SessionContext::new_with_config_rt(Default::default(), Arc::new(runtime_env));
-
-    Ok(context
-        .read_one_shot(stream)?
-        .sort(vec![col(PART_ID_COLUMN).sort(true, true)])?
-        .group_by_stream(&[PART_ID_COLUMN])
-        .await?)
-}
-
-pub async fn shuffle_dataset_v2(
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
     ivf: Arc<dyn lance_index::vector::ivf::Ivf>,
@@ -179,7 +99,7 @@ pub async fn shuffle_dataset_v2(
 
     let stream = lance_core::io::RecordBatchStreamAdapter::new(schema.clone(), stream);
 
-    let shuffler = IvfShuffler::try_new(
+    let mut shuffler = IvfShuffler::try_new(
         num_partitions,
         num_sub_vectors,
         None,
@@ -240,7 +160,7 @@ pub(super) async fn build_partitions(
         precomputed_partitons,
     )?;
 
-    let stream = shuffle_dataset_v2(
+    let stream = shuffle_dataset(
         data,
         column,
         ivf_model,
