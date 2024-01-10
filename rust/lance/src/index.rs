@@ -21,11 +21,13 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use datafusion::optimizer::OptimizerConfig;
 use lance_core::io::{read_message, read_message_from_buf, read_metadata_offset, Reader};
+use lance_index::optimize::OptimizeAction;
 use lance_index::pb::index::Implementation;
-use lance_index::scalar::expression::IndexInformationProvider;
-use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::ScalarIndex;
+use lance_index::scalar::{
+    expression::IndexInformationProvider, lance_format::LanceIndexStore, ScalarIndex,
+};
 use lance_index::{pb, Index, IndexType, INDEX_FILE_NAME};
 use snafu::{location, Location};
 use tracing::instrument;
@@ -155,7 +157,7 @@ pub trait DatasetIndexExt {
     ) -> Result<()>;
 
     /// Optimize indices.
-    async fn optimize_indices(&mut self) -> Result<()>;
+    async fn optimize_indices(&mut self, action: Option<OptimizeAction>) -> Result<()>;
 }
 
 async fn open_index_proto(dataset: &Dataset, reader: &dyn Reader) -> Result<pb::Index> {
@@ -279,16 +281,57 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
+    /// Optimize Indices.
     #[instrument(skip_all)]
-    async fn optimize_indices(&mut self) -> Result<()> {
+    async fn optimize_indices(&mut self, action: Option<OptimizeAction>) -> Result<()> {
         let dataset = Arc::new(self.clone());
-        // Append index
         let indices = self.load_indices().await?;
+
+        let mut indices_by_column = HashMap::<i32, Vec<&dyn Index>>::new();
+        indices.iter().try_for_each(|idx| {
+            if idx.fields.len() != 1 {
+                return Err(Error::Index {
+                    message: "Only support optimize indices with 1 column at the moment"
+                        .to_string(),
+                    location: location!(),
+                });
+            }
+            indices_by_column[&idx.fields[0]].push(idx);
+            Ok(())
+        })?;
+
+        for (&column_id, indices) in indices_by_column.iter() {
+            let column = dataset
+                .schema()
+                .field_by_id(column_id)
+                .ok_or(Err(Error::Index {
+                    message: format!(
+                        "Optimize indices: column {} does not exist in dataset.",
+                        column_id
+                    ),
+                    location: location!(),
+                }))?;
+
+            match action {
+                Some(OptimizeAction::CreateDelta) => {
+                    todo!()
+                }
+                Some(OptimizeAction::Merge(opts)) => {
+                    todo!()
+                }
+                None | Some(OptimizeAction::Append) => {
+                    // Default action is append to existing index.
+                    // For backward compatibility.
+                    todo!()
+                }
+            }
+        }
 
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
         for idx in indices.as_slice() {
             if idx.dataset_version == self.manifest.version {
+                // This is latest index, skip.
                 continue;
             }
             let Some((new_id, new_frag_ids)) = append_index(dataset.clone(), idx).await? else {

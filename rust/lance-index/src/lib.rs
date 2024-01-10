@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use lance_core::Result;
 use roaring::RoaringBitmap;
 
+pub mod optimize;
 pub mod scalar;
 pub mod vector;
 

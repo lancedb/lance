@@ -64,7 +64,7 @@ pub(super) async fn build_partitions(
         column,
         pq.clone(),
         Some(part_range),
-        precomputed_partitons,
+        precomputed_partitions,
     )?;
 
     let stream = shuffle_dataset(

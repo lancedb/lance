@@ -159,7 +159,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
 
     /// Get the centroids for one sub-vector.
     ///
-    /// Returns a flatten `num_centroids * sub_vector_width` f32 array.
+    /// Returns a flatten `num_centroids * sub_vector_width` float array.
     pub fn centroids(&self, sub_vector_idx: usize) -> &[T::Native] {
         get_sub_vector_centroids(
             self.codebook.as_slice(),
