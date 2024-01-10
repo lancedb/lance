@@ -305,6 +305,9 @@ impl DatasetIndexExt for Dataset {
             indices.sort_by_key(|idx| idx.dataset_version);
         }
 
+        let mut new_indices = vec![];
+        let mut removed_indices = vec![];
+
         for (&column_id, indices) in indices_by_column.iter() {
             let column = dataset
                 .schema()
@@ -321,37 +324,31 @@ impl DatasetIndexExt for Dataset {
                 Some(OptimizeAction::CreateDelta) => {
                     todo!()
                 }
-                Some(OptimizeAction::Merge(opts)) => {
+                Some(OptimizeAction::Merge(_opts)) => {
                     todo!()
                 }
                 None | Some(OptimizeAction::Append) => {
                     // Default action is append to existing index.
                     // For backward compatibility.
-                    todo!()
+                    let idx = indices.last().expect(
+                        format!("Must has more than 1 index for column: {}", column.name).as_str(),
+                    );
+                    let Some((new_id, new_frag_ids)) = append_index(dataset.clone(), idx).await?
+                    else {
+                        continue;
+                    };
+
+                    let new_idx = IndexMetadata {
+                        uuid: new_id,
+                        name: idx.name.clone(),
+                        fields: idx.fields.clone(),
+                        dataset_version: self.manifest.version,
+                        fragment_bitmap: new_frag_ids,
+                    };
+                    removed_indices.push((*idx).clone());
+                    new_indices.push(new_idx);
                 }
             }
-        }
-
-        let mut new_indices = vec![];
-        let mut removed_indices = vec![];
-        for idx in indices.as_slice() {
-            if idx.dataset_version == self.manifest.version {
-                // This is latest index, skip.
-                continue;
-            }
-            let Some((new_id, new_frag_ids)) = append_index(dataset.clone(), idx).await? else {
-                continue;
-            };
-
-            let new_idx = IndexMetadata {
-                uuid: new_id,
-                name: idx.name.clone(),
-                fields: idx.fields.clone(),
-                dataset_version: self.manifest.version,
-                fragment_bitmap: new_frag_ids,
-            };
-            removed_indices.push(idx.clone());
-            new_indices.push(new_idx);
         }
 
         if new_indices.is_empty() {
