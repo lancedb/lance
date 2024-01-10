@@ -14,12 +14,16 @@
 
 //! Build IVF model
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray};
+use arrow_array::cast::{as_primitive_array, AsArray};
+use arrow_array::{Array, FixedSizeListArray, UInt32Array, UInt64Array};
+use futures::{StreamExt, TryStreamExt};
 use snafu::{location, Location};
 
 use lance_core::error::{Error, Result};
+use lance_core::io::RecordBatchStream;
 
 /// Parameters to build IVF partitions
 #[derive(Debug, Clone)]
@@ -87,4 +91,38 @@ impl IvfBuildParams {
             ..Default::default()
         })
     }
+}
+
+/// Load precomputed partitions from disk.
+///
+/// Currently, because `Dataset` is not cleanly refactored from `lance` to `lance-core`,
+/// we have to use `RecordBatchStream` as a result.
+pub async fn load_precomputed_partitions(
+    mut stream: impl RecordBatchStream + Unpin + 'static,
+    size_hint: usize,
+) -> Result<HashMap<u64, u32>> {
+    let mut partition_lookup = HashMap::with_capacity(size_hint);
+
+    // Use a loop to
+
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        let row_ids: &UInt64Array = batch
+            .column_by_name("row_id")
+            .expect("malformed partition file: missing row_id column")
+            .as_primitive();
+        let partitions: &UInt32Array = batch
+            .column_by_name("partition")
+            .expect("malformed partition file: missing partition column")
+            .as_primitive();
+        row_ids
+            .values()
+            .iter()
+            .zip(partitions.values().iter())
+            .for_each(|(row_id, partition)| {
+                partition_lookup.insert(*row_id, *partition);
+            });
+    }
+
+    Ok(partition_lookup)
 }

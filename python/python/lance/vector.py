@@ -1,4 +1,4 @@
-#  Copyright 2023 Lance Developers
+#  Copyright 2024 Lance Developers
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -13,21 +13,27 @@
 
 """Embedding vector utilities"""
 
+from __future__ import annotations
+
 import logging
 import re
 import tempfile
-from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Literal, Optional, Union
+from pathlib import Path
+from typing import TYPE_CHECKING, Dict, Iterable, Literal, Optional, Union
 
 import numpy as np
 import pyarrow as pa
 from tqdm.auto import tqdm
 
-from . import LanceDataset
+
 from .fragment import write_fragments
+from . import write_dataset
 
 if TYPE_CHECKING:
+
     import torch
+
+    from . import LanceDataset
 
 
 def _normalize_vectors(vectors, ndim):
@@ -167,8 +173,7 @@ def train_ivf_centroids_on_accelerator(
     init_centroids = torch.from_numpy(np.stack(fsl.to_numpy(zero_copy_only=False)))
     logging.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
-    ds = partial(
-        TorchDataset,
+    ds = TorchDataset(
         dataset,
         batch_size=20480,
         columns=[column],
@@ -198,11 +203,30 @@ def train_ivf_centroids_on_accelerator(
 def compute_partitions(
     dataset: LanceDataset,
     column: str,
-    kmeans: Any,  # KMeans
-    *,
-    batch_size: int = 1024,
+    kmeans: "lance.torch.kmeans.KMeans",
+    batch_size: int = 10240,
+    spill_dir: Union[str, Path] = None,
 ) -> str:
-    """Compute partitions using GPU kmeans."""
+    """Compute partitions for each row using GPU kmeans and spill to disk.
+
+    Parameters
+    ----------
+    dataset: LanceDataset
+        Dataset to compute partitions for.
+    column: str
+        Column name of the vector column.
+    kmeans: lance.torch.kmeans.KMeans
+        KMeans model to use to compute partitions.
+    batch_size: int, default 10240
+        The batch size used to read the dataset.
+    spill_dir: Path
+        The path to store the partitions.
+
+    Returns
+    -------
+    str
+        The absolute path of the partition dataset.
+    """
     import torch
 
     from lance.torch.data import LanceDataset as PytorchLanceDataset
@@ -249,15 +273,19 @@ def compute_partitions(
         output_schema, tqdm(_partition_assignment())
     )
 
-    fragments = write_fragments(
+    if spill_dir is None:
+        spill_dir = tempfile.mkdtemp()
+
+    split_uri = Path(spill_dir) / "precomputed_partitions.lance"
+
+    ds = write_dataset(
         rbr,
-        dataset.uri,
+        split_uri,
         schema=output_schema,
         max_rows_per_file=dataset.count_rows(),
     )
-    assert len(fragments) == 1
-
-    files = fragments[0].data_files()
+    assert len(ds.get_fragments()) == 1
+    files = ds.get_fragments()[0].data_files()
     assert len(files) == 1
 
-    return files[0].path()
+    return str(split_uri)

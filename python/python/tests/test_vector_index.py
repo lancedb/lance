@@ -553,10 +553,8 @@ def test_vector_with_nans(tmp_path: Path):
     row = dataset._take_rows([1])
     assert row["vector"]
 
-    # TODO: async_dataset hangs in pytest
-    # from lance.torch import preferred_device
-    # for device in [preferred_device(), None]:
-    for device in [None]:
+    from lance.torch import preferred_device
+    for device in [preferred_device(), None]:
         ds = dataset.create_index(
             "vector",
             index_type="IVF_PQ",
