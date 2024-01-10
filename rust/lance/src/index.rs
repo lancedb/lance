@@ -22,6 +22,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::io::{read_message, read_message_from_buf, read_metadata_offset, Reader};
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{
     expression::IndexInformationProvider, lance_format::LanceIndexStore, ScalarIndex,
 };
@@ -282,7 +283,7 @@ impl DatasetIndexExt for Dataset {
 
     /// Optimize Indices.
     #[instrument(skip_all)]
-    async fn optimize_indices(&mut self, action: Option<OptimizeAction>) -> Result<()> {
+    async fn optimize_indices(&mut self, options: OptimizeOptions) -> Result<()> {
         let dataset = Arc::new(self.clone());
         let indices = self.load_indices().await?;
 

@@ -12,21 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub struct MergeIndex {}
-
-pub enum OptimizeAction {
-    Append,
-
-    /// Create a delta index that covers the un-indexed rows from the
-    /// last index.
-    CreateDelta,
-
-    /// Merge existing indices
-    Merge(MergeIndex),
+pub struct OptimizeOptions {
+    /// The number of existing indices to merge into a single index, plus the un-indexed fragments.
+    ///
+    /// - If this is zero, then no merging will be done, which means a new delta index will be created
+    ///   just to cover un-indexed fragments.
+    /// - If it is one, we will append the un-indexed fragments to the last index.
+    /// - If it is greater than one, we will merge the last `num_indices_to_merge` indices into a single
+    ///   one, thus reduce the number of indices for this column.
+    /// - If this number exceeds the number of existing indices, we will merge all existing indices into
+    ///   a single one. So it is a re-write of the entire index.
+    ///
+    /// Note that no re-train of the index happens during the operation.
+    pub num_indices_to_merge: usize,
 }
 
-impl Default for OptimizeAction {
+impl Default for OptimizeOptions {
     fn default() -> Self {
-        Self::Append
+        Self {
+            num_indices_to_merge: 0,
+        }
     }
 }
