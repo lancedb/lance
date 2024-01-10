@@ -24,7 +24,7 @@ use arrow_arith::numeric::sub;
 use arrow_array::{
     cast::{as_primitive_array, as_struct_array, AsArray},
     types::{Float16Type, Float32Type, Float64Type},
-    Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array, UInt64Array,
+    Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::DataType;

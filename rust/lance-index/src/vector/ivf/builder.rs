@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,9 +17,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::cast::{as_primitive_array, AsArray};
+use arrow_array::cast::AsArray;
 use arrow_array::{Array, FixedSizeListArray, UInt32Array, UInt64Array};
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use snafu::{location, Location};
 
 use lance_core::error::{Error, Result};
@@ -96,33 +96,31 @@ impl IvfBuildParams {
 /// Load precomputed partitions from disk.
 ///
 /// Currently, because `Dataset` is not cleanly refactored from `lance` to `lance-core`,
-/// we have to use `RecordBatchStream` as a result.
+/// we have to use `RecordBatchStream` as parameter.
 pub async fn load_precomputed_partitions(
-    mut stream: impl RecordBatchStream + Unpin + 'static,
+    stream: impl RecordBatchStream + Unpin + 'static,
     size_hint: usize,
 ) -> Result<HashMap<u64, u32>> {
-    let mut partition_lookup = HashMap::with_capacity(size_hint);
-
-    // Use a loop to
-
-    while let Some(batch) = stream.next().await {
-        let batch = batch?;
-        let row_ids: &UInt64Array = batch
-            .column_by_name("row_id")
-            .expect("malformed partition file: missing row_id column")
-            .as_primitive();
-        let partitions: &UInt32Array = batch
-            .column_by_name("partition")
-            .expect("malformed partition file: missing partition column")
-            .as_primitive();
-        row_ids
-            .values()
-            .iter()
-            .zip(partitions.values().iter())
-            .for_each(|(row_id, partition)| {
-                partition_lookup.insert(*row_id, *partition);
-            });
-    }
+    let partition_lookup = stream
+        .try_fold(HashMap::with_capacity(size_hint), |mut lookup, batch| {
+            let row_ids: &UInt64Array = batch
+                .column_by_name("row_id")
+                .expect("malformed partition file: missing row_id column")
+                .as_primitive();
+            let partitions: &UInt32Array = batch
+                .column_by_name("partition")
+                .expect("malformed partition file: missing partition column")
+                .as_primitive();
+            row_ids
+                .values()
+                .iter()
+                .zip(partitions.values().iter())
+                .for_each(|(row_id, partition)| {
+                    lookup.insert(*row_id, *partition);
+                });
+            async move { Ok(lookup) }
+        })
+        .await?;
 
     Ok(partition_lookup)
 }
