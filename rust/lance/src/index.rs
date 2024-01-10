@@ -286,9 +286,12 @@ impl DatasetIndexExt for Dataset {
         let dataset = Arc::new(self.clone());
         let indices = self.load_indices().await?;
 
+        // Collecting the indices by each column, cause it is possible we have multiple small
+        // delta indices on the same column.
         let mut indices_by_column = HashMap::<i32, Vec<&lance_core::format::Index>>::new();
         indices.iter().try_for_each(|idx| {
             if idx.fields.len() != 1 {
+                // Do not support multi-column indices at the moment.
                 return Err(Error::Index {
                     message: "Only support optimize indices with 1 column at the moment"
                         .to_string(),
