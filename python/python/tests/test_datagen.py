@@ -22,7 +22,7 @@ import pytest
 @pytest.mark.skipif(datagen.is_datagen_supported(), reason="datagen is supported")
 def test_import_error():
     with pytest.raises(
-            NotImplementedError, match="was not built with the datagen feature"
+        NotImplementedError, match="was not built with the datagen feature"
     ):
         datagen.rand_batches(None)
 

@@ -19,14 +19,12 @@ import logging
 import re
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Iterable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Literal, Optional, Union
 
 import numpy as np
 import pyarrow as pa
 from tqdm.auto import tqdm
 
-
-from .fragment import write_fragments
 from . import write_dataset
 
 if TYPE_CHECKING:
@@ -202,7 +200,7 @@ def train_ivf_centroids_on_accelerator(
 def compute_partitions(
     dataset: LanceDataset,
     column: str,
-    kmeans: "lance.torch.kmeans.KMeans",
+    kmeans: Any,  # KMeans
     batch_size: int = 10240,
     spill_dir: Union[str, Path] = None,
 ) -> str:
