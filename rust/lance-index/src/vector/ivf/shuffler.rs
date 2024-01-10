@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,9 +24,11 @@
 
 use std::sync::Arc;
 
-use arrow_array::cast::AsArray;
-use arrow_array::{FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array, UInt8Array};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_array::{
+    cast::AsArray, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array, UInt8Array,
+};
+use arrow_schema::{DataType, Field as ArrowField, Field, Schema as ArrowSchema};
+use futures::stream::repeat_with;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::datatypes::Schema;
@@ -49,6 +51,98 @@ fn get_temp_dir() -> Result<Path> {
         location: location!(),
     })?;
     Ok(tmp_dir_path)
+}
+
+/// Disk-based shuffle for a stream of [RecordBatch] into each IVF partition.
+/// Sub-quantizer will be applied if provided.
+///
+/// Parameters
+/// ----------
+///   *data*: input data stream.
+///   *column*: column name of the vector column.
+///   *ivf*: IVF model.
+///   *num_partitions*: number of IVF partitions.
+///   *num_sub_vectors*: number of PQ sub-vectors.
+///
+/// Returns
+/// -------
+///   Result<Vec<impl Stream<Item = Result<RecordBatch>>>>: a vector of streams
+///   of shuffled partitioned data. Each stream corresponds to a partition and
+///   is sorted within the stream. Consumer of these streams is expected to merge
+///   the streams into a single stream by k-list mergo algo.
+///
+pub async fn shuffle_dataset(
+    data: impl RecordBatchStream + Unpin + 'static,
+    column: &str,
+    ivf: Arc<dyn crate::vector::ivf::Ivf>,
+    num_partitions: u32,
+    num_sub_vectors: usize,
+    shuffle_partition_batches: usize,
+    shuffle_partition_concurrency: usize,
+) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
+    let column: Arc<str> = column.into();
+    let stream = data
+        .zip(repeat_with(move || ivf.clone()))
+        .map(move |(b, ivf)| {
+            let col_ref = column.clone();
+
+            tokio::task::spawn(async move {
+                let batch = b?;
+                ivf.partition_transform(&batch, col_ref.as_ref()).await
+            })
+        })
+        .buffer_unordered(num_cpus::get())
+        .map(|res| match res {
+            Ok(Ok(batch)) => Ok(batch),
+            Ok(Err(err)) => Err(Error::IO {
+                message: err.to_string(),
+                location: location!(),
+            }),
+            Err(err) => Err(Error::IO {
+                message: err.to_string(),
+                location: location!(),
+            }),
+        })
+        .boxed();
+
+    // TODO: dynamically detect schema from the transforms.
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        Field::new(PART_ID_COLUMN, DataType::UInt32, false),
+        Field::new(
+            PQ_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                num_sub_vectors as i32,
+            ),
+            false,
+        ),
+    ]));
+
+    let stream = lance_core::io::RecordBatchStreamAdapter::new(schema.clone(), stream);
+
+    let mut shuffler = IvfShuffler::try_new(
+        num_partitions,
+        num_sub_vectors,
+        None,
+        Schema::try_from(schema.as_ref())?,
+    )?;
+
+    let start = std::time::Instant::now();
+    shuffler.write_unsorted_stream(stream).await?;
+    info!("wrote raw stream: {:?}", start.elapsed());
+
+    let start = std::time::Instant::now();
+    let partition_files = shuffler
+        .write_partitioned_shuffles(shuffle_partition_batches, shuffle_partition_concurrency)
+        .await?;
+    info!("counted partition sizes: {:?}", start.elapsed());
+
+    let start = std::time::Instant::now();
+    let stream = shuffler.load_partitioned_shuffles(partition_files).await?;
+    info!("merged partitioned shuffles: {:?}", start.elapsed());
+
+    Ok(stream)
 }
 
 pub struct IvfShuffler {

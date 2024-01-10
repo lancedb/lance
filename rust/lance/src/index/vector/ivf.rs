@@ -47,7 +47,7 @@ use lance_core::{
 };
 use lance_index::{
     vector::{
-        ivf::IvfBuildParams,
+        ivf::{shuffler::shuffle_dataset, IvfBuildParams},
         pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
         Query, DIST_COL,
     },
@@ -70,10 +70,7 @@ use crate::{
     index::{
         pb,
         prefilter::PreFilter,
-        vector::{
-            ivf::{builder::shuffle_dataset, io::write_index_partitions},
-            Transformer,
-        },
+        vector::{ivf::io::write_index_partitions, Transformer},
         INDEX_FILE_NAME,
     },
     session::Session,
