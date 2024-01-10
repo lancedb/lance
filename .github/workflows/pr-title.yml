@@ -27,6 +27,7 @@ jobs:
           echo 'module.exports = {
             "rules": {
               "body-max-line-length": [0, "always", Infinity],
+              "footer-max-line-length": [0, "always", Infinity],
               "body-leading-blank": [0, "always"]
             }
           }' > .commitlintrc.js
