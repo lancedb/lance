@@ -365,9 +365,7 @@ impl FragmentMetadata {
                 let manifest = pb::Manifest::decode(bytes).map_err(|e| {
                     PyValueError::new_err(format!("Unable to unpickle FragmentMetadata: {}", e))
                 })?;
-                self.schema = Schema::try_from(&manifest.fields).map_err(|e| {
-                    PyValueError::new_err(format!("Unable to unpickle FragmentMetadata: {}", e))
-                })?;
+                self.schema = Schema::from(&manifest.fields);
                 self.inner = LanceFragmentMetadata::from(&manifest.fragments[0]);
                 Ok(())
             }
@@ -434,6 +432,7 @@ pub fn cleanup_partial_writes(base_uri: &str, files: Vec<(String, String)>) -> P
         .map(|(path, multipart_id)| (Path::from(path.as_str()), multipart_id))
         .collect();
 
+    #[allow(clippy::map_identity)]
     async fn inner(store: ObjectStore, files: Vec<(Path, String)>) -> Result<(), ::lance::Error> {
         let files_iter = files
             .iter()
