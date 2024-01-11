@@ -69,7 +69,7 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
-    pub fn compare_with_options(&self, other: &Schema, options: &SchemaCompareOptions) -> bool {
+    pub fn compare_with_options(&self, other: &Self, options: &SchemaCompareOptions) -> bool {
         self.fields
             .iter()
             .zip(&other.fields)
@@ -79,7 +79,7 @@ impl Schema {
 
     pub fn explain_difference(
         &self,
-        expected: &Schema,
+        expected: &Self,
         options: &SchemaCompareOptions,
     ) -> Option<String> {
         if self.fields.len() != expected.fields.len()
@@ -148,11 +148,7 @@ impl Schema {
         }
     }
 
-    pub fn check_compatible(
-        &self,
-        expected: &Schema,
-        options: &SchemaCompareOptions,
-    ) -> Result<()> {
+    pub fn check_compatible(&self, expected: &Self, options: &SchemaCompareOptions) -> Result<()> {
         if !self.compare_with_options(expected, options) {
             let difference = self.explain_difference(expected, options);
             Err(Error::SchemaMismatch {

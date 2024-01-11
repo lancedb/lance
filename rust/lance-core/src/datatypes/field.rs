@@ -83,17 +83,27 @@ impl Field {
 
     fn explain_differences(
         &self,
-        expected: &Field,
+        expected: &Self,
         options: &SchemaCompareOptions,
         path: Option<&str>,
     ) -> Vec<String> {
         let mut differences = Vec::new();
         let self_name = path
-            .map(|path| path.to_owned() + "." + &self.name)
+            .map(|path| {
+                let mut self_name = path.to_owned();
+                self_name.push('.');
+                self_name.push_str(&self.name);
+                self_name
+            })
             .unwrap_or_else(|| self.name.clone());
         if self.name != expected.name {
             let expected_path = path
-                .map(|path| path.to_owned() + "." + &expected.name)
+                .map(|path| {
+                    let mut expected_path = path.to_owned();
+                    expected_path.push('.');
+                    expected_path.push_str(&expected.name);
+                    expected_path
+                })
                 .unwrap_or_else(|| expected.name.clone());
             differences.push(format!(
                 "expected name '{}' but name was '{}'",
@@ -191,7 +201,7 @@ impl Field {
 
     pub fn explain_difference(
         &self,
-        expected: &Field,
+        expected: &Self,
         options: &SchemaCompareOptions,
     ) -> Option<String> {
         let differences = self.explain_differences(expected, options, None);
@@ -202,7 +212,7 @@ impl Field {
         }
     }
 
-    pub fn compare_with_options(&self, other: &Field, options: &SchemaCompareOptions) -> bool {
+    pub fn compare_with_options(&self, other: &Self, options: &SchemaCompareOptions) -> bool {
         self.name == other.name
             && self.logical_type == other.logical_type
             && self.nullable == other.nullable
