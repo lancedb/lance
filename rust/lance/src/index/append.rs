@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use futures::{stream, StreamExt, TryStreamExt};
 use lance_core::{format::Index as IndexMetadata, Error, Result};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -23,7 +24,6 @@ use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
-use crate::dataset::index::unindexed_fragments;
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::Dataset;
 use crate::index::vector::ivf::IVFIndex;
@@ -35,38 +35,61 @@ use super::DatasetIndexInternalExt;
 /// Returns the UUID of the new index along with a vector of newly indexed fragment ids
 ///
 /// TODO: move this function to `lance-index`
-pub async fn append_index(
+pub async fn append_index<'a>(
     dataset: Arc<Dataset>,
-    old_index: &[&IndexMetadata],
+    old_indices: &[&'a IndexMetadata],
     options: OptimizeOptions,
-) -> Result<Option<(Uuid, Option<RoaringBitmap>)>> {
-    let unindexed = unindexed_fragments(old_index, dataset.as_ref()).await?;
-    if unindexed.is_empty() {
-        return Ok(None);
-    };
-
-    let frag_bitmap = old_index.fragment_bitmap.as_ref().map(|bitmap| {
-        let mut bitmap = bitmap.clone();
-        bitmap.extend(unindexed.iter().map(|frag| frag.id as u32));
-        bitmap
+) -> Result<Option<(Uuid, Vec<&'a IndexMetadata>, Option<RoaringBitmap>)>> {
+    let mut frag_bitmap = RoaringBitmap::new();
+    old_indices.iter().for_each(|idx| {
+        frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
     });
 
+    let unindexed = dataset
+        .fragments()
+        .iter()
+        .filter(|f| !frag_bitmap.contains(f.id as u32))
+        .map(|f| f.clone())
+        .collect::<Vec<_>>();
+
+    let latest_idx = old_indices.last().ok_or(Error::Index {
+        message: "Append index: no index found".to_string(),
+        location: location!(),
+    })?;
     let column = dataset
         .schema()
-        .field_by_id(old_index.fields[0])
+        .field_by_id(latest_idx.fields[0])
         .ok_or(Error::Index {
             message: format!(
                 "Append index: column {} does not exist",
-                old_index.fields[0]
+                latest_idx.fields[0]
             ),
             location: location!(),
         })?;
 
-    let index = dataset
-        .open_generic_index(&column.name, &old_index.uuid.to_string())
+    let indices = stream::iter(old_indices.iter())
+        .map(|idx| async move {
+            let index = dataset
+                .open_generic_index(&column.name, &idx.uuid.to_string())
+                .await?;
+            Ok::<_, Error>(index)
+        })
+        .buffered(4)
+        .try_collect::<Vec<_>>()
         .await?;
 
-    match index.index_type() {
+    // Sanity check.
+    if !indices
+        .windows(2)
+        .all(|w| w[0].index_type() == w[1].index_type())
+    {
+        return Err(Error::Index {
+            message: "Append index: indices have different types".to_string(),
+            location: location!(),
+        });
+    }
+
+    match indices[0].index_type() {
         IndexType::Scalar => {
             let index = dataset
                 .open_scalar_index(&column.name, &old_index.uuid.to_string())

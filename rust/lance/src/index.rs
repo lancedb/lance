@@ -291,7 +291,7 @@ impl DatasetIndexExt for Dataset {
         // Append index
         let indices = self.load_indices().await?;
 
-        /// Collect indices by column.
+        // Collect indices by column.
         let mut column_to_indices_map: HashMap<i32, Vec<&IndexMetadata>> = HashMap::new();
         for idx in indices.iter() {
             if idx.fields.len() != 1 {
@@ -324,7 +324,7 @@ impl DatasetIndexExt for Dataset {
                     location: location!(),
                 })?;
 
-            let Some((new_id, new_frag_ids)) =
+            let Some((new_id, removed, new_frag_ids)) =
                 append_index(dataset.clone(), &indices, options).await?
             else {
                 continue;
@@ -339,7 +339,7 @@ impl DatasetIndexExt for Dataset {
                 dataset_version: self.manifest.version,
                 fragment_bitmap: new_frag_ids,
             };
-            removed_indices.push(idx.clone());
+            removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
             new_indices.push(new_idx);
         }
 
