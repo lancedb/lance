@@ -1054,7 +1054,7 @@ mod tests {
         .try_into()
         .unwrap();
         let keys = UInt32Array::from_iter_values(vec![0, 1]);
-        let values: ArrayRef = Arc::new(StringArray::from_iter_values(&[
+        let values: ArrayRef = Arc::new(StringArray::from_iter_values([
             "a".to_string(),
             "b".to_string(),
         ]));
@@ -1070,16 +1070,13 @@ mod tests {
         .unwrap();
 
         // By default, do not compare dictionary
-        assert_eq!(no_dictionary.compare_with_options(&expected, &opts), true);
+        assert!(no_dictionary.compare_with_options(&expected, &opts));
 
         let compare_dict = SchemaCompareOptions {
             compare_dictionary: true,
             ..Default::default()
         };
-        assert_eq!(
-            no_dictionary.compare_with_options(&expected, &compare_dict),
-            false
-        );
+        assert!(!no_dictionary.compare_with_options(&expected, &compare_dict));
 
         let metadata = HashMap::<_, _>::from_iter(vec![("foo".to_string(), "bar".to_string())]);
         let expected: Field = ArrowField::new("a", DataType::UInt32, true)
@@ -1092,16 +1089,13 @@ mod tests {
             .unwrap();
 
         // By default, do not compare metadata
-        assert_eq!(no_metadata.compare_with_options(&expected, &opts), true);
+        assert!(no_metadata.compare_with_options(&expected, &opts));
 
         let compare_metadata = SchemaCompareOptions {
             compare_metadata: true,
             ..Default::default()
         };
-        assert_eq!(
-            no_metadata.compare_with_options(&expected, &compare_metadata),
-            false
-        );
+        assert!(!no_metadata.compare_with_options(&expected, &compare_metadata));
 
         let mut expected: Field = ArrowField::new("a", DataType::UInt32, true)
             .try_into()
@@ -1113,13 +1107,13 @@ mod tests {
             .try_into()
             .unwrap();
         // Do not compare ids by default
-        assert_eq!(no_id.compare_with_options(&expected, &opts), true);
+        assert!(no_id.compare_with_options(&expected, &opts));
 
         let compare_ids = SchemaCompareOptions {
             compare_field_ids: true,
             ..Default::default()
         };
-        assert_eq!(no_id.compare_with_options(&expected, &compare_ids), false);
+        assert!(no_id.compare_with_options(&expected, &compare_ids));
     }
 
     #[test]
@@ -1225,7 +1219,7 @@ mod tests {
         .try_into()
         .unwrap();
         let keys = UInt32Array::from_iter_values(vec![0, 1]);
-        let values: ArrayRef = Arc::new(StringArray::from_iter_values(&[
+        let values: ArrayRef = Arc::new(StringArray::from_iter_values([
             "a".to_string(),
             "b".to_string(),
         ]));
