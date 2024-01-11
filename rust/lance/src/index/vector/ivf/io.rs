@@ -252,7 +252,7 @@ mod tests {
             .open_vector_index(&indices[0].name, &indices[0].uuid.to_string())
             .await
             .unwrap();
-        let ivf_idx = idx
+        let _ivf_idx = idx
             .as_any()
             .downcast_ref::<IVFIndex>()
             .expect("Invalid index type");
