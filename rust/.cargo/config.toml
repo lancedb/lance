@@ -12,7 +12,7 @@ lto = "thin"
 [target.'cfg(all())']
 rustflags = [
     "-Wclippy::all",
-    # "-Wclippy::style",
+    "-Wclippy::style",
     "-Wclippy::fallible_impl_from",
     "-Wclippy::manual_let_else",
     "-Wclippy::redundant_pub_crate",

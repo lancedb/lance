@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -749,7 +749,7 @@ mod tests {
             let field = Field::try_from(&arrow_field).unwrap();
             assert_eq!(field.name, name);
             assert_eq!(field.data_type(), data_type);
-            assert_eq!(ArrowField::try_from(&field).unwrap(), arrow_field);
+            assert_eq!(ArrowField::from(&field), arrow_field);
         }
     }
 
@@ -801,7 +801,7 @@ mod tests {
         let field = Field::try_from(&arrow_field).unwrap();
         assert_eq!(field.name, "struct");
         assert_eq!(&field.data_type(), arrow_field.data_type());
-        assert_eq!(ArrowField::try_from(&field).unwrap(), arrow_field);
+        assert_eq!(ArrowField::from(&field), arrow_field);
     }
 
     #[test]

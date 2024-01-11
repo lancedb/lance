@@ -1267,7 +1267,7 @@ mod tests {
         frag_struct.deletion_file = deletion_file;
         frag_struct.add_file("foo", &schema);
 
-        let manifest = Manifest::new(&schema, Arc::new(vec![frag_struct]));
+        let manifest = Manifest::new(schema, Arc::new(vec![frag_struct]));
 
         let mut reader =
             FileReader::try_new_with_fragment(&store, &path, fragment, Some(&manifest), None)
@@ -1326,7 +1326,7 @@ mod tests {
         frag_struct.deletion_file = deletion_file;
         frag_struct.add_file("foo", &schema);
 
-        let manifest = Manifest::new(&schema, Arc::new(vec![frag_struct]));
+        let manifest = Manifest::new(schema, Arc::new(vec![frag_struct]));
 
         let mut reader =
             FileReader::try_new_with_fragment(&store, &path, fragment, Some(&manifest), None)
@@ -1802,7 +1802,7 @@ mod tests {
         let arrow_schema =
             ArrowSchema::new(vec![ArrowField::new(long_name, DataType::Int64, false)]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut manifest = Manifest::new(&schema, Arc::new(vec![]));
+        let mut manifest = Manifest::new(schema, Arc::new(vec![]));
         let pos = write_manifest(&mut writer, &mut manifest, None)
             .await
             .unwrap();

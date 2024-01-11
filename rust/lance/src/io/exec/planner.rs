@@ -24,15 +24,17 @@ use arrow_select::concat::concat;
 use datafusion::common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion};
 use datafusion::common::DFSchema;
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::{GetFieldAccess, GetIndexedField, ScalarFunctionDefinition};
+use datafusion::logical_expr::{GetFieldAccess, GetIndexedField};
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
 use datafusion::sql::sqlparser::ast::{
     Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr,
     Function, FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
 };
 use datafusion::{
     common::Column,
-    logical_expr::{col, expr::ScalarFunction, BinaryExpr, BuiltinScalarFunction, Like, Operator},
+    logical_expr::{col, BinaryExpr, Like, Operator},
     physical_expr::execution_props::ExecutionProps,
     physical_plan::PhysicalExpr,
     prelude::Expr,
@@ -51,10 +53,11 @@ use crate::{
     Result,
 };
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct FilterPlan {
     pub index_query: Option<ScalarIndexExpr>,
     pub refine_expr: Option<Expr>,
+    pub full_expr: Option<Expr>,
 }
 
 impl FilterPlan {
@@ -68,6 +71,48 @@ impl FilterPlan {
     /// Return true if this has a refine step, regardless of the status of prefilter
     pub fn has_refine(&self) -> bool {
         self.refine_expr.is_some()
+    }
+}
+
+// Adapter that instructs datafusion how lance expects expressions to be interpreted
+#[derive(Default)]
+struct LanceContextProvider {
+    options: datafusion::config::ConfigOptions,
+}
+
+impl ContextProvider for LanceContextProvider {
+    fn get_table_source(
+        &self,
+        name: datafusion::sql::TableReference,
+    ) -> DFResult<Arc<dyn datafusion::logical_expr::TableSource>> {
+        Err(datafusion::error::DataFusionError::NotImplemented(format!(
+            "Attempt to reference inner table {} not supported",
+            name
+        )))
+    }
+
+    fn get_function_meta(&self, _: &str) -> Option<Arc<datafusion_physical_expr::udf::ScalarUDF>> {
+        // UDFs not supported yet
+        None
+    }
+
+    fn get_aggregate_meta(&self, _: &str) -> Option<Arc<datafusion::logical_expr::AggregateUDF>> {
+        // UDFs not supported yet
+        None
+    }
+
+    fn get_window_meta(&self, _: &str) -> Option<Arc<datafusion::logical_expr::WindowUDF>> {
+        // UDFs not supported yet
+        None
+    }
+
+    fn get_variable_type(&self, _: &[String]) -> Option<ArrowDataType> {
+        // Variables (things like @@LANGUAGE) not supported
+        None
+    }
+
+    fn options(&self) -> &datafusion::config::ConfigOptions {
+        &self.options
     }
 }
 
@@ -198,40 +243,41 @@ impl Planner {
         }
     }
 
-    fn parse_function(&self, func: &Function) -> Result<Expr> {
-        if func.name.to_string() == "is_valid" {
-            if func.args.len() != 1 {
-                return Err(Error::IO {
-                    message: format!("is_valid only support 1 args, got {}", func.args.len()),
-                    location: location!(),
-                });
-            }
-            return Ok(Expr::IsNotNull(Box::new(
-                self.parse_function_args(&func.args[0])?,
-            )));
-        } else if func.name.to_string() == "regexp_match" {
-            if func.args.len() != 2 {
-                return Err(Error::IO {
-                    message: format!("regexp_match only supports 2 args, got {}", func.args.len()),
-                    location: location!(),
-                });
-            }
-
-            let args_vec: Vec<Expr> = func
-                .args
-                .iter()
-                .map(|arg| self.parse_function_args(arg).unwrap())
-                .collect::<Vec<_>>();
-
-            return Ok(Expr::ScalarFunction(ScalarFunction {
-                func_def: ScalarFunctionDefinition::BuiltIn(BuiltinScalarFunction::RegexpMatch),
-                args: args_vec,
-            }));
+    // We now use datafusion to parse functions.  This allows us to use datafusion's
+    // entire collection of functions (previously we had just hard-coded support for two functions).
+    //
+    // Unfortunately, one of those two functions was is_valid and the reason we needed it was because
+    // this is a function that comes from duckdb.  Datafusion does not consider is_valid to be a function
+    // but rather an AST node (Expr::IsNotNull) and so we need to handle this case specially.
+    fn legacy_parse_function(&self, func: &Function) -> Result<Expr> {
+        if func.args.len() != 1 {
+            return Err(Error::IO {
+                message: format!("is_valid only support 1 args, got {}", func.args.len()),
+                location: location!(),
+            });
         }
-        Err(Error::IO {
-            message: format!("function '{}' is not supported", func.name),
-            location: location!(),
-        })
+        Ok(Expr::IsNotNull(Box::new(
+            self.parse_function_args(&func.args[0])?,
+        )))
+    }
+
+    fn parse_function(&self, function: SQLExpr) -> Result<Expr> {
+        if let SQLExpr::Function(function) = &function {
+            if !function.name.0.is_empty() && function.name.0[0].value == "is_valid" {
+                return self.legacy_parse_function(function);
+            }
+        }
+        let context_provider = LanceContextProvider::default();
+        let sql_to_rel = SqlToRel::new_with_options(
+            &context_provider,
+            ParserOptions {
+                parse_float_as_decimal: false,
+                enable_ident_normalization: false,
+            },
+        );
+        let mut planner_context = PlannerContext::default();
+        let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        Ok(sql_to_rel.sql_to_expr(function, &schema, &mut planner_context)?)
     }
 
     fn parse_type(&self, data_type: &SQLDataType) -> Result<ArrowDataType> {
@@ -428,7 +474,7 @@ impl Planner {
                 Ok(value_expr.in_list(list_exprs, *negated))
             }
             SQLExpr::Nested(inner) => self.parse_sql_expr(inner.as_ref()),
-            SQLExpr::Function(func) => self.parse_function(func),
+            SQLExpr::Function(_) => self.parse_function(expr.clone()),
             SQLExpr::ILike {
                 negated,
                 expr,
@@ -546,17 +592,23 @@ impl Planner {
     ) -> Result<FilterPlan> {
         let logical_expr = self.optimize_expr(filter)?;
         if use_scalar_index {
-            let indexed_expr = apply_scalar_indices(logical_expr, index_info);
+            let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info);
             Ok(FilterPlan {
                 index_query: indexed_expr.scalar_query,
                 refine_expr: indexed_expr.refine_expr,
+                full_expr: Some(logical_expr),
             })
         } else {
             Ok(FilterPlan {
                 index_query: None,
-                refine_expr: Some(logical_expr),
+                refine_expr: Some(logical_expr.clone()),
+                full_expr: Some(logical_expr),
             })
         }
+    }
+
+    pub fn get_physical_optimizer() -> PhysicalOptimizer {
+        PhysicalOptimizer::with_rules(vec![Arc::new(crate::io::exec::optimizer::CoalesceTake)])
     }
 }
 

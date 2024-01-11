@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ use std::task::{Context, Poll};
 
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
+use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use datafusion::logical_expr::{AggregateFunction, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
@@ -35,6 +36,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::scalar::ScalarValue;
 use futures::stream::{Stream, StreamExt};
+use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::ROW_ID_FIELD;
 use lance_datafusion::exec::execute_plan;
@@ -506,10 +508,7 @@ impl Scanner {
                 message: format!("Column {} not found", q.column),
                 location: location!(),
             })?;
-            let vector_field = ArrowField::try_from(vector_field).map_err(|e| Error::IO {
-                message: format!("Failed to convert vector field: {}", e),
-                location: location!(),
-            })?;
+            let vector_field = ArrowField::from(vector_field);
             extra_columns.push(vector_field);
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
         };
@@ -535,6 +534,13 @@ impl Scanner {
     pub(crate) async fn try_into_dfstream(&self) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
         execute_plan(plan)
+    }
+
+    pub async fn try_into_batch(&self) -> Result<RecordBatch> {
+        let stream = self.try_into_stream().await?;
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await?;
+        Ok(concat_batches(&schema, &batches)?)
     }
 
     /// Scan and return the number of matching rows
@@ -640,10 +646,10 @@ impl Scanner {
     /// 3. Sort
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
-    async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         // Scalar indices are only used when prefiltering
         // TODO: Should we use them when postfiltering if there is no vector search?
-        let use_scalar_index = self.prefilter;
+        let use_scalar_index = self.prefilter || self.nearest.is_none();
 
         // NOTE: we only support node that have one partition. So any nodes that
         // produce multiple need to be repartitioned to 1.
@@ -798,6 +804,12 @@ impl Scanner {
             plan = Arc::new(ProjectionExec::try_new(plan, output_schema)?);
         }
 
+        let optimizer = Planner::get_physical_optimizer();
+        let options = Default::default();
+        for rule in optimizer.rules {
+            plan = rule.optimize(plan, &options)?;
+        }
+
         debug!("Execution plan:\n{:?}", plan);
 
         Ok(plan)
@@ -909,8 +921,8 @@ impl Scanner {
         if !unindexed_fragments.is_empty() {
             let mut columns = vec![q.column.clone()];
             let mut num_filter_columns = 0;
-            if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
-                let filter_columns = Planner::column_names_in_expr(refine_expr);
+            if let Some(expr) = filter_plan.full_expr.as_ref() {
+                let filter_columns = Planner::column_names_in_expr(expr);
                 num_filter_columns = filter_columns.len();
                 columns.extend(filter_columns);
             }
@@ -927,10 +939,11 @@ impl Scanner {
                 // in a deterministic order.
                 false,
             );
-            if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+
+            if let Some(expr) = filter_plan.full_expr.as_ref() {
                 // If there is a prefilter we need to manually apply it to the new data
                 let planner = Planner::new(scan_node.schema());
-                let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
+                let physical_refine_expr = planner.create_physical_expr(expr)?;
                 scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
             }
             // first we do flat search on just the new data
@@ -1093,7 +1106,7 @@ impl Scanner {
         } else {
             self.dataset.fragments().clone()
         };
-        let ordered = if self.ordering.is_some() {
+        let ordered = if self.ordering.is_some() || self.nearest.is_some() {
             // If we are sorting the results there is no need to scan in order
             false
         } else {
@@ -1307,7 +1320,6 @@ impl From<DatasetRecordBatchStream> for SendableRecordBatchStream {
 mod test {
 
     use std::collections::{BTreeSet, HashMap};
-    use std::path::PathBuf;
     use std::vec;
 
     use arrow::array::as_primitive_array;
@@ -1316,7 +1328,7 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray, PrimitiveArray,
+        ArrayRef, FixedSizeListArray, Int32Array, LargeStringArray, PrimitiveArray,
         RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
@@ -1389,115 +1401,53 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_filter_parsing() {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", DataType::Int32, true),
-            ArrowField::new("s", DataType::Utf8, true),
-        ]));
+    async fn test_filter_parsing() -> Result<()> {
+        let test_ds = TestVectorDataset::new().await?;
+        let dataset = &test_ds.dataset;
 
-        let batches: Vec<RecordBatch> = vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..100)),
-                Arc::new(StringArray::from_iter_values(
-                    (0..100).map(|v| format!("s-{}", v)),
-                )),
-            ],
-        )
-        .unwrap()];
-
-        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        Dataset::write(batches, test_uri, None).await.unwrap();
-
-        let dataset = Dataset::open(test_uri).await.unwrap();
         let mut scan = dataset.scan();
         assert!(scan.filter.is_none());
 
-        scan.filter("i > 50").unwrap();
+        scan.filter("i > 50")?;
         assert_eq!(scan.filter, Some(col("i").gt(lit(50))));
 
         for use_stats in [false, true] {
             let batches = scan
-                .project(&["s"])
-                .unwrap()
+                .project(&["s"])?
                 .use_stats(use_stats)
                 .try_into_stream()
-                .await
-                .unwrap()
+                .await?
                 .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+                .await?;
+            let batch = concat_batches(&batches[0].schema(), &batches)?;
 
             let expected_batch = RecordBatch::try_new(
-                Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                    "s",
-                    DataType::Utf8,
-                    true,
-                )])),
+                // Projected just "s"
+                Arc::new(test_ds.schema.project(&[1])?),
                 vec![Arc::new(StringArray::from_iter_values(
-                    (51..100).map(|v| format!("s-{}", v)),
+                    (51..400).map(|v| format!("s-{}", v)),
                 ))],
-            )
-            .unwrap();
+            )?;
             assert_eq!(batch, expected_batch);
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_limit() {
-        let temp = tempdir().unwrap();
-        let mut file_path = PathBuf::from(temp.as_ref());
-        file_path.push("limit_test.lance");
-        let path = file_path.to_str().unwrap();
-        let expected_batches = write_data(path).await;
-        let expected_combined =
-            concat_batches(&expected_batches[0].schema(), &expected_batches).unwrap();
+    async fn test_limit() -> Result<()> {
+        let test_ds = TestVectorDataset::new().await?;
+        let dataset = &test_ds.dataset;
 
-        let dataset = Dataset::open(path).await.unwrap();
-        let mut scanner = dataset.scan();
-        scanner.limit(Some(2), Some(19)).unwrap();
-        let actual_batches: Vec<RecordBatch> = scanner
-            .try_into_stream()
-            .await
-            .unwrap()
-            .map(|b| b.unwrap())
-            .collect::<Vec<RecordBatch>>()
-            .await;
-        let actual_combined = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+        let full_data = dataset.scan().try_into_batch().await?.slice(19, 2);
 
-        assert_eq!(expected_combined.slice(19, 2), actual_combined);
-        // skipped 1 batch
-        assert_eq!(actual_batches.len(), 2);
-    }
+        let actual = dataset
+            .scan()
+            .limit(Some(2), Some(19))?
+            .try_into_batch()
+            .await?;
 
-    async fn write_data(path: &str) -> Vec<RecordBatch> {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "i",
-            DataType::Int64,
-            true,
-        )])) as SchemaRef;
-
-        // Write 3 batches.
-        let expected_batches: Vec<RecordBatch> = (0..3)
-            .map(|batch_id| {
-                let value_range = batch_id * 10..batch_id * 10 + 10;
-                let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter(
-                    value_range.collect::<Vec<_>>(),
-                ))];
-                RecordBatch::try_new(schema.clone(), columns).unwrap()
-            })
-            .collect();
-        let params = WriteParams {
-            max_rows_per_group: 10,
-            ..Default::default()
-        };
-        let reader =
-            RecordBatchIterator::new(expected_batches.clone().into_iter().map(Ok), schema.clone());
-        Dataset::write(reader, path, Some(params)).await.unwrap();
-        expected_batches
+        assert_eq!(actual, full_data);
+        Ok(())
     }
 
     // Creates a dataset with 5 batches where each batch has 80 rows
@@ -1509,57 +1459,75 @@ mod test {
     //  vec - [f32; 32]: [[0, 1, ... 31], [32, ..., 63], ... [..., (80 * 5 * 32) - 1]]
     //
     // An IVF-PQ index with 2 partitions is trained on this data
-    async fn create_vector_dataset(path: &str, build_index: bool) -> Arc<Dataset> {
-        // Make sure the schema has metadata so it tests all paths that re-construct the schema along the way
-        let metadata: HashMap<String, String> = vec![("dataset".to_string(), "vector".to_string())]
-            .into_iter()
-            .collect();
+    struct TestVectorDataset {
+        _tmp_dir: TempDir,
+        pub schema: Arc<ArrowSchema>,
+        pub dataset: Dataset,
+    }
 
-        let schema = Arc::new(ArrowSchema::new_with_metadata(
-            vec![
-                ArrowField::new("i", DataType::Int32, true),
-                ArrowField::new("s", DataType::Utf8, true),
-                ArrowField::new(
-                    "vec",
-                    DataType::FixedSizeList(
-                        Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                        32,
+    impl TestVectorDataset {
+        async fn new() -> Result<Self> {
+            let tmp_dir = tempdir()?;
+            let path = tmp_dir.path().to_str().unwrap();
+
+            // Make sure the schema has metadata so it tests all paths that re-construct the schema along the way
+            let metadata: HashMap<String, String> =
+                vec![("dataset".to_string(), "vector".to_string())]
+                    .into_iter()
+                    .collect();
+
+            let schema = Arc::new(ArrowSchema::new_with_metadata(
+                vec![
+                    ArrowField::new("i", DataType::Int32, true),
+                    ArrowField::new("s", DataType::Utf8, true),
+                    ArrowField::new(
+                        "vec",
+                        DataType::FixedSizeList(
+                            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                            32,
+                        ),
+                        true,
                     ),
-                    true,
-                ),
-            ],
-            metadata,
-        ));
+                ],
+                metadata,
+            ));
 
-        let batches: Vec<RecordBatch> = (0..5)
-            .map(|i| {
-                let vector_values: Float32Array = (0..32 * 80).map(|v| v as f32).collect();
-                let vectors = FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
-                RecordBatch::try_new(
-                    schema.clone(),
-                    vec![
-                        Arc::new(Int32Array::from_iter_values(i * 80..(i + 1) * 80)),
-                        Arc::new(StringArray::from_iter_values(
-                            (i * 80..(i + 1) * 80).map(|v| format!("s-{}", v)),
-                        )),
-                        Arc::new(vectors),
-                    ],
-                )
-                .unwrap()
+            let batches: Vec<RecordBatch> = (0..5)
+                .map(|i| {
+                    let vector_values: Float32Array = (0..32 * 80).map(|v| v as f32).collect();
+                    let vectors =
+                        FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from_iter_values(i * 80..(i + 1) * 80)),
+                            Arc::new(StringArray::from_iter_values(
+                                (i * 80..(i + 1) * 80).map(|v| format!("s-{}", v)),
+                            )),
+                            Arc::new(vectors),
+                        ],
+                    )
+                })
+                .collect::<std::result::Result<Vec<_>, ArrowError>>()?;
+
+            let params = WriteParams {
+                max_rows_per_group: 10,
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+            let dataset = Dataset::write(reader, path, Some(params)).await?;
+
+            Ok(Self {
+                _tmp_dir: tmp_dir,
+                schema,
+                dataset,
             })
-            .collect();
+        }
 
-        let params = WriteParams {
-            max_rows_per_group: 10,
-            ..Default::default()
-        };
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-
-        let mut dataset = Dataset::write(reader, path, Some(params)).await.unwrap();
-
-        if build_index {
+        async fn make_vector_index(&mut self) -> Result<()> {
             let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
-            dataset
+            self.dataset
                 .create_index(
                     &["vec"],
                     IndexType::Vector,
@@ -1568,58 +1536,51 @@ mod test {
                     true,
                 )
                 .await
-                .unwrap();
         }
 
-        Arc::new(Dataset::open(path).await.unwrap())
-    }
+        async fn make_scalar_index(&mut self) -> Result<()> {
+            self.dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+        }
 
-    // Given a dataset created with the create_vector_dataset method above this adds
-    // 10 additional rows
-    //
-    //  i   - i32      : [400, 401, ..., 409]
-    //  s   - &str     : ["s-400", "s-401", ..., "s-409"]
-    //  vec - [f32; 32]: [[0, 0, ... 0], [1, 1, ..., 1], ... [9, 9, ..., 9]]
-    async fn add_vector_dataset_new_data(dataset: Arc<Dataset>, test_uri: &str) -> Arc<Dataset> {
-        // Insert more data
-        // (0, 0, ...), (1, 1, ...), (2, 2, ...)
-        let vector_values: Float32Array =
-            (0..10).flat_map(|i| [i as f32; 32].into_iter()).collect();
-        let new_vectors = FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
-        let new_data: Vec<ArrayRef> = vec![
-            Arc::new(Int32Array::from_iter_values(400..410)), // 5 * 80
-            Arc::new(StringArray::from_iter_values(
-                (400..410).map(|v| format!("s-{}", v)),
-            )),
-            Arc::new(new_vectors),
-        ];
-        let schema: Arc<ArrowSchema> = Arc::new(dataset.schema().try_into().unwrap());
-        let new_data_reader = RecordBatchIterator::new(
-            vec![RecordBatch::try_new(schema.clone(), new_data).unwrap()]
-                .into_iter()
-                .map(Ok),
-            schema.clone(),
-        );
-        Arc::new(
-            Dataset::write(
-                new_data_reader,
-                test_uri,
-                Some(WriteParams {
-                    mode: WriteMode::Append,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap(),
-        )
+        async fn append_new_data(&mut self) -> Result<()> {
+            let vector_values: Float32Array =
+                (0..10).flat_map(|i| [i as f32; 32].into_iter()).collect();
+            let new_vectors = FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
+            let new_data: Vec<ArrayRef> = vec![
+                Arc::new(Int32Array::from_iter_values(400..410)), // 5 * 80
+                Arc::new(StringArray::from_iter_values(
+                    (400..410).map(|v| format!("s-{}", v)),
+                )),
+                Arc::new(new_vectors),
+            ];
+            let reader = RecordBatchIterator::new(
+                vec![RecordBatch::try_new(self.schema.clone(), new_data).unwrap()]
+                    .into_iter()
+                    .map(Ok),
+                self.schema.clone(),
+            );
+            self.dataset.append(reader, None).await?;
+            Ok(())
+        }
     }
 
     #[tokio::test]
     async fn test_knn_nodes() {
         for build_index in &[true, false] {
-            let test_dir = tempdir().unwrap();
-            let test_uri = test_dir.path().to_str().unwrap();
-            let dataset = create_vector_dataset(test_uri, *build_index).await;
+            let mut test_ds = TestVectorDataset::new().await.unwrap();
+            if *build_index {
+                test_ds.make_vector_index().await.unwrap();
+            }
+            let dataset = &test_ds.dataset;
+
             let mut scan = dataset.scan();
             let key: Float32Array = (32..64).map(|v| v as f32).collect();
             scan.nearest("vec", &key, 5).unwrap();
@@ -1667,10 +1628,10 @@ mod test {
 
     #[tokio::test]
     async fn test_knn_with_new_data() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_vector_dataset(test_uri, true).await;
-        let dataset = add_vector_dataset_new_data(dataset, test_uri).await;
+        let mut test_ds = TestVectorDataset::new().await.unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        test_ds.append_new_data().await.unwrap();
+        let dataset = &test_ds.dataset;
 
         // Create a bunch of queries
         let key: Float32Array = [0f32; 32].into_iter().collect();
@@ -1746,9 +1707,10 @@ mod test {
 
     #[tokio::test]
     async fn test_knn_with_prefilter() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_vector_dataset(test_uri, true).await;
+        let mut test_ds = TestVectorDataset::new().await.unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+
         let mut scan = dataset.scan();
         let key: Float32Array = (32..64).map(|v| v as f32).collect();
         scan.filter("i > 100").unwrap();
@@ -1804,10 +1766,10 @@ mod test {
         // This test verifies that a filter (prefilter or postfilter) gets applied to the flat KNN results
         // in a combined KNN scan (a scan that combines results from an indexed ANN with an unindexed flat
         // search of new data)
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_vector_dataset(test_uri, true).await;
-        let dataset = add_vector_dataset_new_data(dataset, test_uri).await;
+        let mut test_ds = TestVectorDataset::new().await.unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        test_ds.append_new_data().await.unwrap();
+        let dataset = &test_ds.dataset;
 
         // This query will match exactly the new row with i = 400 which should be excluded by the prefilter
         let key: Float32Array = [0f32; 32].into_iter().collect();
@@ -1864,9 +1826,9 @@ mod test {
 
     #[tokio::test]
     async fn test_knn_with_filter() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_vector_dataset(test_uri, true).await;
+        let test_ds = TestVectorDataset::new().await.unwrap();
+        let dataset = &test_ds.dataset;
+
         let mut scan = dataset.scan();
         let key: Float32Array = (32..64).map(|v| v as f32).collect();
         scan.nearest("vec", &key, 5).unwrap();
@@ -1914,10 +1876,9 @@ mod test {
 
     #[tokio::test]
     async fn test_refine_factor() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_ds = TestVectorDataset::new().await.unwrap();
+        let dataset = &test_ds.dataset;
 
-        let dataset = create_vector_dataset(test_uri, true).await;
         let mut scan = dataset.scan();
         let key: Float32Array = (32..64).map(|v| v as f32).collect();
         scan.nearest("vec", &key, 5).unwrap();
@@ -1963,48 +1924,9 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_simple_scan_plan() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_vector_dataset(test_uri, false).await;
-
-        let scan = dataset.scan();
-        let plan = scan.create_plan().await.unwrap();
-
-        assert!(plan.as_any().is::<LanceScanExec>());
-        assert_eq!(plan.schema().field_names(), ["i", "s", "vec"]);
-
-        let mut scan = dataset.scan();
-        scan.project(&["s"]).unwrap();
-        let plan = scan.create_plan().await.unwrap();
-
-        assert!(plan.as_any().is::<LanceScanExec>());
-        assert_eq!(plan.schema().field_names(), ["s"]);
-    }
-
-    #[tokio::test]
-    async fn test_scan_with_row_id() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_vector_dataset(test_uri, false).await;
-
-        let mut scan = dataset.scan();
-        scan.project(&["i"]).unwrap();
-        scan.with_row_id();
-        let plan = scan.create_plan().await.unwrap();
-
-        assert!(plan.as_any().is::<ProjectionExec>());
-        assert_eq!(plan.schema().field_names(), &["i", ROW_ID]);
-        let scan = &plan.children()[0];
-        assert!(scan.as_any().is::<LanceScanExec>());
-        assert_eq!(scan.schema().field_names(), &["i", ROW_ID]);
-    }
-
-    #[tokio::test]
     async fn test_scan_unordered_with_row_id() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_vector_dataset(test_uri, false).await;
+        let test_ds = TestVectorDataset::new().await.unwrap();
+        let dataset = &test_ds.dataset;
 
         let mut scan = dataset.scan();
         scan.with_row_id();
@@ -2263,200 +2185,6 @@ mod test {
             .unwrap();
 
         assert_eq!(batches_by_int_then_float[0], sorted_by_int_then_float);
-    }
-
-    /// Test scan with filter.
-    ///
-    /// Query:
-    ///
-    /// ```
-    /// SELECT s FROM dataset WHERE i > 10 and i < 20
-    /// ```
-    ///
-    /// Expected plan:
-    ///  pushdown_scan(i)
-    #[tokio::test]
-    async fn test_scan_with_filter() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_vector_dataset(test_uri, false).await;
-
-        let mut scan = dataset.scan();
-        scan.project(&["s"]).unwrap();
-        scan.filter("i > 10 and i < 20").unwrap();
-        let plan = scan.create_plan().await.unwrap();
-
-        assert!(plan.as_any().is::<LancePushdownScanExec>());
-        assert_eq!(plan.schema().field_names(), ["s"]);
-    }
-
-    /// Test KNN with index
-    ///
-    /// Query: nearest(vec, [...], 10) + filter(i > 10 and i < 20)
-    ///
-    /// Expected plan:
-    ///  KNNIndex(vec) -> Take(i) -> filter(i) -> take(s, vec) -> projection(s, vec, _distance)
-    #[tokio::test]
-    async fn test_ann_with_index() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_vector_dataset(test_uri, true).await;
-
-        let mut scan = dataset.scan();
-        let key: Float32Array = (32..64).map(|v| v as f32).collect();
-        scan.nearest("vec", &key, 10).unwrap();
-        scan.project(&["s"]).unwrap();
-        scan.filter("i > 10 and i < 20").unwrap();
-
-        let plan = scan.create_plan().await.unwrap();
-
-        assert!(plan.as_any().is::<ProjectionExec>());
-        assert_eq!(
-            plan.schema()
-                .fields()
-                .iter()
-                .map(|f| f.name())
-                .collect::<Vec<_>>(),
-            vec!["s", "vec", DIST_COL]
-        );
-
-        let take = &plan.children()[0];
-        let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(
-            take.schema().field_names(),
-            [DIST_COL, ROW_ID, "vec", "i", "s"]
-        );
-        assert_eq!(
-            take.extra_schema
-                .fields
-                .iter()
-                .map(|f| f.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["s"]
-        );
-
-        let filter = &take.children()[0];
-        assert!(filter.as_any().is::<FilterExec>());
-        assert_eq!(
-            filter.schema().field_names(),
-            [DIST_COL, ROW_ID, "vec", "i"]
-        );
-
-        let take = &filter.children()[0];
-        let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(take.schema().field_names(), [DIST_COL, ROW_ID, "vec", "i"]);
-        assert_eq!(
-            take.extra_schema
-                .fields
-                .iter()
-                .map(|f| f.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["i"]
-        );
-
-        // TODO: Two continuous take execs, we can merge them into one.
-        let take = &take.children()[0];
-        let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(take.schema().field_names(), [DIST_COL, ROW_ID, "vec"]);
-        assert_eq!(
-            take.extra_schema
-                .fields
-                .iter()
-                .map(|f| f.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["vec"]
-        );
-
-        let knn = &take.children()[0];
-        assert!(knn.as_any().is::<KNNIndexExec>());
-        assert_eq!(knn.schema().field_names(), [DIST_COL, ROW_ID]);
-    }
-
-    /// Test KNN index with refine factor
-    ///
-    /// Query: nearest(vec, [...], 10, refine_factor=10) + filter(i > 10 and i < 20)
-    ///
-    /// Expected plan:
-    ///  KNNIndex(vec) -> Take(vec) -> KNNFlat(vec, 10) -> Take(i) -> Filter(i)
-    ///     -> take(s, vec) -> projection(s, vec, _distance)
-    #[tokio::test]
-    async fn test_knn_with_refine() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_vector_dataset(test_uri, true).await;
-
-        let mut scan = dataset.scan();
-        let key: Float32Array = (32..64).map(|v| v as f32).collect();
-        scan.nearest("vec", &key, 10).unwrap();
-        scan.refine(10);
-        scan.project(&["s"]).unwrap();
-        scan.filter("i > 10 and i < 20").unwrap();
-
-        let plan = scan.create_plan().await.unwrap();
-
-        assert!(plan.as_any().is::<ProjectionExec>());
-        assert_eq!(
-            plan.schema()
-                .fields()
-                .iter()
-                .map(|f| f.name())
-                .collect::<Vec<_>>(),
-            vec!["s", "vec", DIST_COL]
-        );
-
-        let take = &plan.children()[0];
-        let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(
-            take.schema().field_names(),
-            [DIST_COL, ROW_ID, "vec", "i", "s"]
-        );
-        assert_eq!(
-            take.extra_schema
-                .fields
-                .iter()
-                .map(|f| f.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["s"]
-        );
-
-        let filter = &take.children()[0];
-        assert!(filter.as_any().is::<FilterExec>());
-        assert_eq!(
-            filter.schema().field_names(),
-            [DIST_COL, ROW_ID, "vec", "i"]
-        );
-
-        let take = &filter.children()[0];
-        let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(take.schema().field_names(), [DIST_COL, ROW_ID, "vec", "i"]);
-        assert_eq!(
-            take.extra_schema
-                .fields
-                .iter()
-                .map(|f| f.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["i"]
-        );
-
-        // Flat refine step
-        let flat = &take.children()[0];
-        assert!(flat.as_any().is::<KNNFlatExec>());
-
-        let take = &flat.children()[0];
-        let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(take.schema().field_names(), [DIST_COL, ROW_ID, "vec"]);
-        assert_eq!(
-            take.extra_schema
-                .fields
-                .iter()
-                .map(|f| f.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["vec"]
-        );
-
-        let knn = &take.children()[0];
-        assert!(knn.as_any().is::<KNNIndexExec>());
-        assert_eq!(knn.schema().field_names(), [DIST_COL, ROW_ID]);
     }
 
     #[tokio::test]
@@ -3130,22 +2858,7 @@ mod test {
             scan.prefilter(true);
 
             let plan = scan.explain_plan(true).await.unwrap();
-            let output_schema = scan.schema().unwrap();
-            let batches = scan
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-
-            let batch = if batches.is_empty() {
-                RecordBatch::new_empty(output_schema)
-            } else {
-                concat_batches(&batches[0].schema(), batches.iter())
-                    .map_err(ArrowError::from)
-                    .unwrap()
-            };
+            let batch = scan.try_into_batch().await.unwrap();
 
             if params.use_projection {
                 // 1 projected column
@@ -3393,5 +3106,327 @@ mod test {
                 }
             }
         }
+    }
+
+    /// Assert that the plan when formatted matches the expected string.
+    ///
+    /// Within expected, you can use `...` to match any number of characters.
+    async fn assert_plan_equals(
+        dataset: &Dataset,
+        plan: impl Fn(&mut Scanner) -> Result<&mut Scanner>,
+        expected: &str,
+    ) -> Result<()> {
+        let mut scan = dataset.scan();
+        plan(&mut scan)?;
+        let exec_plan = scan.create_plan().await?;
+        let plan_desc = format!(
+            "{}",
+            datafusion::physical_plan::displayable(exec_plan.as_ref()).indent(true)
+        );
+
+        let to_match = expected.split("...").collect::<Vec<_>>();
+        let num_pieces = to_match.len();
+        let mut remainder = plan_desc.as_str().trim_end_matches('\n');
+        for (i, piece) in to_match.into_iter().enumerate() {
+            let res = match i {
+                0 => remainder.starts_with(piece),
+                _ if i == num_pieces - 1 => remainder.ends_with(piece),
+                _ => remainder.contains(piece),
+            };
+            if !res {
+                break;
+            }
+            let idx = remainder.find(piece).unwrap();
+            remainder = &remainder[idx + piece.len()..];
+        }
+        if !remainder.is_empty() {
+            panic!(
+                "Expected plan to match:\nExpected: {}\nActual: {}",
+                expected, plan_desc
+            )
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plans() -> Result<()> {
+        // Create a vector dataset
+        let mut dataset = TestVectorDataset::new().await?;
+
+        // Scans
+        // ---------------------------------------------------------------------
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| scan.project(&["s"])?.filter("i > 10 and i < 20"),
+            "LancePushdownScan: uri=..., projection=[s], predicate=i > Int32(10) AND i < Int32(20), row_id=false, ordered=true"
+        ).await?;
+
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.use_stats(false)
+                    .project(&["s"])?
+                    .filter("i > 10 and i < 20")
+            },
+            "Projection: fields=[s]
+  FilterExec: i@2 > 10 AND i@2 < 20
+    Take: columns=\"s, _rowid, i\"
+      LanceScan: uri..., projection=[s], row_id=true, ordered=true",
+        )
+        .await?;
+
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| Ok(scan.project(&["s"])?.with_row_id().scan_in_order(false)),
+            "Projection: fields=[s, _rowid]
+  LanceScan: uri=..., projection=[s], row_id=true, ordered=false",
+        )
+        .await?;
+
+        // KNN
+        // ---------------------------------------------------------------------
+        let q: Float32Array = (32..64).map(|v| v as f32).collect();
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| scan.nearest("vec", &q, 5),
+            "Projection: fields=[i, s, vec, _distance]
+  Take: columns=\"vec, _rowid, _distance, i, s\"
+    KNNFlat: k=5 metric=l2
+      LanceScan: uri=..., projection=[vec], row_id=true, ordered=false",
+        )
+        .await?;
+
+        // ANN
+        // ---------------------------------------------------------------------
+        dataset.make_vector_index().await?;
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| scan.nearest("vec", &q, 42),
+            "Projection: fields=[i, s, vec, _distance]
+  Take: columns=\"_distance, _rowid, vec, i, s\"
+    KNNIndex: name=..., k=42",
+        )
+        .await?;
+
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| Ok(scan.nearest("vec", &q, 10)?.refine(4)),
+            "Projection: fields=[i, s, vec, _distance]
+  Take: columns=\"_distance, _rowid, vec, i, s\"
+    KNNFlat: k=10 metric=l2
+      Take: columns=\"_distance, _rowid, vec\"
+        KNNIndex: name=..., k=40",
+        )
+        .await?;
+
+        // use_index = False -> same plan as KNN
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| Ok(scan.nearest("vec", &q, 13)?.use_index(false)),
+            "Projection: fields=[i, s, vec, _distance]
+  Take: columns=\"vec, _rowid, _distance, i, s\"
+    KNNFlat: k=13 metric=l2
+      LanceScan: uri=..., projection=[vec], row_id=true, ordered=false",
+        )
+        .await?;
+
+        // with filter and projection
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                Ok(scan
+                    .nearest("vec", &q, 17)?
+                    .filter("i > 10")?
+                    .project(&["s", "vec"])?
+                    .with_row_id())
+            },
+            "Projection: fields=[s, vec, _distance, _rowid]
+  Take: columns=\"_distance, _rowid, vec, i, s\"
+    FilterExec: i@3 > 10
+      Take: columns=\"_distance, _rowid, vec, i\"
+        KNNIndex: name=..., k=17",
+        )
+        .await?;
+
+        // with prefilter
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                Ok(scan
+                    .nearest("vec", &q, 17)?
+                    .filter("i > 10")?
+                    .prefilter(true))
+            },
+            "Projection: fields=[i, s, vec, _distance]
+  Take: columns=\"_distance, _rowid, vec, i, s\"
+    KNNIndex: name=..., k=17
+      FilterExec: i@0 > 10
+        LanceScan: uri=..., projection=[i], row_id=true, ordered=false",
+        )
+        .await?;
+
+        dataset.append_new_data().await?;
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| scan.nearest("vec", &q, 5),
+            // TODO: we could write an optimizer rule to eliminate the last Projection
+            // by doing it as part of the last Take. This would likely have minimal impact though.
+            "Projection: fields=[i, s, vec, _distance]
+  Take: columns=\"_distance, _rowid, vec, i, s\"
+    KNNFlat: k=5 metric=l2
+      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+        UnionExec
+          Projection: fields=[_distance, _rowid, vec]
+            KNNFlat: k=5 metric=l2
+              LanceScan: uri=..., projection=[vec], row_id=true, ordered=false
+          Take: columns=\"_distance, _rowid, vec\"
+            KNNIndex: name=..., k=5",
+        )
+        .await?;
+
+        // new data and with filter
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| scan.nearest("vec", &q, 5)?.filter("i > 10"),
+            "Projection: fields=[i, s, vec, _distance]
+  Take: columns=\"_distance, _rowid, vec, i, s\"
+    FilterExec: i@3 > 10
+      Take: columns=\"_distance, _rowid, vec, i\"
+        KNNFlat: k=5 metric=l2
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Projection: fields=[_distance, _rowid, vec]
+                KNNFlat: k=5 metric=l2
+                  LanceScan: uri=..., projection=[vec], row_id=true, ordered=false
+              Take: columns=\"_distance, _rowid, vec\"
+                KNNIndex: name=..., k=5",
+        )
+        .await?;
+
+        // new data and with prefilter
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                Ok(scan
+                    .nearest("vec", &q, 5)?
+                    .filter("i > 10")?
+                    .prefilter(true))
+            },
+            // TODO: i is scanned on both sides but is projected away mid-plan
+            // only to be taken again later. We should fix this.
+            "Projection: fields=[i, s, vec, _distance]
+  Take: columns=\"_distance, _rowid, vec, i, s\"
+    KNNFlat: k=5 metric=l2
+      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+        UnionExec
+          Projection: fields=[_distance, _rowid, vec]
+            KNNFlat: k=5 metric=l2
+              FilterExec: i@1 > 10
+                LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
+          Take: columns=\"_distance, _rowid, vec\"
+            KNNIndex: name=..., k=5
+              FilterExec: i@0 > 10
+                LanceScan: uri=..., projection=[i], row_id=true, ordered=false",
+        )
+        .await?;
+
+        // ANN with scalar index
+        // ---------------------------------------------------------------------
+        // Make sure both indices are up-to-date to start
+        dataset.make_vector_index().await?;
+        dataset.make_scalar_index().await?;
+
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                Ok(scan
+                    .nearest("vec", &q, 5)?
+                    .filter("i > 10")?
+                    .prefilter(true))
+            },
+            "Projection: fields=[i, s, vec, _distance]
+  Take: columns=\"_distance, _rowid, vec, i, s\"
+    KNNIndex: name=..., k=5
+      ScalarIndexQuery: query=i > 10",
+        )
+        .await?;
+
+        dataset.append_new_data().await?;
+
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                Ok(scan
+                    .nearest("vec", &q, 5)?
+                    .filter("i > 10")?
+                    .prefilter(true))
+            },
+            "Projection: fields=[i, s, vec, _distance]
+  Take: columns=\"_distance, _rowid, vec, i, s\"
+    KNNFlat: k=5 metric=l2
+      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+        UnionExec
+          Projection: fields=[_distance, _rowid, vec]
+            KNNFlat: k=5 metric=l2
+              FilterExec: i@1 > 10
+                LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
+          Take: columns=\"_distance, _rowid, vec\"
+            KNNIndex: name=..., k=5
+              ScalarIndexQuery: query=i > 10",
+        )
+        .await?;
+
+        // Update scalar index but not vector index
+        dataset.make_scalar_index().await?;
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                Ok(scan
+                    .nearest("vec", &q, 5)?
+                    .filter("i > 10")?
+                    .prefilter(true))
+            },
+            "Projection: fields=[i, s, vec, _distance]
+  Take: columns=\"_distance, _rowid, vec, i, s\"
+    KNNFlat: k=5 metric=l2
+      RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+        UnionExec
+          Projection: fields=[_distance, _rowid, vec]
+            KNNFlat: k=5 metric=l2
+              FilterExec: i@1 > 10
+                LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
+          Take: columns=\"_distance, _rowid, vec\"
+            KNNIndex: name=..., k=5
+              ScalarIndexQuery: query=i > 10",
+        )
+        .await?;
+
+        // Scans with scalar index
+        // ---------------------------------------------------------------------
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| scan.project(&["s"])?.filter("i > 10"),
+            "Projection: fields=[s]
+  Take: columns=\"_rowid, s\"
+    MaterializeIndex: query=i > 10",
+        )
+        .await?;
+
+        dataset.append_new_data().await?;
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| scan.project(&["s"])?.filter("i > 10"),
+            "Projection: fields=[s]
+  RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+    UnionExec
+      Take: columns=\"_rowid, s\"
+        MaterializeIndex: query=i > 10
+      Projection: fields=[_rowid, s]
+        FilterExec: i@1 > 10
+          LanceScan: uri=..., projection=[s, i], row_id=true, ordered=false",
+        )
+        .await?;
+
+        Ok(())
     }
 }

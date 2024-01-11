@@ -495,9 +495,9 @@ impl Transaction {
         };
 
         let mut manifest = if let Some(current_manifest) = current_manifest {
-            Manifest::new_from_previous(current_manifest, &schema, Arc::new(final_fragments))
+            Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments))
         } else {
-            Manifest::new(&schema, Arc::new(final_fragments))
+            Manifest::new(schema, Arc::new(final_fragments))
         };
 
         manifest.tag = self.tag.clone();

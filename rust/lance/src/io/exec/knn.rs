@@ -140,11 +140,11 @@ impl DFRecordBatchStream for KNNFlatStream {
 /// - `input` schema does not have "_distance" column.
 #[derive(Debug)]
 pub struct KNNFlatExec {
-    /// Input node.
-    input: Arc<dyn ExecutionPlan>,
+    /// Inner input node.
+    pub input: Arc<dyn ExecutionPlan>,
 
-    /// The query to execute.
-    query: Query,
+    /// The vector query to execute.
+    pub query: Query,
 }
 
 impl DisplayAs for KNNFlatExec {
@@ -425,7 +425,12 @@ impl DisplayAs for KNNIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "KNNIndex: name={}, k={}", self.index.uuid, self.query.k)
+                write!(
+                    f,
+                    "KNNIndex: name={}, k={}",
+                    self.index.uuid,
+                    self.query.k * self.query.refine_factor.unwrap_or(1) as usize
+                )
             }
         }
     }
