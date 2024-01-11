@@ -38,7 +38,6 @@ use snafu::{location, Location};
 use tracing::{instrument, Instrument};
 
 pub mod builder;
-mod merger;
 pub mod shuffler;
 
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
