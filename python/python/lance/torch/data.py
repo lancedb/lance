@@ -22,13 +22,12 @@ import logging
 import math
 from typing import TYPE_CHECKING, Iterable, Literal, Optional, Union
 
-import numpy as np
 import pyarrow as pa
-import torch
-from torch.utils.data import Dataset, IterableDataset
 
 from lance._dataset.cache import CachedDataset
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
+from lance.dependencies import _check_for_numpy, torch
+from lance.dependencies import numpy as np
 
 from ..sampler import maybe_sample
 
@@ -77,7 +76,7 @@ def _to_tensor(
     return ret
 
 
-class TensorDataset(Dataset):
+class TensorDataset(torch.utils.data.Dataset):
     """A PyTorch Dataset that wraps over a tensor, returns in batches.
 
     Unlike `torch.utils.data.TensorDataset`, this has the same behavior as LanceDataset
@@ -88,7 +87,7 @@ class TensorDataset(Dataset):
         self, data: Union[torch.Tensor, np.ndarray], batch_size: int, *args, **kwargs
     ):
         super().__init__(*args, **kwargs)
-        if isinstance(data, np.ndarray):
+        if _check_for_numpy(data) and isinstance(data, np.ndarray):
             data = torch.from_numpy(data)
         self._data: torch.Tensor = data
         self._batch_size = batch_size
@@ -135,12 +134,12 @@ def _buffer_arrow_batches(
         yield concat_batches(buffer)
 
 
-class LanceDataset(IterableDataset):
+class LanceDataset(torch.utils.data.IterableDataset):
     """PyTorch IterableDataset over LanceDataset."""
 
     def __init__(
         self,
-        dataset: Union[Dataset, str, Path],
+        dataset: Union[torch.utils.data.Dataset, str, Path],
         batch_size: int,
         *args,
         columns: Optional[list[str]] = None,

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Generator, List, Literal, Union
 
 import lance
 from lance.dataset import LanceDataset
+from lance.dependencies import torch
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -101,12 +102,6 @@ class ShardedBatchIterator:
 
         Other parameters, see :py:meth:`ShardedBatchIterator.__init__`.
         """
-        try:
-            import torch
-        except ImportError:
-            raise ImportError(
-                "PyTorch is not installed, please install torch first before using ."
-            )
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         return ShardedBatchIterator(

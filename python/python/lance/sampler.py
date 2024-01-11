@@ -23,10 +23,10 @@ from heapq import heappush, heappushpop
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, TypeVar, Union
 
-import numpy as np
 import pyarrow as pa
 
 import lance
+from lance.dependencies import numpy as np
 
 if TYPE_CHECKING:
     from collections.abc import Generator

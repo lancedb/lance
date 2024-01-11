@@ -16,7 +16,7 @@
 import logging
 from typing import Optional, Tuple
 
-import torch
+from lance.dependencies import torch
 
 __all__ = [
     "pairwise_cosine",

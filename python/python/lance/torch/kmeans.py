@@ -16,11 +16,11 @@ import logging
 import time
 from typing import List, Literal, Optional, Tuple, Union
 
-import numpy as np
 import pyarrow as pa
-import torch
-from torch.utils.data import IterableDataset
 from tqdm import tqdm
+
+from lance.dependencies import _check_for_numpy, _check_for_torch, torch
+from lance.dependencies import numpy as np
 
 from . import preferred_device
 from .data import TensorDataset
@@ -98,7 +98,7 @@ class KMeans:
     ) -> torch.Tensor:
         if isinstance(data, pa.FixedSizeListArray):
             data = torch.from_numpy(np.stack(data.to_numpy(zero_copy_only=False)))
-        elif isinstance(data, np.ndarray):
+        elif _check_for_numpy(data) and isinstance(data, np.ndarray):
             data = torch.from_numpy(data)
         elif isinstance(data, torch.Tensor):
             # Good type
@@ -117,15 +117,22 @@ class KMeans:
         if self.centroids is not None:
             logging.debug("KMeans centroids already initialized")
             return
-        if isinstance(data, (np.ndarray, torch.Tensor)):
+
+        is_numpy = _check_for_numpy(data) and isinstance(data, np.ndarray)
+        if is_numpy or (_check_for_torch(data) and isinstance(data, torch.Tensor)):
             indices = np.random.choice(data.shape[0], self.k)
-            if isinstance(data, np.ndarray):
+            if is_numpy:
                 data = torch.from_numpy(data)
             self.centroids = data[indices]
 
     def fit(
         self,
-        data: Union[IterableDataset, np.ndarray, torch.Tensor, pa.FixedSizeListArray],
+        data: Union[
+            torch.utils.data.IterableDataset,
+            np.ndarray,
+            torch.Tensor,
+            pa.FixedSizeListArray,
+        ],
     ) -> None:
         """Fit - Train the kmeans model.
 
@@ -139,7 +146,9 @@ class KMeans:
             data = np.stack(data.to_numpy(zero_copy_only=False))
         elif isinstance(data, pa.FixedShapeTensorArray):
             data = data.to_numpy_ndarray()
-        if isinstance(data, (np.ndarray, torch.Tensor)):
+        if (_check_for_torch(data) and isinstance(data, torch.Tensor)) or (
+            _check_for_numpy(data) and isinstance(data, np.ndarray)
+        ):
             self._random_init(data)
             data = TensorDataset(data, batch_size=10240)
 
@@ -189,7 +198,7 @@ class KMeans:
         return num_rows
 
     def _fit_once(
-        self, data: IterableDataset, epoch: int, last_dist: float = 0.0
+        self, data: torch.utils.data.IterableDataset, epoch: int, last_dist: float = 0.0
     ) -> float:
         """Train KMean once and return the total distance.
 
