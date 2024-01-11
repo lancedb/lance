@@ -52,7 +52,9 @@ use crate::dataset::index::unindexed_fragments;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index};
 use crate::index::DatasetIndexInternalExt;
-use crate::io::exec::{FilterPlan, MaterializeIndexExec, PreFilterSource, ScalarIndexExec};
+use crate::io::exec::{
+    FilterPlan, LimitGroupExec, MaterializeIndexExec, PreFilterSource, ScalarIndexExec,
+};
 use crate::io::{
     exec::{
         KNNFlatExec, KNNIndexExec, LancePushdownScanExec, LanceScanExec, Planner, ProjectionExec,
@@ -70,6 +72,14 @@ pub const DEFAULT_BATCH_READAHEAD: usize = 16;
 
 // Same as pyarrow Dataset::scanner()
 pub const DEFAULT_FRAGMENT_READAHEAD: usize = 4;
+
+/// A limit on how many results are returned per group
+pub struct GroupLimit {
+    /// How many results to return per group
+    pub results_per_group: u32,
+    /// The column to group by
+    pub group_column: String,
+}
 
 /// Defines an ordering for a single column
 ///
@@ -151,6 +161,8 @@ pub struct Scanner {
     limit: Option<i64>,
     offset: Option<i64>,
 
+    group_limit: Option<GroupLimit>,
+
     /// If Some then results will be ordered by the provided ordering
     ///
     /// If there are multiple columns the the results will first be ordered
@@ -200,6 +212,7 @@ impl Scanner {
             fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
             limit: None,
             offset: None,
+            group_limit: None,
             ordering: None,
             nearest: None,
             use_stats: true,
@@ -350,6 +363,40 @@ impl Scanner {
         self.limit = limit;
         self.offset = offset;
         Ok(self)
+    }
+
+    /// Sets a group limit
+    ///
+    /// A group limit will filter the results so that only `results_per_group` results are returned
+    /// for each group.
+    ///
+    /// Currently, group limits are applied after the index search.  This means you will likely want
+    /// to set the `k` value of the call to `nearest` to be significnatly larger than `results_per_group`.
+    /// For example, if the closest 100 results are all in group X then you will not see results from
+    /// other groups unless `k` is larger than 100.
+    pub fn limit_groups(&mut self, group_limit: Option<GroupLimit>) -> Result<&mut Self> {
+        match &group_limit {
+            Some(limit) => {
+                self.dataset
+                    .schema()
+                    .field(&limit.group_column)
+                    .ok_or_else(|| {
+                        Error::invalid_input(
+                            format!(
+                                "Cannot group on column {} because it does not exist",
+                                &limit.group_column
+                            ),
+                            location!(),
+                        )
+                    })?;
+                self.group_limit = group_limit;
+                Ok(self)
+            }
+            None => {
+                self.group_limit = None;
+                Ok(self)
+            }
+        }
     }
 
     /// Find k-nearest neighbor within the vector column.
@@ -744,8 +791,20 @@ impl Scanner {
                     .collect::<Vec<_>>(),
             )?;
         }
+        if let Some(group_limit) = &self.group_limit {
+            additional_schema = self.calc_new_fields(
+                &additional_schema
+                    .map(Ok::<Schema, Error>)
+                    .unwrap_or_else(|| Schema::try_from(plan.schema().as_ref()))?,
+                &[&group_limit.group_column],
+            )?;
+        }
         if let Some(additional_schema) = additional_schema {
             plan = self.take(plan, &additional_schema, self.batch_readahead)?;
+        }
+
+        if let Some(group_limit) = &self.group_limit {
+            plan = self.apply_group_limit(group_limit, plan, self.nearest.is_some())?;
         }
 
         // Stage 2: filter
@@ -1091,6 +1150,39 @@ impl Scanner {
         }
     }
 
+    fn apply_group_limit(
+        &self,
+        group_limit: &GroupLimit,
+        plan: Arc<dyn ExecutionPlan>,
+        has_distance_column: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let group_sort = PhysicalSortExpr {
+            expr: expressions::col(&group_limit.group_column, plan.schema().as_ref())?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        };
+        let distance_sort = PhysicalSortExpr {
+            expr: expressions::col(DIST_COL, plan.schema().as_ref())?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        };
+        let sort_cols = if has_distance_column {
+            vec![group_sort, distance_sort]
+        } else {
+            vec![group_sort]
+        };
+        let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(sort_cols, plan));
+        Ok(Arc::new(LimitGroupExec::new(
+            sorted,
+            group_limit.results_per_group,
+            vec![group_limit.group_column.clone()],
+        )))
+    }
+
     /// Create an Execution plan with a scan node
     ///
     /// Setting `with_make_deletions_null` will use the validity of the _rowid
@@ -1329,7 +1421,7 @@ mod test {
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Int32Array, LargeStringArray, PrimitiveArray,
-        RecordBatchIterator, StringArray, StructArray,
+        RecordBatchIterator, StringArray, StructArray, UInt64Array,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{ArrowError, DataType};
@@ -2438,6 +2530,72 @@ mod test {
             .await
             .unwrap();
         concat_batches(&batches[0].schema(), &batches).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_group_limit() {
+        // Basic limit group test, there are more tests of this feature in python
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // 1030 rows from group 0, 100 rows from group 1, 5 rows from group 2
+        let data = gen()
+            .col(
+                Some("vector".to_string()),
+                array::cycle_vec(array::step::<Float32Type>(), Dimension::from(2)),
+            )
+            .col(Some("group".to_string()), array::fill::<UInt64Type>(0))
+            .into_reader_rows(RowCount::from(1030), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(data, test_uri, None).await.unwrap();
+
+        let data = gen()
+            .col(
+                Some("vector".to_string()),
+                array::cycle_vec(
+                    array::step_custom::<Float32Type>(2060.0, 1.0),
+                    Dimension::from(2),
+                ),
+            )
+            .col(Some("group".to_string()), array::fill::<UInt64Type>(1))
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        dataset.append(data, None).await.unwrap();
+
+        let data = gen()
+            .col(
+                Some("vector".to_string()),
+                array::cycle_vec(
+                    array::step_custom::<Float32Type>(2260.0, 1.0),
+                    Dimension::from(2),
+                ),
+            )
+            .col(Some("group".to_string()), array::fill::<UInt64Type>(2))
+            .into_reader_rows(RowCount::from(5), BatchCount::from(1));
+        dataset.append(data, None).await.unwrap();
+
+        let query = Float32Array::from_iter_values([0.0, 1.0]);
+        let results = dataset
+            .scan()
+            .nearest("vector", &query, 2000)
+            .unwrap()
+            .limit_groups(Some(GroupLimit {
+                results_per_group: 2,
+                group_column: "group".to_string(),
+            }))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let results = concat_batches(&results[0].schema(), results.iter()).unwrap();
+
+        assert_eq!(results.num_rows(), 6);
+        let group_col = results.column_by_name("group").unwrap().clone();
+        let expected: Arc<dyn Array> = Arc::new(UInt64Array::from_iter_values([0, 0, 1, 1, 2, 2]));
+        assert_eq!(group_col.as_ref(), expected.as_ref());
     }
 
     #[tokio::test]
