@@ -1113,7 +1113,7 @@ mod tests {
             compare_field_ids: true,
             ..Default::default()
         };
-        assert!(no_id.compare_with_options(&expected, &compare_ids));
+        assert!(!no_id.compare_with_options(&expected, &compare_ids));
     }
 
     #[test]
