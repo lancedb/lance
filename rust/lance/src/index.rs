@@ -32,7 +32,7 @@ use lance_index::scalar::ScalarIndex;
 pub use lance_index::IndexParams;
 use lance_index::{pb, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
 use snafu::{location, Location};
-use tracing::instrument;
+use tracing::{field, instrument};
 use uuid::Uuid;
 
 pub(crate) mod append;
@@ -322,7 +322,7 @@ impl DatasetIndexExt for Dataset {
         let mut removed_indices = vec![];
 
         for (&field_id, indices) in column_to_indices_map.iter() {
-            let _ = self
+            let field = self
                 .schema()
                 .field_by_id(field_id)
                 .ok_or_else(|| Error::Index {

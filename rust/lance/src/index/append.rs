@@ -14,8 +14,7 @@
 
 use std::sync::Arc;
 
-use lance_core::format::Index;
-use lance_core::{Error, Result};
+use lance_core::{format::Index as IndexMetadata, Error, Result};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::{optimize::OptimizeOptions, IndexType};
 use roaring::RoaringBitmap;
@@ -34,9 +33,9 @@ use crate::dataset::Dataset;
 /// TODO: move this function to `lance-index`
 pub async fn append_index<'a>(
     dataset: Arc<Dataset>,
-    old_indices: &[&'a Index],
+    old_indices: &[&'a IndexMetadata],
     options: &OptimizeOptions,
-) -> Result<Option<(Uuid, Vec<&'a Index>, RoaringBitmap)>> {
+) -> Result<Option<(Uuid, Vec<&'a IndexMetadata>, RoaringBitmap)>> {
     let mut frag_bitmap = RoaringBitmap::new();
     old_indices.iter().for_each(|idx| {
         frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
@@ -167,7 +166,7 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
-    use crate::index::{DatasetIndexExt, vector::ivf::IVFIndex};
+    use crate::index::{vector::ivf::IVFIndex, DatasetIndexExt};
     use crate::{
         dataset::index::unindexed_fragments,
         index::vector::{pq::PQIndex, VectorIndexParams},
