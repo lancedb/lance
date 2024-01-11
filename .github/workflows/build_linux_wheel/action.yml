@@ -31,6 +31,7 @@ runs:
         manylinux: "2_17"
         args: ${{ inputs.args }}
         before-script-linux: |
+          set -e
           yum install -y openssl-devel \
             && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-$(uname -m).zip > /tmp/protoc.zip \
             && unzip /tmp/protoc.zip -d /usr/local \
