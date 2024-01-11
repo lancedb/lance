@@ -22,13 +22,14 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::io::{read_message, read_message_from_buf, read_metadata_offset, Reader};
-use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
+use lance_index::{optimize::OptimizeOptions, pb::index::Implementation};
 use lance_index::{pb, Index, IndexType, INDEX_FILE_NAME};
+use log::warn;
 use snafu::{location, Location};
-use tracing::instrument;
+use tracing::{field, instrument};
 use uuid::Uuid;
 
 pub(crate) mod append;
@@ -155,7 +156,12 @@ pub trait DatasetIndexExt {
     ) -> Result<()>;
 
     /// Optimize indices.
-    async fn optimize_indices(&mut self) -> Result<()>;
+    ///
+    /// Parameters
+    /// ----------
+    /// options: OptimizeOptions
+    ///     Options for optimizing indices.
+    async fn optimize_indices(&mut self, options: OptimizeOptions) -> Result<()>;
 }
 
 async fn open_index_proto(dataset: &Dataset, reader: &dyn Reader) -> Result<pb::Index> {
@@ -280,25 +286,56 @@ impl DatasetIndexExt for Dataset {
     }
 
     #[instrument(skip_all)]
-    async fn optimize_indices(&mut self) -> Result<()> {
+    async fn optimize_indices(&mut self, options: OptimizeOptions) -> Result<()> {
         let dataset = Arc::new(self.clone());
         // Append index
         let indices = self.load_indices().await?;
 
-        let mut new_indices = vec![];
-        let mut removed_indices = vec![];
-        for idx in indices.as_slice() {
-            if idx.dataset_version == self.manifest.version {
+        /// Collect indices by column.
+        let mut column_to_indices_map: HashMap<i32, Vec<&IndexMetadata>> = HashMap::new();
+        for idx in indices.iter() {
+            if idx.fields.len() != 1 {
+                warn!(
+                    "Index with multiple fields is not supported yet: fields={:?}, uuid={}",
+                    idx.fields, idx.uuid
+                );
                 continue;
             }
-            let Some((new_id, new_frag_ids)) = append_index(dataset.clone(), idx).await? else {
+            let field_id = idx.fields[0];
+            column_to_indices_map.entry(field_id).or_default().push(idx);
+        }
+
+        // Sort indices by its creating order.
+        for indices in column_to_indices_map.values_mut() {
+            indices.sort_by_key(|idx| idx.dataset_version);
+        }
+
+        let mut new_indices = vec![];
+        let mut removed_indices = vec![];
+
+        for (&field_id, indices) in column_to_indices_map.iter() {
+            let field = self
+                .schema()
+                .field_by_id(field_id)
+                .ok_or_else(|| Error::Index {
+                    message: format!(
+                        "Index referenced a field with id {field_id} which did not exist in the schema"
+                    ),
+                    location: location!(),
+                })?;
+
+            let Some((new_id, new_frag_ids)) =
+                append_index(dataset.clone(), &indices, options).await?
+            else {
                 continue;
             };
 
+            let last_idx = indices.last().unwrap();
+
             let new_idx = IndexMetadata {
                 uuid: new_id,
-                name: idx.name.clone(),
-                fields: idx.fields.clone(),
+                name: last_idx.name.clone(),
+                fields: last_idx.fields.clone(),
                 dataset_version: self.manifest.version,
                 fragment_bitmap: new_frag_ids,
             };

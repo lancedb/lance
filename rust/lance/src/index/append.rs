@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use lance_core::{format::Index as IndexMetadata, Error, Result};
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::IndexType;
 use log::info;
@@ -32,9 +33,12 @@ use super::DatasetIndexInternalExt;
 /// Append new data to the index, without re-train.
 ///
 /// Returns the UUID of the new index along with a vector of newly indexed fragment ids
+///
+/// TODO: move this function to `lance-index`
 pub async fn append_index(
     dataset: Arc<Dataset>,
-    old_index: &IndexMetadata,
+    old_index: &[&IndexMetadata],
+    options: OptimizeOptions,
 ) -> Result<Option<(Uuid, Option<RoaringBitmap>)>> {
     let unindexed = unindexed_fragments(old_index, dataset.as_ref()).await?;
     if unindexed.is_empty() {
