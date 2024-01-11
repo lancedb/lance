@@ -24,7 +24,7 @@ use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use lance_arrow::*;
 use snafu::{location, Location};
 
-use super::field::Field;
+use super::field::{Field, SchemaCompareOptions};
 use crate::{format::pb, io::Reader, Error, Result};
 
 /// Lance Schema.
@@ -69,6 +69,102 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
+    pub fn compare_with_options(&self, other: &Schema, options: &SchemaCompareOptions) -> bool {
+        self.fields
+            .iter()
+            .zip(&other.fields)
+            .all(|(lhs, rhs)| lhs.compare_with_options(rhs, options))
+            && (!options.compare_metadata || self.metadata == other.metadata)
+    }
+
+    pub fn explain_difference(
+        &self,
+        expected: &Schema,
+        options: &SchemaCompareOptions,
+    ) -> Option<String> {
+        if self.fields.len() != expected.fields.len()
+            || !self
+                .fields
+                .iter()
+                .zip(expected.fields.iter())
+                .all(|(field, expected)| field.name == expected.name)
+        {
+            let self_fields = self
+                .fields
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<HashSet<_>>();
+            let expected_fields = expected
+                .fields
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<HashSet<_>>();
+            let missing = expected_fields
+                .difference(&self_fields)
+                .cloned()
+                .collect::<Vec<_>>();
+            let unexpected = self_fields
+                .difference(&expected_fields)
+                .cloned()
+                .collect::<Vec<_>>();
+            if missing.is_empty() && unexpected.is_empty() {
+                Some(format!(
+                    "fields in different order, expected: [{}], actual: [{}]",
+                    expected
+                        .fields
+                        .iter()
+                        .map(|f| f.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    self.fields
+                        .iter()
+                        .map(|f| f.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ))
+            } else {
+                Some(format!(
+                    "fields did not match, missing=[{}], unexpected=[{}]",
+                    missing.join(", "),
+                    unexpected.join(", ")
+                ))
+            }
+        } else {
+            let differences = self
+                .fields
+                .iter()
+                .zip(expected.fields.iter())
+                .flat_map(|(field, expected)| field.explain_difference(expected, options))
+                .collect::<Vec<_>>();
+            if differences.is_empty() {
+                if options.compare_metadata && self.metadata != expected.metadata {
+                    Some("schema metadata did not match expected schema metadata".to_string())
+                } else {
+                    None
+                }
+            } else {
+                Some(differences.join(", "))
+            }
+        }
+    }
+
+    pub fn check_compatible(
+        &self,
+        expected: &Schema,
+        options: &SchemaCompareOptions,
+    ) -> Result<()> {
+        if !self.compare_with_options(expected, options) {
+            let difference = self.explain_difference(expected, options);
+            Err(Error::SchemaMismatch {
+                // unknown reason is messy but this shouldn't happen.
+                difference: difference.unwrap_or("unknown reason".to_string()),
+                location: location!(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     /// Project the columns over the schema.
     ///
     /// ```ignore
@@ -932,5 +1028,39 @@ mod tests {
 
         let field = schema.field_by_id(3).unwrap();
         assert_eq!(field.name, "f2");
+    }
+
+    #[test]
+    fn test_explain_difference() {
+        let expected = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let expected = Schema::try_from(&expected).unwrap();
+
+        let mismatched = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, true),
+        ]);
+        let mismatched = Schema::try_from(&mismatched).unwrap();
+
+        assert_eq!(mismatched.explain_difference(&expected, &SchemaCompareOptions::default()), Some("`b` had mismatched children, missing=[f2] unexpected=[], `c` should have nullable=false but nullable=true".to_string()));
     }
 }

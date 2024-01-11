@@ -14,7 +14,6 @@
 
 mod statistics;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
@@ -22,13 +21,14 @@ use arrow_array::cast::{as_large_list_array, as_list_array, as_struct_array};
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_buffer::ArrowNativeType;
-use arrow_schema::{DataType, Schema as ArrowSchema};
+use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use lance_arrow::*;
 
 use object_store::path::Path;
 use snafu::{location, Location};
 
+use crate::datatypes::SchemaCompareOptions;
 use crate::{
     datatypes::{Field, Schema},
     encodings::{
@@ -56,7 +56,6 @@ use crate::{
 pub struct FileWriter {
     object_writer: ObjectWriter,
     schema: Schema,
-    arrow_schema: ArrowSchema,
     batch_id: i32,
     page_table: PageTable,
     metadata: Metadata,
@@ -102,14 +101,9 @@ impl FileWriter {
             None
         };
 
-        // This is used for validation. We clear the metadata because we don't
-        // care about mismatches in metadata.
-        let arrow_schema = ArrowSchema::from(&schema).with_metadata(HashMap::new());
-
         Ok(Self {
             object_writer,
             schema,
-            arrow_schema,
             batch_id: 0,
             page_table: PageTable::default(),
             metadata: Metadata::default(),
@@ -123,21 +117,10 @@ impl FileWriter {
     /// Returns [Err] if the schema does not match with the batch.
     pub async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         for batch in batches {
-            // Compare with metadata reset
-            let schema = batch
-                .schema()
-                .as_ref()
-                .clone()
-                .with_metadata(HashMap::new());
-            if self.arrow_schema != schema {
-                return Err(Error::Schema {
-                    message: format!(
-                        "FileWriter::write: schema mismatch: expected: {:?}, actual: {:?}",
-                        self.arrow_schema, schema
-                    ),
-                    location: location!(),
-                });
-            }
+            // Compare, ignore metadata and dictionary
+            //   dictionary should have been checked earlier and could be an expensive check
+            let schema = Schema::try_from(batch.schema().as_ref())?;
+            schema.check_compatible(&self.schema, &SchemaCompareOptions::default())?;
         }
 
         // If we are collecting stats for this column, collect them.

@@ -36,7 +36,10 @@ pub enum Error {
     DatasetAlreadyExists { uri: String, location: Location },
     // #[snafu(display("Append with different schema: original={original} new={new}"))]
     #[snafu(display("Append with different schema:"))]
-    SchemaMismatch {},
+    SchemaMismatch {
+        difference: String,
+        location: Location,
+    },
     #[snafu(display("Dataset at path {path} was not found: {source}, {location}"))]
     DatasetNotFound {
         path: String,

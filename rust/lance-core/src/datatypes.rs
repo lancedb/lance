@@ -27,6 +27,7 @@ mod schema;
 use crate::format::pb;
 use crate::{Error, Result};
 pub use field::Field;
+pub use field::SchemaCompareOptions;
 pub use schema::Schema;
 
 /// LogicalType is a string presentation of arrow type.
