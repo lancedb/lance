@@ -223,7 +223,7 @@ impl IVFIndex {
         )
         .await?;
         let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
-        write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(self)).await?;
+        write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(&[self])).await?;
         let metadata = IvfPQIndexMetadata {
             name: metadata.name.clone(),
             column: column.to_string(),

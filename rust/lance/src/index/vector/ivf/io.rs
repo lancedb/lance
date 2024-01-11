@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::types::UInt64Type;
+use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt32Array};
 use futures::{Stream, StreamExt};
 use lance_arrow::*;
 use lance_core::io::Writer;
@@ -34,14 +35,24 @@ use crate::Result;
 
 /// Write each partition of IVF_PQ index to the index file.
 ///
-/// `batches`: RecordBatch stream of PQ codes and row ids, sorted by PQ code.
+/// Parameters
+/// ----------
+/// `writer`: Index file writer.
+/// `ivf`: IVF index to be written.
+/// `streams`: RecordBatch stream of PQ codes and row ids, sorted by PQ code.
+/// `existing_partitions`: Existing IVF indices to be merged. Can be zero or more.
+///
+/// These existing partitions must have the same centroids and PQ codebook.
+///
+/// TODO: migrate this function to `lance-index` crate.
 pub(super) async fn write_index_partitions(
     writer: &mut dyn Writer,
     ivf: &mut Ivf,
     streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
-    existing_partitions: Option<&IVFIndex>,
+    existing_partitions: Option<&[&IVFIndex]>,
 ) -> Result<()> {
-    // build the inital heap
+    // build the initial heap
+    // TODO: extract heap sort to a separate function.
     let mut streams_heap = BinaryHeap::new();
     let mut new_streams = vec![];
 
@@ -75,20 +86,31 @@ pub(super) async fn write_index_partitions(
 
     for part_id in 0..ivf.num_partitions() as u32 {
         let start = Instant::now();
-        let mut pq_array = Vec::<Arc<dyn Array>>::new();
-        let mut row_id_array = Vec::<Arc<dyn Array>>::new();
+        let mut pq_array: Vec<Arc<dyn Array>> = vec![];
+        let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
 
-        if let Some(existing_idx) = existing_partitions.as_ref() {
-            let part = existing_idx.load_partition(part_id as usize, true).await?;
-            let pq_idx = part.as_any().downcast_ref::<PQIndex>().unwrap();
-            if pq_idx.code.is_some() {
-                let pq_code_arr = pq_idx.code.as_ref().unwrap().clone();
-                let pq_code_fixed_size_arr = FixedSizeListArray::try_new_from_values(
-                    pq_code_arr.as_ref().clone(),
-                    pq_idx.pq.num_sub_vectors() as i32,
-                )?;
-                pq_array.push(Arc::new(pq_code_fixed_size_arr));
-                row_id_array.push(pq_idx.row_ids.as_ref().unwrap().clone());
+        if let Some(&previous_indices) = existing_partitions.as_ref() {
+            for &idx in previous_indices.iter() {
+                let sub_index = idx.load_partition(part_id as usize, true).await?;
+                let pq_index =
+                    sub_index
+                        .as_any()
+                        .downcast_ref::<PQIndex>()
+                        .ok_or(Error::Index {
+                            message: "Invalid sub index".to_string(),
+                            location: location!(),
+                        })?;
+                if let Some(pq_code) = pq_index.code.as_ref() {
+                    let fsl = Arc::new(
+                        FixedSizeListArray::try_new_from_values(
+                            pq_code.as_ref().clone(),
+                            pq_index.pq.num_sub_vectors() as i32,
+                        )
+                        .unwrap(),
+                    );
+                    pq_array.push(fsl);
+                    row_id_array.push(pq_index.row_ids.as_ref().unwrap().clone());
+                }
             }
         }
 
@@ -116,20 +138,22 @@ pub(super) async fn write_index_partitions(
                 }
             };
 
-            let pq_codes = batch
-                .column_by_name(PQ_CODE_COLUMN)
-                .expect("pq code column not found")
-                .as_fixed_size_list()
-                .clone();
-
-            let row_ids: UInt64Array = batch
-                .column_by_name(ROW_ID)
-                .expect("row id column not found")
-                .as_primitive()
-                .clone();
-
-            pq_array.push(Arc::new(pq_codes));
-            row_id_array.push(Arc::new(row_ids));
+            let pq_codes = Arc::new(
+                batch
+                    .column_by_name(PQ_CODE_COLUMN)
+                    .expect("pq code column not found")
+                    .as_fixed_size_list()
+                    .clone(),
+            );
+            let row_ids: Arc<dyn Array> = Arc::new(
+                batch
+                    .column_by_name(ROW_ID)
+                    .expect("row id column not found")
+                    .as_primitive::<UInt64Type>()
+                    .clone(),
+            );
+            pq_array.push(pq_codes);
+            row_id_array.push(row_ids);
 
             match stream.peek().await {
                 Some(Ok(batch)) => {
