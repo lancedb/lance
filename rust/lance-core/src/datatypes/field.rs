@@ -45,6 +45,7 @@ use crate::{
 pub struct SchemaCompareOptions {
     pub compare_metadata: bool,
     pub compare_dictionary: bool,
+    pub compare_field_ids: bool,
 }
 
 /// Lance Schema Field
@@ -97,6 +98,12 @@ impl Field {
             differences.push(format!(
                 "expected name '{}' but name was '{}'",
                 expected_path, self_name
+            ));
+        }
+        if options.compare_field_ids && self.id != expected.id {
+            differences.push(format!(
+                "`{}` should have id {} but id was {}",
+                self_name, expected.id, self.id
             ));
         }
         if self.logical_type != expected.logical_type {
@@ -205,6 +212,7 @@ impl Field {
                 .iter()
                 .zip(&other.children)
                 .all(|(left, right)| left.compare_with_options(right, options))
+            && (!options.compare_field_ids || self.id == other.id)
             && (!options.compare_dictionary || self.dictionary == other.dictionary)
             && (!options.compare_metadata || self.metadata == other.metadata)
     }
@@ -1025,6 +1033,86 @@ mod tests {
     }
 
     #[test]
+    fn test_compare() {
+        let opts = SchemaCompareOptions::default();
+
+        let mut expected: Field = ArrowField::new(
+            "a",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        let keys = UInt32Array::from_iter_values(vec![0, 1]);
+        let values: ArrayRef = Arc::new(StringArray::from_iter_values(&[
+            "a".to_string(),
+            "b".to_string(),
+        ]));
+        let dictionary: ArrayRef = Arc::new(DictionaryArray::new(keys, values));
+        expected.set_dictionary(&dictionary);
+
+        let no_dictionary: Field = ArrowField::new(
+            "a",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )
+        .try_into()
+        .unwrap();
+
+        // By default, do not compare dictionary
+        assert_eq!(no_dictionary.compare_with_options(&expected, &opts), true);
+
+        let compare_dict = SchemaCompareOptions {
+            compare_dictionary: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            no_dictionary.compare_with_options(&expected, &compare_dict),
+            false
+        );
+
+        let metadata = HashMap::<_, _>::from_iter(vec![("foo".to_string(), "bar".to_string())]);
+        let expected: Field = ArrowField::new("a", DataType::UInt32, true)
+            .with_metadata(metadata)
+            .try_into()
+            .unwrap();
+
+        let no_metadata: Field = ArrowField::new("a", DataType::UInt32, true)
+            .try_into()
+            .unwrap();
+
+        // By default, do not compare metadata
+        assert_eq!(no_metadata.compare_with_options(&expected, &opts), true);
+
+        let compare_metadata = SchemaCompareOptions {
+            compare_metadata: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            no_metadata.compare_with_options(&expected, &compare_metadata),
+            false
+        );
+
+        let mut expected: Field = ArrowField::new("a", DataType::UInt32, true)
+            .try_into()
+            .unwrap();
+        let mut seed = 0;
+        expected.set_id(-1, &mut seed);
+
+        let no_id: Field = ArrowField::new("a", DataType::UInt32, true)
+            .try_into()
+            .unwrap();
+        // Do not compare ids by default
+        assert_eq!(no_id.compare_with_options(&expected, &opts), true);
+
+        let compare_ids = SchemaCompareOptions {
+            compare_field_ids: true,
+            ..Default::default()
+        };
+        assert_eq!(no_id.compare_with_options(&expected, &compare_ids), false);
+    }
+
+    #[test]
     fn test_explain_difference() {
         let expected: Field = ArrowField::new(
             "a",
@@ -1164,7 +1252,7 @@ mod tests {
             .try_into()
             .unwrap();
 
-        // By default, do not compare dictionary
+        // By default, do not compare metadata
         assert_eq!(no_metadata.explain_difference(&expected, &opts), None);
 
         let compare_metadata = SchemaCompareOptions {
@@ -1174,6 +1262,27 @@ mod tests {
         assert_eq!(
             no_metadata.explain_difference(&expected, &compare_metadata),
             Some("metadata for `a` did not match expected metadata".to_string())
+        );
+
+        let mut expected: Field = ArrowField::new("a", DataType::UInt32, true)
+            .try_into()
+            .unwrap();
+        let mut seed = 0;
+        expected.set_id(-1, &mut seed);
+
+        let no_id: Field = ArrowField::new("a", DataType::UInt32, true)
+            .try_into()
+            .unwrap();
+        // Do not compare ids by default
+        assert_eq!(no_id.explain_difference(&expected, &opts), None);
+
+        let compare_ids = SchemaCompareOptions {
+            compare_field_ids: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            no_id.explain_difference(&expected, &compare_ids),
+            Some("`a` should have id 0 but id was -1".to_string())
         );
     }
 }
