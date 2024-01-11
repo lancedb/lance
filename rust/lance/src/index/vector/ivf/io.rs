@@ -17,13 +17,12 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::UInt64Type;
-use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt32Array};
+use arrow_array::{
+    cast::AsArray, types::UInt64Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
+};
 use futures::{Stream, StreamExt};
 use lance_arrow::*;
-use lance_core::io::Writer;
-use lance_core::Error;
+use lance_core::{io::Writer, Error};
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use snafu::{location, Location};
 
@@ -191,4 +190,61 @@ pub(super) async fn write_index_partitions(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::default;
+
+    use super::*;
+
+    use crate::{
+        index::{vector::VectorIndexParams, DatasetIndexExt},
+        Dataset,
+    };
+    use arrow_array::{RecordBatch, RecordBatchIterator};
+    use arrow_schema::{Field, Schema};
+    use lance_index::IndexType;
+    use lance_linalg::distance::MetricType;
+    use lance_testing::datagen::generate_random_array;
+
+    #[tokio::test]
+    async fn test_merge_multiple_indices() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 1024;
+        let vector_values = generate_random_array(TOTAL * DIM);
+        let fsl = Arc::new(FixedSizeListArray::try_new_from_values(vector_values, DIM as i32).unwrap());
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            fsl.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![fsl.clone()]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), schema.clone());
+
+        let tmp_uri = tempfile::tempdir().unwrap();
+
+        let mut ds = Dataset::write(
+            batches,
+            tmp_uri.path().to_str().unwrap(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+        let idx_params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 50);
+        ds.create_index(&["vector"], IndexType::Vector, None, &idx_params, true)
+            .await
+            .unwrap();
+        let indices = ds.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+
+        let batches = RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), schema.clone());
+        ds.append(batches, None).await.unwrap();
+        let indices = ds.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+
+        //let indices = /ds.
+    }
 }

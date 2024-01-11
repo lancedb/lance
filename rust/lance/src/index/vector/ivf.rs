@@ -617,7 +617,7 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
 fn sanity_check_ivf_param(params: &IvfBuildParams) -> Result<()> {
     if params.precomputed_partitons_file.is_some() && params.centroids.is_none() {
         return Err(Error::Index {
-            message: "precomputed_partitons_file requires centroids to be set".to_string(),
+            message: "precomputed_partitions_file requires centroids to be set".to_string(),
             location: location!(),
         });
     }
@@ -725,7 +725,7 @@ pub async fn build_ivf_pq_index(
         train_ivf_model(training_data.as_ref().unwrap(), metric_type, ivf_params).await?
     };
     info!(
-        "Traied IVF model in {:02} seconds",
+        "Trained IVF model in {:02} seconds",
         start.elapsed().as_secs_f32()
     );
 
