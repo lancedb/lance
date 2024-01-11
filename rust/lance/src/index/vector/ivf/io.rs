@@ -194,12 +194,10 @@ pub(super) async fn write_index_partitions(
 
 #[cfg(test)]
 mod tests {
-    use std::default;
-
     use super::*;
 
     use crate::{
-        index::{vector::VectorIndexParams, DatasetIndexExt},
+        index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt},
         Dataset,
     };
     use arrow_array::{RecordBatch, RecordBatchIterator};
@@ -213,7 +211,8 @@ mod tests {
         const DIM: usize = 32;
         const TOTAL: usize = 1024;
         let vector_values = generate_random_array(TOTAL * DIM);
-        let fsl = Arc::new(FixedSizeListArray::try_new_from_values(vector_values, DIM as i32).unwrap());
+        let fsl =
+            Arc::new(FixedSizeListArray::try_new_from_values(vector_values, DIM as i32).unwrap());
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "vector",
@@ -221,7 +220,8 @@ mod tests {
             false,
         )]));
         let batch = RecordBatch::try_new(schema.clone(), vec![fsl.clone()]).unwrap();
-        let batches = RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), schema.clone());
+        let batches =
+            RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), schema.clone());
 
         let tmp_uri = tempfile::tempdir().unwrap();
 
@@ -239,11 +239,23 @@ mod tests {
             .unwrap();
         let indices = ds.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
+        assert_eq!(ds.get_fragments().len(), 1);
 
-        let batches = RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), schema.clone());
+        let batches =
+            RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), schema.clone());
         ds.append(batches, None).await.unwrap();
         let indices = ds.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
+        assert_eq!(ds.get_fragments().len(), 2);
+
+        let idx = ds
+            .open_vector_index(&indices[0].name, &indices[0].uuid.to_string())
+            .await
+            .unwrap();
+        let ivf_idx = idx
+            .as_any()
+            .downcast_ref::<IVFIndex>()
+            .expect("Invalid index type");
 
         //let indices = /ds.
     }
