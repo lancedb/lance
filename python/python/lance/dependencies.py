@@ -12,9 +12,13 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-# Originally from https://github.com/pola-rs/polars/blob/ea4389c31b0e87ddf20a85e4c3797b285966edb6/py-polars/polars/dependencies.py
+# The following code is originally from https://github.com/pola-rs/polars/blob/ea4389c31b0e87ddf20a85e4c3797b285966edb6/py-polars/polars/dependencies.py
+# and is licensed under the MIT license:
+#
 # License: MIT, Copyright (c) 2020 Ritchie Vink
 # https://github.com/pola-rs/polars/blob/main/LICENSE
+#
+# It has been modified by the Lance developers to fit the needs of the Lance project.
 
 from __future__ import annotations
 
