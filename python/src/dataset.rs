@@ -24,18 +24,16 @@ use async_trait::async_trait;
 use chrono::Duration;
 
 use futures::StreamExt;
-use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::UpdateBuilder;
 use lance::dataset::{
-    fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
-    scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
-    Dataset as LanceDataset, ReadParams, Version, WriteMode, WriteParams,
+    builder::DatasetBuilder, fragment::FileFragment as LanceFileFragment,
+    progress::WriteFragmentProgress, scanner::Scanner as LanceScanner,
+    transaction::Operation as LanceOperation, Dataset as LanceDataset, ReadParams, UpdateBuilder,
+    Version, WriteMode, WriteParams,
 };
-use lance::index::IndexParams;
 use lance::index::{
     scalar::ScalarIndexParams,
     vector::{diskann::DiskANNParams, VectorIndexParams},
-    DatasetIndexExt,
+    DatasetIndexExt, DatasetIndexInternalExt, IndexParams,
 };
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::{datatypes::Schema, format::Fragment, io::object_store::ObjectStoreParams};
