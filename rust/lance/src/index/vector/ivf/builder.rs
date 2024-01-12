@@ -64,13 +64,13 @@ pub(super) async fn build_partitions(
         column,
         pq.clone(),
         Some(part_range),
-        precomputed_partitons,
     )?;
 
     let stream = shuffle_dataset(
         data,
         column,
         ivf_model,
+        precomputed_partitons,
         ivf.num_partitions() as u32,
         pq.num_sub_vectors(),
         shuffle_partition_batches,
