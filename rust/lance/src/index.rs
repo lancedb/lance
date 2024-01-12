@@ -352,6 +352,13 @@ pub trait DatasetIndexInternalExt {
     /// Parameters
     /// ----------
     /// - *column*: the name of the column.
+    ///
+    /// Returns
+    /// -------
+    /// (fragment_bitmap, unindexed_fragments)
+    ///
+    /// fragment_bitmap: a bitmap of all the fragments that are indexed on the column.
+    /// unindexed_fragments: a vector of fragments that are not indexed on the column.
     async fn unindexed_fragments(&self, column: &str) -> Result<(RoaringBitmap, Vec<&Fragment>)>;
 
     /// Count the number of rows that are not indexed on the column.
