@@ -22,7 +22,6 @@ use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
-use crate::dataset::index::unindexed_fragments;
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::Dataset;
 use crate::index::vector::ivf::IVFIndex;
@@ -36,27 +35,20 @@ pub async fn append_index(
     dataset: Arc<Dataset>,
     old_index: &IndexMetadata,
 ) -> Result<Option<(Uuid, Option<RoaringBitmap>)>> {
-    let unindexed = unindexed_fragments(old_index, dataset.as_ref()).await?;
-    if unindexed.is_empty() {
-        return Ok(None);
-    };
-
-    let frag_bitmap = old_index.fragment_bitmap.as_ref().map(|bitmap| {
-        let mut bitmap = bitmap.clone();
-        bitmap.extend(unindexed.iter().map(|frag| frag.id as u32));
-        bitmap
-    });
-
     let column = dataset
         .schema()
         .field_by_id(old_index.fields[0])
         .ok_or(Error::Index {
-            message: format!(
-                "Append index: column {} does not exist",
-                old_index.fields[0]
-            ),
+            message: format!("column {} does not exist", old_index.fields[0]),
             location: location!(),
         })?;
+
+    let (mut frag_bitmap, unindexed) = dataset.unindexed_fragments(&column.name).await?;
+    if unindexed.is_empty() {
+        return Ok(None);
+    };
+
+    frag_bitmap.extend(unindexed.iter().map(|frag| frag.id as u32));
 
     let index = dataset
         .open_generic_index(&column.name, &old_index.uuid.to_string())
@@ -70,7 +62,7 @@ pub async fn append_index(
 
             let mut scanner = dataset.scan();
             scanner
-                .with_fragments(unindexed)
+                .with_fragments(unindexed.iter().cloned().cloned().collect())
                 .with_row_id()
                 .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
                     column.name.clone(),
@@ -85,13 +77,14 @@ pub async fn append_index(
 
             index.update(new_data_stream.into(), &new_store).await?;
 
-            Ok(Some((new_uuid, frag_bitmap)))
+            Ok(Some((new_uuid, Some(frag_bitmap))))
         }
         IndexType::Vector => {
             let mut scanner = dataset.scan();
-            scanner.with_fragments(unindexed);
-            scanner.with_row_id();
-            scanner.project(&[&column.name])?;
+            scanner
+                .with_fragments(unindexed.iter().cloned().cloned().collect())
+                .with_row_id()
+                .project(&[&column.name])?;
             let new_data_stream = scanner.try_into_stream().await?;
 
             let index = dataset
@@ -107,7 +100,7 @@ pub async fn append_index(
                 .append(dataset.as_ref(), new_data_stream, old_index, &column.name)
                 .await?;
 
-            Ok(Some((new_index, frag_bitmap)))
+            Ok(Some((new_index, Some(frag_bitmap))))
         }
     }
 }

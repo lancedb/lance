@@ -293,6 +293,7 @@ impl DatasetIndexExt for Dataset {
             if idx.dataset_version == self.manifest.version {
                 continue;
             }
+
             let Some((new_id, new_frag_ids)) = append_index(dataset.clone(), idx).await? else {
                 continue;
             };

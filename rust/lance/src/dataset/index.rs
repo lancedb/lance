@@ -16,12 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lance_core::{
-    format::{Fragment, Index},
-    Error, Result,
-};
+use lance_core::{format::Index, Result};
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
 
 use crate::index::remap_index;
 use crate::Dataset;
@@ -79,38 +75,5 @@ impl IndexRemapper for DatasetIndexRemapper {
             }
         }
         Ok(remapped)
-    }
-}
-
-/// Returns the fragment ids that are not indexed by this index.
-pub(crate) async fn unindexed_fragments(index: &Index, dataset: &Dataset) -> Result<Vec<Fragment>> {
-    if index.dataset_version == dataset.version().version {
-        return Ok(vec![]);
-    }
-    if let Some(bitmap) = index.fragment_bitmap.as_ref() {
-        Ok(dataset
-            .fragments()
-            .iter()
-            .filter(|f| !bitmap.contains(f.id as u32))
-            .cloned()
-            .collect::<Vec<_>>())
-    } else {
-        let ds = dataset.checkout_version(index.dataset_version).await?;
-        let max_fragment_id_idx = ds.manifest.max_fragment_id().ok_or_else(|| Error::IO {
-            message: "No fragments in index version".to_string(),
-            location: location!(),
-        })?;
-        let max_fragment_id_ds = dataset
-            .manifest
-            .max_fragment_id()
-            .ok_or_else(|| Error::IO {
-                message: "No fragments in dataset version".to_string(),
-                location: location!(),
-            })?;
-        if max_fragment_id_idx < max_fragment_id_ds {
-            dataset.manifest.fragments_since(&ds.manifest)
-        } else {
-            Ok(vec![])
-        }
     }
 }
