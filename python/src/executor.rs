@@ -84,6 +84,11 @@ impl BackgroundExecutor {
                     return Err(err);
                 }
             }
+
+            if handle.is_finished() {
+                return Err(PyRuntimeError::new_err("task is gone."));
+            }
+
             // Wait for 100ms before checking signals again
             match rx.recv_timeout(SIGNAL_CHECK_INTERVAL) {
                 Ok(output) => return Ok(output),
