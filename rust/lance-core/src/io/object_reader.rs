@@ -19,9 +19,10 @@ use async_trait::async_trait;
 
 use bytes::Bytes;
 use object_store::{path::Path, ObjectStore};
+use snafu::{location, Location};
 
 use super::Reader;
-use crate::error::Result;
+use crate::error::{Result, Error};
 
 /// Object Reader
 ///
@@ -68,9 +69,17 @@ impl Reader for CloudObjectReader {
         // of the response body. Thus we add an outer retry loop here.
         let mut retries = 3;
         loop {
-            match self.object_store.get_range(&self.path, range.clone()).await {
-                Ok(bytes) => return Ok(bytes),
-                Err(err) => {
+            let task = self.object_store.get_range(&self.path, range.clone());
+            let res = tokio::time::timeout(std::time::Duration::from_secs(10), task).await;
+            match res {
+                Ok(Ok(bytes)) => return Ok(bytes),
+                Err(_) => {
+                    if retries == 0 {
+                        return Err(Error::IO { message: "timeout".to_string(), location: location!() });
+                    }
+                    retries -= 1;
+                }
+                Ok(Err(err)) => {
                     if retries == 0 {
                         return Err(err.into());
                     }
