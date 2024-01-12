@@ -44,7 +44,7 @@ use crate::Result;
 /// These existing partitions must have the same centroids and PQ codebook.
 ///
 /// TODO: migrate this function to `lance-index` crate.
-pub(super) async fn write_index_partitions(
+pub(crate) async fn write_index_partitions(
     writer: &mut dyn Writer,
     ivf: &mut Ivf,
     streams: Vec<impl Stream<Item = Result<RecordBatch>>>,

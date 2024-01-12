@@ -29,7 +29,7 @@ use lance_index::{optimize::OptimizeOptions, pb::index::Implementation};
 use lance_index::{pb, Index, IndexType, INDEX_FILE_NAME};
 use log::warn;
 use snafu::{location, Location};
-use tracing::{field, instrument};
+use tracing::instrument;
 use uuid::Uuid;
 
 pub(crate) mod append;
@@ -314,7 +314,7 @@ impl DatasetIndexExt for Dataset {
         let mut removed_indices = vec![];
 
         for (&field_id, indices) in column_to_indices_map.iter() {
-            let field = self
+            let _ = self
                 .schema()
                 .field_by_id(field_id)
                 .ok_or_else(|| Error::Index {
@@ -325,7 +325,7 @@ impl DatasetIndexExt for Dataset {
                 })?;
 
             let Some((new_id, removed, new_frag_ids)) =
-                append_index(dataset.clone(), &indices, options).await?
+                append_index(dataset.clone(), &indices, &options).await?
             else {
                 continue;
             };
@@ -337,7 +337,7 @@ impl DatasetIndexExt for Dataset {
                 name: last_idx.name.clone(),
                 fields: last_idx.fields.clone(),
                 dataset_version: self.manifest.version,
-                fragment_bitmap: new_frag_ids,
+                fragment_bitmap: Some(new_frag_ids),
             };
             removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
             new_indices.push(new_idx);
