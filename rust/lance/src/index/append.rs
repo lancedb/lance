@@ -185,7 +185,6 @@ mod tests {
 
         dataset.optimize_indices().await.unwrap();
         let index = &dataset.load_indices().await.unwrap()[0];
-        let dataset = Dataset::open(test_uri).await.unwrap();
         let (_, unindexed) = dataset.unindexed_fragments("vector").await.unwrap();
         assert!(
             unindexed.is_empty(),
