@@ -442,7 +442,10 @@ impl DatasetIndexInternalExt for Dataset {
         })
     }
 
-    async fn unindexed_fragments(&self, column: &str) -> Result<(RoaringBitmap, Vec<&Fragment>)> {
+    async fn unindexed_fragments<'a>(
+        &'a self,
+        column: &str,
+    ) -> Result<(RoaringBitmap, Vec<&'a Fragment>)> {
         let field_id = self.schema().field_id(column)?;
         let indices = self.load_indices().await?;
 
@@ -468,7 +471,12 @@ impl DatasetIndexInternalExt for Dataset {
             }
         }
 
-        todo!()
+        let unindexed = self
+            .fragments()
+            .iter()
+            .filter(|f| !bitmap.contains(f.id as u32))
+            .collect::<Vec<_>>();
+        Ok((bitmap, unindexed))
     }
 }
 
