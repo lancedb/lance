@@ -48,7 +48,6 @@ use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
-use crate::dataset::index::unindexed_fragments;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index};
 use crate::index::DatasetIndexInternalExt;
@@ -882,7 +881,7 @@ impl Scanner {
                 knn_node_with_vector
             }; // vector, _distance, _rowid
 
-            knn_node = self.knn_combined(&q, index, knn_node, filter_plan).await?;
+            knn_node = self.knn_combined(&q, knn_node, filter_plan).await?;
 
             Ok(knn_node)
         } else {
@@ -912,12 +911,11 @@ impl Scanner {
     async fn knn_combined(
         &self,
         q: &&Query,
-        index: &Index,
         knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Check if we've created new versions since the index
-        let unindexed_fragments = unindexed_fragments(index, self.dataset.as_ref()).await?;
+        let (_, unindexed_fragments) = self.dataset.unindexed_fragments(&q.column).await?;
         if !unindexed_fragments.is_empty() {
             let mut columns = vec![q.column.clone()];
             let mut num_filter_columns = 0;
@@ -934,7 +932,7 @@ impl Scanner {
                 true,
                 true,
                 vector_scan_projection,
-                Arc::new(unindexed_fragments),
+                Arc::new(unindexed_fragments.iter().cloned().cloned().collect()),
                 // We are re-ordering anyways, so no need to get data in data
                 // in a deterministic order.
                 false,

@@ -69,7 +69,6 @@ use self::fragment::FileFragment;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::{reader_to_stream, write_fragments_internal};
-use crate::dataset::index::unindexed_fragments;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{Fragment, Index, Manifest};
@@ -1411,36 +1410,6 @@ impl Dataset {
             Ok(Some(index_statistics))
         } else {
             Ok(None)
-        }
-    }
-
-    pub async fn count_unindexed_rows(&self, index_uuid: &str) -> Result<Option<usize>> {
-        let index = self.load_index(index_uuid).await;
-
-        if let Some(index) = index {
-            let unindexed_frags = unindexed_fragments(&index, self).await?;
-            let unindexed_rows = unindexed_frags
-                .iter()
-                .map(Fragment::num_rows)
-                // sum the number of rows in each fragment if no fragment returned None from row_count
-                .try_fold(0, |a, b| b.map(|b| a + b).ok_or(()));
-
-            Ok(unindexed_rows.ok())
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub async fn count_indexed_rows(&self, index_uuid: &str) -> Result<Option<usize>> {
-        let count_rows = self.count_rows();
-        let count_unindexed_rows = self.count_unindexed_rows(index_uuid);
-
-        let (count_rows, count_unindexed_rows) =
-            futures::try_join!(count_rows, count_unindexed_rows)?;
-
-        match count_unindexed_rows {
-            Some(count_unindexed_rows) => Ok(Some(count_rows - count_unindexed_rows)),
-            None => Ok(None),
         }
     }
 
@@ -3428,87 +3397,6 @@ mod tests {
                 &Field::new(DIST_COL, DataType::Float32, true)
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_count_index_rows() {
-        let test_dir = tempdir().unwrap();
-        let dimensions = 16;
-        let column_name = "vec";
-        let field = Field::new(
-            column_name,
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                dimensions,
-            ),
-            false,
-        );
-        let schema = Arc::new(ArrowSchema::new(vec![field]));
-
-        let float_arr = generate_random_array(512 * dimensions as usize);
-
-        let vectors =
-            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
-
-        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
-
-        let reader =
-            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
-
-        let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
-        dataset.validate().await.unwrap();
-
-        // Make sure it returns None if there's no index with the passed identifier
-        assert_eq!(dataset.count_unindexed_rows("bad_id").await.unwrap(), None);
-        assert_eq!(dataset.count_indexed_rows("bad_id").await.unwrap(), None);
-
-        // Create an index
-        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 10);
-        dataset
-            .create_index(
-                &[column_name],
-                IndexType::Vector,
-                Some("vec_idx".into()),
-                &params,
-                true,
-            )
-            .await
-            .unwrap();
-
-        let index = dataset.load_index_by_name("vec_idx").await.unwrap();
-        let index_uuid = &index.uuid.to_string();
-
-        // Make sure there are no unindexed rows
-        assert_eq!(
-            dataset.count_unindexed_rows(index_uuid).await.unwrap(),
-            Some(0)
-        );
-        assert_eq!(
-            dataset.count_indexed_rows(index_uuid).await.unwrap(),
-            Some(512)
-        );
-
-        // Now we'll append some rows which shouldn't be indexed and see the
-        // count change
-        let float_arr = generate_random_array(512 * dimensions as usize);
-        let vectors =
-            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
-
-        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
-
-        let reader = RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema);
-        dataset.append(reader, None).await.unwrap();
-
-        // Make sure the new rows are not indexed
-        assert_eq!(
-            dataset.count_unindexed_rows(index_uuid).await.unwrap(),
-            Some(512)
-        );
-        assert_eq!(
-            dataset.count_indexed_rows(index_uuid).await.unwrap(),
-            Some(512)
-        );
     }
 
     #[tokio::test]

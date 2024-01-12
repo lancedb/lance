@@ -337,7 +337,7 @@ impl DatasetIndexExt for Dataset {
 
 /// A trait for internal dataset utilities
 #[async_trait]
-pub(crate) trait DatasetIndexInternalExt {
+pub trait DatasetIndexInternalExt {
     /// Opens an index (scalar or vector) as a generic index
     async fn open_generic_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn Index>>;
     /// Opens the requested scalar index
@@ -353,6 +353,19 @@ pub(crate) trait DatasetIndexInternalExt {
     /// ----------
     /// - *column*: the name of the column.
     async fn unindexed_fragments(&self, column: &str) -> Result<(RoaringBitmap, Vec<&Fragment>)>;
+
+    /// Count the number of rows that are not indexed on the column.
+    async fn count_unindexed_rows(&self, column: &str) -> Result<usize> {
+        let (_, unindexed_fragments) = self.unindexed_fragments(column).await?;
+
+        Ok(unindexed_fragments
+            .iter()
+            .map(|f| f.num_rows().unwrap_or_default())
+            .sum())
+    }
+
+    /// Count the number of rows in the dataset that are covered by the index.
+    async fn count_indexed_rows(&self, column: &str) -> Result<usize>;
 }
 
 #[async_trait]
@@ -478,6 +491,13 @@ impl DatasetIndexInternalExt for Dataset {
             .collect::<Vec<_>>();
         Ok((bitmap, unindexed))
     }
+
+    async fn count_indexed_rows(&self, column: &str) -> Result<usize> {
+        let total = self.count_rows().await?;
+        let unindexed = self.count_unindexed_rows(column).await?;
+
+        Ok(total - unindexed)
+    }
 }
 
 #[cfg(test)]
@@ -548,5 +568,74 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_count_index_rows() {
+        let test_dir = tempdir().unwrap();
+        let dimensions = 16;
+        let column_name = "vec";
+        let field = Field::new(
+            column_name,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimensions,
+            ),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+
+        let float_arr = generate_random_array(512 * dimensions as usize);
+
+        let vectors =
+            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+
+        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+
+        let reader =
+            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Make sure it returns None if there's no index with the passed identifier
+        assert_eq!(dataset.count_unindexed_rows("bad_id").await.unwrap(), 0);
+        assert_eq!(dataset.count_indexed_rows("bad_id").await.unwrap(), 512);
+
+        // Create an index
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 10);
+        dataset
+            .create_index(
+                &[column_name],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let index = dataset.load_index_by_name("vec_idx").await.unwrap();
+        let index_uuid = &index.uuid.to_string();
+
+        // Make sure there are no unindexed rows
+        assert_eq!(dataset.count_unindexed_rows(index_uuid).await.unwrap(), 0);
+        assert_eq!(dataset.count_indexed_rows(index_uuid).await.unwrap(), 512);
+
+        // Now we'll append some rows which shouldn't be indexed and see the
+        // count change
+        let float_arr = generate_random_array(512 * dimensions as usize);
+        let vectors =
+            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+
+        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+
+        let reader = RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema);
+        dataset.append(reader, None).await.unwrap();
+
+        // Make sure the new rows are not indexed
+        assert_eq!(dataset.count_unindexed_rows(index_uuid).await.unwrap(), 512);
+        assert_eq!(dataset.count_indexed_rows(index_uuid).await.unwrap(), 512);
     }
 }
