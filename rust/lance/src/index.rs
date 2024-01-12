@@ -467,7 +467,10 @@ impl DatasetIndexInternalExt for Dataset {
         &'a self,
         column: &str,
     ) -> Result<(RoaringBitmap, Vec<&'a Fragment>)> {
-        let field_id = self.schema().field_id(column)?;
+        let field = self.schema().field(column).ok_or(Error::Index {
+            message: format!("column {} does not exist", column),
+            location: location!(),
+        })?;
         let indices = self.load_indices().await?;
 
         let mut bitmap = RoaringBitmap::new();
@@ -479,7 +482,7 @@ impl DatasetIndexInternalExt for Dataset {
                 });
             }
 
-            if idx.fields[0] == field_id {
+            if idx.fields[0] == field.id {
                 if let Some(frag_bitmap) = idx.fragment_bitmap.as_ref() {
                     bitmap.extend(frag_bitmap.iter());
                 } else {
@@ -491,7 +494,6 @@ impl DatasetIndexInternalExt for Dataset {
                 }
             }
         }
-
         let unindexed = self
             .fragments()
             .iter()
@@ -608,8 +610,8 @@ mod tests {
         dataset.validate().await.unwrap();
 
         // Make sure it returns None if there's no index with the passed identifier
-        assert_eq!(dataset.count_unindexed_rows("bad_id").await.unwrap(), 0);
-        assert_eq!(dataset.count_indexed_rows("bad_id").await.unwrap(), 512);
+        assert!(dataset.count_unindexed_rows("bad_id").await.is_err());
+        assert!(dataset.count_indexed_rows("bad_id").await.is_err());
 
         // Create an index
         let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 10);
@@ -624,12 +626,9 @@ mod tests {
             .await
             .unwrap();
 
-        let index = dataset.load_index_by_name("vec_idx").await.unwrap();
-        let index_uuid = &index.uuid.to_string();
-
         // Make sure there are no unindexed rows
-        assert_eq!(dataset.count_unindexed_rows(index_uuid).await.unwrap(), 0);
-        assert_eq!(dataset.count_indexed_rows(index_uuid).await.unwrap(), 512);
+        assert_eq!(dataset.count_unindexed_rows(column_name).await.unwrap(), 0);
+        assert_eq!(dataset.count_indexed_rows(column_name).await.unwrap(), 512);
 
         // Now we'll append some rows which shouldn't be indexed and see the
         // count change
@@ -643,7 +642,10 @@ mod tests {
         dataset.append(reader, None).await.unwrap();
 
         // Make sure the new rows are not indexed
-        assert_eq!(dataset.count_unindexed_rows(index_uuid).await.unwrap(), 512);
-        assert_eq!(dataset.count_indexed_rows(index_uuid).await.unwrap(), 512);
+        assert_eq!(
+            dataset.count_unindexed_rows(column_name).await.unwrap(),
+            512
+        );
+        assert_eq!(dataset.count_indexed_rows(column_name).await.unwrap(), 512);
     }
 }

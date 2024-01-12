@@ -168,11 +168,8 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         dataset.append(batches, None).await.unwrap();
 
-        let index = &dataset.load_indices().await.unwrap()[0];
-        assert!(!unindexed_fragments(index, &dataset)
-            .await
-            .unwrap()
-            .is_empty());
+        let (_, unindexed) = dataset.unindexed_fragments("vector").await.unwrap();
+        assert!(!unindexed.is_empty());
 
         let q = array.value(5);
         let mut scanner = dataset.scan();
@@ -188,10 +185,12 @@ mod tests {
 
         dataset.optimize_indices().await.unwrap();
         let index = &dataset.load_indices().await.unwrap()[0];
-        assert!(unindexed_fragments(index, &dataset)
-            .await
-            .unwrap()
-            .is_empty());
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let (_, unindexed) = dataset.unindexed_fragments("vector").await.unwrap();
+        assert!(
+            unindexed.is_empty(),
+            "no unindexed fragments after optimize"
+        );
 
         // There should be two indices directories existed.
         let object_store = dataset.object_store();
