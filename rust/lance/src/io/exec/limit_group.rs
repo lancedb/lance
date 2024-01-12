@@ -205,7 +205,7 @@ impl ExecutionPlan for LimitGroupExec {
         let column_indices = self
             .group_columns
             .iter()
-            .map(|group_column| schema.index_of(&group_column))
+            .map(|group_column| schema.index_of(group_column))
             .collect::<arrow::error::Result<Vec<_>>>()?;
         Ok(Box::pin(LimitGroupStream {
             input,
