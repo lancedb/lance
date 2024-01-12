@@ -357,6 +357,18 @@ def test_to_batches(tmp_path: Path):
     assert sorted_batches == table
 
 
+def test_list_from_parquet(tmp_path: Path):
+    # This is a regression for GH-1482, the parquet reader creates
+    # list fields with the name 'element' instead of 'item'.  We should
+    # ignore that
+    tab = pa.Table.from_pydict(
+        {"x": pa.array([[1, 2], [3, 4]], pa.list_(pa.float32(), 2))}
+    )
+    pq.write_table(tab, tmp_path / "foo.parquet")
+    tab = pq.read_table(tmp_path / "foo.parquet")
+    lance.write_dataset(tab, tmp_path / "foo.lance")
+
+
 def test_pickle(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

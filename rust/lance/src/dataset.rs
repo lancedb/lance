@@ -30,6 +30,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt, Stream};
+use lance_core::datatypes::SchemaCompareOptions;
 use lance_core::io::{
     commit::CommitError,
     object_store::{ObjectStore, ObjectStoreParams},
@@ -402,12 +403,13 @@ impl Dataset {
         if matches!(params.mode, WriteMode::Append) {
             if let Some(d) = dataset.as_ref() {
                 let m = d.manifest.as_ref();
-                if schema != m.schema {
-                    return Err(Error::SchemaMismatch {
-                        // original: m.schema.clone(),
-                        // new: schema,
-                    });
-                }
+                schema.check_compatible(
+                    &m.schema,
+                    &SchemaCompareOptions {
+                        compare_dictionary: true,
+                        ..Default::default()
+                    },
+                )?;
             }
         }
 
@@ -498,12 +500,13 @@ impl Dataset {
         let (stream, schema) = reader_to_stream(batches)?;
 
         // Return Error if append and input schema differ
-        if self.manifest.schema != schema {
-            return Err(Error::SchemaMismatch {
-                // original: self.manifest.schema.clone(),
-                // new: schema,
-            });
-        }
+        self.manifest.schema.check_compatible(
+            &schema,
+            &SchemaCompareOptions {
+                compare_dictionary: true,
+                ..Default::default()
+            },
+        )?;
 
         let fragments = write_fragments_internal(
             object_store.clone(),
