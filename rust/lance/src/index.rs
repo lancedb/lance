@@ -21,12 +21,14 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use lance_core::format::Fragment;
 use lance_core::io::{read_message, read_message_from_buf, read_metadata_offset, Reader};
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
 use lance_index::{pb, Index, IndexType, INDEX_FILE_NAME};
+use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
@@ -344,6 +346,13 @@ pub(crate) trait DatasetIndexInternalExt {
     async fn open_vector_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn VectorIndex>>;
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
+
+    /// Return the fragments that are not in the indices on the column.
+    ///
+    /// Parameters
+    /// ----------
+    /// - *column*: the name of the column.
+    async fn unindexed_fragments(&self, column: &str) -> Result<(RoaringBitmap, Vec<&Fragment>)>;
 }
 
 #[async_trait]
@@ -431,6 +440,35 @@ impl DatasetIndexInternalExt for Dataset {
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,
         })
+    }
+
+    async fn unindexed_fragments(&self, column: &str) -> Result<(RoaringBitmap, Vec<&Fragment>)> {
+        let field_id = self.schema().field_id(column)?;
+        let indices = self.load_indices().await?;
+
+        let mut bitmap = RoaringBitmap::new();
+        for idx in indices.iter() {
+            if idx.fields.len() != 1 {
+                return Err(Error::Index {
+                    message: format!("index should only cover 1 column: {:?}", idx.fields),
+                    location: location!(),
+                });
+            }
+
+            if idx.fields[0] == field_id {
+                if let Some(frag_bitmap) = idx.fragment_bitmap.as_ref() {
+                    bitmap.extend(frag_bitmap.iter());
+                } else {
+                    return Err(Error::Index {
+                        message: "Index lacks fragment bitmap, please upgrade pylance to 0.8+"
+                            .to_string(),
+                        location: location!(),
+                    });
+                }
+            }
+        }
+
+        todo!()
     }
 }
 
