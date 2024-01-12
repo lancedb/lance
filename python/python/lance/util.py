@@ -176,3 +176,54 @@ class KMeans:
         """Predict the cluster for each vector in the data."""
         arr = self._to_fixed_size_list(data)
         return self._kmeans.predict(arr)
+
+
+def sanity_check_vector_index(
+    dataset,
+    column: str,
+    refine_factor: int = 5,
+    sample_size: Optional[int] = None,
+    pass_threshold: float = 1.0,
+):
+    """Run in-sample queries and make sure that the recall
+    for k=1 is very high (should be near 100%)
+    Parameters
+    ----------
+    dataset: LanceDataset
+        The dataset to sanity check.
+    column: str
+        The column name of the vector column.
+    refine_factor: int, default=5
+        The refine factor to use for the nearest neighbor query.
+    sample_size: int, optional
+        The number of vectors to sample from the dataset.
+        If None, the entire dataset will be used.
+    pass_threshold: float, default=1.0
+        The minimum fraction of vectors that must pass the sanity check.
+        If less than this fraction of vectors pass, a ValueError will be raised.
+    """
+
+    data = dataset.to_table() if sample_size is None else dataset.sample(sample_size)
+    vecs = data[column].to_numpy(zero_copy_only=False)
+    passes = 0
+    total = len(vecs)
+
+    for vec in vecs:
+        if np.isnan(vec).any():
+            total -= 1
+            continue
+        distance = dataset.to_table(
+            nearest={
+                "column": column,
+                "q": vec,
+                "k": 1,
+                "nprobes": 1,
+                "refine_factor": refine_factor,
+            }
+        )["_distance"].to_pylist()[0]
+        passes += 1 if abs(distance) < 1e-6 else 0
+
+    if passes / total < pass_threshold:
+        raise ValueError(
+            f"Vector index failed sanity check, only {passes}/{total} passed"
+        )
