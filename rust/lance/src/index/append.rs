@@ -20,8 +20,10 @@ use lance_core::{
     io::{object_store::ObjectStore, RecordBatchStream},
     Error, Result,
 };
-use lance_index::{optimize::OptimizeOptions, IndexType, INDEX_FILE_NAME};
-use lance_index::{scalar::lance_format::LanceIndexStore, Index};
+use lance_index::{
+    optimize::OptimizeOptions, vector::ivf::shuffler::shuffle_dataset, IndexType, INDEX_FILE_NAME,
+};
+use lance_index::{pb, scalar::lance_format::LanceIndexStore, Index};
 use log::info;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
@@ -38,6 +40,7 @@ async fn optimize_vector_indices(
     object_store: &ObjectStore,
     index_dir: &Path,
     unindexed: impl RecordBatchStream + Unpin + 'static,
+    vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
     options: OptimizeOptions,
 ) -> Result<Uuid> {
@@ -65,18 +68,18 @@ async fn optimize_vector_indices(
     let ivf = lance_index::vector::ivf::new_ivf_with_pq(
         first_idx.ivf.centroids.values(),
         first_idx.ivf.dimension(),
-        first_idx.metric_type,
-        column,
+        first_idx.ivf.metric_type(),
+        vector_column,
         pq_index.pq.clone(),
         None,
         None,
     )?;
 
     let shuffled = shuffle_dataset(
-        data,
-        column,
+        unindexed,
+        vector_column,
         ivf,
-        self.ivf.num_partitions() as u32,
+        ivf.num_partitions() as u32,
         pq_index.pq.num_sub_vectors(),
         10000,
         2,

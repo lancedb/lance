@@ -36,13 +36,15 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::datatypes::Schema;
 use lance_core::io::{FileReader, FileWriter, ReadBatchParams, RecordBatchStream};
 
-use crate::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_core::io::object_store::ObjectStore;
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use log::info;
 use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::TempDir;
+
+use super::Ivf;
+use crate::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 
 const UNSORTED_BUFFER: &str = "unsorted.lance";
 
@@ -76,7 +78,7 @@ fn get_temp_dir() -> Result<Path> {
 pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
-    ivf: Arc<dyn crate::vector::ivf::Ivf>,
+    ivf: Arc<dyn Ivf>,
     precomputed_partitions: Option<HashMap<u64, u32>>,
     num_partitions: u32,
     num_sub_vectors: usize,
