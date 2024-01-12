@@ -417,7 +417,7 @@ pub(crate) struct Ivf {
     ///
     /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
     /// memory allocator.
-    centroids: Arc<FixedSizeListArray>,
+    pub(crate) centroids: Arc<FixedSizeListArray>,
 
     /// Offset of each partition in the file.
     offsets: Vec<usize>,
