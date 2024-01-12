@@ -81,7 +81,7 @@ pub struct IVFIndex {
     uuid: String,
 
     /// Ivf model
-    ivf: Ivf,
+    pub(crate) ivf: Ivf,
 
     reader: Arc<dyn Reader>,
 

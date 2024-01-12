@@ -15,20 +15,94 @@
 use std::sync::Arc;
 
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::{format::Index as IndexMetadata, Error, Result};
-use lance_index::optimize::OptimizeOptions;
-use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::IndexType;
+use lance_core::{
+    format::Index as IndexMetadata,
+    io::{object_store::ObjectStore, RecordBatchStream},
+    Error, Result,
+};
+use lance_index::{optimize::OptimizeOptions, IndexType, INDEX_FILE_NAME};
+use lance_index::{scalar::lance_format::LanceIndexStore, Index};
 use log::info;
+use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
+use super::DatasetIndexInternalExt;
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::Dataset;
 use crate::index::vector::ivf::IVFIndex;
 
-use super::DatasetIndexInternalExt;
+// TODO: move to `lance-index` crate.
+async fn optimize_vector_indices(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+    unindexed: impl RecordBatchStream + Unpin + 'static,
+    existing_indices: &[Arc<dyn Index>],
+    options: OptimizeOptions,
+) -> Result<Uuid> {
+    // Senity check the indices
+    if existing_indices.is_empty() {
+        return Err(Error::Index {
+            message: "optimizing vector index: no existing index found".to_string(),
+            location: location!(),
+        });
+    }
+
+    let new_uuid = Uuid::new_v4();
+    let index_file = index_dir.child(new_uuid.to_string()).child(INDEX_FILE_NAME);
+    let mut writer = object_store.create(&index_file).await?;
+
+    let first_idx = existing_indices[0]
+        .as_any()
+        .downcast_ref::<IVFIndex>()
+        .ok_or(Error::Index {
+            message: "optimizing vector index: first index is not IVF".to_string(),
+            location: location!(),
+        })?;
+
+    // TODO: merge two IVF implementations.
+    let ivf = lance_index::vector::ivf::new_ivf_with_pq(
+        first_idx.ivf.centroids.values(),
+        first_idx.ivf.dimension(),
+        first_idx.metric_type,
+        column,
+        pq_index.pq.clone(),
+        None,
+        None,
+    )?;
+
+    let shuffled = shuffle_dataset(
+        data,
+        column,
+        ivf,
+        self.ivf.num_partitions() as u32,
+        pq_index.pq.num_sub_vectors(),
+        10000,
+        2,
+    )
+    .await?;
+
+    let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
+    write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(&[self])).await?;
+    let metadata = IvfPQIndexMetadata {
+        name: metadata.name.clone(),
+        column: column.to_string(),
+        dimension: self.ivf.dimension() as u32,
+        dataset_version: dataset.version().version,
+        metric_type: self.metric_type,
+        ivf: ivf_mut,
+        pq: pq_index.pq.clone(),
+        transforms: vec![],
+    };
+
+    let metadata = pb::Index::try_from(&metadata)?;
+    let pos = writer.write_protobuf(&metadata).await?;
+    writer.write_magics(pos).await?;
+    writer.shutdown().await?;
+
+    Ok(new_uuid)
+}
 
 /// Append new data to the index, without re-train.
 ///
@@ -67,12 +141,12 @@ pub async fn append_index<'a>(
             location: location!(),
         })?;
 
+    // Open all indices.
     let indices = stream::iter(old_indices.iter())
         .map(|idx| async move {
-            let index = dataset
+            dataset
                 .open_generic_index(&column.name, &idx.uuid.to_string())
-                .await?;
-            Ok::<_, Error>(index)
+                .await
         })
         .buffered(4)
         .try_collect::<Vec<_>>()
@@ -91,6 +165,21 @@ pub async fn append_index<'a>(
 
     match indices[0].index_type() {
         IndexType::Scalar => {
+            if indices.len() > 1 {
+                return Err(Error::Index {
+                    message: "Append index: scalar index does not support more than one index yet"
+                        .to_string(),
+                    location: location!(),
+                });
+            }
+            if options.num_indices_to_merge != 1 {
+                return Err(Error::Index {
+                    message: "Append index: scalar index does not support merge".to_string(),
+                    location: location!(),
+                });
+            }
+
+            let old_index = &old_indices[0];
             let index = dataset
                 .open_scalar_index(&column.name, &old_index.uuid.to_string())
                 .await?;
@@ -112,7 +201,7 @@ pub async fn append_index<'a>(
 
             index.update(new_data_stream.into(), &new_store).await?;
 
-            Ok(Some((new_uuid, frag_bitmap)))
+            Ok(Some((new_uuid, vec![old_index], frag_bitmap)))
         }
         IndexType::Vector => {
             let mut scanner = dataset.scan();

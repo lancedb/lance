@@ -41,9 +41,10 @@ roaring.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 snafu.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tempfile.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
