@@ -209,13 +209,13 @@ impl IVFIndex {
             column,
             pq_index.pq.clone(),
             None,
-            None,
         )?;
 
         let shuffled = shuffle_dataset(
             data,
             column,
             ivf,
+            None,
             self.ivf.num_partitions() as u32,
             pq_index.pq.num_sub_vectors(),
             10000,
@@ -523,7 +523,6 @@ impl Ivf {
             metric_type,
             vec![],
             None,
-            None,
         )?;
         internal.find_partitions(query, nprobes)
     }
@@ -772,7 +771,6 @@ pub async fn build_ivf_pq_index(
             ivf_model.dimension(),
             metric_type,
             vec![],
-            None,
             None,
         )?;
 

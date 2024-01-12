@@ -22,8 +22,10 @@
 //! 1. while groupby column will stay the same, we may want to include extra data columns in the future
 //! 2. shuffling into memory is fast but we should add disk buffer to support bigger datasets
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_array::types::UInt64Type;
 use arrow_array::{
     cast::AsArray, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array, UInt8Array,
 };
@@ -70,25 +72,52 @@ fn get_temp_dir() -> Result<Path> {
 ///   of shuffled partitioned data. Each stream corresponds to a partition and
 ///   is sorted within the stream. Consumer of these streams is expected to merge
 ///   the streams into a single stream by k-list mergo algo.
-///
+#[allow(clippy::too_many_arguments)]
 pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
     ivf: Arc<dyn crate::vector::ivf::Ivf>,
+    precomputed_partitions: Option<HashMap<u64, u32>>,
     num_partitions: u32,
     num_sub_vectors: usize,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
 ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
     let column: Arc<str> = column.into();
+    let precomputed_partitions = precomputed_partitions.map(Arc::new);
     let stream = data
         .zip(repeat_with(move || ivf.clone()))
         .map(move |(b, ivf)| {
             let col_ref = column.clone();
 
+            // If precomputed_partitions map is provided, use it
+            // for fast partitions.
+            let partition_map = precomputed_partitions
+                .as_ref()
+                .cloned()
+                .unwrap_or(Arc::new(HashMap::new()));
+
             tokio::task::spawn(async move {
                 let batch = b?;
-                ivf.partition_transform(&batch, col_ref.as_ref()).await
+
+                let part_ids = if !partition_map.is_empty() {
+                    let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
+                        message: "column does not exist".to_string(),
+                        location: location!(),
+                    })?;
+                    let part_ids = row_ids
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .iter()
+                        .filter_map(|row_id| partition_map.get(row_id).copied())
+                        .collect::<Vec<_>>();
+                    Some(UInt32Array::from(part_ids))
+                } else {
+                    None
+                };
+
+                ivf.partition_transform(&batch, col_ref.as_ref(), part_ids)
+                    .await
             })
         })
         .buffer_unordered(num_cpus::get())
