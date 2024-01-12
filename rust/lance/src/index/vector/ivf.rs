@@ -39,9 +39,7 @@ use lance_core::io::{
     local::to_local_path, object_store::ObjectStore, ObjectWriter, Reader, RecordBatchStream,
     WriteExt, Writer,
 };
-use lance_core::{
-    datatypes::Field, encodings::plain::PlainEncoder, format::Index as IndexMetadata, Error, Result,
-};
+use lance_core::{datatypes::Field, encodings::plain::PlainEncoder, Error, Result};
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
@@ -84,7 +82,7 @@ pub struct IVFIndex {
     uuid: String,
 
     /// Ivf model
-    pub ivf: Ivf,
+    ivf: Ivf,
 
     reader: Arc<dyn Reader>,
 
@@ -178,72 +176,6 @@ impl IVFIndex {
         };
         let batch = part_index.search(&query, pre_filter).await?;
         Ok(batch)
-    }
-
-    pub(crate) async fn append(
-        &self,
-        dataset: &Dataset,
-        data: impl RecordBatchStream + Unpin + 'static,
-        metadata: &IndexMetadata,
-        column: &str,
-    ) -> Result<Uuid> {
-        let new_uuid = Uuid::new_v4();
-        let object_store = dataset.object_store();
-        let index_file = dataset
-            .indices_dir()
-            .child(new_uuid.to_string())
-            .child(INDEX_FILE_NAME);
-        let mut writer = object_store.create(&index_file).await?;
-
-        let pq_index = self
-            .sub_index
-            .as_any()
-            .downcast_ref::<PQIndex>()
-            .ok_or(Error::Index {
-                message: "Only support append to IVF_PQ".to_string(),
-                location: location!(),
-            })?;
-
-        // TODO: merge two IVF implementations.
-        let ivf = lance_index::vector::ivf::new_ivf_with_pq(
-            self.ivf.centroids.values(),
-            self.ivf.dimension(),
-            self.metric_type,
-            column,
-            pq_index.pq.clone(),
-            None,
-        )?;
-
-        let shuffled = shuffle_dataset(
-            data,
-            column,
-            ivf,
-            None,
-            self.ivf.num_partitions() as u32,
-            pq_index.pq.num_sub_vectors(),
-            10000,
-            2,
-        )
-        .await?;
-        let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
-        write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(&[self])).await?;
-        let metadata = IvfPQIndexMetadata {
-            name: metadata.name.clone(),
-            column: column.to_string(),
-            dimension: self.ivf.dimension() as u32,
-            dataset_version: dataset.version().version,
-            metric_type: self.metric_type,
-            ivf: ivf_mut,
-            pq: pq_index.pq.clone(),
-            transforms: vec![],
-        };
-
-        let metadata = pb::Index::try_from(&metadata)?;
-        let pos = writer.write_protobuf(&metadata).await?;
-        writer.write_magics(pos).await?;
-        writer.shutdown().await?;
-
-        Ok(new_uuid)
     }
 }
 
@@ -485,7 +417,7 @@ pub(crate) struct Ivf {
     ///
     /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
     /// memory allocator.
-    pub(crate) centroids: Arc<FixedSizeListArray>,
+    centroids: Arc<FixedSizeListArray>,
 
     /// Offset of each partition in the file.
     offsets: Vec<usize>,

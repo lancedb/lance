@@ -155,8 +155,7 @@ pub async fn append_index<'a>(
 mod tests {
     use super::*;
 
-    use arrow_array::cast::AsArray;
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
+    use arrow_array::{cast::AsArray, FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
@@ -168,8 +167,11 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
-    use crate::index::vector::{pq::PQIndex, VectorIndexParams};
-    use crate::index::DatasetIndexExt;
+    use crate::index::{DatasetIndexExt, vector::ivf::IVFIndex};
+    use crate::{
+        dataset::index::unindexed_fragments,
+        index::vector::{pq::PQIndex, VectorIndexParams},
+    };
 
     #[tokio::test]
     async fn test_append_index() {
@@ -232,8 +234,17 @@ mod tests {
             .unwrap();
         assert_eq!(results[0].num_rows(), 10); // Flat search.
 
-        dataset.optimize_indices().await.unwrap();
-        let index = &dataset.load_indices().await.unwrap()[0];
+        // Create a new delta index
+        dataset
+            .optimize_indices(OptimizeOptions {
+                num_indices_to_merge: 0,
+            })
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2);
+
+        let index = &indices[0];
         assert!(unindexed_fragments(index, &dataset)
             .await
             .unwrap()
