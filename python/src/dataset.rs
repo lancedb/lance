@@ -805,7 +805,7 @@ impl Dataset {
         }
     }
 
-    fn count_unindexed_rows(&self, index_name: String) -> PyResult<Option<usize>> {
+    fn count_unindexed_rows(&self, index_name: String) -> PyResult<usize> {
         let idx = RT.block_on(None, self.ds.load_index_by_name(index_name.as_str()))?;
         if let Some(index) = idx {
             RT.block_on(
@@ -822,7 +822,7 @@ impl Dataset {
         }
     }
 
-    fn count_indexed_rows(&self, index_name: String) -> PyResult<Option<usize>> {
+    fn count_indexed_rows(&self, index_name: String) -> PyResult<usize> {
         let idx = RT.block_on(None, self.ds.load_index_by_name(index_name.as_str()))?;
         if let Some(index) = idx {
             RT.block_on(
