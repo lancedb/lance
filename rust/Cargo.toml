@@ -87,7 +87,7 @@ mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = "0.11"
 num_cpus = "1.0"
 num-traits = "0.2"
-object_store = { version = "0.8.0", features = ["aws", "gcp", "azure"] }
+object_store = { version = "0.9.0", features = ["aws", "gcp", "azure"] }
 parquet = "49.0"
 pin-project = "1.0"
 pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
