@@ -15,7 +15,7 @@ arrow = { version = "49.0.0", features = ["pyarrow"] }
 arrow-array = "49.0"
 arrow-data = "49.0"
 arrow-schema = "49.0"
-object_store = "0.8.0"
+object_store = "0.9.0"
 async-trait = "0.1"
 chrono = "0.4.31"
 env_logger = "0.10"
