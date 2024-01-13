@@ -51,7 +51,7 @@ use super::Dataset;
 use crate::dataset::index::unindexed_fragments;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index};
-use crate::index::DatasetIndexInternalExt;
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use crate::io::exec::{FilterPlan, MaterializeIndexExec, PreFilterSource, ScalarIndexExec};
 use crate::io::{
     exec::{

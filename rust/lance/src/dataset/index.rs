@@ -23,7 +23,7 @@ use lance_core::{
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
-use crate::index::remap_index;
+use crate::index::{remap_index, DatasetIndexExt};
 use crate::Dataset;
 
 use super::optimize::{IndexRemapper, IndexRemapperOptions, RemappedIndex};

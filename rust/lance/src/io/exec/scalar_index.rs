@@ -35,7 +35,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 
 use crate::{
-    index::{prefilter::PreFilter, DatasetIndexInternalExt},
+    index::{prefilter::PreFilter, DatasetIndexExt, DatasetIndexInternalExt},
     Dataset,
 };
 

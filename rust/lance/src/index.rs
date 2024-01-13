@@ -21,7 +21,11 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use lance_core::io::{read_message, read_message_from_buf, read_metadata_offset, Reader};
+use lance_core::format::Fragment;
+use lance_core::io::{
+    read_message, read_message_from_buf, read_metadata_offset, reader::read_manifest_indexes,
+    Reader,
+};
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -37,6 +41,7 @@ pub(crate) mod prefilter;
 pub mod scalar;
 pub mod vector;
 
+use crate::dataset::index::unindexed_fragments;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::format::Index as IndexMetadata;
 use crate::index::append::append_index;
@@ -154,8 +159,31 @@ pub trait DatasetIndexExt {
         replace: bool,
     ) -> Result<()>;
 
+    /// Read all indices of this Dataset version.
+    async fn load_indices(&self) -> Result<Vec<IndexMetadata>>;
+
+    /// Loads a specific index with the given id
+    async fn load_index(&self, uuid: &str) -> Result<Option<IndexMetadata>> {
+        self.load_indices()
+            .await
+            .map(|indices| indices.into_iter().find(|idx| idx.uuid.to_string() == uuid))
+    }
+
+    /// Loads a specific index with the given index name
+    async fn load_index_by_name(&self, name: &str) -> Result<Option<IndexMetadata>> {
+        self.load_indices()
+            .await
+            .map(|indices| indices.into_iter().find(|idx| idx.name == name))
+    }
+
+    /// Loads a specific index with the given index name.
+    async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<IndexMetadata>>;
+
     /// Optimize indices.
     async fn optimize_indices(&mut self) -> Result<()>;
+
+    /// Find index with a given index_name and return its serialized statistics.
+    async fn index_statistics(&self, index_name: &str) -> Result<Option<String>>;
 }
 
 async fn open_index_proto(dataset: &Dataset, reader: &dyn Reader) -> Result<pb::Index> {
@@ -178,6 +206,35 @@ async fn open_index_proto(dataset: &Dataset, reader: &dyn Reader) -> Result<pb::
         read_message_from_buf(&tail_bytes.slice(offset..))?
     };
     Ok(proto)
+}
+
+async fn count_unindexed_rows(ds: &Dataset, index_uuid: &str) -> Result<Option<usize>> {
+    let index = ds.load_index(index_uuid).await?;
+
+    if let Some(index) = index {
+        let unindexed_frags = unindexed_fragments(&index, ds).await?;
+        let unindexed_rows = unindexed_frags
+            .iter()
+            .map(Fragment::num_rows)
+            // sum the number of rows in each fragment if no fragment returned None from row_count
+            .try_fold(0, |a, b| b.map(|b| a + b).ok_or(()));
+
+        Ok(unindexed_rows.ok())
+    } else {
+        Ok(None)
+    }
+}
+
+async fn count_indexed_rows(ds: &Dataset, index_uuid: &str) -> Result<Option<usize>> {
+    let count_rows = ds.count_rows();
+    let count_unindexed_rows = count_unindexed_rows(ds, index_uuid);
+
+    let (count_rows, count_unindexed_rows) = futures::try_join!(count_rows, count_unindexed_rows)?;
+
+    match count_unindexed_rows {
+        Some(count_unindexed_rows) => Ok(Some(count_rows - count_unindexed_rows)),
+        None => Ok(None),
+    }
 }
 
 #[async_trait]
@@ -279,6 +336,27 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
+    async fn load_indices(&self) -> Result<Vec<IndexMetadata>> {
+        let manifest_file = self.manifest_file(self.version().version).await?;
+        read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest).await
+    }
+
+    async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<IndexMetadata>> {
+        Ok(self
+            .load_indices()
+            .await?
+            .into_iter()
+            .filter(|idx| idx.fields.len() == 1)
+            .find(|idx| {
+                let field = self.schema().field_by_id(idx.fields[0]);
+                if let Some(field) = field {
+                    field.name == col
+                } else {
+                    false
+                }
+            }))
+    }
+
     #[instrument(skip_all)]
     async fn optimize_indices(&mut self) -> Result<()> {
         let dataset = Arc::new(self.clone());
@@ -330,6 +408,24 @@ impl DatasetIndexExt for Dataset {
 
         self.manifest = Arc::new(new_manifest);
         Ok(())
+    }
+
+    async fn index_statistics(&self, index_name: &str) -> Result<Option<String>> {
+        let index_uuid = self
+            .load_index_by_name(index_name)
+            .await?
+            .map(|idx| idx.uuid.to_string());
+
+        if let Some(index_uuid) = index_uuid {
+            let index_statistics = self
+                .open_generic_index("vector", &index_uuid)
+                .await?
+                .statistics()
+                .unwrap();
+            Ok(Some(index_statistics))
+        } else {
+            Ok(None)
+        }
     }
 }
 

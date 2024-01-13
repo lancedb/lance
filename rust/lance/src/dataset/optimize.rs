@@ -106,7 +106,7 @@ use uuid::Uuid;
 use crate::format::RowAddress;
 use crate::io::commit::{commit_transaction, migrate_fragments};
 use crate::Result;
-use crate::{format::Fragment, Dataset};
+use crate::{format::Fragment, index::DatasetIndexExt, Dataset};
 
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
