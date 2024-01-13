@@ -19,11 +19,13 @@
 use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;
-use lance_core::{format::Index as IndexMetadata, Result};
+use lance_core::Result;
 use roaring::RoaringBitmap;
 
 pub mod scalar;
+pub mod traits;
 pub mod vector;
+pub use crate::traits::*;
 
 pub const INDEX_FILE_NAME: &str = "index.idx";
 
@@ -70,62 +72,4 @@ impl std::fmt::Display for IndexType {
 
 pub trait IndexParams: Send + Sync {
     fn as_any(&self) -> &dyn Any;
-}
-
-/// Extends Lance Dataset with secondary index.
-///
-#[async_trait]
-pub trait DatasetIndexExt {
-    /// Create indices on columns.
-    ///
-    /// Upon finish, a new dataset version is generated.
-    ///
-    /// Parameters:
-    ///
-    ///  - `columns`: the columns to build the indices on.
-    ///  - `index_type`: specify [`IndexType`].
-    ///  - `name`: optional index name. Must be unique in the dataset.
-    ///            if not provided, it will auto-generate one.
-    ///  - `params`: index parameters.
-    ///  - `replace`: replace the existing index if it exists.
-    async fn create_index(
-        &mut self,
-        columns: &[&str],
-        index_type: IndexType,
-        name: Option<String>,
-        params: &dyn IndexParams,
-        replace: bool,
-    ) -> Result<()>;
-
-    /// Read all indices of this Dataset version.
-    async fn load_indices(&self) -> Result<Vec<IndexMetadata>>;
-
-    /// Loads all the indies of a given UUID.
-    ///
-    /// Note that it is possible to have multiple indices with the same UUID,
-    /// as they are the deltas of the same index.
-    async fn load_index(&self, uuid: &str) -> Result<Vec<IndexMetadata>> {
-        self.load_indices().await.map(|indices| {
-            indices
-                .into_iter()
-                .filter(|idx| idx.uuid.to_string() == uuid)
-                .collect()
-        })
-    }
-
-    /// Loads a specific index with the given index name
-    async fn load_index_by_name(&self, name: &str) -> Result<Option<IndexMetadata>> {
-        self.load_indices()
-            .await
-            .map(|indices| indices.into_iter().find(|idx| idx.name == name))
-    }
-
-    /// Loads a specific index with the given index name.
-    async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<IndexMetadata>>;
-
-    /// Optimize indices.
-    async fn optimize_indices(&mut self) -> Result<()>;
-
-    /// Find index with a given index_name and return its serialized statistics.
-    async fn index_statistics(&self, index_name: &str) -> Result<Option<String>>;
 }
