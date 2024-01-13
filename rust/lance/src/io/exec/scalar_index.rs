@@ -25,9 +25,12 @@ use lance_core::{
     format::{Fragment, RowAddress},
     Error, Result, ROW_ID_FIELD,
 };
-use lance_index::scalar::{
-    expression::{ScalarIndexExpr, ScalarIndexLoader},
-    ScalarIndex,
+use lance_index::{
+    scalar::{
+        expression::{ScalarIndexExpr, ScalarIndexLoader},
+        ScalarIndex,
+    },
+    DatasetIndexExt,
 };
 use pin_project::pin_project;
 use roaring::RoaringBitmap;
@@ -35,7 +38,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 
 use crate::{
-    index::{prefilter::PreFilter, DatasetIndexExt, DatasetIndexInternalExt},
+    index::{prefilter::PreFilter, DatasetIndexInternalExt},
     Dataset,
 };
 

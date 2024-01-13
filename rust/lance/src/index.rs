@@ -15,7 +15,6 @@
 //! Secondary Index
 //!
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,7 +29,8 @@ use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
-use lance_index::{pb, Index, IndexType, INDEX_FILE_NAME};
+pub use lance_index::IndexParams;
+use lance_index::{pb, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
@@ -58,10 +58,6 @@ pub trait IndexBuilder {
     fn index_type() -> IndexType;
 
     async fn build(&self) -> Result<()>;
-}
-
-pub trait IndexParams: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
 }
 
 pub(crate) async fn remap_index(
@@ -133,57 +129,6 @@ impl IndexInformationProvider for ScalarIndexInfo {
     fn get_index(&self, col: &str) -> Option<&DataType> {
         self.indexed_columns.get(col)
     }
-}
-
-/// Extends Dataset with secondary index.
-#[async_trait]
-pub trait DatasetIndexExt {
-    /// Create indices on columns.
-    ///
-    /// Upon finish, a new dataset version is generated.
-    ///
-    /// Parameters:
-    ///
-    ///  - `columns`: the columns to build the indices on.
-    ///  - `index_type`: specify [`IndexType`].
-    ///  - `name`: optional index name. Must be unique in the dataset.
-    ///            if not provided, it will auto-generate one.
-    ///  - `params`: index parameters.
-    ///  - `replace`: replace the existing index if it exists.
-    async fn create_index(
-        &mut self,
-        columns: &[&str],
-        index_type: IndexType,
-        name: Option<String>,
-        params: &dyn IndexParams,
-        replace: bool,
-    ) -> Result<()>;
-
-    /// Read all indices of this Dataset version.
-    async fn load_indices(&self) -> Result<Vec<IndexMetadata>>;
-
-    /// Loads a specific index with the given id
-    async fn load_index(&self, uuid: &str) -> Result<Option<IndexMetadata>> {
-        self.load_indices()
-            .await
-            .map(|indices| indices.into_iter().find(|idx| idx.uuid.to_string() == uuid))
-    }
-
-    /// Loads a specific index with the given index name
-    async fn load_index_by_name(&self, name: &str) -> Result<Option<IndexMetadata>> {
-        self.load_indices()
-            .await
-            .map(|indices| indices.into_iter().find(|idx| idx.name == name))
-    }
-
-    /// Loads a specific index with the given index name.
-    async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<IndexMetadata>>;
-
-    /// Optimize indices.
-    async fn optimize_indices(&mut self) -> Result<()>;
-
-    /// Find index with a given index_name and return its serialized statistics.
-    async fn index_statistics(&self, index_name: &str) -> Result<Option<String>>;
 }
 
 async fn open_index_proto(dataset: &Dataset, reader: &dyn Reader) -> Result<pb::Index> {

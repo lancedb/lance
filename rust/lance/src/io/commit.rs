@@ -44,6 +44,7 @@ use lance_core::{
     io::commit::{CommitConfig, CommitError},
     Error, Result,
 };
+use lance_index::DatasetIndexExt;
 use object_store::path::Path;
 use prost::Message;
 
@@ -53,7 +54,7 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig};
 use crate::format::{DeletionFile, Fragment};
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::DatasetIndexInternalExt;
 use crate::Dataset;
 
 #[cfg(all(target_feature = "dynamodb", test))]

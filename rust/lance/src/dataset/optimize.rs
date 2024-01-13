@@ -99,6 +99,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_index::DatasetIndexExt;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -106,7 +107,7 @@ use uuid::Uuid;
 use crate::format::RowAddress;
 use crate::io::commit::{commit_transaction, migrate_fragments};
 use crate::Result;
-use crate::{format::Fragment, index::DatasetIndexExt, Dataset};
+use crate::{format::Fragment, Dataset};
 
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;

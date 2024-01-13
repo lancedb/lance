@@ -20,10 +20,11 @@ use lance_core::{
     format::{Fragment, Index},
     Error, Result,
 };
+use lance_index::DatasetIndexExt;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
-use crate::index::{remap_index, DatasetIndexExt};
+use crate::index::remap_index;
 use crate::Dataset;
 
 use super::optimize::{IndexRemapper, IndexRemapperOptions, RemappedIndex};

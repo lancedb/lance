@@ -40,8 +40,8 @@ use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::ROW_ID_FIELD;
 use lance_datafusion::exec::execute_plan;
-use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::vector::{Query, DIST_COL};
+use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_linalg::distance::MetricType;
 use log::debug;
 use roaring::RoaringBitmap;
@@ -51,7 +51,7 @@ use super::Dataset;
 use crate::dataset::index::unindexed_fragments;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index};
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::{FilterPlan, MaterializeIndexExec, PreFilterSource, ScalarIndexExec};
 use crate::io::{
     exec::{
