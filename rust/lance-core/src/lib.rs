@@ -34,6 +34,3 @@ lazy_static::lazy_static! {
 }
 
 pub(crate) const DELETION_DIRS: &str = "_deletions";
-
-/// Trait for a Lance Dataset
-pub trait Dataset {}
