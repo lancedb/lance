@@ -69,16 +69,17 @@ use self::fragment::FileFragment;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::{reader_to_stream, write_fragments_internal};
+use super::index::CachedIndexMetadata;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{Fragment, Index, Manifest};
 use crate::io::commit::{commit_new_dataset, commit_transaction};
 use crate::session::Session;
-
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
+
 pub use write::update::{UpdateBuilder, UpdateJob};
 pub use write::{write_fragments, WriteMode, WriteParams};
 
@@ -97,7 +98,7 @@ pub struct Dataset {
     pub(crate) session: Arc<Session>,
 
     /// Cache index metadadta of a version of the dataset.
-    pub(crate) index_metadata_cache: Arc<futures::lock::Mutex<Option<Vec<Index>>>>,
+    pub(crate) index_metadata_cache: Arc<futures::lock::Mutex<Option<CachedIndexMetadata>>>,
 }
 
 /// Dataset Version

@@ -52,6 +52,11 @@ use crate::{dataset::Dataset, Error, Result};
 use self::scalar::build_scalar_index;
 use self::vector::{build_vector_index, VectorIndex, VectorIndexParams};
 
+pub(crate) struct CachedIndexMetadata {
+    dataset_version: u64,
+    indices: Vec<IndexMetadata>,
+}
+
 /// Builds index.
 #[async_trait]
 pub trait IndexBuilder {
@@ -255,16 +260,23 @@ impl DatasetIndexExt for Dataset {
 
     async fn load_indices<'a>(&'a self) -> Result<Vec<IndexMetadata>> {
         let mut indices = self.index_metadata_cache.lock().await;
+        if let Some(cached_indices) = indices.as_ref() {
+            if cached_indices.dataset_version != self.manifest.version {
+                *indices = None;
+            }
+        }
         if indices.is_none() {
             let manifest_file = self.manifest_file(self.version().version).await?;
             let loaded_indices =
                 read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest).await?;
-            *indices = Some(loaded_indices);
+            *indices = Some(CachedIndexMetadata {
+                dataset_version: self.manifest.version,
+                indices: loaded_indices,
+            });
         }
-
         Ok(indices
             .as_ref()
-            .map(|indices| indices.clone())
+            .map(|indices| indices.indices.clone())
             .unwrap_or_default())
     }
 
