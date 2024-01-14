@@ -40,8 +40,8 @@ use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::ROW_ID_FIELD;
 use lance_datafusion::exec::execute_plan;
-use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::vector::{Query, DIST_COL};
+use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_linalg::distance::MetricType;
 use log::debug;
 use roaring::RoaringBitmap;
@@ -1338,8 +1338,7 @@ mod test {
     use futures::TryStreamExt;
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
-    use lance_index::vector::DIST_COL;
-    use lance_index::IndexType;
+    use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use tempfile::{tempdir, TempDir};
 
@@ -1349,7 +1348,7 @@ mod test {
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
     use crate::index::scalar::ScalarIndexParams;
-    use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
+    use crate::index::vector::VectorIndexParams;
 
     #[tokio::test]
     async fn test_batch_size() {

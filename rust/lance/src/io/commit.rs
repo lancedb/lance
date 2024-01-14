@@ -44,6 +44,7 @@ use lance_core::{
     io::commit::{CommitConfig, CommitError},
     Error, Result,
 };
+use lance_index::DatasetIndexExt;
 use object_store::path::Path;
 use prost::Message;
 
@@ -413,14 +414,14 @@ mod tests {
         CommitError, CommitHandler, CommitLease, CommitLock, RenameCommitHandler,
         UnsafeCommitHandler,
     };
-    use lance_index::IndexType;
+    use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
 
     use super::*;
 
     use crate::dataset::{transaction::Operation, WriteMode, WriteParams};
-    use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
+    use crate::index::vector::VectorIndexParams;
     use crate::io::object_store::ObjectStoreParams;
     use crate::Dataset;
 

@@ -99,6 +99,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_index::DatasetIndexExt;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
