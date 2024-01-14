@@ -31,17 +31,15 @@ use lance::dataset::{
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
     Dataset as LanceDataset, ReadParams, Version, WriteMode, WriteParams,
 };
-use lance::index::IndexParams;
 use lance::index::{
     scalar::ScalarIndexParams,
     vector::{diskann::DiskANNParams, VectorIndexParams},
-    DatasetIndexExt,
 };
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::{datatypes::Schema, format::Fragment, io::object_store::ObjectStoreParams};
 use lance_index::{
     vector::{ivf::IvfBuildParams, pq::PQBuildParams},
-    IndexType,
+    DatasetIndexExt, IndexParams, IndexType,
 };
 use lance_linalg::distance::MetricType;
 use pyo3::exceptions::PyStopIteration;
@@ -808,7 +806,9 @@ impl Dataset {
     }
 
     fn count_unindexed_rows(&self, index_name: String) -> PyResult<Option<usize>> {
-        let idx = RT.block_on(None, self.ds.load_index_by_name(index_name.as_str()))?;
+        let idx = RT
+            .block_on(None, self.ds.load_index_by_name(index_name.as_str()))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
         if let Some(index) = idx {
             RT.block_on(
                 None,
@@ -825,7 +825,9 @@ impl Dataset {
     }
 
     fn count_indexed_rows(&self, index_name: String) -> PyResult<Option<usize>> {
-        let idx = RT.block_on(None, self.ds.load_index_by_name(index_name.as_str()))?;
+        let idx = RT
+            .block_on(None, self.ds.load_index_by_name(index_name.as_str()))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
         if let Some(index) = idx {
             RT.block_on(
                 None,

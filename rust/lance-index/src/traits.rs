@@ -71,4 +71,14 @@ pub trait DatasetIndexExt {
 
     /// Find index with a given index_name and return its serialized statistics.
     async fn index_statistics(&self, index_name: &str) -> Result<Option<String>>;
+
+    /// Count the rows that are not indexed by the given index.
+    ///
+    /// TODO: move to [DatasetInternalExt]
+    async fn count_unindexed_rows(&self, index_name: &str) -> Result<Option<usize>>;
+
+    /// Count the rows that are indexed by the given index.
+    ///
+    /// TODO: move to [DatasetInternalExt]
+    async fn count_indexed_rows(&self, index_name: &str) -> Result<Option<usize>>;
 }

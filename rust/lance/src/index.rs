@@ -153,35 +153,6 @@ async fn open_index_proto(dataset: &Dataset, reader: &dyn Reader) -> Result<pb::
     Ok(proto)
 }
 
-async fn count_unindexed_rows(ds: &Dataset, index_uuid: &str) -> Result<Option<usize>> {
-    let index = ds.load_index(index_uuid).await?;
-
-    if let Some(index) = index {
-        let unindexed_frags = unindexed_fragments(&index, ds).await?;
-        let unindexed_rows = unindexed_frags
-            .iter()
-            .map(Fragment::num_rows)
-            // sum the number of rows in each fragment if no fragment returned None from row_count
-            .try_fold(0, |a, b| b.map(|b| a + b).ok_or(()));
-
-        Ok(unindexed_rows.ok())
-    } else {
-        Ok(None)
-    }
-}
-
-async fn count_indexed_rows(ds: &Dataset, index_uuid: &str) -> Result<Option<usize>> {
-    let count_rows = ds.count_rows();
-    let count_unindexed_rows = count_unindexed_rows(ds, index_uuid);
-
-    let (count_rows, count_unindexed_rows) = futures::try_join!(count_rows, count_unindexed_rows)?;
-
-    match count_unindexed_rows {
-        Some(count_unindexed_rows) => Ok(Some(count_rows - count_unindexed_rows)),
-        None => Ok(None),
-    }
-}
-
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     #[instrument(skip_all)]
@@ -370,6 +341,36 @@ impl DatasetIndexExt for Dataset {
             Ok(Some(index_statistics))
         } else {
             Ok(None)
+        }
+    }
+
+    async fn count_unindexed_rows(&self, index_uuid: &str) -> Result<Option<usize>> {
+        let index = self.load_index(index_uuid).await?;
+
+        if let Some(index) = index {
+            let unindexed_frags = unindexed_fragments(&index, self).await?;
+            let unindexed_rows = unindexed_frags
+                .iter()
+                .map(Fragment::num_rows)
+                // sum the number of rows in each fragment if no fragment returned None from row_count
+                .try_fold(0, |a, b| b.map(|b| a + b).ok_or(()));
+
+            Ok(unindexed_rows.ok())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn count_indexed_rows(&self, index_uuid: &str) -> Result<Option<usize>> {
+        let count_rows = self.count_rows();
+        let count_unindexed_rows = self.count_unindexed_rows(index_uuid);
+
+        let (count_rows, count_unindexed_rows) =
+            futures::try_join!(count_rows, count_unindexed_rows)?;
+
+        match count_unindexed_rows {
+            Some(count_unindexed_rows) => Ok(Some(count_rows - count_unindexed_rows)),
+            None => Ok(None),
         }
     }
 }
