@@ -336,8 +336,7 @@ impl DatasetIndexExt for Dataset {
             let index_statistics = self
                 .open_generic_index("vector", &index_uuid)
                 .await?
-                .statistics()
-                .unwrap();
+                .statistics()?;
             Ok(Some(index_statistics))
         } else {
             Ok(None)
