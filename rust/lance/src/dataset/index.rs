@@ -20,6 +20,7 @@ use lance_core::{
     format::{Fragment, Index},
     Error, Result,
 };
+use lance_index::DatasetIndexExt;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
