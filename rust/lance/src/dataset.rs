@@ -95,6 +95,9 @@ pub struct Dataset {
     pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) session: Arc<Session>,
+
+    /// Cache index metadadta of a version of the dataset.
+    pub(crate) index_metadata_cache: Arc<futures::lock::Mutex<Option<Vec<Index>>>>,
 }
 
 /// Dataset Version
@@ -332,6 +335,7 @@ impl Dataset {
             base: base_path,
             manifest: Arc::new(manifest),
             session,
+            index_metadata_cache: Arc::new(Default::default()),
         })
     }
 
@@ -459,6 +463,7 @@ impl Dataset {
             base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
+            index_metadata_cache: Arc::new(Default::default()),
         })
     }
 
@@ -724,6 +729,7 @@ impl Dataset {
             base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
+            index_metadata_cache: Arc::new(Default::default()),
         })
     }
 

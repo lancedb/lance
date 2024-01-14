@@ -44,6 +44,7 @@ pub trait DatasetIndexExt {
     ) -> Result<()>;
 
     /// Read all indices of this Dataset version.
+    ///
     async fn load_indices(&self) -> Result<Vec<Index>>;
 
     /// Loads all the indies of a given UUID.
