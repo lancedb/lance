@@ -784,7 +784,10 @@ async fn rewrite_files(
     // information.
     let fragments = migrate_fragments(dataset.as_ref(), &task.fragments, recompute_stats).await?;
     let mut scanner = dataset.scan();
-    scanner.with_fragments(fragments.clone()).with_row_id();
+    scanner
+        .with_fragments(fragments.clone())
+        .scan_in_order(true)
+        .with_row_id();
 
     let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
     let row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
