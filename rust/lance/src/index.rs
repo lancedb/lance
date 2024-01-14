@@ -334,6 +334,7 @@ impl DatasetIndexExt for Dataset {
         .await?;
 
         self.manifest = Arc::new(new_manifest);
+        self.reset_index_metadata_cache().await;
         Ok(())
     }
 
