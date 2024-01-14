@@ -253,7 +253,6 @@ impl DatasetIndexExt for Dataset {
         .await?;
 
         self.manifest = Arc::new(new_manifest);
-        self.reset_index_metadata_cache().await;
 
         Ok(())
     }
@@ -346,7 +345,6 @@ impl DatasetIndexExt for Dataset {
         .await?;
 
         self.manifest = Arc::new(new_manifest);
-        self.reset_index_metadata_cache().await;
         Ok(())
     }
 
@@ -409,9 +407,6 @@ pub(crate) trait DatasetIndexInternalExt {
     async fn open_vector_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn VectorIndex>>;
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
-
-    /// Resets the index metadata cache, forcing it to be reloaded from disk next time.
-    async fn reset_index_metadata_cache(&self);
 }
 
 #[async_trait]
@@ -499,11 +494,6 @@ impl DatasetIndexInternalExt for Dataset {
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,
         })
-    }
-
-    async fn reset_index_metadata_cache(&self) {
-        let mut indices = self.index_metadata_cache.lock().await;
-        *indices = None;
     }
 }
 
