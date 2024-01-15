@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +21,6 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::format::pb::metadata;
 use lance_core::format::Fragment;
 use lance_core::io::{
     read_message, read_message_from_buf, read_metadata_offset, reader::read_manifest_indexes,
@@ -33,9 +32,9 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
 pub use lance_index::IndexParams;
 use lance_index::{pb, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
+use roaring::RoaringBitmap;
 use serde_json::json;
 use snafu::{location, Location};
-use tracing::instrument;
 use uuid::Uuid;
 
 pub(crate) mod append;
@@ -367,20 +366,52 @@ impl DatasetIndexExt for Dataset {
                 location: location!(),
             })?;
 
-        let delta_stats = stream::iter(metadatas.iter())
-            .then(|m| async move {
-                self.open_generic_index(column, &m.uuid.to_string())
-                    .await
-                    .map(|idx| idx.statistics())
-            })
+        // Open all delta indices
+        let deltas = stream::iter(metadatas.iter())
+            .then(|m| async move { self.open_generic_index(column, &m.uuid.to_string()).await })
             .try_collect::<Vec<_>>()
-            .await?
-            .into_iter()
+            .await?;
+
+        // Stastistics for each delta index.
+        let delta_stats = deltas
+            .iter()
+            .map(|idx| idx.statistics())
             .collect::<Result<Vec<_>>>()?;
 
-        let mut stats = json!({
-            "index_type": "IVF_PQ",
-            "index_name": index_name,
+        let all_fragments = self.fragments();
+        let mut unindexed_fragments: usize = 0;
+        let mut unindexed_rows: usize = 0;
+        let mut indexed_fragments: usize = 0;
+        let mut indexed_rows: usize = 0;
+
+        let mut total_fragment_bitmap = RoaringBitmap::new();
+        for (i, idx) in metadatas.iter().enumerate() {
+            total_fragment_bitmap |= idx.fragment_bitmap.as_ref().ok_or(|| {
+                Error::Index { message: "Please upgrade lance to 0.8+ to use this function.", location: () }
+            })?;
+            indexed_fragments = idx.fragment_bitmap.as_ref().unwrap().len() as usize;
+        }
+
+            let num_fragments = fragment_bitmap.len() as usize;
+            let num_rows = all_fragments
+                .iter()
+                .filter(|f| fragment_bitmap.contains(f.id() as u32))
+                .map(|f| f.num_rows())
+                .sum::<usize>();
+
+            if num_fragments == 0 {
+                unindexed_fragments += 1;
+                unindexed_rows += num_rows;
+            } else {
+                indexed_fragments += 1;
+                indexed_rows += num_rows;
+            }
+        }
+        // TODO: collect unindexed fragments and rows.
+
+        let stats = json!({
+            "type": "IVF_PQ",
+            "name": index_name,
             "num_deltas": metadatas.len(),
             "deltas": delta_stats,
         });
