@@ -438,8 +438,6 @@ def test_tfrecord_parsing(tmp_path, sample_tf_example):
 
 
 def test_tfrecord_roundtrip(tmp_path, sample_tf_example):
-    del sample_tf_example.features.feature["9_tensor_bf16"]
-
     serialized = sample_tf_example.SerializeToString()
 
     path = tmp_path / "test.tfrecord"

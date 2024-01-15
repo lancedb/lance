@@ -26,6 +26,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use half::{bf16, f16};
+use lance_arrow::bfloat16::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
 use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -284,7 +285,7 @@ fn make_field(name: &str, feature_meta: &FeatureMeta) -> Result<ArrowField> {
 
             let inner_meta = match dtype {
                 TensorDataType::DtBfloat16 => Some(
-                    [("ARROW:extension:name", "lance.bfloat16")]
+                    [(ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME)]
                         .into_iter()
                         .map(|(k, v)| (k.to_string(), v.to_string()))
                         .collect::<HashMap<String, String>>(),
@@ -309,11 +310,11 @@ fn make_field(name: &str, feature_meta: &FeatureMeta) -> Result<ArrowField> {
                 shape: shape.clone(),
             };
             metadata.insert(
-                "ARROW:extension:name".to_string(),
+                ARROW_EXT_NAME_KEY.to_string(),
                 "arrow.fixed_shape_tensor".to_string(),
             );
             metadata.insert(
-                "ARROW:extension:metadata".to_string(),
+                ARROW_EXT_META_KEY.to_string(),
                 serde_json::to_string(&tensor_metadata)?,
             );
             Some(metadata)
@@ -364,10 +365,10 @@ fn convert_column(records: &[Example], field: &ArrowField) -> Result<ArrayRef> {
             field.set_metadata(
                 [
                     (
-                        "ARROW:extension:name".to_string(),
-                        "lance.bfloat16".to_string(),
+                        ARROW_EXT_NAME_KEY.to_string(),
+                        BFLOAT16_EXT_NAME.to_string(),
                     ),
-                    ("ARROW:extension:metadata".to_string(), "".to_string()),
+                    (ARROW_EXT_META_KEY.to_string(), "".to_string()),
                 ]
                 .into_iter()
                 .collect(),
