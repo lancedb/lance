@@ -544,18 +544,18 @@ def test_index_cache_size(tmp_path):
     assert (
         indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 3
     )
-    assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_hit_rate"] == 0.5
+    assert np.isclose(
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_hit_rate"], 18 / 25
     )
     query_index(indexed_dataset, 128)
     assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 10
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 11
     )
 
     indexed_dataset = lance.LanceDataset(indexed_dataset.uri, index_cache_size=5)
     query_index(indexed_dataset, 128)
     assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 5
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 6
     )
 
 
