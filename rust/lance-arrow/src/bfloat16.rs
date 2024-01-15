@@ -23,10 +23,24 @@ use arrow_array::{
 };
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayData;
-use arrow_schema::{ArrowError, DataType};
+use arrow_schema::{ArrowError, DataType, Field as ArrowField};
 use half::bf16;
 
 use crate::FloatArray;
+
+pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
+pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
+pub const BFLOAT16_EXT_NAME: &str = "lance.bfloat16";
+
+/// Check whether the given field is a bfloat16 field.
+pub fn is_bfloat16_field(field: &ArrowField) -> bool {
+    field.data_type() == &DataType::FixedSizeBinary(2)
+        && field
+            .metadata()
+            .get(ARROW_EXT_NAME_KEY)
+            .map(|name| name == BFLOAT16_EXT_NAME)
+            .unwrap_or_default()
+}
 
 #[derive(Debug)]
 pub struct BFloat16Type {}

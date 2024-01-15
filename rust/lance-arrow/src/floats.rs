@@ -25,11 +25,12 @@ use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
     Array, Float16Array, Float32Array, Float64Array,
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use half::{bf16, f16};
 use num_traits::{AsPrimitive, Bounded, Float, FromPrimitive};
 
 use super::bfloat16::{BFloat16Array, BFloat16Type};
+use crate::bfloat16::is_bfloat16_field;
 use crate::Result;
 
 /// Float data type.
@@ -55,6 +56,8 @@ impl std::fmt::Display for FloatType {
     }
 }
 
+/// Try to convert a [DataType] to a [FloatType]. To support bfloat16, always
+/// prefer using the `TryFrom<&Field>` implementation.
 impl TryFrom<&DataType> for FloatType {
     type Error = crate::ArrowError;
 
@@ -67,6 +70,17 @@ impl TryFrom<&DataType> for FloatType {
                 "{:?} is not a floating type",
                 value
             ))),
+        }
+    }
+}
+
+impl TryFrom<&Field> for FloatType {
+    type Error = crate::ArrowError;
+
+    fn try_from(field: &Field) -> Result<Self> {
+        match field.data_type() {
+            DataType::FixedSizeBinary(2) if is_bfloat16_field(field) => Ok(Self::BFloat16),
+            _ => Self::try_from(field.data_type()),
         }
     }
 }

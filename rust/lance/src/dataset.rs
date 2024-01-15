@@ -1603,7 +1603,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
-    use lance_arrow::bfloat16;
+    use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_core::format::WriterVersion;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::vector::DIST_COL;
@@ -3931,8 +3931,8 @@ mod tests {
         let inner_field = Arc::new(
             Field::new("item", DataType::FixedSizeBinary(2), true).with_metadata(
                 [
-                    ("ARROW:extension:name".into(), "lance.bfloat16".into()),
-                    ("ARROW:extension:metadata".into(), "".into()),
+                    (ARROW_EXT_NAME_KEY.into(), BFLOAT16_EXT_NAME.into()),
+                    (ARROW_EXT_META_KEY.into(), "".into()),
                 ]
                 .into(),
             ),

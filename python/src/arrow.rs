@@ -20,6 +20,7 @@ use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{DataType, Field, Schema};
 use half::bf16;
 use lance::arrow::bfloat16::BFloat16Array;
+use lance_arrow::bfloat16::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
 use pyo3::{
     exceptions::PyValueError,
     ffi::Py_uintptr_t,
@@ -72,8 +73,8 @@ impl BFloat16 {
 }
 
 const EXPORT_METADATA: [(&str, &str); 2] = [
-    ("ARROW:extension:name", "lance.bfloat16"),
-    ("ARROW:extension:metadata", ""),
+    (ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME),
+    (ARROW_EXT_META_KEY, ""),
 ];
 
 #[pyfunction]

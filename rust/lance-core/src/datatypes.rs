@@ -19,6 +19,9 @@ use std::sync::Arc;
 
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, TimeUnit};
+use lance_arrow::bfloat16::{
+    is_bfloat16_field, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME,
+};
 use snafu::{location, Location};
 
 mod field;
@@ -137,12 +140,7 @@ impl TryFrom<&DataType> for LogicalType {
                 _ => "large_list".to_string(),
             },
             DataType::FixedSizeList(field, len) => {
-                if field
-                    .metadata()
-                    .get("ARROW:extension:name")
-                    .map(|name| name == "lance.bfloat16")
-                    .unwrap_or_default()
-                {
+                if is_bfloat16_field(field) {
                     // Don't want to directly use `blfoat16`, in case a built-in type is added
                     // that isn't identical to our extension type.
                     format!("fixed_size_list:lance.bfloat16:{}", *len)
@@ -220,12 +218,12 @@ impl TryFrom<&LogicalType> for DataType {
                     })?;
 
                     match splits[1] {
-                        "lance.bfloat16" => {
+                        BFLOAT16_EXT_NAME => {
                             let field = ArrowField::new("item", Self::FixedSizeBinary(2), true)
                                 .with_metadata(
                                     [
-                                        ("ARROW:extension:name".into(), "lance.bfloat16".into()),
-                                        ("ARROW:extension:metadata".into(), "".into()),
+                                        (ARROW_EXT_NAME_KEY.into(), BFLOAT16_EXT_NAME.into()),
+                                        (ARROW_EXT_META_KEY.into(), "".into()),
                                     ]
                                     .into(),
                                 );
