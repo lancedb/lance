@@ -168,6 +168,35 @@ def test_index_with_no_centroid_movement(tmp_path):
     sanity_check_vector_index(dataset, "vector")
 
 
+def test_index_with_pq_codebook(tmp_path):
+    tbl = create_table(nvec=1024, ndim=128)
+    dataset = lance.write_dataset(tbl, tmp_path)
+    pq_codebook = np.random.randn(4, 256, 128 // 4).astype(np.float32)
+
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=1,
+        num_sub_vectors=4,
+        ivf_centroids=np.random.randn(1, 128).astype(np.float32),
+        pq_codebook=pq_codebook,
+    )
+    sanity_check_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
+
+    pq_codebook = pa.FixedShapeTensorArray.from_numpy_ndarray(pq_codebook)
+
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=1,
+        num_sub_vectors=4,
+        ivf_centroids=np.random.randn(1, 128).astype(np.float32),
+        pq_codebook=pq_codebook,
+        replace=True,
+    )
+    sanity_check_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
+
+
 @pytest.mark.cuda
 def test_create_index_using_cuda(tmp_path):
     tbl = create_table()
