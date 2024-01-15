@@ -118,7 +118,7 @@ impl IndexCache {
         let key = Self::metadata_key(key, version);
         if let Some(indices) = self.metadata_cache.get(&key) {
             self.cache_stats.record_hit();
-            return Some(indices);
+            Some(indices)
         } else {
             self.cache_stats.record_miss();
             None
@@ -138,8 +138,9 @@ impl IndexCache {
         let misses = self.cache_stats.misses.load(Ordering::Relaxed) as f32;
         // Returns 1.0 if hits + misses == 0 and avoids division by zero.
         if (hits + misses) == 0.0 {
-            return 1.0;
+            1.0
+        } else {
+            hits / (hits + misses)
         }
-        hits / (hits + misses)
     }
 }

@@ -76,7 +76,7 @@ impl IndexRemapper for DatasetIndexRemapper {
                     .any(|frag_idx| affected_frag_ids.contains(&(frag_idx as u64))),
             };
             if needs_remapped {
-                remapped.push(self.remap_index(&index, &mapping).await?);
+                remapped.push(self.remap_index(index, &mapping).await?);
             }
         }
         Ok(remapped)
