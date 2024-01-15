@@ -165,7 +165,7 @@ impl LanceStream {
                 .map_ok(move |reader| scan_batches(reader, read_size))
                 // When we flatten the streams (one stream per fragment), we allow
                 // `fragment_readahead` stream to be read concurrently.
-                .try_flatten_unordered(None)
+                .try_flatten_unordered(fragment_readahead)
                 // We buffer up to `batch_readahead` batches across all streams.
                 .try_buffer_unordered(batch_readahead)
                 .stream_in_current_span()
