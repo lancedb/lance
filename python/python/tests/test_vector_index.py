@@ -337,8 +337,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     if platform.system() == "Windows":
         expected_filepath = expected_filepath.replace("\\", "/")
     expected_statistics = {
-        "index_cache_entry_count": 1,
-        "index_cache_hit_rate": 0,
+        "index_cache_entry_count": 2,
         "index_type": "IVF",
         "uuid": index_uuid,
         "uri": expected_filepath,
@@ -356,15 +355,20 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     }
 
     with pytest.raises(KeyError, match='Index "non-existent_idx" not found'):
+        # increase 1 miss of index_cache.metadata_cache
         assert dataset_with_index.stats.index_stats("non-existent_idx")
     with pytest.raises(KeyError, match='Index "" not found'):
+        # increase 1 miss of index_cache.metadata_cache
         assert dataset_with_index.stats.index_stats("")
     with pytest.raises(TypeError):
         dataset_with_index.stats.index_stats()
 
+    # increase 1 hit of index_cache.metadata_cache
     actual_statistics = dataset_with_index.stats.index_stats("vector_idx")
     partitions = actual_statistics.pop("partitions")
+    hit_rate = actual_statistics.pop("index_cache_hit_rate")
     assert actual_statistics == expected_statistics
+    assert np.isclose(hit_rate, 7 / 11)
 
     assert len(partitions) == 5
     partition_keys = {"index", "length", "offset", "centroid"}
@@ -534,11 +538,11 @@ def test_index_cache_size(tmp_path):
     )
 
     assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 1
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 2
     )
     query_index(indexed_dataset, 1)
     assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 2
+        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 3
     )
     assert (
         indexed_dataset.stats.index_stats("vector_idx")["index_cache_hit_rate"] == 0.5
