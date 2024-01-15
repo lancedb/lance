@@ -22,22 +22,28 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+import torch
+from lance.util import sanity_check_vector_index
 from lance.vector import vec_to_table
 
 
-def create_table(nvec=1000, ndim=128):
+def create_table(nvec=1000, ndim=128, nans=0):
     mat = np.random.randn(nvec, ndim)
-    price = np.random.rand(nvec) * 100
+    if nans > 0:
+        nans_mat = np.empty((nans, ndim))
+        nans_mat[:] = np.nan
+        mat = np.concatenate((mat, nans_mat), axis=0)
+    price = np.random.rand(nvec + nans) * 100
 
     def gen_str(n):
         return "".join(random.choices(string.ascii_letters + string.digits, k=n))
 
-    meta = np.array([gen_str(100) for _ in range(nvec)])
+    meta = np.array([gen_str(100) for _ in range(nvec + nans)])
     tbl = (
         vec_to_table(data=mat)
         .append_column("price", pa.array(price))
         .append_column("meta", pa.array(meta))
-        .append_column("id", pa.array(range(nvec)))
+        .append_column("id", pa.array(range(nvec + nans)))
     )
     return tbl
 
@@ -126,6 +132,40 @@ def test_ann_append(tmp_path):
         assert rs["vector"][0].as_py() == q
 
     print(run(dataset, q=np.array(q), assert_func=func))
+
+
+def test_index_with_nans(tmp_path):
+    # 1024 rows, the entire table should be sampled
+    tbl = create_table(nvec=1000, nans=24)
+
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        accelerator=torch.device("cpu"),
+    )
+    sanity_check_vector_index(dataset, "vector")
+
+
+def test_index_with_no_centroid_movement(tmp_path):
+    # this test makes the centroids essentially [1..]
+    # this makes sure the early stop condition in the index building code
+    # doesn't do divide by zero
+    mat = np.concatenate([np.ones((256, 32))])
+
+    tbl = vec_to_table(data=mat)
+
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=1,
+        num_sub_vectors=4,
+        accelerator=torch.device("cpu"),
+    )
+    sanity_check_vector_index(dataset, "vector")
 
 
 @pytest.mark.cuda

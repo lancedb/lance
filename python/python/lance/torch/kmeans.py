@@ -249,6 +249,16 @@ class KMeans:
             del dists
             del chunk
 
+        # this happens when there are too many NaNs or the data is just the same
+        # vectors repeated over and over. Performance may be bad but we don't
+        # want to crash.
+        if total_dist == 0:
+            logging.warning(
+                "Kmeans::train: total_dist is 0, this is unusual."
+                " This could result in bad performance during search."
+            )
+            raise StopIteration("kmeans: converged")
+
         if abs(total_dist - last_dist) / total_dist < self.tolerance:
             raise StopIteration("kmeans: converged")
 
