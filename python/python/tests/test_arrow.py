@@ -162,6 +162,27 @@ def test_bf16_fixed_size_list_cast():
         assert casted == fsl
 
 
+def test_bf16_roundtrip(tmp_path: Path):
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    values = BFloat16Array.from_numpy(np.random.random(9).astype(bfloat16))
+    vectors = pa.FixedSizeListArray.from_arrays(values, 3)
+    tensors = pa.ExtensionArray.from_storage(
+        pa.fixed_shape_tensor(values.type, [3]), vectors
+    )
+    data = pa.table(
+        {
+            "values": values.slice(0, 3),
+            "vector": vectors,
+            "tensors": tensors,
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    assert ds.schema == data.schema
+    assert ds.to_table() == data
+
+
 def test_roundtrip_take_ext_types(tmp_path: Path):
     tensor_type = pa.fixed_shape_tensor(pa.float32(), [2, 3])
     inner = pa.array([float(x) for x in range(0, 18)], pa.float32())

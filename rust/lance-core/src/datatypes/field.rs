@@ -30,7 +30,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field as ArrowField};
 use async_recursion::async_recursion;
-use lance_arrow::*;
+use lance_arrow::{bfloat16::ARROW_EXT_NAME_KEY, *};
 use snafu::{location, Location};
 
 use super::{Dictionary, LogicalType};
@@ -228,9 +228,7 @@ impl Field {
     }
 
     pub fn extension_name(&self) -> Option<&str> {
-        self.metadata
-            .get("ARROW:extension:name")
-            .map(String::as_str)
+        self.metadata.get(ARROW_EXT_NAME_KEY).map(String::as_str)
     }
 
     pub fn child(&self, name: &str) -> Option<&Self> {
@@ -781,10 +779,7 @@ impl From<&pb::Field> for Field {
             })
             .collect();
         if !field.extension_name.is_empty() {
-            lance_metadata.insert(
-                "ARROW:extension:name".to_string(),
-                field.extension_name.clone(),
-            );
+            lance_metadata.insert(ARROW_EXT_NAME_KEY.to_string(), field.extension_name.clone());
         }
         Self {
             name: field.name.clone(),

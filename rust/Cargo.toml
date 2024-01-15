@@ -111,6 +111,7 @@ tokio = { version = "1.23", features = [
 tracing = "0.1"
 url = "2.3"
 uuid = { version = "1.2", features = ["v4", "serde"] }
+pretty_assertions = "1.4.0"
 
 [profile.bench]
 opt-level = 3
