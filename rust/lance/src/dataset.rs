@@ -69,7 +69,6 @@ use self::fragment::FileFragment;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::{reader_to_stream, write_fragments_internal};
-use super::index::CachedIndexMetadata;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{Fragment, Index, Manifest};
@@ -96,9 +95,6 @@ pub struct Dataset {
     pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) session: Arc<Session>,
-
-    /// Cache index metadadta of a version of the dataset.
-    pub(crate) index_metadata_cache: Arc<futures::lock::Mutex<Option<CachedIndexMetadata>>>,
 }
 
 /// Dataset Version
@@ -336,7 +332,6 @@ impl Dataset {
             base: base_path,
             manifest: Arc::new(manifest),
             session,
-            index_metadata_cache: Arc::new(Default::default()),
         })
     }
 
@@ -464,7 +459,6 @@ impl Dataset {
             base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
-            index_metadata_cache: Arc::new(Default::default()),
         })
     }
 
@@ -730,7 +724,6 @@ impl Dataset {
             base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
-            index_metadata_cache: Arc::new(Default::default()),
         })
     }
 
@@ -3731,10 +3724,10 @@ mod tests {
         // Any transaction, no matter how simple, should trigger the fragment bitmap to be recalculated
         dataset.append(data, None).await.unwrap();
 
-        for idx in dataset.load_indices().await.unwrap() {
+        for idx in dataset.load_indices().await.unwrap().iter() {
             // The corrupt fragment_bitmap does not contain 0 but the
             // restored one should
-            assert!(idx.fragment_bitmap.unwrap().contains(0));
+            assert!(idx.fragment_bitmap.as_ref().unwrap().contains(0));
         }
 
         let mut dataset = dataset.checkout_version(broken_version).await.unwrap();
@@ -3746,8 +3739,8 @@ mod tests {
             .await
             .unwrap();
 
-        for idx in dataset.load_indices().await.unwrap() {
-            assert!(idx.fragment_bitmap.unwrap().contains(0));
+        for idx in dataset.load_indices().await.unwrap().iter() {
+            assert!(idx.fragment_bitmap.as_ref().unwrap().contains(0));
         }
 
         let mut scan = dataset.scan();
