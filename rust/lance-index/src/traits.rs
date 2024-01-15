@@ -45,6 +45,8 @@ pub trait DatasetIndexExt {
 
     /// Read all indices of this Dataset version.
     ///
+    /// The indices are lazy loaded and cached in memory within the [`Dataset`] instance.
+    /// The cache is invalidated when the dataset version (Manifest) is changed.
     async fn load_indices(&self) -> Result<Vec<Index>>;
 
     /// Loads all the indies of a given UUID.
