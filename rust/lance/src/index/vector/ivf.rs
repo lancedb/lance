@@ -285,7 +285,7 @@ impl Index for IVFIndex {
         IndexType::Vector
     }
 
-    fn statistics(&self) -> Result<String> {
+    fn statistics(&self) -> Result<serde_json::Value> {
         let partitions_statistics = self
             .ivf
             .lengths
@@ -303,14 +303,13 @@ impl Index for IVFIndex {
             })
             .collect::<Vec<_>>();
 
-        Ok(serde_json::to_string(&IvfIndexStatistics {
+        Ok(serde_json::to_value(&IvfIndexStatistics {
             index_type: "IVF".to_string(),
             uuid: self.uuid.clone(),
             uri: to_local_path(self.reader.path()),
             metric_type: self.metric_type.to_string(),
             num_partitions: self.ivf.num_partitions(),
-            // TODO: Not ideal that we have to re-parse the JSON here
-            sub_index: serde_json::from_str(&self.sub_index.statistics()?)?,
+            sub_index: self.sub_index.statistics()?,
             partitions: partitions_statistics,
         })?)
     }

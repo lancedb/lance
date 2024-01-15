@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use futures::{stream, StreamExt, TryStreamExt};
+use lance_core::format::pb::metadata;
 use lance_core::format::Fragment;
 use lance_core::io::{
     read_message, read_message_from_buf, read_metadata_offset, reader::read_manifest_indexes,
@@ -31,6 +33,7 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
 pub use lance_index::IndexParams;
 use lance_index::{pb, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
+use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
@@ -346,21 +349,43 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
-    async fn index_statistics(&self, index_name: &str) -> Result<Option<String>> {
-        let index_uuid = self
-            .load_index_by_name(index_name)
-            .await?
-            .map(|idx| idx.uuid.to_string());
-
-        if let Some(index_uuid) = index_uuid {
-            let index_statistics = self
-                .open_generic_index("vector", &index_uuid)
-                .await?
-                .statistics()?;
-            Ok(Some(index_statistics))
-        } else {
-            Ok(None)
+    async fn index_statistics(&self, index_name: &str) -> Result<serde_json::Value> {
+        let metadatas = self.load_indices().await?;
+        if metadatas.is_empty() {
+            return Err(Error::IndexNotFound {
+                identity: format!("name={}", index_name),
+                location: location!(),
+            });
         }
+
+        let column = self
+            .schema()
+            .field_by_id(metadatas[0].fields[0])
+            .map(|f| f.name.as_str())
+            .ok_or(Error::IndexNotFound {
+                identity: index_name.to_string(),
+                location: location!(),
+            })?;
+
+        let delta_stats = stream::iter(metadatas.iter())
+            .then(|m| async move {
+                self.open_generic_index(column, &m.uuid.to_string())
+                    .await
+                    .map(|idx| idx.statistics())
+            })
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut stats = json!({
+            "index_type": "IVF_PQ",
+            "index_name": index_name,
+            "num_deltas": metadatas.len(),
+            "deltas": delta_stats,
+        });
+
+        Ok(stats)
     }
 
     async fn count_unindexed_rows(&self, index_uuid: &str) -> Result<Option<usize>> {
@@ -395,8 +420,10 @@ impl DatasetIndexExt for Dataset {
 }
 
 /// A trait for internal dataset utilities
+///
+/// Internal use only. No API stability guarantees.
 #[async_trait]
-pub(crate) trait DatasetIndexInternalExt {
+pub(crate) trait DatasetIndexInternalExt: DatasetIndexExt {
     /// Opens an index (scalar or vector) as a generic index
     async fn open_generic_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn Index>>;
     /// Opens the requested scalar index
@@ -405,6 +432,9 @@ pub(crate) trait DatasetIndexInternalExt {
     async fn open_vector_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn VectorIndex>>;
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
+
+    /// Find the unindexed fragments for a given index, speicified by its metadata name.
+    async fn unindexed_fragments(&self, index_name: &str) -> Result<Vec<Fragment>>;
 }
 
 #[async_trait]
@@ -492,6 +522,19 @@ impl DatasetIndexInternalExt for Dataset {
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,
         })
+    }
+
+    async fn unindexed_fragments(&self, index_name: &str) -> Result<Vec<Fragment>> {
+        todo!()
+        // let index = self
+        //     .load_index_by_name(index_name)
+        //     .await?
+        //     .ok_or_else(|| Error::Index {
+        //         message: format!("Index with name {} does not exist", index_name),
+        //         location: location!(),
+        //     })?;
+
+        // unindexed_fragments(&index, self).await
     }
 }
 

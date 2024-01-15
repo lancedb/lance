@@ -44,8 +44,8 @@ pub trait Index: Send + Sync {
     /// Cast to [Index]
     fn as_index(self: Arc<Self>) -> Arc<dyn Index>;
 
-    /// Retrieve index statistics as a JSON string
-    fn statistics(&self) -> Result<String>;
+    /// Retrieve index statistics as a JSON Value
+    fn statistics(&self) -> Result<serde_json::Value>;
 
     /// Get the type of the index
     fn index_type(&self) -> IndexType;

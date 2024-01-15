@@ -2456,23 +2456,13 @@ mod tests {
         assert_eq!(fragment_bitmap.len(), 1);
         assert!(fragment_bitmap.contains(0));
 
-        let actual_statistics: serde_json::value::Value = serde_json::from_str(
-            &dataset
-                .index_statistics("embeddings_idx")
-                .await
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+        let actual_statistics = dataset.index_statistics("embeddings_idx").await.unwrap();
         let actual_statistics = actual_statistics.as_object().unwrap();
         assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF");
         assert_eq!(actual_statistics["metric_type"].as_str().unwrap(), "l2");
         assert_eq!(actual_statistics["num_partitions"].as_i64().unwrap(), 10);
 
-        assert_eq!(
-            dataset.index_statistics("non-existent_idx").await.unwrap(),
-            None
-        );
+        assert!(dataset.index_statistics("non-existent_idx").await.is_err());
         assert_eq!(dataset.index_statistics("").await.unwrap(), None);
 
         // Overwrite should invalidate index

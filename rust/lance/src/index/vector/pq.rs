@@ -36,7 +36,7 @@ use lance_index::{
 };
 use lance_linalg::distance::MetricType;
 use roaring::RoaringBitmap;
-use serde::Serialize;
+use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -108,15 +108,6 @@ impl PQIndex {
     }
 }
 
-#[derive(Serialize)]
-pub struct PQIndexStatistics {
-    index_type: String,
-    nbits: u32,
-    num_sub_vectors: usize,
-    dimension: usize,
-    metric_type: String,
-}
-
 #[async_trait]
 impl Index for PQIndex {
     fn as_any(&self) -> &dyn Any {
@@ -131,14 +122,14 @@ impl Index for PQIndex {
         IndexType::Vector
     }
 
-    fn statistics(&self) -> Result<String> {
-        Ok(serde_json::to_string(&PQIndexStatistics {
-            index_type: "PQ".to_string(),
-            nbits: self.pq.num_bits(),
-            num_sub_vectors: self.pq.num_sub_vectors(),
-            dimension: self.pq.dimension(),
-            metric_type: self.metric_type.to_string(),
-        })?)
+    fn statistics(&self) -> Result<serde_json::Value> {
+        Ok(json!({
+            "index_type": "PQ",
+            "nbits": self.pq.num_bits(),
+            "num_sub_vectors": self.pq.num_sub_vectors(),
+            "dimension": self.pq.dimension(),
+            "metric_type": self.metric_type.to_string(),
+        }))
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {

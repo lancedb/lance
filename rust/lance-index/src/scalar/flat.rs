@@ -25,7 +25,6 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use lance_core::{format::RowAddress, Result};
 use roaring::RoaringBitmap;
-use serde::Serialize;
 
 use crate::{Index, IndexType};
 
@@ -133,11 +132,6 @@ impl BTreeSubIndex for FlatIndexMetadata {
     }
 }
 
-#[derive(Serialize)]
-struct FlatStatistics {
-    num_values: u32,
-}
-
 #[async_trait]
 impl Index for FlatIndex {
     fn as_any(&self) -> &dyn Any {
@@ -152,11 +146,10 @@ impl Index for FlatIndex {
         IndexType::Scalar
     }
 
-    fn statistics(&self) -> Result<String> {
-        serde_json::to_string(&FlatStatistics {
-            num_values: self.data.num_rows() as u32,
-        })
-        .map_err(|err| err.into())
+    fn statistics(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "num_values": self.data.num_rows(),
+        }))
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
