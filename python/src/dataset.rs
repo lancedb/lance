@@ -700,6 +700,17 @@ impl Dataset {
                         pq_params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
                     };
 
+                    if let Some(c) = kwargs.get_item("pq_codebook")? {
+                        let batch = RecordBatch::from_pyarrow(c)?;
+                        if "_pq_codebook" != batch.schema().field(0).name() {
+                            return Err(PyValueError::new_err(
+                                "Expected '_pq_codebook' as the first column name.",
+                            ));
+                        }
+                        let codebook = as_fixed_size_list_array(batch.column(0));
+                        pq_params.codebook = Some(codebook.values().clone())
+                    };
+
                     if let Some(o) = kwargs.get_item("max_opq_iterations")? {
                         pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
                     };
