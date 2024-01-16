@@ -68,7 +68,7 @@ pub trait DatasetIndexExt {
     /// Returns
     /// -------
     /// - `Ok(indices)`: if the index exists, returns the index.
-    /// - `Ok(empty)`: if the index does not exist.
+    /// - `Ok(vec![])`: if the index does not exist.
     /// - `Err(e)`: if there is an error loading indices.
     ///
     async fn load_indices_by_name(&self, name: &str) -> Result<Vec<Index>> {
@@ -88,5 +88,7 @@ pub trait DatasetIndexExt {
     async fn optimize_indices(&mut self) -> Result<()>;
 
     /// Find index with a given index_name and return its serialized statistics.
-    async fn index_statistics(&self, index_name: &str) -> Result<serde_json::Value>;
+    ///
+    /// If the index does not exist, return Error.
+    async fn index_statistics(&self, index_name: &str) -> Result<String>;
 }

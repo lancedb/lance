@@ -348,7 +348,7 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
-    async fn index_statistics(&self, index_name: &str) -> Result<serde_json::Value> {
+    async fn index_statistics(&self, index_name: &str) -> Result<String> {
         let metadatas = self.load_indices_by_name(index_name).await?;
         if metadatas.is_empty() {
             return Err(Error::IndexNotFound {
@@ -367,38 +367,44 @@ impl DatasetIndexExt for Dataset {
             })?;
 
         // Open all delta indices
-        let deltas = stream::iter(metadatas.iter())
+        let indices = stream::iter(metadatas.iter())
             .then(|m| async move { self.open_generic_index(column, &m.uuid.to_string()).await })
             .try_collect::<Vec<_>>()
             .await?;
 
         // Stastistics for each delta index.
-        let delta_stats = deltas
+        let indices_stats = indices
             .iter()
             .map(|idx| idx.statistics())
             .collect::<Result<Vec<_>>>()?;
 
         let unindexed_fragments = self.unindexed_fragments(index_name).await?;
-        let num_unindexed_rows = unindexed_fragments
-            .iter()
-            .map(|f| f.num_rows().unwrap_or_default())
-            .sum::<usize>();
+        let mut num_unindexed_rows = 0;
+        for f in unindexed_fragments.iter() {
+            num_unindexed_rows += f.num_rows().ok_or(Error::Index {
+                message: format!("fragment {} has no rows", f.id),
+                location: location!(),
+            })?;
+        }
         let num_unindexed_fragments = unindexed_fragments.len();
         let num_indexed_fragments = self.fragments().len() - num_unindexed_fragments;
         let num_indexed_rows = self.count_rows().await? - num_unindexed_rows;
 
         let stats = json!({
-            "index_type": delta_stats[0]["index_type"],
+            "index_type": indices_stats[0]["index_type"],
             "name": index_name,
-            "num_deltas": metadatas.len(),
-            "deltas": delta_stats,
+            "num_indices": metadatas.len(),
+            "indices": indices_stats,
             "num_indexed_fragments": num_indexed_fragments,
             "num_indexed_rows": num_indexed_rows,
             "num_unindexed_fragments": num_unindexed_fragments,
             "num_unindexed_rows": num_unindexed_rows,
         });
 
-        Ok(stats)
+        serde_json::to_string(&stats).map_err(|e| Error::Index {
+            message: format!("Failed to serialize index statistics: {}", e),
+            location: location!(),
+        })
     }
 }
 
@@ -639,7 +645,8 @@ mod tests {
             .await
             .unwrap();
 
-        let stats = dataset.index_statistics("vec_idx").await.unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
         assert_eq!(stats["num_unindexed_rows"], 0);
         assert_eq!(stats["num_indexed_rows"], 512);
 
@@ -654,7 +661,8 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema);
         dataset.append(reader, None).await.unwrap();
 
-        let stats = dataset.index_statistics("vec_idx").await.unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
         assert_eq!(stats["num_unindexed_rows"], 512);
         assert_eq!(stats["num_indexed_rows"], 512);
     }

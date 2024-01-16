@@ -2456,11 +2456,13 @@ mod tests {
         assert_eq!(fragment_bitmap.len(), 1);
         assert!(fragment_bitmap.contains(0));
 
-        let actual_statistics = dataset.index_statistics("embeddings_idx").await.unwrap();
+        let actual_statistics: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("embeddings_idx").await.unwrap())
+                .unwrap();
         let actual_statistics = actual_statistics.as_object().unwrap();
         assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF");
 
-        let deltas = actual_statistics["deltas"].as_array().unwrap();
+        let deltas = actual_statistics["indices"].as_array().unwrap();
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0]["metric_type"].as_str().unwrap(), "l2");
         assert_eq!(deltas[0]["num_partitions"].as_i64().unwrap(), 10);
