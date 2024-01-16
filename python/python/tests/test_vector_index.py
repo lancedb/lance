@@ -181,7 +181,7 @@ def test_index_with_pq_codebook(tmp_path):
         ivf_centroids=np.random.randn(1, 128).astype(np.float32),
         pq_codebook=pq_codebook,
     )
-    sanity_check_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
+    validate_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
 
     pq_codebook = pa.FixedShapeTensorArray.from_numpy_ndarray(pq_codebook)
 
@@ -194,7 +194,7 @@ def test_index_with_pq_codebook(tmp_path):
         pq_codebook=pq_codebook,
         replace=True,
     )
-    sanity_check_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
+    validate_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
 
 
 @pytest.mark.cuda
