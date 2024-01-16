@@ -19,6 +19,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as pa_ds
 import pytest
+from lance.util import validate_vector_index
 from lance.vector import vec_to_table
 
 
@@ -153,7 +154,6 @@ def test_create_index(tmp_path):
 def test_create_index_shuffle_params(tmp_path):
     dataset = _create_dataset(str(tmp_path / "test.lance"), num_batches=10)
 
-    # all good
     dataset = dataset.create_index(
         "emb",
         "IVF_PQ",
@@ -163,19 +163,7 @@ def test_create_index_shuffle_params(tmp_path):
         shuffle_partition_concurrency=10,
     )
 
-    embs = dataset.to_table()["emb"].to_numpy(zero_copy_only=False)
-
-    for emb in embs:
-        distance = dataset.to_table(
-            nearest={
-                "column": "emb",
-                "q": emb,
-                "k": 1,
-                "nprobes": 1,
-                "refine_factor": 5,
-            }
-        )["_distance"].to_pylist()[0]
-        assert abs(distance) < 1e-6
+    validate_vector_index(dataset, "emb")
 
 
 def _create_dataset(uri, num_batches=1):

@@ -178,7 +178,7 @@ class KMeans:
         return self._kmeans.predict(arr)
 
 
-def sanity_check_vector_index(
+def validate_vector_index(
     dataset,
     column: str,
     refine_factor: int = 5,
@@ -187,6 +187,7 @@ def sanity_check_vector_index(
 ):
     """Run in-sample queries and make sure that the recall
     for k=1 is very high (should be near 100%)
+
     Parameters
     ----------
     dataset: LanceDataset

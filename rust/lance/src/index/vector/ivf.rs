@@ -51,6 +51,7 @@ use lance_index::{
 };
 use lance_linalg::distance::{Cosine, Dot, MetricType, L2};
 use log::{debug, info};
+use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -220,6 +221,7 @@ impl IVFIndex {
             pq_index.pq.num_sub_vectors(),
             10000,
             2,
+            None,
         )
         .await?;
         let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
@@ -613,10 +615,32 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
     Ok(field)
 }
 
-fn sanity_check_ivf_param(params: &IvfBuildParams) -> Result<()> {
-    if params.precomputed_partitons_file.is_some() && params.centroids.is_none() {
+fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
+    if ivf.precomputed_partitons_file.is_some() && ivf.centroids.is_none() {
         return Err(Error::Index {
             message: "precomputed_partitions_file requires centroids to be set".to_string(),
+            location: location!(),
+        });
+    }
+
+    if ivf.precomputed_shuffle_buffers.is_some()
+        && (
+            // If either centroids or codebook is not set, precomputed_shuffle can't be used.
+            ivf.centroids.is_none() || pq.codebook.is_none()
+        )
+    {
+        return Err(Error::Index {
+            message: "precomputed_shuffle_buffers requires centroids AND codebook to be set"
+                .to_string(),
+            location: location!(),
+        });
+    }
+
+    if ivf.precomputed_shuffle_buffers.is_some() && ivf.precomputed_partitons_file.is_some() {
+        return Err(Error::Index {
+            message:
+                "precomputed_shuffle_buffers and precomputed_partitons_file are mutually exclusive"
+                    .to_string(),
             location: location!(),
         });
     }
@@ -634,7 +658,7 @@ pub async fn build_ivf_pq_index(
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
 ) -> Result<()> {
-    sanity_check_ivf_param(ivf_params)?;
+    sanity_check_params(ivf_params, pq_params)?;
 
     info!(
         "Building vector index: IVF{},{}PQ{}, metric={}",
@@ -830,6 +854,7 @@ pub async fn build_ivf_pq_index(
         precomputed_partitions,
         ivf_params.shuffle_partition_batches,
         ivf_params.shuffle_partition_concurrency,
+        ivf_params.precomputed_shuffle_buffers.clone(),
     )
     .await
 }
@@ -969,6 +994,7 @@ async fn write_index_file(
     precomputed_partitons: Option<HashMap<u64, u32>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
+    precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
     let object_store = dataset.object_store();
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
@@ -987,6 +1013,7 @@ async fn write_index_file(
         precomputed_partitons,
         shuffle_partition_batches,
         shuffle_partition_concurrency,
+        precomputed_shuffle_buffers,
     )
     .await?;
     info!("Built IVF partitions: {}s", start.elapsed().as_secs_f32());

@@ -23,7 +23,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 import torch
-from lance.util import sanity_check_vector_index
+from lance.util import validate_vector_index
 from lance.vector import vec_to_table
 
 
@@ -146,7 +146,7 @@ def test_index_with_nans(tmp_path):
         num_sub_vectors=16,
         accelerator=torch.device("cpu"),
     )
-    sanity_check_vector_index(dataset, "vector")
+    validate_vector_index(dataset, "vector")
 
 
 def test_index_with_no_centroid_movement(tmp_path):
@@ -165,7 +165,7 @@ def test_index_with_no_centroid_movement(tmp_path):
         num_sub_vectors=4,
         accelerator=torch.device("cpu"),
     )
-    sanity_check_vector_index(dataset, "vector")
+    validate_vector_index(dataset, "vector")
 
 
 def test_index_with_pq_codebook(tmp_path):
@@ -639,3 +639,23 @@ def test_vector_with_nans(tmp_path: Path):
     )
     assert len(tbl) == TOTAL - 1
     assert 1 not in tbl["_rowid"].to_numpy(), "Row with ID 1 is not in the index"
+
+
+def test_validate_vector_index(tmp_path: Path):
+    # make sure the sanity check is correctly catchting issues
+    ds = lance.write_dataset(create_table(), tmp_path)
+    validate_vector_index(ds, "vector", sample_size=100)
+
+    called = False
+
+    def direct_first_call_to_new_table(*args, **kwargs):
+        nonlocal called
+        if called:
+            return ds.to_table(*args, **kwargs)
+        called = True
+        return create_table()
+
+    # return a new random table so things fail
+    ds.sample = direct_first_call_to_new_table
+    with pytest.raises(ValueError, match="Vector index failed sanity check"):
+        validate_vector_index(ds, "vector", sample_size=100)

@@ -71,7 +71,8 @@ fn get_temp_dir() -> Result<Path> {
 ///   Result<Vec<impl Stream<Item = Result<RecordBatch>>>>: a vector of streams
 ///   of shuffled partitioned data. Each stream corresponds to a partition and
 ///   is sorted within the stream. Consumer of these streams is expected to merge
-///   the streams into a single stream by k-list mergo algo.
+///   the streams into a single stream by k-list merge algo.
+///
 #[allow(clippy::too_many_arguments)]
 pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
@@ -82,57 +83,9 @@ pub async fn shuffle_dataset(
     num_sub_vectors: usize,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
+    precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
     let column: Arc<str> = column.into();
-    let precomputed_partitions = precomputed_partitions.map(Arc::new);
-    let stream = data
-        .zip(repeat_with(move || ivf.clone()))
-        .map(move |(b, ivf)| {
-            let col_ref = column.clone();
-
-            // If precomputed_partitions map is provided, use it
-            // for fast partitions.
-            let partition_map = precomputed_partitions
-                .as_ref()
-                .cloned()
-                .unwrap_or(Arc::new(HashMap::new()));
-
-            tokio::task::spawn(async move {
-                let batch = b?;
-
-                let part_ids = if !partition_map.is_empty() {
-                    let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
-                        message: "column does not exist".to_string(),
-                        location: location!(),
-                    })?;
-                    let part_ids = row_ids
-                        .as_primitive::<UInt64Type>()
-                        .values()
-                        .iter()
-                        .filter_map(|row_id| partition_map.get(row_id).copied())
-                        .collect::<Vec<_>>();
-                    Some(UInt32Array::from(part_ids))
-                } else {
-                    None
-                };
-
-                ivf.partition_transform(&batch, col_ref.as_ref(), part_ids)
-                    .await
-            })
-        })
-        .buffer_unordered(num_cpus::get())
-        .map(|res| match res {
-            Ok(Ok(batch)) => Ok(batch),
-            Ok(Err(err)) => Err(Error::IO {
-                message: err.to_string(),
-                location: location!(),
-            }),
-            Err(err) => Err(Error::IO {
-                message: err.to_string(),
-                location: location!(),
-            }),
-        })
-        .boxed();
 
     // TODO: dynamically detect schema from the transforms.
     let schema = Arc::new(arrow_schema::Schema::new(vec![
@@ -148,28 +101,100 @@ pub async fn shuffle_dataset(
         ),
     ]));
 
-    let stream = lance_core::io::RecordBatchStreamAdapter::new(schema.clone(), stream);
+    // step 1: either use precomputed shuffle files or write shuffle data to a file
+    let shuffler = if let Some((path, buffers)) = precomputed_shuffle_buffers {
+        let mut shuffler = IvfShuffler::try_new(
+            num_partitions,
+            num_sub_vectors,
+            Some(path),
+            Schema::try_from(schema.as_ref())?,
+        )?;
+        unsafe {
+            shuffler.set_unsorted_buffers(&buffers);
+        }
 
-    let mut shuffler = IvfShuffler::try_new(
-        num_partitions,
-        num_sub_vectors,
-        None,
-        Schema::try_from(schema.as_ref())?,
-    )?;
+        shuffler
+    } else {
+        let mut shuffler = IvfShuffler::try_new(
+            num_partitions,
+            num_sub_vectors,
+            None,
+            Schema::try_from(schema.as_ref())?,
+        )?;
 
-    let start = std::time::Instant::now();
-    shuffler.write_unsorted_stream(stream).await?;
-    info!("wrote raw stream: {:?}", start.elapsed());
+        let precomputed_partitions = precomputed_partitions.map(Arc::new);
+        let stream = data
+            .zip(repeat_with(move || ivf.clone()))
+            .map(move |(b, ivf)| {
+                let col_ref = column.clone();
 
+                // If precomputed_partitions map is provided, use it
+                // for fast partitions.
+                let partition_map = precomputed_partitions
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or(Arc::new(HashMap::new()));
+
+                tokio::task::spawn(async move {
+                    let batch = b?;
+
+                    let part_ids = if !partition_map.is_empty() {
+                        let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
+                            message: "column does not exist".to_string(),
+                            location: location!(),
+                        })?;
+                        let part_ids = row_ids
+                            .as_primitive::<UInt64Type>()
+                            .values()
+                            .iter()
+                            .filter_map(|row_id| partition_map.get(row_id).copied())
+                            .collect::<Vec<_>>();
+                        Some(UInt32Array::from(part_ids))
+                    } else {
+                        None
+                    };
+
+                    ivf.partition_transform(&batch, col_ref.as_ref(), part_ids)
+                        .await
+                })
+            })
+            .buffer_unordered(num_cpus::get())
+            .map(|res| match res {
+                Ok(Ok(batch)) => Ok(batch),
+                Ok(Err(err)) => Err(Error::IO {
+                    message: err.to_string(),
+                    location: location!(),
+                }),
+                Err(err) => Err(Error::IO {
+                    message: err.to_string(),
+                    location: location!(),
+                }),
+            })
+            .boxed();
+
+        let stream = lance_core::io::RecordBatchStreamAdapter::new(schema.clone(), stream);
+
+        let start = std::time::Instant::now();
+        shuffler.write_unsorted_stream(stream).await?;
+        info!("wrote unstored stream in {:?} seconds", start.elapsed());
+
+        shuffler
+    };
+
+    // step 2: stream in the shuffle data in chunks and write sorted chuncks out
     let start = std::time::Instant::now();
     let partition_files = shuffler
         .write_partitioned_shuffles(shuffle_partition_batches, shuffle_partition_concurrency)
         .await?;
-    info!("counted partition sizes: {:?}", start.elapsed());
+    info!("counted partition sizes in {:?} seconds", start.elapsed());
 
+    // step 3: load the sorted chuncks, consumers are expect to be responsible for merging the streams
     let start = std::time::Instant::now();
     let stream = shuffler.load_partitioned_shuffles(partition_files).await?;
-    info!("merged partitioned shuffles: {:?}", start.elapsed());
+    info!(
+        "merged partitioned shuffles in {:?} seconds",
+        start.elapsed()
+    );
 
     Ok(stream)
 }

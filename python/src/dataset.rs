@@ -42,9 +42,10 @@ use lance_index::{
     DatasetIndexExt, IndexParams, IndexType,
 };
 use lance_linalg::distance::MetricType;
+use object_store::path::Path;
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
-use pyo3::types::PySet;
+use pyo3::types::{PyList, PySet};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
@@ -730,15 +731,30 @@ impl Dataset {
                         ivf_params.precomputed_partitons_file = Some(f.to_string());
                     };
 
-                    if let Some(o) = kwargs.get_item("shuffle_partition_batches")? {
-                        ivf_params.shuffle_partition_batches =
-                            PyAny::downcast::<PyInt>(o)?.extract()?;
-                    };
-
-                    if let Some(o) = kwargs.get_item("shuffle_partition_concurrency")? {
-                        ivf_params.shuffle_partition_concurrency =
-                            PyAny::downcast::<PyInt>(o)?.extract()?;
-                    };
+                    match (
+                        kwargs.get_item("precomputed_shuffle_buffers")?,
+                        kwargs.get_item("precomputed_shuffle_buffers_path")?
+                    ) {
+                        (Some(l), Some(p)) => {
+                            let path = Path::parse(p.to_string()).map_err(|e| {
+                                PyValueError::new_err(format!(
+                                    "Failed to parse precomputed_shuffle_buffers_path: {}",
+                                    e
+                                ))
+                            })?;
+                            let list = PyAny::downcast::<PyList>(l)?
+                                .iter()
+                                .map(|f| f.to_string())
+                                .collect();
+                            ivf_params.precomputed_shuffle_buffers = Some((path, list));
+                        },
+                        (None, None) => {},
+                        _ => {
+                            return Err(PyValueError::new_err(
+                                "precomputed_shuffle_buffers and precomputed_shuffle_buffers_path must be specified together."
+                            ))
+                        }
+                    }
                 }
                 Box::new(VectorIndexParams::with_ivf_pq_params(
                     m_type, ivf_params, pq_params,
