@@ -394,7 +394,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     assert actual_statistics["num_indexed_rows"] == 1000
     assert actual_statistics["num_unindexed_rows"] == 0
 
-    idx_stats = actual_statistics["deltas"][0]
+    idx_stats = actual_statistics["indices"][0]
     partitions = idx_stats.pop("partitions")
     idx_stats.pop("centroids")
     assert idx_stats == expected_statistics

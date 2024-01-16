@@ -206,8 +206,7 @@ impl Dataset {
 
     /// Get index statistics
     fn index_statistics(&self, index_name: String) -> PyResult<String> {
-        let index_statistics = RT
-            .runtime
+        RT.runtime
             .block_on(self.ds.index_statistics(&index_name))
             .map_err(|err| match err {
                 lance::Error::IndexNotFound { .. } => {
@@ -217,9 +216,7 @@ impl Dataset {
                     "Failed to get index statistics for index {}: {}",
                     index_name, err
                 )),
-            })?;
-        serde_json::to_string(&index_statistics)
-            .map_err(|err| PyValueError::new_err(err.to_string()))
+            })
     }
 
     /// Load index metadata
