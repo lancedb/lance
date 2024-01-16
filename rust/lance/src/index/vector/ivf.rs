@@ -288,15 +288,13 @@ fn centroids_to_vectors(centroids: &FixedSizeListArray) -> Result<Vec<Vec<f32>>>
                         .iter()
                         .map(|v| *v as f32)
                         .collect::<Vec<_>>()),
-                    _ => {
-                        return Err(Error::Index {
-                            message: format!(
-                                "IVF centroids must be FixedSizeList of floating number, got: {}",
-                                row.data_type()
-                            ),
-                            location: location!(),
-                        });
-                    }
+                    _ => Err(Error::Index {
+                        message: format!(
+                            "IVF centroids must be FixedSizeList of floating number, got: {}",
+                            row.data_type()
+                        ),
+                        location: location!(),
+                    }),
                 }
             } else {
                 Err(Error::Index {
@@ -332,7 +330,7 @@ impl Index for IVFIndex {
 
         let centroid_vecs = centroids_to_vectors(&self.ivf.centroids)?;
 
-        Ok(serde_json::to_value(&IvfIndexStatistics {
+        Ok(serde_json::to_value(IvfIndexStatistics {
             index_type: "IVF".to_string(),
             uuid: self.uuid.clone(),
             uri: to_local_path(self.reader.path()),
