@@ -22,7 +22,7 @@ use std::{
 
 use arrow_arith::numeric::sub;
 use arrow_array::{
-    cast::{as_primitive_array, as_struct_array, AsArray},
+    cast::{as_struct_array, AsArray},
     types::{Float16Type, Float32Type, Float64Type},
     Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
 };
@@ -266,6 +266,46 @@ pub struct IvfIndexStatistics {
     num_partitions: usize,
     sub_index: serde_json::Value,
     partitions: Vec<IvfIndexPartitionStatistics>,
+    centroids: Vec<Vec<f32>>,
+}
+
+fn centroids_to_vectors(centroids: &FixedSizeListArray) -> Result<Vec<Vec<f32>>> {
+    centroids
+        .iter()
+        .map(|v| {
+            if let Some(row) = v {
+                match row.data_type() {
+                    DataType::Float16 => Ok(row
+                        .as_primitive::<Float16Type>()
+                        .values()
+                        .iter()
+                        .map(|v| v.to_f32())
+                        .collect::<Vec<_>>()),
+                    DataType::Float32 => Ok(row.as_primitive::<Float32Type>().values().to_vec()),
+                    DataType::Float64 => Ok(row
+                        .as_primitive::<Float64Type>()
+                        .values()
+                        .iter()
+                        .map(|v| *v as f32)
+                        .collect::<Vec<_>>()),
+                    _ => {
+                        return Err(Error::Index {
+                            message: format!(
+                                "IVF centroids must be FixedSizeList of floating number, got: {}",
+                                row.data_type()
+                            ),
+                            location: location!(),
+                        });
+                    }
+                }
+            } else {
+                Err(Error::Index {
+                    message: "Invalid centroid".to_string(),
+                    location: location!(),
+                })
+            }
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -287,13 +327,10 @@ impl Index for IVFIndex {
             .ivf
             .lengths
             .iter()
-            .enumerate()
-            .map(|(i, &len)| {
-                let centroid = self.ivf.centroids.value(i);
-                let centroid_arr: &Float32Array = as_primitive_array(centroid.as_ref());
-                IvfIndexPartitionStatistics { length: len }
-            })
+            .map(|&len| IvfIndexPartitionStatistics { length: len })
             .collect::<Vec<_>>();
+
+        let centroid_vecs = centroids_to_vectors(&self.ivf.centroids)?;
 
         Ok(serde_json::to_value(&IvfIndexStatistics {
             index_type: "IVF".to_string(),
@@ -303,6 +340,7 @@ impl Index for IVFIndex {
             num_partitions: self.ivf.num_partitions(),
             sub_index: self.sub_index.statistics()?,
             partitions: partitions_statistics,
+            centroids: centroid_vecs,
         })?)
     }
 

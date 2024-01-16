@@ -2459,11 +2459,14 @@ mod tests {
         let actual_statistics = dataset.index_statistics("embeddings_idx").await.unwrap();
         let actual_statistics = actual_statistics.as_object().unwrap();
         assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF");
-        assert_eq!(actual_statistics["metric_type"].as_str().unwrap(), "l2");
-        assert_eq!(actual_statistics["num_partitions"].as_i64().unwrap(), 10);
+
+        let deltas = actual_statistics["deltas"].as_array().unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0]["metric_type"].as_str().unwrap(), "l2");
+        assert_eq!(deltas[0]["num_partitions"].as_i64().unwrap(), 10);
 
         assert!(dataset.index_statistics("non-existent_idx").await.is_err());
-        assert_eq!(dataset.index_statistics("").await.unwrap(), None);
+        assert!(dataset.index_statistics("").await.is_err());
 
         // Overwrite should invalidate index
         let write_params = WriteParams {
@@ -2512,15 +2515,12 @@ mod tests {
             .await
             .unwrap();
 
-        let index = dataset
-            .load_index_by_name(&index_name)
-            .await
-            .unwrap()
-            .unwrap();
+        let indices = dataset.load_indices_by_name(&index_name).await.unwrap();
 
-        assert_eq!(index.dataset_version, 1);
-        assert_eq!(index.fields, vec![0]);
-        assert_eq!(index.name, index_name);
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].dataset_version, 1);
+        assert_eq!(indices[0].fields, vec![0]);
+        assert_eq!(indices[0].name, index_name);
 
         dataset.index_statistics(&index_name).await.unwrap();
     }
