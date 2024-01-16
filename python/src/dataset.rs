@@ -211,7 +211,7 @@ impl Dataset {
             .block_on(self.ds.index_statistics(&index_name))
             .map_err(|err| match err {
                 lance::Error::IndexNotFound { .. } => {
-                    return PyKeyError::new_err(format!("Index \"{}\" not found", index_name))
+                    PyKeyError::new_err(format!("Index \"{}\" not found", index_name))
                 }
                 _ => PyIOError::new_err(format!(
                     "Failed to get index statistics for index {}: {}",
