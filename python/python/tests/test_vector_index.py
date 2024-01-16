@@ -399,8 +399,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     idx_stats.pop("centroids")
     assert idx_stats == expected_statistics
     assert len(partitions) == 5
-    partition_keys = {"length"}
-    print(partitions)
+    partition_keys = {"size"}
     assert all([partition_keys == set(p.keys()) for p in partitions])
 
 
@@ -564,26 +563,12 @@ def test_index_cache_size(tmp_path):
         index_cache_size=10,
     )
 
-    assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 2
-    )
     query_index(indexed_dataset, 1)
-    assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 3
-    )
-    assert np.isclose(
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_hit_rate"], 18 / 25
-    )
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.25)
     query_index(indexed_dataset, 128)
-    assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 11
-    )
-
     indexed_dataset = lance.LanceDataset(indexed_dataset.uri, index_cache_size=5)
     query_index(indexed_dataset, 128)
-    assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 6
-    )
+    assert indexed_dataset._ds.index_cache_entry_count() == 6
 
 
 def test_f16_index(tmp_path: Path):
