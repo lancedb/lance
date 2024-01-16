@@ -25,12 +25,14 @@ use lance_core::io::{
     read_message, read_message_from_buf, read_metadata_offset, reader::read_manifest_indexes,
     Reader,
 };
+use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
 pub use lance_index::IndexParams;
 use lance_index::{pb, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
+use log::warn;
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
@@ -294,13 +296,13 @@ impl DatasetIndexExt for Dataset {
     }
 
     #[instrument(skip_all)]
-    async fn optimize_indices(&mut self, options: OptimizeOptions) -> Result<()> {
+    async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
         let dataset = Arc::new(self.clone());
         // Append index
         let indices = self.load_indices().await?;
 
-        // Collect indices by column.
-        let mut column_to_indices_map: HashMap<i32, Vec<&IndexMetadata>> = HashMap::new();
+        // Collect indices by index name.
+        let mut column_to_indices_map: HashMap<String, Vec<&IndexMetadata>> = HashMap::new();
         for idx in indices.iter() {
             if idx.fields.len() != 1 {
                 warn!(
@@ -309,8 +311,10 @@ impl DatasetIndexExt for Dataset {
                 );
                 continue;
             }
-            let field_id = idx.fields[0];
-            column_to_indices_map.entry(field_id).or_default().push(idx);
+            column_to_indices_map
+                .entry(idx.name.to_owned())
+                .or_default()
+                .push(idx);
         }
 
         // Sort indices by its creating order.
@@ -321,17 +325,7 @@ impl DatasetIndexExt for Dataset {
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
 
-        for (&field_id, indices) in column_to_indices_map.iter() {
-            let _ = self
-                .schema()
-                .field_by_id(field_id)
-                .ok_or_else(|| Error::Index {
-                    message: format!(
-                        "Index referenced a field with id {field_id} which did not exist in the schema"
-                    ),
-                    location: location!(),
-                })?;
-
+        for indices in column_to_indices_map.values() {
             let Some((new_id, removed, new_frag_ids)) =
                 append_index(dataset.clone(), &indices, &options).await?
             else {
