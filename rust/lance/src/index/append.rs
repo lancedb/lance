@@ -22,7 +22,6 @@ use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
-use crate::dataset::index::unindexed_fragments;
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::Dataset;
 use crate::index::vector::ivf::IVFIndex;
@@ -36,7 +35,7 @@ pub async fn append_index(
     dataset: Arc<Dataset>,
     old_index: &IndexMetadata,
 ) -> Result<Option<(Uuid, Option<RoaringBitmap>)>> {
-    let unindexed = unindexed_fragments(old_index, dataset.as_ref()).await?;
+    let unindexed = dataset.unindexed_fragments(&old_index.name).await?;
     if unindexed.is_empty() {
         return Ok(None);
     };
@@ -176,7 +175,8 @@ mod tests {
         dataset.append(batches, None).await.unwrap();
 
         let index = &dataset.load_indices().await.unwrap()[0];
-        assert!(!unindexed_fragments(index, &dataset)
+        assert!(!dataset
+            .unindexed_fragments(&index.name)
             .await
             .unwrap()
             .is_empty());
@@ -195,7 +195,8 @@ mod tests {
 
         dataset.optimize_indices().await.unwrap();
         let index = &dataset.load_indices().await.unwrap()[0];
-        assert!(unindexed_fragments(index, &dataset)
+        assert!(dataset
+            .unindexed_fragments(&index.name)
             .await
             .unwrap()
             .is_empty());

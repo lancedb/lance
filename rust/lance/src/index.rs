@@ -21,6 +21,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
+use lance_core::format::Fragment;
 use lance_core::io::{
     read_message, read_message_from_buf, read_metadata_offset, reader::read_manifest_indexes,
     Reader,
@@ -377,38 +378,24 @@ impl DatasetIndexExt for Dataset {
             .map(|idx| idx.statistics())
             .collect::<Result<Vec<_>>>()?;
 
-        let all_fragments = self.fragments();
-        let mut unindexed_fragments: usize = 0;
-        let mut unindexed_rows: usize = 0;
-        let mut indexed_fragments: usize = 0;
-        let mut indexed_rows: usize = 0;
-
-        let mut total_fragment_bitmap = RoaringBitmap::new();
-        for idx in metadatas.iter() {
-            total_fragment_bitmap |= idx.fragment_bitmap.as_ref().ok_or(Error::Index {
-                message: "Please upgrade lance to 0.8+ to use this function".to_string(),
-                location: location!(),
-            })?;
-        }
-        all_fragments.iter().for_each(|f| {
-            if total_fragment_bitmap.contains(f.id as u32) {
-                indexed_fragments += 1;
-                indexed_rows += f.num_rows().unwrap_or_default();
-            } else {
-                unindexed_fragments += 1;
-                unindexed_rows += f.num_rows().unwrap_or_default();
-            }
-        });
+        let unindexed_fragments = self.unindexed_fragments(index_name).await?;
+        let num_unindexed_rows = unindexed_fragments
+            .iter()
+            .map(|f| f.num_rows().unwrap_or_default())
+            .sum::<usize>();
+        let num_unindexed_fragments = unindexed_fragments.len();
+        let num_indexed_fragments = self.fragments().len() - num_unindexed_fragments;
+        let num_indexed_rows = self.count_rows().await? - num_unindexed_rows;
 
         let stats = json!({
             "index_type": delta_stats[0]["index_type"],
             "name": index_name,
             "num_deltas": metadatas.len(),
             "deltas": delta_stats,
-            "num_indexed_fragments": indexed_fragments,
-            "num_indexed_rows": indexed_rows,
-            "num_unindexed_fragments": unindexed_fragments,
-            "num_unindexed_rows": unindexed_rows,
+            "num_indexed_fragments": num_indexed_fragments,
+            "num_indexed_rows": num_indexed_rows,
+            "num_unindexed_fragments": num_unindexed_fragments,
+            "num_unindexed_rows": num_unindexed_rows,
         });
 
         Ok(stats)
@@ -428,6 +415,9 @@ pub(crate) trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn open_vector_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn VectorIndex>>;
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
+
+    /// Return the fragments that are not covered by any of the deltas of the index.
+    async fn unindexed_fragments(&self, idx_name: &str) -> Result<Vec<Fragment>>;
 }
 
 #[async_trait]
@@ -515,6 +505,23 @@ impl DatasetIndexInternalExt for Dataset {
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,
         })
+    }
+
+    async fn unindexed_fragments(&self, name: &str) -> Result<Vec<Fragment>> {
+        let indices = self.load_indices_by_name(name).await?;
+        let mut total_fragment_bitmap = RoaringBitmap::new();
+        for idx in indices.iter() {
+            total_fragment_bitmap |= idx.fragment_bitmap.as_ref().ok_or(Error::Index {
+                message: "Please upgrade lance to 0.8+ to use this function".to_string(),
+                location: location!(),
+            })?;
+        }
+        Ok(self
+            .fragments()
+            .iter()
+            .filter(|f| !total_fragment_bitmap.contains(f.id as u32))
+            .cloned()
+            .collect())
     }
 }
 
