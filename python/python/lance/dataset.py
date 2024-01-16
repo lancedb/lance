@@ -866,7 +866,12 @@ class LanceDataset(pa.dataset.Dataset):
         metric: str = "L2",
         replace: bool = False,
         num_partitions: Optional[int] = None,
-        ivf_centroids: Optional[Union[np.ndarray, pa.FixedSizeListArray]] = None,
+        ivf_centroids: Optional[
+            Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+        ] = None,
+        pq_codebook: Optional[
+            Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+        ] = None,
         num_sub_vectors: Optional[int] = None,
         accelerator: Optional[Union[str, "torch.Device"]] = None,
         index_cache_size: Optional[int] = None,
@@ -894,9 +899,16 @@ class LanceDataset(pa.dataset.Dataset):
             Replace the existing index if it exists.
         num_partitions : int, optional
             The number of partitions of IVF (Inverted File Index).
-        ivf_centroids : ``np.ndarray`` or ``pyarrow.FixedSizeListArray``. Optional.
+        ivf_centroids : ``np.ndarray``, ``pyarrow.FixedSizeListArray``
+        or ``pyarrow.FixedShapeTensorArray``. Optional.
             A ``num_partitions x dimension`` array of K-mean centroids for IVF
             clustering. If not provided, a new Kmean model will be trained.
+        pq_codebook : ``np.ndarray``, ``pyarrow.FixedSizeListArray``
+        or ``pyarrow.FixedShapeTensorArray``. Optional.
+            A ``num_sub_vectors x (2 ^ nbits * dimensions // num_sub_vectors)``
+            array of K-mean centroids for PQ codebook.
+            Note: nbits is always 8 for now.
+            If not provided, a new PQ model will be trained.
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
         accelerator : str or ``torch.Device``, optional
@@ -1049,6 +1061,11 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 kwargs["precomputed_partitions_file"] = partitions_file
 
+            if (ivf_centroids is None) and (pq_codebook is not None):
+                raise ValueError(
+                    "ivf_centroids must be specified when pq_codebook is provided"
+                )
+
             if ivf_centroids is not None:
                 # User provided IVF centroids
                 if _check_for_numpy(ivf_centroids) and isinstance(
@@ -1075,6 +1092,35 @@ class LanceDataset(pa.dataset.Dataset):
                     [ivf_centroids], ["_ivf_centroids"]
                 )
                 kwargs["ivf_centroids"] = ivf_centroids_batch
+
+            if pq_codebook is not None:
+                # User provided IVF centroids
+                if _check_for_numpy(pq_codebook) and isinstance(
+                    pq_codebook, np.ndarray
+                ):
+                    if (
+                        len(pq_codebook.shape) != 3
+                        or pq_codebook.shape[0] != num_sub_vectors
+                        or pq_codebook.shape[1] != 256
+                    ):
+                        raise ValueError(
+                            f"PQ codebook must be 3D array: (sub_vectors, 256, dim), "
+                            f"got {pq_codebook.shape}"
+                        )
+                    if pq_codebook.dtype not in [np.float16, np.float32, np.float64]:
+                        raise TypeError(
+                            "PQ codebook must be floating number"
+                            + f"got {pq_codebook.dtype}"
+                        )
+                    values = pa.array(pq_codebook.reshape(-1))
+                    pq_codebook = pa.FixedSizeListArray.from_arrays(
+                        values, num_sub_vectors * 256
+                    )
+                pq_codebook_batch = pa.RecordBatch.from_arrays(
+                    [pq_codebook], ["_pq_codebook"]
+                )
+                kwargs["pq_codebook"] = pq_codebook_batch
+
         if shuffle_partition_batches is not None:
             kwargs["shuffle_partition_batches"] = shuffle_partition_batches
         if shuffle_partition_concurrency is not None:
