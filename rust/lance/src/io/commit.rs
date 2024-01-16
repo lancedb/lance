@@ -333,7 +333,7 @@ pub(crate) async fn commit_transaction(
             }
             _ => transaction.build_manifest(
                 Some(dataset.manifest.as_ref()),
-                dataset.load_indices().await?,
+                dataset.load_indices().await?.as_ref().clone(),
                 &transaction_file,
                 write_config,
             )?,

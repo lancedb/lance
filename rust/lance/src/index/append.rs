@@ -296,6 +296,9 @@ mod tests {
             .iter()
             .sum::<usize>();
         assert_eq!(row_in_index, 2000);
-        assert_eq!(dataset.index_cache_entry_count(), 6)
+        assert_eq!(
+            dataset.index_cache_entry_count(),
+            6 + dataset.versions().await.unwrap().len()
+        );
     }
 }

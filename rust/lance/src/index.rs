@@ -252,16 +252,35 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
-    async fn load_indices(&self) -> Result<Vec<IndexMetadata>> {
+    async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
+        let dataset_dir = self.base.to_string();
+        if let Some(indices) = self
+            .session
+            .index_cache
+            .get_metadata(&dataset_dir, self.version().version)
+        {
+            return Ok(indices);
+        }
+
         let manifest_file = self.manifest_file(self.version().version).await?;
-        read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest).await
+        let loaded_indices: Arc<Vec<IndexMetadata>> =
+            read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest)
+                .await?
+                .into();
+
+        self.session.index_cache.insert_metadata(
+            &dataset_dir,
+            self.version().version,
+            loaded_indices.clone(),
+        );
+        Ok(loaded_indices)
     }
 
     async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<IndexMetadata>> {
         Ok(self
             .load_indices()
             .await?
-            .into_iter()
+            .iter()
             .filter(|idx| idx.fields.len() == 1)
             .find(|idx| {
                 let field = self.schema().field_by_id(idx.fields[0]);
@@ -270,7 +289,8 @@ impl DatasetIndexExt for Dataset {
                 } else {
                     false
                 }
-            }))
+            })
+            .cloned())
     }
 
     #[instrument(skip_all)]
