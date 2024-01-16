@@ -16,13 +16,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lance_core::{
-    format::{Fragment, Index},
-    Error, Result,
-};
+use lance_core::{format::Index, Result};
 use lance_index::DatasetIndexExt;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
 
 use crate::index::remap_index;
 use crate::Dataset;

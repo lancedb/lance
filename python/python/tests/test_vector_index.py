@@ -366,7 +366,6 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     if platform.system() == "Windows":
         expected_filepath = expected_filepath.replace("\\", "/")
     expected_statistics = {
-        "index_cache_entry_count": 2,
         "index_type": "IVF",
         "uuid": index_uuid,
         "uri": expected_filepath,
@@ -379,8 +378,6 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
             "nbits": 8,
             "num_sub_vectors": 8,
         },
-        "num_indexed_rows": 1000,
-        "num_unindexed_rows": 0,
     }
 
     with pytest.raises(KeyError, match='Index "non-existent_idx" not found'):
@@ -394,16 +391,17 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
 
     # increase 1 hit of index_cache.metadata_cache
     actual_statistics = dataset_with_index.stats.index_stats("vector_idx")
-    partitions = actual_statistics.pop("partitions")
-    hit_rate = actual_statistics.pop("index_cache_hit_rate")
-    assert actual_statistics == expected_statistics
-    assert np.isclose(hit_rate, 7 / 11)
+    assert actual_statistics["num_indexed_rows"] == 1000
+    assert actual_statistics["num_unindexed_rows"] == 0
 
+    idx_stats = actual_statistics["deltas"][0]
+    partitions = idx_stats.pop("partitions")
+    idx_stats.pop("centroids")
+    assert idx_stats == expected_statistics
     assert len(partitions) == 5
-    partition_keys = {"index", "length", "offset", "centroid"}
-    assert all([p["index"] == i for i, p in enumerate(partitions)])
+    partition_keys = {"length"}
+    print(partitions)
     assert all([partition_keys == set(p.keys()) for p in partitions])
-    assert all([all([isinstance(c, float) for c in p["centroid"]]) for p in partitions])
 
 
 def test_optimize_index(dataset, tmp_path):

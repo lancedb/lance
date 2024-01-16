@@ -254,7 +254,7 @@ impl std::fmt::Debug for IVFIndex {
 
 #[derive(Serialize)]
 pub struct IvfIndexPartitionStatistics {
-    length: u32,
+    size: u32,
 }
 
 #[derive(Serialize)]
@@ -327,7 +327,7 @@ impl Index for IVFIndex {
             .ivf
             .lengths
             .iter()
-            .map(|&len| IvfIndexPartitionStatistics { length: len })
+            .map(|&len| IvfIndexPartitionStatistics { size: len })
             .collect::<Vec<_>>();
 
         let centroid_vecs = centroids_to_vectors(&self.ivf.centroids)?;

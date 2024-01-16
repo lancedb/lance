@@ -1924,10 +1924,6 @@ class LanceStats:
             The name of the index to get statistics for.
         """
         index_stats = json.loads(self._ds.index_statistics(index_name))
-        index_stats["num_indexed_rows"] = self._ds.count_indexed_rows(index_name)
-        index_stats["num_unindexed_rows"] = self._ds.count_unindexed_rows(index_name)
-        index_stats["index_cache_entry_count"] = self._ds.index_cache_entry_count()
-        index_stats["index_cache_hit_rate"] = self._ds.index_cache_hit_rate()
         return index_stats
 
 
