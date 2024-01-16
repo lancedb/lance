@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use async_trait::async_trait;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use lance_core::{format::Index, Result};
 
 use crate::{IndexParams, IndexType};
@@ -44,23 +45,29 @@ pub trait DatasetIndexExt {
     ) -> Result<()>;
 
     /// Read all indices of this Dataset version.
-    async fn load_indices(&self) -> Result<Vec<Index>>;
+    ///
+    /// The indices are lazy loaded and cached in memory within the [`Dataset`] instance.
+    /// The cache is invalidated when the dataset version (Manifest) is changed.
+    async fn load_indices(&self) -> Result<Arc<Vec<Index>>>;
 
     /// Loads all the indies of a given UUID.
     ///
     /// Note that it is possible to have multiple indices with the same UUID,
     /// as they are the deltas of the same index.
     async fn load_index(&self, uuid: &str) -> Result<Option<Index>> {
-        self.load_indices()
-            .await
-            .map(|indices| indices.into_iter().find(|idx| idx.uuid.to_string() == uuid))
+        self.load_indices().await.map(|indices| {
+            indices
+                .iter()
+                .find(|idx| idx.uuid.to_string() == uuid)
+                .cloned()
+        })
     }
 
     /// Loads a specific index with the given index name
     async fn load_index_by_name(&self, name: &str) -> Result<Option<Index>> {
         self.load_indices()
             .await
-            .map(|indices| indices.into_iter().find(|idx| idx.name == name))
+            .map(|indices| indices.iter().find(|idx| idx.name == name).cloned())
     }
 
     /// Loads a specific index with the given index name.

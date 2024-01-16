@@ -851,7 +851,7 @@ impl Scanner {
         let indices = if use_index {
             self.dataset.load_indices().await?
         } else {
-            vec![]
+            Arc::new(vec![])
         };
         let knn_idx = indices.iter().find(|i| i.fields.contains(&column_id));
         if let Some(index) = knn_idx {
@@ -2499,7 +2499,10 @@ mod test {
             scan.refine(100);
             scan.nprobs(100);
 
-            assert_eq!(dataset.index_cache_entry_count(), 0);
+            assert_eq!(
+                dataset.index_cache_entry_count(),
+                1, // 1 for index metadata
+            );
             let results = scan
                 .try_into_stream()
                 .await
@@ -2508,7 +2511,10 @@ mod test {
                 .await
                 .unwrap();
 
-            assert_eq!(dataset.index_cache_entry_count(), 5);
+            assert_eq!(
+                dataset.index_cache_entry_count(),
+                5 + dataset.versions().await.unwrap().len()
+            );
             assert_eq!(results.len(), 1);
             let batch = &results[0];
 

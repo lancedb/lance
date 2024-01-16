@@ -74,11 +74,11 @@ use crate::error::box_error;
 use crate::format::{Fragment, Index, Manifest};
 use crate::io::commit::{commit_new_dataset, commit_transaction};
 use crate::session::Session;
-
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
+
 pub use write::update::{UpdateBuilder, UpdateJob};
 pub use write::{write_fragments, WriteMode, WriteParams};
 
@@ -3724,10 +3724,10 @@ mod tests {
         // Any transaction, no matter how simple, should trigger the fragment bitmap to be recalculated
         dataset.append(data, None).await.unwrap();
 
-        for idx in dataset.load_indices().await.unwrap() {
+        for idx in dataset.load_indices().await.unwrap().iter() {
             // The corrupt fragment_bitmap does not contain 0 but the
             // restored one should
-            assert!(idx.fragment_bitmap.unwrap().contains(0));
+            assert!(idx.fragment_bitmap.as_ref().unwrap().contains(0));
         }
 
         let mut dataset = dataset.checkout_version(broken_version).await.unwrap();
@@ -3739,8 +3739,8 @@ mod tests {
             .await
             .unwrap();
 
-        for idx in dataset.load_indices().await.unwrap() {
-            assert!(idx.fragment_bitmap.unwrap().contains(0));
+        for idx in dataset.load_indices().await.unwrap().iter() {
+            assert!(idx.fragment_bitmap.as_ref().unwrap().contains(0));
         }
 
         let mut scan = dataset.scan();
