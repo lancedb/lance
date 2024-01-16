@@ -206,18 +206,17 @@ impl Dataset {
 
     /// Get index statistics
     fn index_statistics(&self, index_name: String) -> PyResult<String> {
-        let index_statistics = RT
-            .runtime
+        RT.runtime
             .block_on(self.ds.index_statistics(&index_name))
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        if let Some(s) = index_statistics {
-            Ok(s)
-        } else {
-            Err(PyKeyError::new_err(format!(
-                "Index \"{}\" not found",
-                index_name
-            )))
-        }
+            .map_err(|err| match err {
+                lance::Error::IndexNotFound { .. } => {
+                    PyKeyError::new_err(format!("Index \"{}\" not found", index_name))
+                }
+                _ => PyIOError::new_err(format!(
+                    "Failed to get index statistics for index {}: {}",
+                    index_name, err
+                )),
+            })
     }
 
     /// Load index metadata
@@ -829,43 +828,6 @@ impl Dataset {
             Ok(Some(FileFragment::new(fragment)))
         } else {
             Ok(None)
-        }
-    }
-
-    fn count_unindexed_rows(&self, index_name: String) -> PyResult<Option<usize>> {
-        let idx = RT
-            .block_on(None, self.ds.load_index_by_name(index_name.as_str()))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        if let Some(index) = idx {
-            RT.block_on(
-                None,
-                self.ds
-                    .count_unindexed_rows(index.uuid.to_string().as_str()),
-            )?
-            .map_err(|err| PyIOError::new_err(err.to_string()))
-        } else {
-            Err(PyIOError::new_err(format!(
-                "Index {} not found",
-                index_name
-            )))
-        }
-    }
-
-    fn count_indexed_rows(&self, index_name: String) -> PyResult<Option<usize>> {
-        let idx = RT
-            .block_on(None, self.ds.load_index_by_name(index_name.as_str()))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        if let Some(index) = idx {
-            RT.block_on(
-                None,
-                self.ds.count_indexed_rows(index.uuid.to_string().as_str()),
-            )?
-            .map_err(|err| PyIOError::new_err(err.to_string()))
-        } else {
-            Err(PyIOError::new_err(format!(
-                "Index {} not found",
-                index_name
-            )))
         }
     }
 

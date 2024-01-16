@@ -64,10 +64,21 @@ pub trait DatasetIndexExt {
     }
 
     /// Loads a specific index with the given index name
-    async fn load_index_by_name(&self, name: &str) -> Result<Option<Index>> {
-        self.load_indices()
-            .await
-            .map(|indices| indices.iter().find(|idx| idx.name == name).cloned())
+    ///
+    /// Returns
+    /// -------
+    /// - `Ok(indices)`: if the index exists, returns the index.
+    /// - `Ok(vec![])`: if the index does not exist.
+    /// - `Err(e)`: if there is an error loading indices.
+    ///
+    async fn load_indices_by_name(&self, name: &str) -> Result<Vec<Index>> {
+        self.load_indices().await.map(|indices| {
+            indices
+                .iter()
+                .filter(|idx| idx.name == name)
+                .cloned()
+                .collect()
+        })
     }
 
     /// Loads a specific index with the given index name.
@@ -77,15 +88,7 @@ pub trait DatasetIndexExt {
     async fn optimize_indices(&mut self) -> Result<()>;
 
     /// Find index with a given index_name and return its serialized statistics.
-    async fn index_statistics(&self, index_name: &str) -> Result<Option<String>>;
-
-    /// Count the rows that are not indexed by the given index.
     ///
-    /// TODO: move to [DatasetInternalExt]
-    async fn count_unindexed_rows(&self, index_name: &str) -> Result<Option<usize>>;
-
-    /// Count the rows that are indexed by the given index.
-    ///
-    /// TODO: move to [DatasetInternalExt]
-    async fn count_indexed_rows(&self, index_name: &str) -> Result<Option<usize>>;
+    /// If the index does not exist, return Error.
+    async fn index_statistics(&self, index_name: &str) -> Result<String>;
 }

@@ -794,7 +794,7 @@ impl Index for BTreeIndex {
         IndexType::Scalar
     }
 
-    fn statistics(&self) -> Result<String> {
+    fn statistics(&self) -> Result<serde_json::Value> {
         let min = self
             .page_lookup
             .tree
@@ -805,7 +805,7 @@ impl Index for BTreeIndex {
             .tree
             .last_key_value()
             .map(|(k, _)| k.clone());
-        serde_json::to_string(&BTreeStatistics {
+        serde_json::to_value(&BTreeStatistics {
             num_pages: self.page_lookup.tree.len() as u32,
             min,
             max,

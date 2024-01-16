@@ -22,7 +22,7 @@ use std::{
 
 use arrow_arith::numeric::sub;
 use arrow_array::{
-    cast::{as_primitive_array, as_struct_array, AsArray},
+    cast::{as_struct_array, AsArray},
     types::{Float16Type, Float32Type, Float64Type},
     Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
 };
@@ -254,10 +254,7 @@ impl std::fmt::Debug for IVFIndex {
 
 #[derive(Serialize)]
 pub struct IvfIndexPartitionStatistics {
-    index: usize,
-    length: u32,
-    offset: usize,
-    centroid: Vec<f32>,
+    size: u32,
 }
 
 #[derive(Serialize)]
@@ -269,6 +266,44 @@ pub struct IvfIndexStatistics {
     num_partitions: usize,
     sub_index: serde_json::Value,
     partitions: Vec<IvfIndexPartitionStatistics>,
+    centroids: Vec<Vec<f32>>,
+}
+
+fn centroids_to_vectors(centroids: &FixedSizeListArray) -> Result<Vec<Vec<f32>>> {
+    centroids
+        .iter()
+        .map(|v| {
+            if let Some(row) = v {
+                match row.data_type() {
+                    DataType::Float16 => Ok(row
+                        .as_primitive::<Float16Type>()
+                        .values()
+                        .iter()
+                        .map(|v| v.to_f32())
+                        .collect::<Vec<_>>()),
+                    DataType::Float32 => Ok(row.as_primitive::<Float32Type>().values().to_vec()),
+                    DataType::Float64 => Ok(row
+                        .as_primitive::<Float64Type>()
+                        .values()
+                        .iter()
+                        .map(|v| *v as f32)
+                        .collect::<Vec<_>>()),
+                    _ => Err(Error::Index {
+                        message: format!(
+                            "IVF centroids must be FixedSizeList of floating number, got: {}",
+                            row.data_type()
+                        ),
+                        location: location!(),
+                    }),
+                }
+            } else {
+                Err(Error::Index {
+                    message: "Invalid centroid".to_string(),
+                    location: location!(),
+                })
+            }
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -285,33 +320,25 @@ impl Index for IVFIndex {
         IndexType::Vector
     }
 
-    fn statistics(&self) -> Result<String> {
+    fn statistics(&self) -> Result<serde_json::Value> {
         let partitions_statistics = self
             .ivf
             .lengths
             .iter()
-            .enumerate()
-            .map(|(i, &len)| {
-                let centroid = self.ivf.centroids.value(i);
-                let centroid_arr: &Float32Array = as_primitive_array(centroid.as_ref());
-                IvfIndexPartitionStatistics {
-                    index: i,
-                    length: len,
-                    offset: self.ivf.offsets[i],
-                    centroid: centroid_arr.values().to_vec(),
-                }
-            })
+            .map(|&len| IvfIndexPartitionStatistics { size: len })
             .collect::<Vec<_>>();
 
-        Ok(serde_json::to_string(&IvfIndexStatistics {
+        let centroid_vecs = centroids_to_vectors(&self.ivf.centroids)?;
+
+        Ok(serde_json::to_value(IvfIndexStatistics {
             index_type: "IVF".to_string(),
             uuid: self.uuid.clone(),
             uri: to_local_path(self.reader.path()),
             metric_type: self.metric_type.to_string(),
             num_partitions: self.ivf.num_partitions(),
-            // TODO: Not ideal that we have to re-parse the JSON here
-            sub_index: serde_json::from_str(&self.sub_index.statistics()?)?,
+            sub_index: self.sub_index.statistics()?,
             partitions: partitions_statistics,
+            centroids: centroid_vecs,
         })?)
     }
 

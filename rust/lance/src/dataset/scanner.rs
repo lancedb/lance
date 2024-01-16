@@ -48,7 +48,6 @@ use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
-use crate::dataset::index::unindexed_fragments;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index};
 use crate::index::DatasetIndexInternalExt;
@@ -917,7 +916,7 @@ impl Scanner {
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Check if we've created new versions since the index
-        let unindexed_fragments = unindexed_fragments(index, self.dataset.as_ref()).await?;
+        let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
         if !unindexed_fragments.is_empty() {
             let mut columns = vec![q.column.clone()];
             let mut num_filter_columns = 0;

@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -2456,24 +2456,19 @@ mod tests {
         assert_eq!(fragment_bitmap.len(), 1);
         assert!(fragment_bitmap.contains(0));
 
-        let actual_statistics: serde_json::value::Value = serde_json::from_str(
-            &dataset
-                .index_statistics("embeddings_idx")
-                .await
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+        let actual_statistics: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("embeddings_idx").await.unwrap())
+                .unwrap();
         let actual_statistics = actual_statistics.as_object().unwrap();
         assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF");
-        assert_eq!(actual_statistics["metric_type"].as_str().unwrap(), "l2");
-        assert_eq!(actual_statistics["num_partitions"].as_i64().unwrap(), 10);
 
-        assert_eq!(
-            dataset.index_statistics("non-existent_idx").await.unwrap(),
-            None
-        );
-        assert_eq!(dataset.index_statistics("").await.unwrap(), None);
+        let deltas = actual_statistics["indices"].as_array().unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0]["metric_type"].as_str().unwrap(), "l2");
+        assert_eq!(deltas[0]["num_partitions"].as_i64().unwrap(), 10);
+
+        assert!(dataset.index_statistics("non-existent_idx").await.is_err());
+        assert!(dataset.index_statistics("").await.is_err());
 
         // Overwrite should invalidate index
         let write_params = WriteParams {
@@ -2522,15 +2517,12 @@ mod tests {
             .await
             .unwrap();
 
-        let index = dataset
-            .load_index_by_name(&index_name)
-            .await
-            .unwrap()
-            .unwrap();
+        let indices = dataset.load_indices_by_name(&index_name).await.unwrap();
 
-        assert_eq!(index.dataset_version, 1);
-        assert_eq!(index.fields, vec![0]);
-        assert_eq!(index.name, index_name);
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].dataset_version, 1);
+        assert_eq!(indices[0].fields, vec![0]);
+        assert_eq!(indices[0].name, index_name);
 
         dataset.index_statistics(&index_name).await.unwrap();
     }

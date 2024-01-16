@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use futures::{stream, StreamExt, TryStreamExt};
 use lance_core::format::Fragment;
 use lance_core::io::{
     read_message, read_message_from_buf, read_metadata_offset, reader::read_manifest_indexes,
@@ -31,6 +32,8 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
 pub use lance_index::IndexParams;
 use lance_index::{pb, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
+use roaring::RoaringBitmap;
+use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
@@ -41,7 +44,6 @@ pub(crate) mod prefilter;
 pub mod scalar;
 pub mod vector;
 
-use crate::dataset::index::unindexed_fragments;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::format::Index as IndexMetadata;
 use crate::index::append::append_index;
@@ -346,57 +348,71 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
-    async fn index_statistics(&self, index_name: &str) -> Result<Option<String>> {
-        let index_uuid = self
-            .load_index_by_name(index_name)
-            .await?
-            .map(|idx| idx.uuid.to_string());
-
-        if let Some(index_uuid) = index_uuid {
-            let index_statistics = self
-                .open_generic_index("vector", &index_uuid)
-                .await?
-                .statistics()?;
-            Ok(Some(index_statistics))
-        } else {
-            Ok(None)
+    async fn index_statistics(&self, index_name: &str) -> Result<String> {
+        let metadatas = self.load_indices_by_name(index_name).await?;
+        if metadatas.is_empty() {
+            return Err(Error::IndexNotFound {
+                identity: format!("name={}", index_name),
+                location: location!(),
+            });
         }
-    }
 
-    async fn count_unindexed_rows(&self, index_uuid: &str) -> Result<Option<usize>> {
-        let index = self.load_index(index_uuid).await?;
+        let column = self
+            .schema()
+            .field_by_id(metadatas[0].fields[0])
+            .map(|f| f.name.as_str())
+            .ok_or(Error::IndexNotFound {
+                identity: index_name.to_string(),
+                location: location!(),
+            })?;
 
-        if let Some(index) = index {
-            let unindexed_frags = unindexed_fragments(&index, self).await?;
-            let unindexed_rows = unindexed_frags
-                .iter()
-                .map(Fragment::num_rows)
-                // sum the number of rows in each fragment if no fragment returned None from row_count
-                .try_fold(0, |a, b| b.map(|b| a + b).ok_or(()));
+        // Open all delta indices
+        let indices = stream::iter(metadatas.iter())
+            .then(|m| async move { self.open_generic_index(column, &m.uuid.to_string()).await })
+            .try_collect::<Vec<_>>()
+            .await?;
 
-            Ok(unindexed_rows.ok())
-        } else {
-            Ok(None)
+        // Stastistics for each delta index.
+        let indices_stats = indices
+            .iter()
+            .map(|idx| idx.statistics())
+            .collect::<Result<Vec<_>>>()?;
+
+        let unindexed_fragments = self.unindexed_fragments(index_name).await?;
+        let mut num_unindexed_rows = 0;
+        for f in unindexed_fragments.iter() {
+            num_unindexed_rows += f.num_rows().ok_or(Error::Index {
+                message: format!("fragment {} has no rows", f.id),
+                location: location!(),
+            })?;
         }
-    }
+        let num_unindexed_fragments = unindexed_fragments.len();
+        let num_indexed_fragments = self.fragments().len() - num_unindexed_fragments;
+        let num_indexed_rows = self.count_rows().await? - num_unindexed_rows;
 
-    async fn count_indexed_rows(&self, index_uuid: &str) -> Result<Option<usize>> {
-        let count_rows = self.count_rows();
-        let count_unindexed_rows = self.count_unindexed_rows(index_uuid);
+        let stats = json!({
+            "index_type": indices_stats[0]["index_type"],
+            "name": index_name,
+            "num_indices": metadatas.len(),
+            "indices": indices_stats,
+            "num_indexed_fragments": num_indexed_fragments,
+            "num_indexed_rows": num_indexed_rows,
+            "num_unindexed_fragments": num_unindexed_fragments,
+            "num_unindexed_rows": num_unindexed_rows,
+        });
 
-        let (count_rows, count_unindexed_rows) =
-            futures::try_join!(count_rows, count_unindexed_rows)?;
-
-        match count_unindexed_rows {
-            Some(count_unindexed_rows) => Ok(Some(count_rows - count_unindexed_rows)),
-            None => Ok(None),
-        }
+        serde_json::to_string(&stats).map_err(|e| Error::Index {
+            message: format!("Failed to serialize index statistics: {}", e),
+            location: location!(),
+        })
     }
 }
 
 /// A trait for internal dataset utilities
+///
+/// Internal use only. No API stability guarantees.
 #[async_trait]
-pub(crate) trait DatasetIndexInternalExt {
+pub(crate) trait DatasetIndexInternalExt: DatasetIndexExt {
     /// Opens an index (scalar or vector) as a generic index
     async fn open_generic_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn Index>>;
     /// Opens the requested scalar index
@@ -405,6 +421,9 @@ pub(crate) trait DatasetIndexInternalExt {
     async fn open_vector_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn VectorIndex>>;
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
+
+    /// Return the fragments that are not covered by any of the deltas of the index.
+    async fn unindexed_fragments(&self, idx_name: &str) -> Result<Vec<Fragment>>;
 }
 
 #[async_trait]
@@ -492,6 +511,23 @@ impl DatasetIndexInternalExt for Dataset {
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,
         })
+    }
+
+    async fn unindexed_fragments(&self, name: &str) -> Result<Vec<Fragment>> {
+        let indices = self.load_indices_by_name(name).await?;
+        let mut total_fragment_bitmap = RoaringBitmap::new();
+        for idx in indices.iter() {
+            total_fragment_bitmap |= idx.fragment_bitmap.as_ref().ok_or(Error::Index {
+                message: "Please upgrade lance to 0.8+ to use this function".to_string(),
+                location: location!(),
+            })?;
+        }
+        Ok(self
+            .fragments()
+            .iter()
+            .filter(|f| !total_fragment_bitmap.contains(f.id as u32))
+            .cloned()
+            .collect())
     }
 }
 
@@ -595,9 +631,7 @@ mod tests {
         dataset.validate().await.unwrap();
 
         // Make sure it returns None if there's no index with the passed identifier
-        assert_eq!(dataset.count_unindexed_rows("bad_id").await.unwrap(), None);
-        assert_eq!(dataset.count_indexed_rows("bad_id").await.unwrap(), None);
-
+        assert!(dataset.index_statistics("bad_id").await.is_err());
         // Create an index
         let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 10);
         dataset
@@ -611,22 +645,10 @@ mod tests {
             .await
             .unwrap();
 
-        let index = dataset
-            .load_index_by_name("vec_idx")
-            .await
-            .unwrap()
-            .unwrap();
-        let index_uuid = &index.uuid.to_string();
-
-        // Make sure there are no unindexed rows
-        assert_eq!(
-            dataset.count_unindexed_rows(index_uuid).await.unwrap(),
-            Some(0)
-        );
-        assert_eq!(
-            dataset.count_indexed_rows(index_uuid).await.unwrap(),
-            Some(512)
-        );
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+        assert_eq!(stats["num_indexed_rows"], 512);
 
         // Now we'll append some rows which shouldn't be indexed and see the
         // count change
@@ -639,14 +661,9 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema);
         dataset.append(reader, None).await.unwrap();
 
-        // Make sure the new rows are not indexed
-        assert_eq!(
-            dataset.count_unindexed_rows(index_uuid).await.unwrap(),
-            Some(512)
-        );
-        assert_eq!(
-            dataset.count_indexed_rows(index_uuid).await.unwrap(),
-            Some(512)
-        );
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 512);
+        assert_eq!(stats["num_indexed_rows"], 512);
     }
 }
