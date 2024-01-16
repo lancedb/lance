@@ -26,6 +26,7 @@ use lance_core::io::{
     read_message, read_message_from_buf, read_metadata_offset, reader::read_manifest_indexes,
     Reader,
 };
+use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -296,7 +297,7 @@ impl DatasetIndexExt for Dataset {
     }
 
     #[instrument(skip_all)]
-    async fn optimize_indices(&mut self) -> Result<()> {
+    async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
         let dataset = Arc::new(self.clone());
         // Append index
         let indices = self.load_indices().await?;

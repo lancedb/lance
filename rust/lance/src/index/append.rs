@@ -193,7 +193,7 @@ mod tests {
             .unwrap();
         assert_eq!(results[0].num_rows(), 10); // Flat search.
 
-        dataset.optimize_indices().await.unwrap();
+        dataset.optimize_indices(&Default::default()).await.unwrap();
         let index = &dataset.load_indices().await.unwrap()[0];
         assert!(dataset
             .unindexed_fragments(&index.name)

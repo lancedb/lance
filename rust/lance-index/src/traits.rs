@@ -17,7 +17,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use lance_core::{format::Index, Result};
 
-use crate::{IndexParams, IndexType};
+use crate::{IndexParams, IndexType, optimize::OptimizeOptions};
 
 // Extends Lance Dataset with secondary index.
 ///
@@ -85,7 +85,7 @@ pub trait DatasetIndexExt {
     async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<Index>>;
 
     /// Optimize indices.
-    async fn optimize_indices(&mut self) -> Result<()>;
+    async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()>;
 
     /// Find index with a given index_name and return its serialized statistics.
     ///
