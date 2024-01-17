@@ -3208,7 +3208,7 @@ mod test {
             |scan| scan.nearest("vec", &q, 42),
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNIndex: name=..., k=42",
+    KNNIndex: name=..., k=42, deltas=1",
         )
         .await?;
 
@@ -3219,7 +3219,7 @@ mod test {
   Take: columns=\"_distance, _rowid, vec, i, s\"
     KNNFlat: k=10 metric=l2
       Take: columns=\"_distance, _rowid, vec\"
-        KNNIndex: name=..., k=40",
+        KNNIndex: name=..., k=40, deltas=1",
         )
         .await?;
 
@@ -3248,7 +3248,7 @@ mod test {
   Take: columns=\"_distance, _rowid, vec, i, s\"
     FilterExec: i@3 > 10
       Take: columns=\"_distance, _rowid, vec, i\"
-        KNNIndex: name=..., k=17",
+        KNNIndex: name=..., k=17, deltas=1",
         )
         .await?;
 
@@ -3263,7 +3263,7 @@ mod test {
             },
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNIndex: name=..., k=17
+    KNNIndex: name=..., k=17, deltas=1
       FilterExec: i@0 > 10
         LanceScan: uri=..., projection=[i], row_id=true, ordered=false",
         )
@@ -3284,7 +3284,7 @@ mod test {
             KNNFlat: k=5 metric=l2
               LanceScan: uri=..., projection=[vec], row_id=true, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
-            KNNIndex: name=..., k=5",
+            KNNIndex: name=..., k=5, deltas=1",
         )
         .await?;
 
@@ -3303,7 +3303,7 @@ mod test {
                 KNNFlat: k=5 metric=l2
                   LanceScan: uri=..., projection=[vec], row_id=true, ordered=false
               Take: columns=\"_distance, _rowid, vec\"
-                KNNIndex: name=..., k=5",
+                KNNIndex: name=..., k=5, deltas=1",
         )
         .await?;
 
@@ -3328,7 +3328,7 @@ mod test {
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
-            KNNIndex: name=..., k=5
+            KNNIndex: name=..., k=5, deltas=1
               FilterExec: i@0 > 10
                 LanceScan: uri=..., projection=[i], row_id=true, ordered=false",
         )
@@ -3350,7 +3350,7 @@ mod test {
             },
             "Projection: fields=[i, s, vec, _distance]
   Take: columns=\"_distance, _rowid, vec, i, s\"
-    KNNIndex: name=..., k=5
+    KNNIndex: name=..., k=5, deltas=1
       ScalarIndexQuery: query=i > 10",
         )
         .await?;
@@ -3375,7 +3375,7 @@ mod test {
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
-            KNNIndex: name=..., k=5
+            KNNIndex: name=..., k=5, deltas=1
               ScalarIndexQuery: query=i > 10",
         )
         .await?;
@@ -3400,7 +3400,7 @@ mod test {
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[vec, i], row_id=true, ordered=false
           Take: columns=\"_distance, _rowid, vec\"
-            KNNIndex: name=..., k=5
+            KNNIndex: name=..., k=5, deltas=1
               ScalarIndexQuery: query=i > 10",
         )
         .await?;

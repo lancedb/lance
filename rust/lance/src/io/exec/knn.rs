@@ -315,7 +315,7 @@ fn knn_index_stream(
         ROW_ID_FIELD.clone(),
     ]));
 
-    let s = stream::iter(index_meta.into_iter())
+    let s = stream::iter(index_meta)
         .zip(stream::repeat((
             dataset.clone(),
             pre_filter.clone(),
@@ -364,7 +364,7 @@ impl DisplayAs for KNNIndexExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "KNNIndex(name={}, k={}, deltas={})",
+                    "KNNIndex: name={}, k={}, deltas={}",
                     self.indices[0].name,
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
                     self.indices.len()
