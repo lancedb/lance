@@ -25,10 +25,17 @@ use super::DatasetIndexInternalExt;
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::Dataset;
 
-/// Append new data to the index, without re-train.
+/// Merge in-inflight unindexed data, with a specific number of previous indices
+/// into a new index, to improve the query performance.
 ///
-/// Returns the UUID of the new index along with a vector of newly indexed fragment ids
-pub async fn append_index<'a>(
+/// The merge behavior is controlled by [`OptimizeOptions::num_indices_to_merge].
+///
+/// Returns
+/// -------
+/// - the UUID of the new index
+/// - merged indices,
+/// - Bitmap of the fragments that covered in the newly created index.
+pub(crate) async fn merge_indices<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
     options: &OptimizeOptions,

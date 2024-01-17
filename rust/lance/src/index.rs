@@ -47,7 +47,7 @@ pub mod vector;
 
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::format::Index as IndexMetadata;
-use crate::index::append::append_index;
+use crate::index::append::merge_indices;
 use crate::index::vector::remap_vector_index;
 use crate::io::commit::commit_transaction;
 use crate::{dataset::Dataset, Error, Result};
@@ -314,7 +314,7 @@ impl DatasetIndexExt for Dataset {
         let mut removed_indices = vec![];
         for deltas in name_to_indices.values() {
             let Some((new_id, removed, mut new_frag_ids)) =
-                append_index(dataset.clone(), deltas.as_slice(), options).await?
+                merge_indices(dataset.clone(), deltas.as_slice(), options).await?
             else {
                 continue;
             };

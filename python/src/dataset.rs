@@ -640,6 +640,7 @@ impl Dataset {
         })
     }
 
+    #[pyo3(signature(**kwargs))]
     fn optimize_indices(&mut self, kwargs: Option<&PyDict>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         let mut options: OptimizeOptions = Default::default();
@@ -653,8 +654,8 @@ impl Dataset {
             new_self
                 .optimize_indices(&options)
                 .map_err(|err| PyIOError::new_err(err.to_string())),
-        )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        )??;
+
         self.ds = Arc::new(new_self);
         Ok(())
     }
