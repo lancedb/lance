@@ -23,7 +23,7 @@ use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use chrono::Duration;
 
-use futures::StreamExt;
+use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::UpdateBuilder;
 use lance::dataset::{
@@ -37,6 +37,7 @@ use lance::index::{
 };
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::{datatypes::Schema, format::Fragment, io::object_store::ObjectStoreParams};
+use lance_index::optimize::OptimizeOptions;
 use lance_index::{
     vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     DatasetIndexExt, IndexParams, IndexType,
@@ -639,10 +640,21 @@ impl Dataset {
         })
     }
 
-    fn optimize_indices(&mut self, _kwargs: Option<&PyDict>) -> PyResult<()> {
+    fn optimize_indices(&mut self, kwargs: Option<&PyDict>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.optimize_indices())?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let mut options: OptimizeOptions = Default::default();
+        if let Some(kwargs) = kwargs {
+            if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
+                options.num_indices_to_merge = num_indices_to_merge.extract()?;
+            }
+        }
+        RT.block_on(
+            None,
+            new_self
+                .optimize_indices(&options)
+                .map_err(|err| PyIOError::new_err(err.to_string())),
+        )?
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
