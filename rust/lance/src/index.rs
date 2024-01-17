@@ -21,6 +21,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
+use itertools::Itertools;
 use lance_core::format::Fragment;
 use lance_core::io::{
     read_message, read_message_from_buf, read_metadata_offset, reader::read_manifest_indexes,
@@ -299,16 +300,12 @@ impl DatasetIndexExt for Dataset {
     #[instrument(skip_all)]
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
         let dataset = Arc::new(self.clone());
-        // Append index
         let indices = self.load_indices().await?;
 
-        let mut name_to_indices = HashMap::new();
-        for idx in indices.iter() {
-            name_to_indices
-                .entry(idx.name.clone())
-                .or_insert_with(Vec::new)
-                .push(idx);
-        }
+        let name_to_indices = indices
+            .iter()
+            .map(|idx| (idx.name.clone(), idx))
+            .into_group_map();
 
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
