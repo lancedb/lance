@@ -640,7 +640,7 @@ impl Dataset {
         })
     }
 
-    #[pyo3(signature(**kwargs))]
+    #[pyo3(signature = (**kwargs))]
     fn optimize_indices(&mut self, kwargs: Option<&PyDict>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         let mut options: OptimizeOptions = Default::default();
