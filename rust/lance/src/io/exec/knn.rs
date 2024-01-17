@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::any::Any;
-use std::iter::repeat;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -336,106 +335,6 @@ fn knn_index_stream(
     RecordBatchStreamAdapter::new(schema, s)
 }
 
-/// KNN Node from reading a vector index.
-pub struct KNNIndexStream {
-    rx: Receiver<datafusion::error::Result<RecordBatch>>,
-    bg_thread: Option<JoinHandle<()>>,
-}
-
-impl KNNIndexStream {
-    async fn knn_stream(
-        query: Query,
-        dataset: Arc<Dataset>,
-        index_meta: Vec<Index>,
-        allow_list_input: Option<Box<dyn FilterLoader>>,
-    ) -> Result<RecordBatch> {
-        let pre_filter = Arc::new(PreFilter::new(dataset, &index_meta, allow_list_input));
-
-        let index = dataset
-            .open_vector_index(&query.column, &index_meta.uuid.to_string())
-            .await?;
-        index.search(&query, pre_filter).await
-    }
-
-    #[instrument(level = "debug", skip_all, name = "KNNIndexStream::new")]
-    pub fn new(
-        dataset: Arc<Dataset>,
-        indices: &[Index],
-        query: &Query,
-        allow_list: Option<Box<dyn FilterLoader>>,
-    ) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(2);
-        let q = query.clone();
-        let indices = indices.to_vec();
-        let bg_thread = tokio::spawn(
-            async move {
-                let result = match Self::knn_stream(q, dataset, indices, allow_list).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
-                            "Failed to calculate KNN: {e}"
-                        ))))
-                        .await
-                        .expect("KNNIndex failed to send message");
-                        return;
-                    }
-                };
-
-                if !tx.is_closed() {
-                    if let Err(e) = tx.send(Ok(result)).await {
-                        eprintln!("KNNIndex tx.send error: {e}")
-                    };
-                }
-                drop(tx);
-            }
-            .in_current_span(),
-        );
-
-        Self {
-            rx,
-            bg_thread: Some(bg_thread),
-        }
-    }
-}
-
-impl DFRecordBatchStream for KNNIndexStream {
-    fn schema(&self) -> arrow_schema::SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new(DIST_COL, DataType::Float32, true),
-            ROW_ID_FIELD.clone(),
-        ]))
-    }
-}
-
-impl Stream for KNNIndexStream {
-    type Item = std::result::Result<RecordBatch, datafusion::error::DataFusionError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = Pin::into_inner(self);
-        // We need to check the JoinHandle to make sure the thread hasn't panicked.
-        let bg_thread_completed = if let Some(bg_thread) = &mut this.bg_thread {
-            match bg_thread.poll_unpin(cx) {
-                Poll::Ready(Ok(())) => true,
-                Poll::Ready(Err(join_error)) => {
-                    return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
-                        "ExecNode(KNNIndexStream): thread panicked: {}",
-                        join_error
-                    )))));
-                }
-                Poll::Pending => false,
-            }
-        } else {
-            false
-        };
-        if bg_thread_completed {
-            // Need to take it, since we aren't allowed to poll if again after.
-            this.bg_thread.take();
-        }
-        // this.rx.
-        this.rx.poll_recv(cx)
-    }
-}
-
 #[derive(Debug)]
 pub enum PreFilterSource {
     /// The prefilter input is an array of row ids that match the filter condition
@@ -561,10 +460,10 @@ impl ExecutionPlan for KNNIndexExec {
             PreFilterSource::None => None,
         };
 
-        Ok(Box::pin(KNNIndexStream::new(
+        Ok(Box::pin(knn_index_stream(
+            self.query.clone(),
             self.dataset.clone(),
-            &self.indices,
-            &self.query,
+            self.indices.clone(),
             prefilter_loader,
         )))
     }

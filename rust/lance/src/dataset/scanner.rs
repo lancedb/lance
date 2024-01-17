@@ -1230,7 +1230,7 @@ impl Scanner {
 
         Ok(Arc::new(KNNIndexExec::try_new(
             self.dataset.clone(),
-            index.clone(),
+            index,
             q,
             prefilter_source,
         )?))
