@@ -270,6 +270,11 @@ pub(crate) async fn optimize_vector_indices(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    println!(
+        "Index to be emrged: {} options={}",
+        indices_to_merge.len(),
+        options.num_indices_to_merge
+    );
     write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(&indices_to_merge)).await?;
     let metadata = IvfPQIndexMetadata {
         name: format!("_{}_idx", vector_column),
