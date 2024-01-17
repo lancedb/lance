@@ -327,7 +327,7 @@ fn knn_index_stream(
                 .await?;
             index.search(&query, pre_filter.clone()).await
         })
-        .buffer_unordered(2)
+        .buffer_unordered(num_cpus::get())
         .map(|r| {
             r.map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {}", e)))
         })
