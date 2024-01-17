@@ -3231,7 +3231,7 @@ mod test {
   Take: columns=\"_distance, _rowid, vec, i, s\"
     KNNFlat: k=10 metric=l2
       Take: columns=\"_distance, _rowid, vec\"
-        SortExec: TopK(fetch=10), expr=...
+        SortExec: TopK(fetch=40), expr=...
           KNNIndex: name=..., k=40, deltas=1",
         )
         .await?;
