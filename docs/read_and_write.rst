@@ -10,31 +10,31 @@ Writing Lance Dataset
 Similar to Apache Pyarrow, the simplest approach to create a Lance dataset is
 writing a :py:class:`pyarrow.Table` via :py:meth:`lance.write_dataset`.
 
-  .. code-block:: python
+.. code-block:: python
 
-    import lance
-    import pyarrow as pa
+  import lance
+  import pyarrow as pa
 
-    table = pa.Table.from_pylist([{"name": "Alice", "age": 20},
-                                  {"name": "Bob", "age": 30}])
-    lance.write_dataset(table, "./alice_and_bob.lance")
+  table = pa.Table.from_pylist([{"name": "Alice", "age": 20},
+                                {"name": "Bob", "age": 30}])
+  lance.write_dataset(table, "./alice_and_bob.lance")
 
 If the memory footprint of the dataset is too large to fit in memory, :py:meth:`lance.write_dataset`
 also supports writing a dataset in iterator of :py:class:`pyarrow.RecordBatch` es.
 
-  .. code-block:: python
+.. code-block:: python
 
-    import lance
-    import pyarrow as pa
+  import lance
+  import pyarrow as pa
 
-    def producer():
-        yield pa.RecordBatch.from_pylist([{"name": "Alice", "age": 20}])
-        yield pa.RecordBatch.from_pylist([{"name": "Blob", "age": 30}])
+  def producer():
+      yield pa.RecordBatch.from_pylist([{"name": "Alice", "age": 20}])
+      yield pa.RecordBatch.from_pylist([{"name": "Blob", "age": 30}])
 
-    schema = pa.schema([
-            pa.field("name", pa.string()),
-            pa.field("age", pa.int64()),
-        ])
+  schema = pa.schema([
+          pa.field("name", pa.string()),
+          pa.field("age", pa.int64()),
+      ])
 
     lance.write_dataset(reader, "./alice_and_bob.lance", schema)
 
@@ -89,12 +89,12 @@ Deleting rows
 Lance supports deleting rows from a dataset using a SQL filter. For example, to
 delete Bob's row from the dataset above, one could use:
 
-  .. code-block:: python
+.. code-block:: python
 
-    import lance
+  import lance
 
-    dataset = lance.dataset("./alice_and_bob.lance")
-    dataset.delete("name = 'Bob'")
+  dataset = lance.dataset("./alice_and_bob.lance")
+  dataset.delete("name = 'Bob'")
 
 :py:meth:`lance.LanceDataset.delete` supports the same filters as described in
 :ref:`filter-push-down`.
@@ -116,24 +116,24 @@ Lance supports updating rows based on SQL expressions with the
 that Bob's name in our dataset has been sometimes written as ``Blob``, we can fix
 that with:
 
-  .. code-block:: python
+.. code-block:: python
 
-    import lance
+  import lance
 
-    dataset = lance.dataset("./alice_and_bob.lance")
-    dataset.update({"name": "'Bob'"}), where="name = 'Blob'")
+  dataset = lance.dataset("./alice_and_bob.lance")
+  dataset.update({"name": "'Bob'"}), where="name = 'Blob'")
 
 The update values are SQL expressions, which is why ``'Bob'`` is wrapped in single
 quotes. This means we can use complex expressions that reference existing columns if
 we wish. For example, if two years have passed and we wish to update the ages
 of Alice and Bob in the same example, we could write:
 
-  .. code-block:: python
+.. code-block:: python
 
-    import lance
+  import lance
 
-    dataset = lance.dataset("./alice_and_bob.lance")
-    dataset.update({"age": "age + 2"})
+  dataset = lance.dataset("./alice_and_bob.lance")
+  dataset.update({"age": "age + 2"})
 
 .. TODO: Once we implement MERGE, we should make a note that this method shouldn't be used 
 ..       for updating single rows in a loop, and users should instead do bulk updates
@@ -217,35 +217,35 @@ Reading Lance Dataset
 
 To open a Lance dataset, use the :py:meth:`lance.dataset` function:
 
-  .. code-block:: python
+.. code-block:: python
 
-    import lance
-    ds = lance.dataset("s3://bucket/path/imagenet.lance")
-    # Or local path
-    ds = lance.dataset("./imagenet.lance")
+  import lance
+  ds = lance.dataset("s3://bucket/path/imagenet.lance")
+  # Or local path
+  ds = lance.dataset("./imagenet.lance")
 
-  .. note::
+.. note::
 
-    Lance supports local file system, AWS ``s3`` and Google Cloud Storage(``gs``) as storage backends
-    at the moment. See :ref:`storages` for more details.
+  Lance supports local file system, AWS ``s3`` and Google Cloud Storage(``gs``) as storage backends
+  at the moment. See :ref:`storages` for more details.
 
 The most straightforward approach for reading a Lance dataset is to utilize the :py:meth:`lance.LanceDataset.to_table`
 method in order to load the entire dataset into memory.
 
-  .. code-block:: python
+.. code-block:: python
 
-    table = ds.to_table()
+  table = ds.to_table()
 
 Due to Lance being a high-performance columnar format, it enables efficient reading of subsets of the dataset by utilizing
 **Column (projection)** push-down and **filter (predicates)** push-downs.
 
-    .. code-block:: python
+.. code-block:: python
 
-        table = ds.to_table(
-            columns=["image", "label"],
-            filter="label = 2 AND text IS NOT NULL",
-            limit=1000,
-            offset=3000)
+    table = ds.to_table(
+        columns=["image", "label"],
+        filter="label = 2 AND text IS NOT NULL",
+        limit=1000,
+        offset=3000)
 
 Lance understands the cost of reading heavy columns such as ``image``.
 Consequently, it employs an optimized query plan to execute the operation efficiently.
@@ -256,11 +256,11 @@ Iterative Read
 If the dataset is too large to fit in memory, you can read it in batches
 using the :py:meth:`lance.LanceDataset.to_batches` method:
 
-  .. code-block:: python
+.. code-block:: python
 
-    for batch in ds.to_batches(columns=["image"], filter="label = 10"):
-        # do something with batch
-        compute_on_batch(batch)
+  for batch in ds.to_batches(columns=["image"], filter="label = 10"):
+      # do something with batch
+      compute_on_batch(batch)
 
 Unsurprisingly, :py:meth:`~lance.LanceDataset.to_batches` takes the same parameters
 as :py:meth:`~lance.LanceDataset.to_table` function.
@@ -288,19 +288,19 @@ Currently, Lance supports a growing list of expressions.
 
 For example, the following filter string is acceptable:
 
-  .. code-block:: SQL
+.. code-block:: SQL
 
-    ((label IN [10, 20]) AND (note.email IS NOT NULL))
-        OR NOT note.created
+  ((label IN [10, 20]) AND (note.email IS NOT NULL))
+      OR NOT note.created
 
 If your column name contains special characters or is a `SQL Keyword <https://docs.rs/sqlparser/latest/sqlparser/keywords/index.html>`_,
 you can use backtick (`````) to escape it. For nested fields, each segment of the
 path must be wrapped in backticks. 
 
-  .. code-block:: SQL
+.. code-block:: SQL
 
-    `CUBE` = 10 AND `column name with space` IS NOT NULL
-      AND `nested with space`.`inner with space` < 2
+  `CUBE` = 10 AND `column name with space` IS NOT NULL
+    AND `nested with space`.`inner with space` < 2
 
 .. warning::
 
@@ -309,11 +309,11 @@ path must be wrapped in backticks.
 Literals for dates, timestamps, and decimals can be written by writing the string
 value after the type name. For example
 
-  .. code-block:: SQL
+.. code-block:: SQL
 
-    date_col = date '2021-01-01'
-    and timestamp_col = timestamp '2021-01-01 00:00:00'
-    and decimal_col = decimal(8,3) '1.000'
+  date_col = date '2021-01-01'
+  and timestamp_col = timestamp '2021-01-01 00:00:00'
+  and decimal_col = decimal(8,3) '1.000'
 
 For timestamp columns, the precision can be specified as a number in the type
 parameter. Microsecond precision (6) is the default.
@@ -375,10 +375,10 @@ Random read
 
 One district feature of Lance, as columnar format, is that it allows you to read random samples quickly.
 
-    .. code-block:: python
+.. code-block:: python
 
-        # Access the 2nd, 101th and 501th rows
-        data = ds.take([1, 100, 500], columns=["image", "label"])
+    # Access the 2nd, 101th and 501th rows
+    data = ds.take([1, 100, 500], columns=["image", "label"])
 
 The ability to achieve fast random access to individual rows plays a crucial role in facilitating various workflows
 such as random sampling and shuffling in ML training.
