@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use lance_core::Result;
 use roaring::RoaringBitmap;
 
+pub mod optimize;
 pub mod scalar;
 pub mod traits;
 pub mod vector;
@@ -58,6 +59,7 @@ pub trait Index: Send + Sync {
 }
 
 /// Index Type
+#[derive(Debug, PartialEq)]
 pub enum IndexType {
     // Preserve 0-100 for simple indices.
     Scalar = 0,
