@@ -314,12 +314,10 @@ impl DatasetIndexExt for Dataset {
         let mut removed_indices = vec![];
         for deltas in name_to_indices.values() {
             let Some((new_id, removed, mut new_frag_ids)) =
-                append_index(dataset.clone(), deltas.as_slice(), &options).await?
+                append_index(dataset.clone(), deltas.as_slice(), options).await?
             else {
                 continue;
             };
-            println!("Removed indices: {:?}, new index: {}", removed, new_id);
-
             for removed_idx in removed.iter() {
                 new_frag_ids |= removed_idx.fragment_bitmap.as_ref().unwrap();
             }
@@ -365,7 +363,6 @@ impl DatasetIndexExt for Dataset {
         )
         .await?;
 
-        println!("New manifest: {:?}", new_manifest);
         self.manifest = Arc::new(new_manifest);
         Ok(())
     }
@@ -555,6 +552,8 @@ impl DatasetIndexInternalExt for Dataset {
 
 #[cfg(test)]
 mod tests {
+    use crate::dataset::builder::DatasetBuilder;
+
     use super::*;
 
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
@@ -740,6 +739,7 @@ mod tests {
         let reader =
             RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
         dataset.append(reader, None).await.unwrap();
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         let stats: serde_json::Value =
             serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
         assert_eq!(stats["num_unindexed_rows"], 512);
@@ -749,9 +749,13 @@ mod tests {
         assert_eq!(stats["num_indices"], 1);
 
         dataset
-            .optimize_indices(&OptimizeOptions::default())
+            .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 0, // Just create index for delta
+            })
             .await
             .unwrap();
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+
         let stats: serde_json::Value =
             serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
         assert_eq!(stats["num_unindexed_rows"], 0);

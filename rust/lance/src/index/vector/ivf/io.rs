@@ -47,7 +47,7 @@ use crate::Result;
 pub(super) async fn write_index_partitions(
     writer: &mut dyn Writer,
     ivf: &mut Ivf,
-    streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
+    streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
     existing_indices: Option<&[&IVFIndex]>,
 ) -> Result<()> {
     // build the initial heap
@@ -55,30 +55,32 @@ pub(super) async fn write_index_partitions(
     let mut streams_heap = BinaryHeap::new();
     let mut new_streams = vec![];
 
-    for stream in streams {
-        let mut stream = Box::pin(stream.peekable());
+    if let Some(streams) = streams {
+        for stream in streams {
+            let mut stream = Box::pin(stream.peekable());
 
-        match stream.as_mut().peek().await {
-            Some(Ok(batch)) => {
-                let part_ids: &UInt32Array = batch
-                    .column_by_name(PART_ID_COLUMN)
-                    .expect("part id column not found")
-                    .as_primitive();
-                let part_id = part_ids.values()[0];
-                streams_heap.push((Reverse(part_id), new_streams.len()));
-                new_streams.push(stream);
-            }
-            Some(Err(e)) => {
-                return Err(Error::IO {
-                    message: format!("failed to read batch: {}", e),
-                    location: location!(),
-                });
-            }
-            None => {
-                return Err(Error::IO {
-                    message: "failed to read batch: end of stream".to_string(),
-                    location: location!(),
-                });
+            match stream.as_mut().peek().await {
+                Some(Ok(batch)) => {
+                    let part_ids: &UInt32Array = batch
+                        .column_by_name(PART_ID_COLUMN)
+                        .expect("part id column not found")
+                        .as_primitive();
+                    let part_id = part_ids.values()[0];
+                    streams_heap.push((Reverse(part_id), new_streams.len()));
+                    new_streams.push(stream);
+                }
+                Some(Err(e)) => {
+                    return Err(Error::IO {
+                        message: format!("failed to read batch: {}", e),
+                        location: location!(),
+                    });
+                }
+                None => {
+                    return Err(Error::IO {
+                        message: "failed to read batch: end of stream".to_string(),
+                        location: location!(),
+                    });
+                }
             }
         }
     }
@@ -111,7 +113,7 @@ pub(super) async fn write_index_partitions(
                     row_id_array.push(pq_index.row_ids.as_ref().unwrap().clone());
                 }
             }
-       }
+        }
 
         // Merge all streams with the same partition id.
         while let Some((Reverse(stream_part_id), stream_idx)) = streams_heap.pop() {

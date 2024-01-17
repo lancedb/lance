@@ -193,7 +193,7 @@ pub(crate) async fn optimize_vector_indices(
     object_store: &ObjectStore,
     index_dir: &Path,
     dataset_version: u64,
-    unindexed: impl RecordBatchStream + Unpin + 'static,
+    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
@@ -240,18 +240,24 @@ pub(crate) async fn optimize_vector_indices(
     )?;
 
     // Shuffled un-indexed data with partition.
-    let shuffled = shuffle_dataset(
-        unindexed,
-        vector_column,
-        ivf,
-        None,
-        first_idx.ivf.num_partitions() as u32,
-        pq_index.pq.num_sub_vectors(),
-        10000,
-        2,
-        None,
-    )
-    .await?;
+    let shuffled = if let Some(stream) = unindexed {
+        Some(
+            shuffle_dataset(
+                stream,
+                vector_column,
+                ivf,
+                None,
+                first_idx.ivf.num_partitions() as u32,
+                pq_index.pq.num_sub_vectors(),
+                10000,
+                2,
+                None,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
     let mut ivf_mut = Ivf::new(first_idx.ivf.centroids.clone());
 
@@ -270,17 +276,12 @@ pub(crate) async fn optimize_vector_indices(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    println!(
-        "Index to be emrged: {} options={}",
-        indices_to_merge.len(),
-        options.num_indices_to_merge
-    );
     write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(&indices_to_merge)).await?;
     let metadata = IvfPQIndexMetadata {
         name: format!("_{}_idx", vector_column),
         column: vector_column.to_string(),
         dimension: dim as u32,
-        dataset_version: dataset_version,
+        dataset_version,
         metric_type,
         ivf: ivf_mut,
         pq: pq_index.pq.clone(),

@@ -81,7 +81,7 @@ pub(super) async fn build_partitions(
     )
     .await?;
 
-    write_index_partitions(writer, ivf, stream, None).await?;
+    write_index_partitions(writer, ivf, Some(stream), None).await?;
 
     Ok(())
 }
