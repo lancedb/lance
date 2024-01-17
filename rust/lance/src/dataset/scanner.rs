@@ -1242,7 +1242,8 @@ impl Scanner {
             },
         };
         Ok(Arc::new(
-            SortExec::new(vec![sort_expr], inner_fanout_search).with_fetch(Some(q.k)),
+            SortExec::new(vec![sort_expr], inner_fanout_search)
+                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         ))
     }
 
