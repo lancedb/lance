@@ -852,24 +852,24 @@ impl Scanner {
         } else {
             Arc::new(vec![])
         };
-        let knn_idx = indices.iter().find(|i| i.fields.contains(&column_id));
-        if let Some(index) = knn_idx {
+        if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
             // There is an index built for the column.
             // We will use the index.
-            if let Some(rf) = q.refine_factor {
-                if rf == 0 {
-                    return Err(Error::IO {
-                        message: "Refine factor can not be zero".to_string(),
-                        location: location!(),
-                    });
-                }
+            if q.refine_factor == Some(0) {
+                return Err(Error::IO {
+                    message: "Refine factor can not be zero".to_string(),
+                    location: location!(),
+                });
             }
 
-            let ann_node = self.ann(q, index, filter_plan).await?; // _distance, _rowid
+            // Find all deltas with the same index name.
+            let deltas = self.dataset.load_indices_by_name(&index.name).await?;
+            let ann_node = self.ann(q, &deltas, filter_plan).await?; // _distance, _rowid
 
             let with_vector = self.dataset.schema().project(&[&q.column])?;
             let knn_node_with_vector = self.take(ann_node, &with_vector, self.batch_readahead)?;
             let mut knn_node = if q.refine_factor.is_some() {
+                // TODO: now we just open an index to get its metric type.
                 let idx = self
                     .dataset
                     .open_vector_index(q.column.as_str(), &index.uuid.to_string())
@@ -1178,7 +1178,7 @@ impl Scanner {
     async fn ann(
         &self,
         q: &Query,
-        index: &Index,
+        index: &[Index],
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let prefilter_source = match (

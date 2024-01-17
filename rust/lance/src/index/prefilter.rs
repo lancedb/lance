@@ -62,15 +62,19 @@ pub struct PreFilter {
 }
 
 impl PreFilter {
-    pub fn new(dataset: Arc<Dataset>, index: Index, filter: Option<Box<dyn FilterLoader>>) -> Self {
-        let fragments = index.fragment_bitmap.unwrap_or_else(|| {
-            // If the index doesn't have a fragment bitmap then we don't know which fragments were covered
-            // by the index so we have to be very conservative and figure that any fragment that has ever
-            // been deleted might be part of the index
-            let mut bitmap = RoaringBitmap::new();
-            bitmap.insert_range(0..dataset.manifest.max_fragment_id);
-            bitmap
-        });
+    pub fn new(
+        dataset: Arc<Dataset>,
+        indices: &[Index],
+        filter: Option<Box<dyn FilterLoader>>,
+    ) -> Self {
+        let mut fragments = RoaringBitmap::new();
+        if indices.iter().any(|idx| idx.fragment_bitmap.is_none()) {
+            fragments.insert_range(0..dataset.manifest.max_fragment_id);
+        } else {
+            indices.iter().for_each(|idx| {
+                fragments |= idx.fragment_bitmap.as_ref().unwrap();
+            });
+        }
         let deleted_ids =
             Self::create_deletion_mask(dataset.clone(), fragments).map(SharedPrerequisite::spawn);
         let filtered_ids = filter

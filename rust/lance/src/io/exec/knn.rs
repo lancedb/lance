@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::any::Any;
+use std::iter::repeat;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -24,11 +25,10 @@ use async_trait::async_trait;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
+    stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
     RecordBatchStream as DFRecordBatchStream, SendableRecordBatchStream, Statistics,
 };
-use futures::stream::Stream;
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{flat::flat_search, Query, DIST_COL};
@@ -299,6 +299,43 @@ impl FilterLoader for SelectionVectorToPrefilter {
     }
 }
 
+fn knn_index_stream(
+    query: Query,
+    dataset: Arc<Dataset>,
+    index_meta: Vec<Index>,
+    allow_list_input: Option<Box<dyn FilterLoader>>,
+) -> impl DFRecordBatchStream {
+    let pre_filter = Arc::new(PreFilter::new(
+        dataset.clone(),
+        &index_meta,
+        allow_list_input,
+    ));
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(DIST_COL, DataType::Float32, true),
+        ROW_ID_FIELD.clone(),
+    ]));
+
+    let s = stream::iter(index_meta.into_iter())
+        .zip(stream::repeat((
+            dataset.clone(),
+            pre_filter.clone(),
+            query.clone(),
+        )))
+        .map(|(idx, (ds, pre_filter, query))| async move {
+            let index = ds
+                .open_vector_index(&query.column, &idx.uuid.to_string())
+                .await?;
+            index.search(&query, pre_filter.clone()).await
+        })
+        .buffer_unordered(2)
+        .map(|r| {
+            r.map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {}", e)))
+        })
+        .boxed();
+    RecordBatchStreamAdapter::new(schema, s)
+}
+
 /// KNN Node from reading a vector index.
 pub struct KNNIndexStream {
     rx: Receiver<datafusion::error::Result<RecordBatch>>,
@@ -309,29 +346,30 @@ impl KNNIndexStream {
     async fn knn_stream(
         query: Query,
         dataset: Arc<Dataset>,
-        index_meta: Index,
+        index_meta: Vec<Index>,
         allow_list_input: Option<Box<dyn FilterLoader>>,
     ) -> Result<RecordBatch> {
+        let pre_filter = Arc::new(PreFilter::new(dataset, &index_meta, allow_list_input));
+
         let index = dataset
             .open_vector_index(&query.column, &index_meta.uuid.to_string())
             .await?;
-        let pre_filter = Arc::new(PreFilter::new(dataset, index_meta, allow_list_input));
         index.search(&query, pre_filter).await
     }
 
     #[instrument(level = "debug", skip_all, name = "KNNIndexStream::new")]
     pub fn new(
         dataset: Arc<Dataset>,
-        index: &Index,
+        indices: &[Index],
         query: &Query,
         allow_list: Option<Box<dyn FilterLoader>>,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         let q = query.clone();
-        let index = index.clone();
+        let indices = indices.to_vec();
         let bg_thread = tokio::spawn(
             async move {
-                let result = match Self::knn_stream(q, dataset, index, allow_list).await {
+                let result = match Self::knn_stream(q, dataset, indices, allow_list).await {
                     Ok(b) => b,
                     Err(e) => {
                         tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
@@ -416,7 +454,7 @@ pub struct KNNIndexExec {
     /// Prefiltering input
     prefilter_source: PreFilterSource,
     /// The index metadata
-    index: Index,
+    indices: Vec<Index>,
     /// The vector query to execute.
     query: Query,
 }
@@ -427,9 +465,10 @@ impl DisplayAs for KNNIndexExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "KNNIndex: name={}, k={}",
-                    self.index.uuid,
-                    self.query.k * self.query.refine_factor.unwrap_or(1) as usize
+                    "KNNIndex(name={}, k={}, deltas={})",
+                    self.indices[0].name,
+                    self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
+                    self.indices.len()
                 )
             }
         }
@@ -440,10 +479,16 @@ impl KNNIndexExec {
     /// Create a new [KNNIndexExec].
     pub fn try_new(
         dataset: Arc<Dataset>,
-        index: Index,
+        indices: &[Index],
         query: &Query,
         prefilter_source: PreFilterSource,
     ) -> Result<Self> {
+        if indices.is_empty() {
+            return Err(Error::IO {
+                message: "KNNIndexExec node: no index found for query".to_string(),
+                location: location!(),
+            });
+        }
         let schema = dataset.schema();
         if schema.field(query.column.as_str()).is_none() {
             return Err(Error::IO {
@@ -457,7 +502,7 @@ impl KNNIndexExec {
 
         Ok(Self {
             dataset,
-            index,
+            indices: indices.to_vec(),
             query: query.clone(),
             prefilter_source,
         })
@@ -518,7 +563,7 @@ impl ExecutionPlan for KNNIndexExec {
 
         Ok(Box::pin(KNNIndexStream::new(
             self.dataset.clone(),
-            &self.index,
+            &self.indices,
             &self.query,
             prefilter_loader,
         )))
