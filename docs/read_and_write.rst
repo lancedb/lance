@@ -227,7 +227,7 @@ To open a Lance dataset, use the :py:meth:`lance.dataset` function:
 .. note::
 
   Lance supports local file system, AWS ``s3`` and Google Cloud Storage(``gs``) as storage backends
-  at the moment. See :ref:`storages` for more details.
+  at the moment.
 
 The most straightforward approach for reading a Lance dataset is to utilize the :py:meth:`lance.LanceDataset.to_table`
 method in order to load the entire dataset into memory.
