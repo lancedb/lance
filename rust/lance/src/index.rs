@@ -323,7 +323,7 @@ impl DatasetIndexExt for Dataset {
                 new_frag_ids |= removed_idx.fragment_bitmap.as_ref().unwrap();
             }
 
-            let last_idx = indices.last().unwrap();
+            let last_idx = deltas.last().expect("Delte indices should not be empty");
             let new_idx = IndexMetadata {
                 uuid: new_id,
                 name: last_idx.name.clone(), // Keep the same name
