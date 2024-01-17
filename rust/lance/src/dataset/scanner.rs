@@ -1228,12 +1228,23 @@ impl Scanner {
             (_, _, false) => PreFilterSource::None,
         };
 
-        Ok(Arc::new(KNNIndexExec::try_new(
+        let inner_fanout_search = Arc::new(KNNIndexExec::try_new(
             self.dataset.clone(),
             index,
             q,
             prefilter_source,
-        )?))
+        )?);
+
+        let sort_expr = PhysicalSortExpr {
+            expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        };
+        Ok(Arc::new(
+            SortExec::new(vec![sort_expr], inner_fanout_search).with_fetch(Some(q.k)),
+        ))
     }
 
     /// Take row indices produced by input plan from the dataset (with projection)
