@@ -34,11 +34,15 @@ use futures::stream::repeat_with;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::datatypes::Schema;
-use lance_core::format::SelfDescribingFileReader;
-use lance_core::io::{FileReader, FileWriter, ReadBatchParams, RecordBatchStream};
+use lance_file::reader::FileReader;
+use lance_file::writer::FileWriter;
+use lance_io::object_store::ObjectStore;
+use lance_io::stream::RecordBatchStream;
+use lance_io::ReadBatchParams;
+use lance_table::format::SelfDescribingFileReader;
+use lance_table::io::manifest::ManifestDescribing;
 
 use crate::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
-use lance_core::io::object_store::ObjectStore;
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use log::info;
 use object_store::path::Path;
@@ -260,8 +264,11 @@ impl IvfShuffler {
         let path = self.output_dir.child(UNSORTED_BUFFER);
         let writer = object_store.create(&path).await?;
 
-        let mut file_writer =
-            FileWriter::with_object_writer(writer, self.schema.clone(), &Default::default())?;
+        let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
+            writer,
+            self.schema.clone(),
+            &Default::default(),
+        )?;
 
         let mut data = Box::pin(data);
 
@@ -476,7 +483,7 @@ impl IvfShuffler {
                     ),
                 ]));
 
-                let mut file_writer = FileWriter::with_object_writer(
+                let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
                     writer,
                     self.schema.clone(),
                     &Default::default(),
@@ -553,7 +560,7 @@ mod test {
         types::{UInt32Type, UInt64Type, UInt8Type},
         Array,
     };
-    use lance_core::io::RecordBatchStreamAdapter;
+    use lance_io::stream::RecordBatchStreamAdapter;
 
     use super::*;
 

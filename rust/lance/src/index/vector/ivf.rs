@@ -35,12 +35,8 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
-use lance_core::io::{
-    local::to_local_path, ObjectWriter, Reader, RecordBatchStream, WriteExt, Writer,
-};
-use lance_core::{
-    datatypes::Field, encodings::plain::PlainEncoder, io::object_store::ObjectStore, Error, Result,
-};
+use lance_core::{datatypes::Field, Error, Result};
+use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
@@ -50,7 +46,15 @@ use lance_index::{
     },
     Index, IndexType,
 };
+use lance_io::{
+    encodings::plain::PlainEncoder,
+    local::to_local_path,
+    object_writer::ObjectWriter,
+    stream::RecordBatchStream,
+    traits::{Reader, WriteExt, Writer},
+};
 use lance_linalg::distance::{Cosine, Dot, MetricType, L2};
+use lance_table::format::Index as IndexMetadata;
 use log::{debug, info};
 use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -1043,7 +1047,9 @@ pub(crate) async fn remap_index_file(
 
     let metadata = pb::Index::try_from(&metadata)?;
     let pos = writer.write_protobuf(&metadata).await?;
-    writer.write_magics(pos).await?;
+    writer
+        .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+        .await?;
     writer.shutdown().await?;
 
     Ok(())
@@ -1109,7 +1115,9 @@ async fn write_index_file(
 
     let metadata = pb::Index::try_from(&metadata)?;
     let pos = writer.write_protobuf(&metadata).await?;
-    writer.write_magics(pos).await?;
+    writer
+        .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+        .await?;
     writer.shutdown().await?;
 
     Ok(())
@@ -1175,6 +1183,7 @@ mod tests {
 
     use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
+    use lance_core::utils::address::RowAddress;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_seed, generate_scaled_random_array,
@@ -1184,9 +1193,8 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
-    use crate::{
-        format::RowAddress,
-        index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt, IndexType},
+    use crate::index::{
+        vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt, IndexType,
     };
 
     const DIM: usize = 32;
@@ -1554,7 +1562,7 @@ mod tests {
             .unwrap();
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
 
-        let index_meta = crate::format::Index {
+        let index_meta = IndexMetadata {
             uuid,
             dataset_version: 0,
             fields: Vec::new(),

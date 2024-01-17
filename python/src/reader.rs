@@ -22,7 +22,7 @@ use futures::lock::Mutex;
 use futures::stream::StreamExt;
 
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner as LanceScanner};
-use lance_core::io::RecordBatchStream;
+use lance_io::stream::RecordBatchStream;
 
 use crate::RT;
 

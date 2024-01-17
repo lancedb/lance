@@ -36,15 +36,14 @@ use lance::index::{
     vector::{diskann::DiskANNParams, VectorIndexParams},
 };
 use lance_arrow::as_fixed_size_list_array;
-use lance_core::io::commit::CommitHandler;
-use lance_core::{datatypes::Schema, format::Fragment, io::object_store::ObjectStoreParams};
-use lance_index::optimize::OptimizeOptions;
 use lance_index::{
     vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     DatasetIndexExt, IndexParams, IndexType,
 };
+use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
-use object_store::path::Path;
+use lance_table::format::Fragment;
+use lance_table::io::commit::CommitHandler;
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PySet};

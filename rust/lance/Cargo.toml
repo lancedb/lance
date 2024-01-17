@@ -20,8 +20,11 @@ lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 lance-datafusion = { workspace = true }
 lance-datagen = { workspace = true }
+lance-file = { workspace = true }
+lance-io = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
+lance-table = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }

@@ -22,8 +22,11 @@ use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::datatypes::Schema;
-use lance::format::{pb, DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
-use lance_core::io::{deletion::deletion_file_path, object_store::ObjectStore};
+use lance_file::datatypes::Fields;
+use lance_file::format::pb::Field as LanceField;
+use lance_io::object_store::ObjectStore;
+use lance_table::format::{pb, DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
+use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
 use prost::Message;
 use pyo3::prelude::*;
@@ -327,7 +330,7 @@ impl FragmentMetadata {
     fn init() -> Self {
         Self {
             inner: LanceFragmentMetadata::new(0),
-            schema: Schema::from(&Vec::<pb::Field>::new()),
+            schema: Schema::from(&Fields(Vec::<LanceField>::new())),
         }
     }
 
@@ -339,7 +342,7 @@ impl FragmentMetadata {
 
         Ok(Self {
             inner: metadata,
-            schema: Schema::from(&Vec::<pb::Field>::new()),
+            schema: Schema::from(&Fields(Vec::<LanceField>::new())),
         })
     }
 
@@ -365,7 +368,7 @@ impl FragmentMetadata {
                 let manifest = pb::Manifest::decode(bytes).map_err(|e| {
                     PyValueError::new_err(format!("Unable to unpickle FragmentMetadata: {}", e))
                 })?;
-                self.schema = Schema::from(&manifest.fields);
+                self.schema = Schema::from(&Fields(manifest.fields));
                 self.inner = LanceFragmentMetadata::from(&manifest.fragments[0]);
                 Ok(())
             }
@@ -375,7 +378,7 @@ impl FragmentMetadata {
 
     pub fn __getstate__(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let container = pb::Manifest {
-            fields: (&self_.schema).into(),
+            fields: Fields::from(&self_.schema).0,
             fragments: vec![pb::DataFragment::from(&self_.inner)],
             ..Default::default()
         };

@@ -31,14 +31,14 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt, Stream};
 use lance_core::datatypes::SchemaCompareOptions;
-use lance_core::io::commit::{commit_handler_from_url, CommitHandler, CommitLock};
-use lance_core::io::{
-    commit::CommitError,
-    object_store::{ObjectStore, ObjectStoreParams},
-    read_metadata_offset, read_struct,
-    reader::read_manifest,
-    write_manifest, ObjectWriter, WriteExt,
-};
+use lance_file::datatypes::populate_schema_dictionary;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_writer::ObjectWriter;
+use lance_io::traits::WriteExt;
+use lance_io::utils::{read_metadata_offset, read_struct};
+use lance_table::format::{Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION};
+use lance_table::io::commit::{commit_handler_from_url, CommitError, CommitHandler, CommitLock};
+use lance_table::io::manifest::{read_manifest, write_manifest};
 use log::warn;
 use object_store::path::Path;
 use snafu::{location, Location};
@@ -72,7 +72,6 @@ use self::transaction::{Operation, Transaction};
 use self::write::{reader_to_stream, write_fragments_internal};
 use crate::datatypes::Schema;
 use crate::error::box_error;
-use crate::format::{Fragment, Index, Manifest};
 use crate::io::commit::{commit_new_dataset, commit_transaction};
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
@@ -379,10 +378,7 @@ impl Dataset {
             });
         }
 
-        manifest
-            .schema
-            .load_dictionary(object_reader.as_ref())
-            .await?;
+        populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
         Ok(Self {
             object_store,
             base: base_path,
@@ -1520,7 +1516,9 @@ fn write_manifest_file_to_path<'a>(
     Box::pin(async {
         let mut object_writer = ObjectWriter::new(object_store, path).await?;
         let pos = write_manifest(&mut object_writer, manifest, indices).await?;
-        object_writer.write_magics(pos).await?;
+        object_writer
+            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+            .await?;
         object_writer.shutdown().await?;
         Ok(())
     })
@@ -1566,7 +1564,6 @@ mod tests {
     use crate::datatypes::Schema;
     use crate::index::scalar::ScalarIndexParams;
     use crate::index::vector::VectorIndexParams;
-    use crate::io::deletion::read_deletion_file;
 
     use arrow_array::FixedSizeListArray;
     use arrow_array::{
@@ -1586,6 +1583,8 @@ mod tests {
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
+    use lance_table::format::WriterVersion;
+    use lance_table::io::deletion::read_deletion_file;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use tempfile::{tempdir, TempDir};

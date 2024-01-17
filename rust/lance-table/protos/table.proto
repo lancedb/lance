@@ -1,0 +1,234 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * <p>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p>
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+package lance.table;
+
+import "google/protobuf/timestamp.proto";
+import "file.proto";
+
+/*
+
+Format:
+
++----------------------------------------+
+|       Encoded Column 0, Chunk 0        |
+           ...
+|       Encoded Column M, Chunk N - 1    |
+|       Encoded Column M, Chunk N        |
+|       Indices ...                      |
+|       Chunk Position (M x N x 8)       |
+|         Manifest (Optional)            |
+|         Metadata                       |
+| i64: metadata position                 |
+| MAJOR_VERSION | MINOR_VERSION | "LANC" |
++----------------------------------------+
+ */
+
+/// UUID type. encoded as 16 bytes.
+message UUID {
+  bytes uuid = 1;
+}
+
+// Manifest is a global section shared between all the files.
+message Manifest {
+  // All fields of the dataset, including the nested fields.
+  repeated lance.file.Field fields = 1;
+
+  // Fragments of the dataset.
+  repeated DataFragment fragments = 2;
+
+  // Snapshot version number.
+  uint64 version = 3;
+
+  // The file position of the version auxiliary data.
+  //  * It is not inheritable between versions.
+  //  * It is not loaded by default during query.
+  uint64 version_aux_data = 4;
+
+  // Schema metadata.
+  map<string, bytes> metadata = 5;
+
+  message WriterVersion {
+    // The name of the library that created this file.
+    string library = 1;
+    // The version of the library that created this file. Because we cannot assume
+    // that the library is semantically versioned, this is a string. However, if it
+    // is semantically versioned, it should be a valid semver string without any 'v'
+    // prefix. For example: `2.0.0`, `2.0.0-rc.1`.
+    string version = 2;
+  }
+
+  // The version of the writer that created this file.
+  //
+  // This information may be used to detect whether the file may have known bugs
+  // associated with that writer.
+  WriterVersion writer_version = 13;
+
+  // If presented, the file position of the index metadata.
+  optional uint64 index_section = 6;
+
+  // Version creation Timestamp, UTC timezone
+  google.protobuf.Timestamp timestamp = 7;
+
+  // Optional version tag
+  string tag = 8;
+
+  // Feature flags for readers.
+  //
+  // A bitmap of flags that indicate which features are required to be able to
+  // read the table. If a reader does not recognize a flag that is set, it
+  // should not attempt to read the dataset.
+  //
+  // Known flags:
+  // * 1: deletion files are present
+  uint64 reader_feature_flags = 9;
+
+  // Feature flags for writers.
+  //
+  // A bitmap of flags that indicate which features are required to be able to
+  // write to the dataset. if a writer does not recognize a flag that is set, it
+  // should not attempt to write to the dataset.
+  //
+  // The flags are the same as for reader_feature_flags, although they will not
+  // always apply to both.
+  uint64 writer_feature_flags = 10;
+
+  // The highest fragment ID that has been used so far.
+  //
+  // This ID is not guaranteed to be present in the current version, but it may
+  // have been used in previous versions.
+  // 
+  // For a single file, will be zero.
+  uint32 max_fragment_id = 11;
+
+  // Path to the transaction file, relative to `{root}/_transactions`
+  //
+  // This contains a serialized Transaction message representing the transaction
+  // that created this version.
+  //
+  // May be empty if no transaction file was written.
+  //
+  // The path format is "{read_version}-{uuid}.txn" where {read_version} is the
+  // version of the table the transaction read from, and {uuid} is a 
+  // hyphen-separated UUID.
+  string transaction_file = 12;
+} // Manifest
+
+// Auxiliary Data attached to a version.
+// Only load on-demand.
+message VersionAuxData {
+  // key-value metadata.
+  map<string, bytes> metadata = 3;
+}
+
+// Metadata describing the index.
+message IndexMetadata {
+  // Unique ID of an index. It is unique across all the dataset versions.
+  UUID uuid = 1;
+
+  // The columns to build the index.
+  repeated int32 fields = 2;
+
+  // Index name. Must be unique within one dataset version.
+  string name = 3;
+
+  // The version of the dataset this index was built from.
+  uint64 dataset_version = 4;
+
+  /// A bitmap of the included fragment ids.
+  ///
+  /// This may by used to determine how much of the dataset is covered by the
+  /// index. This information can be retrieved from the dataset by looking at
+  /// the dataset at `dataset_version`. However, since the old version may be
+  /// deleted while the index is still in use, this information is also stored
+  /// in the index.
+  /// 
+  /// The bitmap is stored as a 32-bit Roaring bitmap.
+  bytes fragment_bitmap = 5;
+}
+
+// Index Section, containing a list of index metadata for one dataset version.
+message IndexSection {
+  repeated IndexMetadata indices = 1;
+}
+
+// Data fragment. A fragment is a set of files which represent the
+// different columns of the same rows.
+// If column exists in the schema, but the related file does not exist,
+// treat this column as nulls.
+message DataFragment {
+  // Unique ID of each DataFragment
+  uint64 id = 1;
+
+  repeated DataFile files = 2;
+
+  // File that indicates which rows, if any, should be considered deleted.
+  DeletionFile deletion_file = 3;
+
+  // Number of original rows in the fragment, not counting deletions. To compute
+  // the current number of rows, subtract `deletion_file.num_deleted_rows` from
+  // this value.
+  uint64 physical_rows = 4;
+}
+
+// Lance Data File
+message DataFile {
+  // Relative path to the root.
+  string path = 1;
+  // The ids of the fields/columns in this file.
+  //
+  // IDs are assigned based on position in the file, offset by the max existing
+  // field id in the table (if any already). So when a fragment is first created
+  // with one file of N columns, the field ids will be 1, 2, ..., N. If a second,
+  // fragment is created with M columns, the field ids will be N+1, N+2, ..., N+M.
+  //
+  // These ids must be sorted and contiguous.
+  repeated int32 fields = 2;
+} // DataFile
+
+// Deletion File
+//
+// The path of the deletion file is constructed as:
+//   {root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}
+// where {extension} is `.arrow` or `.bin` depending on the type of deletion.
+message DeletionFile {
+  // Type of deletion file, which varies depending on what is the most efficient
+  // way to store the deleted row ids. If none, then will be unspecified. If there are
+  // sparsely deleted rows, then ARROW_ARRAY is the most efficient. If there are
+  // densely deleted rows, then BIT_MAP is the most efficient.
+  enum DeletionFileType {
+    // Deletion file is a single Int32Array of deleted row ids. This is stored as
+    // an Arrow IPC file with one batch and one column. Has a .arrow extension.
+    ARROW_ARRAY = 0;
+    // Deletion file is a Roaring Bitmap of deleted row ids. Has a .bin extension.
+    BITMAP = 1;
+  }
+
+  // Type of deletion file. If it is unspecified, then the remaining fields will be missing.
+  DeletionFileType file_type = 1;
+  // The version of the dataset this deletion file was built from.
+  uint64 read_version = 2;
+  // An opaque id used to differentiate this file from others written by concurrent
+  // writers.
+  uint64 id = 3;
+  // The number of rows that are marked as deleted.
+  uint64 num_deleted_rows = 4;
+} // DeletionFile
+

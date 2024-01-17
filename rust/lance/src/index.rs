@@ -20,22 +20,17 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use futures::{stream, StreamExt, TryStreamExt};
-use itertools::Itertools;
-use lance_core::format::Fragment;
-use lance_core::io::{
-    read_message, read_message_from_buf, read_metadata_offset, reader::read_manifest_indexes,
-    Reader,
-};
-use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
 pub use lance_index::IndexParams;
 use lance_index::{pb, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
-use roaring::RoaringBitmap;
-use serde_json::json;
+use lance_io::traits::Reader;
+use lance_io::utils::{read_message, read_message_from_buf, read_metadata_offset};
+use lance_table::format::Fragment;
+use lance_table::format::Index as IndexMetadata;
+use lance_table::io::manifest::read_manifest_indexes;
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
@@ -47,8 +42,7 @@ pub mod scalar;
 pub mod vector;
 
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::format::Index as IndexMetadata;
-use crate::index::append::merge_indices;
+use crate::index::append::append_index;
 use crate::index::vector::remap_vector_index;
 use crate::io::commit::commit_transaction;
 use crate::{dataset::Dataset, Error, Result};

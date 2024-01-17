@@ -28,16 +28,16 @@ use futures::stream;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use lance_core::format::Fragment;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::utils::mask::RowIdTreeMap;
+use lance_table::format::Fragment;
+use lance_table::format::Index;
 use roaring::RoaringBitmap;
 use tracing::instrument;
 use tracing::Instrument;
 
 use crate::dataset::fragment::FileFragment;
 use crate::error::Result;
-use crate::format::Index;
 use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
 

@@ -21,10 +21,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
 };
 use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt};
-use lance_core::{
-    format::{Fragment, RowAddress},
-    Error, Result, ROW_ID_FIELD,
-};
+use lance_core::{utils::address::RowAddress, Error, Result, ROW_ID_FIELD};
 use lance_index::{
     scalar::{
         expression::{ScalarIndexExpr, ScalarIndexLoader},
@@ -32,6 +29,7 @@ use lance_index::{
     },
     DatasetIndexExt,
 };
+use lance_table::format::Fragment;
 use pin_project::pin_project;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};

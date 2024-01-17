@@ -17,5 +17,4 @@
 pub mod commit;
 pub(crate) mod exec;
 
-pub use lance_core::io::object_store::ObjectStore;
-pub use lance_core::io::*;
+pub use lance_io::object_store::ObjectStore;

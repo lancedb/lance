@@ -20,12 +20,12 @@ use object_store::path::Path;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use lance_core::{io::Writer, ROW_ID};
+use lance_core::{Error, Result, ROW_ID};
 use lance_index::vector::{ivf::shuffler::shuffle_dataset, pq::ProductQuantizer};
+use lance_io::{stream::RecordBatchStream, traits::Writer};
 use lance_linalg::distance::MetricType;
 
 use crate::index::vector::ivf::{io::write_index_partitions, Ivf};
-use crate::{io::RecordBatchStream, Error, Result};
 
 /// Build specific partitions of IVF index.
 ///

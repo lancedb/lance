@@ -25,17 +25,16 @@ use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
-use lance_core::format::{DataFile, DeletionFile};
-use lance_core::{
-    datatypes::Schema,
-    io::{
-        deletion::{deletion_file_path, read_deletion_file, write_deletion_file, DeletionVector},
-        object_store::ObjectStore,
-        FileReader, FileWriter, ReadBatchParams,
-    },
-    Error, Result, ROW_ID,
-};
+use lance_core::utils::deletion::DeletionVector;
+use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_datafusion::chunker::chunk_stream;
+use lance_file::reader::FileReader;
+use lance_file::writer::FileWriter;
+use lance_io::object_store::ObjectStore;
+use lance_io::ReadBatchParams;
+use lance_table::format::{DataFile, DeletionFile, Fragment};
+use lance_table::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
+use lance_table::io::manifest::ManifestDescribing;
 use snafu::{location, Location};
 use uuid::Uuid;
 
@@ -46,7 +45,6 @@ use super::write::reader_to_stream;
 use super::WriteParams;
 use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
-use crate::format::Fragment;
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -93,7 +91,7 @@ impl FileFragment {
         let filename = format!("{}.lance", Uuid::new_v4());
         let mut fragment = Fragment::with_file(id as u64, &filename, &schema, None);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
-        let mut writer = FileWriter::try_new(
+        let mut writer = FileWriter::<ManifestDescribing>::try_new(
             &object_store,
             &full_path,
             schema.clone(),

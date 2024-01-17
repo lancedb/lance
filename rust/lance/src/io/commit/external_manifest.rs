@@ -20,10 +20,11 @@ mod test {
 
     use async_trait::async_trait;
     use futures::{future::join_all, StreamExt, TryStreamExt};
-    use lance_core::{
-        io::commit::{external_manifest::*, latest_manifest_path, manifest_path, CommitHandler},
-        Error, Result,
+    use lance_core::{Error, Result};
+    use lance_table::io::commit::external_manifest::{
+        ExternalManifestCommitHandler, ExternalManifestStore,
     };
+    use lance_table::io::commit::{latest_manifest_path, manifest_path, CommitHandler};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
     use snafu::{location, Location};

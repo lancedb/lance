@@ -29,8 +29,8 @@ use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::error::{box_error, InvalidInputSnafu};
-use lance_core::format::Fragment;
 use lance_datafusion::expr::safe_coerce_scalar;
+use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 use snafu::{location, Location, ResultExt};
 

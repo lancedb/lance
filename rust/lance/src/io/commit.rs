@@ -35,26 +35,22 @@
 
 use std::sync::Arc;
 
-use lance_core::io::commit::CommitHandler;
+use lance_table::format::{pb, DeletionFile, Fragment, Index, Manifest};
+use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler};
+use lance_table::io::deletion::read_deletion_file;
 use snafu::{location, Location};
 
 use futures::future::Either;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::{
-    format::{pb, Index, Manifest},
-    io::commit::{CommitConfig, CommitError},
-    Error, Result,
-};
+use lance_core::{Error, Result};
 use lance_index::DatasetIndexExt;
 use object_store::path::Path;
 use prost::Message;
 
-use super::deletion::read_deletion_file;
 use super::ObjectStore;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig};
-use crate::format::{DeletionFile, Fragment};
 use crate::index::DatasetIndexInternalExt;
 use crate::Dataset;
 
@@ -62,7 +58,6 @@ use crate::Dataset;
 mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
-pub use lance_core::io::commit::latest_manifest_path;
 
 /// Read the transaction data from a transaction file.
 async fn read_transaction_file(
@@ -416,12 +411,11 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::future::join_all;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::io::commit::{
-        CommitError, CommitHandler, CommitLease, CommitLock, RenameCommitHandler,
-        UnsafeCommitHandler,
-    };
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
+    use lance_table::io::commit::{
+        CommitLease, CommitLock, RenameCommitHandler, UnsafeCommitHandler,
+    };
     use lance_testing::datagen::generate_random_array;
 
     use super::*;

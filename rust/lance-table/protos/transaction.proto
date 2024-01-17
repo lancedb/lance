@@ -1,0 +1,188 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * <p>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p>
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+import "file.proto";
+import "table.proto";
+
+package lance.table;
+
+// A transaction represents the changes to a dataset.
+//
+// This has two purposes:
+// 1. When retrying a commit, the transaction can be used to re-build an updated
+//    manifest.
+// 2. When there's a conflict, this can be used to determine whether the other
+//    transaction is compatible with this one.
+message Transaction {
+  // The version of the dataset this transaction was built from.
+  //
+  // For example, for a delete transaction this means the version of the dataset
+  // that was read from while evaluating the deletion predicate.
+  uint64 read_version = 1;
+
+  // The UUID that unique identifies a transaction.
+  string uuid = 2;
+
+  // Optional version tag.
+  string tag = 3;
+
+  // Add new rows to the dataset.
+  message Append {
+    // The new fragments to append.
+    //
+    // Fragment IDs are not yet assigned.
+    repeated DataFragment fragments = 1;
+  }
+
+  // Mark rows as deleted.
+  message Delete {
+    // The fragments to update
+    //
+    // The fragment IDs will match existing fragments in the dataset.
+    repeated DataFragment updated_fragments = 1;
+    // The fragments to delete entirely.
+    repeated uint64 deleted_fragment_ids = 2;
+    // The predicate that was evaluated
+    //
+    // This may be used to determine whether the delete would have affected 
+    // files written by a concurrent transaction.
+    string predicate = 3;
+  }
+
+  // Create or overwrite the entire dataset.
+  message Overwrite {
+    // The new fragments
+    //
+    // Fragment IDs are not yet assigned.
+    repeated DataFragment fragments = 1;
+    // The new schema
+    repeated lance.file.Field schema = 2;
+    // Schema metadata.
+    map<string, bytes> schema_metadata = 3;
+  }
+
+  // Add or replace a new secondary index.
+  //
+  // - new_indices: the modified indices
+  // - removed_indices: the indices that are being replaced
+  message CreateIndex {
+    repeated IndexMetadata new_indices = 1;
+    repeated IndexMetadata removed_indices = 2;
+  }
+
+  // An operation that rewrites but does not change the data in the table. These
+  // kinds of operations just rearrange data.
+  message Rewrite {
+    // The old fragments that are being replaced
+    //
+    // DEPRECATED: use groups instead.
+    //
+    // These should all have existing fragment IDs.
+    repeated DataFragment old_fragments = 1;
+    // The new fragments
+    //
+    // DEPRECATED: use groups instead.
+    //
+    // These fragments IDs are not yet assigned.
+    repeated DataFragment new_fragments = 2;
+
+    // During a rewrite an index may be rewritten.  We only serialize the UUID
+    // since a rewrite should not change the other index parameters.
+    message RewrittenIndex {
+      // The id of the index that will be replaced
+      UUID old_id = 1;
+      // the id of the new index
+      UUID new_id = 2;
+    }
+
+    // A group of rewrite files that are all part of the same rewrite.
+    message RewriteGroup {
+      // The old fragment that is being replaced
+      //
+      // This should have an existing fragment ID.
+      repeated DataFragment old_fragments = 1;
+      // The new fragment
+      //
+      // The ID should have been reserved by an earlier
+      // reserve operation
+      repeated DataFragment new_fragments = 2;
+    }
+
+    // Groups of files that have been rewritten
+    repeated RewriteGroup groups = 3;
+    // Indices that have been rewritten
+    repeated RewrittenIndex rewritten_indices = 4;
+  }
+
+  // An operation that merges in a new column, altering the schema.
+  message Merge {
+    // The updated fragments
+    //
+    // These should all have existing fragment IDs.
+    repeated DataFragment fragments = 1;
+    // The new schema
+    repeated lance.file.Field schema = 2;
+    // Schema metadata.
+    map<string, bytes> schema_metadata = 3;
+  }
+
+  // An operation that projects a subset of columns, altering the schema.
+  message Project {
+    // The new schema
+    repeated lance.file.Field schema = 1;
+  }
+
+  // An operation that restores a dataset to a previous version.
+  message Restore {
+    // The version to restore to
+    uint64 version = 1;
+  }
+
+  // An operation that reserves fragment ids for future use in
+  // a rewrite operation.
+  message ReserveFragments {
+    uint32 num_fragments = 1;
+  }
+
+  // An operation that updates rows but does not add or remove rows.
+  message Update {
+    // The fragments that have been removed. These are fragments where all rows
+    // have been updated and moved to a new fragment.
+    repeated uint64 removed_fragment_ids = 1;
+    // The fragments that have been updated.
+    repeated DataFragment updated_fragments = 2;
+    // The new fragments where updated rows have been moved to.
+    repeated DataFragment new_fragments = 3;
+  }
+
+  // The operation of this transaction.
+  oneof operation {
+    Append append = 100;
+    Delete delete = 101;
+    Overwrite overwrite = 102;
+    CreateIndex create_index = 103;
+    Rewrite rewrite = 104;
+    Merge merge = 105;
+    Restore restore = 106;
+    ReserveFragments reserve_fragments = 107;
+    Update update = 108;
+    Project project = 109;
+  }
+}

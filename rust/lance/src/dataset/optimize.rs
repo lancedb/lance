@@ -104,10 +104,11 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::format::RowAddress;
 use crate::io::commit::{commit_transaction, migrate_fragments};
+use crate::Dataset;
 use crate::Result;
-use crate::{format::Fragment, Dataset};
+use lance_core::utils::address::RowAddress;
+use lance_table::format::Fragment;
 
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;

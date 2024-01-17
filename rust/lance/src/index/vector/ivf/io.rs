@@ -22,13 +22,14 @@ use arrow_array::{
 };
 use futures::{Stream, StreamExt};
 use lance_arrow::*;
-use lance_core::{io::Writer, Error};
+use lance_core::Error;
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
+use lance_io::encodings::plain::PlainEncoder;
+use lance_io::traits::Writer;
 use snafu::{location, Location};
 
 use super::{IVFIndex, Ivf};
 use crate::dataset::ROW_ID;
-use crate::encodings::plain::PlainEncoder;
 use crate::index::vector::pq::PQIndex;
 use crate::Result;
 
