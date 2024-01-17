@@ -117,6 +117,7 @@ that Bob's name in our dataset has been sometimes written as ``Blob``, we can fi
 that with:
 
   .. code-block:: python
+
     import lance
 
     dataset = lance.dataset("./alice_and_bob.lance")
@@ -128,6 +129,7 @@ we wish. For example, if two years have passed and we wish to update the ages
 of Alice and Bob in the same example, we could write:
 
   .. code-block:: python
+
     import lance
 
     dataset = lance.dataset("./alice_and_bob.lance")
