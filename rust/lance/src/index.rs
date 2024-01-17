@@ -302,24 +302,36 @@ impl DatasetIndexExt for Dataset {
         // Append index
         let indices = self.load_indices().await?;
 
+        let mut name_to_indices = HashMap::new();
+        for idx in indices.iter() {
+            name_to_indices
+                .entry(idx.name.clone())
+                .or_insert_with(Vec::new)
+                .push(idx);
+        }
+
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
-        for idx in indices.as_slice() {
-            if idx.dataset_version == self.manifest.version {
-                continue;
-            }
-            let Some((new_id, new_frag_ids)) = append_index(dataset.clone(), idx).await? else {
+        for deltas in name_to_indices.values() {
+            let Some((new_id, removed, mut new_frag_ids)) =
+                append_index(dataset.clone(), deltas.as_slice(), &options).await?
+            else {
                 continue;
             };
 
+            for removed_idx in removed.iter() {
+                new_frag_ids |= removed_idx.fragment_bitmap.as_ref().unwrap();
+            }
+
+            let last_idx = indices.last().unwrap();
             let new_idx = IndexMetadata {
                 uuid: new_id,
-                name: idx.name.clone(),
-                fields: idx.fields.clone(),
+                name: last_idx.name.clone(), // Keep the same name
+                fields: last_idx.fields.clone(),
                 dataset_version: self.manifest.version,
-                fragment_bitmap: new_frag_ids,
+                fragment_bitmap: Some(new_frag_ids),
             };
-            removed_indices.push(idx.clone());
+            removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
             new_indices.push(new_idx);
         }
 

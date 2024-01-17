@@ -13,6 +13,7 @@
 // limitations under the License.
 
 /// Options for optimizing all indices.
+#[derive(Debug)]
 pub struct OptimizeOptions {
     /// Number of delta indices to merge for one column. Default: 1.
     ///

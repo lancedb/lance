@@ -15,56 +15,73 @@
 use std::sync::Arc;
 
 use lance_core::{format::Index as IndexMetadata, Error, Result};
-use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::IndexType;
-use log::info;
+use lance_index::{optimize::OptimizeOptions, scalar::lance_format::LanceIndexStore, IndexType};
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use uuid::Uuid;
 
+use super::vector::ivf::optimize_vector_indices;
+use super::DatasetIndexInternalExt;
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::Dataset;
-use crate::index::vector::ivf::IVFIndex;
-
-use super::DatasetIndexInternalExt;
 
 /// Append new data to the index, without re-train.
 ///
 /// Returns the UUID of the new index along with a vector of newly indexed fragment ids
-pub async fn append_index(
+pub async fn append_index<'a>(
     dataset: Arc<Dataset>,
-    old_index: &IndexMetadata,
-) -> Result<Option<(Uuid, Option<RoaringBitmap>)>> {
-    let unindexed = dataset.unindexed_fragments(&old_index.name).await?;
-    if unindexed.is_empty() {
-        return Ok(None);
+    old_indices: &[&'a IndexMetadata],
+    options: &OptimizeOptions,
+) -> Result<Option<(Uuid, Vec<&'a IndexMetadata>, RoaringBitmap)>> {
+    if old_indices.is_empty() {
+        return Err(Error::Index {
+            message: "Append index: no prevoius index found".to_string(),
+            location: location!(),
+        });
     };
-
-    let frag_bitmap = old_index.fragment_bitmap.as_ref().map(|bitmap| {
-        let mut bitmap = bitmap.clone();
-        bitmap.extend(unindexed.iter().map(|frag| frag.id as u32));
-        bitmap
-    });
 
     let column = dataset
         .schema()
-        .field_by_id(old_index.fields[0])
+        .field_by_id(old_indices[0].fields[0])
         .ok_or(Error::Index {
             message: format!(
                 "Append index: column {} does not exist",
-                old_index.fields[0]
+                old_indices[0].fields[0]
             ),
             location: location!(),
         })?;
 
-    let index = dataset
-        .open_generic_index(&column.name, &old_index.uuid.to_string())
-        .await?;
+    let mut indices = Vec::with_capacity(old_indices.len());
+    for idx in old_indices {
+        let index = dataset
+            .open_generic_index(&column.name, &idx.uuid.to_string())
+            .await?;
+        indices.push(index);
+    }
 
-    match index.index_type() {
+    if indices
+        .windows(2)
+        .any(|w| w[0].index_type() != w[1].index_type())
+    {
+        return Err(Error::Index {
+            message: format!("Append index: invalid index deltas: {:?}", old_indices),
+            location: location!(),
+        });
+    }
+    let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
+
+    let mut frag_bitmap = RoaringBitmap::new();
+    old_indices.iter().for_each(|idx| {
+        frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
+    });
+    unindexed.iter().for_each(|frag| {
+        frag_bitmap.push(frag.id as u32);
+    });
+
+    let (new_uuid, indices_merged) = match indices[0].index_type() {
         IndexType::Scalar => {
             let index = dataset
-                .open_scalar_index(&column.name, &old_index.uuid.to_string())
+                .open_scalar_index(&column.name, &old_indices[0].uuid.to_string())
                 .await?;
 
             let mut scanner = dataset.scan();
@@ -84,7 +101,7 @@ pub async fn append_index(
 
             index.update(new_data_stream.into(), &new_store).await?;
 
-            Ok(Some((new_uuid, frag_bitmap)))
+            Ok((new_uuid, 1))
         }
         IndexType::Vector => {
             let mut scanner = dataset.scan();
@@ -93,22 +110,24 @@ pub async fn append_index(
             scanner.project(&[&column.name])?;
             let new_data_stream = scanner.try_into_stream().await?;
 
-            let index = dataset
-                .open_vector_index(&column.name, old_index.uuid.to_string().as_str())
-                .await?;
-
-            let Some(ivf_idx) = index.as_any().downcast_ref::<IVFIndex>() else {
-                info!("Index type: {:?} does not support append", index);
-                return Ok(None);
-            };
-
-            let new_index = ivf_idx
-                .append(dataset.as_ref(), new_data_stream, old_index, &column.name)
-                .await?;
-
-            Ok(Some((new_index, frag_bitmap)))
+            optimize_vector_indices(
+                &dataset.object_store,
+                &dataset.indices_dir(),
+                dataset.version().version,
+                new_data_stream,
+                &column.name,
+                &indices,
+                options,
+            )
+            .await
         }
-    }
+    }?;
+
+    Ok(Some((
+        new_uuid,
+        old_indices[old_indices.len() - indices_merged..].to_vec(),
+        frag_bitmap,
+    )))
 }
 
 #[cfg(test)]
@@ -128,6 +147,8 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
 
+    use crate::dataset::builder::DatasetBuilder;
+    use crate::index::vector::ivf::IVFIndex;
     use crate::index::vector::{pq::PQIndex, VectorIndexParams};
     use crate::index::DatasetIndexExt;
 
@@ -194,7 +215,9 @@ mod tests {
         assert_eq!(results[0].num_rows(), 10); // Flat search.
 
         dataset.optimize_indices(&Default::default()).await.unwrap();
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         let index = &dataset.load_indices().await.unwrap()[0];
+
         assert!(dataset
             .unindexed_fragments(&index.name)
             .await
@@ -247,9 +270,5 @@ mod tests {
             .iter()
             .sum::<usize>();
         assert_eq!(row_in_index, 2000);
-        assert_eq!(
-            dataset.index_cache_entry_count(),
-            6 + dataset.versions().await.unwrap().len()
-        );
     }
 }

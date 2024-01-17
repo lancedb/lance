@@ -48,7 +48,7 @@ pub(super) async fn write_index_partitions(
     writer: &mut dyn Writer,
     ivf: &mut Ivf,
     streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
-    existing_partitions: Option<&[&IVFIndex]>,
+    existing_indices: Option<&[&IVFIndex]>,
 ) -> Result<()> {
     // build the initial heap
     // TODO: extract heap sort to a separate function.
@@ -88,7 +88,7 @@ pub(super) async fn write_index_partitions(
         let mut pq_array: Vec<Arc<dyn Array>> = vec![];
         let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
 
-        if let Some(&previous_indices) = existing_partitions.as_ref() {
+        if let Some(&previous_indices) = existing_indices.as_ref() {
             for &idx in previous_indices.iter() {
                 let sub_index = idx.load_partition(part_id as usize, true).await?;
                 let pq_index =
@@ -111,7 +111,7 @@ pub(super) async fn write_index_partitions(
                     row_id_array.push(pq_index.row_ids.as_ref().unwrap().clone());
                 }
             }
-        }
+       }
 
         // Merge all streams with the same partition id.
         while let Some((Reverse(stream_part_id), stream_idx)) = streams_heap.pop() {
