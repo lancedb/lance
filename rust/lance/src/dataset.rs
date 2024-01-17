@@ -31,6 +31,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt, Stream};
 use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::io::commit::{commit_handler_from_url, CommitHandler, CommitLock};
 use lance_core::io::{
     commit::CommitError,
     object_store::{ObjectStore, ObjectStoreParams},
@@ -92,6 +93,7 @@ pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 #[derive(Debug, Clone)]
 pub struct Dataset {
     pub(crate) object_store: Arc<ObjectStore>,
+    pub(crate) commit_handler: Arc<dyn CommitHandler>,
     pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) session: Arc<Session>,
@@ -136,6 +138,15 @@ pub struct ReadParams {
     pub session: Option<Arc<Session>>,
 
     pub store_options: Option<ObjectStoreParams>,
+
+    /// If present, dataset will use this to resolve the latest version
+    ///
+    /// If not set, the default will be based on the object store.  Generally this will
+    /// be RenameCommitHandler unless the object store does not handle atomic renames (e.g. S3)
+    ///
+    /// If a custom object store is provided (via store_params.object_store) then this
+    /// must also be provided.
+    pub commit_handler: Option<Arc<dyn CommitHandler>>,
 }
 
 impl ReadParams {
@@ -156,6 +167,11 @@ impl ReadParams {
         self.session = Some(session);
         self
     }
+
+    /// Use the explicit locking to resolve the latest version
+    pub fn set_commit_lock<T: CommitLock + Send + Sync + 'static>(&mut self, lock: Arc<T>) {
+        self.commit_handler = Some(Arc::new(lock));
+    }
 }
 
 impl Default for ReadParams {
@@ -165,6 +181,7 @@ impl Default for ReadParams {
             metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
             session: None,
             store_options: None,
+            commit_handler: None,
         }
     }
 }
@@ -178,25 +195,53 @@ impl Dataset {
         DatasetBuilder::from_uri(uri).load().await
     }
 
-    /// Open a dataset with read params.
-    #[deprecated(since = "0.8.17", note = "Please use `DatasetBuilder` instead.")]
-    #[instrument(skip(params))]
-    pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
-        let (mut object_store, base_path) = match params.store_options.as_ref() {
+    async fn params_from_uri(
+        uri: &str,
+        commit_handler: &Option<Arc<dyn CommitHandler>>,
+        store_options: &Option<ObjectStoreParams>,
+    ) -> Result<(ObjectStore, Path, Arc<dyn CommitHandler>)> {
+        let (mut object_store, base_path) = match store_options.as_ref() {
             Some(store_options) => ObjectStore::from_uri_and_params(uri, store_options).await?,
             None => ObjectStore::from_uri(uri).await?,
         };
 
-        if let Some(block_size) = params
-            .store_options
-            .as_ref()
-            .and_then(|opts| opts.block_size)
-        {
+        if let Some(block_size) = store_options.as_ref().and_then(|opts| opts.block_size) {
             object_store.set_block_size(block_size);
         }
 
-        let latest_manifest = object_store
-            .commit_handler
+        let commit_handler = match &commit_handler {
+            None => {
+                if store_options.is_some() && store_options.as_ref().unwrap().object_store.is_some()
+                {
+                    return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: location!() });
+                }
+                commit_handler_from_url(uri, store_options).await?
+            }
+            Some(commit_handler) => {
+                if uri.starts_with("s3+ddb") {
+                    return Err(Error::InvalidInput {
+                        source:
+                            "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
+                                .into(),
+                        location: location!(),
+                    });
+                } else {
+                    commit_handler.clone()
+                }
+            }
+        };
+
+        Ok((object_store, base_path, commit_handler))
+    }
+
+    /// Open a dataset with read params.
+    #[deprecated(since = "0.8.17", note = "Please use `DatasetBuilder` instead.")]
+    #[instrument(skip(params))]
+    pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
+        let (object_store, base_path, commit_handler) =
+            Self::params_from_uri(uri, &params.commit_handler, &params.store_options).await?;
+
+        let latest_manifest = commit_handler
             .resolve_latest_version(&base_path, &object_store.inner)
             .await
             .map_err(|e| Error::DatasetNotFound {
@@ -219,6 +264,7 @@ impl Dataset {
             base_path.clone(),
             &latest_manifest,
             session,
+            commit_handler,
         )
         .await
     }
@@ -235,17 +281,10 @@ impl Dataset {
         version: u64,
         params: &ReadParams,
     ) -> Result<Self> {
-        let (mut object_store, base_path) = ObjectStore::from_uri(uri).await?;
-        if let Some(block_size) = params
-            .store_options
-            .as_ref()
-            .and_then(|opts| opts.block_size)
-        {
-            object_store.set_block_size(block_size);
-        };
+        let (object_store, base_path, commit_handler) =
+            Self::params_from_uri(uri, &params.commit_handler, &params.store_options).await?;
 
-        let manifest_file = object_store
-            .commit_handler
+        let manifest_file = commit_handler
             .resolve_version(&base_path, version, &object_store.inner)
             .await?;
 
@@ -257,14 +296,20 @@ impl Dataset {
                 params.metadata_cache_size,
             ))
         };
-        Self::checkout_manifest(Arc::new(object_store), base_path, &manifest_file, session).await
+        Self::checkout_manifest(
+            Arc::new(object_store),
+            base_path,
+            &manifest_file,
+            session,
+            commit_handler,
+        )
+        .await
     }
 
     /// Check out the specified version of this dataset
     pub async fn checkout_version(&self, version: u64) -> Result<Self> {
         let base_path = self.base.clone();
         let manifest_file = self
-            .object_store
             .commit_handler
             .resolve_version(&base_path, version, &self.object_store.inner)
             .await?;
@@ -273,6 +318,7 @@ impl Dataset {
             base_path,
             &manifest_file,
             self.session.clone(),
+            self.commit_handler.clone(),
         )
         .await
     }
@@ -282,6 +328,7 @@ impl Dataset {
         base_path: Path,
         manifest_path: &Path,
         session: Arc<Session>,
+        commit_handler: Arc<dyn CommitHandler>,
     ) -> Result<Self> {
         let object_reader = object_store
             .open(manifest_path)
@@ -331,6 +378,7 @@ impl Dataset {
             object_store,
             base: base_path,
             manifest: Arc::new(manifest),
+            commit_handler,
             session,
         })
     }
@@ -342,14 +390,11 @@ impl Dataset {
         params: Option<WriteParams>,
     ) -> Result<Self> {
         let mut params = params.unwrap_or_default();
-
-        let (object_store, base) =
-            ObjectStore::from_uri_and_params(uri, &params.store_params.clone().unwrap_or_default())
-                .await?;
+        let (object_store, base, commit_handler) =
+            Self::params_from_uri(uri, &params.commit_handler, &params.store_params).await?;
 
         // Read expected manifest path for the dataset
-        let dataset_exists = match object_store
-            .commit_handler
+        let dataset_exists = match commit_handler
             .resolve_latest_version(&base, &object_store.inner)
             .await
         {
@@ -390,6 +435,7 @@ impl Dataset {
                 DatasetBuilder::from_uri(uri)
                     .with_read_params(ReadParams {
                         store_options: params.store_params.clone(),
+                        commit_handler: params.commit_handler.clone(),
                         ..Default::default()
                     })
                     .load()
@@ -445,13 +491,21 @@ impl Dataset {
             commit_transaction(
                 dataset,
                 &object_store,
+                commit_handler.as_ref(),
                 &transaction,
                 &Default::default(),
                 &Default::default(),
             )
             .await?
         } else {
-            commit_new_dataset(&object_store, &base, &transaction, &Default::default()).await?
+            commit_new_dataset(
+                &object_store,
+                commit_handler.as_ref(),
+                &base,
+                &transaction,
+                &Default::default(),
+            )
+            .await?
         };
 
         Ok(Self {
@@ -459,6 +513,7 @@ impl Dataset {
             base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
+            commit_handler,
         })
     }
 
@@ -489,11 +544,13 @@ impl Dataset {
             ..params.unwrap_or_default()
         };
 
-        // Need to include params here because it might include a commit mechanism.
-        let object_store = Arc::new(
-            self.object_store()
-                .with_params(&params.store_params.clone().unwrap_or_default()),
-        );
+        if params.commit_handler.is_some() || params.store_params.is_some() {
+            return Err(Error::InvalidInput {
+                source: "commit_handler / store_params should not be specified when calling append"
+                    .into(),
+                location: location!(),
+            });
+        }
 
         let (stream, schema) = reader_to_stream(batches)?;
 
@@ -507,7 +564,7 @@ impl Dataset {
         )?;
 
         let fragments = write_fragments_internal(
-            object_store.clone(),
+            self.object_store.clone(),
             &self.base,
             &schema,
             stream,
@@ -520,7 +577,8 @@ impl Dataset {
 
         let new_manifest = commit_transaction(
             self,
-            &object_store,
+            &self.object_store,
+            self.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
@@ -550,7 +608,6 @@ impl Dataset {
         read_manifest(
             &self.object_store,
             &self
-                .object_store
                 .commit_handler
                 .resolve_latest_version(&self.base, &self.object_store.inner)
                 .await?,
@@ -559,10 +616,7 @@ impl Dataset {
     }
 
     /// Restore the currently checked out version of the dataset as the latest version.
-    ///
-    /// Currently, `write_params` is just used to get additional store params.
-    /// Other options are ignored.
-    pub async fn restore(&mut self, write_params: Option<WriteParams>) -> Result<()> {
+    pub async fn restore(&mut self) -> Result<()> {
         let latest_manifest = self.latest_manifest().await?;
         let latest_version = latest_manifest.version;
 
@@ -574,17 +628,11 @@ impl Dataset {
             None,
         );
 
-        let object_store =
-            if let Some(store_params) = write_params.and_then(|params| params.store_params) {
-                Arc::new(self.object_store.with_params(&store_params))
-            } else {
-                self.object_store.clone()
-            };
-
         self.manifest = Arc::new(
             commit_transaction(
                 self,
-                &object_store,
+                &self.object_store,
+                self.commit_handler.as_ref(),
                 &transaction,
                 &Default::default(),
                 &Default::default(),
@@ -655,6 +703,7 @@ impl Dataset {
         operation: Operation,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
+        commit_handler: Option<Arc<dyn CommitHandler>>,
     ) -> Result<Self> {
         let read_version = read_version.map_or_else(
             || match operation {
@@ -667,13 +716,11 @@ impl Dataset {
             Ok,
         )?;
 
-        let (object_store, base) =
-            ObjectStore::from_uri_and_params(base_uri, &store_params.clone().unwrap_or_default())
-                .await?;
+        let (object_store, base, commit_handler) =
+            Self::params_from_uri(base_uri, &commit_handler, &store_params).await?;
 
         // Test if the dataset exists
-        let dataset_exists = match object_store
-            .commit_handler
+        let dataset_exists = match commit_handler
             .resolve_latest_version(&base, &object_store.inner)
             .await
         {
@@ -710,13 +757,21 @@ impl Dataset {
             commit_transaction(
                 dataset,
                 &object_store,
+                commit_handler.as_ref(),
                 &transaction,
                 &Default::default(),
                 &Default::default(),
             )
             .await?
         } else {
-            commit_new_dataset(&object_store, &base, &transaction, &Default::default()).await?
+            commit_new_dataset(
+                &object_store,
+                commit_handler.as_ref(),
+                &base,
+                &transaction,
+                &Default::default(),
+            )
+            .await?
         };
 
         Ok(Self {
@@ -724,6 +779,7 @@ impl Dataset {
             base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
+            commit_handler,
         })
     }
 
@@ -806,6 +862,7 @@ impl Dataset {
         let manifest = commit_transaction(
             self,
             &self.object_store,
+            self.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
@@ -855,6 +912,7 @@ impl Dataset {
         let manifest = commit_transaction(
             self,
             &self.object_store,
+            self.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
@@ -1236,6 +1294,7 @@ impl Dataset {
         let manifest = commit_transaction(
             self,
             &self.object_store,
+            self.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
@@ -1260,8 +1319,7 @@ impl Dataset {
     }
 
     pub(crate) async fn manifest_file(&self, version: u64) -> Result<Path> {
-        self.object_store
-            .commit_handler
+        self.commit_handler
             .resolve_version(&self.base, version, &self.object_store.inner)
             .await
     }
@@ -1291,7 +1349,6 @@ impl Dataset {
     /// Get all versions.
     pub async fn versions(&self) -> Result<Vec<Version>> {
         let mut versions: Vec<Version> = self
-            .object_store
             .commit_handler
             .list_manifests(&self.base, &self.object_store.inner)
             .await?
@@ -1314,8 +1371,7 @@ impl Dataset {
     /// This is meant to be a fast path for checking if a dataset has changed. This is why
     /// we don't return the full version struct.
     pub async fn latest_version_id(&self) -> Result<u64> {
-        self.object_store
-            .commit_handler
+        self.commit_handler
             .resolve_latest_version_id(&self.base, &self.object_store.inner)
             .await
     }
@@ -1420,6 +1476,7 @@ impl Default for ManifestWriteConfig {
 /// Commit a manifest file and create a copy at the latest manifest path.
 pub(crate) async fn write_manifest_file(
     object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
     base_path: &Path,
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
@@ -1432,8 +1489,7 @@ pub(crate) async fn write_manifest_file(
 
     manifest.update_max_fragment_id();
 
-    object_store
-        .commit_handler
+    commit_handler
         .commit(
             manifest,
             indices,
@@ -1767,7 +1823,6 @@ mod tests {
         let manifest = read_manifest(
             dataset.object_store(),
             &dataset
-                .object_store()
                 .commit_handler
                 .resolve_latest_version(&dataset.base, &dataset.object_store().inner)
                 .await
@@ -1786,7 +1841,6 @@ mod tests {
         let mut manifest = read_manifest(
             dataset.object_store(),
             &dataset
-                .object_store()
                 .commit_handler
                 .resolve_latest_version(&dataset.base, &dataset.object_store().inner)
                 .await
@@ -1809,6 +1863,7 @@ mod tests {
         manifest.version += 1;
         write_manifest_file(
             dataset.object_store(),
+            dataset.commit_handler.as_ref(),
             &dataset.base,
             &mut manifest,
             None,
@@ -3179,7 +3234,7 @@ mod tests {
         assert_eq!(dataset.manifest, original_manifest);
 
         // Restore to a previous version
-        dataset.restore(None).await.unwrap();
+        dataset.restore().await.unwrap();
         assert_eq!(dataset.manifest.version, 3);
         assert_eq!(dataset.manifest.fragments, original_manifest.fragments);
         assert_eq!(dataset.manifest.schema, original_manifest.schema);
@@ -3728,7 +3783,7 @@ mod tests {
         }
 
         let mut dataset = dataset.checkout_version(broken_version).await.unwrap();
-        dataset.restore(None).await.unwrap();
+        dataset.restore().await.unwrap();
 
         // Running compaction right away should work (this is verifying compaction
         // is not broken by the potentially malformed fragment bitmaps)

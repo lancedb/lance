@@ -54,7 +54,10 @@ use lance_core::{
         pb::{self, IndexMetadata},
         Fragment, Index, Manifest,
     },
-    io::{object_store::ObjectStore, reader::read_manifest, reader::read_manifest_indexes},
+    io::{
+        commit::CommitHandler, object_store::ObjectStore, reader::read_manifest,
+        reader::read_manifest_indexes,
+    },
     Error, Result,
 };
 use object_store::path::Path;
@@ -335,13 +338,13 @@ impl Transaction {
 
     pub(crate) async fn restore_old_manifest(
         object_store: &ObjectStore,
+        commit_handler: &dyn CommitHandler,
         base_path: &Path,
         version: u64,
         config: &ManifestWriteConfig,
         tx_path: &str,
     ) -> Result<(Manifest, Vec<Index>)> {
-        let path = object_store
-            .commit_handler
+        let path = commit_handler
             .resolve_version(base_path, version, &object_store.inner)
             .await?;
         let mut manifest = read_manifest(object_store, &path).await?;

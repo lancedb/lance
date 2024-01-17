@@ -2758,7 +2758,7 @@ mod test {
             // APPEND -> DELETE
 
             dataset.checkout_version(append_version).await.unwrap();
-            dataset.restore(None).await.unwrap();
+            dataset.restore().await.unwrap();
 
             dataset.delete("not_indexed = 75").await.unwrap();
 
@@ -2767,7 +2767,7 @@ mod test {
             // DELETE
 
             let mut dataset = dataset.checkout_version(original_version).await.unwrap();
-            dataset.restore(None).await.unwrap();
+            dataset.restore().await.unwrap();
 
             dataset.delete("not_indexed = 75").await.unwrap();
 
@@ -2780,7 +2780,7 @@ mod test {
                 .unwrap();
             let compact_version = dataset.version().version;
             dataset.checkout_version(original_version).await.unwrap();
-            dataset.restore(None).await.unwrap();
+            dataset.restore().await.unwrap();
 
             Self {
                 _test_dir: test_dir,

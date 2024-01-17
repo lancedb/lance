@@ -130,7 +130,6 @@ impl<'a> CleanupTask<'a> {
     async fn process_manifests(&'a self) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
-            .object_store
             .commit_handler
             .list_manifests(&self.dataset.base, &self.dataset.object_store.inner)
             .await?

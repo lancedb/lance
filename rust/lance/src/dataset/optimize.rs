@@ -736,6 +736,7 @@ async fn reserve_fragment_ids(dataset: &Dataset, fragments: &mut Vec<Fragment>) 
     let manifest = commit_transaction(
         dataset,
         dataset.object_store(),
+        dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),
         &Default::default(),
@@ -899,6 +900,7 @@ pub async fn commit_compaction(
     let manifest = commit_transaction(
         dataset,
         dataset.object_store(),
+        dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),
         &Default::default(),

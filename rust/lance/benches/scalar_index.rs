@@ -8,10 +8,7 @@ use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, Criterion};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::TryStreamExt;
-use lance::{
-    io::{object_store::ObjectStoreParams, ObjectStore},
-    Dataset,
-};
+use lance::{io::ObjectStore, Dataset};
 use lance_core::Result;
 use lance_datafusion::exec::reader_to_stream;
 use lance_datagen::{array, gen, BatchCount, RowCount};
@@ -55,11 +52,8 @@ impl BtreeTrainingSource for BenchmarkDataSource {
 impl BenchmarkFixture {
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.path();
-        let (object_store, test_path) = ObjectStore::from_path(
-            test_path.as_os_str().to_str().unwrap(),
-            &ObjectStoreParams::default(),
-        )
-        .unwrap();
+        let (object_store, test_path) =
+            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
         Arc::new(LanceIndexStore::new(object_store, test_path))
     }
 

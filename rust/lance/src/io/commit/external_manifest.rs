@@ -32,7 +32,6 @@ mod test {
     use crate::dataset::builder::DatasetBuilder;
     use crate::{
         dataset::{ReadParams, WriteMode, WriteParams},
-        io::object_store::ObjectStoreParams,
         Dataset,
     };
 
@@ -124,20 +123,14 @@ mod test {
 
     fn read_params(handler: Arc<dyn CommitHandler>) -> ReadParams {
         ReadParams {
-            store_options: Some(ObjectStoreParams {
-                commit_handler: Some(handler),
-                ..Default::default()
-            }),
+            commit_handler: Some(handler),
             ..Default::default()
         }
     }
 
     fn write_params(handler: Arc<dyn CommitHandler>) -> WriteParams {
         WriteParams {
-            store_params: Some(ObjectStoreParams {
-                commit_handler: Some(handler),
-                ..Default::default()
-            }),
+            commit_handler: Some(handler),
             ..Default::default()
         }
     }
@@ -169,10 +162,7 @@ mod test {
             ds_uri,
             Some(WriteParams {
                 mode: WriteMode::Append,
-                store_params: Some(ObjectStoreParams {
-                    commit_handler: Some(handler),
-                    ..Default::default()
-                }),
+                commit_handler: Some(handler),
                 ..Default::default()
             }),
         )

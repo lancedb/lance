@@ -26,6 +26,7 @@ use lance_core::{
     datatypes::Schema,
     format::Fragment,
     io::{
+        commit::CommitHandler,
         object_store::{ObjectStore, ObjectStoreParams},
         FileWriter,
     },
@@ -80,6 +81,15 @@ pub struct WriteParams {
     pub store_params: Option<ObjectStoreParams>,
 
     pub progress: Arc<dyn WriteFragmentProgress>,
+
+    /// If present, dataset will use this to update the latest version
+    ///
+    /// If not set, the default will be based on the object store.  Generally this will
+    /// be RenameCommitHandler unless the object store does not handle atomic renames (e.g. S3)
+    ///
+    /// If a custom object store is provided (via store_params.object_store) then this
+    /// must also be provided.
+    pub commit_handler: Option<Arc<dyn CommitHandler>>,
 }
 
 impl Default for WriteParams {
@@ -93,6 +103,7 @@ impl Default for WriteParams {
             mode: WriteMode::Create,
             store_params: None,
             progress: Arc::new(NoopFragmentWriteProgress::new()),
+            commit_handler: None,
         }
     }
 }

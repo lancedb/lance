@@ -340,6 +340,7 @@ impl UpdateJob {
         let manifest = commit_transaction(
             self.dataset.as_ref(),
             self.dataset.object_store(),
+            self.dataset.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
