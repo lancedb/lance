@@ -2989,7 +2989,6 @@ mod test {
         }
 
         async fn check_vector_queries(&self, params: &ScalarTestParams) {
-            println!("params: use_compaction={:?}", params.use_compaction);
             self.check_vector_scalar_indexed_only(params).await;
             self.check_vector_scalar_indexed_and_refine(params).await;
         }
