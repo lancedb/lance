@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::{
     get_item::builders::GetItemFluentBuilder, put_item::builders::PutItemFluentBuilder,
     query::builders::QueryFluentBuilder,
@@ -33,24 +34,22 @@ use crate::error::{IOSnafu, NotFoundSnafu};
 use crate::io::commit::external_manifest::ExternalManifestStore;
 use crate::{Error, Result};
 
-// TODO: re-enable after migration is done.
-//
-// impl<E> From<SdkError<E>> for Error
-// where
-//     E: std::error::Error + Send + Sync + 'static,
-// {
-//     fn from(e: SdkError<E>) -> Self {
-//         let error_type = format!("{}", e);
-//         Self::IO {
-//             message: format!(
-//                 "dynamodb error: {}, source: {:?}",
-//                 error_type,
-//                 e.into_source()
-//             ),
-//             location: location!(),
-//         }
-//     }
-// }
+impl<E> From<SdkError<E>> for Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    fn from(e: SdkError<E>) -> Self {
+        let error_type = format!("{}", e);
+        Self::IO {
+            message: format!(
+                "dynamodb error: {}, source: {:?}",
+                error_type,
+                e.into_source()
+            ),
+            location: location!(),
+        }
+    }
+}
 
 /// An external manifest store backed by DynamoDB
 ///
@@ -126,11 +125,7 @@ impl DynamoDBExternalManifestStore {
             .describe_table()
             .table_name(table_name)
             .send()
-            .await
-            .map_err(|e| Error::IO {
-                message: format!("dynamodb error: {}", e,),
-                location: location!(),
-            })?;
+            .await?;
         let table = describe_result.table.context(IOSnafu {
             message: format!("dynamodb table: {table_name} does not exist"),
         })?;
@@ -216,11 +211,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             .key(base_uri!(), AttributeValue::S(base_uri.into()))
             .key(version!(), AttributeValue::N(version.to_string()))
             .send()
-            .await
-            .map_err(|e| Error::IO {
-                message: format!("dynamodb error: {}", e,),
-                location: location!(),
-            })?;
+            .await?;
 
         let item = get_item_result.item.context(NotFoundSnafu {
             uri: format!(
@@ -254,11 +245,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             .scan_index_forward(false)
             .limit(1)
             .send()
-            .await
-            .map_err(|e| Error::IO {
-                message: format!("dynamodb error: {}", e,),
-                location: location!(),
-            })?;
+            .await?;
 
         match query_result.items {
             Some(mut items) => {
@@ -323,11 +310,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                 version!(),
             ))
             .send()
-            .await
-            .map_err(|e| Error::IO {
-                message: format!("dynamodb error: {}", e,),
-                location: location!(),
-            })?;
+            .await?;
 
         Ok(())
     }
@@ -345,11 +328,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                 version!(),
             ))
             .send()
-            .await
-            .map_err(|e| Error::IO {
-                message: format!("dynamodb error: {}", e,),
-                location: location!(),
-            })?;
+            .await?;
 
         Ok(())
     }
