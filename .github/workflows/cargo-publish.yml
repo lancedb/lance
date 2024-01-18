@@ -3,6 +3,9 @@ name: Publish Rust crate
 on:
   release:
     types: [published]
+  push:
+    branches:
+      - albert-test
 
 env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
@@ -25,8 +28,9 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
-      - uses: katyo/publish-crates@v2
+      - uses: katyo/publish-crates@a202a76493c5dcb1de703d0ec8d448d192c56694
         with:
           registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           args: '--all-features'
+          dry-run: true
           path: ./rust
