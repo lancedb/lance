@@ -855,7 +855,7 @@ impl Scanner {
         if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
             // There is an index built for the column.
             // We will use the index.
-            if q.refine_factor == Some(0) {
+            if matches!(q.refine_factor, Some(0)) {
                 return Err(Error::IO {
                     message: "Refine factor can not be zero".to_string(),
                     location: location!(),
