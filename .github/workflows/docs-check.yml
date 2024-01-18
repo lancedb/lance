@@ -1,4 +1,4 @@
-name: Deploy docs to Pages
+name: Check docs
 
 on:
   push:
@@ -6,20 +6,6 @@ on:
   pull_request:
     paths:
       - docs/**
-
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
-
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-# Allow one concurrent deployment
-concurrency:
-  group: "pages"
-  cancel-in-progress: true
 
 env:
   # Disable full debug symbol generation to speed up CI build and keep memory down
@@ -31,10 +17,7 @@ env:
 
 jobs:
   # Single deploy job since we're just deploying
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  check-docs:
     runs-on: ubuntu-22.04-4core
     steps:
       - name: Checkout
@@ -64,16 +47,4 @@ jobs:
         working-directory: docs
         run: |
           make linkcheck
-      - name: Setup Pages
-        uses: actions/configure-pages@v2
-        if: github.ref == 'refs/heads/main'
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v1
-        with:
-          path: 'docs/_build/html'
-        if: github.ref == 'refs/heads/main'
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v1
-        if: github.ref == 'refs/heads/main'
 
