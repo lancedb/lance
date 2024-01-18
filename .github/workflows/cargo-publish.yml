@@ -28,7 +28,7 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
-      - uses: albertlockett/publish-crates@v2.1
+      - uses: albertlockett/publish-crates@v2.2
         with:
           registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           args: '--all-features'
