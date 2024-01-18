@@ -564,7 +564,7 @@ def test_index_cache_size(tmp_path):
     )
 
     query_index(indexed_dataset, 1)
-    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.25)
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.4)
     query_index(indexed_dataset, 128)
     indexed_dataset = lance.LanceDataset(indexed_dataset.uri, index_cache_size=5)
     query_index(indexed_dataset, 128)

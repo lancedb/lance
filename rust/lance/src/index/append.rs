@@ -147,13 +147,14 @@ mod tests {
     use super::*;
 
     use arrow_array::cast::AsArray;
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
+    use arrow_array::types::UInt32Type;
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::{
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
-        IndexType,
+        DatasetIndexExt, IndexType,
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
@@ -162,7 +163,6 @@ mod tests {
     use crate::dataset::builder::DatasetBuilder;
     use crate::index::vector::ivf::IVFIndex;
     use crate::index::vector::{pq::PQIndex, VectorIndexParams};
-    use crate::index::DatasetIndexExt;
 
     #[tokio::test]
     async fn test_append_index() {
@@ -282,5 +282,109 @@ mod tests {
             .iter()
             .sum::<usize>();
         assert_eq!(row_in_index, 2000);
+    }
+
+    #[tokio::test]
+    async fn test_query_delta_indices() {
+        const DIM: usize = 64;
+        const IVF_PARTITIONS: usize = 2;
+        const TOTAL: usize = 1000;
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let vectors = generate_random_array(TOTAL * DIM);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                true,
+            ),
+            Field::new("id", DataType::UInt32, false),
+        ]));
+        let array = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                array.clone(),
+                Arc::new(UInt32Array::from_iter_values(0..TOTAL as u32)),
+            ],
+        )
+        .unwrap();
+
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::with_ivf_pq_params(
+                    MetricType::L2,
+                    IvfBuildParams::new(IVF_PARTITIONS),
+                    PQBuildParams {
+                        num_sub_vectors: 2,
+                        ..Default::default()
+                    },
+                ),
+                true,
+            )
+            .await
+            .unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vector_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_indices"], 1);
+        assert_eq!(stats["num_indexed_fragments"], 1);
+        assert_eq!(stats["num_unindexed_fragments"], 0);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                array.clone(),
+                Arc::new(UInt32Array::from_iter_values(
+                    TOTAL as u32..(TOTAL * 2) as u32,
+                )),
+            ],
+        )
+        .unwrap();
+
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        dataset.append(batches, None).await.unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vector_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_indices"], 1);
+        assert_eq!(stats["num_indexed_fragments"], 1);
+        assert_eq!(stats["num_unindexed_fragments"], 1);
+
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 0,
+            })
+            .await
+            .unwrap();
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vector_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_indices"], 2);
+        assert_eq!(stats["num_indexed_fragments"], 2);
+        assert_eq!(stats["num_unindexed_fragments"], 0);
+
+        let results = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .nearest("vector", array.value(0).as_primitive(), 2)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 2);
+        let mut id_arr = results["id"].as_primitive::<UInt32Type>().values().to_vec();
+        id_arr.sort();
+        assert_eq!(id_arr, vec![0, 1000]);
     }
 }
