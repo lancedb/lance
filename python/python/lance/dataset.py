@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import random
@@ -681,9 +682,20 @@ class LanceDataset(pa.dataset.Dataset):
     @property
     def latest_version(self) -> int:
         """
-        Returns the lastest version of the dataset
+        Returns the latest version of the dataset.
         """
         return self._ds.latest_version()
+
+    def checkout_version(self, version) -> "LanceDataset":
+        """
+        Load the given version of the dataset.
+
+        This is a no-op if the dataset is already at the given version.
+        """
+        ds = copy.copy(self)
+        if version != ds.version:
+            ds._ds = self._ds.checkout_version(version)
+        return ds
 
     def restore(self):
         """
