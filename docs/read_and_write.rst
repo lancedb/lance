@@ -370,7 +370,7 @@ for available configuration options. (The environment variables that can be set
 are the snake-cased versions of these variable names. For example, to set ``ProxyUrl``
 use the environment variable ``PROXY_URL``.)
 
-.. _object-store: https://crates.io/crates/object-store
+.. _object-store: https://docs.rs/object_store/0.9.0/object_store/
 .. __: https://docs.rs/object_store/latest/object_store/enum.ClientConfigKey.html
 
 

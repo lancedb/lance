@@ -55,7 +55,7 @@ By default, Lance will infer the Tensor spec from the projected columns. You can
 Distributed Training and Shuffling
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Since `a Lance Dataset is a set of Fragments <../format>`_, we can distribute and shuffle Fragments to different
+Since `a Lance Dataset is a set of Fragments <../format.rst>`_, we can distribute and shuffle Fragments to different
 workers.
 
 .. code-block:: python
