@@ -139,77 +139,7 @@ of Alice and Bob in the same example, we could write:
 ..       for updating single rows in a loop, and users should instead do bulk updates
 ..       using MERGE.
 
-Committing mechanisms for S3
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Most supported storage systems (e.g. local file system, Google Cloud Storage,
-Azure Blob Store) natively support atomic commits, which prevent concurrent
-writers from corrupting the dataset. However, S3 does not support this natively.
-To work around this, you may provide a locking mechanism that Lance can use to
-lock the table while providing a write. To do so, you should implement a
-context manager that acquires and releases a lock and then pass that to the
-``commit_lock`` parameter of :py:meth:`lance.write_dataset`.
-
-.. note::
-
-  In order for the locking mechanism to work, all writers must use the same exact
-  mechanism. Otherwise, Lance will not be able to detect conflicts.
-
-On entering, the context manager should acquire the lock on the table. The table
-version being committed is passed in as an argument, which may be used if the
-locking service wishes to keep track of the current version of the table, but
-this is not required. If the table is already locked by another transaction,
-it should wait until it is unlocked, since the other transaction may fail. Once
-unlocked, it should either lock the table or, if the lock keeps track of the
-current version of the table, return a :class:`CommitConflictError` if the
-requested version has already been committed.
-
-To prevent poisoned locks, it's recommended to set a timeout on the locks. That
-way, if a process crashes while holding the lock, the lock will be released
-eventually. The timeout should be no less than 30 seconds.
-
-.. code-block:: python
-
-  from contextlib import contextmanager
-
-  @contextmanager
-  def commit_lock(version: int);
-      # Acquire the lock
-      my_lock.acquire()
-      try:
-        yield
-      except:
-        failed = True
-      finally:
-        my_lock.release()
-  
-  lance.write_dataset(data, "s3://bucket/path/", commit_lock=commit_lock)
-
-When the context manager is exited, it will raise an exception if the commit
-failed. This might be because of a network error or if the version has already
-been written. Either way, the context manager should release the lock. Use a 
-try/finally block to ensure that the lock is released.
-
-Concurrent Writer on S3 using DynamoDB
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-.. warning::
-
-  This feature is experimental at the moment
-
-Lance has native support for concurrent writers on S3 using DynamoDB instead of locking.
-User may pass in a DynamoDB table name alone with the S3 URI to their dataset to enable this feature.
-
-.. code-block:: python
-
-  import lance
-  # s3+ddb:// URL scheme let's lance know that you want to use DynamoDB for writing to S3 concurrently
-  ds = lance.dataset("s3+ddb://my-bucket/mydataset.lance?ddbTableName=mytable")
-
-The DynamoDB table is expected to have a primary hash key of ``base_uri`` and a range key ``version``.
-The key ``base_uri`` should be string type, and the key ``version`` should be number type.
-
-For details on how this feature works, please see :ref:`external-manifest-store`.
 
 
 Reading Lance Dataset
@@ -227,7 +157,7 @@ To open a Lance dataset, use the :py:meth:`lance.dataset` function:
 .. note::
 
   Lance supports local file system, AWS ``s3`` and Google Cloud Storage(``gs``) as storage backends
-  at the moment.
+  at the moment. Read more in `Object Store Configuration`_.
 
 The most straightforward approach for reading a Lance dataset is to utilize the :py:meth:`lance.LanceDataset.to_table`
 method in order to load the entire dataset into memory.
@@ -424,3 +354,157 @@ rows don't have to be skipped during the scan.
 When files are rewritten, the original row ids are invalidated. This means the
 affected files are no longer part of any ANN index if they were before. Because
 of this, it's recommended to rewrite files before re-building indices.
+
+
+Object Store Configuration
+--------------------------
+
+Lance supports object stores such as AWS S3 (and compatible stores) and Google Cloud Storage.
+Which object store to use is determined by the URI scheme of the dataset path. For example,
+``s3://bucket/path`` will use S3, while ``gs://bucket/path`` will use GCS.
+
+Lance uses the `object-store`_ Rust crate for object store access. There are general
+environment variables that can be used to configure the object store, such as the
+request timeout and proxy configuration. See the `object_store ClientConfigKey`__ docs
+for available configuration options. (The environment variables that can be set
+are the snake-cased versions of these variable names. For example, to set ``ProxyUrl``
+use the environment variable ``PROXY_URL``.)
+
+.. _object-store: https://crates.io/crates/object-store
+.. __: https://docs.rs/object_store/latest/object_store/enum.ClientConfigKey.html
+
+
+S3 Configuration
+~~~~~~~~~~~~~~~~
+
+To configure credentials for AWS S3, you can use the ``AWS_ACCESS_KEY_ID``,
+``AWS_SECRET_ACCESS_KEY``, and ``AWS_SESSION_TOKEN`` environment variables.
+
+Alternatively, if you are using AWS SSO, you can use the ``AWS_PROFILE`` and
+``AWS_DEFAULT_REGION`` environment variables.
+
+You can see a full list of environment variables `here`__.
+
+.. __: https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env
+
+S3-compatible stores
+^^^^^^^^^^^^^^^^^^^^
+
+Lance can also connect to S3-compatible stores, such as MinIO. To do so, you must
+specify two environment variables: ``AWS_ENDPOINT`` and ``AWS_DEFAULT_REGION``.
+``AWS_ENDPOINT`` should be the URL of the S3-compatible store, and
+``AWS_DEFAULT_REGION`` should be the region to use.
+
+S3 Express
+^^^^^^^^^^
+
+.. versionadded:: 0.9.7
+
+Lance supports `S3 Express One Zone`_ endpoints, but requires additional configuration. Also,
+S3 Express endpoints only support connecting from an EC2 instance within the same
+region.
+
+.. _S3 Express One Zone: https://aws.amazon.com/s3/storage-classes/express-one-zone/
+
+To configure Lance to use an S3 Express endpoint, you must set the environment
+variable ``S3_EXPRESS``:
+
+.. code-block:: bash
+
+  export S3_EXPRESS=true
+
+You can then pass the bucket name **including the suffix** as you would normally:
+
+.. code-block:: python
+
+  import lance
+  ds = lance.dataset("s3://my-bucket--use1-az4--x-s3/path/imagenet.lance")
+
+
+Committing mechanisms for S3
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Most supported storage systems (e.g. local file system, Google Cloud Storage,
+Azure Blob Store) natively support atomic commits, which prevent concurrent
+writers from corrupting the dataset. However, S3 does not support this natively.
+To work around this, you may provide a locking mechanism that Lance can use to
+lock the table while providing a write. To do so, you should implement a
+context manager that acquires and releases a lock and then pass that to the
+``commit_lock`` parameter of :py:meth:`lance.write_dataset`.
+
+.. note::
+
+  In order for the locking mechanism to work, all writers must use the same exact
+  mechanism. Otherwise, Lance will not be able to detect conflicts.
+
+On entering, the context manager should acquire the lock on the table. The table
+version being committed is passed in as an argument, which may be used if the
+locking service wishes to keep track of the current version of the table, but
+this is not required. If the table is already locked by another transaction,
+it should wait until it is unlocked, since the other transaction may fail. Once
+unlocked, it should either lock the table or, if the lock keeps track of the
+current version of the table, return a :class:`CommitConflictError` if the
+requested version has already been committed.
+
+To prevent poisoned locks, it's recommended to set a timeout on the locks. That
+way, if a process crashes while holding the lock, the lock will be released
+eventually. The timeout should be no less than 30 seconds.
+
+.. code-block:: python
+
+  from contextlib import contextmanager
+
+  @contextmanager
+  def commit_lock(version: int);
+      # Acquire the lock
+      my_lock.acquire()
+      try:
+        yield
+      except:
+        failed = True
+      finally:
+        my_lock.release()
+  
+  lance.write_dataset(data, "s3://bucket/path/", commit_lock=commit_lock)
+
+When the context manager is exited, it will raise an exception if the commit
+failed. This might be because of a network error or if the version has already
+been written. Either way, the context manager should release the lock. Use a 
+try/finally block to ensure that the lock is released.
+
+Concurrent Writer on S3 using DynamoDB
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. warning::
+
+  This feature is experimental at the moment
+
+Lance has native support for concurrent writers on S3 using DynamoDB instead of locking.
+User may pass in a DynamoDB table name alone with the S3 URI to their dataset to enable this feature.
+
+.. code-block:: python
+
+  import lance
+  # s3+ddb:// URL scheme let's lance know that you want to use DynamoDB for writing to S3 concurrently
+  ds = lance.dataset("s3+ddb://my-bucket/mydataset.lance?ddbTableName=mytable")
+
+The DynamoDB table is expected to have a primary hash key of ``base_uri`` and a range key ``version``.
+The key ``base_uri`` should be string type, and the key ``version`` should be number type.
+
+For details on how this feature works, please see :ref:`external-manifest-store`.
+
+
+Google Cloud Storage Configuration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+GCS credentials are configured by setting the ``GOOGLE_SERVICE_ACCOUNT`` environment
+variable to the path of a JSON file containing the service account credentials.
+There are several aliases for this environment variable, documented `here`__.
+
+.. __: https://docs.rs/object_store/latest/object_store/gcp/struct.GoogleCloudStorageBuilder.html#method.from_env
+
+.. note::
+  
+  By default, GCS uses HTTP/1 for communication, as opposed to HTTP/2. This improves
+  maximum throughput significantly. However, if you wish to use HTTP/2 for some reason,
+  you can set the environment variable ``HTTP1_ONLY`` to ``false``.
