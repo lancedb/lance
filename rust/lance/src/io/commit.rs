@@ -35,6 +35,7 @@
 
 use std::sync::Arc;
 
+use lance_core::io::commit::CommitHandler;
 use snafu::{location, Location};
 
 use futures::future::Either;
@@ -127,6 +128,7 @@ fn check_transaction(
 
 pub(crate) async fn commit_new_dataset(
     object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
@@ -138,6 +140,7 @@ pub(crate) async fn commit_new_dataset(
 
     write_manifest_file(
         object_store,
+        commit_handler,
         base_path,
         &mut manifest,
         if indices.is_empty() {
@@ -277,6 +280,7 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()>
 pub(crate) async fn commit_transaction(
     dataset: &Dataset,
     object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
@@ -324,6 +328,7 @@ pub(crate) async fn commit_transaction(
             Operation::Restore { version } => {
                 Transaction::restore_old_manifest(
                     object_store,
+                    commit_handler,
                     &dataset.base,
                     version,
                     write_config,
@@ -355,6 +360,7 @@ pub(crate) async fn commit_transaction(
         // Try to commit the manifest
         let result = write_manifest_file(
             object_store,
+            commit_handler,
             &dataset.base,
             &mut manifest,
             if indices.is_empty() {
@@ -422,7 +428,6 @@ mod tests {
 
     use crate::dataset::{transaction::Operation, WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
-    use crate::io::object_store::ObjectStoreParams;
     use crate::Dataset;
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
@@ -440,10 +445,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(data)], schema);
 
         let options = WriteParams {
-            store_params: Some(ObjectStoreParams {
-                commit_handler: Some(handler),
-                ..Default::default()
-            }),
+            commit_handler: Some(handler),
             ..Default::default()
         };
         let dataset = Dataset::write(reader, "memory://test", Some(options))

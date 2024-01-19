@@ -245,6 +245,7 @@ impl DatasetIndexExt for Dataset {
         let new_manifest = commit_transaction(
             self,
             self.object_store(),
+            self.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
@@ -354,6 +355,7 @@ impl DatasetIndexExt for Dataset {
         let new_manifest = commit_transaction(
             self,
             self.object_store(),
+            self.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),

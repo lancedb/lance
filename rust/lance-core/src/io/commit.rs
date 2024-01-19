@@ -36,22 +36,37 @@
 use std::fmt::Debug;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
+use aws_credential_types::provider::error::CredentialsError;
+use aws_credential_types::provider::ProvideCredentials;
 use futures::{
     future::{self, BoxFuture},
     stream::BoxStream,
     StreamExt, TryStreamExt,
 };
+use object_store::aws::AwsCredentialProvider;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore};
 use snafu::{location, Location};
+use url::Url;
 
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod external_manifest;
 
+#[cfg(feature = "dynamodb")]
+use {
+    self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
+    super::object_store::{build_aws_credential, StorageOptions},
+    object_store::aws::AmazonS3ConfigKey,
+    std::borrow::Cow,
+};
+
 use crate::format::{Index, Manifest};
 use crate::io::object_store::ObjectStoreExt;
 use crate::{Error, Result};
+
+use super::object_store::ObjectStoreParams;
 
 const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
@@ -165,6 +180,9 @@ async fn write_latest_manifest(
     Ok(())
 }
 
+#[cfg(feature = "dynamodb")]
+const DDB_URL_QUERY_KEY: &str = "ddbTableName";
+
 /// Handle commits that prevent conflicting writes.
 ///
 /// Commit implementations ensure that if there are multiple concurrent writers
@@ -227,6 +245,150 @@ pub trait CommitHandler: Debug + Send + Sync {
         object_store: &dyn ObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError>;
+}
+
+/// Adapt an object_store credentials into AWS SDK creds
+#[derive(Debug)]
+struct OSObjectStoreToAwsCredAdaptor(AwsCredentialProvider);
+
+impl ProvideCredentials for OSObjectStoreToAwsCredAdaptor {
+    fn provide_credentials<'a>(
+        &'a self,
+    ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+    where
+        Self: 'a,
+    {
+        aws_credential_types::provider::future::ProvideCredentials::new(async {
+            let creds = self
+                .0
+                .get_credential()
+                .await
+                .map_err(|e| CredentialsError::provider_error(Box::new(e)))?;
+            Ok(aws_credential_types::Credentials::new(
+                &creds.key_id,
+                &creds.secret_key,
+                creds.token.clone(),
+                Some(
+                    SystemTime::now()
+                        .checked_add(Duration::from_secs(
+                            60 * 10, //  10 min
+                        ))
+                        .expect("overflow"),
+                ),
+                "",
+            ))
+        })
+    }
+}
+
+#[cfg(feature = "dynamodb")]
+async fn build_dynamodb_external_store(
+    table_name: &str,
+    creds: AwsCredentialProvider,
+    region: &str,
+    app_name: &str,
+) -> Result<Arc<dyn ExternalManifestStore>> {
+    use std::env;
+
+    use super::commit::dynamodb::DynamoDBExternalManifestStore;
+    use aws_sdk_dynamodb::{config::Region, Client};
+
+    let dynamodb_config = aws_sdk_dynamodb::config::Builder::new()
+        .region(Some(Region::new(region.to_string())))
+        .credentials_provider(OSObjectStoreToAwsCredAdaptor(creds));
+    let dynamodb_config = match env::var("DYNAMODB_ENDPOINT") {
+        Ok(endpoint) => dynamodb_config.endpoint_url(endpoint),
+        _ => dynamodb_config,
+    };
+
+    let client = Client::from_conf(dynamodb_config.build());
+
+    DynamoDBExternalManifestStore::new_external_store(client.into(), table_name, app_name).await
+}
+
+pub async fn commit_handler_from_url(
+    url_or_path: &str,
+    // This looks unused if dynamodb feature disabled
+    #[allow(unused_variables)] options: &Option<ObjectStoreParams>,
+) -> Result<Arc<dyn CommitHandler>> {
+    let url = match Url::parse(url_or_path) {
+        Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
+            // On Windows, the drive is parsed as a scheme
+            return Ok(Arc::new(RenameCommitHandler));
+        }
+        Ok(url) => url,
+        Err(_) => {
+            return Ok(Arc::new(RenameCommitHandler));
+        }
+    };
+
+    match url.scheme() {
+        "s3" => Ok(Arc::new(UnsafeCommitHandler)),
+        #[cfg(not(feature = "dynamodb"))]
+        "s3+ddb" => Err(Error::InvalidInput {
+            source: "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
+            location: location!(),
+        }),
+        #[cfg(feature = "dynamodb")]
+        "s3+ddb" => {
+            if url.query_pairs().count() != 1 {
+                return Err(Error::InvalidInput {
+                    source: "`s3+ddb://` scheme and expects exactly one query `ddbTableName`"
+                        .into(),
+                    location: location!(),
+                });
+            }
+            let table_name = match url.query_pairs().next() {
+                Some((Cow::Borrowed(key), Cow::Borrowed(table_name)))
+                    if key == DDB_URL_QUERY_KEY =>
+                {
+                    if table_name.is_empty() {
+                        return Err(Error::InvalidInput {
+                            source: "`s3+ddb://` scheme requires non empty dynamodb table name"
+                                .into(),
+                            location: location!(),
+                        });
+                    }
+                    table_name
+                }
+                _ => {
+                    return Err(Error::InvalidInput {
+                        source: "`s3+ddb://` scheme and expects exactly one query `ddbTableName`"
+                            .into(),
+                        location: location!(),
+                    });
+                }
+            };
+            let options = options.clone().unwrap_or_default();
+            let storage_options =
+                StorageOptions(options.storage_options.unwrap_or_default()).as_s3_options();
+            let region = storage_options
+                .get(&AmazonS3ConfigKey::Region)
+                .map(|s| s.to_string());
+
+            let (aws_creds, region) = build_aws_credential(
+                options.s3_credentials_refresh_offset,
+                options.aws_credentials.clone(),
+                region,
+            )
+            .await?;
+
+            Ok(Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: build_dynamodb_external_store(
+                    table_name,
+                    aws_creds.clone(),
+                    &region,
+                    "lancedb",
+                )
+                .await?,
+            }))
+        }
+        "gs" | "az" | "file" | "memory" => Ok(Arc::new(RenameCommitHandler)),
+        unknown_scheme => Err(Error::IO {
+            message: format!("Unsupported URI scheme: {}", unknown_scheme),
+            location: location!(),
+        }),
+    }
 }
 
 /// Errors that can occur when committing a manifest.

@@ -164,18 +164,14 @@ mod tests {
     use arrow_select::take::TakeOptions;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
-    use lance_core::io::object_store::ObjectStoreParams;
     use lance_datafusion::exec::reader_to_stream;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path: &Path = tempdir.path();
-        let (object_store, test_path) = ObjectStore::from_path(
-            test_path.as_os_str().to_str().unwrap(),
-            &ObjectStoreParams::default(),
-        )
-        .unwrap();
+        let (object_store, test_path) =
+            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
         Arc::new(LanceIndexStore::new(object_store, test_path.to_owned()))
     }
 
