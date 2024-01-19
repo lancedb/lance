@@ -38,7 +38,7 @@ use crate::dataset::Dataset;
 /// - the UUID of the new index
 /// - merged indices,
 /// - Bitmap of the fragments that covered in the newly created index.
-pub(crate) async fn merge_indices<'a>(
+pub async fn merge_indices<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
     options: &OptimizeOptions,

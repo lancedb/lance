@@ -247,8 +247,8 @@ pub async fn populate_schema_dictionary<'a>(
     schema: &mut Schema,
     reader: &dyn Reader,
 ) -> Result<()> {
-    for mut field in schema.fields.as_mut_slice() {
-        load_field_dictionary(&mut field, reader).await?;
+    for field in schema.fields.as_mut_slice() {
+        load_field_dictionary(field, reader).await?;
     }
     Ok(())
 }
