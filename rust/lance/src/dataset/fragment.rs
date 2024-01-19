@@ -171,7 +171,7 @@ impl FileFragment {
     }
 
     fn get_field_id_offset(data_file: &DataFile) -> u32 {
-        data_file.fields.iter().nth(0).copied().unwrap_or(0) as u32
+        data_file.fields.get(0).copied().unwrap_or(0) as u32
     }
 
     async fn open_readers(&self, projection: &Schema) -> Result<Vec<(FileReader, Schema)>> {
