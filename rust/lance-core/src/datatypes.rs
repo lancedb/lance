@@ -56,9 +56,6 @@ impl LogicalType {
     fn is_struct(&self) -> bool {
         self.0 == "struct"
     }
-    pub fn to_string(&self) -> String {
-        self.0.clone()
-    }
 }
 
 impl From<&str> for LogicalType {

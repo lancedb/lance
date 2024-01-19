@@ -490,11 +490,8 @@ async fn read_batch(
         None
     };
 
-    let should_fetch_row_id = with_row_id
-        || !matches!(
-            deletion_vector.as_deref(),
-            None | Some(DeletionVector::NoDeletions)
-        );
+    let should_fetch_row_id =
+        with_row_id || !matches!(deletion_vector, None | Some(DeletionVector::NoDeletions));
 
     let num_rows = if let Some(batch) = &batch {
         batch.num_rows()
