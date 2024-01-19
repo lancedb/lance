@@ -24,7 +24,7 @@ use object_store::path::Path;
 use snafu::{location, Location};
 
 use lance_core::error::{Error, Result};
-use lance_core::io::RecordBatchStream;
+use lance_io::stream::RecordBatchStream;
 
 /// Parameters to build IVF partitions
 #[derive(Debug, Clone)]

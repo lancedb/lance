@@ -42,22 +42,20 @@ use lance_core::ROW_ID_FIELD;
 use lance_datafusion::exec::execute_plan;
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
+use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
+use lance_table::format::{Fragment, Index};
 use log::debug;
 use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
 use crate::datatypes::Schema;
-use crate::format::{Fragment, Index};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::{FilterPlan, MaterializeIndexExec, PreFilterSource, ScalarIndexExec};
-use crate::io::{
-    exec::{
-        KNNFlatExec, KNNIndexExec, LancePushdownScanExec, LanceScanExec, Planner, ProjectionExec,
-        ScanConfig, TakeExec,
-    },
-    RecordBatchStream,
+use crate::io::exec::{
+    KNNFlatExec, KNNIndexExec, LancePushdownScanExec, LanceScanExec, Planner, ProjectionExec,
+    ScanConfig, TakeExec,
 };
 use crate::{Error, Result};
 use snafu::{location, Location};

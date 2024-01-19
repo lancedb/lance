@@ -20,8 +20,11 @@ lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 lance-datafusion = { workspace = true }
 lance-datagen = { workspace = true }
+lance-file = { workspace = true }
+lance-io = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
+lance-table = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
@@ -120,7 +123,7 @@ avx512fp16 = ["lance-linalg/avx512fp16"]
 cli = ["clap"]
 # opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
 tensorflow = ["tfrecord"]
-dynamodb = ["lance-core/dynamodb", "aws-sdk-dynamodb"]
+dynamodb = ["lance-table/dynamodb", "aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 
 [[bin]]

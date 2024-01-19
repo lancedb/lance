@@ -15,7 +15,8 @@
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_schema::{DataType, Field};
 use lance_arrow::{ArrowFloatType, FloatType};
-use lance_core::{encodings::plain::bytes_to_array, Error, Result};
+use lance_core::{Error, Result};
+use lance_io::encodings::plain::bytes_to_array;
 use lance_linalg::MatrixView;
 use prost::bytes;
 use rand::distributions::Standard;

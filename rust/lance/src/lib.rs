@@ -80,7 +80,7 @@
 //! ```
 //!
 use dataset::builder::DatasetBuilder;
-pub use lance_core::{datatypes, encodings, error, format};
+pub use lance_core::{datatypes, error};
 pub use lance_core::{Error, Result};
 
 pub mod arrow;

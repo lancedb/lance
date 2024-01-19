@@ -15,9 +15,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lance_core::{format::Index, Result};
+use lance_core::Result;
 
 use crate::{optimize::OptimizeOptions, IndexParams, IndexType};
+use lance_table::format::Index;
 
 // Extends Lance Dataset with secondary index.
 ///

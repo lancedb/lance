@@ -23,13 +23,13 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
 use lance_arrow::{as_fixed_size_binary_array, as_fixed_size_list_array};
-use lance_core::format::SelfDescribingFileReader;
-use lance_core::{
-    datatypes::Schema,
-    io::{object_store::ObjectStore, FileReader, FileWriter},
-    Error, Result,
-};
+use lance_core::{datatypes::Schema, Error, Result};
+use lance_file::reader::FileReader;
+use lance_file::writer::FileWriter;
+use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::l2::l2;
+use lance_table::format::SelfDescribingFileReader;
+use lance_table::io::manifest::ManifestDescribing;
 use lru_time_cache::LruCache;
 use object_store::path::Path;
 use snafu::{location, Location};
@@ -322,7 +322,9 @@ pub async fn write_graph<V: Vertex + Clone + Sync + Send>(
     ]));
     let schema = Schema::try_from(arrow_schema.as_ref())?;
 
-    let mut writer = FileWriter::try_new(object_store, path, schema, &Default::default()).await?;
+    let mut writer =
+        FileWriter::<ManifestDescribing>::try_new(object_store, path, schema, &Default::default())
+            .await?;
     for nodes in graph.nodes.as_slice().chunks(params.batch_size) {
         let mut vertex_builder =
             FixedSizeBinaryBuilder::with_capacity(nodes.len(), binary_size as i32);

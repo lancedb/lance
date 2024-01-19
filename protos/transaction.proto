@@ -18,9 +18,10 @@
 
 syntax = "proto3";
 
-import "format.proto";
+import "file.proto";
+import "table.proto";
 
-package lance.format.pb;
+package lance.table;
 
 // A transaction represents the changes to a dataset.
 //
@@ -72,7 +73,7 @@ message Transaction {
     // Fragment IDs are not yet assigned.
     repeated DataFragment fragments = 1;
     // The new schema
-    repeated Field schema = 2;
+    repeated lance.file.Field schema = 2;
     // Schema metadata.
     map<string, bytes> schema_metadata = 3;
   }
@@ -137,7 +138,7 @@ message Transaction {
     // These should all have existing fragment IDs.
     repeated DataFragment fragments = 1;
     // The new schema
-    repeated Field schema = 2;
+    repeated lance.file.Field schema = 2;
     // Schema metadata.
     map<string, bytes> schema_metadata = 3;
   }
@@ -145,7 +146,7 @@ message Transaction {
   // An operation that projects a subset of columns, altering the schema.
   message Project {
     // The new schema
-    repeated Field schema = 1;
+    repeated lance.file.Field schema = 1;
   }
 
   // An operation that restores a dataset to a previous version.

@@ -31,6 +31,8 @@ use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{flat::flat_search, Query, DIST_COL};
+use lance_io::stream::RecordBatchStream;
+use lance_table::format::Index;
 use snafu::{location, Location};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
@@ -38,10 +40,8 @@ use tracing::{instrument, Instrument};
 
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
-use crate::format::Index;
 use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::DatasetIndexInternalExt;
-use crate::io::RecordBatchStream;
 use crate::{Error, Result};
 
 /// KNN node for post-filtering.

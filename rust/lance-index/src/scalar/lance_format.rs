@@ -19,16 +19,15 @@ use std::{any::Any, sync::Arc};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use lance_file::{
+    reader::FileReader,
+    writer::{FileWriter, FileWriterOptions, ManifestProvider},
+};
 use snafu::{location, Location};
 
-use lance_core::{
-    format::SelfDescribingFileReader,
-    io::{
-        object_store::ObjectStore, writer::FileWriterOptions, FileReader, FileWriter,
-        ReadBatchParams,
-    },
-    Error, Result,
-};
+use lance_core::{Error, Result};
+use lance_io::{object_store::ObjectStore, ReadBatchParams};
+use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
 
 use super::{IndexReader, IndexStore, IndexWriter};
@@ -55,7 +54,7 @@ impl LanceIndexStore {
 }
 
 #[async_trait]
-impl IndexWriter for FileWriter {
+impl<M: ManifestProvider + Send + Sync> IndexWriter for FileWriter<M> {
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
         let offset = self.tell().await?;
         self.write(&[batch]).await?;
@@ -97,7 +96,7 @@ impl IndexStore for LanceIndexStore {
     ) -> Result<Box<dyn IndexWriter>> {
         let path = self.index_dir.child(name);
         let schema = schema.as_ref().try_into()?;
-        let writer = FileWriter::try_new(
+        let writer = FileWriter::<ManifestDescribing>::try_new(
             &self.object_store,
             &path,
             schema,

@@ -13,10 +13,8 @@
 // limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use lance_core::io::{
-    commit::{commit_handler_from_url, CommitHandler},
-    object_store::{ObjectStore, ObjectStoreParams},
-};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
 use object_store::{aws::AwsCredentialProvider, DynObjectStore};
 use snafu::{location, Location};
 use tracing::instrument;

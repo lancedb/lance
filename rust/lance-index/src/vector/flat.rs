@@ -28,7 +28,8 @@ use futures::{
     stream::{repeat_with, StreamExt, TryStreamExt},
 };
 use lance_arrow::*;
-use lance_core::{io::RecordBatchStream, Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ID};
+use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::DistanceType;
 use snafu::{location, Location};
 use tracing::instrument;

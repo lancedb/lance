@@ -18,7 +18,7 @@ A `Lance Dataset` is organized in a directory.
 
 A ``Manifest`` file includes the metadata to describe a version of the dataset.
 
-.. literalinclude:: ../protos/format.proto
+.. literalinclude:: ../protos/table.proto
    :language: protobuf
    :linenos:
    :start-at: // Manifest is
@@ -31,7 +31,7 @@ Fragments
 where each ``DataFile`` can contain several columns in the chunk of data. It also may include a 
 ``DeletionFile``, which is explained in a later section.
 
-.. literalinclude:: ../protos/format.proto
+.. literalinclude:: ../protos/table.proto
    :language: protobuf
    :linenos:
    :start-at: // Data fragment
@@ -58,7 +58,7 @@ Each ``.lance`` file is the container for the actual data.
 
 At the tail of the file, a `Metadata` protobuf block is used to describe the structure of the data file.
 
-.. literalinclude:: ../protos/format.proto
+.. literalinclude:: ../protos/file.proto
    :language: protobuf
    :linenos:
    :start-at: message Metadata {
@@ -234,7 +234,7 @@ version it was committed to), and ``random_id`` is a random i64 used to avoid
 collisions. The suffix is determined by the file type (``.arrow`` for Arrow file,
 ``.bin`` for roaring bitmap).
 
-.. literalinclude:: ../protos/format.proto
+.. literalinclude:: ../protos/table.proto
    :language: protobuf
    :linenos:
    :start-at: // Deletion File
