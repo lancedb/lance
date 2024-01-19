@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod knn;
+mod limit_group;
 mod optimizer;
 mod planner;
 mod projection;
@@ -24,6 +25,7 @@ mod take;
 pub mod testing;
 
 pub use knn::*;
+pub use limit_group::LimitGroupExec;
 pub use planner::{FilterPlan, Planner};
 pub use projection::ProjectionExec;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
