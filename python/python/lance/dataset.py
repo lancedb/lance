@@ -690,6 +690,8 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Load the given version of the dataset.
 
+        Unlike the :func:`dataset` constructor, this will re-use the
+        current cache.
         This is a no-op if the dataset is already at the given version.
         """
         ds = copy.copy(self)
