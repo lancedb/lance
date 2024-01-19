@@ -23,7 +23,6 @@ arrow-select.workspace = true
 async-recursion.workspace = true
 async-trait.workspace = true
 lance-arrow.workspace = true
-aws-sdk-dynamodb = { workspace = true, optional = true }
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true

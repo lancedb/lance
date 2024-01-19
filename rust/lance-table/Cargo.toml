@@ -22,6 +22,7 @@ arrow-ipc.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
 aws-credential-types.workspace = true
+aws-sdk-dynamodb = { workspace = true, optional = true }
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
