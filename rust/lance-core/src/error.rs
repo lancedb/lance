@@ -235,6 +235,7 @@ impl From<Error> for ArrowError {
     }
 }
 
+#[cfg(feature = "datafusion")]
 impl From<datafusion_sql::sqlparser::parser::ParserError> for Error {
     #[track_caller]
     fn from(e: datafusion_sql::sqlparser::parser::ParserError) -> Self {
@@ -245,6 +246,7 @@ impl From<datafusion_sql::sqlparser::parser::ParserError> for Error {
     }
 }
 
+#[cfg(feature = "datafusion")]
 impl From<datafusion_sql::sqlparser::tokenizer::TokenizerError> for Error {
     #[track_caller]
     fn from(e: datafusion_sql::sqlparser::tokenizer::TokenizerError) -> Self {
@@ -255,6 +257,7 @@ impl From<datafusion_sql::sqlparser::tokenizer::TokenizerError> for Error {
     }
 }
 
+#[cfg(feature = "datafusion")]
 impl From<Error> for datafusion_common::DataFusionError {
     #[track_caller]
     fn from(e: Error) -> Self {
@@ -262,6 +265,7 @@ impl From<Error> for datafusion_common::DataFusionError {
     }
 }
 
+#[cfg(feature = "datafusion")]
 impl From<datafusion_common::DataFusionError> for Error {
     #[track_caller]
     fn from(e: datafusion_common::DataFusionError) -> Self {

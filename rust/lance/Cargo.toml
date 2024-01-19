@@ -47,7 +47,7 @@ dashmap = "5"
 half.workspace = true
 itertools.workspace = true
 http.workspace = true
-object_store.workspace = true
+object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
 aws-config.workspace = true
 aws-credential-types.workspace = true
 pin-project.workspace = true
