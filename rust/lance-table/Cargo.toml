@@ -27,6 +27,7 @@ byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
+lazy_static = { workspace = true, optional = true }
 log.workspace = true
 object_store.workspace = true
 prost.workspace = true
@@ -48,5 +49,5 @@ arrow-schema.workspace = true
 prost-build.workspace = true
 
 [features]
-dynamodb = ["aws-sdk-dynamodb"]
+dynamodb = ["aws-sdk-dynamodb", "lazy_static"]
 dynamodb_tests = ["dynamodb"]

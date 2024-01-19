@@ -61,7 +61,7 @@ use lance_io::object_store::ObjectStoreParams;
 #[cfg(feature = "dynamodb")]
 use {
     self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
-    super::object_store::{build_aws_credential, StorageOptions},
+    lance_io::object_store::{build_aws_credential, StorageOptions},
     object_store::aws::AmazonS3ConfigKey,
     std::borrow::Cow,
 };

@@ -30,24 +30,39 @@ use snafu::OptionExt;
 use snafu::{location, Location};
 use tokio::sync::RwLock;
 
-use crate::error::{IOSnafu, NotFoundSnafu};
 use crate::io::commit::external_manifest::ExternalManifestStore;
-use crate::{Error, Result};
+use lance_core::error::{IOSnafu, NotFoundSnafu};
+use lance_core::{Error, Result};
 
-impl<E> From<SdkError<E>> for Error
+struct WrappedSdkError<E>(SdkError<E>);
+
+impl<E> From<WrappedSdkError<E>> for Error
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    fn from(e: SdkError<E>) -> Self {
-        let error_type = format!("{}", e);
+    fn from(e: WrappedSdkError<E>) -> Self {
+        let error_type = format!("{}", e.0);
         Self::IO {
             message: format!(
                 "dynamodb error: {}, source: {:?}",
                 error_type,
-                e.into_source()
+                e.0.into_source()
             ),
             location: location!(),
         }
+    }
+}
+
+trait SdkResultExt<T> {
+    fn wrap_err(self) -> Result<T>;
+}
+
+impl<T, E> SdkResultExt<T> for std::result::Result<T, SdkError<E>>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    fn wrap_err(self) -> Result<T> {
+        self.map_err(|err| Error::from(WrappedSdkError(err)))
     }
 }
 
@@ -125,7 +140,8 @@ impl DynamoDBExternalManifestStore {
             .describe_table()
             .table_name(table_name)
             .send()
-            .await?;
+            .await
+            .wrap_err()?;
         let table = describe_result.table.context(IOSnafu {
             message: format!("dynamodb table: {table_name} does not exist"),
         })?;
@@ -211,7 +227,8 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             .key(base_uri!(), AttributeValue::S(base_uri.into()))
             .key(version!(), AttributeValue::N(version.to_string()))
             .send()
-            .await?;
+            .await
+            .wrap_err()?;
 
         let item = get_item_result.item.context(NotFoundSnafu {
             uri: format!(
@@ -245,7 +262,8 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             .scan_index_forward(false)
             .limit(1)
             .send()
-            .await?;
+            .await
+            .wrap_err()?;
 
         match query_result.items {
             Some(mut items) => {
@@ -310,7 +328,8 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                 version!(),
             ))
             .send()
-            .await?;
+            .await
+            .wrap_err()?;
 
         Ok(())
     }
@@ -328,7 +347,8 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                 version!(),
             ))
             .send()
-            .await?;
+            .await
+            .wrap_err()?;
 
         Ok(())
     }
