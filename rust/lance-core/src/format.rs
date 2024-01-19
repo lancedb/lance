@@ -25,7 +25,7 @@ mod page_table;
 
 pub use fragment::*;
 pub use index::Index;
-pub use manifest::{Manifest, WriterVersion};
+pub use manifest::{Manifest, SelfDescribingFileReader, WriterVersion};
 pub use metadata::{Metadata, StatisticsMetadata};
 pub use page_table::{PageInfo, PageTable};
 

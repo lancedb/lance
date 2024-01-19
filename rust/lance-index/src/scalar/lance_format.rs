@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use snafu::{location, Location};
 
 use lance_core::{
+    format::SelfDescribingFileReader,
     io::{
         object_store::ObjectStore, writer::FileWriterOptions, FileReader, FileWriter,
         ReadBatchParams,
@@ -69,8 +70,13 @@ impl IndexWriter for FileWriter {
 #[async_trait]
 impl IndexReader for FileReader {
     async fn read_record_batch(&self, offset: u32) -> Result<RecordBatch> {
-        self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
-            .await
+        self.read_batch(
+            offset as i32,
+            ReadBatchParams::RangeFull,
+            self.schema(),
+            None,
+        )
+        .await
     }
 
     async fn num_batches(&self) -> u32 {
@@ -103,7 +109,9 @@ impl IndexStore for LanceIndexStore {
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_dir.child(name);
-        let file_reader = FileReader::try_new(&self.object_store, &path).await?;
+        // TODO: Should probably provide file metadata cache here
+        let file_reader =
+            FileReader::try_new_self_described(&self.object_store, &path, None).await?;
         Ok(Arc::new(file_reader))
     }
 

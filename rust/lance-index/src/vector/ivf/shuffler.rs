@@ -34,6 +34,7 @@ use futures::stream::repeat_with;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::datatypes::Schema;
+use lance_core::format::SelfDescribingFileReader;
 use lance_core::io::{FileReader, FileWriter, ReadBatchParams, RecordBatchStream};
 
 use crate::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
@@ -282,7 +283,7 @@ impl IvfShuffler {
         for buffer in &self.unsorted_buffers {
             let object_store = ObjectStore::local();
             let path = self.output_dir.child(buffer.as_str());
-            let reader = FileReader::try_new(&object_store, &path).await?;
+            let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
             total_batches.push(reader.num_batches());
         }
         Ok(total_batches)
@@ -300,14 +301,14 @@ impl IvfShuffler {
         {
             let file_name = &self.unsorted_buffers[file_idx];
             let path = self.output_dir.child(file_name.as_str());
-            let reader = FileReader::try_new(&object_store, &path).await?;
+            let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
             let lance_schema = reader
                 .schema()
                 .project(&[PART_ID_COLUMN])
                 .expect("part id should exist");
 
             let mut stream = stream::iter(start..end)
-                .map(|i| reader.read_batch(i as i32, .., &lance_schema))
+                .map(|i| reader.read_batch(i as i32, .., &lance_schema, None))
                 .buffer_unordered(16);
 
             while let Some(batch) = stream.next().await {
@@ -347,11 +348,13 @@ impl IvfShuffler {
             let object_store = ObjectStore::local();
             let file_name = &self.unsorted_buffers[file_idx];
             let path = self.output_dir.child(file_name.as_str());
-            let reader = FileReader::try_new(&object_store, &path).await?;
+            let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
             let total_batch = reader.num_batches();
 
             let mut stream = stream::iter(start..end)
-                .map(|i| reader.read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema()))
+                .map(|i| {
+                    reader.read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema(), None)
+                })
                 .buffered(16)
                 .enumerate();
 
@@ -526,14 +529,14 @@ impl IvfShuffler {
         for file in files {
             let object_store = ObjectStore::local();
             let path = self.output_dir.child(file);
-            let reader = FileReader::try_new(&object_store, &path).await?;
+            let reader = FileReader::try_new_self_described(&object_store, &path, None).await?;
             let reader = Arc::new(reader);
 
             let stream = stream::iter(0..reader.num_batches())
                 .zip(stream::repeat(reader))
                 .map(|(i, reader)| async move {
                     reader
-                        .read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema())
+                        .read_batch(i as i32, ReadBatchParams::RangeFull, reader.schema(), None)
                         .await
                 })
                 .buffered(4);

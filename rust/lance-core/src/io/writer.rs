@@ -623,7 +623,10 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use object_store::path::Path;
 
-    use crate::io::{object_store::ObjectStore, FileReader};
+    use crate::{
+        format::SelfDescribingFileReader,
+        io::{object_store::ObjectStore, FileReader},
+    };
 
     #[tokio::test]
     async fn test_write_file() {
@@ -800,8 +803,13 @@ mod tests {
         file_writer.write(&[batch.clone()]).await.unwrap();
         file_writer.finish().await.unwrap();
 
-        let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
+        let reader = FileReader::try_new_self_described(&store, &path, None)
+            .await
+            .unwrap();
+        let actual = reader
+            .read_batch(0, .., reader.schema(), None)
+            .await
+            .unwrap();
         assert_eq!(actual, batch);
     }
 
@@ -829,8 +837,13 @@ mod tests {
         file_writer.write(&[batch.clone()]).await.unwrap();
         file_writer.finish().await.unwrap();
 
-        let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
+        let reader = FileReader::try_new_self_described(&store, &path, None)
+            .await
+            .unwrap();
+        let actual = reader
+            .read_batch(0, .., reader.schema(), None)
+            .await
+            .unwrap();
         assert_eq!(actual, batch);
     }
 
@@ -866,8 +879,13 @@ mod tests {
         file_writer.write(&[batch.clone()]).await.unwrap();
         file_writer.finish().await.unwrap();
 
-        let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
+        let reader = FileReader::try_new_self_described(&store, &path, None)
+            .await
+            .unwrap();
+        let actual = reader
+            .read_batch(0, .., reader.schema(), None)
+            .await
+            .unwrap();
         assert_eq!(actual, batch);
     }
 
@@ -959,7 +977,9 @@ mod tests {
 
         file_writer.finish().await.unwrap();
 
-        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let reader = FileReader::try_new_self_described(&store, &path, None)
+            .await
+            .unwrap();
 
         let read_stats = reader.read_page_stats(&[0, 1, 5, 6]).await.unwrap();
         assert!(read_stats.is_some());
@@ -1063,12 +1083,14 @@ mod tests {
     }
 
     async fn read_file_as_one_batch(object_store: &ObjectStore, path: &Path) -> RecordBatch {
-        let reader = FileReader::try_new(object_store, path).await.unwrap();
+        let reader = FileReader::try_new_self_described(object_store, path, None)
+            .await
+            .unwrap();
         let mut batches = vec![];
         for i in 0..reader.num_batches() {
             batches.push(
                 reader
-                    .read_batch(i as i32, .., reader.schema())
+                    .read_batch(i as i32, .., reader.schema(), None)
                     .await
                     .unwrap(),
             );
