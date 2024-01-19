@@ -16,13 +16,18 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::prelude::*;
+use object_store::path::Path;
 use prost_types::Timestamp;
 
 use super::Fragment;
+use crate::cache::FileMetadataCache;
 use crate::datatypes::Schema;
 use crate::error::{Error, Result};
 use crate::format::{pb, ProtoStruct};
+use crate::io::object_store::ObjectStore;
+use crate::io::{read_struct, FileReader};
 use snafu::{location, Location};
 
 /// Manifest of a dataset
@@ -386,6 +391,50 @@ impl From<&Manifest> for pb::Manifest {
             max_fragment_id: m.max_fragment_id,
             transaction_file: m.transaction_file.clone().unwrap_or_default(),
         }
+    }
+}
+
+#[async_trait]
+pub trait SelfDescribingFileReader {
+    /// Open a file reader without any cached schema
+    ///
+    /// In this case the schema will first need to be loaded
+    /// from the file itself.
+    ///
+    /// When loading files from a dataset it is preferable to use
+    /// the fragment reader to avoid this overhead.
+    async fn try_new_self_described(
+        object_store: &ObjectStore,
+        path: &Path,
+        cache: Option<&FileMetadataCache>,
+    ) -> Result<Self>
+    where
+        Self: Sized;
+}
+
+#[async_trait]
+impl SelfDescribingFileReader for FileReader {
+    async fn try_new_self_described(
+        object_store: &ObjectStore,
+        path: &Path,
+        cache: Option<&FileMetadataCache>,
+    ) -> Result<Self> {
+        let object_reader = object_store.open(path).await?;
+        let metadata = Self::read_metadata(object_reader.as_ref(), cache).await?;
+        let manifest_position = metadata.manifest_position.ok_or(Error::Internal {
+            message: format!(
+                "Attempt to open file at {} as self-describing but it did not contain a manifest",
+                path
+            ),
+            location: location!(),
+        })?;
+        let mut manifest: Manifest = read_struct(object_reader.as_ref(), manifest_position).await?;
+        manifest
+            .schema
+            .load_dictionary(object_reader.as_ref())
+            .await?;
+        let schema = manifest.schema;
+        Self::try_new_from_reader(path, object_reader, metadata, schema, 0, 0, cache).await
     }
 }
 

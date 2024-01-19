@@ -23,6 +23,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
 use lance_arrow::{as_fixed_size_binary_array, as_fixed_size_list_array};
+use lance_core::format::SelfDescribingFileReader;
 use lance_core::{
     datatypes::Schema,
     io::{object_store::ObjectStore, FileReader, FileWriter},
@@ -102,7 +103,12 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
         serde: Arc<dyn VertexSerDe<V> + Send + Sync>,
     ) -> Result<Self> {
         let object_store = dataset.object_store();
-        let file_reader = FileReader::try_new(object_store, path).await?;
+        let file_reader = FileReader::try_new_self_described(
+            object_store,
+            path,
+            Some(&dataset.session.file_metadata_cache),
+        )
+        .await?;
 
         let schema = file_reader.schema();
         let vertex_projection = schema.project(&[VERTEX_COL])?;
@@ -163,7 +169,11 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
         let end = (id + 1) as usize;
         let batch = self
             .reader
-            .read_range(id as usize..(id + 1) as usize, &self.vertex_projection)
+            .read_range(
+                id as usize..(id + 1) as usize,
+                &self.vertex_projection,
+                None,
+            )
             .await?;
         assert_eq!(batch.num_rows(), end - id as usize);
 
@@ -204,7 +214,11 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
         }
         let batch = self
             .reader
-            .read_range(id as usize..(id + 1) as usize, &self.neighbors_projection)
+            .read_range(
+                id as usize..(id + 1) as usize,
+                &self.neighbors_projection,
+                None,
+            )
             .await?;
         {
             let mut cache = self.neighbors_cache.lock().unwrap();
@@ -247,7 +261,7 @@ impl<V: Vertex + Send + Sync + Debug> Graph for PersistedGraph<V> {
         }
         let batch = self
             .reader
-            .read_range(id..(id + 1), &self.neighbors_projection)
+            .read_range(id..(id + 1), &self.neighbors_projection, None)
             .await?;
         {
             let mut cache = self.neighbors_cache.lock().unwrap();
