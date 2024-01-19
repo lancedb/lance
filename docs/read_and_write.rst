@@ -359,9 +359,10 @@ of this, it's recommended to rewrite files before re-building indices.
 Object Store Configuration
 --------------------------
 
-Lance supports object stores such as AWS S3 (and compatible stores) and Google Cloud Storage.
-Which object store to use is determined by the URI scheme of the dataset path. For example,
-``s3://bucket/path`` will use S3, while ``gs://bucket/path`` will use GCS.
+Lance supports object stores such as AWS S3 (and compatible stores), Azure Blob Store,
+and Google Cloud Storage. Which object store to use is determined by the URI scheme of
+the dataset path. For example, ``s3://bucket/path`` will use S3, ``az://bucket/path``
+will use Azure, and ``gs://bucket/path`` will use GCS.
 
 Lance uses the `object-store`_ Rust crate for object store access. There are general
 environment variables that can be used to configure the object store, such as the
@@ -508,3 +509,12 @@ There are several aliases for this environment variable, documented `here`__.
   By default, GCS uses HTTP/1 for communication, as opposed to HTTP/2. This improves
   maximum throughput significantly. However, if you wish to use HTTP/2 for some reason,
   you can set the environment variable ``HTTP1_ONLY`` to ``false``.
+
+Azure Blob Storage Configuration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Azure Blob Storage credentials can be configured by setting the ``AZURE_STORAGE_ACCOUNT_NAME``
+and ``AZURE_STORAGE_ACCOUNT_KEY`` environment variables. The full list of environment
+variables that can be set are documented `here`__.
+
+.. __: https://docs.rs/object_store/latest/object_store/azure/struct.MicrosoftAzureBuilder.html#method.from_env
