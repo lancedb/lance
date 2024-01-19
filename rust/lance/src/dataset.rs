@@ -141,8 +141,17 @@ pub struct ReadParams {
 
     /// If present, dataset will use this to resolve the latest version
     ///
-    /// If not set, the default will be based on the object store.  Generally this will
-    /// be RenameCommitHandler unless the object store does not handle atomic renames (e.g. S3)
+    /// Lance needs to be able to make atomic updates to the manifest.  This involves
+    /// coordination between readers and writers and we can usually rely on the filesystem
+    /// to do this coordination for us.
+    ///
+    /// Some filesystems (e.g. S3) do not support atomic operations.  In this case, for
+    /// safety, we recommend an external commit mechnaism (such as dynamodb) and, on the
+    /// read path, we need to reach out to that external mechanism to figure out the latest
+    /// version of the dataset.
+    ///
+    /// If this is not set then a default behavior is chosen that is appropriate for the
+    /// filesystem.
     ///
     /// If a custom object store is provided (via store_params.object_store) then this
     /// must also be provided.
