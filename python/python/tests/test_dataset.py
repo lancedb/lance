@@ -174,6 +174,28 @@ def test_version_id(tmp_path: Path):
     assert updated_ds.latest_version == 2
 
 
+def test_checkout(tmp_path: Path):
+    tab = pa.table({"a": range(3)})
+    ds1 = lance.write_dataset(tab, tmp_path)
+    ds1.delete("a = 1")
+
+    ds2 = ds1.checkout_version(1)
+
+    assert ds2.version == 1
+    assert ds2.to_table() == tab
+
+    assert ds1.version == 2
+    assert ds1.to_table() == pa.table({"a": [0, 2]})
+
+    with pytest.raises(IOError):
+        ds2.delete("a = 2")
+
+    ds1.delete("a = 2")
+    assert ds1.count_rows() == 1
+
+    assert ds2.checkout_version(ds2.latest_version).version == ds1.version
+
+
 def test_asof_checkout(tmp_path: Path):
     table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
     base_dir = tmp_path / "test"
