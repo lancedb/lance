@@ -173,16 +173,19 @@ class KMeans:
     def _updated_centroids(
         self, centroids: torch.Tensor, counts: torch.Tensor
     ) -> torch.Tensor:
-        for idx, cnt in enumerate(counts.cpu()):
-            # split the largest cluster and remove empty cluster
-            if cnt == 0:
-                max_idx = torch.argmax(counts).item()
-                half_cnt = counts[max_idx] // 2
-                counts[idx], counts[max_idx] = half_cnt, half_cnt
-                centroids[idx] = centroids[max_idx] * 1.05
-                centroids[max_idx] = centroids[max_idx] / 1.05
-
         centroids = centroids / counts[:, None]
+        zero_counts = centroids == 0
+        for idx in zero_counts.nonzero(as_tuple=False):
+            # split the largest cluster and remove empty cluster
+            max_idx = torch.argmax(counts).item()
+            # add 1% gassuian noise to the largest centroid
+            # do this twice so we effectively split the largest cluster into 2
+            # rand_like returns on [0, 1) so we need to shift it to [-0.5, 0.5)
+            noise = (torch.rand_like(centroids[idx]) - 0.5) * 0.01 + 1
+            centroids[idx] = centroids[max_idx] * noise
+            noise = (torch.rand_like(centroids[idx]) - 0.5) * 0.01 + 1
+            centroids[max_idx] = centroids[max_idx] * noise
+
         if self.metric == "cosine":
             # normalize the centroids
             centroids = torch.nn.functional.normalize(centroids)
