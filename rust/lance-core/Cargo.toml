@@ -62,7 +62,3 @@ proptest.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
-
-[features]
-dynamodb = ["aws-sdk-dynamodb"]
-dynamodb_tests = ["dynamodb"]
