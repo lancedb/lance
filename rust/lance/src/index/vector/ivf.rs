@@ -49,12 +49,12 @@ use lance_index::{
 use lance_io::{
     encodings::plain::PlainEncoder,
     local::to_local_path,
+    object_store::ObjectStore,
     object_writer::ObjectWriter,
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
 };
 use lance_linalg::distance::{Cosine, Dot, MetricType, L2};
-use lance_table::format::Index as IndexMetadata;
 use log::{debug, info};
 use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -294,7 +294,9 @@ pub(crate) async fn optimize_vector_indices(
 
     let metadata = pb::Index::try_from(&metadata)?;
     let pos = writer.write_protobuf(&metadata).await?;
-    writer.write_magics(pos).await?;
+    writer
+        .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+        .await?;
     writer.shutdown().await?;
 
     Ok((new_uuid, existing_indices.len() - start_pos))
@@ -1562,7 +1564,7 @@ mod tests {
             .unwrap();
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
 
-        let index_meta = IndexMetadata {
+        let index_meta = lance_table::format::Index {
             uuid,
             dataset_version: 0,
             fields: Vec::new(),

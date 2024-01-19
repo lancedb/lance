@@ -177,7 +177,7 @@ pub async fn shuffle_dataset(
             })
             .boxed();
 
-        let stream = lance_core::io::RecordBatchStreamAdapter::new(schema.clone(), stream);
+        let stream = lance_io::stream::RecordBatchStreamAdapter::new(schema.clone(), stream);
 
         let start = std::time::Instant::now();
         shuffler.write_unsorted_stream(stream).await?;

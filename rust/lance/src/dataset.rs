@@ -1579,7 +1579,6 @@ mod tests {
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
-    use lance_core::format::WriterVersion;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
