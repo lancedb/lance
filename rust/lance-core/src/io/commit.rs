@@ -383,10 +383,7 @@ pub async fn commit_handler_from_url(
                 .await?,
             }))
         }
-        "gs" => Ok(Arc::new(RenameCommitHandler)),
-        "az" => Ok(Arc::new(RenameCommitHandler)),
-        "file" => Ok(Arc::new(RenameCommitHandler)),
-        "memory" => Ok(Arc::new(RenameCommitHandler)),
+        "gs" | "az" | "file" | "memory" => Ok(Arc::new(RenameCommitHandler)),
         unknown_scheme => Err(Error::IO {
             message: format!("Unsupported URI scheme: {}", unknown_scheme),
             location: location!(),
