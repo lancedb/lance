@@ -550,6 +550,8 @@ impl DatasetIndexInternalExt for Dataset {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use crate::dataset::builder::DatasetBuilder;
 
     use super::*;
@@ -557,6 +559,7 @@ mod tests {
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::*;
+    use lance_index::optimize::IndexDeltaOption;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use tempfile::tempdir;
@@ -748,7 +751,7 @@ mod tests {
 
         dataset
             .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0, // Just create index for delta
+                index_delta_option: IndexDeltaOption::NewDelta, // Just create index for delta
             })
             .await
             .unwrap();
@@ -764,7 +767,7 @@ mod tests {
 
         dataset
             .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 2,
+                index_delta_option: IndexDeltaOption::Merge(NonZeroUsize::new(2).unwrap()),
             })
             .await
             .unwrap();

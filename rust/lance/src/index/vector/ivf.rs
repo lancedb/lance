@@ -38,7 +38,7 @@ use lance_arrow::*;
 use lance_core::{datatypes::Field, Error, Result};
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use lance_index::{
-    optimize::OptimizeOptions,
+    optimize::{IndexDeltaOption, OptimizeOptions},
     vector::{
         ivf::{builder::load_precomputed_partitions, shuffler::shuffle_dataset, IvfBuildParams},
         pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
@@ -265,10 +265,15 @@ pub(crate) async fn optimize_vector_indices(
 
     let mut ivf_mut = Ivf::new(first_idx.ivf.centroids.clone());
 
-    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
+    let num_indices_to_merge = match options.index_delta_option {
+        IndexDeltaOption::NewDelta => 0,
+        IndexDeltaOption::Merge(n) => n.get(),
+    };
+
+    let start_pos = if num_indices_to_merge > existing_indices.len() {
         0
     } else {
-        existing_indices.len() - options.num_indices_to_merge
+        existing_indices.len() - num_indices_to_merge
     };
 
     let indices_to_merge = existing_indices[start_pos..]

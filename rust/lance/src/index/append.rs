@@ -155,6 +155,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::optimize::IndexDeltaOption;
     use lance_index::{
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
         DatasetIndexExt, IndexType,
@@ -365,7 +366,7 @@ mod tests {
 
         dataset
             .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0,
+                index_delta_option: IndexDeltaOption::NewDelta, // Just create index for delta
             })
             .await
             .unwrap();
