@@ -19,7 +19,191 @@
 syntax = "proto3";
 
 package lance.file;
+
+// Lance v2 File Format
+// 
+// +------------------------------+
+// | Page 0, Buffer 0             |
+// | ...                          |
+// | Page 0, Buffer N             |
+// | (optional padding)           |
+// | Page 1, Buffer 0             |
+// | ...                          |
+// | Page N2, Buffer N3           |
+// | Column 0 Metadata            |
+// | Column 0 Metadata Buffer 0   |
+// | ...                          |
+// | Column 0 Metadata Buffer N4  |
+// | (optional padding)           |
+// | Column 1 Metadata            |
+// | ...                          |
+// | Column N5 Metadata Buffer N6 |
+// | (optional padding)           |
+// | Column 0 Metadata Position   |
+// | Column 0 Metadata Size       |
+// | ...                          |
+// | Column N5 Metadata Position  |
+// | Column N5 Metadata Size      |
+// | FileDescriptor (optional)    |
+// | Metadata                     |
+// | i64: Metadata position       |
+// | u16: Major version           |
+// | u16: Minor version           |
+// | "LANC"                       |
+// +------------------------------+
+//
+// Note that (optional padding) indicates that a writer may insert padding bytes between
+// pages or column metadata blocks to align these to disk sector boundaries.  Readers
+// should account for this (e.g. cannot assume pages are contiguous).
+//
+// This padding is normally not present in cloud storage where such padding is not helpful.
+
+
+// A file descriptor that describes the contents of a Lance file
+message FileDescriptor {
+  // The schema of the file
+  Schema schema = 1;
+  // The number of rows in the file
+  uint32 length = 2;
+}
+
+// A schema which describes the data type of each of the columns
+message Schema {
+    // All fields in this file, including the nested fields.
+    repeated lance.file.Field fields = 1;
+    // Schema metadata.
+    map<string, bytes> metadata = 5;
+}
+
+// Leaf encoding where all values in the array are the same value
+//
+// Buffers:
+//  * There are no buffers
+// Children:
+//  * There are no children
+message ConstantEncoding {
+  // The constant value
+  // If this is empty then the value is null
+  bytes value = 1;
+}
+
+// Leaf encoding for fixed-width types
+//
+// This encoding does not store nulls, but it is commonly a
+// child of MaskedEncoding in which case some values may be
+// garbage.
+//
+// Buffers:
+//  * Values - A contiguous buffer of fixed-size values
+message ValueEncoding {
+  // The size of each item, in bits
+  uint32 item_width = 1;
+}
+
+// Densely encodes nullable types using a boolean mask
+//
+// Children:
+//  * Values - An array of values with the same logical length as this array
+//             Null values are present but the bytes are garbage and should be
+//             ignored.
+//  * Validity - A boolean array representing whether each value is null or not
+message MaskedEncoding {
+  // The encoding used to store the values
+  Encoding value_encoding = 1;
+  // The encoding used to store the validity
+  EncodingType validity_encoding = 2;
+}
+
+// Values encoded using a dictionary
+//
+// Buffers:
+//  * There are no buffers
+// Children:
+//  * An array of indices into the dictionary (which are unsigned integers)
+//  * An array of values
+message DictionaryEncoding {
+  // The number of bits in each key
+  uint32 key_width = 1;
+  // The encoding used to encode the keys
+  EncodingType key_encoding = 2;
+  // The encoding used to encode the values
+  EncodingType value_encoding = 3;
+}
+
+// Encoding for variable-length lists of data
+//
+// Buffers:
+//  * There are no buffers
+// Children:
+//  * An array of offsets (which are unsigned integer values)
+//  * An array of values
+message VariableLengthEncoding {
+  // The number of bits in each offset
+  uint32 offset_width = 1;
+  // If true, then lists with length 0 should be considered null values
+  bool empty_is_null = 2;
+  // The encoding used to encode the offsets
+  EncodingType offset_encoding = 3;
+  // The encoding used to encode the values
+  EncodingType value_encoding = 4;
+}
+
+// An encoding describes how an array is physically serialized into buffers
+//
+// Some encodings split an array into multiple arrays.  For example, plain
+// encoding stores an array of values and an array for validity.  Each of those
+// child arrays has its own encoding.  This means that the encoding forms a
+// tree of encodings where the leaves are buffers.
+message EncodingType {
+  oneof type {
+    ConstantEncoding constant = 1;
+    ValueEncoding value = 2;
+    MaskedEncoding masked = 3;
+    DictionaryEncoding dictionary = 4;
+    VariableLengthEncoding variable_length = 5;
+  }
+}
+
+message ColumnMetadata {
+  message Page {
+    // The file offsets of each of the page buffers
+    //
+    // These offsets might point to the column's data section or they
+    // might point to the column's metadata section.
+    //
+    // The number of pages is variable and depends on the encoding.  There
+    // may be zero buffers (e.g. constant encoded data) in which case this
+    // could be empty.
+    repeated uint64 buffer_offsets = 1;
+    // The size (in bytes) of each of the page buffers
+    //
+    // This field will have the same length as `buffer_offsets` and
+    // may be empty.
+    repeated uint64 buffer_sizes = 2;
+    // The file offset to the start of the page data
+    uint64 offset = 3;
+    // The size (in bytes) of the page data
+    uint64 size = 4;
+    // Logical length (e.g. # rows) of the page
+    uint32 length = 5;
+    // The top-level node of the encoding tree used to encode the page
+    EncodingType encoding = 6;
+  }
+  repeated Page pages = 1;
   
+  // Statistics store the min/max/nulls/... statistics of a page.
+  // There is an array for each statistic.  The logical length of the
+  // arrays is equal the the number of pages for the column.  The number of
+  // statistics pages may be smaller than the number of column pages (in most
+  // cases there will only be one page of statistics)
+  message ColumnStatistics {
+    // The schema of statistics for this column
+    repeated Field schema = 1;
+    // Pages of statistics data
+    repeated Page pages = 2;
+  }
+}
+
 // Metadata of one Lance file.
 message Metadata {
   // 4 was used for StatisticsMetadata in the past, but has been moved to prevent
@@ -28,10 +212,29 @@ message Metadata {
 
   // Position of the manifest in the file. If it is zero, the manifest is stored
   // externally.
+  //
+  // In Lance version 1 this is a protobuf-encoded Manifest message from the table
+  // format.
+  //
+  // In Lance version 2 this is a FileDescriptor message
+  //
+  // This message is immediately followed by the metadata block.  Therefore, the
+  // size of this block can be calculated by subtracting this value from the 
+  // metadata offset (that was used to read this message)
+  //
+  // This message is optional.  If a file is not self-describing then this must
+  // point to the start of the metadata block (e.g. representing a manifest with
+  // size 0)
   uint64 manifest_position = 1;
 
   // Logical offsets of each chunk group, i.e., number of the rows in each
   // chunk.
+  //
+  // This field is optional in Lance version 2.  If it is non-empty then the
+  // writer should guarantee that pages are cutoff to align with these boundaries.
+  //
+  // If this is a Lance version 2 file and this is empty then it means that
+  // the writer did not write pages into row groups.
   repeated int32 batch_offsets = 2;
 
   // The file position that page table is stored.
@@ -51,6 +254,10 @@ message Metadata {
   //   position = page_table[5][4][0];
   //   length = page_table[5][4][1];
   // ```
+  //
+  // This field is only used in Lance version 1.  In a Lance version 2 file
+  // the page table is replaced by detailed column metadata and this field will
+  // always be 0.
   uint64 page_table_position = 3;
 
   message StatisticsMetadata {
@@ -78,13 +285,41 @@ message Metadata {
     //   position = stats_page_table[5][0];
     //   length = stats_page_table[5][1];
     // ```
-      uint64 page_table_position = 3;
+    uint64 page_table_position = 3;
   }
 
+  // File statistics.  This field is only present in Lance version 1.
+  //
+  // In Lance version 2 statistics are stored per-column and this field
+  // will not be present.
   StatisticsMetadata statistics = 5;
+
+  // The number of columns in the file (including inner columns when there
+  // are nested fields)
+  //
+  // This can be used to access the column metadata offsets array which is
+  // stored immediately before manifest_position.
+  //
+  // Given N columns the column metadata positions and sizes are stored in a
+  // contiguous buffer of 2*N uint64 values immediately preceding the file
+  // descriptor (or the metadata if the file is not self describing).
+  //
+  // If we let `column_offsets_pos` be:
+  //   manifest_position - (16 * num_columns)
+  //
+  // Then the metadata for column x starts at the uint64:
+  //   file[column_offsets_pos + (16 * x)]
+  // The size of the metadata for column x is given by the uint64:
+  //   file[column_offsets_pos + (16 * x) + 8]
+  //
+  // This field is ignored in a Lance version 1 file (the page table is used instead)
+  uint32 num_columns = 6;
 } // Metadata
 
 // Supported encodings.
+//
+// Only used in Lance version 1.  In Lance version 2 the
+// equivalent is EncodingType which is part of a page.
 enum Encoding {
   // Invalid encoding.
   NONE = 0;
@@ -99,6 +334,8 @@ enum Encoding {
 }
 
 // Dictionary field metadata
+//
+// Only used in Lance version 1
 message Dictionary {
   /// The file offset for storing the dictionary value.
   /// It is only valid if encoding is DICTIONARY.
@@ -119,7 +356,7 @@ message Field {
   }
   Type type = 1;
 
-  // Fully qualified name.
+  // Fully qualified name.  Lance requires unique column names.
   string name = 2;
   /// Field Id.
   ///
@@ -159,12 +396,24 @@ message Field {
   // If this field is nullable.
   bool nullable = 6;
 
+  // The encoding of the Field
+  //
+  // This is ignored in Lance version 2
+  // A column may be stored in many different encodings (the writer can choose what is most appropriate
+  // for any given page)
+  //
+  // When loading data in memory the user might specify a desired target encoding but this should be
+  // unrelated to the encoding used in the file.
   Encoding encoding = 7;
 
   /// The file offset for storing the dictionary value.
   /// It is only valid if encoding is DICTIONARY.
   ///
   /// The logic type presents the value type of the column, i.e., string value.
+  ///
+  /// This is ignored in Lance version 2.  If a dictionary is common throughout a file then the dictionary
+  /// should be stored in the column metadata.  If the dictionary changes from page to page then the dictionary
+  /// should be stored within the page.
   Dictionary dictionary = 8;
 
   // Deprecated: optional extension type name, use metadata field ARROW:extension:name

@@ -59,6 +59,7 @@ impl From<&Metadata> for pb::Metadata {
             page_table_position: m.page_table_position as u64,
             manifest_position: m.manifest_position.unwrap_or(0) as u64,
             statistics,
+            num_columns: 0,
         }
     }
 }
