@@ -372,6 +372,11 @@ impl IvfShuffler {
 
                 let batch = batch?;
 
+                // skip empty batches
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+
                 let row_ids: &UInt64Array = batch
                     .column_by_name(ROW_ID)
                     .expect("Row ID column not found")
@@ -579,25 +584,48 @@ mod test {
         ]))
     }
 
-    fn make_stream_and_shuffler() -> (impl RecordBatchStream, IvfShuffler) {
+    fn make_stream_and_shuffler(
+        include_empty_batches: bool,
+    ) -> (impl RecordBatchStream, IvfShuffler) {
         let schema = make_schema();
 
         let schema2 = schema.clone();
 
-        let stream = stream::iter(0..100).map(move |idx| {
-            let row_ids = Arc::new(UInt64Array::from_iter(idx * 1024..(idx + 1) * 1024));
+        let stream =
+            stream::iter(0..if include_empty_batches { 101 } else { 100 }).map(move |idx| {
+                if include_empty_batches && idx == 100 {
+                    return Ok(RecordBatch::try_new(
+                        schema2.clone(),
+                        vec![
+                            Arc::new(UInt64Array::from_iter_values([])),
+                            Arc::new(UInt32Array::from_iter_values([])),
+                            Arc::new(
+                                FixedSizeListArray::try_new_from_values(
+                                    Arc::new(UInt8Array::from_iter_values([])) as Arc<dyn Array>,
+                                    32,
+                                )
+                                .unwrap(),
+                            ),
+                        ],
+                    )
+                    .unwrap());
+                }
+                let row_ids = Arc::new(UInt64Array::from_iter(idx * 1024..(idx + 1) * 1024));
 
-            let part_id = Arc::new(UInt32Array::from_iter(
-                (idx * 1024..(idx + 1) * 1024).map(|_| idx as u32),
-            ));
+                let part_id = Arc::new(UInt32Array::from_iter(
+                    (idx * 1024..(idx + 1) * 1024).map(|_| idx as u32),
+                ));
 
-            let values = Arc::new(UInt8Array::from_iter((0..32 * 1024).map(|_| idx as u8)));
-            let pq_codes = Arc::new(
-                FixedSizeListArray::try_new_from_values(values as Arc<dyn Array>, 32).unwrap(),
-            );
+                let values = Arc::new(UInt8Array::from_iter((0..32 * 1024).map(|_| idx as u8)));
+                let pq_codes = Arc::new(
+                    FixedSizeListArray::try_new_from_values(values as Arc<dyn Array>, 32).unwrap(),
+                );
 
-            Ok(RecordBatch::try_new(schema2.clone(), vec![row_ids, part_id, pq_codes]).unwrap())
-        });
+                Ok(
+                    RecordBatch::try_new(schema2.clone(), vec![row_ids, part_id, pq_codes])
+                        .unwrap(),
+                )
+            });
 
         let stream = RecordBatchStreamAdapter::new(schema.clone(), stream);
 
@@ -639,7 +667,7 @@ mod test {
 
     #[tokio::test]
     async fn test_shuffler_single_partition() {
-        let (stream, mut shuffler) = make_stream_and_shuffler();
+        let (stream, mut shuffler) = make_stream_and_shuffler(false);
 
         shuffler.write_unsorted_stream(stream).await.unwrap();
         let partition_files = shuffler.write_partitioned_shuffles(100, 1).await.unwrap();
@@ -663,8 +691,33 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_shuffler_single_partition_with_empty_batch() {
+        let (stream, mut shuffler) = make_stream_and_shuffler(true);
+
+        shuffler.write_unsorted_stream(stream).await.unwrap();
+        let partition_files = shuffler.write_partitioned_shuffles(101, 1).await.unwrap();
+
+        assert_eq!(partition_files.len(), 1);
+
+        let mut result_stream = shuffler
+            .load_partitioned_shuffles(partition_files)
+            .await
+            .unwrap();
+
+        let mut num_batches = 0;
+        let mut stream = result_stream.pop().unwrap();
+
+        while let Some(item) = stream.next().await {
+            check_batch(item.unwrap(), num_batches, 1024);
+            num_batches += 1;
+        }
+
+        assert_eq!(num_batches, 100);
+    }
+
+    #[tokio::test]
     async fn test_shuffler_multiple_partition() {
-        let (stream, mut shuffler) = make_stream_and_shuffler();
+        let (stream, mut shuffler) = make_stream_and_shuffler(false);
 
         shuffler.write_unsorted_stream(stream).await.unwrap();
         let partition_files = shuffler.write_partitioned_shuffles(1, 100).await.unwrap();
@@ -691,7 +744,7 @@ mod test {
 
     #[tokio::test]
     async fn test_shuffler_multi_buffer_single_partition() {
-        let (stream, mut shuffler) = make_stream_and_shuffler();
+        let (stream, mut shuffler) = make_stream_and_shuffler(false);
         shuffler.write_unsorted_stream(stream).await.unwrap();
 
         // set the same buffer twice we should get double the data
@@ -721,7 +774,7 @@ mod test {
 
     #[tokio::test]
     async fn test_shuffler_multi_buffer_multi_partition() {
-        let (stream, mut shuffler) = make_stream_and_shuffler();
+        let (stream, mut shuffler) = make_stream_and_shuffler(false);
         shuffler.write_unsorted_stream(stream).await.unwrap();
 
         // set the same buffer twice we should get double the data
