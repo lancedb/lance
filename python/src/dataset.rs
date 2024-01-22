@@ -289,6 +289,7 @@ impl Dataset {
         fragments: Option<Vec<FileFragment>>,
         with_row_id: Option<bool>,
         use_stats: Option<bool>,
+        substrait_filter: Option<Vec<u8>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         if let Some(c) = columns {
@@ -297,9 +298,19 @@ impl Dataset {
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = filter {
+            if substrait_filter.is_some() {
+                return Err(PyValueError::new_err(
+                    "cannot specify both a string filter and a substrait filter",
+                ));
+            }
             scanner
                 .filter(f.as_str())
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(f) = substrait_filter {
+            RT.runtime
+                .block_on(scanner.filter_substrait(f.as_slice()))
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
         }
         if let Some(prefilter) = prefilter {
             scanner.prefilter(prefilter);

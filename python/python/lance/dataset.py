@@ -1547,6 +1547,7 @@ class ScannerBuilder:
         self.ds = ds
         self._limit = 0
         self._filter = None
+        self._substrait_filter = None
         self._prefilter = None
         self._offset = None
         self._columns = None
@@ -1605,10 +1606,47 @@ class ScannerBuilder:
         self._columns = cols
         return self
 
-    def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder:
+    def filter(
+        self, filter: Union[str, pa.compute.Expression], use_substrait=True
+    ) -> ScannerBuilder:
         if isinstance(filter, pa.compute.Expression):
-            filter = str(filter)
-        self._filter = filter
+            if use_substrait:
+                try:
+                    from pyarrow.substrait import serialize_expressions
+
+                    fields_without_lists = []
+                    counter = 0
+                    # Pyarrow cannot handle fixed size lists when converting
+                    # types to Substrait. So we can't use those in our filter,
+                    # which is ok for now but we need to replace them with some
+                    # kind of placeholder because Substrait is going to use
+                    # ordinal field references and we want to make sure those are
+                    # correct.
+                    for field in self.ds.schema:
+                        if pa.types.is_fixed_size_list(field.type):
+                            pos = counter
+                            counter += 1
+                            fields_without_lists.append(
+                                pa.field(
+                                    f"__unlikely_name_placeholder_{pos}", pa.int8()
+                                )
+                            )
+                        else:
+                            fields_without_lists.append(field)
+                    # Serialize the pyarrow compute expression toSubstrait and use
+                    # that as a filter.
+                    scalar_schema = pa.schema(fields_without_lists)
+                    self._substrait_filter = serialize_expressions(
+                        [filter], ["my_filter"], scalar_schema
+                    )
+                except ImportError:
+                    # serialize_expressions was introduced in pyarrow 14.  Fallback to
+                    # stringifying the expression if pyarrow is too old
+                    self._filter = str(filter)
+            else:
+                self._filter = str(filter)
+        else:
+            self._filter = filter
         return self
 
     def prefilter(self, prefilter: bool) -> ScannerBuilder:
@@ -1709,6 +1747,7 @@ class ScannerBuilder:
             self._fragments,
             self._with_row_id,
             self._use_stats,
+            self._substrait_filter,
         )
         return LanceScanner(scanner, self.ds)
 

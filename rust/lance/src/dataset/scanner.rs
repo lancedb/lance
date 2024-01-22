@@ -40,6 +40,7 @@ use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::ROW_ID_FIELD;
 use lance_datafusion::exec::execute_plan;
+use lance_datafusion::expr::parse_substrait;
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
@@ -277,6 +278,18 @@ impl Scanner {
         let planner = Planner::new(schema);
         self.filter = Some(planner.parse_filter(filter)?);
         self.filter = Some(planner.optimize_expr(self.filter.take().unwrap())?);
+        Ok(self)
+    }
+
+    /// Set a filter using a Substrait ExtendedExpression message
+    ///
+    /// The message must contain exactly one expression and that expression
+    /// must be a scalar expression whose return type is boolean.
+    pub async fn filter_substrait(&mut self, filter: &[u8]) -> Result<&mut Self> {
+        let schema = Arc::new(ArrowSchema::from(self.dataset.schema()));
+        let expr = parse_substrait(filter, schema.clone()).await?;
+        let planner = Planner::new(schema);
+        self.filter = Some(planner.optimize_expr(expr)?);
         Ok(self)
     }
 
