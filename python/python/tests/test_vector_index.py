@@ -112,11 +112,11 @@ def run(ds, q=None, assert_func=None):
 
 
 def test_flat(dataset):
-    print(run(dataset))
+    run(dataset)
 
 
 def test_ann(indexed_dataset):
-    print(run(indexed_dataset))
+    run(indexed_dataset)
 
 
 def test_ann_append(tmp_path):
@@ -132,7 +132,7 @@ def test_ann_append(tmp_path):
     def func(rs: pa.Table):
         assert rs["vector"][0].as_py() == q
 
-    print(run(dataset, q=np.array(q), assert_func=func))
+    run(dataset, q=np.array(q), assert_func=func)
 
 
 def test_index_with_nans(tmp_path):
