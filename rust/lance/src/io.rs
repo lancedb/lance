@@ -17,4 +17,7 @@
 pub mod commit;
 pub(crate) mod exec;
 
-pub use lance_io::object_store::ObjectStore;
+pub use lance_io::{
+    object_store::{ObjectStore, ObjectStoreParams, WrappingObjectStore},
+    stream::RecordBatchStream,
+};
