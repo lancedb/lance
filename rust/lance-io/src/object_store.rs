@@ -162,7 +162,12 @@ impl CredentialProvider for AwsCredentialAdapter {
                 token: creds.session_token().map(|s| s.to_string()),
             }))
         } else {
-            let refreshed_creds = Arc::new(self.inner.provide_credentials().await.unwrap());
+            let refreshed_creds = Arc::new(self.inner.provide_credentials().await.map_err(|e| {
+                Error::Internal {
+                    message: format!("Failed to get AWS credentials: {}", e),
+                    location: Location::new(file!(), line!(), column!()),
+                }
+            })?);
 
             self.cache
                 .write()
