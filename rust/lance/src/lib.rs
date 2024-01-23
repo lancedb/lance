@@ -89,6 +89,7 @@ pub mod dataset;
 pub mod index;
 pub mod io;
 pub mod session;
+pub mod table;
 pub mod utils;
 
 pub use dataset::Dataset;

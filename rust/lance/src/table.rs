@@ -12,5 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod format;
-pub mod io;
+pub use lance_table::format;
