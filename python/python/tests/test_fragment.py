@@ -140,9 +140,8 @@ def test_dataset_progress(tmp_path: Path):
     p.start()
     try:
         p.join()
-    except Exception as e:
+    except Exception:
         # Allow a crash to happen
-        print(e)
         pass
 
     # In-progress file should be present
