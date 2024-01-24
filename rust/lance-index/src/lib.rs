@@ -59,7 +59,7 @@ pub trait Index: Send + Sync {
 }
 
 /// Index Type
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Copy, Clone)]
 pub enum IndexType {
     // Preserve 0-100 for simple indices.
     Scalar = 0,
