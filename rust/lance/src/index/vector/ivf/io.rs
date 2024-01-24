@@ -22,13 +22,14 @@ use arrow_array::{
 };
 use futures::{Stream, StreamExt};
 use lance_arrow::*;
-use lance_core::{io::Writer, Error};
+use lance_core::Error;
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
+use lance_io::encodings::plain::PlainEncoder;
+use lance_io::traits::Writer;
 use snafu::{location, Location};
 
 use super::{IVFIndex, Ivf};
 use crate::dataset::ROW_ID;
-use crate::encodings::plain::PlainEncoder;
 use crate::index::vector::pq::PQIndex;
 use crate::Result;
 
@@ -47,38 +48,40 @@ use crate::Result;
 pub(super) async fn write_index_partitions(
     writer: &mut dyn Writer,
     ivf: &mut Ivf,
-    streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
-    existing_partitions: Option<&[&IVFIndex]>,
+    streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
+    existing_indices: Option<&[&IVFIndex]>,
 ) -> Result<()> {
     // build the initial heap
     // TODO: extract heap sort to a separate function.
     let mut streams_heap = BinaryHeap::new();
     let mut new_streams = vec![];
 
-    for stream in streams {
-        let mut stream = Box::pin(stream.peekable());
+    if let Some(streams) = streams {
+        for stream in streams {
+            let mut stream = Box::pin(stream.peekable());
 
-        match stream.as_mut().peek().await {
-            Some(Ok(batch)) => {
-                let part_ids: &UInt32Array = batch
-                    .column_by_name(PART_ID_COLUMN)
-                    .expect("part id column not found")
-                    .as_primitive();
-                let part_id = part_ids.values()[0];
-                streams_heap.push((Reverse(part_id), new_streams.len()));
-                new_streams.push(stream);
-            }
-            Some(Err(e)) => {
-                return Err(Error::IO {
-                    message: format!("failed to read batch: {}", e),
-                    location: location!(),
-                });
-            }
-            None => {
-                return Err(Error::IO {
-                    message: "failed to read batch: end of stream".to_string(),
-                    location: location!(),
-                });
+            match stream.as_mut().peek().await {
+                Some(Ok(batch)) => {
+                    let part_ids: &UInt32Array = batch
+                        .column_by_name(PART_ID_COLUMN)
+                        .expect("part id column not found")
+                        .as_primitive();
+                    let part_id = part_ids.values()[0];
+                    streams_heap.push((Reverse(part_id), new_streams.len()));
+                    new_streams.push(stream);
+                }
+                Some(Err(e)) => {
+                    return Err(Error::IO {
+                        message: format!("failed to read batch: {}", e),
+                        location: location!(),
+                    });
+                }
+                None => {
+                    return Err(Error::IO {
+                        message: "failed to read batch: end of stream".to_string(),
+                        location: location!(),
+                    });
+                }
             }
         }
     }
@@ -88,7 +91,7 @@ pub(super) async fn write_index_partitions(
         let mut pq_array: Vec<Arc<dyn Array>> = vec![];
         let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
 
-        if let Some(&previous_indices) = existing_partitions.as_ref() {
+        if let Some(&previous_indices) = existing_indices.as_ref() {
             for &idx in previous_indices.iter() {
                 let sub_index = idx.load_partition(part_id as usize, true).await?;
                 let pq_index =

@@ -21,17 +21,19 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::format::Fragment;
-use lance_core::io::{
-    read_message, read_message_from_buf, read_metadata_offset, reader::read_manifest_indexes,
-    Reader,
-};
+use itertools::Itertools;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ScalarIndex;
 pub use lance_index::IndexParams;
 use lance_index::{pb, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
+use lance_io::traits::Reader;
+use lance_io::utils::{read_message, read_message_from_buf, read_metadata_offset};
+use lance_table::format::Fragment;
+use lance_table::format::Index as IndexMetadata;
+use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use serde_json::json;
 use snafu::{location, Location};
@@ -45,12 +47,11 @@ pub mod scalar;
 pub mod vector;
 
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::format::Index as IndexMetadata;
-use crate::index::append::append_index;
 use crate::index::vector::remap_vector_index;
 use crate::io::commit::commit_transaction;
 use crate::{dataset::Dataset, Error, Result};
 
+use self::append::merge_indices;
 use self::scalar::build_scalar_index;
 use self::vector::{build_vector_index, VectorIndex, VectorIndexParams};
 
@@ -243,6 +244,7 @@ impl DatasetIndexExt for Dataset {
         let new_manifest = commit_transaction(
             self,
             self.object_store(),
+            self.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
@@ -296,29 +298,43 @@ impl DatasetIndexExt for Dataset {
     }
 
     #[instrument(skip_all)]
-    async fn optimize_indices(&mut self) -> Result<()> {
+    async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
         let dataset = Arc::new(self.clone());
-        // Append index
         let indices = self.load_indices().await?;
+
+        let name_to_indices = indices
+            .iter()
+            .map(|idx| (idx.name.clone(), idx))
+            .into_group_map();
 
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
-        for idx in indices.as_slice() {
-            if idx.dataset_version == self.manifest.version {
-                continue;
-            }
-            let Some((new_id, new_frag_ids)) = append_index(dataset.clone(), idx).await? else {
+        for deltas in name_to_indices.values() {
+            let Some((new_id, removed, mut new_frag_ids)) =
+                merge_indices(dataset.clone(), deltas.as_slice(), options).await?
+            else {
                 continue;
             };
+            for removed_idx in removed.iter() {
+                new_frag_ids |= removed_idx.fragment_bitmap.as_ref().unwrap();
+            }
 
+            let last_idx = deltas.last().expect("Delte indices should not be empty");
             let new_idx = IndexMetadata {
                 uuid: new_id,
-                name: idx.name.clone(),
-                fields: idx.fields.clone(),
+                name: last_idx.name.clone(), // Keep the same name
+                fields: last_idx.fields.clone(),
                 dataset_version: self.manifest.version,
-                fragment_bitmap: new_frag_ids,
+                fragment_bitmap: Some(new_frag_ids),
             };
-            removed_indices.push(idx.clone());
+            removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
+            if deltas.len() > removed.len() {
+                new_indices.extend(
+                    deltas[0..(deltas.len() - removed.len())]
+                        .iter()
+                        .map(|&idx| idx.clone()),
+                );
+            }
             new_indices.push(new_idx);
         }
 
@@ -338,6 +354,7 @@ impl DatasetIndexExt for Dataset {
         let new_manifest = commit_transaction(
             self,
             self.object_store(),
+            self.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
@@ -533,6 +550,8 @@ impl DatasetIndexInternalExt for Dataset {
 
 #[cfg(test)]
 mod tests {
+    use crate::dataset::builder::DatasetBuilder;
+
     use super::*;
 
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
@@ -665,5 +684,96 @@ mod tests {
             serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
         assert_eq!(stats["num_unindexed_rows"], 512);
         assert_eq!(stats["num_indexed_rows"], 512);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_delta_indices() {
+        let test_dir = tempdir().unwrap();
+        let dimensions = 16;
+        let column_name = "vec";
+        let field = Field::new(
+            column_name,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimensions,
+            ),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+
+        let float_arr = generate_random_array(512 * dimensions as usize);
+
+        let vectors =
+            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+
+        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+
+        let reader = RecordBatchIterator::new(
+            vec![record_batch.clone()].into_iter().map(Ok),
+            schema.clone(),
+        );
+
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 10);
+        dataset
+            .create_index(
+                &[column_name],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+        assert_eq!(stats["num_indexed_rows"], 512);
+        assert_eq!(stats["num_indexed_fragments"], 1);
+        assert_eq!(stats["num_indices"], 1);
+
+        let reader =
+            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+        dataset.append(reader, None).await.unwrap();
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 512);
+        assert_eq!(stats["num_indexed_rows"], 512);
+        assert_eq!(stats["num_indexed_fragments"], 1);
+        assert_eq!(stats["num_unindexed_fragments"], 1);
+        assert_eq!(stats["num_indices"], 1);
+
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 0, // Just create index for delta
+            })
+            .await
+            .unwrap();
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+        assert_eq!(stats["num_indexed_rows"], 1024);
+        assert_eq!(stats["num_indexed_fragments"], 2);
+        assert_eq!(stats["num_unindexed_fragments"], 0);
+        assert_eq!(stats["num_indices"], 2);
+
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 2,
+            })
+            .await
+            .unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+        assert_eq!(stats["num_indexed_rows"], 1024);
+        assert_eq!(stats["num_indexed_fragments"], 2);
+        assert_eq!(stats["num_unindexed_fragments"], 0);
+        assert_eq!(stats["num_indices"], 1);
     }
 }

@@ -19,15 +19,15 @@ use std::{any::Any, sync::Arc};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use lance_file::{
+    reader::FileReader,
+    writer::{FileWriter, FileWriterOptions, ManifestProvider},
+};
 use snafu::{location, Location};
 
-use lance_core::{
-    io::{
-        object_store::ObjectStore, writer::FileWriterOptions, FileReader, FileWriter,
-        ReadBatchParams,
-    },
-    Error, Result,
-};
+use lance_core::{Error, Result};
+use lance_io::{object_store::ObjectStore, ReadBatchParams};
+use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
 
 use super::{IndexReader, IndexStore, IndexWriter};
@@ -54,7 +54,7 @@ impl LanceIndexStore {
 }
 
 #[async_trait]
-impl IndexWriter for FileWriter {
+impl<M: ManifestProvider + Send + Sync> IndexWriter for FileWriter<M> {
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
         let offset = self.tell().await?;
         self.write(&[batch]).await?;
@@ -69,8 +69,13 @@ impl IndexWriter for FileWriter {
 #[async_trait]
 impl IndexReader for FileReader {
     async fn read_record_batch(&self, offset: u32) -> Result<RecordBatch> {
-        self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
-            .await
+        self.read_batch(
+            offset as i32,
+            ReadBatchParams::RangeFull,
+            self.schema(),
+            None,
+        )
+        .await
     }
 
     async fn num_batches(&self) -> u32 {
@@ -91,7 +96,7 @@ impl IndexStore for LanceIndexStore {
     ) -> Result<Box<dyn IndexWriter>> {
         let path = self.index_dir.child(name);
         let schema = schema.as_ref().try_into()?;
-        let writer = FileWriter::try_new(
+        let writer = FileWriter::<ManifestDescribing>::try_new(
             &self.object_store,
             &path,
             schema,
@@ -103,7 +108,9 @@ impl IndexStore for LanceIndexStore {
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_dir.child(name);
-        let file_reader = FileReader::try_new(&self.object_store, &path).await?;
+        // TODO: Should probably provide file metadata cache here
+        let file_reader =
+            FileReader::try_new_self_described(&self.object_store, &path, None).await?;
         Ok(Arc::new(file_reader))
     }
 
@@ -164,18 +171,14 @@ mod tests {
     use arrow_select::take::TakeOptions;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
-    use lance_core::io::object_store::ObjectStoreParams;
     use lance_datafusion::exec::reader_to_stream;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path: &Path = tempdir.path();
-        let (object_store, test_path) = ObjectStore::from_path(
-            test_path.as_os_str().to_str().unwrap(),
-            &ObjectStoreParams::default(),
-        )
-        .unwrap();
+        let (object_store, test_path) =
+            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
         Arc::new(LanceIndexStore::new(object_store, test_path.to_owned()))
     }
 

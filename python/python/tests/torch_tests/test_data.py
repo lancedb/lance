@@ -93,7 +93,6 @@ def test_sharded_torch_dataset(tmp_path):
     assert len(ds.get_fragments()) == 10
     for f in ds.get_fragments():
         assert f.count_rows() == 100
-        print(f.fragment_id)
 
     ds = LanceDataset(
         tmp_path, batch_size=10, columns=["ids"], rank=1, world_size=2, with_row_id=True

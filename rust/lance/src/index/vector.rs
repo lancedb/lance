@@ -28,9 +28,10 @@ pub mod pq;
 mod traits;
 mod utils;
 
-use lance_core::io::Reader;
 use lance_index::vector::{ivf::IvfBuildParams, pq::PQBuildParams};
+use lance_io::traits::Reader;
 use lance_linalg::distance::*;
+use lance_table::format::Index as IndexMetadata;
 use object_store::path::Path;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -227,7 +228,7 @@ pub(crate) async fn remap_vector_index(
     column: &str,
     old_uuid: &Uuid,
     new_uuid: &Uuid,
-    old_metadata: &crate::format::Index,
+    old_metadata: &IndexMetadata,
     mapping: &HashMap<u64, Option<u64>>,
 ) -> Result<()> {
     let old_index = dataset

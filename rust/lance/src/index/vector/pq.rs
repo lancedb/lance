@@ -24,16 +24,15 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
 // Re-export
-use lance_core::{
-    format::RowAddress,
-    io::{read_fixed_stride_array, Reader},
-    ROW_ID_FIELD,
-};
+use lance_core::utils::address::RowAddress;
+use lance_core::ROW_ID_FIELD;
 pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizerImpl};
 use lance_index::{
     vector::{pq::ProductQuantizer, Query, DIST_COL},
     Index, IndexType,
 };
+use lance_io::traits::Reader;
+use lance_io::utils::read_fixed_stride_array;
 use lance_linalg::distance::MetricType;
 use roaring::RoaringBitmap;
 use serde_json::json;

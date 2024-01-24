@@ -14,9 +14,9 @@
 
 use std::fmt::Debug;
 
+use lance_table::io::commit::{CommitError, CommitLease, CommitLock};
 use snafu::{location, Location};
 
-use lance_core::io::commit::{CommitError, CommitLease, CommitLock};
 use lance_core::Error;
 
 use pyo3::{exceptions::PyIOError, prelude::*};

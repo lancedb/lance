@@ -3,8 +3,11 @@ members = [
     "lance-arrow",
     "lance-core",
     "lance-datagen",
+    "lance-file",
     "lance-index",
+    "lance-io",
     "lance-linalg",
+    "lance-table",
     "lance-testing",
     "lance-test-macros",
     "lance",
@@ -13,7 +16,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.6"
+version = "0.9.9"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -36,15 +39,18 @@ categories = [
 rust-version = "1.75"
 
 [workspace.dependencies]
-lance = { version = "=0.9.6", path = "./lance" }
-lance-arrow = { version = "=0.9.6", path = "./lance-arrow" }
-lance-core = { version = "=0.9.6", path = "./lance-core" }
-lance-datafusion = { version = "=0.9.6", path = "./lance-datafusion" }
-lance-datagen = { version = "=0.9.6", path = "./lance-datagen" }
-lance-index = { version = "=0.9.6", path = "./lance-index" }
-lance-linalg = { version = "=0.9.6", path = "./lance-linalg" }
-lance-test-macros = { version = "=0.9.6", path = "./lance-test-macros" }
-lance-testing = { version = "=0.9.6", path = "./lance-testing" }
+lance = { version = "=0.9.9", path = "./lance" }
+lance-arrow = { version = "=0.9.9", path = "./lance-arrow" }
+lance-core = { version = "=0.9.9", path = "./lance-core" }
+lance-datafusion = { version = "=0.9.9", path = "./lance-datafusion" }
+lance-datagen = { version = "=0.9.9", path = "./lance-datagen" }
+lance-file = { version = "=0.9.9", path = "./lance-file" }
+lance-index = { version = "=0.9.9", path = "./lance-index" }
+lance-io = { version = "=0.9.9", path = "./lance-io" }
+lance-linalg = { version = "=0.9.9", path = "./lance-linalg" }
+lance-table = { version = "=0.9.9", path = "./lance-table" }
+lance-test-macros = { version = "=0.9.9", path = "./lance-test-macros" }
+lance-testing = { version = "=0.9.9", path = "./lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "49.0.0", optional = false, features = ["prettyprint"] }
@@ -81,16 +87,18 @@ datafusion-physical-expr = "34.0"
 either = "1.0"
 futures = "0.3"
 http = "0.2.9"
+itertools = "0.12"
 lazy_static = "1"
 log = "0.4"
 mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = "0.11"
-num_cpus = "1.0"
 num-traits = "0.2"
+num_cpus = "1.0"
 object_store = { version = "0.9.0", features = ["aws", "gcp", "azure"] }
 parquet = "49.0"
 pin-project = "1.0"
 pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
+proptest = "1.3.1"
 prost = "0.12"
 prost-build = "0.12"
 prost-types = "0.12"

@@ -29,23 +29,29 @@ use arrow_array::{
     ArrayRef,
 };
 use arrow_schema::{DataType, Field as ArrowField};
-use async_recursion::async_recursion;
 use lance_arrow::{bfloat16::ARROW_EXT_NAME_KEY, *};
 use snafu::{location, Location};
 
 use super::{Dictionary, LogicalType};
-use crate::{
-    encodings::Encoding,
-    format::pb,
-    io::{read_binary_array, read_fixed_stride_array, Reader},
-    Error, Result,
-};
+use crate::{Error, Result};
 
 #[derive(Default)]
 pub struct SchemaCompareOptions {
     pub compare_metadata: bool,
     pub compare_dictionary: bool,
     pub compare_field_ids: bool,
+}
+/// Encoding enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Encoding {
+    /// Plain encoding.
+    Plain,
+    /// Binary encoding.
+    VarBinary,
+    /// Dictionary encoding.
+    Dictionary,
+    /// RLE encoding.
+    RLE,
 }
 
 /// Lance Schema Field
@@ -54,9 +60,10 @@ pub struct SchemaCompareOptions {
 pub struct Field {
     pub name: String,
     pub id: i32,
-    parent_id: i32,
-    logical_type: LogicalType,
-    metadata: HashMap<String, String>,
+    // TODO: Find way to move these next three fields to private
+    pub parent_id: i32,
+    pub logical_type: LogicalType,
+    pub metadata: HashMap<String, String>,
     pub encoding: Option<Encoding>,
     pub nullable: bool,
 
@@ -639,60 +646,6 @@ impl Field {
         }
         None
     }
-
-    #[async_recursion]
-    pub async fn load_dictionary<'a>(&mut self, reader: &dyn Reader) -> Result<()> {
-        if let DataType::Dictionary(_, value_type) = self.data_type() {
-            assert!(self.dictionary.is_some());
-            if let Some(dict_info) = self.dictionary.as_mut() {
-                use DataType::*;
-                match value_type.as_ref() {
-                    Utf8 | Binary => {
-                        dict_info.values = Some(
-                            read_binary_array(
-                                reader,
-                                value_type.as_ref(),
-                                true, // Empty values are null
-                                dict_info.offset,
-                                dict_info.length,
-                                ..,
-                            )
-                            .await?,
-                        );
-                    }
-                    Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => {
-                        dict_info.values = Some(
-                            read_fixed_stride_array(
-                                reader,
-                                value_type.as_ref(),
-                                dict_info.offset,
-                                dict_info.length,
-                                ..,
-                            )
-                            .await?,
-                        );
-                    }
-                    _ => {
-                        return Err(Error::Schema {
-                            message: format!(
-                                "Does not support {} as dictionary value type",
-                                value_type
-                            ),
-                            location: location!(),
-                        });
-                    }
-                }
-            } else {
-                panic!("Should not reach here: dictionary field does not load dictionary info")
-            }
-            Ok(())
-        } else {
-            for child in self.children.as_mut_slice() {
-                child.load_dictionary(reader).await?;
-            }
-            Ok(())
-        }
-    }
 }
 
 impl fmt::Display for Field {
@@ -765,79 +718,6 @@ impl From<&Field> for ArrowField {
     fn from(field: &Field) -> Self {
         let out = Self::new(&field.name, field.data_type(), field.nullable);
         out.with_metadata(field.metadata.clone())
-    }
-}
-
-impl From<&pb::Field> for Field {
-    fn from(field: &pb::Field) -> Self {
-        let mut lance_metadata: HashMap<String, String> = field
-            .metadata
-            .iter()
-            .map(|(key, value)| {
-                let string_value = String::from_utf8_lossy(value).to_string();
-                (key.clone(), string_value)
-            })
-            .collect();
-        if !field.extension_name.is_empty() {
-            lance_metadata.insert(ARROW_EXT_NAME_KEY.to_string(), field.extension_name.clone());
-        }
-        Self {
-            name: field.name.clone(),
-            id: field.id,
-            parent_id: field.parent_id,
-            logical_type: LogicalType(field.logical_type.clone()),
-            metadata: lance_metadata,
-            encoding: match field.encoding {
-                1 => Some(Encoding::Plain),
-                2 => Some(Encoding::VarBinary),
-                3 => Some(Encoding::Dictionary),
-                4 => Some(Encoding::RLE),
-                _ => None,
-            },
-            nullable: field.nullable,
-            children: vec![],
-            dictionary: field.dictionary.as_ref().map(Dictionary::from),
-        }
-    }
-}
-
-impl From<&Field> for pb::Field {
-    fn from(field: &Field) -> Self {
-        let pb_metadata = field
-            .metadata
-            .clone()
-            .into_iter()
-            .map(|(key, value)| (key, value.into_bytes()))
-            .collect();
-        Self {
-            id: field.id,
-            parent_id: field.parent_id,
-            name: field.name.clone(),
-            logical_type: field.logical_type.0.clone(),
-            encoding: match field.encoding {
-                Some(Encoding::Plain) => 1,
-                Some(Encoding::VarBinary) => 2,
-                Some(Encoding::Dictionary) => 3,
-                Some(Encoding::RLE) => 4,
-                _ => 0,
-            },
-            nullable: field.nullable,
-            dictionary: field.dictionary.as_ref().map(pb::Dictionary::from),
-            metadata: pb_metadata,
-            extension_name: field
-                .extension_name()
-                .map(|name| name.to_owned())
-                .unwrap_or_default(),
-            r#type: 0,
-        }
-    }
-}
-
-impl From<&Field> for Vec<pb::Field> {
-    fn from(field: &Field) -> Self {
-        let mut protos = vec![pb::Field::from(field)];
-        protos.extend(field.children.iter().flat_map(Self::from));
-        protos
     }
 }
 

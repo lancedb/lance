@@ -48,14 +48,18 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use lance_core::{
-    datatypes::Schema,
+use lance_core::{datatypes::Schema, Error, Result};
+use lance_file::datatypes::Fields;
+use lance_io::object_store::ObjectStore;
+use lance_table::{
     format::{
         pb::{self, IndexMetadata},
         Fragment, Index, Manifest,
     },
-    io::{object_store::ObjectStore, reader::read_manifest, reader::read_manifest_indexes},
-    Error, Result,
+    io::{
+        commit::CommitHandler,
+        manifest::{read_manifest, read_manifest_indexes},
+    },
 };
 use object_store::path::Path;
 use roaring::RoaringBitmap;
@@ -335,13 +339,13 @@ impl Transaction {
 
     pub(crate) async fn restore_old_manifest(
         object_store: &ObjectStore,
+        commit_handler: &dyn CommitHandler,
         base_path: &Path,
         version: u64,
         config: &ManifestWriteConfig,
         tx_path: &str,
     ) -> Result<(Manifest, Vec<Index>)> {
-        let path = object_store
-            .commit_handler
+        let path = commit_handler
             .resolve_version(base_path, version, &object_store.inner)
             .await?;
         let mut manifest = read_manifest(object_store, &path).await?;
@@ -659,7 +663,7 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 schema_metadata: _schema_metadata, // TODO: handle metadata
             })) => Operation::Overwrite {
                 fragments: fragments.iter().map(Fragment::from).collect(),
-                schema: Schema::from(schema),
+                schema: Schema::from(&Fields(schema.clone())),
             },
             Some(pb::transaction::Operation::ReserveFragments(
                 pb::transaction::ReserveFragments { num_fragments },
@@ -712,7 +716,7 @@ impl TryFrom<&pb::Transaction> for Transaction {
                 schema_metadata: _schema_metadata, // TODO: handle metadata
             })) => Operation::Merge {
                 fragments: fragments.iter().map(Fragment::from).collect(),
-                schema: Schema::from(schema),
+                schema: Schema::from(&Fields(schema.clone())),
             },
             Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
                 Operation::Restore { version: *version }
@@ -728,7 +732,7 @@ impl TryFrom<&pb::Transaction> for Transaction {
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
-                    schema: Schema::from(schema),
+                    schema: Schema::from(&Fields(schema.clone())),
                 }
             }
             None => {
@@ -810,7 +814,7 @@ impl From<&Transaction> for pb::Transaction {
             Operation::Overwrite { fragments, schema } => {
                 pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                    schema: schema.into(),
+                    schema: Fields::from(schema).0,
                     schema_metadata: Default::default(), // TODO: handle metadata
                 })
             }
@@ -843,7 +847,7 @@ impl From<&Transaction> for pb::Transaction {
             Operation::Merge { fragments, schema } => {
                 pb::transaction::Operation::Merge(pb::transaction::Merge {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                    schema: schema.into(),
+                    schema: Fields::from(schema).0,
                     schema_metadata: Default::default(), // TODO: handle metadata
                 })
             }
@@ -864,7 +868,7 @@ impl From<&Transaction> for pb::Transaction {
             }),
             Operation::Project { schema } => {
                 pb::transaction::Operation::Project(pb::transaction::Project {
-                    schema: schema.into(),
+                    schema: Fields::from(schema).0,
                 })
             }
         };

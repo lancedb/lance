@@ -13,10 +13,8 @@
 // limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use lance_core::io::{
-    commit::CommitHandler,
-    object_store::{ObjectStore, ObjectStoreParams},
-};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
 use object_store::{aws::AwsCredentialProvider, DynObjectStore};
 use snafu::{location, Location};
 use tracing::instrument;
@@ -37,6 +35,7 @@ pub struct DatasetBuilder {
     /// cache is disabled.
     metadata_cache_size: usize,
     session: Option<Arc<Session>>,
+    commit_handler: Option<Arc<dyn CommitHandler>>,
     options: ObjectStoreParams,
     version: Option<u64>,
     table_uri: String,
@@ -49,6 +48,7 @@ impl DatasetBuilder {
             metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
             table_uri: table_uri.as_ref().to_string(),
             options: ObjectStoreParams::default(),
+            commit_handler: None,
             session: None,
             version: None,
         }
@@ -86,7 +86,7 @@ impl DatasetBuilder {
     }
 
     pub fn with_commit_handler(mut self, commit_handler: Arc<dyn CommitHandler>) -> Self {
-        self.options.commit_handler = Some(commit_handler);
+        self.commit_handler = Some(commit_handler);
         self
     }
 
@@ -105,8 +105,14 @@ impl DatasetBuilder {
     }
 
     /// Directly set the object store to use.
-    pub fn with_object_store(mut self, object_store: Arc<DynObjectStore>, location: Url) -> Self {
+    pub fn with_object_store(
+        mut self,
+        object_store: Arc<DynObjectStore>,
+        location: Url,
+        commit_handler: Arc<dyn CommitHandler>,
+    ) -> Self {
         self.options.object_store = Some((object_store, location));
+        self.commit_handler = Some(commit_handler);
         self
     }
 
@@ -151,6 +157,10 @@ impl DatasetBuilder {
             self.session = Some(session);
         }
 
+        if let Some(commit_handler) = read_params.commit_handler {
+            self.commit_handler = Some(commit_handler);
+        }
+
         self
     }
 
@@ -165,19 +175,26 @@ impl DatasetBuilder {
     }
 
     /// Build a lance object store for the given config
-    pub async fn build_object_store(self) -> Result<ObjectStore> {
+    pub async fn build_object_store(self) -> Result<(ObjectStore, Arc<dyn CommitHandler>)> {
+        let commit_handler = match self.commit_handler {
+            Some(commit_handler) => Ok(commit_handler),
+            None => commit_handler_from_url(&self.table_uri, &Some(self.options.clone())).await,
+        }?;
+
         match &self.options.object_store {
-            Some(store) => Ok(ObjectStore::new(
-                store.0.clone(),
-                store.1.clone(),
-                self.options.block_size,
-                self.options.commit_handler,
-                self.options.object_store_wrapper,
+            Some(store) => Ok((
+                ObjectStore::new(
+                    store.0.clone(),
+                    store.1.clone(),
+                    self.options.block_size,
+                    self.options.object_store_wrapper,
+                ),
+                commit_handler,
             )),
             None => {
                 let (store, _path) =
                     ObjectStore::from_uri_and_params(&self.table_uri, &self.options).await?;
-                Ok(store)
+                Ok((store, commit_handler))
             }
         }
     }
@@ -194,17 +211,15 @@ impl DatasetBuilder {
 
         let version = self.version;
 
-        let object_store = self.build_object_store().await?;
+        let (object_store, commit_handler) = self.build_object_store().await?;
         let base_path = object_store.base_path();
         let manifest = match version {
             Some(version) => {
-                object_store
-                    .commit_handler
+                commit_handler
                     .resolve_version(base_path, version, &object_store.inner)
                     .await?
             }
-            None => object_store
-                .commit_handler
+            None => commit_handler
                 .resolve_latest_version(base_path, &object_store.inner)
                 .await
                 .map_err(|e| Error::DatasetNotFound {
@@ -219,6 +234,7 @@ impl DatasetBuilder {
             base_path.clone(),
             &manifest,
             session,
+            commit_handler,
         )
         .await
     }

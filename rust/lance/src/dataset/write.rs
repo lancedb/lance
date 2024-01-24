@@ -22,16 +22,13 @@ use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::{
-    datatypes::Schema,
-    format::Fragment,
-    io::{
-        object_store::{ObjectStore, ObjectStoreParams},
-        FileWriter,
-    },
-    Error, Result,
-};
+use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::chunk_stream;
+use lance_file::writer::FileWriter;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_table::format::Fragment;
+use lance_table::io::commit::CommitHandler;
+use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use tracing::instrument;
 use uuid::Uuid;
@@ -80,6 +77,15 @@ pub struct WriteParams {
     pub store_params: Option<ObjectStoreParams>,
 
     pub progress: Arc<dyn WriteFragmentProgress>,
+
+    /// If present, dataset will use this to update the latest version
+    ///
+    /// If not set, the default will be based on the object store.  Generally this will
+    /// be RenameCommitHandler unless the object store does not handle atomic renames (e.g. S3)
+    ///
+    /// If a custom object store is provided (via store_params.object_store) then this
+    /// must also be provided.
+    pub commit_handler: Option<Arc<dyn CommitHandler>>,
 }
 
 impl Default for WriteParams {
@@ -93,6 +99,7 @@ impl Default for WriteParams {
             mode: WriteMode::Create,
             store_params: None,
             progress: Arc::new(NoopFragmentWriteProgress::new()),
+            commit_handler: None,
         }
     }
 }
@@ -169,7 +176,7 @@ pub async fn write_fragments_internal(
     let mut buffered_reader = chunk_stream(data, params.max_rows_per_group);
 
     let writer_generator = WriterGenerator::new(object_store, base_dir, schema);
-    let mut writer: Option<FileWriter> = None;
+    let mut writer: Option<FileWriter<ManifestDescribing>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
     while let Some(batch_chunk) = buffered_reader.next().await {
@@ -226,7 +233,7 @@ impl WriterGenerator {
         }
     }
 
-    pub async fn new_writer(&self) -> Result<(FileWriter, Fragment)> {
+    pub async fn new_writer(&self) -> Result<(FileWriter<ManifestDescribing>, Fragment)> {
         let data_file_path = format!("{}.lance", Uuid::new_v4());
 
         // Use temporary ID 0; will assign ID later.

@@ -92,7 +92,6 @@ def test_index_remapping(tmp_path: Path):
     # Compact the 2 fragments into 1.  Combined scan still not needed.
     dataset.optimize.compact_files()
     assert len(dataset.get_fragments()) == 1
-    print(dataset.get_fragments())
     check_index(has_knn_combined=False)
 
     # Add a new fragment and recalculate the index

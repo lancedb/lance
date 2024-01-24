@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
-use lance_core::format::Index;
 use lance_index::scalar::ScalarIndex;
+use lance_table::format::Index;
 use moka::sync::{Cache, ConcurrentCacheExt};
 
 use super::vector::VectorIndex;

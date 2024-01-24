@@ -22,9 +22,10 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
-import torch
-from lance.util import validate_vector_index
-from lance.vector import vec_to_table
+
+torch = pytest.importorskip("torch")
+from lance.util import validate_vector_index  # noqa: E402
+from lance.vector import vec_to_table  # noqa: E402
 
 
 def create_table(nvec=1000, ndim=128, nans=0):
@@ -111,11 +112,11 @@ def run(ds, q=None, assert_func=None):
 
 
 def test_flat(dataset):
-    print(run(dataset))
+    run(dataset)
 
 
 def test_ann(indexed_dataset):
-    print(run(indexed_dataset))
+    run(indexed_dataset)
 
 
 def test_ann_append(tmp_path):
@@ -131,7 +132,7 @@ def test_ann_append(tmp_path):
     def func(rs: pa.Table):
         assert rs["vector"][0].as_py() == q
 
-    print(run(dataset, q=np.array(q), assert_func=func))
+    run(dataset, q=np.array(q), assert_func=func)
 
 
 def test_index_with_nans(tmp_path):
@@ -564,7 +565,7 @@ def test_index_cache_size(tmp_path):
     )
 
     query_index(indexed_dataset, 1)
-    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.25)
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.4)
     query_index(indexed_dataset, 128)
     indexed_dataset = lance.LanceDataset(indexed_dataset.uri, index_cache_size=5)
     query_index(indexed_dataset, 128)

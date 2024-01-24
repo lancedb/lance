@@ -27,8 +27,8 @@ use snafu::{location, Location};
 mod field;
 mod schema;
 
-use crate::format::pb;
 use crate::{Error, Result};
+pub use field::Encoding;
 pub use field::Field;
 pub use field::SchemaCompareOptions;
 pub use schema::Schema;
@@ -340,25 +340,6 @@ impl PartialEq for Dictionary {
         match (&self.values, &other.values) {
             (Some(a), Some(b)) => a == b,
             _ => false,
-        }
-    }
-}
-
-impl From<&pb::Dictionary> for Dictionary {
-    fn from(proto: &pb::Dictionary) -> Self {
-        Self {
-            offset: proto.offset as usize,
-            length: proto.length as usize,
-            values: None,
-        }
-    }
-}
-
-impl From<&Dictionary> for pb::Dictionary {
-    fn from(d: &Dictionary) -> Self {
-        Self {
-            offset: d.offset as i64,
-            length: d.length as i64,
         }
     }
 }

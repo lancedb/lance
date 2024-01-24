@@ -16,8 +16,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lance_core::{format::Index, Result};
+use lance_core::Result;
 use lance_index::DatasetIndexExt;
+use lance_table::format::Index;
 use serde::{Deserialize, Serialize};
 
 use crate::index::remap_index;

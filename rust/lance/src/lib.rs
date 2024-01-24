@@ -80,7 +80,7 @@
 //! ```
 //!
 use dataset::builder::DatasetBuilder;
-pub use lance_core::{datatypes, encodings, error, format};
+pub use lance_core::{datatypes, error};
 pub use lance_core::{Error, Result};
 
 pub mod arrow;
@@ -89,6 +89,7 @@ pub mod dataset;
 pub mod index;
 pub mod io;
 pub mod session;
+pub mod table;
 pub mod utils;
 
 pub use dataset::Dataset;

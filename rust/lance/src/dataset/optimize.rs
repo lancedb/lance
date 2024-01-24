@@ -104,10 +104,11 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::format::RowAddress;
 use crate::io::commit::{commit_transaction, migrate_fragments};
+use crate::Dataset;
 use crate::Result;
-use crate::{format::Fragment, Dataset};
+use lance_core::utils::address::RowAddress;
+use lance_table::format::Fragment;
 
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
@@ -736,6 +737,7 @@ async fn reserve_fragment_ids(dataset: &Dataset, fragments: &mut Vec<Fragment>) 
     let manifest = commit_transaction(
         dataset,
         dataset.object_store(),
+        dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),
         &Default::default(),
@@ -899,6 +901,7 @@ pub async fn commit_compaction(
     let manifest = commit_transaction(
         dataset,
         dataset.object_store(),
+        dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),
         &Default::default(),

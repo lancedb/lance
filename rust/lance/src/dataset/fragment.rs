@@ -25,18 +25,16 @@ use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
-use lance_core::format::DeletionFile;
-use lance_core::{
-    datatypes::Schema,
-    io::{
-        deletion::{deletion_file_path, read_deletion_file, write_deletion_file, DeletionVector},
-        object_store::ObjectStore,
-        FileReader, FileWriter, ReadBatchParams,
-    },
-    Error, Result, ROW_ID,
-};
+use lance_core::utils::deletion::DeletionVector;
+use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_datafusion::chunker::chunk_stream;
-use object_store::path::Path;
+use lance_file::reader::FileReader;
+use lance_file::writer::FileWriter;
+use lance_io::object_store::ObjectStore;
+use lance_io::ReadBatchParams;
+use lance_table::format::{DataFile, DeletionFile, Fragment};
+use lance_table::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
+use lance_table::io::manifest::ManifestDescribing;
 use snafu::{location, Location};
 use uuid::Uuid;
 
@@ -47,7 +45,6 @@ use super::write::reader_to_stream;
 use super::WriteParams;
 use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
-use crate::format::Fragment;
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -94,7 +91,7 @@ impl FileFragment {
         let filename = format!("{}.lance", Uuid::new_v4());
         let mut fragment = Fragment::with_file(id as u64, &filename, &schema, None);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
-        let mut writer = FileWriter::try_new(
+        let mut writer = FileWriter::<ManifestDescribing>::try_new(
             &object_store,
             &full_path,
             schema.clone(),
@@ -150,26 +147,12 @@ impl FileFragment {
     /// Parameters
     /// - projection: The projection schema.
     pub async fn open(&self, projection: &Schema) -> Result<FragmentReader> {
-        let full_schema = self.dataset.schema();
-
-        let mut opened_files = vec![];
-        for data_file in self.metadata.files.iter() {
-            let data_file_schema = data_file.schema(full_schema);
-            let schema_per_file = data_file_schema.intersection(projection)?;
-            if !schema_per_file.fields.is_empty() {
-                let path = self.dataset.data_dir().child(data_file.path.as_str());
-                let reader = FileReader::try_new_with_fragment(
-                    &self.dataset.object_store,
-                    &path,
-                    self.id() as u64,
-                    Some(self.dataset.manifest.as_ref()),
-                    Some(&self.dataset.session.file_metadata_cache),
-                )
-                .await?;
-                let initialized_schema = reader.schema().project_by_schema(&schema_per_file)?;
-                opened_files.push((reader, initialized_schema));
-            }
-        }
+        let open_files = self.open_readers(projection);
+        let deletion_vec_load =
+            self.load_deletion_vector(&self.dataset.object_store, &self.metadata);
+        let (opened_files, deletion_vec) = join!(open_files, deletion_vec_load);
+        let opened_files = opened_files?;
+        let deletion_vec = deletion_vec?;
 
         if opened_files.is_empty() {
             return Err(Error::IO {
@@ -182,7 +165,37 @@ impl FileFragment {
             });
         }
 
-        FragmentReader::try_new(self.id(), opened_files)
+        FragmentReader::try_new(self.id(), deletion_vec, opened_files)
+    }
+
+    fn get_field_id_offset(data_file: &DataFile) -> u32 {
+        data_file.fields.first().copied().unwrap_or(0) as u32
+    }
+
+    async fn open_readers(&self, projection: &Schema) -> Result<Vec<(FileReader, Schema)>> {
+        let full_schema = self.dataset.schema();
+
+        let mut opened_files = vec![];
+        for data_file in self.metadata.files.iter() {
+            let data_file_schema = data_file.schema(full_schema);
+            let schema_per_file = data_file_schema.intersection(projection)?;
+            if !schema_per_file.fields.is_empty() {
+                let path = self.dataset.data_dir().child(data_file.path.as_str());
+                let field_id_offset = Self::get_field_id_offset(data_file);
+                let reader = FileReader::try_new_with_fragment_id(
+                    &self.dataset.object_store,
+                    &path,
+                    self.schema().clone(),
+                    self.id() as u32,
+                    field_id_offset,
+                    Some(&self.dataset.session.file_metadata_cache),
+                )
+                .await?;
+                let initialized_schema = reader.schema().project_by_schema(&schema_per_file)?;
+                opened_files.push((reader, initialized_schema));
+            }
+        }
+        Ok(opened_files)
     }
 
     /// Count the rows in this fragment.
@@ -216,6 +229,36 @@ impl FileFragment {
         }
     }
 
+    async fn load_deletion_vector(
+        &self,
+        object_store: &ObjectStore,
+        fragment: &Fragment,
+    ) -> Result<Option<Arc<DeletionVector>>> {
+        if let Some(deletion_file) = &fragment.deletion_file {
+            let path = deletion_file_path(object_store.base_path(), fragment.id, deletion_file);
+
+            let deletion_vector = self
+                .dataset
+                .session
+                .file_metadata_cache
+                .get_or_insert(&path, |_| async {
+                    read_deletion_file(object_store.base_path(), fragment, object_store)
+                        .await?
+                        .ok_or(Error::IO {
+                            message: format!(
+                                "Deletion file {:?} not found in fragment {}",
+                                deletion_file, fragment.id
+                            ),
+                            location: location!(),
+                        })
+                })
+                .await?;
+            Ok(Some(deletion_vector))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Get the number of physical rows in the fragment. This includes deleted rows.
     ///
     /// If there are no deleted rows, this is equal to the number of rows in the
@@ -238,15 +281,14 @@ impl FileFragment {
         }
 
         // Just open any file. All of them should have same size.
-        let path = self
-            .dataset
-            .data_dir()
-            .child(self.metadata.files[0].path.as_str());
-        let reader = FileReader::try_new_with_fragment(
+        let some_file = &self.metadata.files[0];
+        let path = self.dataset.data_dir().child(some_file.path.as_str());
+        let reader = FileReader::try_new_with_fragment_id(
             &self.dataset.object_store,
             &path,
-            self.id() as u64,
-            None,
+            self.schema().clone(),
+            self.id() as u32,
+            Self::get_field_id_offset(some_file),
             Some(&self.dataset.session.file_metadata_cache),
         )
         .await?;
@@ -262,22 +304,27 @@ impl FileFragment {
     /// * `Fragment.physical_rows` matches length of file
     /// * `DeletionFile.num_deleted_rows` matches length of deletion vector
     pub async fn validate(&self) -> Result<()> {
-        let data_file_paths: Vec<Path> = self
+        let get_lengths = self
             .metadata
             .files
             .iter()
-            .map(|data_file| self.dataset.data_dir().child(data_file.path.as_str()))
-            .collect::<Vec<_>>();
-        let get_lengths = data_file_paths.iter().map(|path| {
-            let reader = FileReader::try_new_with_fragment(
-                &self.dataset.object_store,
-                path,
-                self.id() as u64,
-                Some(self.dataset.manifest.as_ref()),
-                Some(&self.dataset.session.file_metadata_cache),
-            );
-            reader.map_ok(|r| r.len())
-        });
+            .map(|data_file| {
+                let path = self.dataset.data_dir().child(data_file.path.as_str());
+                let field_id_offset = Self::get_field_id_offset(data_file);
+                (path, field_id_offset)
+            })
+            .map(|(path, field_id_offset)| async move {
+                let reader = FileReader::try_new_with_fragment_id(
+                    &self.dataset.object_store,
+                    &path,
+                    self.schema().clone(),
+                    self.id() as u32,
+                    field_id_offset,
+                    Some(&self.dataset.session.file_metadata_cache),
+                )
+                .await?;
+                Result::Ok(reader.len())
+            });
         let get_lengths = try_join_all(get_lengths);
 
         let deletion_vector = read_deletion_file(
@@ -290,8 +337,9 @@ impl FileFragment {
 
         let get_lengths = get_lengths?;
         let expected_length = get_lengths.first().unwrap_or(&0);
-        for (length, path) in get_lengths.iter().zip(data_file_paths.into_iter()) {
+        for (length, data_file) in get_lengths.iter().zip(self.metadata.files.iter()) {
             if length != expected_length {
+                let path = self.dataset.data_dir().child(data_file.path.as_str());
                 return Err(Error::corrupt_file(
                     path,
                     format!(
@@ -670,6 +718,9 @@ pub struct FragmentReader {
     /// Readers and schema of each opened data file.
     readers: Vec<(FileReader, Schema)>,
 
+    /// The deleted row IDs
+    deletion_vec: Option<Arc<DeletionVector>>,
+
     /// ID of the fragment
     fragment_id: usize,
 }
@@ -696,7 +747,11 @@ fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
 }
 
 impl FragmentReader {
-    fn try_new(fragment_id: usize, readers: Vec<(FileReader, Schema)>) -> Result<Self> {
+    fn try_new(
+        fragment_id: usize,
+        deletion_vec: Option<Arc<DeletionVector>>,
+        readers: Vec<(FileReader, Schema)>,
+    ) -> Result<Self> {
         if readers.is_empty() {
             return Err(Error::IO {
                 message: "Cannot create FragmentReader with zero readers".to_string(),
@@ -715,6 +770,7 @@ impl FragmentReader {
         }
         Ok(Self {
             readers,
+            deletion_vec,
             fragment_id,
         })
     }
@@ -778,7 +834,12 @@ impl FragmentReader {
         let mut batches = vec![];
         for (reader, schema) in self.readers.iter() {
             let batch = reader
-                .read_batch(batch_id as i32, params.clone(), schema)
+                .read_batch(
+                    batch_id as i32,
+                    params.clone(),
+                    schema,
+                    self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
+                )
                 .await?;
             batches.push(batch);
         }
@@ -801,7 +862,12 @@ impl FragmentReader {
 
             async move {
                 reader
-                    .read_batch(batch_id as i32, params, &projection?)
+                    .read_batch(
+                        batch_id as i32,
+                        params,
+                        &projection?,
+                        self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
+                    )
                     .await
             }
         });
@@ -816,7 +882,13 @@ impl FragmentReader {
         // We need to fix
         let mut batches = vec![];
         for (reader, schema) in self.readers.iter() {
-            let batch = reader.read_range(range.start..range.end, schema).await?;
+            let batch = reader
+                .read_range(
+                    range.start..range.end,
+                    schema,
+                    self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
+                )
+                .await?;
             batches.push(batch);
         }
 
@@ -827,7 +899,13 @@ impl FragmentReader {
     pub async fn take(&self, indices: &[u32]) -> Result<RecordBatch> {
         // Boxed to avoid lifetime issue.
         let stream: BoxStream<_> = futures::stream::iter(&self.readers)
-            .map(|(reader, schema)| reader.take(indices, schema))
+            .map(|(reader, schema)| {
+                reader.take(
+                    indices,
+                    schema,
+                    self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
+                )
+            })
             .buffered(num_cpus::get())
             .boxed();
         let batches: Vec<RecordBatch> = stream.try_collect::<Vec<_>>().await?;
@@ -1091,7 +1169,9 @@ mod tests {
             fragments,
         };
 
-        let new_dataset = Dataset::commit(test_uri, op, None, None).await.unwrap();
+        let new_dataset = Dataset::commit(test_uri, op, None, None, None)
+            .await
+            .unwrap();
 
         assert_eq!(new_dataset.count_rows().await.unwrap(), dataset_rows);
 
@@ -1179,7 +1259,9 @@ mod tests {
                 schema: full_schema.clone(),
             };
 
-            let dataset = Dataset::commit(test_uri, op, None, None).await.unwrap();
+            let dataset = Dataset::commit(test_uri, op, None, None, None)
+                .await
+                .unwrap();
 
             // We only kept the first fragment of 40 rows
             assert_eq!(
@@ -1317,13 +1399,14 @@ mod tests {
         .unwrap();
 
         let (object_store, base_path) = ObjectStore::from_uri(test_uri).await.unwrap();
-        let file_reader = FileReader::try_new_with_fragment(
+        let file_reader = FileReader::try_new_with_fragment_id(
             &object_store,
             &base_path
                 .child("data")
                 .child(fragment.files[0].path.as_str()),
+            schema.as_ref().try_into().unwrap(),
             10,
-            None,
+            0,
             None,
         )
         .await

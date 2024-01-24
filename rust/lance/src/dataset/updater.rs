@@ -15,18 +15,17 @@
 use std::ops::Range;
 
 use arrow_array::{RecordBatch, UInt32Array};
-use lance_core::{
-    datatypes::Schema,
-    io::{deletion::DeletionVector, FileWriter},
-    Error, Result,
-};
+use lance_core::utils::deletion::DeletionVector;
+use lance_core::{datatypes::Schema, Error, Result};
+use lance_file::writer::FileWriter;
+use lance_table::format::Fragment;
+use lance_table::io::manifest::ManifestDescribing;
 use snafu::{location, Location};
 use uuid::Uuid;
 
 use super::fragment::FragmentReader;
 use super::Dataset;
 use crate::dataset::FileFragment;
-use crate::format::Fragment;
 /// Update or insert a new column.
 ///
 /// To use, call [`Updater::next`] to get the next [`RecordBatch`] as input,
@@ -40,7 +39,7 @@ pub struct Updater {
 
     last_input: Option<RecordBatch>,
 
-    writer: Option<FileWriter>,
+    writer: Option<FileWriter<ManifestDescribing>>,
 
     output_schema: Option<Schema>,
 
@@ -98,7 +97,7 @@ impl Updater {
     /// It is the caller's responsibility to close the [`FileWriter`].
     ///
     /// Internal use only.
-    async fn new_writer(&mut self, schema: Schema) -> Result<FileWriter> {
+    async fn new_writer(&mut self, schema: Schema) -> Result<FileWriter<ManifestDescribing>> {
         // Sanity check.
         //
         // To keep it simple, new schema must have no intersection with the existing schema.

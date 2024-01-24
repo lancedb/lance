@@ -31,6 +31,7 @@ import pandas as pd
 import pandas.testing as tm
 import polars as pl
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
@@ -172,6 +173,28 @@ def test_version_id(tmp_path: Path):
 
     assert updated_ds.version == 2
     assert updated_ds.latest_version == 2
+
+
+def test_checkout(tmp_path: Path):
+    tab = pa.table({"a": range(3)})
+    ds1 = lance.write_dataset(tab, tmp_path)
+    ds1.delete("a = 1")
+
+    ds2 = ds1.checkout_version(1)
+
+    assert ds2.version == 1
+    assert ds2.to_table() == tab
+
+    assert ds1.version == 2
+    assert ds1.to_table() == pa.table({"a": [0, 2]})
+
+    with pytest.raises(IOError):
+        ds2.delete("a = 2")
+
+    ds1.delete("a = 2")
+    assert ds1.count_rows() == 1
+
+    assert ds2.checkout_version(ds2.latest_version).version == ds1.version
 
 
 def test_asof_checkout(tmp_path: Path):
@@ -482,14 +505,13 @@ def test_cleanup_old_versions(tmp_path):
     # Ok, can accept timedelta
     dataset.cleanup_old_versions(older_than=timedelta(days=14))
 
-    print(tmp_path)
-    for root, dirnames, filenames in os.walk(tmp_path):
-        for filename in filenames:
-            print(root + "/" + filename)
+    # print(tmp_path)
+    # for root, dirnames, filenames in os.walk(tmp_path):
+    #     for filename in filenames:
+    #         print(root + "/" + filename)
 
     # Now this call will actually delete the old version
     stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
-    print(stats)
     assert stats.bytes_removed > 0
     assert stats.old_versions == 1
 
@@ -626,7 +648,6 @@ def test_deletion_file(tmp_path: Path):
     # New fragment has deletion file
     assert new_fragment.deletion_file() is not None
     assert re.match("_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file())
-    print(type(new_fragment), new_fragment)
     operation = lance.LanceOperation.Overwrite(table.schema, [new_fragment])
     dataset = lance.LanceDataset.commit(base_dir, operation)
     assert dataset.count_rows() == 90
@@ -1047,9 +1068,11 @@ def test_scan_with_row_ids(tmp_path: Path):
 
 
 def test_count_index_rows(tmp_path: Path):
-    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), 32), False)])
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(512 * dims).cast("float32")
     table = pa.Table.from_pydict(
-        {"a": [[float(i) for i in range(32)] for _ in range(512)]}, schema=schema
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
     )
 
     base_dir = tmp_path / "test"

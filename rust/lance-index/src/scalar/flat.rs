@@ -23,7 +23,8 @@ use async_trait::async_trait;
 
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
-use lance_core::{format::RowAddress, Result};
+use lance_core::utils::address::RowAddress;
+use lance_core::Result;
 use roaring::RoaringBitmap;
 
 use crate::{Index, IndexType};

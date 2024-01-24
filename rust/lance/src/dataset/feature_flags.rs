@@ -13,7 +13,8 @@
 // limitations under the License.
 
 // Feature flags
-use crate::format::Manifest;
+
+use lance_table::format::Manifest;
 
 pub const FLAG_DELETION_FILES: u64 = 1;
 

@@ -36,8 +36,9 @@ use datafusion::{
 };
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
-use lance_core::io::ReadBatchParams;
 use lance_core::ROW_ID_FIELD;
+use lance_io::ReadBatchParams;
+use lance_table::format::Fragment;
 use snafu::{location, Location};
 
 use crate::dataset::scanner::{DEFAULT_BATCH_READAHEAD, DEFAULT_FRAGMENT_READAHEAD};
@@ -48,7 +49,6 @@ use crate::{
         ROW_ID,
     },
     datatypes::Schema,
-    format::Fragment,
     Dataset,
 };
 

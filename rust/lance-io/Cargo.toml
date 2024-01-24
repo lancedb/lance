@@ -1,0 +1,49 @@
+[package]
+name = "lance-io"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "I/O utilities for Lance"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lance-arrow.workspace = true
+lance-core.workspace = true
+arrow-arith.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-cast.workspace = true
+arrow-data.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
+async-recursion.workspace = true
+async-trait.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+byteorder.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+lazy_static.workspace = true
+num_cpus.workspace = true
+object_store.workspace = true
+pin-project.workspace = true
+prost.workspace = true
+shellexpand.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+parquet.workspace = true
+rand.workspace = true
+tempfile.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
