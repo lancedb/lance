@@ -78,6 +78,7 @@ def test_simple_predicates(dataset):
         pc.invert(pc.field("int") >= 50),
         pc.is_null(pc.field("int")),
         pc.field("int") + 3 >= 50,
+        pc.is_valid(pc.field("int")),
     ]
     # test simple
     for expr in predicates:
