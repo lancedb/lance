@@ -97,7 +97,7 @@ def cosine_distance(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Cosine pair-wise distances between two 2-D Tensors.
 
-    Cosine distance = 1 - |xy| / ||x|| * ||y||
+    Cosine distance = ``1 - |xy| / ||x|| * ||y||``
 
     Parameters
     ----------

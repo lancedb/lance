@@ -136,8 +136,7 @@ encoded images and return them as :class:`lance.arrow.FixedShapeImageTensorArray
 which they can be converted to numpy arrays or TensorFlow tensors.
 For decoding images, it will first attempt to use a decoder provided via the optional
 function parameter. If decoder is not provided it will attempt to use
-`Pillow <https://pillow.readthedocs.io/en/stable/>`_ and
-`tensorflow <https://www.tensorflow.org/api_docs/python/tf/io/decode_image>`_ in that
+`Pillow`_ and `tensorflow`_ in that
 order. If neither library or custom decoder is available an exception will be raised.
 
 .. testcode::
@@ -183,8 +182,7 @@ created by calling :func:`lance.arrow.ImageArray.from_array` and passing in a
 It can be encoded into to :class:`lance.arrow.EncodedImageArray` by calling
 :func:`lance.arrow.FixedShapeImageTensorArray.to_encoded` and passing custom encoder
 If encoder is not provided it will attempt to use
-`tensorflow <https://www.tensorflow.org/api_docs/python/tf/io/encode_png>`_ and
-`Pillow <https://pillow.readthedocs.io/en/stable/>`_ in that order. Default encoders will
+`tensorflow`_ and `Pillow`_ in that order. Default encoders will
 encode to PNG. If neither library is available it will raise an exception.
 
 .. testcode::
@@ -210,3 +208,7 @@ encode to PNG. If neither library is available it will raise an exception.
     [b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00...']
     <lance.arrow.EncodedImageArray object at 0x00007f8d90b91b40>
     [b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x01...']
+
+
+.. _tensorflow: https://www.tensorflow.org/api_docs/python/tf/io/encode_png
+.. _Pillow: https://pillow.readthedocs.io/en/stable/
