@@ -17,9 +17,8 @@ arrow-ord.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 datafusion-common.workspace = true
-datafusion-expr.workspace = true
 datafusion-physical-expr.workspace = true
 futures.workspace = true
 lance-arrow.workspace = true
-lance-core.workspace = true
+lance-core = { workspace = true, features = ["datafusion"] }
 tokio.workspace = true
