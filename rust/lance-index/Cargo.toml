@@ -23,6 +23,7 @@ datafusion.workspace = true
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
 datafusion-physical-expr.workspace = true
+datafusion-sql.workspace = true
 futures.workspace = true
 half.workspace = true
 lance-arrow.workspace = true

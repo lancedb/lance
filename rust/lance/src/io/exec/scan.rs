@@ -305,9 +305,15 @@ impl ExecutionPlan for LanceScanExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if children.is_empty() {
+            Ok(self)
+        } else {
+            Err(DataFusionError::Internal(
+                "LanceScanExec cannot be assigned children".to_string(),
+            ))
+        }
     }
 
     fn execute(
