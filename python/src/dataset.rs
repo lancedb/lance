@@ -631,11 +631,17 @@ impl Dataset {
     fn merge(
         &mut self,
         reader: PyArrowType<ArrowArrayStreamReader>,
-        left_on: &str,
-        right_on: &str,
+        left_on: String,
+        right_on: String,
     ) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.merge(reader.0, left_on, right_on))?
+        let new_self = RT
+            .spawn(None, async move {
+                new_self
+                    .merge(reader.0, &left_on, &right_on)
+                    .await
+                    .map(|_| new_self)
+            })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
