@@ -85,7 +85,7 @@ pub async fn merge_indices<'a>(
         frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
     });
     unindexed.iter().for_each(|frag| {
-        frag_bitmap.push(frag.id as u32);
+        frag_bitmap.insert(frag.id as u32);
     });
 
     let (new_uuid, indices_merged) = match indices[0].index_type() {
