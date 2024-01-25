@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use arrow::ffi_stream::{export_reader_into_raw, FFI_ArrowArrayStream};
+use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::pyarrow::*;
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{DataType, Field, Schema};
@@ -105,8 +105,7 @@ pub fn reader_to_pyarrow(
     py: Python,
     reader: Box<dyn RecordBatchReader + Send>,
 ) -> PyResult<PyObject> {
-    let mut stream = FFI_ArrowArrayStream::empty();
-    unsafe { export_reader_into_raw(reader, &mut stream) };
+    let mut stream = FFI_ArrowArrayStream::new(reader);
 
     let stream_ptr = (&mut stream) as *mut FFI_ArrowArrayStream;
     let module = py.import("pyarrow")?;
