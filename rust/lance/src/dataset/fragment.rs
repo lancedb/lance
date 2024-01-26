@@ -861,17 +861,32 @@ impl FragmentReader {
             let params = params.clone();
 
             async move {
-                reader
-                    .read_batch(
-                        batch_id as i32,
-                        params,
-                        &projection?,
-                        self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
-                    )
-                    .await
+                // Apply ? inside the task to keep read_tasks a simple iter of futures
+                // for try_join_all
+                let projection = projection?;
+                if projection.fields.is_empty() {
+                    // The projection caused one of the data files to become
+                    // irrelevant and so we can skip it
+                    Result::Ok(None)
+                } else {
+                    Ok(Some(
+                        reader
+                            .read_batch(
+                                batch_id as i32,
+                                params,
+                                &projection,
+                                self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
+                            )
+                            .await?,
+                    ))
+                }
             }
         });
         let batches = try_join_all(read_tasks).await?;
+        let batches = batches
+            .into_iter()
+            .filter_map(|batch| batch)
+            .collect::<Vec<_>>();
         let result = merge_batches(&batches)?;
 
         Ok(result)
