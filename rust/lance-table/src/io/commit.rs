@@ -61,6 +61,7 @@ use lance_io::object_store::ObjectStoreParams;
 #[cfg(feature = "dynamodb")]
 use {
     self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
+    aws_credential_types::cache::CredentialsCache,
     lance_io::object_store::{build_aws_credential, StorageOptions},
     object_store::aws::AmazonS3ConfigKey,
     std::borrow::Cow,
@@ -295,7 +296,10 @@ async fn build_dynamodb_external_store(
 
     let dynamodb_config = aws_sdk_dynamodb::config::Builder::new()
         .region(Some(Region::new(region.to_string())))
-        .credentials_provider(OSObjectStoreToAwsCredAdaptor(creds));
+        .credentials_provider(OSObjectStoreToAwsCredAdaptor(creds))
+        // caching should be handled by passed AwsCredentialProvider
+        .credentials_cache(CredentialsCache::no_caching());
+
     let dynamodb_config = match env::var("DYNAMODB_ENDPOINT") {
         Ok(endpoint) => dynamodb_config.endpoint_url(endpoint),
         _ => dynamodb_config,
