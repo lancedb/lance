@@ -31,7 +31,7 @@ chrono.workspace = true
 futures.workspace = true
 lazy_static.workspace = true
 num_cpus.workspace = true
-object_store.workspace = true
+object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
 pin-project.workspace = true
 prost.workspace = true
 shellexpand.workspace = true

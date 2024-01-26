@@ -561,7 +561,6 @@ impl Planner {
         Ok(datafusion::physical_expr::create_physical_expr(
             expr,
             df_schema.as_ref(),
-            &self.schema,
             &Default::default(),
         )?)
     }

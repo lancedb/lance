@@ -560,7 +560,6 @@ impl Scanner {
             PhysicalGroupBy::new_single(Vec::new()),
             vec![count_expr],
             vec![None],
-            vec![None],
             plan,
             plan_schema,
         )?);
