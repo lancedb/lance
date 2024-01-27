@@ -624,18 +624,31 @@ def test_merge_search(tmp_path: Path):
     right_table = pa.Table.from_pydict({"id": [1, 2, 3], "right": ["A", "B", "C"]})
 
     left_ds = lance.write_dataset(left_table, tmp_path / "left")
+
+    left_orig_data_files = os.listdir(tmp_path / "left" / "data")
+
     right_ds = lance.write_dataset(right_table, tmp_path / "right")
     left_ds.merge(right_ds, "id")
 
     full = left_ds.to_table()
+    full_filtered = left_ds.to_table(filter="id < 3")
+
+    # This is bit of a white-box test so feel free to delete if it
+    # becomes irrelevant.  We want to make sure that the following
+    # operations don't even open the newly merged data file (since
+    # they shouldn't need to because they don't access those
+    # columns).  To do this we just delete those files.
+    for f in os.listdir(tmp_path / "left" / "data"):
+        if f not in left_orig_data_files:
+            os.remove(tmp_path / "left" / "data" / f)
+
     partial = left_ds.to_table(columns=["left"])
 
     assert full.column("left") == partial.column("left")
 
-    full = left_ds.to_table(filter="id < 3")
     partial = left_ds.to_table(columns=["left"], filter="id < 3")
 
-    assert full.column("left") == partial.column("left")
+    assert full_filtered.column("left") == partial.column("left")
 
 
 def test_data_files(tmp_path: Path):
