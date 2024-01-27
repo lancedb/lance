@@ -723,6 +723,9 @@ pub struct FragmentReader {
 
     /// ID of the fragment
     fragment_id: usize,
+
+    /// True if we are reading the row id
+    with_row_id: bool,
 }
 
 impl std::fmt::Display for FragmentReader {
@@ -772,10 +775,12 @@ impl FragmentReader {
             readers,
             deletion_vec,
             fragment_id,
+            with_row_id: false,
         })
     }
 
     pub(crate) fn with_row_id(&mut self) -> &mut Self {
+        self.with_row_id = true;
         self.readers[0].0.with_row_id(true);
         self
     }
@@ -856,37 +861,41 @@ impl FragmentReader {
         params: impl Into<ReadBatchParams> + Clone,
         projection: &Schema,
     ) -> Result<RecordBatch> {
-        let read_tasks = self.readers.iter().map(|(reader, schema)| {
-            let projection = schema.intersection(projection);
-            let params = params.clone();
+        let read_tasks = self
+            .readers
+            .iter()
+            .enumerate()
+            .map(|(reader_idx, (reader, schema))| {
+                let projection = schema.intersection(projection);
+                let params = params.clone();
 
-            async move {
-                // Apply ? inside the task to keep read_tasks a simple iter of futures
-                // for try_join_all
-                let projection = projection?;
-                if projection.fields.is_empty() {
-                    // The projection caused one of the data files to become
-                    // irrelevant and so we can skip it
-                    Result::Ok(None)
-                } else {
-                    Ok(Some(
-                        reader
-                            .read_batch(
-                                batch_id as i32,
-                                params,
-                                &projection,
-                                self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
-                            )
-                            .await?,
-                    ))
+                async move {
+                    // Apply ? inside the task to keep read_tasks a simple iter of futures
+                    // for try_join_all
+                    let projection = projection?;
+                    // We always get the row_id from the first reader and so we need that even
+                    // if the projection is empty
+                    let need_for_row_id = self.with_row_id && reader_idx == 0;
+                    if projection.fields.is_empty() && !need_for_row_id {
+                        // The projection caused one of the data files to become
+                        // irrelevant and so we can skip it
+                        Result::Ok(None)
+                    } else {
+                        Ok(Some(
+                            reader
+                                .read_batch(
+                                    batch_id as i32,
+                                    params,
+                                    &projection,
+                                    self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
+                                )
+                                .await?,
+                        ))
+                    }
                 }
-            }
-        });
+            });
         let batches = try_join_all(read_tasks).await?;
-        let batches = batches
-            .into_iter()
-            .filter_map(|batch| batch)
-            .collect::<Vec<_>>();
+        let batches = batches.into_iter().flatten().collect::<Vec<_>>();
         let result = merge_batches(&batches)?;
 
         Ok(result)
