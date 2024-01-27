@@ -21,7 +21,7 @@ jobs:
       run:
         working-directory: ./integration/duckdb_lance
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install dependencies
         run: |
           sudo apt update
@@ -45,7 +45,7 @@ jobs:
       run:
         working-directory: ./integration/duckdb_lance
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install dependencies
         run: |
           brew install protobuf
