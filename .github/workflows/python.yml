@@ -75,7 +75,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: [ "8", "9", "10", "11" ]
+        python-minor-version: [ "8", "11" ]
     runs-on: "ubuntu-22.04"
     defaults:
       run:
@@ -138,7 +138,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        mac-runner: [ "macos-13", "macos-13-xlarge" ]
+        mac-runner: [ "macos-13-xlarge" ]
     runs-on: "${{ matrix.mac-runner }}"
     defaults:
       run:
@@ -152,7 +152,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.10"
+        python-version: "3.11"
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: python
