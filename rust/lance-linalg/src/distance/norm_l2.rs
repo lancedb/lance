@@ -17,6 +17,9 @@ use std::iter::Sum;
 use half::{bf16, f16};
 use num_traits::{AsPrimitive, Float};
 
+#[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
+use lance_core::utils::cpu::x86::is_avx512_fp16_supported;
+
 use crate::simd::{
     f32::{f32x16, f32x8},
     SIMD,
@@ -45,47 +48,55 @@ mod kernel {
 impl Normalize<f16> for &[f16] {
     // #[inline]
     fn norm_l2(&self) -> f32 {
-        #[cfg(any(
-            all(target_os = "macos", target_feature = "neon"),
-            feature = "avx512fp16"
-        ))]
+        #[cfg(all(target_os = "macos", target_feature = "neon"))]
         unsafe {
             kernel::norm_l2_f16(self.as_ptr(), self.len() as u32)
         }
+
+        #[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
+        if is_avx512_fp16_supported() {
+            unsafe { kernel::norm_l2_f16(self.as_ptr(), self.len() as u32) }
+        } else {
+            norm_l2_f16_impl(self)
+        }
+
         #[cfg(not(any(
             all(target_os = "macos", target_feature = "neon"),
             feature = "avx512fp16"
         )))]
-        {
-            // Please run `cargo bench --bench norm_l2" on Apple Silicon when
-            // change the following code.
-            const LANES: usize = 16;
-            let chunks = self.chunks_exact(LANES);
-            let sum = if chunks.remainder().is_empty() {
-                0.0
-            } else {
-                chunks
-                    .remainder()
-                    .iter()
-                    .map(|v| v.to_f32().powi(2))
-                    .sum::<f32>()
-            };
+        norm_l2_f16_impl(self)
+    }
+}
 
-            let mut sums: [f32; LANES] = [0_f32; LANES];
-            for chk in chunks {
-                // Convert to f32
-                let mut f32_vals: [f32; LANES] = [0_f32; LANES];
-                for i in 0..LANES {
-                    f32_vals[i] = chk[i].to_f32();
-                }
-                // Vectorized multiply
-                for i in 0..LANES {
-                    sums[i] += f32_vals[i].powi(2);
-                }
-            }
-            (sums.iter().copied().sum::<f32>() + sum).sqrt()
+#[inline]
+fn norm_l2_f16_impl(arr: &[f16]) -> f32 {
+    // Please run `cargo bench --bench norm_l2" on Apple Silicon when
+    // change the following code.
+    const LANES: usize = 16;
+    let chunks = arr.chunks_exact(LANES);
+    let sum = if chunks.remainder().is_empty() {
+        0.0
+    } else {
+        chunks
+            .remainder()
+            .iter()
+            .map(|v| v.to_f32().powi(2))
+            .sum::<f32>()
+    };
+
+    let mut sums: [f32; LANES] = [0_f32; LANES];
+    for chk in chunks {
+        // Convert to f32
+        let mut f32_vals: [f32; LANES] = [0_f32; LANES];
+        for i in 0..LANES {
+            f32_vals[i] = chk[i].to_f32();
+        }
+        // Vectorized multiply
+        for i in 0..LANES {
+            sums[i] += f32_vals[i].powi(2);
         }
     }
+    (sums.iter().copied().sum::<f32>() + sum).sqrt()
 }
 
 impl Normalize<bf16> for &[bf16] {

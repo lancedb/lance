@@ -28,6 +28,9 @@ use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 use num_traits::real::Real;
 use num_traits::AsPrimitive;
 
+#[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
+use lance_core::utils::cpu::x86::is_avx512_fp16_supported;
+
 use crate::simd::{
     f32::{f32x16, f32x8},
     SIMD,
@@ -112,13 +115,18 @@ mod kernel {
 impl Dot for Float16Type {
     #[inline]
     fn dot(x: &[f16], y: &[f16]) -> f32 {
-        #[cfg(any(
-            all(target_os = "macos", target_feature = "neon"),
-            all(target_os = "linux", feature = "avx512fp16")
-        ))]
+        #[cfg(all(target_os = "macos", target_feature = "neon"))]
         unsafe {
             kernel::dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
         }
+
+        #[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
+        if is_avx512_fp16_supported() {
+            unsafe { kernel::dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32) }
+        } else {
+            dot_scalar::<f16, 16>(x, y)
+        }
+
         #[cfg(not(any(
             all(target_os = "macos", target_feature = "neon"),
             all(target_os = "linux", feature = "avx512fp16")

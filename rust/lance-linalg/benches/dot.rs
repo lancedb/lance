@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::iter::{repeat_with, Sum};
+use std::time::Duration;
 
 use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
@@ -131,10 +132,18 @@ fn bench_distance(c: &mut Criterion) {
     run_bench::<Float64Type>(c);
 }
 
+fn bench_time() -> Duration {
+    let secs: u64 = option_env!("TARGET_TIME").unwrap_or("5").parse().unwrap();
+    Duration::from_secs(secs)
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
-    config = Criterion::default().significance_level(0.1).sample_size(10)
+    config = Criterion::default()
+        .significance_level(0.1)
+        .sample_size(10)
+        .measurement_time(bench_time())
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_distance);
 
@@ -142,7 +151,7 @@ criterion_group!(
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
-    config = Criterion::default().significance_level(0.1).sample_size(10);
+    config = Criterion::default().significance_level(0.1).sample_size(10).measurement_time(bench_time());
     targets = bench_distance);
 
 criterion_main!(benches);
