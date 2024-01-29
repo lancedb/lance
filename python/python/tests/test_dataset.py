@@ -906,8 +906,8 @@ def test_merge_insert_incompatible_schema(tmp_path: Path):
         }
     )
 
-    # with pytest.raises(OSError):
-    dataset.merge_insert("a").when_matched_update_all().execute(new_table)
+    with pytest.raises(OSError):
+        dataset.merge_insert("a").when_matched_update_all().execute(new_table)
 
 
 def test_merge_insert_vector_column(tmp_path: Path):
