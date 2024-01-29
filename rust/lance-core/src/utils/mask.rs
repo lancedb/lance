@@ -20,6 +20,7 @@ use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use roaring::RoaringBitmap;
 
+use crate::format::RowAddress;
 use crate::Result;
 
 /// A row id mask to select or deselect particular row ids
@@ -376,6 +377,19 @@ impl RowIdTreeMap {
             }
         }
         Ok(Self { inner })
+    }
+
+    pub fn len(&self) -> u64 {
+        self.inner
+            .iter()
+            .map(|(_, chunk)| {
+                if let Some(chunk) = chunk {
+                    chunk.len()
+                } else {
+                    RowAddress::FRAGMENT_SIZE
+                }
+            })
+            .sum()
     }
 }
 

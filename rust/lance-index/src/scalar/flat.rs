@@ -43,6 +43,17 @@ pub struct FlatIndex {
 }
 
 impl FlatIndex {
+    /// Creates a flat index from existing index data
+    ///
+    /// This method is mainly for testing.  Flat indices are normally created
+    /// through training on actual data.
+    ///
+    /// The data must have two columns, the first named values which must be
+    /// ordered and the second named row_ids (which must be u64)
+    pub fn from_existing_data(data: Arc<RecordBatch>) -> Self {
+        Self { data }
+    }
+
     fn values(&self) -> &ArrayRef {
         self.data.column(0)
     }
