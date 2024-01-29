@@ -131,10 +131,7 @@ impl MergeInsertBuilder {
             .when_matched(WhenMatched::DoNothing)
             .when_not_matched(WhenNotMatched::DoNothing);
 
-        Ok(Self {
-            builder: builder,
-            dataset,
-        })
+        Ok(Self { builder, dataset })
     }
 
     pub fn when_matched_update_all(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
