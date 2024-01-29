@@ -853,6 +853,28 @@ def test_merge_insert(tmp_path: Path):
         dataset.merge_insert("a").execute(new_table)
 
 
+def test_merge_insert_source_is_dataset(tmp_path: Path):
+    nrows = 1000
+    table = pa.Table.from_pydict({"a": range(nrows), "b": [1 for _ in range(nrows)]})
+    dataset = lance.write_dataset(
+        table, tmp_path / "dataset", mode="create", max_rows_per_file=100
+    )
+
+    new_table = pa.Table.from_pydict(
+        {"a": range(300, 300 + nrows), "b": [2 for _ in range(nrows)]}
+    )
+    new_dataset = lance.write_dataset(
+        new_table, tmp_path / "dataset2", mode="create", max_rows_per_file=80
+    )
+
+    is_new = pc.field("b") == 2
+
+    dataset.merge_insert("a").when_not_matched_insert_all().execute(new_dataset)
+    table = dataset.to_table()
+    assert table.num_rows == 1300
+    assert table.filter(is_new).num_rows == 300
+
+
 def test_merge_insert_multiple_keys(tmp_path: Path):
     nrows = 1000
     # a - [0, 1, 2, ..., 999]

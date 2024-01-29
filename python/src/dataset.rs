@@ -48,7 +48,7 @@ use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
-use pyo3::exceptions::PyStopIteration;
+use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PySet, PyString};
 use pyo3::{
@@ -165,7 +165,7 @@ impl MergeInsertBuilder {
         let new_data: Box<dyn RecordBatchReader + Send> = if new_data.is_instance_of::<Scanner>() {
             let scanner: Scanner = new_data.extract()?;
             Box::new(
-                RT.block_on(Some(py), scanner.to_reader())?
+                RT.block_on(Some(py), async move { scanner.to_reader().await })?
                     .map_err(|err| PyValueError::new_err(err.to_string()))?,
             )
         } else {
@@ -178,7 +178,7 @@ impl MergeInsertBuilder {
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         let new_self = RT
-            .block_on(None, job.execute_reader(new_data))?
+            .block_on(Some(py), job.execute_reader(new_data))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         let dataset = self.dataset.as_ref(py);
