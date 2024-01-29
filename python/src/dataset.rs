@@ -112,7 +112,7 @@ impl MergeInsertBuilder {
             .map(|val| vec![val.to_string()])
             .or_else(|_| {
                 let iterator = on.iter().map_err(|_| {
-                    PyValueError::new_err(
+                    PyTypeError::new_err(
                         "The `on` argument to merge_insert must be a str or iterable of str",
                     )
                 })?;
