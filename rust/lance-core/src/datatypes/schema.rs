@@ -69,12 +69,16 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
-    pub fn compare_with_options(&self, other: &Self, options: &SchemaCompareOptions) -> bool {
-        self.fields
-            .iter()
-            .zip(&other.fields)
-            .all(|(lhs, rhs)| lhs.compare_with_options(rhs, options))
-            && (!options.compare_metadata || self.metadata == other.metadata)
+    pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
+        if self.fields.len() != expected.fields.len() {
+            false
+        } else {
+            self.fields
+                .iter()
+                .zip(&expected.fields)
+                .all(|(lhs, rhs)| lhs.compare_with_options(rhs, options))
+                && (!options.compare_metadata || self.metadata == expected.metadata)
+        }
     }
 
     pub fn explain_difference(
@@ -411,13 +415,25 @@ impl Schema {
 
     /// Create a new schema by adding fields to the end of this schema
     pub fn extend(&mut self, fields: &[ArrowField]) -> Result<()> {
-        let fields = fields
+        let new_fields = fields
             .iter()
             .map(Field::try_from)
             .collect::<Result<Vec<_>>>()?;
-        self.fields.extend(fields);
-        self.set_field_id();
-        Ok(())
+        self.fields.extend(new_fields);
+        // Validate this addition does not create any duplicate field names
+        let field_names = self.fields.iter().map(|f| &f.name).collect::<HashSet<_>>();
+        if field_names.len() != self.fields.len() {
+            Err(Error::Internal {
+                message: format!(
+                    "Attempt to add fields [{:?}] would lead to duplicate field names",
+                    fields.iter().map(|f| f.name()).collect::<Vec<_>>()
+                ),
+                location: location!(),
+            })
+        } else {
+            self.set_field_id();
+            Ok(())
+        }
     }
 
     /// Merge this schema from the other schema.

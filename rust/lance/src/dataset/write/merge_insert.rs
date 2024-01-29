@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -43,11 +43,12 @@ use datafusion::{
 
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_core::{
+    datatypes::SchemaCompareOptions,
     error::{box_error, InvalidInputSnafu},
-    format::Fragment,
     Error, Result,
 };
 use lance_datafusion::exec::reader_to_stream;
+use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 use snafu::{location, Location, ResultExt};
 
@@ -93,7 +94,7 @@ impl WhenNotMatchedBySource {
             .optimize_expr(expr)
             .map_err(box_error)
             .context(InvalidInputSnafu)?;
-        Ok(WhenNotMatchedBySource::DeleteIf(expr))
+        Ok(Self::DeleteIf(expr))
     }
 }
 
@@ -151,20 +152,23 @@ pub struct MergeInsertJob {
 ///
 /// ```ignore
 /// // find-or-create, insert new rows only
-/// let dataset = MergeInsertBuilder::new(dataset, vec!["my_key"])
+/// let builder = MergeInsertBuilder::new(dataset, vec!["my_key"]);
+/// let dataset = builder
 ///     .build()?
 ///     .execute(new_data)
 ///     .await?;
 ///
 /// // upsert, insert or update
-/// let dataset = MergeInsertBuilder::new(dataset, vec!["my_key"])
+/// let builder = MergeInsertBuilder::new(dataset, vec!["my_key"]);
+/// let dataset = builder
 ///     .when_not_matched(WhenNotMatched::UpdateAll)
 ///     .build()?
 ///     .execute(new_data)
 ///     .await?;
 ///
 /// // replace data for month=january
-/// let dataset = MergeInsertBuilder::new(dataset, vec!["my_key"])
+/// let builder = MergeInsertBuilder::new(dataset, vec!["my_key"]);
+/// let dataset = builder
 ///     .when_not_matched(WhenNotMatched::UpdateAll)
 ///     .when_not_matched_by_source(
 ///         WhenNotMatchedBySource::DeleteIf(month_eq_jan)
@@ -208,7 +212,7 @@ impl MergeInsertBuilder {
     }
 
     /// Specify what should happen when a target row matches a row in the source
-    pub fn when_matched(mut self, behavior: WhenMatched) -> Self {
+    pub fn when_matched(&mut self, behavior: WhenMatched) -> &mut Self {
         self.params.update_matched = match behavior {
             WhenMatched::DoNothing => false,
             WhenMatched::UpdateAll => true,
@@ -219,7 +223,7 @@ impl MergeInsertBuilder {
     /// Specify what should happen when a source row has no match in the target
     ///
     /// These are typically "new rows"
-    pub fn when_not_matched(mut self, behavior: WhenNotMatched) -> Self {
+    pub fn when_not_matched(&mut self, behavior: WhenNotMatched) -> &mut Self {
         self.params.insert_not_matched = match behavior {
             WhenNotMatched::DoNothing => false,
             WhenNotMatched::InsertAll => true,
@@ -230,7 +234,7 @@ impl MergeInsertBuilder {
     /// Specify what should happen when a target row has no match in the source
     ///
     /// These are typically "old rows"
-    pub fn when_not_matched_by_source(mut self, behavior: WhenNotMatchedBySource) -> Self {
+    pub fn when_not_matched_by_source(&mut self, behavior: WhenNotMatchedBySource) -> &mut Self {
         self.params.delete_not_matched_by_source = behavior;
         self
     }
@@ -264,11 +268,13 @@ impl MergeInsertJob {
 
     fn check_compatible_schema(&self, schema: &Schema) -> Result<()> {
         let lance_schema: lance_core::datatypes::Schema = schema.try_into()?;
-        if *self.dataset.schema() == lance_schema {
-            Ok(())
-        } else {
-            Err(Error::invalid_input("The new data inserted during a merge insert operation must have the same schema as the dataset", location!()))
-        }
+        lance_schema.check_compatible(
+            self.dataset.schema(),
+            &SchemaCompareOptions {
+                compare_dictionary: true,
+                ..Default::default()
+            },
+        )
     }
 
     /// Executes the merge insert job
@@ -387,6 +393,7 @@ impl MergeInsertJob {
         let manifest = commit_transaction(
             dataset.as_ref(),
             dataset.object_store(),
+            dataset.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
@@ -403,7 +410,7 @@ impl MergeInsertJob {
 // A sync-safe structure that is shared by all of the "process batch" tasks.
 //
 // Note: we are not currently using parallelism but this still needs to be sync because it is
-//       held across an await boundary (and we might user parallelism someday)
+//       held across an await boundary (and we might use parallelism someday)
 #[derive(Debug, Clone)]
 struct Merger {
     // As the merger runs it will update the list of deleted rows
@@ -477,8 +484,8 @@ impl Merger {
         right_offset: usize,
         num_keys: usize,
     ) -> Result<(BooleanArray, BooleanArray, BooleanArray)> {
-        let in_left = Self::not_all_null(&combined_batch, 0, num_keys)?;
-        let in_right = Self::not_all_null(&combined_batch, right_offset, num_keys)?;
+        let in_left = Self::not_all_null(combined_batch, 0, num_keys)?;
+        let in_right = Self::not_all_null(combined_batch, right_offset, num_keys)?;
         let in_both = arrow::compute::and(&in_left, &in_right)?;
         let left_only = arrow::compute::and(&in_left, &arrow::compute::not(&in_right)?)?;
         let right_only = arrow::compute::and(&arrow::compute::not(&in_left)?, &in_right)?;
@@ -578,7 +585,7 @@ mod tests {
         keys_from_right: &[u32],
     ) {
         let mut dataset = (*job.dataset).clone();
-        dataset.restore(None).await.unwrap();
+        dataset.restore().await.unwrap();
         job.dataset = Arc::new(dataset);
 
         let schema = new_data.schema();

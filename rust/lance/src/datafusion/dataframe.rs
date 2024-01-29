@@ -117,6 +117,9 @@ impl TableProvider for LanceTableProvider {
         scan.create_plan().await.map_err(DataFusionError::from)
     }
 
+    // Since we are using datafusion itself to apply the filters it should
+    // be safe to assume that we can exactly apply any of the given pushdown
+    // filters.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],

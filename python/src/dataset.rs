@@ -50,7 +50,7 @@ use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PySet};
+use pyo3::types::{PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
@@ -96,16 +96,8 @@ fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
 
 #[pyclass(name = "_MergeInsertBuilder", module = "_lib", subclass)]
 pub struct MergeInsertBuilder {
-    builder: Option<LanceMergeInsertBuilder>,
+    builder: LanceMergeInsertBuilder,
     dataset: Py<Dataset>,
-}
-
-impl MergeInsertBuilder {
-    fn take_builder(&mut self) -> PyResult<LanceMergeInsertBuilder> {
-        self.builder
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("the MergeInsertBuilder can only be used once"))
-    }
 }
 
 #[pymethods]
@@ -119,12 +111,11 @@ impl MergeInsertBuilder {
         let on = PyAny::downcast::<PyString>(on)
             .map(|val| vec![val.to_string()])
             .or_else(|_| {
-                let iterator = on.call_method0("__iter__").map_err(|_| {
+                let iterator = on.iter().map_err(|_| {
                     PyValueError::new_err(
                         "The `on` argument to merge_insert must be a str or iterable of str",
                     )
                 })?;
-                let iterator = iterator.downcast::<PyIterator>()?;
                 let mut keys = Vec::new();
                 for key in iterator {
                     keys.push(PyAny::downcast::<PyString>(key?)?.to_string());
@@ -136,27 +127,23 @@ impl MergeInsertBuilder {
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         // We don't have do_nothing methods in python so we start with a blank slate
-        builder = builder
+        builder
             .when_matched(WhenMatched::DoNothing)
             .when_not_matched(WhenNotMatched::DoNothing);
 
         Ok(Self {
-            builder: Some(builder),
+            builder: builder,
             dataset,
         })
     }
 
     pub fn when_matched_update_all(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
-        let old_val = slf.take_builder()?;
-        slf.builder
-            .replace(old_val.when_matched(WhenMatched::UpdateAll));
+        slf.builder.when_matched(WhenMatched::UpdateAll);
         Ok(slf)
     }
 
     pub fn when_not_matched_insert_all(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
-        let old_val = slf.take_builder()?;
-        slf.builder
-            .replace(old_val.when_not_matched(WhenNotMatched::InsertAll));
+        slf.builder.when_not_matched(WhenNotMatched::InsertAll);
         Ok(slf)
     }
 
@@ -171,10 +158,7 @@ impl MergeInsertBuilder {
         } else {
             WhenNotMatchedBySource::Delete
         };
-
-        let old_val = slf.take_builder()?;
-        slf.builder
-            .replace(old_val.when_not_matched_by_source(new_val));
+        slf.builder.when_not_matched_by_source(new_val);
         Ok(slf)
     }
 
@@ -192,7 +176,7 @@ impl MergeInsertBuilder {
         };
 
         let job = self
-            .take_builder()?
+            .builder
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
