@@ -108,7 +108,7 @@ const AWS_CREDS_CACHE_KEY: &str = "aws_credentials";
 
 /// Adapt an AWS SDK cred into object_store credentials
 #[derive(Debug)]
-struct AwsCredentialAdapter {
+pub struct AwsCredentialAdapter {
     pub inner: Arc<dyn ProvideCredentials>,
 
     // RefCell can't be shared accross threads, so we use HashMap
@@ -119,7 +119,10 @@ struct AwsCredentialAdapter {
 }
 
 impl AwsCredentialAdapter {
-    fn new(provider: Arc<dyn ProvideCredentials>, credentials_refresh_offset: Duration) -> Self {
+    pub fn new(
+        provider: Arc<dyn ProvideCredentials>,
+        credentials_refresh_offset: Duration,
+    ) -> Self {
         Self {
             inner: provider,
             cache: Arc::new(RwLock::new(HashMap::new())),
