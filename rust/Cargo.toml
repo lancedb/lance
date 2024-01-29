@@ -16,7 +16,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.9"
+version = "0.9.10"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -39,18 +39,18 @@ categories = [
 rust-version = "1.75"
 
 [workspace.dependencies]
-lance = { version = "=0.9.9", path = "./lance" }
-lance-arrow = { version = "=0.9.9", path = "./lance-arrow" }
-lance-core = { version = "=0.9.9", path = "./lance-core" }
-lance-datafusion = { version = "=0.9.9", path = "./lance-datafusion" }
-lance-datagen = { version = "=0.9.9", path = "./lance-datagen" }
-lance-file = { version = "=0.9.9", path = "./lance-file" }
-lance-index = { version = "=0.9.9", path = "./lance-index" }
-lance-io = { version = "=0.9.9", path = "./lance-io" }
-lance-linalg = { version = "=0.9.9", path = "./lance-linalg" }
-lance-table = { version = "=0.9.9", path = "./lance-table" }
-lance-test-macros = { version = "=0.9.9", path = "./lance-test-macros" }
-lance-testing = { version = "=0.9.9", path = "./lance-testing" }
+lance = { version = "=0.9.10", path = "./lance" }
+lance-arrow = { version = "=0.9.10", path = "./lance-arrow" }
+lance-core = { version = "=0.9.10", path = "./lance-core" }
+lance-datafusion = { version = "=0.9.10", path = "./lance-datafusion" }
+lance-datagen = { version = "=0.9.10", path = "./lance-datagen" }
+lance-file = { version = "=0.9.10", path = "./lance-file" }
+lance-index = { version = "=0.9.10", path = "./lance-index" }
+lance-io = { version = "=0.9.10", path = "./lance-io" }
+lance-linalg = { version = "=0.9.10", path = "./lance-linalg" }
+lance-table = { version = "=0.9.10", path = "./lance-table" }
+lance-test-macros = { version = "=0.9.10", path = "./lance-test-macros" }
+lance-testing = { version = "=0.9.10", path = "./lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "50.0.0", optional = false, features = ["prettyprint"] }

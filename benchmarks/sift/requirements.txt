@@ -1,3 +1,5 @@
 torch
 tdqm
 pylance
+pandas
+ml_dtypes

@@ -619,6 +619,27 @@ def test_merge_with_commit(tmp_path: Path):
     assert tbl == expected
 
 
+def test_merge_search(tmp_path: Path):
+    left_table = pa.Table.from_pydict({"id": [1, 2, 3], "left": ["a", "b", "c"]})
+    right_table = pa.Table.from_pydict({"id": [1, 2, 3], "right": ["A", "B", "C"]})
+
+    left_ds = lance.write_dataset(left_table, tmp_path / "left")
+
+    right_ds = lance.write_dataset(right_table, tmp_path / "right")
+    left_ds.merge(right_ds, "id")
+
+    full = left_ds.to_table()
+    full_filtered = left_ds.to_table(filter="id < 3")
+
+    partial = left_ds.to_table(columns=["left"])
+
+    assert full.column("left") == partial.column("left")
+
+    partial = left_ds.to_table(columns=["left"], filter="id < 3")
+
+    assert full_filtered.column("left") == partial.column("left")
+
+
 def test_data_files(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

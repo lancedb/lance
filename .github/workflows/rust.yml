@@ -36,7 +36,7 @@ jobs:
       run:
         working-directory: ./rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -65,7 +65,7 @@ jobs:
       run:
         working-directory: ./rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -86,7 +86,7 @@ jobs:
       run:
         working-directory: ./rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -99,14 +99,14 @@ jobs:
   mac-build:
     strategy:
       matrix:
-        mac-runner: [ "macos-13", "macos-13-xlarge" ]
+        mac-runner: [ "macos-13-xlarge" ]
     runs-on: "${{ matrix.mac-runner }}"
     timeout-minutes: 45
     defaults:
       run:
         working-directory: ./rust/lance
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: CPU features
         run: sysctl -a | grep cpu
       - uses: Swatinem/rust-cache@v2
@@ -124,7 +124,7 @@ jobs:
       run:
         working-directory: rust/lance
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
