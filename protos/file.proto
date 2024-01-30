@@ -21,36 +21,50 @@ syntax = "proto3";
 package lance.file;
 
 // Lance v2 File Format
-// 
-// +------------------------------+
-// | Page 0, Buffer 0             |
-// | ...                          |
-// | Page 0, Buffer N             |
-// | (optional padding)           |
-// | Page 1, Buffer 0             |
-// | ...                          |
-// | Page N2, Buffer N3           |
-// | Column 0 Metadata            |
-// | Column 0 Metadata Buffer 0   |
-// | ...                          |
-// | Column 0 Metadata Buffer N4  |
-// | (optional padding)           |
-// | Column 1 Metadata            |
-// | ...                          |
-// | Column N5 Metadata Buffer N6 |
-// | (optional padding)           |
-// | Column 0 Metadata Position   |
-// | Column 0 Metadata Size       |
-// | ...                          |
-// | Column N5 Metadata Position  |
-// | Column N5 Metadata Size      |
-// | FileDescriptor (optional)    |
-// | Metadata                     |
-// | i64: Metadata position       |
-// | u16: Major version           |
-// | u16: Minor version           |
-// | "LANC"                       |
-// +------------------------------+
+//
+// Note: the number of pages (PN) is independent of the
+//       number of columns (CN) and each page/column can
+//       have any number of buffers (Px_N)/(Cx_N) which
+//       is determined by the encodings.
+//
+// ├────────────────────────────────┤
+// | Data Pages                     |
+// |   Page 0, Buffer 0             |
+// |   ...                          |
+// |   Page 0, Buffer P0_N          |
+// |   (optional padding)           |
+// |   Page 1, Buffer 0             |
+// |   ...                          |
+// |   Page PN, Buffer PN_N         |
+// ├────────────────────────────────┤
+// | Column Metadatas               |
+// |   Column 0 Metadata            |
+// |   Column 0 Meta Buffer 0       |
+// |   ...                          |
+// |   Column 0 Meta Buffer C0_N    |
+// |   (optional padding)           |
+// |   Column 1 Metadata            |
+// |   ...                          |
+// |   Column CN Meta Buffer CN_N   |
+// |   (optional padding)           |
+// ├────────────────────────────────┤
+// | Column Metadata Offset Table   |
+// |   Column 0 Metadata Position   |
+// |   Column 0 Metadata Size       |
+// |   ...                          |
+// |   Column CN Metadata Position  |
+// |   Column CN Metadata Size      |
+// ├────────────────────────────────┤
+// | FileDescriptor                 |
+// ├────────────────────────────────┤
+// | Metadata                       |
+// ├────────────────────────────────┤
+// | Footer                         |
+// |   i64: Metadata position       |
+// |   u16: Major version           |
+// |   u16: Minor version           |
+// |   "LANC"                       |
+// ├────────────────────────────────┤
 //
 // Note that (optional padding) indicates that a writer may insert padding bytes between
 // pages or column metadata blocks to align these to disk sector boundaries.  Readers
@@ -109,7 +123,7 @@ message ValueEncoding {
 //  * Validity - A boolean array representing whether each value is null or not
 message MaskedEncoding {
   // The encoding used to store the values
-  Encoding value_encoding = 1;
+  EncodingType value_encoding = 1;
   // The encoding used to store the validity
   EncodingType validity_encoding = 2;
 }
@@ -140,8 +154,6 @@ message DictionaryEncoding {
 message VariableLengthEncoding {
   // The number of bits in each offset
   uint32 offset_width = 1;
-  // If true, then lists with length 0 should be considered null values
-  bool empty_is_null = 2;
   // The encoding used to encode the offsets
   EncodingType offset_encoding = 3;
   // The encoding used to encode the values
@@ -180,16 +192,13 @@ message ColumnMetadata {
     // This field will have the same length as `buffer_offsets` and
     // may be empty.
     repeated uint64 buffer_sizes = 2;
-    // The file offset to the start of the page data
-    uint64 offset = 3;
-    // The size (in bytes) of the page data
-    uint64 size = 4;
     // Logical length (e.g. # rows) of the page
-    uint32 length = 5;
+    uint32 length = 3;
     // The top-level node of the encoding tree used to encode the page
-    EncodingType encoding = 6;
+    EncodingType encoding = 4;
   }
   repeated Page pages = 1;
+  ColumnStatistics statistics = 2;
   
   // Statistics store the min/max/nulls/... statistics of a page.
   // There is an array for each statistic.  The logical length of the
@@ -216,15 +225,13 @@ message Metadata {
   // In Lance version 1 this is a protobuf-encoded Manifest message from the table
   // format.
   //
-  // In Lance version 2 this is a FileDescriptor message
+  // In Lance version 2 this is a FileDescriptor message and, for consistency and
+  // simplicity this message should always be present.  If the schema is cached or
+  // stored externally then the reader is free to skip reading this.
   //
   // This message is immediately followed by the metadata block.  Therefore, the
   // size of this block can be calculated by subtracting this value from the 
   // metadata offset (that was used to read this message)
-  //
-  // This message is optional.  If a file is not self-describing then this must
-  // point to the start of the metadata block (e.g. representing a manifest with
-  // size 0)
   uint64 manifest_position = 1;
 
   // Logical offsets of each chunk group, i.e., number of the rows in each
@@ -312,8 +319,16 @@ message Metadata {
   // The size of the metadata for column x is given by the uint64:
   //   file[column_offsets_pos + (16 * x) + 8]
   //
-  // This field is ignored in a Lance version 1 file (the page table is used instead)
+  // This field is ignored in Lance version 1 files (the page table is used instead)
   uint32 num_columns = 6;
+  // The start of the column metadata section
+  //
+  // If column projection is not needed, or if the goal is to cache all column
+  // metadata, then this field can be used to quickly load the entire column metadata
+  // section in a single read without referring to the column metadata offsets array
+  //
+  // This field is ignored in Lance version 1 files
+  uint64 column_metadata_start = 7;
 } // Metadata
 
 // Supported encodings.
