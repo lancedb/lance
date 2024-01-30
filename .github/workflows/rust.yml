@@ -97,10 +97,7 @@ jobs:
       - name: Run clippy
         run: cargo clippy --features cli,dynamodb,tensorflow,dynamodb_tests --tests --benches -- -D warnings
   mac-build:
-    strategy:
-      matrix:
-        mac-runner: [ "macos-13-xlarge" ]
-    runs-on: "${{ matrix.mac-runner }}"
+    runs-on: "macos-14"
     timeout-minutes: 45
     defaults:
       run:
