@@ -150,9 +150,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
         rank: Optional[int] = None,
         world_size: Optional[int] = None,
         shard_granularity: Optional[Literal["fragment", "batch"]] = "fragment",
-        to_tensor_fn: callable[
-            [pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]
-        ] = _to_tensor,
+        to_tensor_fn: Optional[
+            callable[[pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]]
+        ] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -162,12 +162,14 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.samples: Optional[int] = samples
         self.filter = filter
         self.with_row_id = with_row_id
+        if to_tensor_fn is None:
+            to_tensor_fn = _to_tensor
+        self._to_tensor_fn = to_tensor_fn
 
         # As Shared Dataset
         self.rank = rank
         self.world_size = world_size
         self.shard_granularity = shard_granularity
-        self._to_tensor_fn = to_tensor_fn
 
         if samples is not None and filter is not None:
             raise ValueError("Does not support sampling over filtered dataset")
