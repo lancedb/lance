@@ -2,9 +2,7 @@
 name = "pylance"
 dependencies = ["pyarrow>=12", "numpy>=1.22"]
 description = "python wrapper for Lance columnar format"
-authors = [
-    { name = "Lance Devs", email = "dev@lancedb.com" },
-]
+authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
 license = { file = "LICENSE" }
 repository = "https://github.com/eto-ai/lance"
 readme = "README.md"
@@ -48,20 +46,17 @@ build-backend = "maturin"
 
 [project.optional-dependencies]
 tests = [
-    "pandas",
-    "pytest",
+    "datasets",
     "duckdb",
     "ml_dtypes",
+    "pandas",
     "polars[pyarrow,pandas]",
+    "pytest",
     "tensorflow",
     "tqdm",
 ]
-benchmarks = [
-    "pytest-benchmark",
-]
-torch = [
-    "torch",
-]
+benchmarks = ["pytest-benchmark"]
+torch = ["torch"]
 
 [tool.ruff]
 select = ["F", "E", "W", "I", "G", "TCH", "PERF", "CPY001"]
