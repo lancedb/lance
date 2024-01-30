@@ -18,7 +18,7 @@ use half::{bf16, f16};
 use num_traits::{AsPrimitive, Float};
 
 #[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
-use lance_core::utils::cpu::x86::is_avx512_fp16_supported;
+use lance_core::utils::cpu::x86::AVX512_F16_SUPPORTED;
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -54,7 +54,7 @@ impl Normalize<f16> for &[f16] {
         }
 
         #[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
-        if is_avx512_fp16_supported() {
+        if *AVX512_F16_SUPPORTED {
             unsafe { kernel::norm_l2_f16(self.as_ptr(), self.len() as u32) }
         } else {
             norm_l2_f16_impl(self)

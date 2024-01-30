@@ -16,36 +16,27 @@
 pub mod x86 {
     use core::arch::x86_64::__cpuid;
 
+    use lazy_static::lazy_static;
+
     #[inline]
     fn check_flag(x: usize, position: u32) -> bool {
         x & (1 << position) != 0
     }
 
-    /// Runtime check for whether avx512-fp16 is enabled
-    pub fn is_avx512_fp16_supported() -> bool {
-        // cache value so we don't perform the check every time ..
-        static mut CACHED_RESULT: Option<bool> = None;
-        unsafe {
-            if let Some(cached_result) = CACHED_RESULT {
-                return cached_result;
+    lazy_static!{
+        pub static ref AVX512_F16_SUPPORTED: bool = {
+                    // this macro does many OS checks/etc. to determine if allowed to use AVX512
+            if !is_x86_feature_detected!("avx512f") {
+                return false;
             }
-        }
 
-        // this macro does many OS checks/etc. to determine if allowed to use AVX512
-        if !is_x86_feature_detected!("avx512f") {
-            return false;
-        }
+            // EAX=7, ECX=0: Extended Features (includes AVX512)
+            // More info on calling CPUID can be found here (section 1.4)
+            // https://www.intel.com/content/dam/develop/external/us/en/documents/architecture-instruction-set-extensions-programming-reference.pdf
+            let ext_cpuid_result = unsafe { __cpuid(7) };
+            let avx512_fp16 = check_flag(ext_cpuid_result.edx as usize, 23);
 
-        // EAX=7, ECX=0: Extended Features (includes AVX512)
-        // More info on calling CPUID can be found here (section 1.4)
-        // https://www.intel.com/content/dam/develop/external/us/en/documents/architecture-instruction-set-extensions-programming-reference.pdf
-        let ext_cpuid_result = unsafe { __cpuid(7) };
-        let avx512_fp16 = check_flag(ext_cpuid_result.edx as usize, 23);
-
-        unsafe {
-            CACHED_RESULT = Some(avx512_fp16);
-        }
-
-        avx512_fp16
+            avx512_fp16 
+        };
     }
 }

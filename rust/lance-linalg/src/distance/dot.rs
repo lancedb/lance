@@ -29,7 +29,7 @@ use num_traits::real::Real;
 use num_traits::AsPrimitive;
 
 #[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
-use lance_core::utils::cpu::x86::is_avx512_fp16_supported;
+use lance_core::utils::cpu::x86::AVX512_F16_SUPPORTED;
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -121,7 +121,7 @@ impl Dot for Float16Type {
         }
 
         #[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
-        if is_avx512_fp16_supported() {
+        if *AVX512_F16_SUPPORTED {
             unsafe { kernel::dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32) }
         } else {
             dot_scalar::<f16, 16>(x, y)
