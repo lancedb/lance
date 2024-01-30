@@ -34,6 +34,7 @@ _NUMPY_AVAILABLE = True
 _PANDAS_AVAILABLE = True
 _POLARS_AVAILABLE = True
 _TORCH_AVAILABLE = True
+_HUGGING_FACE_AVAILABLE = True
 
 
 class _LazyModule(ModuleType):
@@ -164,6 +165,7 @@ def _lazy_import(module_name: str) -> tuple[ModuleType, bool]:
 
 
 if TYPE_CHECKING:
+    import datasets
     import numpy
     import pandas
     import polars
@@ -174,6 +176,7 @@ else:
     pandas, _PANDAS_AVAILABLE = _lazy_import("pandas")
     polars, _POLARS_AVAILABLE = _lazy_import("polars")
     torch, _TORCH_AVAILABLE = _lazy_import("torch")
+    datasets, _HUGGING_FACE_AVAILABLE = _lazy_import("datasets")
 
 
 @lru_cache(maxsize=None)
@@ -210,6 +213,12 @@ def _check_for_torch(obj: Any, *, check_type: bool = True) -> bool:
     )
 
 
+def _check_for_hugging_face(obj: Any, *, check_type: bool = True) -> bool:
+    return _HUGGING_FACE_AVAILABLE and _might_be(
+        cast(Hashable, type(obj) if check_type else obj), "datasets"
+    )
+
+
 __all__ = [
     # lazy-load third party libs
     "numpy",
@@ -221,10 +230,12 @@ __all__ = [
     "_check_for_pandas",
     "_check_for_polars",
     "_check_for_torch",
+    "_check_for_hugging_face",
     "_LazyModule",
     # exported flags/guards
     "_NUMPY_AVAILABLE",
     "_PANDAS_AVAILABLE",
     "_POLARS_AVAILABLE",
     "_TORCH_AVAILABLE",
+    "_HUGGING_FACE_AVAILABLE",
 ]
