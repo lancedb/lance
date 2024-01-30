@@ -141,7 +141,7 @@ class ShardedBatchIterator:
                 total,
                 self._world_size * self._batch_size,
             ):
-                yield start, max(start + self._batch_size, total)
+                yield start, min(start + self._batch_size, total)
 
         return self._ds._ds.take_scan(
             _gen_ranges(),

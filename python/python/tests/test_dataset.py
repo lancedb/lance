@@ -1426,7 +1426,7 @@ def test_sharded_iterator_non_full_batch(tmp_path: Path):
     shard_datast = ShardedBatchIterator(
         ds,
         1,
-        4,
+        2,
         columns=["a"],
         batch_size=100,
         granularity="batch",
