@@ -69,6 +69,10 @@ impl Normalize<f16> for &[f16] {
 }
 
 #[inline]
+#[cfg(not(any(
+    all(target_os = "macos", target_feature = "neon"),
+    feature = "avx512fp16"
+)))]
 fn norm_l2_f16_impl(arr: &[f16]) -> f32 {
     // Please run `cargo bench --bench norm_l2" on Apple Silicon when
     // change the following code.
