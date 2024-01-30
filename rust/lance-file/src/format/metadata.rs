@@ -60,6 +60,7 @@ impl From<&Metadata> for pb::Metadata {
             manifest_position: m.manifest_position.unwrap_or(0) as u64,
             statistics,
             num_columns: 0,
+            column_metadata_start: 0,
         }
     }
 }
