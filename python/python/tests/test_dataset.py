@@ -1416,3 +1416,22 @@ def test_sharded_iterator_batches(tmp_path: Path):
             for j in range(i, i + BATCH_SIZE)
         ]
     )
+
+
+def test_sharded_iterator_non_full_batch(tmp_path: Path):
+    arr = pa.array(range(1186))
+    tbl = pa.table({"a": arr})
+
+    ds = lance.write_dataset(tbl, tmp_path)
+    shard_datast = ShardedBatchIterator(
+        ds,
+        1,
+        4,
+        columns=["a"],
+        batch_size=100,
+        granularity="batch",
+    )
+    batches = pa.concat_arrays([b["a"] for b in shard_datast])
+
+    # Can read partial batches
+    assert len(set(range(1100, 1186)) - set(batches.to_pylist())) == 0
