@@ -23,7 +23,6 @@ import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from functools import lru_cache
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -114,9 +113,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._uri
 
-    @lru_cache(maxsize=None)
     def list_indices(self) -> List[Dict[str, Any]]:
-        return self._ds.load_indices()
+        if getattr(self, "_list_indices_res", None) is None:
+            self._list_indices_res = self._ds.load_indices()
+        return self._list_indices_res
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
