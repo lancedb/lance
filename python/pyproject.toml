@@ -49,6 +49,7 @@ tests = [
     "datasets",
     "duckdb",
     "ml_dtypes",
+	"pillow",
     "pandas",
     "polars[pyarrow,pandas]",
     "pytest",
