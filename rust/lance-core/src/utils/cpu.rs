@@ -34,9 +34,7 @@ pub mod x86 {
             // More info on calling CPUID can be found here (section 1.4)
             // https://www.intel.com/content/dam/develop/external/us/en/documents/architecture-instruction-set-extensions-programming-reference.pdf
             let ext_cpuid_result = unsafe { __cpuid(7) };
-            let avx512_fp16 = check_flag(ext_cpuid_result.edx as usize, 23);
-
-            avx512_fp16
+            check_flag(ext_cpuid_result.edx as usize, 23)
         };
     }
 }
