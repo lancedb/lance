@@ -12,7 +12,7 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
-  
+
 jobs:
   Linux:
     runs-on: ubuntu-22.04
@@ -39,7 +39,7 @@ jobs:
       #     path: integration/duckdb/build/lance.duckdb_extension
       #     retention-days: 1
   MacOS:
-    runs-on: macos-13
+    runs-on: macos-14
     timeout-minutes: 40
     defaults:
       run:
