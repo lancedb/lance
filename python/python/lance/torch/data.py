@@ -150,6 +150,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
         rank: Optional[int] = None,
         world_size: Optional[int] = None,
         shard_granularity: Optional[Literal["fragment", "batch"]] = "fragment",
+        to_tensor_fn: callable[
+            [pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]
+        ] = _to_tensor,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -164,6 +167,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self.shard_granularity = shard_granularity
+        self._to_tensor_fn = to_tensor_fn
 
         if samples is not None and filter is not None:
             raise ValueError("Does not support sampling over filtered dataset")
@@ -217,5 +221,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 stream = self.cached_ds
 
         for batch in stream:
-            yield _to_tensor(batch)
+            if self._to_tensor_fn is not None:
+                batch = self._to_tensor_fn(batch)
+            yield batch
             del batch
