@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod address;
+pub mod cpu;
 pub mod deletion;
 pub mod mask;
 pub mod testing;
