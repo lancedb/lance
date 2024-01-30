@@ -23,7 +23,7 @@ pub mod x86 {
         x & (1 << position) != 0
     }
 
-    lazy_static!{
+    lazy_static! {
         pub static ref AVX512_F16_SUPPORTED: bool = {
                     // this macro does many OS checks/etc. to determine if allowed to use AVX512
             if !is_x86_feature_detected!("avx512f") {
@@ -36,7 +36,7 @@ pub mod x86 {
             let ext_cpuid_result = unsafe { __cpuid(7) };
             let avx512_fp16 = check_flag(ext_cpuid_result.edx as usize, 23);
 
-            avx512_fp16 
+            avx512_fp16
         };
     }
 }
