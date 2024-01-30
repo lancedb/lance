@@ -404,7 +404,10 @@ def test_pickle(tmp_path: Path):
 
 
 def test_polar_scan(tmp_path: Path):
-    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    some_structs = [{"x": counter, "y": counter} for counter in range(100)]
+    table = pa.Table.from_pydict(
+        {"a": range(100), "b": range(100), "struct": some_structs}
+    )
     base_dir = tmp_path / "test"
     lance.write_dataset(table, base_dir)
 
@@ -412,6 +415,32 @@ def test_polar_scan(tmp_path: Path):
     polars_df = pl.scan_pyarrow_dataset(dataset)
     df = dataset.to_table().to_pandas()
     tm.assert_frame_equal(polars_df.collect().to_pandas(), df)
+
+    # Note, this doesn't verify that the filter is actually pushed down.
+    # It only checks that, if the filter is pushed down, we interpret it
+    # correctly.
+    def check_pushdown_filt(pl_filt, sql_filt):
+        polars_df = pl.scan_pyarrow_dataset(dataset).filter(pl_filt)
+        df = dataset.to_table(filter=sql_filt).to_pandas()
+        tm.assert_frame_equal(polars_df.collect().to_pandas(), df)
+
+    # These three should push down (but we don't verify)
+    check_pushdown_filt(pl.col("a") > 50, "a > 50")
+    check_pushdown_filt(~(pl.col("a") > 50), "a <= 50")
+    check_pushdown_filt(pl.col("a").is_in([50, 51, 52]), "a IN (50, 51, 52)")
+    # At the current moment it seems polars cannot pushdown this
+    # kind of filter
+    check_pushdown_filt((pl.col("a") + 3) < 100, "(a + 3) < 100")
+
+    # I can't seem to get struct["x"] to work in Lance but maybe there is
+    # a way.  For now, let's compare it directly to the pyarrow compute version
+
+    # Doesn't yet work today :( due to upstream issue (datafusion's substrait parser
+    # doesn't yet handle nested refs)
+    # if pa.cpp_version_info.major >= 14:
+    #     polars_df = pl.scan_pyarrow_dataset(dataset).filter(pl.col("struct.x") < 10)
+    #     df = dataset.to_table(filter=pc.field("struct", "x") < 10).to_pandas()
+    #     tm.assert_frame_equal(polars_df.collect().to_pandas(), df)
 
 
 def test_count_fragments(tmp_path: Path):
