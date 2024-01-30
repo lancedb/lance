@@ -1999,7 +1999,6 @@ def write_dataset(
             data_obj = data_obj.data.to_batches()
     except ImportError:
         pass
-    print("Schema is: ", schema)
 
     reader = _coerce_reader(data_obj, schema)
     _validate_schema(reader.schema)
