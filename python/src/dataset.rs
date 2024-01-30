@@ -25,11 +25,12 @@ use chrono::Duration;
 
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::UpdateBuilder;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
-    Dataset as LanceDataset, ReadParams, Version, WriteMode, WriteParams,
+    Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams,
+    UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
+    WriteParams,
 };
 use lance::index::{
     scalar::ScalarIndexParams,
@@ -47,9 +48,9 @@ use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
-use pyo3::exceptions::PyStopIteration;
+use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PySet};
+use pyo3::types::{PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
@@ -91,6 +92,101 @@ fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
             e
         ))
     })
+}
+
+#[pyclass(name = "_MergeInsertBuilder", module = "_lib", subclass)]
+pub struct MergeInsertBuilder {
+    builder: LanceMergeInsertBuilder,
+    dataset: Py<Dataset>,
+}
+
+#[pymethods]
+impl MergeInsertBuilder {
+    #[new]
+    pub fn new(dataset: &PyAny, on: &PyAny) -> PyResult<Self> {
+        let dataset: Py<Dataset> = dataset.extract()?;
+        let ds = dataset.borrow(on.py()).ds.clone();
+        // Either a single string, which we put in a vector or an iterator
+        // of strings, which we collect into a vector
+        let on = PyAny::downcast::<PyString>(on)
+            .map(|val| vec![val.to_string()])
+            .or_else(|_| {
+                let iterator = on.iter().map_err(|_| {
+                    PyTypeError::new_err(
+                        "The `on` argument to merge_insert must be a str or iterable of str",
+                    )
+                })?;
+                let mut keys = Vec::new();
+                for key in iterator {
+                    keys.push(PyAny::downcast::<PyString>(key?)?.to_string());
+                }
+                PyResult::Ok(keys)
+            })?;
+
+        let mut builder = LanceMergeInsertBuilder::try_new(ds, on)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        // We don't have do_nothing methods in python so we start with a blank slate
+        builder
+            .when_matched(WhenMatched::DoNothing)
+            .when_not_matched(WhenNotMatched::DoNothing);
+
+        Ok(Self { builder, dataset })
+    }
+
+    pub fn when_matched_update_all(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
+        slf.builder.when_matched(WhenMatched::UpdateAll);
+        Ok(slf)
+    }
+
+    pub fn when_not_matched_insert_all(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
+        slf.builder.when_not_matched(WhenNotMatched::InsertAll);
+        Ok(slf)
+    }
+
+    pub fn when_not_matched_by_source_delete<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        expr: Option<&str>,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        let new_val = if let Some(expr) = expr {
+            let dataset = slf.dataset.borrow(slf.py());
+            WhenNotMatchedBySource::delete_if(&dataset.ds, expr)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?
+        } else {
+            WhenNotMatchedBySource::Delete
+        };
+        slf.builder.when_not_matched_by_source(new_val);
+        Ok(slf)
+    }
+
+    pub fn execute(&mut self, new_data: &PyAny) -> PyResult<()> {
+        let py = new_data.py();
+
+        let new_data: Box<dyn RecordBatchReader + Send> = if new_data.is_instance_of::<Scanner>() {
+            let scanner: Scanner = new_data.extract()?;
+            Box::new(
+                RT.spawn(Some(py), async move { scanner.to_reader().await })?
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            )
+        } else {
+            Box::new(ArrowArrayStreamReader::from_pyarrow(new_data)?)
+        };
+
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let new_self = RT
+            .spawn(Some(py), job.execute_reader(new_data))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        let dataset = self.dataset.as_ref(py);
+
+        dataset.borrow_mut().ds = new_self;
+
+        Ok(())
+    }
 }
 
 #[pymethods]

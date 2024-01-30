@@ -37,8 +37,11 @@ use crate::{Error, Result};
 
 #[derive(Default)]
 pub struct SchemaCompareOptions {
+    /// Should the metadata be compared (default false)
     pub compare_metadata: bool,
+    /// Should the dictionaries be compared (default false)
     pub compare_dictionary: bool,
+    /// Should the field ids be compared (default false)
     pub compare_field_ids: bool,
 }
 /// Encoding enum.
@@ -219,19 +222,23 @@ impl Field {
         }
     }
 
-    pub fn compare_with_options(&self, other: &Self, options: &SchemaCompareOptions) -> bool {
-        self.name == other.name
-            && self.logical_type == other.logical_type
-            && self.nullable == other.nullable
-            && self.children.len() == other.children.len()
-            && self
-                .children
-                .iter()
-                .zip(&other.children)
-                .all(|(left, right)| left.compare_with_options(right, options))
-            && (!options.compare_field_ids || self.id == other.id)
-            && (!options.compare_dictionary || self.dictionary == other.dictionary)
-            && (!options.compare_metadata || self.metadata == other.metadata)
+    pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
+        if self.children.len() != expected.children.len() {
+            false
+        } else {
+            self.name == expected.name
+                && self.logical_type == expected.logical_type
+                && self.nullable == expected.nullable
+                && self.children.len() == expected.children.len()
+                && self
+                    .children
+                    .iter()
+                    .zip(&expected.children)
+                    .all(|(left, right)| left.compare_with_options(right, options))
+                && (!options.compare_field_ids || self.id == expected.id)
+                && (!options.compare_dictionary || self.dictionary == expected.dictionary)
+                && (!options.compare_metadata || self.metadata == expected.metadata)
+        }
     }
 
     pub fn extension_name(&self) -> Option<&str> {

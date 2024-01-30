@@ -136,7 +136,8 @@ def test_dataset_progress(tmp_path: Path):
 
     assert fragment == FragmentMetadata.from_json(json.dumps(metadata))
 
-    p = multiprocessing.Process(target=failing_write, args=(progress_uri, dataset_uri))
+    ctx = multiprocessing.get_context("spawn")
+    p = ctx.Process(target=failing_write, args=(progress_uri, dataset_uri))
     p.start()
     try:
         p.join()

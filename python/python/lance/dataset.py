@@ -50,7 +50,14 @@ from .dependencies import (
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import FragmentMetadata, LanceFragment
-from .lance import CleanupStats, _Dataset, _Operation, _Scanner, _write_dataset
+from .lance import (
+    CleanupStats,
+    _Dataset,
+    _MergeInsertBuilder,
+    _Operation,
+    _Scanner,
+    _write_dataset,
+)
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .optimize import Compaction
@@ -78,6 +85,12 @@ if TYPE_CHECKING:
         np.ndarray,
         Iterable[float],
     ]
+
+
+class MergeInsertBuilder(_MergeInsertBuilder):
+    def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
+        reader = _coerce_reader(data_obj, schema)
+        super(MergeInsertBuilder, self).execute(reader)
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -629,6 +642,12 @@ class LanceDataset(pa.dataset.Dataset):
         if isinstance(predicate, pa.compute.Expression):
             predicate = str(predicate)
         self._ds.delete(predicate)
+
+    def merge_insert(
+        self,
+        on: Union[str, Iterable[str]],
+    ):
+        return MergeInsertBuilder(self._ds, on)
 
     def update(
         self,

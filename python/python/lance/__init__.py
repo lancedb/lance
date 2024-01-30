@@ -20,6 +20,7 @@ from .dataset import (
     LanceDataset,
     LanceOperation,
     LanceScanner,
+    MergeInsertBuilder,
     __version__,
     write_dataset,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "LanceDataset",
     "LanceOperation",
     "LanceScanner",
+    "MergeInsertBuilder",
     "__version__",
     "write_dataset",
     "schema_to_json",
