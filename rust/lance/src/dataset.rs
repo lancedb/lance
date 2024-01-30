@@ -31,6 +31,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt, Stream};
 use lance_core::datatypes::SchemaCompareOptions;
+use lance_datafusion::utils::reader_to_stream;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::object_writer::ObjectWriter;
@@ -69,7 +70,7 @@ use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_datas
 use self::fragment::FileFragment;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
-use self::write::{reader_to_stream, write_fragments_internal};
+use self::write::write_fragments_internal;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{commit_new_dataset, commit_transaction};
@@ -410,7 +411,7 @@ impl Dataset {
             Err(e) => return Err(e),
         };
 
-        let (stream, schema) = reader_to_stream(batches)?;
+        let (stream, schema) = reader_to_stream(batches).await?;
 
         // Running checks for the different write modes
         // create + dataset already exists = error
@@ -559,7 +560,7 @@ impl Dataset {
             });
         }
 
-        let (stream, schema) = reader_to_stream(batches)?;
+        let (stream, schema) = reader_to_stream(batches).await?;
 
         // Return Error if append and input schema differ
         self.manifest.schema.check_compatible(

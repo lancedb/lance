@@ -28,6 +28,7 @@ use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_datafusion::chunker::chunk_stream;
+use lance_datafusion::utils::reader_to_stream;
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
@@ -41,7 +42,6 @@ use uuid::Uuid;
 use super::hash_joiner::HashJoiner;
 use super::scanner::Scanner;
 use super::updater::Updater;
-use super::write::reader_to_stream;
 use super::WriteParams;
 use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
@@ -78,7 +78,7 @@ impl FileFragment {
         let progress = params.progress.as_ref();
 
         let reader = Box::new(reader);
-        let (stream, schema) = reader_to_stream(reader)?;
+        let (stream, schema) = reader_to_stream(reader).await?;
 
         if schema.fields.is_empty() {
             return Err(Error::invalid_input(

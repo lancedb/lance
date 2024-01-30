@@ -47,7 +47,7 @@ use lance_core::{
     error::{box_error, InvalidInputSnafu},
     Error, Result,
 };
-use lance_datafusion::exec::reader_to_stream;
+use lance_datafusion::utils::reader_to_stream;
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 use snafu::{location, Location, ResultExt};
@@ -262,7 +262,7 @@ impl MergeInsertJob {
         self,
         source: Box<dyn RecordBatchReader + Send>,
     ) -> Result<Arc<Dataset>> {
-        let (source, _) = reader_to_stream(source)?;
+        let (source, _) = reader_to_stream(source).await?;
         self.execute(source).await
     }
 
@@ -573,7 +573,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
-    use lance_datafusion::exec::reader_to_stream;
+    use lance_datafusion::utils::reader_to_stream;
     use tempfile::tempdir;
 
     use super::*;
@@ -593,6 +593,7 @@ mod tests {
             [Ok(new_data)],
             schema.clone(),
         )))
+        .await
         .unwrap();
 
         let merged_dataset = job.execute(new_stream).await.unwrap();

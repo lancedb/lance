@@ -171,7 +171,6 @@ mod tests {
     use arrow_select::take::TakeOptions;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
-    use lance_datafusion::exec::reader_to_stream;
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
@@ -187,9 +186,12 @@ mod tests {
     }
 
     impl MockTrainingSource {
-        fn new(data: impl RecordBatchReader + Send + 'static) -> Self {
+        async fn new(data: impl RecordBatchReader + Send + 'static) -> Self {
             Self {
-                data: reader_to_stream(Box::new(data)).unwrap().0,
+                data: lance_datafusion::utils::reader_to_stream(Box::new(data))
+                    .await
+                    .unwrap()
+                    .0,
             }
         }
     }
@@ -211,7 +213,7 @@ mod tests {
     ) {
         let sub_index_trainer = FlatIndexMetadata::new(value_type);
 
-        let data = Box::new(MockTrainingSource::new(data));
+        let data = Box::new(MockTrainingSource::new(data).await);
         train_btree_index(data, &sub_index_trainer, index_store.as_ref())
             .await
             .unwrap();
@@ -277,7 +279,10 @@ mod tests {
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
-                reader_to_stream(Box::new(data)).unwrap().0,
+                lance_datafusion::utils::reader_to_stream(Box::new(data))
+                    .await
+                    .unwrap()
+                    .0,
                 updated_index_store.as_ref(),
             )
             .await
@@ -617,7 +622,7 @@ mod tests {
         let data = RecordBatchIterator::new(batches, schema);
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
 
-        let data = Box::new(MockTrainingSource::new(data));
+        let data = Box::new(MockTrainingSource::new(data).await);
         // Until DF handles NaN reliably we need to make sure we reject input
         // containing NaN
         assert!(

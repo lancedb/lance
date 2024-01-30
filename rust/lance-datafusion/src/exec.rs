@@ -16,7 +16,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
     dataframe::DataFrame,
@@ -27,47 +26,15 @@ use datafusion::{
         TaskContext,
     },
     physical_plan::{
-        stream::RecordBatchStreamAdapter, streaming::PartitionStream, DisplayAs, DisplayFormatType,
-        ExecutionPlan, SendableRecordBatchStream,
+        streaming::PartitionStream, DisplayAs, DisplayFormatType, ExecutionPlan,
+        SendableRecordBatchStream,
     },
 };
 use datafusion_common::DataFusionError;
 use datafusion_physical_expr::Partitioning;
-use futures::TryStreamExt;
 
 use lance_arrow::SchemaExt;
-use lance_core::{datatypes::Schema, Error, Result};
-
-/// Convert reader to a stream and a schema.
-///
-/// Will peek the first batch to get the dictionaries for dictionary columns.
-///
-/// NOTE: this does not validate the schema. For example, for appends the schema
-/// should be checked to make sure it matches the existing dataset schema before
-/// writing.
-pub fn reader_to_stream(
-    batches: Box<dyn RecordBatchReader + Send>,
-) -> Result<(SendableRecordBatchStream, Schema)> {
-    let arrow_schema = batches.schema();
-    let mut schema: Schema = Schema::try_from(batches.schema().as_ref())?;
-    let mut peekable = batches.peekable();
-    if let Some(batch) = peekable.peek() {
-        if let Ok(b) = batch {
-            schema.set_dictionary(b)?;
-        } else {
-            return Err(Error::from(batch.as_ref().unwrap_err()));
-        }
-    }
-    schema.validate()?;
-
-    let stream = RecordBatchStreamAdapter::new(
-        arrow_schema,
-        futures::stream::iter(peekable).map_err(DataFusionError::from),
-    );
-    let stream = Box::pin(stream) as SendableRecordBatchStream;
-
-    Ok((stream, schema))
-}
+use lance_core::Result;
 
 /// An source execution node created from an existing stream
 ///

@@ -859,6 +859,7 @@ def test_merge_insert_source_is_dataset(tmp_path: Path):
     dataset = lance.write_dataset(
         table, tmp_path / "dataset", mode="create", max_rows_per_file=100
     )
+    version = dataset.version
 
     new_table = pa.Table.from_pydict(
         {"a": range(300, 300 + nrows), "b": [2 for _ in range(nrows)]}
@@ -870,6 +871,18 @@ def test_merge_insert_source_is_dataset(tmp_path: Path):
     is_new = pc.field("b") == 2
 
     dataset.merge_insert("a").when_not_matched_insert_all().execute(new_dataset)
+    table = dataset.to_table()
+    assert table.num_rows == 1300
+    assert table.filter(is_new).num_rows == 300
+
+    dataset = lance.dataset(tmp_path / "dataset", version=version)
+    dataset.restore()
+
+    reader = new_dataset.to_batches()
+
+    dataset.merge_insert("a").when_not_matched_insert_all().execute(
+        reader, schema=new_dataset.schema
+    )
     table = dataset.to_table()
     assert table.num_rows == 1300
     assert table.filter(is_new).num_rows == 300
