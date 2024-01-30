@@ -1,9 +1,11 @@
-HuggingFace
------------
+Lance ❤️ HuggingFace
+--------------------
 
-The Hugging Face Hub has a great amount of pre-trained models and datasets available.
+The HuggingFace Hub has become the go to place for ML practitioners to find pre-trained models and useful datasets.
 
-It is easy to convert a Huggingface dataset to Lance dataset:
+HuggingFace datasets can be written directly into Lance format by using the
+:meth:`lance.write_dataset` method. You can write the entire dataset or a particular split. For example:
+
 
 .. code-block:: python
 
@@ -11,6 +13,6 @@ It is easy to convert a Huggingface dataset to Lance dataset:
     import datasets
     import lance
 
-    lance.write(datasets.load_dataset(
+    lance.write_dataset(datasets.load_dataset(
         "poloclub/diffusiondb", split="train[:10]"
     ), "diffusiondb_train.lance")
