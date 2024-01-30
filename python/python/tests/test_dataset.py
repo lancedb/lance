@@ -822,6 +822,193 @@ def test_delete_data(tmp_path: Path):
     assert dataset.count_rows() == 0
 
 
+def test_merge_insert(tmp_path: Path):
+    nrows = 1000
+    table = pa.Table.from_pydict({"a": range(nrows), "b": [1 for _ in range(nrows)]})
+    dataset = lance.write_dataset(
+        table, tmp_path / "dataset", mode="create", max_rows_per_file=100
+    )
+    version = dataset.version
+
+    new_table = pa.Table.from_pydict(
+        {"a": range(300, 300 + nrows), "b": [2 for _ in range(nrows)]}
+    )
+
+    is_new = pc.field("b") == 2
+
+    dataset.merge_insert("a").when_not_matched_insert_all().execute(new_table)
+    table = dataset.to_table()
+    assert table.num_rows == 1300
+    assert table.filter(is_new).num_rows == 300
+
+    dataset = lance.dataset(tmp_path / "dataset", version=version)
+    dataset.restore()
+    dataset.merge_insert("a").when_matched_update_all().execute(new_table)
+    table = dataset.to_table()
+    assert table.num_rows == 1000
+    assert table.filter(is_new).num_rows == 700
+
+    dataset = lance.dataset(tmp_path / "dataset", version=version)
+    dataset.restore()
+    dataset.merge_insert(
+        "a"
+    ).when_not_matched_insert_all().when_matched_update_all().execute(new_table)
+    table = dataset.to_table()
+    assert table.num_rows == 1300
+    assert table.filter(is_new).num_rows == 1000
+
+    dataset = lance.dataset(tmp_path / "dataset", version=version)
+    dataset.restore()
+    dataset.merge_insert("a").when_not_matched_by_source_delete().execute(new_table)
+    table = dataset.to_table()
+    assert table.num_rows == 700
+    assert table.filter(is_new).num_rows == 0
+
+    dataset = lance.dataset(tmp_path / "dataset", version=version)
+    dataset.restore()
+    dataset.merge_insert("a").when_not_matched_by_source_delete(
+        "a < 100"
+    ).when_not_matched_insert_all().execute(new_table)
+
+    table = dataset.to_table()
+    assert table.num_rows == 1200
+    assert table.filter(is_new).num_rows == 300
+
+    # If the user doesn't specify anything then the merge_insert is
+    # a no-op and the operation fails
+    dataset = lance.dataset(tmp_path / "dataset", version=version)
+    dataset.restore()
+    with pytest.raises(ValueError):
+        dataset.merge_insert("a").execute(new_table)
+
+
+def test_merge_insert_source_is_dataset(tmp_path: Path):
+    nrows = 1000
+    table = pa.Table.from_pydict({"a": range(nrows), "b": [1 for _ in range(nrows)]})
+    dataset = lance.write_dataset(
+        table, tmp_path / "dataset", mode="create", max_rows_per_file=100
+    )
+    version = dataset.version
+
+    new_table = pa.Table.from_pydict(
+        {"a": range(300, 300 + nrows), "b": [2 for _ in range(nrows)]}
+    )
+    new_dataset = lance.write_dataset(
+        new_table, tmp_path / "dataset2", mode="create", max_rows_per_file=80
+    )
+
+    is_new = pc.field("b") == 2
+
+    dataset.merge_insert("a").when_not_matched_insert_all().execute(new_dataset)
+    table = dataset.to_table()
+    assert table.num_rows == 1300
+    assert table.filter(is_new).num_rows == 300
+
+    dataset = lance.dataset(tmp_path / "dataset", version=version)
+    dataset.restore()
+
+    reader = new_dataset.to_batches()
+
+    dataset.merge_insert("a").when_not_matched_insert_all().execute(
+        reader, schema=new_dataset.schema
+    )
+    table = dataset.to_table()
+    assert table.num_rows == 1300
+    assert table.filter(is_new).num_rows == 300
+
+
+def test_merge_insert_multiple_keys(tmp_path: Path):
+    nrows = 1000
+    # a - [0, 1, 2, ..., 999]
+    # b - [1, 1, 1, ..., 1]
+    # c - [0, 1, 0, ..., 1]
+    table = pa.Table.from_pydict(
+        {
+            "a": range(nrows),
+            "b": [1 for _ in range(nrows)],
+            "c": [i % 2 for i in range(nrows)],
+        }
+    )
+    dataset = lance.write_dataset(
+        table, tmp_path / "dataset", mode="create", max_rows_per_file=100
+    )
+
+    # a - [300, 301, 302, ..., 1299]
+    # b - [2, 2, 2, ..., 2]
+    # c - [0, 0, 0, ..., 0]
+    new_table = pa.Table.from_pydict(
+        {
+            "a": range(300, 300 + nrows),
+            "b": [2 for _ in range(nrows)],
+            "c": [0 for _ in range(nrows)],
+        }
+    )
+
+    is_new = pc.field("b") == 2
+
+    dataset.merge_insert(["a", "c"]).when_matched_update_all().execute(new_table)
+    table = dataset.to_table()
+    assert table.num_rows == 1000
+    assert table.filter(is_new).num_rows == 350
+
+
+def test_merge_insert_incompatible_schema(tmp_path: Path):
+    nrows = 1000
+    table = pa.Table.from_pydict(
+        {
+            "a": range(nrows),
+            "b": [1 for _ in range(nrows)],
+        }
+    )
+    dataset = lance.write_dataset(
+        table, tmp_path / "dataset", mode="create", max_rows_per_file=100
+    )
+
+    new_table = pa.Table.from_pydict(
+        {
+            "a": range(300, 300 + nrows),
+        }
+    )
+
+    with pytest.raises(OSError):
+        dataset.merge_insert("a").when_matched_update_all().execute(new_table)
+
+
+def test_merge_insert_vector_column(tmp_path: Path):
+    table = pa.Table.from_pydict(
+        {
+            "vec": pa.array([[1, 2, 3], [4, 5, 6]], pa.list_(pa.float32(), 3)),
+            "key": [1, 2],
+        }
+    )
+
+    new_table = pa.Table.from_pydict(
+        {
+            "vec": pa.array([[7, 8, 9], [10, 11, 12]], pa.list_(pa.float32(), 3)),
+            "key": [2, 3],
+        }
+    )
+
+    dataset = lance.write_dataset(
+        table, tmp_path / "dataset", mode="create", max_rows_per_file=100
+    )
+
+    dataset.merge_insert(
+        ["key"]
+    ).when_not_matched_insert_all().when_matched_update_all().execute(new_table)
+
+    expected = pa.Table.from_pydict(
+        {
+            "vec": pa.array(
+                [[1, 2, 3], [7, 8, 9], [10, 11, 12]], pa.list_(pa.float32(), 3)
+            ),
+            "key": [1, 2, 3],
+        }
+    )
+
+    assert dataset.to_table().sort_by("key") == expected
+
+
 def test_update_dataset(tmp_path: Path):
     nrows = 100
     vecs = pa.FixedSizeListArray.from_arrays(

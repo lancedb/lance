@@ -15,5 +15,6 @@
 //! Extends DataFusion
 //!
 
+pub(crate) mod dataframe;
 pub(crate) mod logical_expr;
 pub(crate) mod logical_plan;
