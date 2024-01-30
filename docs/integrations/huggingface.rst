@@ -14,5 +14,5 @@ HuggingFace datasets can be written directly into Lance format by using the
     import lance
 
     lance.write_dataset(datasets.load_dataset(
-        "poloclub/diffusiondb", split="train[:10]"
+        "poloclub/diffusiondb", split="train[:10]",
     ), "diffusiondb_train.lance")
