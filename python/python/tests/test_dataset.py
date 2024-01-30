@@ -789,8 +789,7 @@ def test_merge_from_dataset(tmp_path: Path):
     tab2 = pa.table({"a": range(100), "c": range(100)})
     ds2 = lance.write_dataset(tab2, tmp_path / "dataset2", mode="append")
 
-    # TODO: for some reason this deadlocks if we remove the list() call.
-    ds1.merge(list(ds2.to_batches()), "a", schema=ds2.schema)
+    ds1.merge(ds2.to_batches(), "a", schema=ds2.schema)
     assert ds1.version == 2
     assert ds1.to_table() == pa.table(
         {
