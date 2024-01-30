@@ -25,7 +25,7 @@ pub mod x86 {
 
     lazy_static! {
         pub static ref AVX512_F16_SUPPORTED: bool = {
-                    // this macro does many OS checks/etc. to determine if allowed to use AVX512
+            // this macro does many OS checks/etc. to determine if allowed to use AVX512
             if !is_x86_feature_detected!("avx512f") {
                 return false;
             }
