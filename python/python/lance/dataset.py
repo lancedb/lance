@@ -42,7 +42,12 @@ import pyarrow as pa
 import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 
-from .dependencies import _check_for_numpy, _check_for_pandas, torch
+from .dependencies import (
+    _check_for_hugging_face,
+    _check_for_numpy,
+    _check_for_pandas,
+    torch,
+)
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import FragmentMetadata, LanceFragment
@@ -1989,16 +1994,14 @@ def write_dataset(
         a custom class that defines hooks to be called when each fragment is
         starting to write and finishing writing.
     """
-    try:
+    if _check_for_hugging_face(data_obj):
         # Huggingface datasets
-        import datasets
+        from .dependencies import datasets
 
         if isinstance(data_obj, datasets.Dataset):
             if schema is None:
                 schema = data_obj.features.arrow_schema
             data_obj = data_obj.data.to_batches()
-    except ImportError:
-        pass
 
     reader = _coerce_reader(data_obj, schema)
     _validate_schema(reader.schema)
