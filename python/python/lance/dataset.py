@@ -718,9 +718,11 @@ class LanceDataset(pa.dataset.Dataset):
         The builder returned by this method can be used to customize what
         should happen for each category of data.
 
-        Please note that the data may appear to be reordered as part of this
+        Please note that the data will be reordered as part of this
         operation.  This is because updated rows will be deleted from the
-        dataset and then reinserted at the end with the new values.
+        dataset and then reinserted at the end with the new values.  The
+        order of the newly inserted rows may fluctuate randomly because a
+        hash-join operation is used internally.
 
         Parameters
         ----------
@@ -742,7 +744,7 @@ class LanceDataset(pa.dataset.Dataset):
         ...        .when_matched_update_all()     \\
         ...        .when_not_matched_insert_all() \\
         ...        .execute(new_table)
-        >>> dataset.to_table().to_pandas()
+        >>> dataset.to_table().sort_by("a").to_pandas()
            a  b
         0  1  b
         1  2  x
