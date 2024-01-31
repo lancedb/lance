@@ -174,7 +174,16 @@ class LanceDataset(torch.utils.data.IterableDataset):
         with_row_id : bool, optional
             If set true, the returned batch will have an additional column named
             `_rowid` that contains the row id of the batch.
-
+        rank: int, optional
+            If set, the rank (idx) of this process in distributed training / inference.
+        world_size: int, optional
+            If set, the total number of processes in distributed training / inference.
+        shard_granularity: str, optional
+            The basic unit of sharding data. If set to "fragment", each worker will get
+            the a subset of fragments. If set to "batch", it will read the "batch" interleave
+            with the same fragments.
+        to_tensor_fn : callable, optional
+            A function that converts a pyarrow RecordBatch to torch.Tensor.
         """
         super().__init__(*args, **kwargs)
         self.dataset = dataset
