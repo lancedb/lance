@@ -782,6 +782,24 @@ def test_merge_data(tmp_path: Path):
     assert dataset.to_table() == expected
 
 
+def test_merge_from_dataset(tmp_path: Path):
+    tab1 = pa.table({"a": range(100), "b": range(100)})
+    ds1 = lance.write_dataset(tab1, tmp_path / "dataset1", mode="append")
+
+    tab2 = pa.table({"a": range(100), "c": range(100)})
+    ds2 = lance.write_dataset(tab2, tmp_path / "dataset2", mode="append")
+
+    ds1.merge(ds2.to_batches(), "a", schema=ds2.schema)
+    assert ds1.version == 2
+    assert ds1.to_table() == pa.table(
+        {
+            "a": range(100),
+            "b": range(100),
+            "c": range(100),
+        }
+    )
+
+
 def test_delete_data(tmp_path: Path):
     # We pass schema explicitly since we want b to be non-nullable.
     schema = pa.schema(

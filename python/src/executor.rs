@@ -44,6 +44,9 @@ impl BackgroundExecutor {
     }
 
     /// Spawn a task and wait for it to complete.
+    ///
+    /// This method is safe to use with inputs that may reference a Rust async
+    /// runtime.
     pub fn spawn<T>(&self, py: Option<Python<'_>>, task: T) -> PyResult<T::Output>
     where
         T: Future + Send + 'static,
@@ -119,6 +122,10 @@ impl BackgroundExecutor {
     /// Block on a future and wait for it to complete.
     ///
     /// This helper method also frees the GIL before blocking.
+    ///
+    /// This method is NOT safe to use with inputs that may reference a Rust async
+    /// runtime. If the future references an async runtime, it will panic on an
+    /// error: "Cannot start a runtime from within a runtime."
     pub fn block_on<F: Future + Send>(
         &self,
         py: Option<Python<'_>>,
