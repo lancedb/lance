@@ -118,7 +118,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         updated.  The rows from the target table will be removed and the rows
         from the source table will be added.
         """
-        super(MergeInsertBuilder, self).when_matched_update_all()
+        return super(MergeInsertBuilder, self).when_matched_update_all()
 
     def when_not_matched_insert_all(self):
         """
@@ -128,9 +128,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         any rows that exist only in the source table will be inserted into
         the target table.
         """
-        super(MergeInsertBuilder, self).when_not_matched_insert_all()
+        return super(MergeInsertBuilder, self).when_not_matched_insert_all()
 
-    def when_not_matched_by_source_delete(self, expr: Optional[str]):
+    def when_not_matched_by_source_delete(self, expr: Optional[str] = None):
         """
         Configure the operation to delete source rows that do not match
 
@@ -140,7 +140,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         operation.  If given (as an SQL filter) then only rows which match
         the filter will be deleted.
         """
-        super(MergeInsertBuilder, self).when_not_matched_by_source_delete(expr)
+        return super(MergeInsertBuilder, self).when_not_matched_by_source_delete(expr)
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -697,7 +697,8 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         on: Union[str, Iterable[str]],
     ):
-        """Returns a builder that can be used to create a "merge insert" operation
+        """
+        Returns a builder that can be used to create a "merge insert" operation
 
         This operation can add rows, update rows, and remove rows in a single
         transaction. It is a very generic tool that can be used to create
@@ -717,28 +718,36 @@ class LanceDataset(pa.dataset.Dataset):
         The builder returned by this method can be used to customize what
         should happen for each category of data.
 
+        Please note that there data may appear to be reordered as part of this
+        operation.  This is because updated rows will be deleted from the
+        dataset and then reinserted at the end with the new values.
+
         Parameters
         ----------
 
         on: Union[str, Iterable[str]]
             A column (or columns) to join on.  This is how records from the
             source table and target table are matched.  Typically this is some
-            kind of key or id column.
+        kind of key or id column.
 
         Examples
         --------
         >>> import lance
         >>> import pyarrow as pa
-        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> table = pa.table({"a": [2, 1, 3], "b": ["a", "b", "c"]})
         >>> dataset = lance.write_dataset(table, "example")
         >>> new_table = pa.table({"a": [2, 3, 4], "b": ["x", "y", "z"]})
         >>> # Perform a "upsert" operation
-        >>> dataset.merge_insert("a")             \
-        >>>        .when_matched_update_all()     \
-        >>>        .when_not_matched_insert_all() \
-        >>>        .execute()
+        >>> dataset.merge_insert("a")             \\
+        ...        .when_matched_update_all()     \\
+        ...        .when_not_matched_insert_all() \\
+        ...        .execute(new_table)
         >>> dataset.to_table().to_pandas()
-
+           a  b
+        0  1  b
+        1  2  x
+        2  3  y
+        3  4  z
         """
         return MergeInsertBuilder(self._ds, on)
 
