@@ -135,7 +135,7 @@ def _buffer_arrow_batches(
 
 
 class LanceDataset(torch.utils.data.IterableDataset):
-    """PyTorch IterableDataset over LanceDataset."""
+    """PyTorch :class:`torch.utils.data.IterableDataset` over lance dataset."""
 
     def __init__(
         self,
@@ -155,6 +155,27 @@ class LanceDataset(torch.utils.data.IterableDataset):
         ] = None,
         **kwargs,
     ):
+        """Use PyTorch Dataset API to read Lance dataset.
+
+        Parameters
+        ----------
+        dataset : Union[torch.utils.data.Dataset, str, Path]
+            Lance dataset to read. Can be URI, path, or an initialized Lance Dataset.
+        batch_size : int
+            Batch size to yield for each iteration.
+        columns : list of str, optional
+            The names of the column to read, by default None, which means reading all
+            columns.
+        filter : str, optional
+            If set, only rows that match the filter will be read.
+        cache : str or bool, optional
+            If set true, the dataset will be cached on disk from the first iteration.
+            The following iterations will read from the cache.
+        with_row_id : bool, optional
+            If set true, the returned batch will have an additional column named
+            `_rowid` that contains the row id of the batch.
+
+        """
         super().__init__(*args, **kwargs)
         self.dataset = dataset
         self.columns = columns
