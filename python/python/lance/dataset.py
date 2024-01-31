@@ -712,13 +712,13 @@ class LanceDataset(pa.dataset.Dataset):
 
         "Matched" records are records that exist in both the source table and
         the target table. "Not matched" records exist only in the source table
-        (e.g. these are new data) "Not matched by source" records exist only
-        in the target table (this is old data)
+        (e.g. these are new data). "Not matched by source" records exist only
+        in the target table (this is old data).
 
         The builder returned by this method can be used to customize what
         should happen for each category of data.
 
-        Please note that there data may appear to be reordered as part of this
+        Please note that the data may appear to be reordered as part of this
         operation.  This is because updated rows will be deleted from the
         dataset and then reinserted at the end with the new values.
 
@@ -728,7 +728,7 @@ class LanceDataset(pa.dataset.Dataset):
         on: Union[str, Iterable[str]]
             A column (or columns) to join on.  This is how records from the
             source table and target table are matched.  Typically this is some
-        kind of key or id column.
+            kind of key or id column.
 
         Examples
         --------
