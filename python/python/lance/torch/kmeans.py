@@ -174,7 +174,7 @@ class KMeans:
         self, centroids: torch.Tensor, counts: torch.Tensor
     ) -> torch.Tensor:
         centroids = centroids / counts[:, None]
-        zero_counts = centroids == 0
+        zero_counts = counts == 0
         for idx in zero_counts.nonzero(as_tuple=False):
             # split the largest cluster and remove empty cluster
             max_idx = torch.argmax(counts).item()
