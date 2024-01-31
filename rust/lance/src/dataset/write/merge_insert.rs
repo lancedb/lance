@@ -522,17 +522,17 @@ impl Merger {
         // borrow checker (the stream needs to be `sync` since it crosses an await point)
         let mut deleted_row_ids = self.deleted_rows.lock().unwrap();
 
-        if self.params.insert_not_matched {
-            let not_matched = arrow::compute::filter_record_batch(&batch, &right_only)?;
-            let not_matched = not_matched.project(&right_cols)?;
-            batches.push(Ok(not_matched));
-        }
         if self.params.update_matched {
             let matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
             let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
             deleted_row_ids.extend(row_ids.values());
             let matched = matched.project(&right_cols)?;
             batches.push(Ok(matched));
+        }
+        if self.params.insert_not_matched {
+            let not_matched = arrow::compute::filter_record_batch(&batch, &right_only)?;
+            let not_matched = not_matched.project(&right_cols)?;
+            batches.push(Ok(not_matched));
         }
         match self.params.delete_not_matched_by_source {
             WhenNotMatchedBySource::Delete => {

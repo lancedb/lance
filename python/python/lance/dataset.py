@@ -89,8 +89,58 @@ if TYPE_CHECKING:
 
 class MergeInsertBuilder(_MergeInsertBuilder):
     def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
+        """Executes the merge insert operation
+
+        There is no return value but the original dataset will be updated.
+
+        Parameters
+        ----------
+
+        data_obj: ReaderLike
+            The new data to use as the source table for the operation.  This parameter
+            can be any source of data (e.g. table / dataset) that
+            :func:`~lance.write_dataset` accepts.
+        schema: Optional[pa.Schema]
+            The schema of the data.  This only needs to be supplied whenever the data
+            source is some kind of generator.
+        """
         reader = _coerce_reader(data_obj, schema)
         super(MergeInsertBuilder, self).execute(reader)
+
+    # These next three overrides exist only to document the methods
+
+    def when_matched_update_all(self):
+        """
+        Configure the operation to update matched rows
+
+        After this method is called, when the merge insert operation executes,
+        any rows that match both the source table and the target table will be
+        updated.  The rows from the target table will be removed and the rows
+        from the source table will be added.
+        """
+        return super(MergeInsertBuilder, self).when_matched_update_all()
+
+    def when_not_matched_insert_all(self):
+        """
+        Configure the operation to insert not matched rows
+
+        After this method is called, when the merge insert operation executes,
+        any rows that exist only in the source table will be inserted into
+        the target table.
+        """
+        return super(MergeInsertBuilder, self).when_not_matched_insert_all()
+
+    def when_not_matched_by_source_delete(self, expr: Optional[str] = None):
+        """
+        Configure the operation to delete source rows that do not match
+
+        After this method is called, when the merge insert operation executes,
+        any rows that exist only in the target table will be deleted.  An
+        optional filter can be specified to limit the scope of the delete
+        operation.  If given (as an SQL filter) then only rows which match
+        the filter will be deleted.
+        """
+        return super(MergeInsertBuilder, self).when_not_matched_by_source_delete(expr)
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -647,6 +697,60 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         on: Union[str, Iterable[str]],
     ):
+        """
+        Returns a builder that can be used to create a "merge insert" operation
+
+        This operation can add rows, update rows, and remove rows in a single
+        transaction. It is a very generic tool that can be used to create
+        behaviors like "insert if not exists", "update or insert (i.e. upsert)",
+        or even replace a portion of existing data with new data (e.g. replace
+        all data where month="january")
+
+        The merge insert operation works by combining new data from a
+        **source table** with existing data in a **target table** by using a
+        join.  There are three categories of records.
+
+        "Matched" records are records that exist in both the source table and
+        the target table. "Not matched" records exist only in the source table
+        (e.g. these are new data). "Not matched by source" records exist only
+        in the target table (this is old data).
+
+        The builder returned by this method can be used to customize what
+        should happen for each category of data.
+
+        Please note that the data will be reordered as part of this
+        operation.  This is because updated rows will be deleted from the
+        dataset and then reinserted at the end with the new values.  The
+        order of the newly inserted rows may fluctuate randomly because a
+        hash-join operation is used internally.
+
+        Parameters
+        ----------
+
+        on: Union[str, Iterable[str]]
+            A column (or columns) to join on.  This is how records from the
+            source table and target table are matched.  Typically this is some
+            kind of key or id column.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [2, 1, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> new_table = pa.table({"a": [2, 3, 4], "b": ["x", "y", "z"]})
+        >>> # Perform a "upsert" operation
+        >>> dataset.merge_insert("a")             \\
+        ...        .when_matched_update_all()     \\
+        ...        .when_not_matched_insert_all() \\
+        ...        .execute(new_table)
+        >>> dataset.to_table().sort_by("a").to_pandas()
+           a  b
+        0  1  b
+        1  2  x
+        2  3  y
+        3  4  z
+        """
         return MergeInsertBuilder(self._ds, on)
 
     def update(

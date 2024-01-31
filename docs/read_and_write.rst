@@ -135,10 +135,128 @@ of Alice and Bob in the same example, we could write:
   dataset = lance.dataset("./alice_and_bob.lance")
   dataset.update({"age": "age + 2"})
 
-.. TODO: Once we implement MERGE, we should make a note that this method shouldn't be used 
-..       for updating single rows in a loop, and users should instead do bulk updates
-..       using MERGE.
+If you are trying to update a set of individual rows with new values then it is often
+more efficient to use the merge insert operation described below.
 
+.. code-block:: python
+
+  import lance
+
+  # Change the ages of both Alice and Bob
+  new_table = pa.Table.from_pylist([{"name": "Alice", "age": 30},
+                                    {"name": "Bob", "age": 20}])
+
+  # This works, but is inefficient, see below for a better approach
+  dataset = lance.dataset("./alice_and_bob.lance")
+  for idx in range(new_table.num_rows):
+    name = new_table[0][idx].as_py()
+    new_age = new_table[1][idx].as_py()
+    dataset.update({"age": new_age}, where=f"name='{name}'")
+
+Merge Insert
+~~~~~~~~~~~~
+
+Lance supports a merge insert operation.  This can be used to add new data in bulk
+while also (potentially) matching against existing data.  This operation can be used
+for a number of different use cases.
+
+Bulk Update
+^^^^^^^^^^^
+
+The :py:meth:`lance.LanceDataset.update` method is useful for updating rows based on
+a filter.  However, if we want to replace existing rows with new rows then a merge
+insert operation would be more efficient:
+
+.. code-block:: python
+
+  import lance
+
+  # Change the ages of both Alice and Bob
+  new_table = pa.Table.from_pylist([{"name": "Alice", "age": 30},
+                                    {"name": "Bob", "age": 20}])
+  dataset = lance.dataset("./alice_and_bob.lance")
+  # This will use `name` as the key for matching rows.  Merge insert
+  # uses a JOIN internally and so you typically want this column to
+  # be a unique key or id of some kind.
+  dataset.merge_insert("name") \
+         .when_matched_update_all() \
+         .execute()
+
+Note that, similar to the update operation, rows that are modified will
+be removed and inserted back into the table, changing their position to
+the end.  Also, the relative order of these rows could change because we
+are using a hash-join operation internally.
+
+Insert if not Exists
+^^^^^^^^^^^^^^^^^^^^
+
+Sometimes we only want to insert data if we haven't already inserted it
+before.  This can happen, for example, when we have a batch of data but
+we don't know which rows we've added previously and we don't want to
+create duplicate rows.  We can use the merge insert operation to achieve
+this:
+
+.. code-block:: python
+
+  import lance
+
+  # Bob is already in the table, but Carla is new
+  new_table = pa.Table.from_pylist([{"name": "Bob", "age": 30},
+                                    {"name": "Carla", "age": 37}])
+
+  dataset = lance.dataset("./alice_and_bob.lance")
+
+  # This will insert Carla but leave Bob unchanged
+  dataset.merge_insert("name") \
+         .when_not_matched_insert_all() \
+         .execute()
+
+Update or Insert (Upsert)
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Sometimes we want to combine both of the above behaviors.  If a row
+already exists we want to update it.  If the row does not exist we want
+to add it.  This operation is sometimes called "upsert".  We can use
+the merge insert operation to do this as well:
+
+.. code-block:: python
+
+  import lance
+
+  # Change Carla's age and insert David
+  new_table = pa.Table.from_pylist([{"name": "Carla", "age": 27},
+                                    {"name": "David", "age": 42}])
+
+  dataset = lance.dataset("./alice_and_bob.lance")
+
+  # This will update Carla and insert David
+  dataset.merge_insert("name") \
+         .when_matched_update_all() \
+         .when_not_matched_insert_all() \
+         .execute()
+
+Replace a Portion of Data
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A less common, but still useful, behavior can be to replace some region
+of existing rows (defined by a filter) with new data.  This is similar
+to performing both a delete and an insert in a single transaction.  For
+example:
+
+.. code-block:: python
+
+  import lance
+
+  new_table = pa.Table.from_pylist([{"name": "Edgar", "age": 46},
+                                    {"name": "Francene", "age": 44}])
+
+  dataset = lance.dataset("./alice_and_bob.lance")
+
+  # This will remove anyone above 40 and insert our new data
+  dataset.merge_insert("name") \
+         .when_not_matched_insert_all() \
+         .when_not_matched_by_source_delete("age >= 40") \
+         .execute()
 
 
 
