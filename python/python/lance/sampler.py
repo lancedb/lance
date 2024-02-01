@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import gc
 import logging
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from heapq import heappush, heappushpop
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, TypeVar, Union
+from typing import TYPE_CHECKING, Iterable, List, Optional, TypeVar, Union
 
 import pyarrow as pa
 
@@ -184,3 +185,100 @@ def reservoir_sampling(stream: Iterable[T], k: int) -> list[T]:
     samples = [i.item for i in heap]
     del heap
     return samples
+
+
+class Sampler(ABC):
+    """Sampler over LanceDataset."""
+
+    @abstractmethod
+    def __call__(
+        self,
+        ds: lance.LanceDataset,
+        *args,
+        batch_size: int = 128,
+        columns: Optional[List[str]] = None,
+        batch_readahead: int = 16,
+        with_row_id: bool = False,
+        **kwargs,
+    ) -> Generator[pa.RecordBatch, None, None]:
+        pass
+
+
+class FragmentSampler(Sampler):
+    """Sampling over Fragments.
+
+    To implement a new `FragmentSampler`, you can implement the `iter_fragments` method
+    to yield fragments in desired order.
+    """
+
+    def __call__(
+        self,
+        dataset: lance.LanceDataset,
+        *args,
+        batch_size: int = 128,
+        columns: Optional[List[str]] = None,
+        batch_readahead: int = 16,
+        with_row_id: bool = False,
+        **kwargs,
+    ) -> Generator[pa.RecordBatch, None, None]:
+        for fragment in self.iter_fragments(dataset, *args, **kwargs):
+            for batch in fragment.to_batches(
+                batch_size=batch_size,
+                columns=columns,
+                with_row_id=with_row_id,
+                batch_readahead=batch_readahead,
+            ):
+                yield batch
+
+    @abstractmethod
+    def iter_fragments(
+        self, ds: lance.LanceDataset, *args, **kwargs
+    ) -> Generator[lance.LanceFragment, None, None]:
+        """Iterate over fragments."""
+        pass
+
+
+class FullScanSampler(FragmentSampler):
+    def iter_fragments(
+        self, dataset: lance.LanceDataset, **kwargs
+    ) -> Generator[lance.LanceFragment, None, None]:
+        return dataset.get_fragments()
+
+
+class ShardedFragmentSampler(FragmentSampler):
+    def __init__(self, rank: int, world_size: int):
+        super().__init__()
+
+        self._rank = rank
+        self._world_size = world_size
+
+    def iter_fragments(
+        self, dataset: lance.LanceDataset, rank: int, world_rank: int, **kwargs
+    ) -> Generator[lance.LanceFragment, None, None]:
+        fragments = dataset.get_fragments()
+        for idx in range(self._rank, len(fragments), self._world_size):
+            yield fragments[idx]
+
+
+class ShardedBatchSampler(Sampler):
+    def __init__(self, rank: int, world_size: int):
+        self._rank = rank
+        self._world_size = world_size
+
+    def __call__(
+        self, dataset: lance.LanceDataset, *args, **kwargs
+    ) -> Generator[lance.RecordBatch, None, None]:
+        total = self._ds.count_rows()
+
+        def _gen_ranges():
+            for start in range(
+                self._rank * self._batch_size,
+                total,
+                self._world_size * self._batch_size,
+            ):
+                yield start, min(start + self._batch_size, total)
+
+        return dataset.take_scan(
+            _gen_ranges(),
+            columns=self._columns,
+        )

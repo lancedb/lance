@@ -29,7 +29,13 @@ from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.dependencies import _check_for_numpy, torch
 from lance.dependencies import numpy as np
 
-from ..sampler import maybe_sample
+from ..sampler import (
+    FullScanSampler,
+    Sampler,
+    ShardedBatchSampler,
+    ShardedFragmentSampler,
+    maybe_sample,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -153,6 +159,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         to_tensor_fn: Optional[
             callable[[pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]]
         ] = None,
+        sampler: Optional[Sampler] = None,
         **kwargs,
     ):
         """Use PyTorch Dataset API to read Lance dataset.
@@ -180,8 +187,11 @@ class LanceDataset(torch.utils.data.IterableDataset):
             If set, the total number of processes in distributed training / inference.
         shard_granularity: str, optional
             The basic unit of sharding data. If set to "fragment", each worker will get
-            the a subset of fragments. If set to "batch", it will read the "batch" interleave
-            with the same fragments.
+            the a subset of fragments.
+            If set to "batch", it will read the "batch" interleave with the
+            same fragments.
+        sampler: callable, optional
+            A function that samples the dataset.
         to_tensor_fn : callable, optional
             A function that converts a pyarrow RecordBatch to torch.Tensor.
         """
@@ -200,8 +210,18 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self.shard_granularity = shard_granularity
+        if not sampler:
+            if shard_granularity is None:
+                sampler = FullScanSampler()
+            elif shard_granularity == "batch":
+                sampler = ShardedBatchSampler(rank, world_size)
+            elif shard_granularity == "fragment":
+                sampler = ShardedFragmentSampler(rank, world_size)
+            else:
+                raise ValueError("Invalid shard_granularity: {}")
+        self.sampler: Sampler = sampler
 
-        if samples is not None and filter is not None:
+        if (samples is not None or sampler is not None) and filter is not None:
             raise ValueError("Does not support sampling over filtered dataset")
 
         self.cache = cache
@@ -228,6 +248,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
                     self.rank,
                     self.world_size,
                     self.shard_granularity,
+                )
+                raw_stream = self.sampler(
+                    self.dataset,
                 )
                 raw_stream = ShardedBatchIterator(
                     self.dataset,
