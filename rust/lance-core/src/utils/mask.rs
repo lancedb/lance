@@ -309,19 +309,16 @@ impl RowIdTreeMap {
             .values()
             .map(|row_id_selection| match row_id_selection {
                 RowIdSelection::Full => None,
-                RowIdSelection::Partial(indices) => Some(indices.len() as u64),
+                RowIdSelection::Partial(indices) => Some(indices.len()),
             })
-            .fold(Some(0_u64), |acc, next| match (acc, next) {
-                (Some(acc), Some(next)) => Some(acc + next),
-                _ => None,
-            })
+            .try_fold(0_u64, |acc, next| next.map(|next| next + acc))
     }
 
     /// An iterator of row ids
     ///
     /// If there are any "full fragment" items then this can't be calculated and None
     /// is returned
-    pub fn row_ids<'a>(&'a self) -> Option<impl Iterator<Item = RowAddress> + 'a> {
+    pub fn row_ids(&self) -> Option<impl Iterator<Item = RowAddress> + '_> {
         let inner_iters = self
             .inner
             .iter()
