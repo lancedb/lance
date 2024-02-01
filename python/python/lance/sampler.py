@@ -253,7 +253,7 @@ class ShardedFragmentSampler(FragmentSampler):
         self._world_size = world_size
 
     def iter_fragments(
-        self, dataset: lance.LanceDataset, rank: int, world_rank: int, **kwargs
+        self, dataset: lance.LanceDataset, **kwargs
     ) -> Generator[lance.LanceFragment, None, None]:
         fragments = dataset.get_fragments()
         for idx in range(self._rank, len(fragments), self._world_size):

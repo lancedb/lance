@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING, Iterable, Literal, Optional, Union
+from pathlib import Path
+from typing import Iterable, Literal, Optional, Union
 
 import pyarrow as pa
 
+import lance
 from lance._dataset.cache import CachedDataset
-from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.dependencies import _check_for_numpy, torch
 from lance.dependencies import numpy as np
 
@@ -36,9 +37,6 @@ from ..sampler import (
     ShardedFragmentSampler,
     maybe_sample,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 __all__ = ["LanceDataset"]
 
@@ -196,6 +194,8 @@ class LanceDataset(torch.utils.data.IterableDataset):
             A function that converts a pyarrow RecordBatch to torch.Tensor.
         """
         super().__init__(*args, **kwargs)
+        if isinstance(dataset, (str, Path)):
+            dataset = lance.dataset(dataset)
         self.dataset = dataset
         self.columns = columns
         self.batch_size = batch_size
@@ -251,15 +251,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 )
                 raw_stream = self.sampler(
                     self.dataset,
-                )
-                raw_stream = ShardedBatchIterator(
-                    self.dataset,
-                    self.rank,
-                    self.world_size,
                     columns=self.columns,
                     batch_size=self.batch_size,
                     with_row_id=self.with_row_id,
-                    granularity=self.shard_granularity,
                 )
             else:
                 raw_stream = self.dataset.to_batches(
