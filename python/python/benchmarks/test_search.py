@@ -227,7 +227,7 @@ def test_filtered_search(test_dataset, benchmark, selectivity, prefilter, use_in
         "in_list_one",
         "not_in_list_one",
         "not_equality_and_chain",
-        "in_list_three",
+        "not_in_list_three",
         "less_than_selective",
         "greater_than_not_selective",
     ],
