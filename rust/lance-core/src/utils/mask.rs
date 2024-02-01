@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::{collections::BTreeMap, io::Read};
 
@@ -357,6 +358,12 @@ impl RowIdTreeMap {
             Some(RowIdSelection::Full) => true,
             Some(RowIdSelection::Partial(fragment_set)) => fragment_set.contains(row_id),
         }
+    }
+
+    pub fn remove_fragments(&mut self, frag_ids: impl IntoIterator<Item = u32>) {
+        let frag_id_set = frag_ids.into_iter().collect::<HashSet<_>>();
+        self.inner
+            .retain(|frag_id, _| frag_id_set.contains(frag_id));
     }
 
     /// Compute the serialized size of the set.

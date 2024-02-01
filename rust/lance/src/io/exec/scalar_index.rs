@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -275,22 +275,10 @@ impl MaterializeIndexExec {
         let span = debug_span!("make_ids");
         let ids = span.in_scope(|| match (mask.allow_list, mask.block_list) {
             (None, None) => FragIdIter::new(fragments).collect::<Vec<_>>(),
-            (Some(allow_list), None) => {
-                let allowed_ids = allow_list.row_ids();
-                if let Some(allowed_ids) = allowed_ids {
-                    let frag_id_filter = fragments
-                        .iter()
-                        .map(|frag| frag.id as u32)
-                        .collect::<HashSet<_>>();
-                    allowed_ids
-                        .filter_map(|addr| {
-                            if frag_id_filter.contains(&addr.fragment_id()) {
-                                Some(u64::from(addr))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
+            (Some(mut allow_list), None) => {
+                allow_list.remove_fragments(fragments.iter().map(|frag| frag.id as u32));
+                if let Some(allow_list_iter) = allow_list.row_ids() {
+                    allow_list_iter.map(u64::from).collect::<Vec<_>>()
                 } else {
                     FragIdIter::new(fragments)
                         .filter(|row_id| allow_list.contains(*row_id))
@@ -300,18 +288,13 @@ impl MaterializeIndexExec {
             (None, Some(block_list)) => FragIdIter::new(fragments)
                 .filter(|row_id| !block_list.contains(*row_id))
                 .collect(),
-            (Some(allow_list), Some(block_list)) => {
-                let allowed_ids = allow_list.row_ids();
-                if let Some(allowed_ids) = allowed_ids {
-                    let frag_id_filter = fragments
-                        .iter()
-                        .map(|frag| frag.id as u32)
-                        .collect::<HashSet<_>>();
-                    allowed_ids
+            (Some(mut allow_list), Some(block_list)) => {
+                allow_list.remove_fragments(fragments.iter().map(|frag| frag.id as u32));
+                if let Some(allow_list_iter) = allow_list.row_ids() {
+                    allow_list_iter
                         .filter_map(|addr| {
-                            let frag_id = addr.fragment_id();
                             let row_id = u64::from(addr);
-                            if !block_list.contains(row_id) && frag_id_filter.contains(&frag_id) {
+                            if !block_list.contains(row_id) {
                                 Some(row_id)
                             } else {
                                 None
