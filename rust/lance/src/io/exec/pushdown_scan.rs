@@ -383,6 +383,12 @@ impl FragmentScanner {
                         // Nothing matched
                         return Ok(None);
                     }
+                    ColumnarValue::Scalar(ScalarValue::Boolean(None)) => {
+                        // The predicate evaluated to null for all inputs.  Usually
+                        // this means that all inputs were null.  When it comes to
+                        // filtering, null means no
+                        return Ok(None);
+                    }
                     ColumnarValue::Array(array) => {
                         let array = array
                             .as_any()
@@ -690,6 +696,53 @@ mod test {
         let projection = Arc::new(dataset.schema().clone());
 
         let predicate = col("i").eq(lit(42));
+
+        let exec = LancePushdownScanExec::try_new(
+            Arc::new(dataset),
+            fragments,
+            projection,
+            predicate,
+            ScanConfig::default(),
+        )
+        .unwrap();
+
+        let ctx = SessionContext::new();
+
+        let results = exec.execute(0, ctx.task_ctx()).unwrap();
+        assert_eq!(results.schema(), exec.schema());
+        let results = results.try_collect::<Vec<_>>().await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_null_batch() {
+        // If every row in a batch is null then a predicate can evaluate to Scalar(NULL)
+        // Ensure we handle that.
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "s",
+            DataType::Utf8,
+            true,
+        )]));
+        let num_rows: usize = 10;
+        // Create a batch where every row is null
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from_iter(
+                (0..num_rows).map(|_| Option::<String>::None),
+            ))],
+        )
+        .unwrap()];
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let fragments = dataset.fragments().clone();
+        let projection = Arc::new(dataset.schema().clone());
+
+        let predicate = col("s").eq(lit("x"));
 
         let exec = LancePushdownScanExec::try_new(
             Arc::new(dataset),
