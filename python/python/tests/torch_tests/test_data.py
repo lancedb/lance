@@ -13,6 +13,8 @@
 #  limitations under the License.
 
 import shutil
+from pathlib import Path
+from itertools import chain
 
 import lance
 import numpy as np
@@ -21,6 +23,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 from lance.torch.data import LanceDataset  # noqa: E402
+from lance.sampler import ShardedFragmentSampler, ShardedBatchSampler, FullScanSampler
 
 
 def test_iter_over_dataset(tmp_path):
@@ -109,3 +112,22 @@ def test_sharded_torch_dataset(tmp_path):
     assert set(row_ids) == {
         i % 100 + (i // 100 << 32) for i in range(1000) if i // 100 % 2 == 1
     }
+
+
+def test_sample_fragments(tmp_path: Path):
+    arr = pa.array(range(2000))
+    tbl = pa.Table.from_arrays([arr], ["ids"])
+
+    # Write 20 files
+    lance.write_dataset(tbl, tmp_path, max_rows_per_file=100)
+
+    ds = LanceDataset(
+        tmp_path,
+        batch_size=25,
+        columns=["ids"],
+        with_row_id=True,
+        sampler=ShardedFragmentSampler(rank=1, world_size=2),
+    )
+
+    all_ids = list(chain.from_iterable([batch["ids"].cpu().numpy() for batch in ds]))
+    assert all_ids == [i for i in range(2000) if i // 100 % 2 == 1]

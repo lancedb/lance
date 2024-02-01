@@ -18,8 +18,8 @@
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
 
-import logging
 import math
+import warnings
 from pathlib import Path
 from typing import Iterable, Literal, Optional, Union
 
@@ -217,8 +217,16 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 sampler = ShardedBatchSampler(rank, world_size)
             elif shard_granularity == "fragment":
                 sampler = ShardedFragmentSampler(rank, world_size)
+            elif rank is not None and world_size is not None:
+                warnings.warn(
+                    "rank and world_size are deprecated,"
+                    + " use SharedFragmentSampler instead.",
+                    DeprecationWarning,
+                )
+                sampler = ShardedFragmentSampler(rank, world_size)
             else:
                 raise ValueError("Invalid shard_granularity: {}")
+
         self.sampler: Sampler = sampler
 
         if (samples is not None or sampler is not None) and filter is not None:
@@ -242,24 +250,11 @@ class LanceDataset(torch.utils.data.IterableDataset):
                     columns=self.columns,
                     batch_size=self.batch_size,
                 )
-            elif self.rank is not None and self.world_size is not None:
-                logging.info(
-                    "Sharded Torch Dataset: rank=%s, world_size=%s, granularity=%s",
-                    self.rank,
-                    self.world_size,
-                    self.shard_granularity,
-                )
+            else:
                 raw_stream = self.sampler(
                     self.dataset,
                     columns=self.columns,
                     batch_size=self.batch_size,
-                    with_row_id=self.with_row_id,
-                )
-            else:
-                raw_stream = self.dataset.to_batches(
-                    columns=self.columns,
-                    batch_size=self.batch_size,
-                    filter=self.filter,
                     with_row_id=self.with_row_id,
                 )
 
