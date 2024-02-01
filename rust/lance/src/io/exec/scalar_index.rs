@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -33,7 +33,7 @@ use lance_table::format::Fragment;
 use pin_project::pin_project;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
-use tracing::instrument;
+use tracing::{debug_span, instrument};
 
 use crate::{
     index::{prefilter::PreFilter, DatasetIndexInternalExt},
@@ -257,29 +257,76 @@ impl MaterializeIndexExec {
     ) -> Result<RecordBatch> {
         // TODO: multiple batches, stream without materializing all row ids in memory
         let mask = expr.evaluate(dataset.as_ref());
-        let fragment_bitmap = RoaringBitmap::from_iter(fragments.iter().map(|frag| frag.id as u32));
-        // The user-requested `fragments` is guaranteed to be stricter than the index's fragment
-        // bitmap.  This node only runs on indexed fragments and any fragments that were deleted
-        // when the index was trained will still be deleted when the index is queried.
-        let prefilter = PreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap);
+        let span = debug_span!("create_prefilter");
+        let prefilter = span.in_scope(|| {
+            let fragment_bitmap =
+                RoaringBitmap::from_iter(fragments.iter().map(|frag| frag.id as u32));
+            // The user-requested `fragments` is guaranteed to be stricter than the index's fragment
+            // bitmap.  This node only runs on indexed fragments and any fragments that were deleted
+            // when the index was trained will still be deleted when the index is queried.
+            PreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap)
+        });
         let mask = if let Some(prefilter) = prefilter {
             let (mask, prefilter) = futures::try_join!(mask, prefilter)?;
             mask.also_block((*prefilter).clone())
         } else {
             mask.await?
         };
-        let ids = match (mask.allow_list, mask.block_list) {
+        let span = debug_span!("make_ids");
+        let ids = span.in_scope(|| match (mask.allow_list, mask.block_list) {
             (None, None) => FragIdIter::new(fragments).collect::<Vec<_>>(),
-            (Some(allow_list), None) => FragIdIter::new(fragments)
-                .filter(|row_id| allow_list.contains(*row_id))
-                .collect(),
+            (Some(allow_list), None) => {
+                let allowed_ids = allow_list.row_ids();
+                if let Some(allowed_ids) = allowed_ids {
+                    let frag_id_filter = fragments
+                        .iter()
+                        .map(|frag| frag.id as u32)
+                        .collect::<HashSet<_>>();
+                    allowed_ids
+                        .filter_map(|addr| {
+                            if frag_id_filter.contains(&addr.fragment_id()) {
+                                Some(u64::from(addr))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    FragIdIter::new(fragments)
+                        .filter(|row_id| allow_list.contains(*row_id))
+                        .collect()
+                }
+            }
             (None, Some(block_list)) => FragIdIter::new(fragments)
                 .filter(|row_id| !block_list.contains(*row_id))
                 .collect(),
-            (Some(allow_list), Some(block_list)) => FragIdIter::new(fragments)
-                .filter(|row_id| !block_list.contains(*row_id) && allow_list.contains(*row_id))
-                .collect(),
-        };
+            (Some(allow_list), Some(block_list)) => {
+                let allowed_ids = allow_list.row_ids();
+                if let Some(allowed_ids) = allowed_ids {
+                    let frag_id_filter = fragments
+                        .iter()
+                        .map(|frag| frag.id as u32)
+                        .collect::<HashSet<_>>();
+                    allowed_ids
+                        .filter_map(|addr| {
+                            let frag_id = addr.fragment_id();
+                            let row_id = u64::from(addr);
+                            if !block_list.contains(row_id) && frag_id_filter.contains(&frag_id) {
+                                Some(row_id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    FragIdIter::new(fragments)
+                        .filter(|row_id| {
+                            !block_list.contains(*row_id) && allow_list.contains(*row_id)
+                        })
+                        .collect()
+                }
+            }
+        });
         let ids = UInt64Array::from(ids);
         Ok(RecordBatch::try_new(
             MATERIALIZE_INDEX_SCHEMA.clone(),

@@ -22,6 +22,8 @@ use roaring::RoaringBitmap;
 
 use crate::Result;
 
+use super::address::RowAddress;
+
 /// A row id mask to select or deselect particular row ids
 ///
 /// If both the allow_list and the block_list are Some then the only selected
@@ -297,6 +299,46 @@ impl RowIdTreeMap {
 
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// The number of rows in the map
+    ///
+    /// If there are any "full fragment" items then this is unknown and None is returned
+    pub fn len(&self) -> Option<u64> {
+        self.inner
+            .values()
+            .map(|row_id_selection| match row_id_selection {
+                RowIdSelection::Full => None,
+                RowIdSelection::Partial(indices) => Some(indices.len() as u64),
+            })
+            .fold(Some(0_u64), |acc, next| match (acc, next) {
+                (Some(acc), Some(next)) => Some(acc + next),
+                _ => None,
+            })
+    }
+
+    /// An iterator of row ids
+    ///
+    /// If there are any "full fragment" items then this can't be calculated and None
+    /// is returned
+    pub fn row_ids<'a>(&'a self) -> Option<impl Iterator<Item = RowAddress> + 'a> {
+        let inner_iters = self
+            .inner
+            .iter()
+            .filter_map(|(frag_id, row_id_selection)| match row_id_selection {
+                RowIdSelection::Full => None,
+                RowIdSelection::Partial(bitmap) => Some(
+                    bitmap
+                        .iter()
+                        .map(|row_offset| RowAddress::new_from_parts(*frag_id, row_offset)),
+                ),
+            })
+            .collect::<Vec<_>>();
+        if inner_iters.len() != self.inner.len() {
+            None
+        } else {
+            Some(inner_iters.into_iter().flatten())
+        }
     }
 
     /// Add a bitmap for a single fragment
