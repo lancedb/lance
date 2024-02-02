@@ -255,6 +255,12 @@ impl FileReader {
     }
 
     /// Instruct the FileReader to return meta row id column.
+    ///
+    /// The row id column will have the name `_rowid` and will be of type `UInt64`.
+    ///
+    /// The row id is a 64-bit integer that is unique within the dataset. The
+    /// most significant 32 bits are the fragment id, and the least significant
+    /// 32 bits are the row offset within the fragment.
     pub fn with_row_id(&mut self, v: bool) -> &mut Self {
         self.with_row_id = v;
         self
@@ -270,7 +276,7 @@ impl FileReader {
         self
     }
 
-    /// Schema of the returning RecordBatch.
+    /// Requested projection of the data in this file, excluding the row id column.
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
