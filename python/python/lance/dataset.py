@@ -662,7 +662,32 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.merge(reader, left_on, right_on)
 
     def drop_columns(self, columns: List[str]):
-        """Drop one or more columns from the dataset"""
+        """Drop one or more columns from the dataset
+
+        Parameters
+        ----------
+        columns : list of str
+            The names of the columns to drop. These can be nested column references
+            (e.g. "a.b.c") or top-level column names (e.g. "a").
+
+        This is a metadata-only operation and does not remove the data from the
+        underlying storage. In order to remove the data, you must subsequently
+        call ``compact_files`` to rewrite the data without the removed columns and
+        then call ``cleanup_files`` to remove the old files.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.drop_columns(["a"])
+        >>> dataset.to_table().to_pandas()
+           b
+        0  a
+        1  b
+        2  c
+        """
         self._ds.drop_columns(columns)
         # Indices might have changed
         self._list_indices_res = None
