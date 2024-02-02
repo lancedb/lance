@@ -143,7 +143,11 @@ impl FileFragment {
         self.metadata.id as usize
     }
 
-    /// Open all the data files as part of the projection schema.
+    /// Open a FileFragment with a given default projection.
+    ///
+    /// All read operations (other than `read_projected`) will use the supplied
+    /// default projection. For `read_projected`, the projection must be a subset
+    /// of the default projection.
     ///
     /// Parameters
     /// - `projection`: The projection schema.
