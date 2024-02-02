@@ -50,7 +50,7 @@ jobs:
         pip install torch --index-url https://download.pytorch.org/whl/cpu
     - name: Lint Python
       run: |
-        ruff format --check python
+        ruff format --preview --check python
         ruff check --preview python
     - name: Install dependencies
       run: |
