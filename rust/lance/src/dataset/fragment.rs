@@ -20,12 +20,13 @@ use std::sync::Arc;
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
+use arrow_schema::Schema as ArrowSchema;
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
-use futures::stream::BoxStream;
-use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{join, Future, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::deletion::DeletionVector;
+use lance_core::ROW_ID_FIELD;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_datafusion::chunker::chunk_stream;
 use lance_datafusion::utils::reader_to_stream;
@@ -165,7 +166,8 @@ impl FileFragment {
             });
         }
 
-        FragmentReader::try_new(self.id(), deletion_vec, opened_files)
+        let output_schema = ArrowSchema::from(projection);
+        FragmentReader::try_new(self.id(), deletion_vec, opened_files, output_schema)
     }
 
     fn get_field_id_offset(data_file: &DataFile) -> u32 {
@@ -718,6 +720,9 @@ pub struct FragmentReader {
     /// Readers and schema of each opened data file.
     readers: Vec<(FileReader, Schema)>,
 
+    /// The output schema. The defines the order in which the columns are returned.
+    output_schema: ArrowSchema,
+
     /// The deleted row IDs
     deletion_vec: Option<Arc<DeletionVector>>,
 
@@ -754,6 +759,7 @@ impl FragmentReader {
         fragment_id: usize,
         deletion_vec: Option<Arc<DeletionVector>>,
         readers: Vec<(FileReader, Schema)>,
+        output_schema: ArrowSchema,
     ) -> Result<Self> {
         if readers.is_empty() {
             return Err(Error::IO {
@@ -773,6 +779,7 @@ impl FragmentReader {
         }
         Ok(Self {
             readers,
+            output_schema,
             deletion_vec,
             fragment_id,
             with_row_id: false,
@@ -782,6 +789,10 @@ impl FragmentReader {
     pub(crate) fn with_row_id(&mut self) -> &mut Self {
         self.with_row_id = true;
         self.readers[0].0.with_row_id(true);
+        self.output_schema = self
+            .output_schema
+            .try_with_column(ROW_ID_FIELD.clone())
+            .expect("Table already has a column named _rowid");
         self
     }
 
@@ -830,25 +841,36 @@ impl FragmentReader {
         }
     }
 
+    async fn read_impl<'a, Fut>(
+        &'a self,
+        read_fn: impl Fn(&'a FileReader, &'a Schema) -> Fut,
+    ) -> Result<RecordBatch>
+    where
+        Fut: Future<Output = Result<RecordBatch>> + 'a,
+    {
+        let futures = self
+            .readers
+            .iter()
+            .map(|(reader, schema)| read_fn(reader, schema))
+            .collect::<Vec<_>>();
+        let batches = try_join_all(futures).await?;
+        Ok(merge_batches(&batches)?.project_by_schema(&self.output_schema)?)
+    }
+
     pub(crate) async fn read_batch(
         &self,
         batch_id: usize,
         params: impl Into<ReadBatchParams> + Clone,
     ) -> Result<RecordBatch> {
-        // TODO: use tokio::async buffer to make parallel reads.
-        let mut batches = vec![];
-        for (reader, schema) in self.readers.iter() {
-            let batch = reader
-                .read_batch(
-                    batch_id as i32,
-                    params.clone(),
-                    schema,
-                    self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
-                )
-                .await?;
-            batches.push(batch);
-        }
-        merge_batches(&batches)
+        self.read_impl(move |reader, schema| {
+            reader.read_batch(
+                batch_id as i32,
+                params.clone(),
+                schema,
+                self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
+            )
+        })
+        .await
     }
 
     /// Read a batch of rows from the fragment, with a subset of columns.
@@ -896,45 +918,41 @@ impl FragmentReader {
             });
         let batches = try_join_all(read_tasks).await?;
         let batches = batches.into_iter().flatten().collect::<Vec<_>>();
-        let result = merge_batches(&batches)?;
+
+        let output_schema = {
+            let mut output_schema = ArrowSchema::from(projection);
+            if self.with_row_id {
+                output_schema = output_schema.try_with_column(ROW_ID_FIELD.clone())?;
+            }
+            output_schema
+        };
+
+        let result = merge_batches(&batches)?.project_by_schema(&output_schema)?;
 
         Ok(result)
     }
 
     pub async fn read_range(&self, range: Range<usize>) -> Result<RecordBatch> {
-        // TODO: Putting this loop in async blocks cause lifetime issues.
-        // We need to fix
-        let mut batches = vec![];
-        for (reader, schema) in self.readers.iter() {
-            let batch = reader
-                .read_range(
-                    range.start..range.end,
-                    schema,
-                    self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
-                )
-                .await?;
-            batches.push(batch);
-        }
-
-        merge_batches(&batches)
+        self.read_impl(move |reader, schema| {
+            reader.read_range(
+                range.start..range.end,
+                schema,
+                self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
+            )
+        })
+        .await
     }
 
     /// Take rows from this fragment.
     pub async fn take(&self, indices: &[u32]) -> Result<RecordBatch> {
-        // Boxed to avoid lifetime issue.
-        let stream: BoxStream<_> = futures::stream::iter(&self.readers)
-            .map(|(reader, schema)| {
-                reader.take(
-                    indices,
-                    schema,
-                    self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
-                )
-            })
-            .buffered(num_cpus::get())
-            .boxed();
-        let batches: Vec<RecordBatch> = stream.try_collect::<Vec<_>>().await?;
-
-        merge_batches(&batches)
+        self.read_impl(move |reader, schema| {
+            reader.take(
+                indices,
+                schema,
+                self.deletion_vec.as_ref().map(|dv| dv.as_ref()),
+            )
+        })
+        .await
     }
 }
 
@@ -946,6 +964,8 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
     use futures::TryStreamExt;
+    use lance_core::ROW_ID_FIELD;
+    use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
     use super::*;
@@ -1443,5 +1463,96 @@ mod tests {
             file_reader.num_rows_in_batch(file_reader.num_batches() as i32 - 1) as i32,
             in_memory_batch * 10 % 100
         );
+    }
+
+    #[tokio::test]
+    async fn test_shuffled_columns() -> Result<()> {
+        // Validates we can handle datasets where the order of columns is not
+        // aligned with the order of the data files. This can happen when replacing
+        // columns in a dataset.
+        let batch_i = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "i",
+                DataType::Int32,
+                true,
+            )])),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )?;
+
+        let batch_s = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "s",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..20).map(|v| format!("s-{}", v)),
+            ))],
+        )?;
+
+        // Write batch_i as a fragment
+        let test_dir = tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch_i.clone())], batch_i.schema().clone()),
+            test_uri,
+            None,
+        )
+        .await?;
+        let fragment = dataset.get_fragments().pop().unwrap();
+
+        // Write batch_s using add_columns
+        let mut updater = fragment.updater(Some(&["i"])).await?;
+        updater.next().await?;
+        updater.update(batch_s.clone()).await?;
+        let frag = updater.finish().await?;
+
+        // Rearrange schema so it's `s` then `i`.
+        let schema = updater.schema().unwrap().clone().project(&["s", "i"])?;
+
+        let dataset = Dataset::commit(
+            test_uri,
+            Operation::Merge {
+                schema,
+                fragments: vec![frag],
+            },
+            Some(dataset.manifest.version),
+            None,
+            None,
+        )
+        .await?;
+
+        let expected_data = batch_s.merge(&batch_i)?;
+        let actual_data = dataset.scan().try_into_batch().await?;
+        assert_eq!(expected_data, actual_data);
+
+        // Also take, read_range, and read_batch_projected
+        let reader = dataset
+            .get_fragments()
+            .first()
+            .unwrap()
+            .open(dataset.schema())
+            .await?;
+        let actual_data = reader.take(&[0, 1, 2]).await?;
+        assert_eq!(expected_data.slice(0, 3), actual_data);
+
+        let actual_data = reader.read_range(0..3).await?;
+        assert_eq!(expected_data.slice(0, 3), actual_data);
+
+        let actual_data = reader
+            .read_batch_projected(0, .., &dataset.schema().project(&["s", "i"]).unwrap())
+            .await?;
+        assert_eq!(expected_data, actual_data);
+
+        // Also check case of row_id.
+        let expected_data = expected_data.try_with_column(
+            ROW_ID_FIELD.clone(),
+            Arc::new(UInt64Array::from_iter_values(0..20)),
+        )?;
+        let actual_data = dataset.scan().with_row_id().try_into_batch().await?;
+        assert_eq!(expected_data, actual_data);
+
+        Ok(())
     }
 }
