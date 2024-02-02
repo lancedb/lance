@@ -153,7 +153,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         with_row_id: bool = False,
         rank: Optional[int] = None,
         world_size: Optional[int] = None,
-        shard_granularity: Optional[Literal["fragment", "batch"]] = "fragment",
+        shard_granularity: Optional[Literal["fragment", "batch"]] = None,
         batch_readehead: int = 16,
         to_tensor_fn: Optional[
             callable[[pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]]
@@ -215,19 +215,20 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self.shard_granularity = shard_granularity
-        if not sampler:
+        if sampler is None:
             if shard_granularity is None:
-                sampler = FullScanSampler()
+                if (rank is not None or world_size is not None):
+                    warnings.warn(
+                        "rank and world_size are deprecated,"
+                        + " use SharedFragmentSampler instead.",
+                        DeprecationWarning,
+                    )
+                    sampler = ShardedFragmentSampler(rank=rank, world_size=world_size)
+                else:
+                    sampler = FullScanSampler()
             elif shard_granularity == "batch":
                 sampler = ShardedBatchSampler(rank, world_size)
             elif shard_granularity == "fragment":
-                sampler = ShardedFragmentSampler(rank, world_size)
-            elif rank is not None and world_size is not None:
-                warnings.warn(
-                    "rank and world_size are deprecated,"
-                    + " use SharedFragmentSampler instead.",
-                    DeprecationWarning,
-                )
                 sampler = ShardedFragmentSampler(rank, world_size)
             else:
                 raise ValueError("Invalid shard_granularity: {}")
