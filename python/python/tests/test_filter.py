@@ -177,9 +177,9 @@ def test_escaped_name(tmp_path: Path, provide_pandas: bool):
         result, pd.DataFrame([{"ALLCAPSNAME": 1, "other": 3}])
     )
 
-    table = pa.table(
-        {"Nested with Space": pa.array([{"Inner With Caps": i} for i in range(3)])}
-    )
+    table = pa.table({
+        "Nested with Space": pa.array([{"Inner With Caps": i} for i in range(3)])
+    })
     _ = lance.write_dataset(table, tmp_path / "test_escaped_name_nested_and_capped")
 
     dataset = lance.dataset(tmp_path / "test_escaped_name_nested_and_capped")
@@ -193,9 +193,9 @@ def test_escaped_name(tmp_path: Path, provide_pandas: bool):
 
 def test_functions(tmp_path: Path):
     # Ensure that we can use complex functions
-    table = pa.table(
-        {"genres": [["action", "comedy"], ["anime", "drama"], ["adventure"]]}
-    )
+    table = pa.table({
+        "genres": [["action", "comedy"], ["anime", "drama"], ["adventure"]]
+    })
     expected = table.slice(1, 2)
     dataset = lance.write_dataset(table, tmp_path / "test_neg_expr")
     assert (

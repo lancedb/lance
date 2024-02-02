@@ -264,9 +264,9 @@ def lance_fragments(dataset: Union[str, Path, LanceDataset]) -> tf.data.Dataset:
     """
     if not isinstance(dataset, LanceDataset):
         dataset = lance.dataset(dataset)
-    return tf.data.Dataset.from_tensor_slices(
-        [f.fragment_id for f in dataset.get_fragments()]
-    )
+    return tf.data.Dataset.from_tensor_slices([
+        f.fragment_id for f in dataset.get_fragments()
+    ])
 
 
 def _ith_batch(i: int, batch_size: int, total_size: int) -> Tuple[int, int]:

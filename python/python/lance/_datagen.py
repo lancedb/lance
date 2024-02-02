@@ -15,6 +15,7 @@
 """
 An internal module for generating Arrow data for use in testing and benchmarking.
 """
+
 import pyarrow as pa
 
 from .lance import datagen

@@ -991,12 +991,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         index_type = index_type.upper()
         if index_type != "BTREE":
-            raise NotImplementedError(
-                (
-                    'Only "BTREE" is supported for ',
-                    f"index_type.  Received {index_type}",
-                )
-            )
+            raise NotImplementedError((
+                'Only "BTREE" is supported for ',
+                f"index_type.  Received {index_type}",
+            ))
 
         self._ds.create_index([column], index_type, name, replace)
 

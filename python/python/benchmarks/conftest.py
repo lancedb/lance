@@ -16,6 +16,7 @@ pytest configurations for benchmarks.
 
 For configuration that is shared between tests and benchmarks, see ../conftest.py
 """
+
 from pathlib import Path
 
 import pytest

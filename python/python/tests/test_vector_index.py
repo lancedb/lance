@@ -435,12 +435,10 @@ def create_uniform_table(min, max, nvec, offset, ndim=8):
     mat = np.random.uniform(min, max, (nvec, ndim))
     # rowid = np.arange(offset, offset + nvec)
     tbl = vec_to_table(data=mat)
-    tbl = pa.Table.from_pydict(
-        {
-            "vector": tbl.column(0).chunk(0),
-            "filterable": np.arange(offset, offset + nvec),
-        }
-    )
+    tbl = pa.Table.from_pydict({
+        "vector": tbl.column(0).chunk(0),
+        "filterable": np.arange(offset, offset + nvec),
+    })
     return tbl
 
 
@@ -508,12 +506,10 @@ def test_knn_with_deletions(tmp_path):
     values = pa.array(
         [x for val in range(50) for x in [float(val)] * 5], type=pa.float32()
     )
-    tbl = pa.Table.from_pydict(
-        {
-            "vector": pa.FixedSizeListArray.from_arrays(values, dims),
-            "filterable": pa.array(range(50)),
-        }
-    )
+    tbl = pa.Table.from_pydict({
+        "vector": pa.FixedSizeListArray.from_arrays(values, dims),
+        "filterable": pa.array(range(50)),
+    })
     dataset = lance.write_dataset(tbl, tmp_path, max_rows_per_group=10)
 
     dataset.delete("not (filterable % 5 == 0)")
