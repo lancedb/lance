@@ -11,7 +11,6 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-
 from pathlib import Path
 
 import lance
@@ -48,3 +47,32 @@ def test_drop_columns(tmp_path: Path):
     # Can't drop all columns
     with pytest.raises(ValueError):
         dataset.drop_columns(["c"])
+
+
+def test_alter_columns(tmp_path: Path):
+    schema = pa.schema([
+        pa.field("a", pa.int64(), nullable=False),
+        pa.field("b", pa.string(), nullable=False),
+    ])
+    tab = pa.table(
+        {"a": pa.array([1, 2, 3]), "b": pa.array(["a", "b", "c"])}, schema=schema
+    )
+
+    dataset = lance.write_dataset(tab, tmp_path)
+
+    dataset.alter_columns(
+        {"path": "a", "name": "x", "nullable": True},
+        {"path": "b", "name": "y"},
+    )
+
+    expected_schema = pa.schema([
+        pa.field("x", pa.int64()),
+        pa.field("y", pa.string(), nullable=False),
+    ])
+    assert dataset.schema == expected_schema
+
+    expected_tab = pa.table(
+        {"x": pa.array([1, 2, 3]), "y": pa.array(["a", "b", "c"])},
+        schema=expected_schema,
+    )
+    assert dataset.to_table() == expected_tab
