@@ -154,6 +154,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         rank: Optional[int] = None,
         world_size: Optional[int] = None,
         shard_granularity: Optional[Literal["fragment", "batch"]] = "fragment",
+        batch_readehead: int = 16,
         to_tensor_fn: Optional[
             callable[[pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]]
         ] = None,
@@ -188,6 +189,8 @@ class LanceDataset(torch.utils.data.IterableDataset):
             the a subset of fragments.
             If set to "batch", it will read the "batch" interleave with the
             same fragments.
+        batch_readahead: int, optional
+            The number of batches to read ahead in different (Rust) threads for each fragment.
         sampler: callable, optional
             A function that samples the dataset.
         to_tensor_fn : callable, optional
@@ -202,6 +205,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.samples: Optional[int] = samples
         self.filter = filter
         self.with_row_id = with_row_id
+        self.batch_readahead = batch_readehead
         if to_tensor_fn is None:
             to_tensor_fn = _to_tensor
         self._to_tensor_fn = to_tensor_fn
@@ -256,6 +260,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
                     columns=self.columns,
                     batch_size=self.batch_size,
                     with_row_id=self.with_row_id,
+                    batch_readahead=self.batch_readahead,
                 )
 
             stream = _buffer_arrow_batches(raw_stream, buffer_size=self.batch_size)
