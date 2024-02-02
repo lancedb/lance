@@ -201,12 +201,31 @@ impl Schema {
     /// to distinguish from nested fields.
     // TODO: pub(crate)
     pub fn validate(&self) -> Result<()> {
+        let mut seen_names = HashSet::new();
+
         for field in self.fields.iter() {
             if field.name.contains('.') {
                 return Err(Error::Schema{message:format!(
                     "Top level field {} cannot contain `.`. Maybe you meant to create a struct field?",
                     field.name.clone()
                 ), location: location!(),});
+            }
+
+            let column_path = self
+                .field_ancestry_by_id(field.id)
+                .unwrap()
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if !seen_names.insert(column_path.clone()) {
+                return Err(Error::Schema {
+                    message: format!(
+                        "Duplicate field name \"{}\" in schema:\n {:#?}",
+                        column_path, self
+                    ),
+                    location: location!(),
+                });
             }
         }
 

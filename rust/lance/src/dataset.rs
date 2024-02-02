@@ -1510,6 +1510,8 @@ impl Dataset {
             }
         }
 
+        new_schema.validate()?;
+
         // If we aren't casting a column, we don't need to touch the fragments.
         let transaction = Transaction::new(
             self.manifest.version,
@@ -3817,6 +3819,13 @@ mod tests {
             metadata.clone(),
         );
         assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
+
+        // Rename to duplicate name fails
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("b".into()).rename("x".into())])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Duplicate field name \"x\""));
 
         // Rename a nested column.
         dataset
