@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from heapq import heappush, heappushpop
@@ -266,19 +267,32 @@ class ShardedBatchSampler(Sampler):
         self._world_size = world_size
 
     def __call__(
-        self, dataset: lance.LanceDataset, *args, **kwargs
+        self,
+        dataset: lance.LanceDataset,
+        *args,
+        batch_size: int = 128,
+        columns: Optional[List[str]] = None,
+        batch_readahead: int = 16,
+        with_row_id: Optional[bool] = None,
+        **kwargs,
     ) -> Generator[lance.RecordBatch, None, None]:
-        total = self._ds.count_rows()
+        total = dataset.count_rows()
+
+        if with_row_id is not None:
+            warnings.warn(
+                "with_row_id is not supported for ShardedBatchSampler",
+            )
 
         def _gen_ranges():
             for start in range(
-                self._rank * self._batch_size,
+                self._rank * batch_size,
                 total,
-                self._world_size * self._batch_size,
+                self._world_size * batch_size,
             ):
-                yield start, min(start + self._batch_size, total)
+                yield start, min(start + batch_size, total)
 
-        return dataset.take_scan(
+        return dataset._ds.take_scan(
             _gen_ranges(),
-            columns=self._columns,
+            columns=columns,
+            batch_readahead=batch_readahead,
         )
