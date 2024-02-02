@@ -299,7 +299,7 @@ class ShardedFragmentSampler(FragmentSampler):
         self, dataset: lance.LanceDataset, **kwargs
     ) -> Generator[lance.LanceFragment, None, None]:
         fragments = dataset.get_fragments()
-        if self.randomize:
+        if self._randomize:
             random.seed(self._seed)
             fragments = random.shuffle(fragments)
         for idx in range(self._rank, len(fragments), self._world_size):
