@@ -50,9 +50,10 @@ def create_table(min, max, nvec, ndim=8):
     mat = np.random.uniform(min, max, (nvec, ndim))
     tbl = vec_to_table(data=mat)
     # Add id column for filtering
-    tbl = pa.Table.from_pydict(
-        {"vector": tbl.column(0).chunk(0), "id": np.arange(0, nvec)}
-    )
+    tbl = pa.Table.from_pydict({
+        "vector": tbl.column(0).chunk(0),
+        "id": np.arange(0, nvec),
+    })
     return tbl
 
 

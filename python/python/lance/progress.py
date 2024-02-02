@@ -210,12 +210,10 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
                     fragment_metadata = FragmentMetadata.from_json(
                         f.read().decode("utf-8")
                     )
-                objects.append(
-                    (
-                        fragment_metadata.data_files()[0].path(),
-                        progress_data["multipart_id"],
-                    )
-                )
+                objects.append((
+                    fragment_metadata.data_files()[0].path(),
+                    progress_data["multipart_id"],
+                ))
 
         _cleanup_partial_writes(dataset_uri, objects)
 

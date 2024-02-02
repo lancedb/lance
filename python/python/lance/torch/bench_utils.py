@@ -143,9 +143,9 @@ def recall(expected: np.ndarray, actual: np.ndarray) -> np.ndarray:
         The ANN results
     """
     assert expected.shape == actual.shape
-    recalls = np.array(
-        [np.isin(exp, act).sum() / exp.shape[0] for exp, act in zip(expected, actual)]
-    )
+    recalls = np.array([
+        np.isin(exp, act).sum() / exp.shape[0] for exp, act in zip(expected, actual)
+    ])
     return recalls
 
 

@@ -18,21 +18,25 @@
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
 
-import logging
 import math
-from typing import TYPE_CHECKING, Iterable, Literal, Optional, Union
+import warnings
+from pathlib import Path
+from typing import Iterable, Literal, Optional, Union
 
 import pyarrow as pa
 
+import lance
 from lance._dataset.cache import CachedDataset
-from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.dependencies import _check_for_numpy, torch
 from lance.dependencies import numpy as np
 
-from ..sampler import maybe_sample
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from ..sampler import (
+    FullScanSampler,
+    Sampler,
+    ShardedBatchSampler,
+    ShardedFragmentSampler,
+    maybe_sample,
+)
 
 __all__ = ["LanceDataset"]
 
@@ -135,7 +139,7 @@ def _buffer_arrow_batches(
 
 
 class LanceDataset(torch.utils.data.IterableDataset):
-    """PyTorch IterableDataset over LanceDataset."""
+    """PyTorch :class:`torch.utils.data.IterableDataset` over lance dataset."""
 
     def __init__(
         self,
@@ -149,19 +153,60 @@ class LanceDataset(torch.utils.data.IterableDataset):
         with_row_id: bool = False,
         rank: Optional[int] = None,
         world_size: Optional[int] = None,
-        shard_granularity: Optional[Literal["fragment", "batch"]] = "fragment",
+        shard_granularity: Optional[Literal["fragment", "batch"]] = None,
+        batch_readehead: int = 16,
         to_tensor_fn: Optional[
             callable[[pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]]
         ] = None,
+        sampler: Optional[Sampler] = None,
         **kwargs,
     ):
+        """Use PyTorch Dataset API to read Lance dataset.
+
+        Parameters
+        ----------
+        dataset : Union[torch.utils.data.Dataset, str, Path]
+            Lance dataset to read. Can be URI, path, or an initialized Lance Dataset.
+        batch_size : int
+            Batch size to yield for each iteration.
+        columns : list of str, optional
+            The names of the column to read, by default None, which means reading all
+            columns.
+        filter : str, optional
+            If set, only rows that match the filter will be read.
+        cache : str or bool, optional
+            If set true, the dataset will be cached on disk from the first iteration.
+            The following iterations will read from the cache.
+        with_row_id : bool, optional
+            If set true, the returned batch will have an additional column named
+            `_rowid` that contains the row id of the batch.
+        rank: int, optional
+            If set, the rank (idx) of this process in distributed training / inference.
+        world_size: int, optional
+            If set, the total number of processes in distributed training / inference.
+        shard_granularity: str, optional
+            The basic unit of sharding data. If set to "fragment", each worker will get
+            the a subset of fragments.
+            If set to "batch", it will read the "batch" interleave with the
+            same fragments.
+        batch_readahead: int, optional
+            The number of batches to read ahead in different (Rust) threads for each
+            fragment.
+        sampler: callable, optional
+            A function that samples the dataset.
+        to_tensor_fn : callable, optional
+            A function that converts a pyarrow RecordBatch to torch.Tensor.
+        """
         super().__init__(*args, **kwargs)
+        if isinstance(dataset, (str, Path)):
+            dataset = lance.dataset(dataset)
         self.dataset = dataset
         self.columns = columns
         self.batch_size = batch_size
         self.samples: Optional[int] = samples
         self.filter = filter
         self.with_row_id = with_row_id
+        self.batch_readahead = batch_readehead
         if to_tensor_fn is None:
             to_tensor_fn = _to_tensor
         self._to_tensor_fn = to_tensor_fn
@@ -170,8 +215,26 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self.shard_granularity = shard_granularity
+        if sampler is None:
+            if shard_granularity is None:
+                if rank is not None or world_size is not None:
+                    warnings.warn(
+                        "rank and world_size are deprecated,"
+                        + " use SharedFragmentSampler instead.",
+                    )
+                    sampler = ShardedFragmentSampler(rank=rank, world_size=world_size)
+                else:
+                    sampler = FullScanSampler()
+            elif shard_granularity == "batch":
+                sampler = ShardedBatchSampler(rank, world_size)
+            elif shard_granularity == "fragment":
+                sampler = ShardedFragmentSampler(rank, world_size)
+            else:
+                raise ValueError("Invalid shard_granularity: {}")
 
-        if samples is not None and filter is not None:
+        self.sampler: Sampler = sampler
+
+        if (samples is not None or sampler is not None) and filter is not None:
             raise ValueError("Does not support sampling over filtered dataset")
 
         self.cache = cache
@@ -192,28 +255,13 @@ class LanceDataset(torch.utils.data.IterableDataset):
                     columns=self.columns,
                     batch_size=self.batch_size,
                 )
-            elif self.rank is not None and self.world_size is not None:
-                logging.info(
-                    "Sharded Torch Dataset: rank=%s, world_size=%s, granularity=%s",
-                    self.rank,
-                    self.world_size,
-                    self.shard_granularity,
-                )
-                raw_stream = ShardedBatchIterator(
-                    self.dataset,
-                    self.rank,
-                    self.world_size,
-                    columns=self.columns,
-                    batch_size=self.batch_size,
-                    with_row_id=self.with_row_id,
-                    granularity=self.shard_granularity,
-                )
             else:
-                raw_stream = self.dataset.to_batches(
+                raw_stream = self.sampler(
+                    self.dataset,
                     columns=self.columns,
                     batch_size=self.batch_size,
-                    filter=self.filter,
                     with_row_id=self.with_row_id,
+                    batch_readahead=self.batch_readahead,
                 )
 
             stream = _buffer_arrow_batches(raw_stream, buffer_size=self.batch_size)

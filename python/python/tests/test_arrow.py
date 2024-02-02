@@ -171,13 +171,11 @@ def test_bf16_roundtrip(tmp_path: Path):
     tensors = pa.ExtensionArray.from_storage(
         pa.fixed_shape_tensor(values.type, [3]), vectors
     )
-    data = pa.table(
-        {
-            "values": values.slice(0, 3),
-            "vector": vectors,
-            "tensors": tensors,
-        }
-    )
+    data = pa.table({
+        "values": values.slice(0, 3),
+        "vector": vectors,
+        "tensors": tensors,
+    })
     ds = lance.write_dataset(data, tmp_path)
     assert ds.schema == data.schema
     assert ds.to_table() == data
