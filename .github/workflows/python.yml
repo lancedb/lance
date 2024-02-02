@@ -51,7 +51,7 @@ jobs:
     - name: Lint Python
       run: |
         ruff format --check python
-        ruff check python
+        ruff check --preview python
     - name: Install dependencies
       run: |
         sudo apt update
