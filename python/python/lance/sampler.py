@@ -301,7 +301,7 @@ class ShardedFragmentSampler(FragmentSampler):
         fragments = dataset.get_fragments()
         if self._randomize:
             random.seed(self._seed)
-            fragments = random.shuffle(fragments)
+            random.shuffle(fragments)
         for idx in range(self._rank, len(fragments), self._world_size):
             yield fragments[idx]
 
