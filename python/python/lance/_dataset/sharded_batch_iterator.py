@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Generator, List, Literal, Union
 
 import lance
@@ -74,6 +75,10 @@ class ShardedBatchIterator:
         batch_readahead: int = 8,
         with_row_id: bool = False,
     ):
+        warnings.warn(
+            "ShardedBatchIterator is deprecated, use :class:`Sampler` instead",
+            DeprecationWarning,
+        )
         self._rank = rank
         self._world_size = world_size
         self._batch_size = batch_size
