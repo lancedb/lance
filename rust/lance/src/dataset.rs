@@ -1100,7 +1100,7 @@ impl Dataset {
                 )
             })?;
 
-            let reader = fragment.open(projection.as_ref()).await?;
+            let reader = fragment.open(projection.as_ref(), false).await?;
             reader.read_range(range).await
         } else if row_id_meta.sorted {
             // Don't need to re-arrange data, just concatenate
@@ -1803,7 +1803,7 @@ mod tests {
         assert_eq!(dataset.count_fragments(), 10);
         for fragment in &fragments {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
-            let reader = fragment.open(dataset.schema()).await.unwrap();
+            let reader = fragment.open(dataset.schema(), false).await.unwrap();
             assert_eq!(reader.num_batches(), 10);
             for i in 0..reader.num_batches() {
                 assert_eq!(reader.num_rows_in_batch(i), 10);
