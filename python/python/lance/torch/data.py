@@ -217,7 +217,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.shard_granularity = shard_granularity
         if sampler is None:
             if shard_granularity is None:
-                if (rank is not None or world_size is not None):
+                if rank is not None or world_size is not None:
                     warnings.warn(
                         "rank and world_size are deprecated,"
                         + " use SharedFragmentSampler instead.",
