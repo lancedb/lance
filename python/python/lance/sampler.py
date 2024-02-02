@@ -189,7 +189,11 @@ def reservoir_sampling(stream: Iterable[T], k: int) -> list[T]:
 
 
 class Sampler(ABC):
-    """Sampler over LanceDataset."""
+    """Sampler over LanceDataset.
+
+    To implement a new `Sampler`, you can implement the `__call__` method to yield
+    a `pyarrow.RecordBatch`.
+    """
 
     @abstractmethod
     def __call__(
@@ -202,6 +206,7 @@ class Sampler(ABC):
         with_row_id: bool = False,
         **kwargs,
     ) -> Generator[pa.RecordBatch, None, None]:
+        """A generator to yield `pyarrow.RecordBatch` from the dataset."""
         pass
 
 
@@ -235,11 +240,13 @@ class FragmentSampler(Sampler):
     def iter_fragments(
         self, ds: lance.LanceDataset, *args, **kwargs
     ) -> Generator[lance.LanceFragment, None, None]:
-        """Iterate over fragments."""
+        """Iterate over data fragments."""
         pass
 
 
 class FullScanSampler(FragmentSampler):
+    """Default Sampler, which scan the entire dataset sequentially."""
+
     def iter_fragments(
         self, dataset: lance.LanceDataset, **kwargs
     ) -> Generator[lance.LanceFragment, None, None]:
@@ -247,6 +254,11 @@ class FullScanSampler(FragmentSampler):
 
 
 class ShardedFragmentSampler(FragmentSampler):
+    """Sharded fragments by rank and world_size.
+
+    Each rank / process will process a subset of the fragments.
+    """
+
     def __init__(self, rank: int, world_size: int):
         super().__init__()
 
@@ -262,6 +274,11 @@ class ShardedFragmentSampler(FragmentSampler):
 
 
 class ShardedBatchSampler(Sampler):
+    """Sharded batch sampler.
+
+    Each rank / process will process a subset of the batches.
+    """
+
     def __init__(self, rank: int, world_size: int):
         self._rank = rank
         self._world_size = world_size
