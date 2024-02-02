@@ -86,6 +86,10 @@ pub enum Error {
     InvalidTableLocation { message: String },
     /// Stream early stop
     Stop,
+    Wrapped {
+        error: BoxedError,
+        location: Location,
+    },
 }
 
 impl Error {
