@@ -221,7 +221,6 @@ class LanceDataset(torch.utils.data.IterableDataset):
                     warnings.warn(
                         "rank and world_size are deprecated,"
                         + " use SharedFragmentSampler instead.",
-                        DeprecationWarning,
                     )
                     sampler = ShardedFragmentSampler(rank=rank, world_size=world_size)
                 else:

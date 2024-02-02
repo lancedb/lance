@@ -77,7 +77,6 @@ class ShardedBatchIterator:
     ):
         warnings.warn(
             "ShardedBatchIterator is deprecated, use :class:`Sampler` instead",
-            DeprecationWarning,
         )
         self._rank = rank
         self._world_size = world_size
