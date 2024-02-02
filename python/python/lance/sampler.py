@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import random
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -259,16 +260,48 @@ class ShardedFragmentSampler(FragmentSampler):
     Each rank / process will process a subset of the fragments.
     """
 
-    def __init__(self, rank: int, world_size: int):
+    def __init__(
+        self, rank: int, world_size: int, randomize: bool = False, seed: int = 0
+    ):
+        """Initialize the ShardedFragmentSampler.
+
+        Parameters
+        ----------
+        rank : int
+            The rank of the process in the distributed cluster.
+        world_size : int
+            The total number of processes in the distributed cluster.
+        randomize : bool
+            If set true, randomize
+        """
         super().__init__()
 
         self._rank = rank
         self._world_size = world_size
+        self._randomize = randomize
+        self._seed = seed
+
+    @staticmethod
+    def from_torch(randomize: bool = False, seed: int = 0) -> ShardedFragmentSampler:
+        """Use from a PyTorch distributed environment.
+
+        Automatically infer `rank` and `world_size` from `torch.distributed`.
+
+        Other parameters, see :py:meth:`ShardedBatchIterator.__init__`.
+        """
+        import torch
+
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        return ShardedFragmentSampler(rank, world_size, randomize=randomize, seed=seed)
 
     def iter_fragments(
         self, dataset: lance.LanceDataset, **kwargs
     ) -> Generator[lance.LanceFragment, None, None]:
         fragments = dataset.get_fragments()
+        if self.randomize:
+            random.seed(self._seed)
+            fragments = random.shuffle(fragments)
         for idx in range(self._rank, len(fragments), self._world_size):
             yield fragments[idx]
 
@@ -279,9 +312,25 @@ class ShardedBatchSampler(Sampler):
     Each rank / process will process a subset of the batches.
     """
 
-    def __init__(self, rank: int, world_size: int):
+    def __init__(
+        self, rank: int, world_size: int, randomize: bool = False, seed: int = 0
+    ):
         self._rank = rank
         self._world_size = world_size
+        self._randomize = randomize
+        self._seed = seed
+
+    @staticmethod
+    def from_torch(randomize: bool = False, seed: int = 0) -> ShardedBatchSampler:
+        """Use it from a PyTorch distributed environment.
+
+        Automatically infer `rank` and `world_size` from `torch.distributed`.
+        """
+        import torch
+
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        return ShardedBatchSampler(rank, world_size, randomize=randomize, seed=seed)
 
     def __call__(
         self,
@@ -308,8 +357,13 @@ class ShardedBatchSampler(Sampler):
             ):
                 yield start, min(start + batch_size, total)
 
+        ranges = list(_gen_ranges())
+        if self._randomize:
+            random.seed(self._seed)
+            random.shuffle(ranges)
+
         return dataset._ds.take_scan(
-            _gen_ranges(),
+            ranges,
             columns=columns,
             batch_readahead=batch_readahead,
         )

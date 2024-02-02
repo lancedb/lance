@@ -190,7 +190,8 @@ class LanceDataset(torch.utils.data.IterableDataset):
             If set to "batch", it will read the "batch" interleave with the
             same fragments.
         batch_readahead: int, optional
-            The number of batches to read ahead in different (Rust) threads for each fragment.
+            The number of batches to read ahead in different (Rust) threads for each
+            fragment.
         sampler: callable, optional
             A function that samples the dataset.
         to_tensor_fn : callable, optional
