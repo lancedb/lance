@@ -1474,6 +1474,40 @@ pub enum NewColumnTransform {
     SqlExpressions(Vec<(String, String)>),
 }
 
+/// Definition of a change to a column in a dataset
+pub struct ColumnAlteration {
+    /// Path to the existing column to be altered.
+    pub path: String,
+    /// The new name of the column. If None, the column name will not be changed.
+    pub rename: Option<String>,
+    /// Whether the column is nullable. If None, the nullability will not be changed.
+    pub nullable: Option<bool>,
+    // TODO: support changing data type.
+}
+
+impl ColumnAlteration {
+    pub fn new(path: String) -> Self {
+        Self {
+            path,
+            rename: None,
+            // data_type: None,
+            nullable: None,
+        }
+    }
+
+    pub fn rename(mut self, name: String) -> Self {
+        self.rename = Some(name);
+        self
+    }
+
+    pub fn set_nullable(mut self, nullable: bool) -> Self {
+        self.nullable = Some(nullable);
+        self
+    }
+}
+
+// TODO: move all schema evolution methods to this impl and provide a dedicated
+// docs section to describe the schema evolution methods.
 impl Dataset {
     /// Append new columns to the dataset.
     pub async fn add_columns(
@@ -1655,6 +1689,67 @@ impl Dataset {
             .try_collect::<Vec<_>>()
             .await?;
         Ok(fragments)
+    }
+
+    /// Modify columns in the dataset, changing their name, type, or nullability.
+    ///
+    /// If a column has an index, it's index will be preserved or transformed to
+    /// the new type as part of the operation.
+    pub async fn alter_columns(&mut self, alterations: &[ColumnAlteration]) -> Result<()> {
+        // Validate we aren't making nullable columns non-nullable and that all
+        // the referenced columns actually exist.
+        let mut new_schema = self.schema().clone();
+
+        for alteration in alterations {
+            let field = self.schema().field(&alteration.path).ok_or_else(|| {
+                Error::invalid_input(
+                    format!("Column {} does not exist in the dataset", alteration.path),
+                    location!(),
+                )
+            })?;
+            if let Some(nullable) = alteration.nullable {
+                // TODO: in the future, we could check the values of the column to see if
+                //       they are all non-null and thus the column could be made non-nullable.
+                if field.nullable && !nullable {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "Column {} is already nullable and thus cannot be made non-nullable",
+                            alteration.path
+                        ),
+                        location!(),
+                    ));
+                }
+            }
+
+            let field_mut = new_schema.mut_field_by_id(field.id).unwrap();
+            if let Some(rename) = &alteration.rename {
+                field_mut.name = rename.clone();
+            }
+            if let Some(nullable) = alteration.nullable {
+                field_mut.nullable = nullable;
+            }
+        }
+
+        // If we aren't casting a column, we don't need to touch the fragments.
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Project { schema: new_schema },
+            None,
+        );
+
+        let manifest = commit_transaction(
+            self,
+            &self.object_store,
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+        )
+        .await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
     }
 
     /// Remove columns from the dataset.
@@ -4205,6 +4300,98 @@ mod tests {
                 batch_index: 1,
             },]
         );
+
+        Ok(())
+    }
+    async fn test_rename_columns() -> Result<()> {
+        let metadata: HashMap<String, String> = [("k1".into(), "v1".into())].into();
+
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new(
+                    "b",
+                    DataType::Struct(ArrowFields::from(vec![Field::new(
+                        "c",
+                        DataType::Int32,
+                        true,
+                    )])),
+                    true,
+                ),
+            ],
+            metadata.clone(),
+        ));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StructArray::from(vec![(
+                    Arc::new(ArrowField::new("c", DataType::Int32, true)),
+                    Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                )])),
+            ],
+        )?;
+
+        let test_dir = tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await?;
+
+        let original_fragments = dataset.fragments().to_vec();
+
+        // Rename a top-level column
+        dataset
+            .alter_columns(&[ColumnAlteration::new("a".into())
+                .rename("x".into())
+                .set_nullable(true)])
+            .await?;
+        dataset.validate().await?;
+        assert_eq!(dataset.manifest.version, 2);
+        assert_eq!(dataset.fragments().as_ref(), &original_fragments);
+
+        let expected_schema = ArrowSchema::new_with_metadata(
+            vec![
+                Field::new("x", DataType::Int32, true),
+                Field::new(
+                    "b",
+                    DataType::Struct(ArrowFields::from(vec![Field::new(
+                        "c",
+                        DataType::Int32,
+                        true,
+                    )])),
+                    true,
+                ),
+            ],
+            metadata.clone(),
+        );
+        assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
+
+        // Rename a nested column.
+        dataset
+            .alter_columns(&[ColumnAlteration::new("b.c".into()).rename("d".into())])
+            .await?;
+        dataset.validate().await?;
+        assert_eq!(dataset.manifest.version, 3);
+        assert_eq!(dataset.fragments().as_ref(), &original_fragments);
+
+        let expected_schema = ArrowSchema::new_with_metadata(
+            vec![
+                Field::new("x", DataType::Int32, true),
+                Field::new(
+                    "b",
+                    DataType::Struct(ArrowFields::from(vec![Field::new(
+                        "d",
+                        DataType::Int32,
+                        true,
+                    )])),
+                    true,
+                ),
+            ],
+            metadata.clone(),
+        );
+        assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
 
         Ok(())
     }
