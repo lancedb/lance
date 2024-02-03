@@ -32,7 +32,7 @@ use lance::dataset::{
     UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
     WriteParams,
 };
-use lance::dataset::{BatchUDF, NewColumnTransform};
+use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCache};
 use lance::index::{
     scalar::ScalarIndexParams,
     vector::{diskann::DiskANNParams, VectorIndexParams},
@@ -1036,6 +1036,9 @@ impl Dataset {
                 transforms.getattr("output_schema")?.extract()?;
             let append_schema = Arc::new(append_schema.0);
 
+            let result_cache: Option<PyObject> = transforms.getattr("cache")?.extract()?;
+            let result_cache = result_cache.map(|c| PyBatchUDFCacheWrapper { inner: c });
+
             let udf_obj = transforms.to_object(transforms.py());
             let mapper = move |batch: &RecordBatch| -> lance::Result<RecordBatch> {
                 Python::with_gil(|py| {
@@ -1059,7 +1062,7 @@ impl Dataset {
                 mapper: Box::new(mapper),
                 append_schema,
                 read_columns,
-                result_cache: None, // TODO
+                result_cache: result_cache.map(|c| Arc::new(c) as Arc<dyn UDFCache>),
             })
         };
 
@@ -1208,4 +1211,82 @@ fn format_python_error(e: PyErr, py: Python) -> PyResult<String> {
     let formatted = traceback.call1((e,))?;
     let lines: Vec<String> = formatted.extract()?;
     Ok(lines.join(""))
+}
+
+struct PyBatchUDFCacheWrapper {
+    inner: PyObject,
+}
+
+impl PyBatchUDFCacheWrapper {
+    fn batch_info_to_py(&self, info: &BatchInfo, py: Python) -> PyResult<PyObject> {
+        self.inner
+            .getattr(py, "BatchInfo")?
+            .call1(py, (info.fragment_id, info.batch_index))
+    }
+}
+
+impl UDFCache for PyBatchUDFCacheWrapper {
+    fn get_batch(&self, info: &BatchInfo) -> lance::Result<Option<RecordBatch>> {
+        Python::with_gil(|py| {
+            let info = self.batch_info_to_py(info, py)?;
+            let batch = self.inner.call_method1(py, "get_batch", (info,))?;
+            let batch: Option<PyArrowType<RecordBatch>> = batch.extract(py)?;
+            Ok(batch.map(|b| b.0))
+        })
+        .map_err(|err: PyErr| lance_core::Error::IO {
+            message: format!("Failed to call get_batch() on UDFCache: {}", err),
+            location: location!(),
+        })
+    }
+
+    fn get_fragment(&self, fragment_id: u32) -> lance::Result<Option<Fragment>> {
+        let fragment_data = Python::with_gil(|py| {
+            let fragment = self
+                .inner
+                .call_method1(py, "get_fragment", (fragment_id,))?;
+            let fragment: Option<String> = fragment.extract(py)?;
+            Ok(fragment)
+        })
+        .map_err(|err: PyErr| lance_core::Error::IO {
+            message: format!("Failed to call get_fragment() on UDFCache: {}", err),
+            location: location!(),
+        })?;
+        fragment_data
+            .map(|data| {
+                serde_json::from_str(&data).map_err(|err| lance::Error::IO {
+                    message: format!("Failed to deserialize fragment data: {}", err),
+                    location: location!(),
+                })
+            })
+            .transpose()
+    }
+
+    fn insert_batch(&self, info: BatchInfo, batch: RecordBatch) -> lance::Result<()> {
+        Python::with_gil(|py| {
+            let info = self.batch_info_to_py(&info, py)?;
+            let batch = PyArrowType(batch);
+            self.inner.call_method1(py, "insert_batch", (info, batch))?;
+            Ok(())
+        })
+        .map_err(|err: PyErr| lance_core::Error::IO {
+            message: format!("Failed to call insert_batch() on UDFCache: {}", err),
+            location: location!(),
+        })
+    }
+
+    fn insert_fragment(&self, fragment: Fragment) -> lance_core::Result<()> {
+        let data = serde_json::to_string(&fragment).map_err(|err| lance_core::Error::IO {
+            message: format!("Failed to serialize fragment data: {}", err),
+            location: location!(),
+        })?;
+        Python::with_gil(|py| {
+            self.inner
+                .call_method1(py, "insert_fragment", (fragment.id, data))?;
+            Ok(())
+        })
+        .map_err(|err: PyErr| lance_core::Error::IO {
+            message: format!("Failed to call insert_fragment() on UDFCache: {}", err),
+            location: location!(),
+        })
+    }
 }

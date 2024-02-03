@@ -53,7 +53,7 @@ class FragmentMetadata:
             return False
         return self._metadata.__eq__(other._metadata)
 
-    def to_json(self) -> str:
+    def to_json(self):
         """Serialize :class:`FragmentMetadata` to a JSON blob"""
         return json.loads(self._metadata.json())
 

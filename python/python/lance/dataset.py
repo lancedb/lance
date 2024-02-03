@@ -18,7 +18,9 @@ from __future__ import annotations
 import copy
 import json
 import os
+import pickle
 import random
+import sqlite3
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -739,6 +741,10 @@ class LanceDataset(pa.dataset.Dataset):
             raise TypeError("transforms must be a dict or AddColumnsUDF")
 
         self._ds.add_columns(transforms)
+
+        if isinstance(transforms, AddColumnsUDF):
+            if transforms.cache is not None:
+                transforms.cache.cleanup()
 
     def drop_columns(self, columns: List[str]):
         """Drop one or more columns from the dataset
@@ -2424,6 +2430,10 @@ class AddColumnsUDF:
         self.func = func
         self.read_columns = read_columns
         self.output_schema = output_schema
+        if cache_file is not None:
+            self.cache = BatchUDFCache(cache_file)
+        else:
+            self.cache = None
 
     def __call__(self, batch: pa.RecordBatch):
         # Directly call inner function. This is to allow the user to test the
@@ -2481,6 +2491,71 @@ def add_columns_udf(read_columns=None, output_schema=None, cache_file=None):
     return inner
 
 
-class BatchInfo(NamedTuple):
-    fragment_id: int
-    batch_index: int
+class BatchUDFCache:
+    """A cache for BatchUDF results to avoid recomputation
+
+    This is backed by a SQLite database.
+    """
+
+    class BatchInfo(NamedTuple):
+        fragment_id: int
+        batch_index: int
+
+    def __init__(self, path):
+        self.path = path
+        # We don't re-use the connection because it's not thread safe
+        conn = sqlite3.connect(path)
+        # One table to store the results for each batch.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS batches
+            (fragment_id INT, batch_index INT, result BLOB)
+            """
+        )
+        # One table to store fully written (but not committed) fragments.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS fragments (fragment_id INT, data BLOB)"
+        )
+        conn.commit()
+
+    def cleanup(self):
+        os.remove(self.path)
+
+    def get_batch(self, info: BatchInfo) -> Optional[pa.RecordBatch]:
+        conn = sqlite3.connect(self.path)
+        cursor = conn.execute(
+            "SELECT result FROM batches WHERE fragment_id = ? AND batch_index = ?",
+            (info.fragment_id, info.batch_index),
+        )
+        row = cursor.fetchone()
+        if row is not None:
+            return pickle.loads(row[0])
+        return None
+
+    def insert_batch(self, info: BatchInfo, batch: pa.RecordBatch):
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "INSERT INTO batches (fragment_id, batch_index, result) VALUES (?, ?, ?)",
+            (info.fragment_id, info.batch_index, pickle.dumps(batch)),
+        )
+        conn.commit()
+
+    def get_fragment(self, fragment_id: int) -> Optional[str]:
+        conn = sqlite3.connect(self.path)
+        cursor = conn.execute(
+            "SELECT data FROM fragments WHERE fragment_id = ?", (fragment_id,)
+        )
+        row = cursor.fetchone()
+        if row is not None:
+            return row[0]
+        return None
+
+    def insert_fragment(self, fragment_id: int, fragment: str):
+        # Clear all batches for the fragment
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "INSERT INTO fragments (fragment_id, data) VALUES (?, ?)",
+            (fragment_id, fragment),
+        )
+        conn.execute("DELETE FROM batches WHERE fragment_id = ?", (fragment_id,))
+        conn.commit()

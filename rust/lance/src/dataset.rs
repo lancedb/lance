@@ -1452,6 +1452,7 @@ pub trait UDFCache: Send + Sync {
 }
 
 pub struct BatchUDF {
+    #[allow(clippy::type_complexity)]
     pub mapper: Box<dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send + Sync>,
     /// The schema of the returned RecordBatch
     pub append_schema: Arc<ArrowSchema>,
@@ -1585,6 +1586,7 @@ impl Dataset {
         Ok(())
     }
 
+    #[allow(clippy::type_complexity)]
     async fn add_columns_impl(
         &self,
         read_columns: Option<Vec<String>>,
@@ -1806,7 +1808,7 @@ mod tests {
         Int8DictionaryArray, RecordBatch, RecordBatchIterator, StringArray, UInt16Array,
         UInt32Array,
     };
-    use arrow_array::{FixedSizeListArray, Float64Array, ListArray};
+    use arrow_array::{FixedSizeListArray, Float64Array};
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
     use arrow_select::take::take;
@@ -3887,13 +3889,11 @@ mod tests {
         dataset.validate().await?;
 
         // Adding a duplicate column name will break
-        let fut = dataset
-        .add_columns(NewColumnTransform::SqlExpressions(vec![(
+        let fut = dataset.add_columns(NewColumnTransform::SqlExpressions(vec![(
             "id".into(),
             "id + 1".into(),
         )]));
         // (Quick validation that the future is Send)
-        fn require_send<T: Send>(t: T) -> T { t }
         let res = require_send(fut).await;
         assert!(matches!(res, Err(Error::InvalidInput { .. })));
 
@@ -4038,41 +4038,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_append_columns_udf_cache() -> Result<()> {
-        #[derive(Default)]
-        struct RequestCounter {
-            pub get_batch_requests: Mutex<Vec<BatchInfo>>,
-            pub insert_batch_requests: Mutex<Vec<BatchInfo>>,
-            pub get_fragment_requests: Mutex<Vec<u32>>,
-            pub insert_fragment_requests: Mutex<Vec<u32>>,
-        }
-
-        impl UDFCache for RequestCounter {
-            fn get_batch(&self, key: &BatchInfo) -> Result<Option<RecordBatch>> {
-                self.get_batch_requests.lock().unwrap().push(key.clone());
-                // TODO: Add a pre-computed batch
-                Ok(None)
-            }
-
-            fn insert_batch(&self, key: BatchInfo, _value: RecordBatch) -> Result<()> {
-                self.insert_batch_requests.lock().unwrap().push(key);
-                Ok(())
-            }
-
-            fn get_fragment(&self, _key: u32) -> Result<Option<Fragment>> {
-                self.get_fragment_requests.lock().unwrap().push(_key);
-                // TODO: Add a pre-computed fragment
-                Ok(None)
-            }
-
-            fn insert_fragment(&self, fragment: Fragment) -> Result<()> {
-                self.insert_fragment_requests
-                    .lock()
-                    .unwrap()
-                    .push(fragment.id as u32);
-                Ok(())
-            }
-        }
-
         let num_rows = 100;
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "id",
@@ -4082,7 +4047,7 @@ mod tests {
 
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
         )?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
@@ -4099,6 +4064,60 @@ mod tests {
         )
         .await?;
         dataset.validate().await?;
+
+        #[derive(Default)]
+        struct RequestCounter {
+            pub get_batch_requests: Mutex<Vec<BatchInfo>>,
+            pub insert_batch_requests: Mutex<Vec<BatchInfo>>,
+            pub get_fragment_requests: Mutex<Vec<u32>>,
+            pub insert_fragment_requests: Mutex<Vec<u32>>,
+        }
+
+        impl UDFCache for RequestCounter {
+            fn get_batch(&self, info: &BatchInfo) -> Result<Option<RecordBatch>> {
+                self.get_batch_requests.lock().unwrap().push(info.clone());
+
+                if info.fragment_id == 1 && info.batch_index == 0 {
+                    Ok(Some(RecordBatch::try_new(
+                        Arc::new(ArrowSchema::new(vec![Field::new(
+                            "double_id",
+                            DataType::Int32,
+                            false,
+                        )])),
+                        vec![Arc::new(Int32Array::from_iter_values(50..75))],
+                    )?))
+                } else {
+                    Ok(None)
+                }
+            }
+
+            fn insert_batch(&self, info: BatchInfo, _value: RecordBatch) -> Result<()> {
+                self.insert_batch_requests.lock().unwrap().push(info);
+                Ok(())
+            }
+
+            fn get_fragment(&self, fragment_id: u32) -> Result<Option<Fragment>> {
+                self.get_fragment_requests.lock().unwrap().push(fragment_id);
+                if fragment_id == 0 {
+                    Ok(Some(Fragment {
+                        files: vec![],
+                        id: 0,
+                        deletion_file: None,
+                        physical_rows: Some(50),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+
+            fn insert_fragment(&self, fragment: Fragment) -> Result<()> {
+                self.insert_fragment_requests
+                    .lock()
+                    .unwrap()
+                    .push(fragment.id as u32);
+                Ok(())
+            }
+        }
 
         let request_counter = Arc::new(RequestCounter::default());
 
@@ -4129,57 +4148,54 @@ mod tests {
         });
         dataset.add_columns(transforms).await?;
 
-        let expected_batch_req = vec![
-            BatchInfo {
-                fragment_id: 0,
-                batch_index: 0,
-            },
-            BatchInfo {
-                fragment_id: 0,
-                batch_index: 1,
-            },
-            BatchInfo {
-                fragment_id: 1,
-                batch_index: 0,
-            },
-            BatchInfo {
-                fragment_id: 1,
-                batch_index: 1,
-            },
-        ];
-        assert_eq!(
-            request_counter
-                .get_batch_requests
-                .lock()
-                .unwrap()
-                .as_slice(),
-            &expected_batch_req
-        );
-        assert_eq!(
-            request_counter
-                .insert_batch_requests
-                .lock()
-                .unwrap()
-                .as_slice(),
-            &expected_batch_req
-        );
-
-        let expected_fragment_req = vec![0, 1];
+        // Should have requested both fragments
         assert_eq!(
             request_counter
                 .get_fragment_requests
                 .lock()
                 .unwrap()
                 .as_slice(),
-            &expected_fragment_req
+            &[0, 1]
         );
+        // Should have only inserted the second fragment, since the first one was already cached
         assert_eq!(
             request_counter
                 .insert_fragment_requests
                 .lock()
                 .unwrap()
                 .as_slice(),
-            &expected_fragment_req
+            &[1]
+        );
+
+        // Should have only requested the second two batches, since the first fragment was already cached
+        assert_eq!(
+            request_counter
+                .get_batch_requests
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[
+                BatchInfo {
+                    fragment_id: 1,
+                    batch_index: 0,
+                },
+                BatchInfo {
+                    fragment_id: 1,
+                    batch_index: 1,
+                },
+            ]
+        );
+        // Should have only saved the last batch, since the first batch of second fragment was already cached
+        assert_eq!(
+            request_counter
+                .insert_batch_requests
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[BatchInfo {
+                fragment_id: 1,
+                batch_index: 1,
+            },]
         );
 
         Ok(())
