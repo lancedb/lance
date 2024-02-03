@@ -48,7 +48,7 @@ build-backend = "maturin"
 [project.optional-dependencies]
 tests = [
     "datasets",
-    "duckdb",
+    "duckdb; python_version<'3.12'",  # TODO: remove when duckdb supports 3.12
     "ml_dtypes",
 	"pillow",
     "pandas",
