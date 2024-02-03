@@ -492,6 +492,10 @@ impl Transaction {
             }
             Operation::Project { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
+
+                // Some fields that have indices may have been removed, so we should
+                // remove those indices as well.
+                Self::retain_relevant_indices(&mut final_indices, &schema)
             }
             Operation::Restore { .. } => {
                 unreachable!()
@@ -520,6 +524,19 @@ impl Transaction {
         manifest.transaction_file = Some(transaction_file_path.to_string());
 
         Ok((manifest, final_indices))
+    }
+
+    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema) {
+        let field_ids = schema
+            .fields_pre_order()
+            .map(|f| f.id)
+            .collect::<HashSet<_>>();
+        indices.retain(|existing_index| {
+            existing_index
+                .fields
+                .iter()
+                .all(|field_id| field_ids.contains(field_id))
+        });
     }
 
     fn recalculate_fragment_bitmap(
