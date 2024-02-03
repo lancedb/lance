@@ -54,7 +54,7 @@ tests = [
     "pandas",
     "polars[pyarrow,pandas]",
     "pytest",
-    "tensorflow",
+    "tensorflow; python_version<'3.12'",  # TODO: remove when tensorflow supports 3.12
     "tqdm",
 ]
 benchmarks = ["pytest-benchmark"]
