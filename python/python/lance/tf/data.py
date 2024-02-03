@@ -28,15 +28,13 @@ from functools import partial
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Union
 
 import pyarrow as pa
-import pytest
-
-tf = pytest.importorskip("tensorflow")
 
 import lance
 from lance import LanceDataset
 from lance.arrow import EncodedImageType, FixedShapeImageTensorType, ImageURIType
 from lance.dependencies import _check_for_numpy
 from lance.dependencies import numpy as np
+from lance.dependencies import tensorflow as tf
 from lance.fragment import FragmentMetadata, LanceFragment
 
 if TYPE_CHECKING:
@@ -266,9 +264,9 @@ def lance_fragments(dataset: Union[str, Path, LanceDataset]) -> tf.data.Dataset:
     """
     if not isinstance(dataset, LanceDataset):
         dataset = lance.dataset(dataset)
-    return tf.data.Dataset.from_tensor_slices(
-        [f.fragment_id for f in dataset.get_fragments()]
-    )
+    return tf.data.Dataset.from_tensor_slices([
+        f.fragment_id for f in dataset.get_fragments()
+    ])
 
 
 def _ith_batch(i: int, batch_size: int, total_size: int) -> Tuple[int, int]:
