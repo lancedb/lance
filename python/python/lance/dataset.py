@@ -695,22 +695,22 @@ class LanceDataset(pa.dataset.Dataset):
         >>> import pyarrow as pa
         >>> table = pa.table({"a": [1, 2, 3]})
         >>> dataset = lance.write_dataset(table, "my_dataset")
-        >>> @lance.add_columns_udf
+        >>> @lance.add_columns_udf(read_columns=['a'])
         ... def double_a(batch):
         ...     df = batch.to_pandas()
         ...     return pd.DataFrame({'double_a': 2 * df['a']})
-        >>> dataset.add_columns(double_a, ['a'])
+        >>> dataset.add_columns(double_a)
         >>> dataset.to_table().to_pandas()
-           a double_a
-        0  1        2
-        1  2        4
-        2  3        6
+           a  double_a
+        0  1         2
+        1  2         4
+        2  3         6
         >>> dataset.add_columns({"triple_a": "a * 3"})
         >>> dataset.to_table().to_pandas()
-           a double_a triple_a
-        0  1        2        3
-        1  2        4        6
-        2  3        6        9
+           a  double_a  triple_a
+        0  1         2         3
+        1  2         4         6
+        2  3         6         9
 
         See Also
         --------
