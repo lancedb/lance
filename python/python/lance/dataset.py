@@ -704,7 +704,7 @@ class LanceDataset(pa.dataset.Dataset):
         >>> import pyarrow as pa
         >>> table = pa.table({"a": [1, 2, 3]})
         >>> dataset = lance.write_dataset(table, "my_dataset")
-        >>> @lance.add_columns_udf(read_columns=['a'])
+        >>> @lance.batch_udf()
         ... def double_a(batch):
         ...     df = batch.to_pandas()
         ...     return pd.DataFrame({'double_a': 2 * df['a']})
