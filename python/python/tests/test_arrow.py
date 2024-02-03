@@ -202,7 +202,7 @@ def test_image_arrays(tmp_path: Path):
     import os
     from pathlib import Path
 
-    import tensorflow as tf
+    tf = pytest.importorskip("tensorflow")
 
     n = 10
     png_uris = [
