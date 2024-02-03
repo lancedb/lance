@@ -171,8 +171,8 @@ if TYPE_CHECKING:
     import numpy
     import pandas
     import polars
-    import torch
     import tensorflow
+    import torch
 else:
     # heavy/optional third party libs
     numpy, _NUMPY_AVAILABLE = _lazy_import("numpy")
