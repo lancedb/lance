@@ -331,8 +331,8 @@ class EncodedImageArray(ImageArray):
                 from PIL import Image
 
                 return np.stack([
-                    Image.open(io.BytesIO(img)) for img in images.to_pylist()]
-                )
+                    Image.open(io.BytesIO(img)) for img in images.to_pylist()
+                ])
 
             def tensorflow_decoder(images):
                 import tensorflow as tf
