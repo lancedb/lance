@@ -30,8 +30,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt, Stream};
-use lance_core::datatypes::{Field, LogicalType, SchemaCompareOptions};
 use lance_arrow::SchemaExt;
+use lance_core::datatypes::{Field, LogicalType, SchemaCompareOptions};
 use lance_datafusion::utils::reader_to_stream;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
@@ -1504,6 +1504,11 @@ impl ColumnAlteration {
         self.nullable = Some(nullable);
         self
     }
+
+    pub fn cast_to(mut self, data_type: DataType) -> Self {
+        self.data_type = Some(data_type);
+        self
+    }
 }
 
 // TODO: move all schema evolution methods to this impl and provide a dedicated
@@ -1575,6 +1580,8 @@ impl Dataset {
             }
         }
 
+        new_schema.validate()?;
+
         // If we aren't casting a column, we don't need to touch the fragments.
         let transaction = if cast_fields.is_empty() {
             Transaction::new(
@@ -1600,7 +1607,7 @@ impl Dataset {
             // This schema contains the exact field ids we want to write the new fields with.
             let new_col_schema = new_schema.project_by_ids(&new_ids);
 
-            let mapper = move |batch: &RecordBatch, _batch_info: &BatchInfo| {
+            let mapper = move |batch: &RecordBatch| {
                 let mut fields = Vec::with_capacity(cast_fields.len());
                 let mut columns = Vec::with_capacity(batch.num_columns());
                 for (old, new) in &cast_fields {
@@ -1619,7 +1626,12 @@ impl Dataset {
             let mapper = Box::new(mapper);
 
             let fragments = self
-                .add_columns_impl(Some(read_columns), mapper, None, Some(new_col_schema))
+                .add_columns_impl(
+                    Some(read_columns),
+                    mapper,
+                    None,
+                    Some((new_col_schema, new_schema.clone())),
+                )
                 .await?;
 
             Transaction::new(
@@ -1742,7 +1754,7 @@ impl Dataset {
         let schema = self.schema().merge(append_schema.as_ref())?;
 
         let fragments = self
-            .add_columns_impl(read_columns, mapper, result_cache)
+            .add_columns_impl(read_columns, mapper, result_cache, None)
             .await?;
         let operation = Operation::Merge { fragments, schema };
         let transaction = Transaction::new(self.manifest.version, operation, None);
@@ -1767,9 +1779,11 @@ impl Dataset {
         read_columns: Option<Vec<String>>,
         mapper: Box<dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send + Sync>,
         result_cache: Option<Arc<dyn UDFCache>>,
+        schemas: Option<(Schema, Schema)>,
     ) -> Result<Vec<Fragment>> {
         let read_columns_ref = read_columns.as_deref();
         let mapper_ref = mapper.as_ref();
+        let schemas_ref = &schemas;
         let fragments = futures::stream::iter(self.get_fragments())
             .then(|fragment| {
                 let cache_ref = result_cache.clone();
@@ -1782,7 +1796,9 @@ impl Dataset {
                         }
                     }
 
-                    let mut updater = fragment.updater(read_columns_ref).await?;
+                    let mut updater = fragment
+                        .updater(read_columns_ref, schemas_ref.clone())
+                        .await?;
 
                     let mut batch_index = 0;
                     // TODO: the structure of the updater prevents batch-level parallelism here,
@@ -1983,11 +1999,12 @@ mod tests {
         Int8DictionaryArray, RecordBatch, RecordBatchIterator, StringArray, UInt16Array,
         UInt32Array,
     };
-    use arrow_array::{FixedSizeListArray, Float64Array};
+    use arrow_array::{FixedSizeListArray, Float16Array, Float64Array};
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
+    use half::f16;
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
@@ -4305,7 +4322,6 @@ mod tests {
         Ok(())
     }
 
-
     #[tokio::test]
     async fn test_append_columns_exprs() -> Result<()> {
         let num_rows = 5;
@@ -4373,7 +4389,6 @@ mod tests {
 
         Ok(())
     }
-
 
     #[tokio::test]
     async fn test_append_columns_udf() -> Result<()> {

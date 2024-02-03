@@ -571,7 +571,20 @@ impl FileFragment {
     }
 
     /// Create an [`Updater`] to append new columns.
-    pub async fn updater<T: AsRef<str>>(&self, columns: Option<&[T]>) -> Result<Updater> {
+    ///
+    /// The `columns` parameter is a list of existing columns to be read from
+    /// the fragment. They can be used to derive new columns. This is allowed to
+    /// be empty.
+    ///
+    /// The `schemas` parameter is a tuple of the write schema (just the new fields)
+    /// and the full schema (the target schema after the update). If the write
+    /// schema is None, it is inferred from the first batch of results. The full
+    /// schema is inferred by appending the write schema to the existing schema.
+    pub async fn updater<T: AsRef<str>>(
+        &self,
+        columns: Option<&[T]>,
+        schemas: Option<(Schema, Schema)>,
+    ) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
         if let Some(columns) = columns {
             schema = schema.project(columns)?;
@@ -588,11 +601,11 @@ impl FileFragment {
         let reader = reader?;
         let deletion_vector = deletion_vector?.unwrap_or_default();
 
-        Ok(Updater::new(self.clone(), reader, deletion_vector))
+        Ok(Updater::new(self.clone(), reader, deletion_vector, schemas))
     }
 
     pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
-        let mut updater = self.updater(Some(&[join_column])).await?;
+        let mut updater = self.updater(Some(&[join_column]), None).await?;
 
         while let Some(batch) = updater.next().await? {
             let batch = joiner.collect(batch[join_column].clone()).await?;
@@ -1297,7 +1310,7 @@ mod tests {
             }
 
             let fragment = &mut dataset.get_fragment(0).unwrap();
-            let mut updater = fragment.updater(Some(&["i"])).await.unwrap();
+            let mut updater = fragment.updater(Some(&["i"]), None).await.unwrap();
             let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "double_i",
                 DataType::Int32,
@@ -1526,7 +1539,7 @@ mod tests {
         let fragment = dataset.get_fragments().pop().unwrap();
 
         // Write batch_s using add_columns
-        let mut updater = fragment.updater(Some(&["i"])).await?;
+        let mut updater = fragment.updater(Some(&["i"]), None).await?;
         updater.next().await?;
         updater.update(batch_s.clone()).await?;
         let frag = updater.finish().await?;
