@@ -628,6 +628,12 @@ class LanceDataset(pa.dataset.Dataset):
                 nullability is not changed. Only non-nullable columns can be changed
                 to nullable. Currently, you cannot change a nullable column to
                 non-nullable.
+            - "data_type": pyarrow.DataType, optional
+                The new data type to cast the column to. If not specified, the column
+                data type is not changed.
+
+        Columns that are renamed can keep any indices that are on them. However, if
+        the column is casted to a different type, it's indices will be dropped.
 
         Examples
         --------
@@ -644,6 +650,10 @@ class LanceDataset(pa.dataset.Dataset):
         0  1  a
         1  2  b
         2  3  c
+        >>> dataset.alter_columns({"path": "x", "data_type": pa.int32()})
+        >>> dataset.schema
+        x: int32
+        b: string
         """
         self._ds.alter_columns(list(alterations))
 

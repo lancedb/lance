@@ -181,3 +181,18 @@ def test_alter_columns(tmp_path: Path):
         schema=expected_schema,
     )
     assert dataset.to_table() == expected_tab
+
+    dataset.alter_columns(
+        {"path": "x", "data_type": pa.int32()},
+    )
+    expected_schema = pa.schema([
+        pa.field("x", pa.int32()),
+        pa.field("y", pa.string(), nullable=False),
+    ])
+    assert dataset.schema == expected_schema
+
+    expected_tab = pa.table(
+        {"x": pa.array([1, 2, 3], type=pa.int32()), "y": pa.array(["a", "b", "c"])},
+        schema=expected_schema,
+    )
+    assert dataset.to_table() == expected_tab
