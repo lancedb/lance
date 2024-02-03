@@ -48,13 +48,13 @@ build-backend = "maturin"
 [project.optional-dependencies]
 tests = [
     "datasets",
-    "duckdb; python_version<'3.12'",  # TODO: remove when duckdb supports 3.12
+    "duckdb; python_version<'3.12'", # TODO: remove when duckdb supports 3.12
     "ml_dtypes",
-	"pillow",
+    "pillow",
     "pandas",
     "polars[pyarrow,pandas]",
     "pytest",
-    "tensorflow; python_version<'3.12'",  # TODO: remove when tensorflow supports 3.12
+    "tensorflow; python_version<'3.12'", # TODO: remove when tensorflow supports 3.12
     "tqdm",
 ]
 benchmarks = ["pytest-benchmark"]
@@ -76,4 +76,10 @@ markers = [
     "gpu: tests which rely on pytorch and some kind of gpu",
     "slow",
     "torch: tests which rely on pytorch being installed",
+]
+filterwarnings = [
+    'error::FutureWarning',
+    'error::DeprecationWarning',
+    # Pandas 2.2
+    'ignore:.*datetime\.datetime\.utcfromtimestamp\(\) is deprecated.*:DeprecationWarning',
 ]
