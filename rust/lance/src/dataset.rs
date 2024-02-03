@@ -1444,7 +1444,11 @@ pub struct BatchInfo {
     pub batch_index: usize,
 }
 
-pub trait UDFCache: Send + Sync {
+/// A mechanism for saving UDF results.
+///
+/// This is used to determine if a UDF has already been run on a given input,
+/// and to store the results of a UDF for future use.
+pub trait UDFCheckpointStore: Send + Sync {
     fn get_batch(&self, info: &BatchInfo) -> Result<Option<RecordBatch>>;
     fn insert_batch(&self, info: BatchInfo, batch: RecordBatch) -> Result<()>;
     fn get_fragment(&self, fragment_id: u32) -> Result<Option<Fragment>>;
@@ -1455,12 +1459,9 @@ pub struct BatchUDF {
     #[allow(clippy::type_complexity)]
     pub mapper: Box<dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send + Sync>,
     /// The schema of the returned RecordBatch
-    pub append_schema: Arc<ArrowSchema>,
-    /// The names of the columns that are required to be present in the input
-    /// RecordBatch. If None, then all columns will be read and passed in.
-    pub read_columns: Option<Vec<String>>,
-    /// A cache for UDF results.
-    pub result_cache: Option<Arc<dyn UDFCache>>,
+    pub output_schema: Arc<ArrowSchema>,
+    /// A checkpoint store for the UDF results
+    pub result_checkpoint: Option<Arc<dyn UDFCheckpointStore>>,
 }
 
 /// A way to define one or more new columns in a dataset
@@ -1475,16 +1476,22 @@ pub enum NewColumnTransform {
 
 impl Dataset {
     /// Append new columns to the dataset.
-    pub async fn add_columns(&mut self, transforms: NewColumnTransform) -> Result<()> {
+    pub async fn add_columns(
+        &mut self,
+        transforms: NewColumnTransform,
+        read_columns: Option<Vec<String>>,
+    ) -> Result<()> {
         // We just transform the SQL expression into a UDF backed by DataFusion
         // physical expressions.
-        let BatchUDF {
-            mapper,
-            append_schema,
+        let (
+            BatchUDF {
+                mapper,
+                output_schema,
+                result_checkpoint,
+            },
             read_columns,
-            result_cache,
-        } = match transforms {
-            NewColumnTransform::BatchUDF(udf) => udf,
+        ) = match transforms {
+            NewColumnTransform::BatchUDF(udf) => (udf, read_columns),
             NewColumnTransform::SqlExpressions(expressions) => {
                 let arrow_schema = Arc::new(ArrowSchema::from(self.schema()));
                 let planner = Planner::new(arrow_schema);
@@ -1516,7 +1523,7 @@ impl Dataset {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                let append_schema = Arc::new(ArrowSchema::new(
+                let output_schema = Arc::new(ArrowSchema::new(
                     exprs
                         .iter()
                         .map(|(name, expr)| {
@@ -1529,7 +1536,7 @@ impl Dataset {
                         .collect::<Result<Vec<_>>>()?,
                 ));
 
-                let schema_ref = append_schema.clone();
+                let schema_ref = output_schema.clone();
                 let mapper = move |batch: &RecordBatch| {
                     let num_rows = batch.num_rows();
                     let columns = exprs
@@ -1543,17 +1550,19 @@ impl Dataset {
                 let mapper = Box::new(mapper);
 
                 let read_columns = Some(read_schema.field_names().into_iter().cloned().collect());
-                BatchUDF {
-                    mapper,
-                    append_schema,
+                (
+                    BatchUDF {
+                        mapper,
+                        output_schema,
+                        result_checkpoint: None,
+                    },
                     read_columns,
-                    result_cache: None,
-                }
+                )
             }
         };
 
         {
-            let new_names = append_schema.field_names();
+            let new_names = output_schema.field_names();
             for field in &self.schema().fields {
                 if new_names.contains(&&field.name) {
                     return Err(Error::invalid_input(
@@ -1564,10 +1573,10 @@ impl Dataset {
             }
         }
 
-        let schema = self.schema().merge(append_schema.as_ref())?;
+        let schema = self.schema().merge(output_schema.as_ref())?;
 
         let fragments = self
-            .add_columns_impl(read_columns, mapper, result_cache)
+            .add_columns_impl(read_columns, mapper, result_checkpoint)
             .await?;
         let operation = Operation::Merge { fragments, schema };
         let transaction = Transaction::new(self.manifest.version, operation, None);
@@ -1591,7 +1600,7 @@ impl Dataset {
         &self,
         read_columns: Option<Vec<String>>,
         mapper: Box<dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send + Sync>,
-        result_cache: Option<Arc<dyn UDFCache>>,
+        result_cache: Option<Arc<dyn UDFCheckpointStore>>,
     ) -> Result<Vec<Fragment>> {
         let read_columns_ref = read_columns.as_deref();
         let mapper_ref = mapper.as_ref();
@@ -3889,36 +3898,39 @@ mod tests {
         dataset.validate().await?;
 
         // Adding a duplicate column name will break
-        let fut = dataset.add_columns(NewColumnTransform::SqlExpressions(vec![(
-            "id".into(),
-            "id + 1".into(),
-        )]));
+        let fut = dataset.add_columns(
+            NewColumnTransform::SqlExpressions(vec![("id".into(), "id + 1".into())]),
+            None,
+        );
         // (Quick validation that the future is Send)
         let res = require_send(fut).await;
         assert!(matches!(res, Err(Error::InvalidInput { .. })));
 
         // Can add a column that is independent of any existing ones
         dataset
-            .add_columns(NewColumnTransform::SqlExpressions(vec![(
-                "value".into(),
-                "2 * random()".into(),
-            )]))
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("value".into(), "2 * random()".into())]),
+                None,
+            )
             .await?;
 
         // Can add a column derived from an existing one.
         dataset
-            .add_columns(NewColumnTransform::SqlExpressions(vec![(
-                "double_id".into(),
-                "2 * id".into(),
-            )]))
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("double_id".into(), "2 * id".into())]),
+                None,
+            )
             .await?;
 
         // Can derive a column from existing ones across multiple data files.
         dataset
-            .add_columns(NewColumnTransform::SqlExpressions(vec![(
-                "triple_id".into(),
-                "id + double_id".into(),
-            )]))
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(
+                    "triple_id".into(),
+                    "id + double_id".into(),
+                )]),
+                None,
+            )
             .await?;
 
         // These can be read back, the dataset is valid
@@ -3960,27 +3972,26 @@ mod tests {
         // Adding a duplicate column name will break
         let transforms = NewColumnTransform::BatchUDF(BatchUDF {
             mapper: Box::new(|_| unimplemented!()),
-            append_schema: Arc::new(ArrowSchema::new(vec![Field::new(
+            output_schema: Arc::new(ArrowSchema::new(vec![Field::new(
                 "id",
                 DataType::Int32,
                 false,
             )])),
-            read_columns: None,
-            result_cache: None,
+            result_checkpoint: None,
         });
-        let res = dataset.add_columns(transforms).await;
+        let res = dataset.add_columns(transforms, None).await;
         assert!(matches!(res, Err(Error::InvalidInput { .. })));
 
         // Can add a column that independent (empty read_schema)
-        let append_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        let output_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "value",
             DataType::Float64,
             true,
         )]));
-        let append_schema_ref = append_schema.clone();
+        let output_schema_ref = output_schema.clone();
         let mapper = move |batch: &RecordBatch| {
             Ok(RecordBatch::try_new(
-                append_schema_ref.clone(),
+                output_schema_ref.clone(),
                 vec![Arc::new(Float64Array::from_iter_values(
                     (0..batch.num_rows()).map(|i| i as f64),
                 ))],
@@ -3988,19 +3999,18 @@ mod tests {
         };
         let transforms = NewColumnTransform::BatchUDF(BatchUDF {
             mapper: Box::new(mapper),
-            append_schema,
-            read_columns: None,
-            result_cache: None,
+            output_schema,
+            result_checkpoint: None,
         });
-        dataset.add_columns(transforms).await?;
+        dataset.add_columns(transforms, None).await?;
 
         // Can add a column that depends on another column (double id)
-        let append_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        let output_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "double_id",
             DataType::Int32,
             false,
         )]));
-        let append_schema_ref = append_schema.clone();
+        let output_schema_ref = output_schema.clone();
         let mapper = move |batch: &RecordBatch| {
             let id = batch
                 .column(0)
@@ -4008,7 +4018,7 @@ mod tests {
                 .downcast_ref::<Int32Array>()
                 .unwrap();
             Ok(RecordBatch::try_new(
-                append_schema_ref.clone(),
+                output_schema_ref.clone(),
                 vec![Arc::new(Int32Array::from_iter_values(
                     id.values().iter().map(|i| i * 2),
                 ))],
@@ -4016,11 +4026,10 @@ mod tests {
         };
         let transforms = NewColumnTransform::BatchUDF(BatchUDF {
             mapper: Box::new(mapper),
-            append_schema,
-            read_columns: None,
-            result_cache: None,
+            output_schema,
+            result_checkpoint: None,
         });
-        dataset.add_columns(transforms).await?;
+        dataset.add_columns(transforms, None).await?;
         // These can be read back, the dataset is valid
         dataset.validate().await?;
 
@@ -4073,7 +4082,7 @@ mod tests {
             pub insert_fragment_requests: Mutex<Vec<u32>>,
         }
 
-        impl UDFCache for RequestCounter {
+        impl UDFCheckpointStore for RequestCounter {
             fn get_batch(&self, info: &BatchInfo) -> Result<Option<RecordBatch>> {
                 self.get_batch_requests.lock().unwrap().push(info.clone());
 
@@ -4121,12 +4130,12 @@ mod tests {
 
         let request_counter = Arc::new(RequestCounter::default());
 
-        let append_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        let output_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "double_id",
             DataType::Int32,
             false,
         )]));
-        let append_schema_ref = append_schema.clone();
+        let output_schema_ref = output_schema.clone();
         let mapper = move |batch: &RecordBatch| {
             let id = batch
                 .column(0)
@@ -4134,7 +4143,7 @@ mod tests {
                 .downcast_ref::<Int32Array>()
                 .unwrap();
             Ok(RecordBatch::try_new(
-                append_schema_ref.clone(),
+                output_schema_ref.clone(),
                 vec![Arc::new(Int32Array::from_iter_values(
                     id.values().iter().map(|i| i * 2),
                 ))],
@@ -4142,11 +4151,10 @@ mod tests {
         };
         let transforms = NewColumnTransform::BatchUDF(BatchUDF {
             mapper: Box::new(mapper),
-            append_schema,
-            read_columns: None,
-            result_cache: Some(request_counter.clone()),
+            output_schema,
+            result_checkpoint: Some(request_counter.clone()),
         });
-        dataset.add_columns(transforms).await?;
+        dataset.add_columns(transforms, None).await?;
 
         // Should have requested both fragments
         assert_eq!(

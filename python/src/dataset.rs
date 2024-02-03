@@ -32,7 +32,7 @@ use lance::dataset::{
     UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
     WriteParams,
 };
-use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCache};
+use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore};
 use lance::index::{
     scalar::ScalarIndexParams,
     vector::{diskann::DiskANNParams, VectorIndexParams},
@@ -1018,7 +1018,11 @@ impl Dataset {
         Ok(())
     }
 
-    fn add_columns(&mut self, transforms: &PyAny) -> PyResult<()> {
+    fn add_columns(
+        &mut self,
+        transforms: &PyAny,
+        read_columns: Option<Vec<String>>,
+    ) -> PyResult<()> {
         let transforms = if let Ok(transforms) = transforms.extract::<&PyDict>() {
             let expressions = transforms
                 .iter()
@@ -1030,14 +1034,13 @@ impl Dataset {
                 .collect::<PyResult<Vec<_>>>()?;
             NewColumnTransform::SqlExpressions(expressions)
         } else {
-            let read_columns: Option<Vec<String>> =
-                transforms.getattr("read_columns")?.extract()?;
             let append_schema: PyArrowType<ArrowSchema> =
                 transforms.getattr("output_schema")?.extract()?;
-            let append_schema = Arc::new(append_schema.0);
+            let output_schema = Arc::new(append_schema.0);
 
-            let result_cache: Option<PyObject> = transforms.getattr("cache")?.extract()?;
-            let result_cache = result_cache.map(|c| PyBatchUDFCacheWrapper { inner: c });
+            let result_checkpoint: Option<PyObject> = transforms.getattr("cache")?.extract()?;
+            let result_checkpoint =
+                result_checkpoint.map(|c| PyBatchUDFCheckpointWrapper { inner: c });
 
             let udf_obj = transforms.to_object(transforms.py());
             let mapper = move |batch: &RecordBatch| -> lance::Result<RecordBatch> {
@@ -1060,16 +1063,16 @@ impl Dataset {
 
             NewColumnTransform::BatchUDF(BatchUDF {
                 mapper: Box::new(mapper),
-                append_schema,
-                read_columns,
-                result_cache: result_cache.map(|c| Arc::new(c) as Arc<dyn UDFCache>),
+                output_schema,
+                result_checkpoint: result_checkpoint
+                    .map(|c| Arc::new(c) as Arc<dyn UDFCheckpointStore>),
             })
         };
 
         let mut new_self = self.ds.as_ref().clone();
         let new_self = RT
             .spawn(None, async move {
-                new_self.add_columns(transforms).await?;
+                new_self.add_columns(transforms, read_columns).await?;
                 Ok(new_self)
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
@@ -1219,11 +1222,11 @@ fn format_python_error(e: PyErr, py: Python) -> PyResult<String> {
     Ok(lines.join(""))
 }
 
-struct PyBatchUDFCacheWrapper {
+struct PyBatchUDFCheckpointWrapper {
     inner: PyObject,
 }
 
-impl PyBatchUDFCacheWrapper {
+impl PyBatchUDFCheckpointWrapper {
     fn batch_info_to_py(&self, info: &BatchInfo, py: Python) -> PyResult<PyObject> {
         self.inner
             .getattr(py, "BatchInfo")?
@@ -1231,7 +1234,7 @@ impl PyBatchUDFCacheWrapper {
     }
 }
 
-impl UDFCache for PyBatchUDFCacheWrapper {
+impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
     fn get_batch(&self, info: &BatchInfo) -> lance::Result<Option<RecordBatch>> {
         Python::with_gil(|py| {
             let info = self.batch_info_to_py(info, py)?;
@@ -1240,7 +1243,7 @@ impl UDFCache for PyBatchUDFCacheWrapper {
             Ok(batch.map(|b| b.0))
         })
         .map_err(|err: PyErr| lance_core::Error::IO {
-            message: format!("Failed to call get_batch() on UDFCache: {}", err),
+            message: format!("Failed to call get_batch() on UDFCheckpointer: {}", err),
             location: location!(),
         })
     }
@@ -1254,7 +1257,7 @@ impl UDFCache for PyBatchUDFCacheWrapper {
             Ok(fragment)
         })
         .map_err(|err: PyErr| lance_core::Error::IO {
-            message: format!("Failed to call get_fragment() on UDFCache: {}", err),
+            message: format!("Failed to call get_fragment() on UDFCheckpointer: {}", err),
             location: location!(),
         })?;
         fragment_data
@@ -1275,7 +1278,7 @@ impl UDFCache for PyBatchUDFCacheWrapper {
             Ok(())
         })
         .map_err(|err: PyErr| lance_core::Error::IO {
-            message: format!("Failed to call insert_batch() on UDFCache: {}", err),
+            message: format!("Failed to call insert_batch() on UDFCheckpointer: {}", err),
             location: location!(),
         })
     }
@@ -1291,7 +1294,10 @@ impl UDFCache for PyBatchUDFCacheWrapper {
             Ok(())
         })
         .map_err(|err: PyErr| lance_core::Error::IO {
-            message: format!("Failed to call insert_fragment() on UDFCache: {}", err),
+            message: format!(
+                "Failed to call insert_fragment() on UDFCheckpointer: {}",
+                err
+            ),
             location: location!(),
         })
     }

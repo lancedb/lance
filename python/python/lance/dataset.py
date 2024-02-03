@@ -555,7 +555,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return pa.Table.from_batches([self._ds.take_rows(row_ids, columns)])
 
-    def head(self, num_rows, **kwargs) -> pa.Table:
+    def head(self, num_rows, **kwargs):
         """
         Load the first N rows of the dataset.
 
@@ -669,7 +669,11 @@ class LanceDataset(pa.dataset.Dataset):
 
         self._ds.merge(reader, left_on, right_on)
 
-    def add_columns(self, transforms: Dict[str, str] | AddColumnsUDF):
+    def add_columns(
+        self,
+        transforms: Dict[str, str] | BatchUDF,
+        read_columns: List[str] | None = None,
+    ):
         """
         Add new columns with defined values.
 
@@ -688,6 +692,11 @@ class LanceDataset(pa.dataset.Dataset):
             columns and the values are SQL expression strings. These strings can
             reference existing columns in the dataset.
             If this is a AddColumnsUDF, then it is a UDF that takes a batch of
+            existing data and returns a new batch with the new columns.
+        read_columns : list of str, optional
+            The names of the columns that the UDF will read. If None, then the
+            UDF will read all columns. This is only used when transforms is a
+            UDF. Otherwise, the read columns are inferred from the SQL expressions.
 
         Examples
         --------
@@ -717,13 +726,11 @@ class LanceDataset(pa.dataset.Dataset):
         LanceDataset.merge :
             Merge a pre-computed set of columns into the dataset.
         """
-        if isinstance(transforms, AddColumnsUDF):
+        if isinstance(transforms, BatchUDF):
             if transforms.output_schema is None:
                 # Infer the schema based on the first batch
                 sample_batch = transforms(
-                    next(
-                        iter(self.to_batches(limit=1, columns=transforms.read_columns))
-                    )
+                    next(iter(self.to_batches(limit=1, columns=read_columns)))
                 )
                 if isinstance(sample_batch, pd.DataFrame):
                     sample_batch = pa.RecordBatch.from_pandas(sample_batch)
@@ -740,9 +747,9 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             raise TypeError("transforms must be a dict or AddColumnsUDF")
 
-        self._ds.add_columns(transforms)
+        self._ds.add_columns(transforms, read_columns)
 
-        if isinstance(transforms, AddColumnsUDF):
+        if isinstance(transforms, BatchUDF):
             if transforms.cache is not None:
                 transforms.cache.cleanup()
 
@@ -2425,18 +2432,17 @@ def _casting_recordbatch_iter(
         yield batch
 
 
-class AddColumnsUDF:
+class BatchUDF:
     """A user-defined function that can be passed to :meth:`LanceDataset.add_columns`.
 
     Use :func:`lance.add_columns_udf` decorator to wrap a function with this class.
     """
 
-    def __init__(self, func, read_columns=None, output_schema=None, cache_file=None):
+    def __init__(self, func, output_schema=None, checkpoint_file=None):
         self.func = func
-        self.read_columns = read_columns
         self.output_schema = output_schema
-        if cache_file is not None:
-            self.cache = BatchUDFCache(cache_file)
+        if checkpoint_file is not None:
+            self.cache = BatchUDFCheckpoint(checkpoint_file)
         else:
             self.cache = None
 
@@ -2452,8 +2458,10 @@ class AddColumnsUDF:
                 "returns a RecordBatch"
             )
         result = self.func(batch)
-        if isinstance(result, pd.DataFrame):
-            result = pa.RecordBatch.from_pandas(result)
+
+        if _check_for_pandas(result):
+            if isinstance(result, pd.DataFrame):
+                result = pa.RecordBatch.from_pandas(result)
         assert result.schema == self.output_schema, (
             f"Output schema of function does not match the expected schema. "
             f"Expected:\n{self.output_schema}\nGot:\n{result.schema}"
@@ -2461,7 +2469,7 @@ class AddColumnsUDF:
         return result
 
 
-def add_columns_udf(read_columns=None, output_schema=None, cache_file=None):
+def batch_udf(output_schema=None, checkpoint_file=None):
     """
     Create a user defined function (UDF) that adds columns to a dataset.
 
@@ -2473,19 +2481,17 @@ def add_columns_udf(read_columns=None, output_schema=None, cache_file=None):
 
     Parameters
     ----------
-    read_columns : list[str], optional
-        The columns that the function reads from the input RecordBatch. This is
-        used to optimize the function so that only the necessary columns are
-        read from disk.
     output_schema : Schema, optional
         The schema of the output RecordBatch. This is used to validate the
         output of the function. If not provided, the schema of the first output
         RecordBatch will be used.
-    cache_file : str or Path, optional
+    checkpoint_file : str or Path, optional
         If specified, this file will be used as a cache for unsaved results of
         this UDF. If the process fails, and you call add_columns again with this
         same file, it will resume from the last saved state. This is useful for
-        long running processes that may fail and need to be resumed.
+        long running processes that may fail and need to be resumed. This file
+        may get very large. It will hold up to an entire data files' worth of
+        results on disk, which can be multiple gigabytes of data.
 
     Returns
     -------
@@ -2493,12 +2499,12 @@ def add_columns_udf(read_columns=None, output_schema=None, cache_file=None):
     """
 
     def inner(func):
-        return AddColumnsUDF(func, read_columns, output_schema, cache_file)
+        return BatchUDF(func, output_schema, checkpoint_file)
 
     return inner
 
 
-class BatchUDFCache:
+class BatchUDFCheckpoint:
     """A cache for BatchUDF results to avoid recomputation.
 
     This is backed by a SQLite database.
@@ -2548,6 +2554,7 @@ class BatchUDFCache:
         conn.commit()
 
     def get_fragment(self, fragment_id: int) -> Optional[str]:
+        """Retrieves a fragment as a JSON string."""
         conn = sqlite3.connect(self.path)
         cursor = conn.execute(
             "SELECT data FROM fragments WHERE fragment_id = ?", (fragment_id,)
@@ -2558,6 +2565,7 @@ class BatchUDFCache:
         return None
 
     def insert_fragment(self, fragment_id: int, fragment: str):
+        """Save a JSON string of a fragment to the cache."""
         # Clear all batches for the fragment
         conn = sqlite3.connect(self.path)
         conn.execute(
