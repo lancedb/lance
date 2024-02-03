@@ -84,4 +84,5 @@ filterwarnings = [
     'ignore:.*datetime\.datetime\.utcfromtimestamp\(\) is deprecated.*:DeprecationWarning',
     # Pytorch 2.2 on Python 2.12
     'ignore:.*is deprecated and will be removed in Python 3\.14.*:DeprecationWarning',
+    'ignore:.*The distutils package is deprecated.*:DeprecationWarning',
 ]
