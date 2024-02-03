@@ -2426,6 +2426,11 @@ def _casting_recordbatch_iter(
 
 
 class AddColumnsUDF:
+    """A user-defined function that can be passed to :meth:`LanceDataset.add_columns`.
+
+    Use :func:`lance.add_columns_udf` decorator to wrap a function with this class.
+    """
+
     def __init__(self, func, read_columns=None, output_schema=None, cache_file=None):
         self.func = func
         self.read_columns = read_columns
@@ -2468,9 +2473,6 @@ def add_columns_udf(read_columns=None, output_schema=None, cache_file=None):
 
     Parameters
     ----------
-    func : callable
-        The function that adds the columns. The function should take a single
-        argument, a RecordBatch, and return a RecordBatch.
     read_columns : list[str], optional
         The columns that the function reads from the input RecordBatch. This is
         used to optimize the function so that only the necessary columns are
@@ -2479,6 +2481,11 @@ def add_columns_udf(read_columns=None, output_schema=None, cache_file=None):
         The schema of the output RecordBatch. This is used to validate the
         output of the function. If not provided, the schema of the first output
         RecordBatch will be used.
+    cache_file : str or Path, optional
+        If specified, this file will be used as a cache for unsaved results of
+        this UDF. If the process fails, and you call add_columns again with this
+        same file, it will resume from the last saved state. This is useful for
+        long running processes that may fail and need to be resumed.
 
     Returns
     -------
@@ -2492,7 +2499,7 @@ def add_columns_udf(read_columns=None, output_schema=None, cache_file=None):
 
 
 class BatchUDFCache:
-    """A cache for BatchUDF results to avoid recomputation
+    """A cache for BatchUDF results to avoid recomputation.
 
     This is backed by a SQLite database.
     """
