@@ -1205,10 +1205,16 @@ impl WriteFragmentProgress for PyWriteProgress {
     }
 }
 
+/// Formats a Python error just as it would in Python interpreter.
 fn format_python_error(e: PyErr, py: Python) -> PyResult<String> {
+    let sys_mod = py.import("sys")?;
+    // the traceback is the third element of the tuple returned by sys.exc_info()
+    let traceback = sys_mod.call_method0("exc_info")?.get_item(2)?;
+
     let tracback_mod = py.import("traceback")?;
-    let traceback = tracback_mod.getattr("format_exception")?;
-    let formatted = traceback.call1((e,))?;
+    let fmt_func = tracback_mod.getattr("format_exception")?;
+    let e_type = e.get_type(py).to_owned();
+    let formatted = fmt_func.call1((e_type, &e, traceback))?;
     let lines: Vec<String> = formatted.extract()?;
     Ok(lines.join(""))
 }
