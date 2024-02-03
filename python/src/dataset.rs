@@ -1003,6 +1003,19 @@ impl Dataset {
         RT.block_on(None, self.ds.validate())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
+
+    fn drop_columns(&mut self, columns: Vec<&str>) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.drop_columns(&columns))?
+            .map_err(|err| match err {
+                lance::Error::InvalidInput { source, .. } => {
+                    PyValueError::new_err(source.to_string())
+                }
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
 }
 
 impl Dataset {
