@@ -80,6 +80,6 @@ markers = [
 filterwarnings = [
     'error::FutureWarning',
     'error::DeprecationWarning',
-    # Pandas 2.2
+    # Pandas 2.2 on Python 2.12
     'ignore:.*datetime\.datetime\.utcfromtimestamp\(\) is deprecated.*:DeprecationWarning',
 ]
