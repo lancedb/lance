@@ -25,7 +25,6 @@ use chrono::Duration;
 
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::NewColumnTransform;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
@@ -33,6 +32,7 @@ use lance::dataset::{
     UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
     WriteParams,
 };
+use lance::dataset::{BatchUDF, NewColumnTransform};
 use lance::index::{
     scalar::ScalarIndexParams,
     vector::{diskann::DiskANNParams, VectorIndexParams},
@@ -1030,7 +1030,37 @@ impl Dataset {
                 .collect::<PyResult<Vec<_>>>()?;
             NewColumnTransform::SqlExpressions(expressions)
         } else {
-            todo!()
+            let read_columns: Option<Vec<String>> =
+                transforms.getattr("read_columns")?.extract()?;
+            let append_schema: PyArrowType<ArrowSchema> =
+                transforms.getattr("output_schema")?.extract()?;
+            let append_schema = Arc::new(append_schema.0);
+
+            let udf_obj = transforms.to_object(transforms.py());
+            let mapper = move |batch: &RecordBatch| -> lance::Result<RecordBatch> {
+                Python::with_gil(|py| {
+                    let py_batch: PyArrowType<RecordBatch> = PyArrowType(batch.clone());
+                    let result = udf_obj
+                        .call_method1(py, "_call", (py_batch,))
+                        .map_err(|err| lance::Error::IO {
+                            message: format_python_error(err, py).unwrap(),
+                            location: location!(),
+                        })?;
+                    let result_batch: PyArrowType<RecordBatch> =
+                        result.extract(py).map_err(|err| lance::Error::IO {
+                            message: err.to_string(),
+                            location: location!(),
+                        })?;
+                    Ok(result_batch.0)
+                })
+            };
+
+            NewColumnTransform::BatchUDF(BatchUDF {
+                mapper: Box::new(mapper),
+                append_schema,
+                read_columns,
+                result_cache: None, // TODO
+            })
         };
 
         let mut new_self = self.ds.as_ref().clone();
@@ -1170,4 +1200,12 @@ impl WriteFragmentProgress for PyWriteProgress {
         })?;
         Ok(())
     }
+}
+
+fn format_python_error(e: PyErr, py: Python) -> PyResult<String> {
+    let tracback_mod = py.import("traceback")?;
+    let traceback = tracback_mod.getattr("format_exception")?;
+    let formatted = traceback.call1((e,))?;
+    let lines: Vec<String> = formatted.extract()?;
+    Ok(lines.join(""))
 }

@@ -2420,30 +2420,33 @@ def _casting_recordbatch_iter(
 
 
 class AddColumnsUDF:
-    def __init__(self, func, read_columns, output_schema=None):
+    def __init__(self, func, read_columns=None, output_schema=None, cache_file=None):
         self.func = func
         self.read_columns = read_columns
         self.output_schema = output_schema
 
-    def __call__(self, batch: pa.RecordBatch, info: BatchInfo):
+    def __call__(self, batch: pa.RecordBatch):
         # Directly call inner function. This is to allow the user to test the
         # function and have it behave exactly as it was written.
-        return self.func(batch, info)
+        return self.func(batch)
 
-    def _call(self, batch: pa.RecordBatch, info: BatchInfo):
+    def _call(self, batch: pa.RecordBatch):
         if self.output_schema is None:
             raise ValueError(
                 "output_schema must be provided when using a function that "
                 "returns a RecordBatch"
             )
-        result = self.func(batch, info)
+        result = self.func(batch)
         if isinstance(result, pd.DataFrame):
             result = pa.RecordBatch.from_pandas(result)
-        assert result.schema == self.output_schema
+        assert result.schema == self.output_schema, (
+            f"Output schema of function does not match the expected schema. "
+            f"Expected:\n{self.output_schema}\nGot:\n{result.schema}"
+        )
         return result
 
 
-def add_columns_udf(func, read_columns, output_schema=None):
+def add_columns_udf(read_columns=None, output_schema=None, cache_file=None):
     """
     Create a user defined function (UDF) that adds columns to a dataset.
 
@@ -2458,7 +2461,7 @@ def add_columns_udf(func, read_columns, output_schema=None):
     func : callable
         The function that adds the columns. The function should take a single
         argument, a RecordBatch, and return a RecordBatch.
-    read_columns : list[str]
+    read_columns : list[str], optional
         The columns that the function reads from the input RecordBatch. This is
         used to optimize the function so that only the necessary columns are
         read from disk.
@@ -2471,7 +2474,11 @@ def add_columns_udf(func, read_columns, output_schema=None):
     -------
     AddColumnsUDF
     """
-    return AddColumnsUDF(func, read_columns, output_schema)
+
+    def inner(func):
+        return AddColumnsUDF(func, read_columns, output_schema, cache_file)
+
+    return inner
 
 
 class BatchInfo(NamedTuple):

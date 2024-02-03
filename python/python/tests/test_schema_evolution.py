@@ -62,7 +62,7 @@ def test_add_columns_udf(tmp_path):
         read_columns=["a"],
         output_schema=pa.schema([pa.field("double_a", pa.int64())]),
     )
-    def double_a(batch, _info):
+    def double_a(batch):
         assert batch.schema.names == ["a"]
         return pa.record_batch(
             [pa.array([2 * x.as_py() for x in batch["a"]])], ["double_a"]
@@ -74,17 +74,20 @@ def test_add_columns_udf(tmp_path):
     assert expected == dataset.to_table()
 
     # Check: errors if produces inconsistent schema
+    @lance.add_columns_udf()
     def make_new_col(batch):
         col_name = str(uuid.uuid4())
         return pa.record_batch([batch["a"]], [col_name])
 
-    with pytest.raises(AssertionError):
+    with pytest.raises(
+        Exception, match="Output schema of function does not match the expected schema"
+    ):
         dataset.add_columns(make_new_col)
 
     # Schema inference and Pandas conversion
     @lance.add_columns_udf(read_columns=["a"])
-    def triple_a(batch, _info):
-        return pd.DataFrame({"double_a": [3 * x.as_py() for x in batch["a"]]})
+    def triple_a(batch):
+        return pd.DataFrame({"triple_a": [3 * x.as_py() for x in batch["a"]]})
 
     dataset.add_columns(triple_a)
 
@@ -108,7 +111,7 @@ def test_add_columns_udf_caching(tmp_path):
             raise RuntimeError("I failed")
         return pa.record_batch([pc.multiply(batch["a"], pa.scalar(2))], ["a_times_2"])
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(Exception):
         dataset.add_columns(double_a)
 
     assert dataset.version == 1
