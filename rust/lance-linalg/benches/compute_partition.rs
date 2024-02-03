@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use arrow_array::types::Float32Type;
 use criterion::{criterion_group, criterion_main, Criterion};
 use lance_linalg::{distance::MetricType, kmeans::compute_partitions};
@@ -25,14 +27,20 @@ fn bench_compute_partitions(c: &mut Criterion) {
     const INPUT_SIZE: usize = 10240;
     const SEED: [u8; 32] = [42; 32];
 
-    let centroids = generate_random_array_with_seed::<Float32Type>(K * DIMENSION, SEED);
-    let input = generate_random_array_with_seed::<Float32Type>(INPUT_SIZE * DIMENSION, SEED);
+    let centroids = Arc::new(generate_random_array_with_seed::<Float32Type>(
+        K * DIMENSION,
+        SEED,
+    ));
+    let input = Arc::new(generate_random_array_with_seed::<Float32Type>(
+        INPUT_SIZE * DIMENSION,
+        SEED,
+    ));
 
     c.bench_function("compute_centroids(L2)", |b| {
         b.iter(|| {
             compute_partitions::<Float32Type>(
-                centroids.values(),
-                input.values(),
+                centroids.clone(),
+                input.clone(),
                 DIMENSION,
                 MetricType::L2,
             )
@@ -42,8 +50,8 @@ fn bench_compute_partitions(c: &mut Criterion) {
     c.bench_function("compute_centroids(Cosine)", |b| {
         b.iter(|| {
             compute_partitions::<Float32Type>(
-                centroids.values(),
-                input.values(),
+                centroids.clone(),
+                input.clone(),
                 DIMENSION,
                 MetricType::Cosine,
             )

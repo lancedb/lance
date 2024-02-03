@@ -332,17 +332,19 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
             // have one empty chunk at the end. This filter removes those empty chunks.
             .filter(|range| futures::future::ready(range.start < range.end))
             .map(|range| async {
+                let range: Range<usize> = range;
                 let centroids = centroids.clone();
-                let data = data.clone();
+                let data = Arc::new(
+                    data.slice(range.start, range.end - range.start)
+                        .as_any()
+                        .downcast_ref::<T::ArrayType>()
+                        .unwrap()
+                        .clone(),
+                );
 
-                compute_partitions::<T>(
-                    centroids.as_slice(),
-                    &data.as_slice()[range],
-                    dimension,
-                    metric_type,
-                )
-                .in_current_span()
-                .await
+                compute_partitions::<T>(centroids, data, dimension, metric_type)
+                    .in_current_span()
+                    .await
             })
             .buffered(chunks)
             .collect::<Vec<_>>()

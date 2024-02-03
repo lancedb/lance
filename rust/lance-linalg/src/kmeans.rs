@@ -663,19 +663,16 @@ where
 ///
 /// If returns `None`, means the vector is not valid, i.e., all `NaN`.
 pub async fn compute_partitions<T: ArrowFloatType>(
-    centroids: &[T::Native],
-    vectors: &[T::Native],
+    centroids: Arc<T::ArrayType>,
+    vectors: Arc<T::ArrayType>,
     dimension: usize,
     metric_type: MetricType,
 ) -> Vec<Option<u32>>
 where
     <T::Native as FloatToArrayType>::ArrowType: Dot + Cosine + L2,
 {
-    let kmeans: KMeans<T> =
-        KMeans::with_centroids(Arc::new(centroids.to_vec().into()), dimension, metric_type);
-    let membership = kmeans
-        .compute_membership(Arc::new(vectors.to_vec().into()))
-        .await;
+    let kmeans: KMeans<T> = KMeans::with_centroids(centroids, dimension, metric_type);
+    let membership = kmeans.compute_membership(vectors).await;
     membership
         .cluster_id_and_distances
         .iter()
@@ -730,8 +727,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let actual = compute_partitions::<Float32Type>(
-            centroids.values(),
-            data.values(),
+            Arc::new(centroids),
+            Arc::new(data),
             DIM,
             MetricType::L2,
         )
