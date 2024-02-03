@@ -2415,16 +2415,6 @@ def _casting_recordbatch_iter(
         yield batch
 
 
-# this is used in LanceDataset.add_columns, but must be defined here so that
-# it can be pickled.
-def _validated_batch_func(func, output_schema, batch):
-    result = func(batch)
-    if isinstance(result, pd.DataFrame):
-        result = pa.RecordBatch.from_pandas(result)
-    assert result.schema == output_schema
-    return result
-
-
 class AddColumnsUDF:
     def __init__(self, func, read_columns, output_schema=None):
         self.func = func

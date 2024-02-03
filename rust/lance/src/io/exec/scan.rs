@@ -45,6 +45,7 @@ async fn open_file(
     with_make_deletions_null: bool,
 ) -> Result<FragmentReader> {
     let mut reader = file_fragment.open(projection.as_ref(), with_row_id).await?;
+
     if with_make_deletions_null {
         reader.with_make_deletions_null();
     };

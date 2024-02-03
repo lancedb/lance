@@ -1688,6 +1688,7 @@ impl Dataset {
             &Default::default(),
         )
         .await?;
+
         self.manifest = Arc::new(manifest);
 
         Ok(())
