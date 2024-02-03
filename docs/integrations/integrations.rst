@@ -6,3 +6,4 @@ Integrations
 
     Huggingface <./huggingface>
     Tensorflow <./tensorflow>
+    PyTorch <./pytorch>

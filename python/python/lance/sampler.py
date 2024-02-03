@@ -34,7 +34,14 @@ from lance.dependencies import numpy as np
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-__all__ = ["maybe_sample"]
+__all__ = [
+    "maybe_sample",
+    "Sampler",
+    "FragmentSampler",
+    "FullScanSampler",
+    "ShardedFragmentSampler",
+    "ShardedBatchSampler",
+]
 
 
 def _efficient_sample(
@@ -258,22 +265,25 @@ class ShardedFragmentSampler(FragmentSampler):
     """Sharded fragments by rank and world_size.
 
     Each rank / process will process a subset of the fragments.
+    It yields batches from ``ds.fragments[rank::world_size]``.
+
+    This sampler is more efficient than `ShardedBatchSampler` when the dataset is large.
+
+    Parameters
+    ----------
+    rank : int
+        The rank of the process in the distributed cluster.
+    world_size : int
+        The total number of processes in the distributed cluster.
+    randomize : bool
+        If set true, randomize
+    seed : int
+        The random seed to use when randomize is set true.
     """
 
     def __init__(
         self, rank: int, world_size: int, randomize: bool = False, seed: int = 0
     ):
-        """Initialize the ShardedFragmentSampler.
-
-        Parameters
-        ----------
-        rank : int
-            The rank of the process in the distributed cluster.
-        world_size : int
-            The total number of processes in the distributed cluster.
-        randomize : bool
-            If set true, randomize
-        """
         super().__init__()
 
         self._rank = rank
@@ -285,9 +295,7 @@ class ShardedFragmentSampler(FragmentSampler):
     def from_torch(randomize: bool = False, seed: int = 0) -> ShardedFragmentSampler:
         """Use from a PyTorch distributed environment.
 
-        Automatically infer `rank` and `world_size` from `torch.distributed`.
-
-        Other parameters, see :py:meth:`ShardedBatchIterator.__init__`.
+        Automatically infer `rank` and `world_size` from :mod:`torch.distributed`.
         """
         import torch
 
