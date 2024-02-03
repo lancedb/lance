@@ -669,42 +669,46 @@ class LanceDataset(pa.dataset.Dataset):
 
     def add_columns(self, transforms: Dict[str, str] | AddColumnsUDF):
         """
-        Add new columns by computing them based on input data.
+        Add new columns with defined values.
 
-        This function will infer the final schema by apply the function against
-        the first row of your dataset.
+        There are two ways to specify the new columns. First, you can provide
+        SQL expressions for each new column. Second you can provide a UDF that
+        takes a batch of existing data and returns a new batch with the new
+        columns. These new columns will be appended to the dataset.
+
+        See the :func:`lance.add_columns_udf` decorator for more information on
+        writing UDFs.
 
         Parameters
         ----------
-        value_func: Callable.
-            A function that takes a RecordBatch as input and returns a RecordBatch
-            or Pandas DataFrame. This should return only the new columns you wish
-            to add.
-        read_columns: Optional[list[str]].
-            If specified, only the columns in this list will be passed to the
-            value_func. Otherwise, all columns will be passed to the value_func.
-        commit_lock : CommitLock, optional
-            A custom commit lock.  Only needed if your object store does not support
-            atomic commits.  See the user guide for more details.
-        pool_executor: ThreadPoolExecutor, optional
-            A thread pool to run the function concurrently. This will
-            write out the data in parallel across fragments.
+        transforms : dict or AddColumnsUDF
+            If this is a dictionary, then the keys are the names of the new
+            columns and the values are SQL expression strings. These strings can
+            reference existing columns in the dataset.
+            If this is a AddColumnsUDF, then it is a UDF that takes a batch of
 
         Examples
         --------
         >>> import lance
         >>> import pyarrow as pa
-        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> table = pa.table({"a": [1, 2, 3]})
         >>> dataset = lance.write_dataset(table, "my_dataset")
-        >>> def double_a(batch):
+        >>> @lance.add_columns_udf
+        ... def double_a(batch):
         ...     df = batch.to_pandas()
         ...     return pd.DataFrame({'double_a': 2 * df['a']})
         >>> dataset.add_columns(double_a, ['a'])
         >>> dataset.to_table().to_pandas()
-           a  b  double_a
-        0  1  a         2
-        1  2  b         4
-        2  3  c         6
+           a double_a
+        0  1        2
+        1  2        4
+        2  3        6
+        >>> dataset.add_columns({"triple_a": "a * 3"})
+        >>> dataset.to_table().to_pandas()
+           a double_a triple_a
+        0  1        2        3
+        1  2        4        6
+        2  3        6        9
 
         See Also
         --------

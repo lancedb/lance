@@ -25,6 +25,7 @@ use chrono::Duration;
 
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::NewColumnTransform;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
@@ -1018,7 +1019,30 @@ impl Dataset {
     }
 
     fn add_columns(&mut self, transforms: &PyAny) -> PyResult<()> {
-        todo!()
+        let transforms = if let Ok(transforms) = transforms.extract::<&PyDict>() {
+            let expressions = transforms
+                .iter()
+                .map(|(k, v)| {
+                    let col = k.extract::<String>()?;
+                    let expr = v.extract::<String>()?;
+                    Ok((col, expr))
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            NewColumnTransform::SqlExpressions(expressions)
+        } else {
+            todo!()
+        };
+
+        let mut new_self = self.ds.as_ref().clone();
+        let new_self = RT
+            .spawn(None, async move {
+                new_self.add_columns(transforms).await?;
+                Ok(new_self)
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+
+        Ok(())
     }
 }
 

@@ -1444,7 +1444,7 @@ pub struct BatchInfo {
     pub batch_index: usize,
 }
 
-pub trait UDFCache {
+pub trait UDFCache: Send + Sync {
     fn get_batch(&self, info: &BatchInfo) -> Result<Option<RecordBatch>>;
     fn insert_batch(&self, info: BatchInfo, batch: RecordBatch) -> Result<()>;
     fn get_fragment(&self, fragment_id: u32) -> Result<Option<Fragment>>;
@@ -1452,7 +1452,7 @@ pub trait UDFCache {
 }
 
 pub struct BatchUDF {
-    pub mapper: Box<dyn Fn(&RecordBatch) -> Result<RecordBatch>>,
+    pub mapper: Box<dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send + Sync>,
     /// The schema of the returned RecordBatch
     pub append_schema: Arc<ArrowSchema>,
     /// The names of the columns that are required to be present in the input
@@ -1588,7 +1588,7 @@ impl Dataset {
     async fn add_columns_impl(
         &self,
         read_columns: Option<Vec<String>>,
-        mapper: Box<dyn Fn(&RecordBatch) -> Result<RecordBatch>>,
+        mapper: Box<dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send + Sync>,
         result_cache: Option<Arc<dyn UDFCache>>,
     ) -> Result<Vec<Fragment>> {
         let read_columns_ref = read_columns.as_deref();
@@ -3887,12 +3887,14 @@ mod tests {
         dataset.validate().await?;
 
         // Adding a duplicate column name will break
-        let res = dataset
-            .add_columns(NewColumnTransform::SqlExpressions(vec![(
-                "id".into(),
-                "id + 1".into(),
-            )]))
-            .await;
+        let fut = dataset
+        .add_columns(NewColumnTransform::SqlExpressions(vec![(
+            "id".into(),
+            "id + 1".into(),
+        )]));
+        // (Quick validation that the future is Send)
+        fn require_send<T: Send>(t: T) -> T { t }
+        let res = require_send(fut).await;
         assert!(matches!(res, Err(Error::InvalidInput { .. })));
 
         // Can add a column that is independent of any existing ones

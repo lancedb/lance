@@ -17,6 +17,7 @@ import uuid
 from pathlib import Path
 
 import lance
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -134,3 +135,24 @@ def test_add_columns_exprs(tmp_path):
     dataset = lance.write_dataset(tab, tmp_path)
     dataset.add_columns({"b": "a + 1"})
     assert dataset.to_table() == pa.table({"a": range(100), "b": range(1, 101)})
+
+
+def test_query_after_merge(tmp_path):
+    # https://github.com/lancedb/lance/issues/1905
+    tab = pa.table({
+        "id": range(100),
+        "vec": pa.FixedShapeTensorArray.from_numpy_ndarray(
+            np.random.rand(100, 128).astype("float32")
+        ),
+    })
+    tab2 = pa.table({
+        "id": range(100),
+        "data": range(100, 200),
+    })
+    dataset = lance.write_dataset(tab, tmp_path)
+
+    dataset.merge(tab2, left_on="id")
+
+    dataset.to_table(
+        nearest=dict(column="vec", k=10, q=np.random.rand(128).astype("float32"))
+    )
