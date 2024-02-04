@@ -613,10 +613,14 @@ class LanceDataset(pa.dataset.Dataset):
     def alter_columns(self, *alterations: Iterable[Dict[str, Any]]):
         """Alter column names and nullability.
 
+        Columns that are renamed can keep any indices that are on them. However, if
+        the column is casted to a different type, it's indices will be dropped.
+
         Parameters
         ----------
         alterations : Iterable[Dict[str, Any]]
             A sequence of dictionaries, each with the following keys:
+
             - "path": str
                 The column path to alter. For a top-level column, this is the name.
                 For a nested column, this is the dot-separated path, e.g. "a.b.c".
@@ -631,9 +635,6 @@ class LanceDataset(pa.dataset.Dataset):
             - "data_type": pyarrow.DataType, optional
                 The new data type to cast the column to. If not specified, the column
                 data type is not changed.
-
-        Columns that are renamed can keep any indices that are on them. However, if
-        the column is casted to a different type, it's indices will be dropped.
 
         Examples
         --------
@@ -796,16 +797,16 @@ class LanceDataset(pa.dataset.Dataset):
     def drop_columns(self, columns: List[str]):
         """Drop one or more columns from the dataset
 
+        This is a metadata-only operation and does not remove the data from the
+        underlying storage. In order to remove the data, you must subsequently
+        call ``compact_files`` to rewrite the data without the removed columns and
+        then call ``cleanup_files`` to remove the old files.
+
         Parameters
         ----------
         columns : list of str
             The names of the columns to drop. These can be nested column references
             (e.g. "a.b.c") or top-level column names (e.g. "a").
-
-        This is a metadata-only operation and does not remove the data from the
-        underlying storage. In order to remove the data, you must subsequently
-        call ``compact_files`` to rewrite the data without the removed columns and
-        then call ``cleanup_files`` to remove the old files.
 
         Examples
         --------
