@@ -102,6 +102,7 @@ jobs:
       run: sudo rm -rf target/wheels
   linux-arm:
     timeout-minutes: 45
+    name: Python Linux 3.${{ matrix.python-minor-version }} ARM
     strategy:
       matrix:
         python-minor-version: [ "12" ]
@@ -137,6 +138,7 @@ jobs:
       run: sudo rm -rf target/wheels
   mac:
     timeout-minutes: 45
+    name: Python macOS 3.12 ARM
     runs-on: "macos-14"
     defaults:
       run:
