@@ -99,14 +99,16 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_index::DatasetIndexExt;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::format::RowAddress;
 use crate::io::commit::{commit_transaction, migrate_fragments};
+use crate::Dataset;
 use crate::Result;
-use crate::{format::Fragment, Dataset};
+use lance_core::utils::address::RowAddress;
+use lance_table::format::Fragment;
 
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
@@ -473,8 +475,8 @@ impl CandidateBin {
 async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
     let indices = dataset.load_indices().await?;
     let mut index_fragmaps = Vec::with_capacity(indices.len());
-    for index in indices {
-        if let Some(fragment_bitmap) = index.fragment_bitmap {
+    for index in indices.iter() {
+        if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
             index_fragmaps.push(fragment_bitmap.clone());
         } else {
             let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
@@ -735,6 +737,7 @@ async fn reserve_fragment_ids(dataset: &Dataset, fragments: &mut Vec<Fragment>) 
     let manifest = commit_transaction(
         dataset,
         dataset.object_store(),
+        dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),
         &Default::default(),
@@ -784,7 +787,10 @@ async fn rewrite_files(
     // information.
     let fragments = migrate_fragments(dataset.as_ref(), &task.fragments, recompute_stats).await?;
     let mut scanner = dataset.scan();
-    scanner.with_fragments(fragments.clone()).with_row_id();
+    scanner
+        .with_fragments(fragments.clone())
+        .scan_in_order(true)
+        .with_row_id();
 
     let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
     let row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
@@ -895,6 +901,7 @@ pub async fn commit_compaction(
     let manifest = commit_transaction(
         dataset,
         dataset.object_store(),
+        dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),
         &Default::default(),

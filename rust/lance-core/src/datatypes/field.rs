@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,12 @@
 
 //! Lance Schema Field
 
-use std::{cmp::max, collections::HashMap, fmt, sync::Arc};
+use std::{
+    cmp::max,
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 use arrow_array::{
     cast::AsArray,
@@ -24,17 +29,33 @@ use arrow_array::{
     ArrayRef,
 };
 use arrow_schema::{DataType, Field as ArrowField};
-use async_recursion::async_recursion;
-use lance_arrow::*;
+use lance_arrow::{bfloat16::ARROW_EXT_NAME_KEY, *};
 use snafu::{location, Location};
 
 use super::{Dictionary, LogicalType};
-use crate::{
-    encodings::Encoding,
-    format::pb,
-    io::{read_binary_array, read_fixed_stride_array, Reader},
-    Error, Result,
-};
+use crate::{Error, Result};
+
+#[derive(Default)]
+pub struct SchemaCompareOptions {
+    /// Should the metadata be compared (default false)
+    pub compare_metadata: bool,
+    /// Should the dictionaries be compared (default false)
+    pub compare_dictionary: bool,
+    /// Should the field ids be compared (default false)
+    pub compare_field_ids: bool,
+}
+/// Encoding enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Encoding {
+    /// Plain encoding.
+    Plain,
+    /// Binary encoding.
+    VarBinary,
+    /// Dictionary encoding.
+    Dictionary,
+    /// RLE encoding.
+    RLE,
+}
 
 /// Lance Schema Field
 ///
@@ -42,9 +63,10 @@ use crate::{
 pub struct Field {
     pub name: String,
     pub id: i32,
-    parent_id: i32,
-    logical_type: LogicalType,
-    metadata: HashMap<String, String>,
+    // TODO: Find way to move these next three fields to private
+    pub parent_id: i32,
+    pub logical_type: LogicalType,
+    pub metadata: HashMap<String, String>,
     pub encoding: Option<Encoding>,
     pub nullable: bool,
 
@@ -69,10 +91,158 @@ impl Field {
         }
     }
 
+    fn explain_differences(
+        &self,
+        expected: &Self,
+        options: &SchemaCompareOptions,
+        path: Option<&str>,
+    ) -> Vec<String> {
+        let mut differences = Vec::new();
+        let self_name = path
+            .map(|path| {
+                let mut self_name = path.to_owned();
+                self_name.push('.');
+                self_name.push_str(&self.name);
+                self_name
+            })
+            .unwrap_or_else(|| self.name.clone());
+        if self.name != expected.name {
+            let expected_path = path
+                .map(|path| {
+                    let mut expected_path = path.to_owned();
+                    expected_path.push('.');
+                    expected_path.push_str(&expected.name);
+                    expected_path
+                })
+                .unwrap_or_else(|| expected.name.clone());
+            differences.push(format!(
+                "expected name '{}' but name was '{}'",
+                expected_path, self_name
+            ));
+        }
+        if options.compare_field_ids && self.id != expected.id {
+            differences.push(format!(
+                "`{}` should have id {} but id was {}",
+                self_name, expected.id, self.id
+            ));
+        }
+        if self.logical_type != expected.logical_type {
+            differences.push(format!(
+                "`{}` should have type {} but type was {}",
+                self_name, expected.logical_type, self.logical_type
+            ));
+        }
+        if self.nullable != expected.nullable {
+            differences.push(format!(
+                "`{}` should have nullable={} but nullable={}",
+                self_name, expected.nullable, self.nullable
+            ))
+        }
+        if options.compare_dictionary && self.dictionary != expected.dictionary {
+            differences.push(format!(
+                "dictionary for `{}` did not match expected dictionary",
+                self_name
+            ));
+        }
+        if options.compare_metadata && self.metadata != expected.metadata {
+            differences.push(format!(
+                "metadata for `{}` did not match expected metadata",
+                self_name
+            ));
+        }
+        if self.children.len() != expected.children.len()
+            || !self
+                .children
+                .iter()
+                .zip(expected.children.iter())
+                .all(|(child, expected)| child.name == expected.name)
+        {
+            let self_children = self
+                .children
+                .iter()
+                .map(|child| child.name.clone())
+                .collect::<HashSet<_>>();
+            let expected_children = expected
+                .children
+                .iter()
+                .map(|child| child.name.clone())
+                .collect::<HashSet<_>>();
+            let missing = expected_children
+                .difference(&self_children)
+                .cloned()
+                .collect::<Vec<_>>();
+            let unexpected = self_children
+                .difference(&expected_children)
+                .cloned()
+                .collect::<Vec<_>>();
+            if missing.is_empty() && unexpected.is_empty() {
+                differences.push(format!(
+                    "`{}` field order mismatch, expected [{}] but was [{}]",
+                    self_name,
+                    expected
+                        .children
+                        .iter()
+                        .map(|child| child.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    self.children
+                        .iter()
+                        .map(|child| child.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
+            } else {
+                differences.push(format!(
+                    "`{}` had mismatched children, missing=[{}] unexpected=[{}]",
+                    self_name,
+                    missing.join(", "),
+                    unexpected.join(", ")
+                ));
+            }
+        } else {
+            differences.extend(self.children.iter().zip(expected.children.iter()).flat_map(
+                |(child, expected_child)| {
+                    child.explain_differences(expected_child, options, Some(&self_name))
+                },
+            ));
+        }
+        differences
+    }
+
+    pub fn explain_difference(
+        &self,
+        expected: &Self,
+        options: &SchemaCompareOptions,
+    ) -> Option<String> {
+        let differences = self.explain_differences(expected, options, None);
+        if differences.is_empty() {
+            None
+        } else {
+            Some(differences.join(", "))
+        }
+    }
+
+    pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
+        if self.children.len() != expected.children.len() {
+            false
+        } else {
+            self.name == expected.name
+                && self.logical_type == expected.logical_type
+                && self.nullable == expected.nullable
+                && self.children.len() == expected.children.len()
+                && self
+                    .children
+                    .iter()
+                    .zip(&expected.children)
+                    .all(|(left, right)| left.compare_with_options(right, options))
+                && (!options.compare_field_ids || self.id == expected.id)
+                && (!options.compare_dictionary || self.dictionary == expected.dictionary)
+                && (!options.compare_metadata || self.metadata == expected.metadata)
+        }
+    }
+
     pub fn extension_name(&self) -> Option<&str> {
-        self.metadata
-            .get("ARROW:extension:name")
-            .map(String::as_str)
+        self.metadata.get(ARROW_EXT_NAME_KEY).map(String::as_str)
     }
 
     pub fn child(&self, name: &str) -> Option<&Self> {
@@ -483,60 +653,6 @@ impl Field {
         }
         None
     }
-
-    #[async_recursion]
-    pub async fn load_dictionary<'a>(&mut self, reader: &dyn Reader) -> Result<()> {
-        if let DataType::Dictionary(_, value_type) = self.data_type() {
-            assert!(self.dictionary.is_some());
-            if let Some(dict_info) = self.dictionary.as_mut() {
-                use DataType::*;
-                match value_type.as_ref() {
-                    Utf8 | Binary => {
-                        dict_info.values = Some(
-                            read_binary_array(
-                                reader,
-                                value_type.as_ref(),
-                                true, // Empty values are null
-                                dict_info.offset,
-                                dict_info.length,
-                                ..,
-                            )
-                            .await?,
-                        );
-                    }
-                    Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => {
-                        dict_info.values = Some(
-                            read_fixed_stride_array(
-                                reader,
-                                value_type.as_ref(),
-                                dict_info.offset,
-                                dict_info.length,
-                                ..,
-                            )
-                            .await?,
-                        );
-                    }
-                    _ => {
-                        return Err(Error::Schema {
-                            message: format!(
-                                "Does not support {} as dictionary value type",
-                                value_type
-                            ),
-                            location: location!(),
-                        });
-                    }
-                }
-            } else {
-                panic!("Should not reach here: dictionary field does not load dictionary info")
-            }
-            Ok(())
-        } else {
-            for child in self.children.as_mut_slice() {
-                child.load_dictionary(reader).await?;
-            }
-            Ok(())
-        }
-    }
 }
 
 impl fmt::Display for Field {
@@ -612,86 +728,11 @@ impl From<&Field> for ArrowField {
     }
 }
 
-impl From<&pb::Field> for Field {
-    fn from(field: &pb::Field) -> Self {
-        let mut lance_metadata: HashMap<String, String> = field
-            .metadata
-            .iter()
-            .map(|(key, value)| {
-                let string_value = String::from_utf8_lossy(value).to_string();
-                (key.clone(), string_value)
-            })
-            .collect();
-        if !field.extension_name.is_empty() {
-            lance_metadata.insert(
-                "ARROW:extension:name".to_string(),
-                field.extension_name.clone(),
-            );
-        }
-        Self {
-            name: field.name.clone(),
-            id: field.id,
-            parent_id: field.parent_id,
-            logical_type: LogicalType(field.logical_type.clone()),
-            metadata: lance_metadata,
-            encoding: match field.encoding {
-                1 => Some(Encoding::Plain),
-                2 => Some(Encoding::VarBinary),
-                3 => Some(Encoding::Dictionary),
-                4 => Some(Encoding::RLE),
-                _ => None,
-            },
-            nullable: field.nullable,
-            children: vec![],
-            dictionary: field.dictionary.as_ref().map(Dictionary::from),
-        }
-    }
-}
-
-impl From<&Field> for pb::Field {
-    fn from(field: &Field) -> Self {
-        let pb_metadata = field
-            .metadata
-            .clone()
-            .into_iter()
-            .map(|(key, value)| (key, value.into_bytes()))
-            .collect();
-        Self {
-            id: field.id,
-            parent_id: field.parent_id,
-            name: field.name.clone(),
-            logical_type: field.logical_type.0.clone(),
-            encoding: match field.encoding {
-                Some(Encoding::Plain) => 1,
-                Some(Encoding::VarBinary) => 2,
-                Some(Encoding::Dictionary) => 3,
-                Some(Encoding::RLE) => 4,
-                _ => 0,
-            },
-            nullable: field.nullable,
-            dictionary: field.dictionary.as_ref().map(pb::Dictionary::from),
-            metadata: pb_metadata,
-            extension_name: field
-                .extension_name()
-                .map(|name| name.to_owned())
-                .unwrap_or_default(),
-            r#type: 0,
-        }
-    }
-}
-
-impl From<&Field> for Vec<pb::Field> {
-    fn from(field: &Field) -> Self {
-        let mut protos = vec![pb::Field::from(field)];
-        protos.extend(field.children.iter().flat_map(Self::from));
-        protos
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use arrow_array::{DictionaryArray, StringArray, UInt32Array};
     use arrow_schema::{DataType, Fields, TimeUnit};
 
     #[test]
@@ -749,7 +790,7 @@ mod tests {
             let field = Field::try_from(&arrow_field).unwrap();
             assert_eq!(field.name, name);
             assert_eq!(field.data_type(), data_type);
-            assert_eq!(ArrowField::try_from(&field).unwrap(), arrow_field);
+            assert_eq!(ArrowField::from(&field), arrow_field);
         }
     }
 
@@ -801,7 +842,7 @@ mod tests {
         let field = Field::try_from(&arrow_field).unwrap();
         assert_eq!(field.name, "struct");
         assert_eq!(&field.data_type(), arrow_field.data_type());
-        assert_eq!(ArrowField::try_from(&field).unwrap(), arrow_field);
+        assert_eq!(ArrowField::from(&field), arrow_field);
     }
 
     #[test]
@@ -881,5 +922,253 @@ mod tests {
         .try_into()
         .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_compare() {
+        let opts = SchemaCompareOptions::default();
+
+        let mut expected: Field = ArrowField::new(
+            "a",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        let keys = UInt32Array::from_iter_values(vec![0, 1]);
+        let values: ArrayRef = Arc::new(StringArray::from_iter_values([
+            "a".to_string(),
+            "b".to_string(),
+        ]));
+        let dictionary: ArrayRef = Arc::new(DictionaryArray::new(keys, values));
+        expected.set_dictionary(&dictionary);
+
+        let no_dictionary: Field = ArrowField::new(
+            "a",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )
+        .try_into()
+        .unwrap();
+
+        // By default, do not compare dictionary
+        assert!(no_dictionary.compare_with_options(&expected, &opts));
+
+        let compare_dict = SchemaCompareOptions {
+            compare_dictionary: true,
+            ..Default::default()
+        };
+        assert!(!no_dictionary.compare_with_options(&expected, &compare_dict));
+
+        let metadata = HashMap::<_, _>::from_iter(vec![("foo".to_string(), "bar".to_string())]);
+        let expected: Field = ArrowField::new("a", DataType::UInt32, true)
+            .with_metadata(metadata)
+            .try_into()
+            .unwrap();
+
+        let no_metadata: Field = ArrowField::new("a", DataType::UInt32, true)
+            .try_into()
+            .unwrap();
+
+        // By default, do not compare metadata
+        assert!(no_metadata.compare_with_options(&expected, &opts));
+
+        let compare_metadata = SchemaCompareOptions {
+            compare_metadata: true,
+            ..Default::default()
+        };
+        assert!(!no_metadata.compare_with_options(&expected, &compare_metadata));
+
+        let mut expected: Field = ArrowField::new("a", DataType::UInt32, true)
+            .try_into()
+            .unwrap();
+        let mut seed = 0;
+        expected.set_id(-1, &mut seed);
+
+        let no_id: Field = ArrowField::new("a", DataType::UInt32, true)
+            .try_into()
+            .unwrap();
+        // Do not compare ids by default
+        assert!(no_id.compare_with_options(&expected, &opts));
+
+        let compare_ids = SchemaCompareOptions {
+            compare_field_ids: true,
+            ..Default::default()
+        };
+        assert!(!no_id.compare_with_options(&expected, &compare_ids));
+    }
+
+    #[test]
+    fn test_explain_difference() {
+        let expected: Field = ArrowField::new(
+            "a",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("b", DataType::Int32, true),
+                ArrowField::new("c", DataType::Int32, true),
+            ])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+
+        let opts = SchemaCompareOptions::default();
+        assert_eq!(expected.explain_difference(&expected, &opts), None);
+
+        let wrong_name: Field = ArrowField::new(
+            "b",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("b", DataType::Int32, true),
+                ArrowField::new("c", DataType::Int32, true),
+            ])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+
+        assert_eq!(
+            wrong_name.explain_difference(&expected, &opts),
+            Some("expected name 'a' but name was 'b'".to_string())
+        );
+
+        let wrong_child: Field = ArrowField::new(
+            "a",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("b", DataType::Int32, false),
+                ArrowField::new("c", DataType::Int32, true),
+            ])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            wrong_child.explain_difference(&expected, &opts),
+            Some("`a.b` should have nullable=true but nullable=false".to_string())
+        );
+
+        let mismatched_children: Field = ArrowField::new(
+            "a",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("d", DataType::Int32, false),
+                ArrowField::new("b", DataType::Int32, true),
+            ])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            mismatched_children.explain_difference(&expected, &opts),
+            Some("`a` had mismatched children, missing=[c] unexpected=[d]".to_string())
+        );
+
+        let reordered_children: Field = ArrowField::new(
+            "a",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("c", DataType::Int32, false),
+                ArrowField::new("b", DataType::Int32, true),
+            ])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            reordered_children.explain_difference(&expected, &opts),
+            Some("`a` field order mismatch, expected [b, c] but was [c, b]".to_string())
+        );
+
+        let multiple_wrongs: Field = ArrowField::new(
+            "c",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("b", DataType::Int32, true),
+                ArrowField::new("c", DataType::Float32, true),
+            ])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            multiple_wrongs.explain_difference(&expected, &opts),
+            Some(
+                "expected name 'a' but name was 'c', `c.c` should have type int32 but type was float"
+                    .to_string()
+            )
+        );
+
+        let mut expected: Field = ArrowField::new(
+            "a",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        let keys = UInt32Array::from_iter_values(vec![0, 1]);
+        let values: ArrayRef = Arc::new(StringArray::from_iter_values([
+            "a".to_string(),
+            "b".to_string(),
+        ]));
+        let dictionary: ArrayRef = Arc::new(DictionaryArray::new(keys, values));
+        expected.set_dictionary(&dictionary);
+
+        let no_dictionary: Field = ArrowField::new(
+            "a",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )
+        .try_into()
+        .unwrap();
+
+        // By default, do not compare dictionary
+        assert_eq!(no_dictionary.explain_difference(&expected, &opts), None);
+
+        let compare_dict = SchemaCompareOptions {
+            compare_dictionary: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            no_dictionary.explain_difference(&expected, &compare_dict),
+            Some("dictionary for `a` did not match expected dictionary".to_string())
+        );
+
+        let metadata = HashMap::<_, _>::from_iter(vec![("foo".to_string(), "bar".to_string())]);
+        let expected: Field = ArrowField::new("a", DataType::UInt32, true)
+            .with_metadata(metadata)
+            .try_into()
+            .unwrap();
+
+        let no_metadata: Field = ArrowField::new("a", DataType::UInt32, true)
+            .try_into()
+            .unwrap();
+
+        // By default, do not compare metadata
+        assert_eq!(no_metadata.explain_difference(&expected, &opts), None);
+
+        let compare_metadata = SchemaCompareOptions {
+            compare_metadata: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            no_metadata.explain_difference(&expected, &compare_metadata),
+            Some("metadata for `a` did not match expected metadata".to_string())
+        );
+
+        let mut expected: Field = ArrowField::new("a", DataType::UInt32, true)
+            .try_into()
+            .unwrap();
+        let mut seed = 0;
+        expected.set_id(-1, &mut seed);
+
+        let no_id: Field = ArrowField::new("a", DataType::UInt32, true)
+            .try_into()
+            .unwrap();
+        // Do not compare ids by default
+        assert_eq!(no_id.explain_difference(&expected, &opts), None);
+
+        let compare_ids = SchemaCompareOptions {
+            compare_field_ids: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            no_id.explain_difference(&expected, &compare_ids),
+            Some("`a` should have id 0 but id was -1".to_string())
+        );
     }
 }

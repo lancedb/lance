@@ -20,14 +20,14 @@ lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 lance-datafusion = { workspace = true }
 lance-datagen = { workspace = true }
+lance-file = { workspace = true }
+lance-io = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
+lance-table = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
-arrow-cast = { workspace = true }
-arrow-data = { workspace = true }
-arrow-ipc = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
@@ -42,20 +42,17 @@ clap = { version = "4.1.1", features = ["derive"], optional = true }
 dashmap = "5"
 # matches arrow-rs use
 half.workspace = true
-http.workspace = true
-object_store.workspace = true
-aws-config.workspace = true
+itertools.workspace = true
+object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
 aws-credential-types.workspace = true
 pin-project.workspace = true
 prost.workspace = true
-prost-types.workspace = true
 roaring.workspace = true
 tokio.workspace = true
 url.workspace = true
 rand.workspace = true
 futures.workspace = true
 uuid.workspace = true
-shellexpand.workspace = true
 arrow.workspace = true
 num_cpus.workspace = true
 # TODO: use datafusion sub-modules to reduce build size?
@@ -64,7 +61,6 @@ datafusion-physical-expr.workspace = true
 lapack = { version = "0.19.0", optional = true }
 cblas = { version = "0.4.0", optional = true }
 lru_time_cache = "0.11"
-num-traits.workspace = true
 ordered-float = "3.6.0"
 snafu = { workspace = true }
 log = { workspace = true }
@@ -76,7 +72,6 @@ aws-sdk-dynamodb = { workspace = true, optional = true }
 tempfile.workspace = true
 tracing.workspace = true
 lazy_static = { workspace = true }
-base64 = "0.21.4"
 async_cell = "0.2.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -102,10 +97,9 @@ prost-build.workspace = true
 
 [dev-dependencies]
 lance-test-macros = { workspace = true }
-
+pretty_assertions = { workspace = true }
 clap = { version = "4.1.1", features = ["derive"] }
 criterion = { workspace = true }
-
 approx.workspace = true
 dirs = "5.0.0"
 all_asserts = "2.3.1"
@@ -120,7 +114,7 @@ avx512fp16 = ["lance-linalg/avx512fp16"]
 cli = ["clap"]
 # opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
 tensorflow = ["tfrecord"]
-dynamodb = ["lance-core/dynamodb", "aws-sdk-dynamodb"]
+dynamodb = ["lance-table/dynamodb", "aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 
 [[bin]]

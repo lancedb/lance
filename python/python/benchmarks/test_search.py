@@ -54,8 +54,18 @@ def create_base_dataset(data_dir: Path) -> lance.LanceDataset:
     if dataset:
         return dataset
 
-    table = create_table(NUM_ROWS, offset=0)
-    dataset = lance.write_dataset(table, tmp_path)
+    rows_remaining = NUM_ROWS
+    offset = 0
+    dataset = None
+    while rows_remaining > 0:
+        next_batch_length = min(rows_remaining, 1024 * 1024)
+        rows_remaining -= next_batch_length
+        table = create_table(next_batch_length, offset)
+        if offset == 0:
+            dataset = lance.write_dataset(table, tmp_path)
+        else:
+            dataset = lance.write_dataset(table, tmp_path, mode="append")
+        offset += next_batch_length
 
     dataset.create_index(
         column="vector",
@@ -65,6 +75,8 @@ def create_base_dataset(data_dir: Path) -> lance.LanceDataset:
         num_sub_vectors=16,
         num_bits=8,
     )
+
+    dataset.create_scalar_index("filterable", "BTREE")
 
     return dataset
 
@@ -208,14 +220,23 @@ def test_filtered_search(test_dataset, benchmark, selectivity, prefilter, use_in
         "filterable < 5000",
         "filterable > 5000",
     ),
+    ids=[
+        "none",
+        "equality",
+        "not_equality",
+        "in_list_one",
+        "not_in_list_one",
+        "not_equality_and_chain",
+        "not_in_list_three",
+        "less_than_selective",
+        "greater_than_not_selective",
+    ],
 )
-def test_scalar_index_prefilter(datasets: Datasets, benchmark, filter: str):
-    dataset = datasets.clean
-    dataset.create_scalar_index("filterable", "BTREE")
+def test_scalar_index_prefilter(test_dataset, benchmark, filter: str):
     q = pc.random(N_DIMS).cast(pa.float32())
     if filter is None:
         benchmark(
-            dataset.to_table,
+            test_dataset.to_table,
             nearest=dict(
                 column="vector",
                 q=q,
@@ -225,13 +246,54 @@ def test_scalar_index_prefilter(datasets: Datasets, benchmark, filter: str):
         )
     else:
         benchmark(
-            dataset.to_table,
+            test_dataset.to_table,
             nearest=dict(
                 column="vector",
                 q=q,
                 k=100,
                 nprobes=10,
             ),
+            prefilter=True,
+            filter=filter,
+        )
+
+
+@pytest.mark.benchmark(group="query_no_vec")
+@pytest.mark.parametrize(
+    "filter",
+    (
+        None,
+        "filterable = 0",
+        "filterable != 0",
+        "filterable IN (0)",
+        "filterable IN (0, 5000, 10000)",
+        "filterable NOT IN (0)",
+        "filterable != 0 AND filterable != 5000 AND filterable != 10000",
+        "filterable NOT IN (0, 5000, 10000)",
+        "filterable < 5000",
+        "filterable > 5000",
+    ),
+    ids=[
+        "none",
+        "equality",
+        "not_equality",
+        "in_list_one",
+        "in_list_three",
+        "not_in_list_one",
+        "not_equality_and_chain",
+        "not_in_list_three",
+        "less_than_selective",
+        "greater_than_not_selective",
+    ],
+)
+def test_scalar_index_search(test_dataset, benchmark, filter: str):
+    if filter is None:
+        benchmark(
+            test_dataset.to_table,
+        )
+    else:
+        benchmark(
+            test_dataset.to_table,
             prefilter=True,
             filter=filter,
         )

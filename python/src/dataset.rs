@@ -23,30 +23,34 @@ use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use chrono::Duration;
 
-use futures::StreamExt;
+use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::UpdateBuilder;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
-    Dataset as LanceDataset, ReadParams, Version, WriteMode, WriteParams,
+    Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams,
+    UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
+    WriteParams,
 };
-use lance::index::IndexParams;
 use lance::index::{
     scalar::ScalarIndexParams,
     vector::{diskann::DiskANNParams, VectorIndexParams},
-    DatasetIndexExt,
 };
 use lance_arrow::as_fixed_size_list_array;
-use lance_core::{datatypes::Schema, format::Fragment, io::object_store::ObjectStoreParams};
+use lance_core::datatypes::Schema;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::{
     vector::{ivf::IvfBuildParams, pq::PQBuildParams},
-    IndexType,
+    DatasetIndexExt, IndexParams, IndexType,
 };
+use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
-use pyo3::exceptions::PyStopIteration;
+use lance_table::format::Fragment;
+use lance_table::io::commit::CommitHandler;
+use object_store::path::Path;
+use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::PySet;
+use pyo3::types::{PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
@@ -88,6 +92,101 @@ fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
             e
         ))
     })
+}
+
+#[pyclass(name = "_MergeInsertBuilder", module = "_lib", subclass)]
+pub struct MergeInsertBuilder {
+    builder: LanceMergeInsertBuilder,
+    dataset: Py<Dataset>,
+}
+
+#[pymethods]
+impl MergeInsertBuilder {
+    #[new]
+    pub fn new(dataset: &PyAny, on: &PyAny) -> PyResult<Self> {
+        let dataset: Py<Dataset> = dataset.extract()?;
+        let ds = dataset.borrow(on.py()).ds.clone();
+        // Either a single string, which we put in a vector or an iterator
+        // of strings, which we collect into a vector
+        let on = PyAny::downcast::<PyString>(on)
+            .map(|val| vec![val.to_string()])
+            .or_else(|_| {
+                let iterator = on.iter().map_err(|_| {
+                    PyTypeError::new_err(
+                        "The `on` argument to merge_insert must be a str or iterable of str",
+                    )
+                })?;
+                let mut keys = Vec::new();
+                for key in iterator {
+                    keys.push(PyAny::downcast::<PyString>(key?)?.to_string());
+                }
+                PyResult::Ok(keys)
+            })?;
+
+        let mut builder = LanceMergeInsertBuilder::try_new(ds, on)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        // We don't have do_nothing methods in python so we start with a blank slate
+        builder
+            .when_matched(WhenMatched::DoNothing)
+            .when_not_matched(WhenNotMatched::DoNothing);
+
+        Ok(Self { builder, dataset })
+    }
+
+    pub fn when_matched_update_all(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
+        slf.builder.when_matched(WhenMatched::UpdateAll);
+        Ok(slf)
+    }
+
+    pub fn when_not_matched_insert_all(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
+        slf.builder.when_not_matched(WhenNotMatched::InsertAll);
+        Ok(slf)
+    }
+
+    pub fn when_not_matched_by_source_delete<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        expr: Option<&str>,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        let new_val = if let Some(expr) = expr {
+            let dataset = slf.dataset.borrow(slf.py());
+            WhenNotMatchedBySource::delete_if(&dataset.ds, expr)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?
+        } else {
+            WhenNotMatchedBySource::Delete
+        };
+        slf.builder.when_not_matched_by_source(new_val);
+        Ok(slf)
+    }
+
+    pub fn execute(&mut self, new_data: &PyAny) -> PyResult<()> {
+        let py = new_data.py();
+
+        let new_data: Box<dyn RecordBatchReader + Send> = if new_data.is_instance_of::<Scanner>() {
+            let scanner: Scanner = new_data.extract()?;
+            Box::new(
+                RT.spawn(Some(py), async move { scanner.to_reader().await })?
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            )
+        } else {
+            Box::new(ArrowArrayStreamReader::from_pyarrow(new_data)?)
+        };
+
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let new_self = RT
+            .spawn(Some(py), job.execute_reader(new_data))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        let dataset = self.dataset.as_ref(py);
+
+        dataset.borrow_mut().ds = new_self;
+
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -167,18 +266,16 @@ impl Dataset {
         let mut params = ReadParams {
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
             metadata_cache_size: metadata_cache_size.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
-            session: None,
             store_options: Some(ObjectStoreParams {
                 block_size,
                 ..Default::default()
             }),
+            ..Default::default()
         };
 
         if let Some(commit_handler) = commit_handler {
             let py_commit_lock = PyCommitLock::new(commit_handler);
-            let mut object_store_params = ObjectStoreParams::default();
-            object_store_params.set_commit_lock(Arc::new(py_commit_lock));
-            params.store_options = Some(object_store_params);
+            params.set_commit_lock(Arc::new(py_commit_lock));
         }
         let dataset = if let Some(ver) = version {
             RT.runtime
@@ -207,18 +304,17 @@ impl Dataset {
 
     /// Get index statistics
     fn index_statistics(&self, index_name: String) -> PyResult<String> {
-        let index_statistics = RT
-            .runtime
+        RT.runtime
             .block_on(self.ds.index_statistics(&index_name))
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        if let Some(s) = index_statistics {
-            Ok(s)
-        } else {
-            Err(PyKeyError::new_err(format!(
-                "Index \"{}\" not found",
-                index_name
-            )))
-        }
+            .map_err(|err| match err {
+                lance::Error::IndexNotFound { .. } => {
+                    PyKeyError::new_err(format!("Index \"{}\" not found", index_name))
+                }
+                _ => PyIOError::new_err(format!(
+                    "Failed to get index statistics for index {}: {}",
+                    index_name, err
+                )),
+            })
     }
 
     /// Load index metadata
@@ -289,6 +385,7 @@ impl Dataset {
         fragments: Option<Vec<FileFragment>>,
         with_row_id: Option<bool>,
         use_stats: Option<bool>,
+        substrait_filter: Option<Vec<u8>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         if let Some(c) = columns {
@@ -297,9 +394,19 @@ impl Dataset {
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = filter {
+            if substrait_filter.is_some() {
+                return Err(PyValueError::new_err(
+                    "cannot specify both a string filter and a substrait filter",
+                ));
+            }
             scanner
                 .filter(f.as_str())
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(f) = substrait_filter {
+            RT.runtime
+                .block_on(scanner.filter_substrait(f.as_slice()))
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
         }
         if let Some(prefilter) = prefilter {
             scanner.prefilter(prefilter);
@@ -524,11 +631,17 @@ impl Dataset {
     fn merge(
         &mut self,
         reader: PyArrowType<ArrowArrayStreamReader>,
-        left_on: &str,
-        right_on: &str,
+        left_on: String,
+        right_on: String,
     ) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.merge(reader.0, left_on, right_on))?
+        let new_self = RT
+            .spawn(None, async move {
+                new_self
+                    .merge(reader.0, &left_on, &right_on)
+                    .await
+                    .map(|_| new_self)
+            })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -613,10 +726,20 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
+    fn checkout_version(&self, version: u64) -> PyResult<Self> {
+        let ds = RT
+            .block_on(None, self.ds.checkout_version(version))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(Self {
+            ds: Arc::new(ds),
+            uri: self.uri.clone(),
+        })
+    }
+
     /// Restore the current version
     fn restore(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.restore(None))?
+        RT.block_on(None, new_self.restore())?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -641,10 +764,22 @@ impl Dataset {
         })
     }
 
-    fn optimize_indices(&mut self, _kwargs: Option<&PyDict>) -> PyResult<()> {
+    #[pyo3(signature = (**kwargs))]
+    fn optimize_indices(&mut self, kwargs: Option<&PyDict>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.optimize_indices())?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let mut options: OptimizeOptions = Default::default();
+        if let Some(kwargs) = kwargs {
+            if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
+                options.num_indices_to_merge = num_indices_to_merge.extract()?;
+            }
+        }
+        RT.block_on(
+            None,
+            new_self
+                .optimize_indices(&options)
+                .map_err(|err| PyIOError::new_err(err.to_string())),
+        )??;
+
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -702,6 +837,17 @@ impl Dataset {
                         pq_params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
                     };
 
+                    if let Some(c) = kwargs.get_item("pq_codebook")? {
+                        let batch = RecordBatch::from_pyarrow(c)?;
+                        if "_pq_codebook" != batch.schema().field(0).name() {
+                            return Err(PyValueError::new_err(
+                                "Expected '_pq_codebook' as the first column name.",
+                            ));
+                        }
+                        let codebook = as_fixed_size_list_array(batch.column(0));
+                        pq_params.codebook = Some(codebook.values().clone())
+                    };
+
                     if let Some(o) = kwargs.get_item("max_opq_iterations")? {
                         pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
                     };
@@ -720,6 +866,31 @@ impl Dataset {
                     if let Some(f) = kwargs.get_item("precomputed_partitions_file")? {
                         ivf_params.precomputed_partitons_file = Some(f.to_string());
                     };
+
+                    match (
+                        kwargs.get_item("precomputed_shuffle_buffers")?,
+                        kwargs.get_item("precomputed_shuffle_buffers_path")?
+                    ) {
+                        (Some(l), Some(p)) => {
+                            let path = Path::parse(p.to_string()).map_err(|e| {
+                                PyValueError::new_err(format!(
+                                    "Failed to parse precomputed_shuffle_buffers_path: {}",
+                                    e
+                                ))
+                            })?;
+                            let list = PyAny::downcast::<PyList>(l)?
+                                .iter()
+                                .map(|f| f.to_string())
+                                .collect();
+                            ivf_params.precomputed_shuffle_buffers = Some((path, list));
+                        },
+                        (None, None) => {},
+                        _ => {
+                            return Err(PyValueError::new_err(
+                                "precomputed_shuffle_buffers and precomputed_shuffle_buffers_path must be specified together."
+                            ))
+                        }
+                    }
                 }
                 Box::new(VectorIndexParams::with_ivf_pq_params(
                     m_type, ivf_params, pq_params,
@@ -797,39 +968,6 @@ impl Dataset {
         }
     }
 
-    fn count_unindexed_rows(&self, index_name: String) -> PyResult<Option<usize>> {
-        let idx = RT.block_on(None, self.ds.load_index_by_name(index_name.as_str()))?;
-        if let Some(index) = idx {
-            RT.block_on(
-                None,
-                self.ds
-                    .count_unindexed_rows(index.uuid.to_string().as_str()),
-            )?
-            .map_err(|err| PyIOError::new_err(err.to_string()))
-        } else {
-            Err(PyIOError::new_err(format!(
-                "Index {} not found",
-                index_name
-            )))
-        }
-    }
-
-    fn count_indexed_rows(&self, index_name: String) -> PyResult<Option<usize>> {
-        let idx = RT.block_on(None, self.ds.load_index_by_name(index_name.as_str()))?;
-        if let Some(index) = idx {
-            RT.block_on(
-                None,
-                self.ds.count_indexed_rows(index.uuid.to_string().as_str()),
-            )?
-            .map_err(|err| PyIOError::new_err(err.to_string()))
-        } else {
-            Err(PyIOError::new_err(format!(
-                "Index {} not found",
-                index_name
-            )))
-        }
-    }
-
     fn index_cache_entry_count(&self) -> PyResult<usize> {
         Ok(self.ds.index_cache_entry_count())
     }
@@ -845,18 +983,14 @@ impl Dataset {
         read_version: Option<u64>,
         commit_lock: Option<&PyAny>,
     ) -> PyResult<Self> {
-        let store_params = if let Some(commit_handler) = commit_lock {
-            let py_commit_lock = PyCommitLock::new(commit_handler.to_object(commit_handler.py()));
-            let mut object_store_params = ObjectStoreParams::default();
-            object_store_params.set_commit_lock(Arc::new(py_commit_lock));
-            Some(object_store_params)
-        } else {
-            None
-        };
+        let commit_handler = commit_lock.map(|commit_lock| {
+            Arc::new(PyCommitLock::new(commit_lock.to_object(commit_lock.py())))
+                as Arc<dyn CommitHandler>
+        });
         let ds = RT
             .block_on(
                 commit_lock.map(|cl| cl.py()),
-                LanceDataset::commit(dataset_uri, operation.0, read_version, store_params),
+                LanceDataset::commit(dataset_uri, operation.0, read_version, None, commit_handler),
             )?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
@@ -868,6 +1002,19 @@ impl Dataset {
     fn validate(&self) -> PyResult<()> {
         RT.block_on(None, self.ds.validate())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    fn drop_columns(&mut self, columns: Vec<&str>) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.drop_columns(&columns))?
+            .map_err(|err| match err {
+                lance::Error::InvalidInput { source, .. } => {
+                    PyValueError::new_err(source.to_string())
+                }
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
+        self.ds = Arc::new(new_self);
+        Ok(())
     }
 }
 
@@ -907,14 +1054,13 @@ fn parse_write_mode(mode: &str) -> PyResult<WriteMode> {
     }
 }
 
-pub fn get_object_store_params(options: &PyDict) -> Option<ObjectStoreParams> {
+pub fn get_commit_handler(options: &PyDict) -> Option<Arc<dyn CommitHandler>> {
     if options.is_none() {
         None
     } else if let Ok(Some(commit_handler)) = options.get_item("commit_handler") {
-        let py_commit_lock = PyCommitLock::new(commit_handler.to_object(options.py()));
-        let mut object_store_params = ObjectStoreParams::default();
-        object_store_params.set_commit_lock(Arc::new(py_commit_lock));
-        Some(object_store_params)
+        Some(Arc::new(PyCommitLock::new(
+            commit_handler.to_object(options.py()),
+        )))
     } else {
         None
     }
@@ -943,7 +1089,7 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
             }
         }
 
-        p.store_params = get_object_store_params(options);
+        p.commit_handler = get_commit_handler(options);
 
         Some(p)
     };

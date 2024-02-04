@@ -24,10 +24,24 @@ tar -xzf sift.tar.gz
 
 Generate Lance datasets using the `datagen.py` script:
 
+Prepare a python virtual environment first.
+
+```
+python3 -m venv venv
+. ./venv/bin/activate
+pip install -r requirements.txt
+```
+
 #### Database vectors
 
 ```sh
 ./datagen.py ./sift/sift_base.fvecs ./.lancedb/sift1m.lance -d 128
+```
+
+#### Generate Ground Truth
+
+```sh
+./gt.py ./.lancedb/sift1m.lance -o ./.lancedb/ground_truth.lance
 ```
 
 #### Query vectors

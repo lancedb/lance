@@ -63,11 +63,9 @@ def test_write_fragment_two_phases(tmp_path: Path):
 
 def test_write_fragments(tmp_path: Path):
     # This will be split across two files if we set the max_bytes_per_file to 1024
-    tab = pa.table(
-        {
-            "a": pa.array(range(1024)),
-        }
-    )
+    tab = pa.table({
+        "a": pa.array(range(1024)),
+    })
     progress = ProgressForTest()
     fragments = write_fragments(
         tab,
@@ -136,13 +134,13 @@ def test_dataset_progress(tmp_path: Path):
 
     assert fragment == FragmentMetadata.from_json(json.dumps(metadata))
 
-    p = multiprocessing.Process(target=failing_write, args=(progress_uri, dataset_uri))
+    ctx = multiprocessing.get_context("spawn")
+    p = ctx.Process(target=failing_write, args=(progress_uri, dataset_uri))
     p.start()
     try:
         p.join()
-    except Exception as e:
+    except Exception:
         # Allow a crash to happen
-        print(e)
         pass
 
     # In-progress file should be present

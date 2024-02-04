@@ -21,18 +21,19 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
 };
 use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt};
-use lance_core::{
-    format::{Fragment, RowAddress},
-    Error, Result, ROW_ID_FIELD,
+use lance_core::{utils::address::RowAddress, Error, Result, ROW_ID_FIELD};
+use lance_index::{
+    scalar::{
+        expression::{ScalarIndexExpr, ScalarIndexLoader},
+        ScalarIndex,
+    },
+    DatasetIndexExt,
 };
-use lance_index::scalar::{
-    expression::{ScalarIndexExpr, ScalarIndexLoader},
-    ScalarIndex,
-};
+use lance_table::format::Fragment;
 use pin_project::pin_project;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
-use tracing::instrument;
+use tracing::{debug_span, instrument};
 
 use crate::{
     index::{prefilter::PreFilter, DatasetIndexInternalExt},
@@ -256,29 +257,59 @@ impl MaterializeIndexExec {
     ) -> Result<RecordBatch> {
         // TODO: multiple batches, stream without materializing all row ids in memory
         let mask = expr.evaluate(dataset.as_ref());
-        let fragment_bitmap = RoaringBitmap::from_iter(fragments.iter().map(|frag| frag.id as u32));
-        // The user-requested `fragments` is guaranteed to be stricter than the index's fragment
-        // bitmap.  This node only runs on indexed fragments and any fragments that were deleted
-        // when the index was trained will still be deleted when the index is queried.
-        let prefilter = PreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap);
+        let span = debug_span!("create_prefilter");
+        let prefilter = span.in_scope(|| {
+            let fragment_bitmap =
+                RoaringBitmap::from_iter(fragments.iter().map(|frag| frag.id as u32));
+            // The user-requested `fragments` is guaranteed to be stricter than the index's fragment
+            // bitmap.  This node only runs on indexed fragments and any fragments that were deleted
+            // when the index was trained will still be deleted when the index is queried.
+            PreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap)
+        });
         let mask = if let Some(prefilter) = prefilter {
             let (mask, prefilter) = futures::try_join!(mask, prefilter)?;
             mask.also_block((*prefilter).clone())
         } else {
             mask.await?
         };
-        let ids = match (mask.allow_list, mask.block_list) {
+        let span = debug_span!("make_ids");
+        let ids = span.in_scope(|| match (mask.allow_list, mask.block_list) {
             (None, None) => FragIdIter::new(fragments).collect::<Vec<_>>(),
-            (Some(allow_list), None) => FragIdIter::new(fragments)
-                .filter(|row_id| allow_list.contains(*row_id))
-                .collect(),
+            (Some(mut allow_list), None) => {
+                allow_list.remove_fragments(fragments.iter().map(|frag| frag.id as u32));
+                if let Some(allow_list_iter) = allow_list.row_ids() {
+                    allow_list_iter.map(u64::from).collect::<Vec<_>>()
+                } else {
+                    FragIdIter::new(fragments)
+                        .filter(|row_id| allow_list.contains(*row_id))
+                        .collect()
+                }
+            }
             (None, Some(block_list)) => FragIdIter::new(fragments)
                 .filter(|row_id| !block_list.contains(*row_id))
                 .collect(),
-            (Some(allow_list), Some(block_list)) => FragIdIter::new(fragments)
-                .filter(|row_id| !block_list.contains(*row_id) && allow_list.contains(*row_id))
-                .collect(),
-        };
+            (Some(mut allow_list), Some(block_list)) => {
+                allow_list.remove_fragments(fragments.iter().map(|frag| frag.id as u32));
+                if let Some(allow_list_iter) = allow_list.row_ids() {
+                    allow_list_iter
+                        .filter_map(|addr| {
+                            let row_id = u64::from(addr);
+                            if !block_list.contains(row_id) {
+                                Some(row_id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    FragIdIter::new(fragments)
+                        .filter(|row_id| {
+                            !block_list.contains(*row_id) && allow_list.contains(*row_id)
+                        })
+                        .collect()
+                }
+            }
+        });
         let ids = UInt64Array::from(ids);
         Ok(RecordBatch::try_new(
             MATERIALIZE_INDEX_SCHEMA.clone(),

@@ -18,7 +18,7 @@ def setup(app):
 # -- Project information -----------------------------------------------------
 
 project = "Lance"
-copyright = "2023, Lance Developer"
+copyright = "2024, Lance Developer"
 author = "Lance Developer"
 
 
@@ -61,10 +61,10 @@ html_theme = "piccolo_theme"
 # so a file named "default.css" will overwrite the builtin "default.css".
 html_static_path = ["_static"]
 
-html_favicon = '_static/favicon_64x64.png'
+html_favicon = "_static/favicon_64x64.png"
 # html_logo = "_static/high-res-icon.png"
 html_theme_options = {
-    "source_url": 'https://github.com/lancedb/lance',
-    "source_icon": "github"
+    "source_url": "https://github.com/lancedb/lance",
+    "source_icon": "github",
 }
-html_css_files = ['custom.css']
+html_css_files = ["custom.css"]

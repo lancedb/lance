@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::{collections::BTreeMap, io::Read};
 
@@ -21,6 +22,8 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use roaring::RoaringBitmap;
 
 use crate::Result;
+
+use super::address::RowAddress;
 
 /// A row id mask to select or deselect particular row ids
 ///
@@ -299,6 +302,43 @@ impl RowIdTreeMap {
         self.inner.is_empty()
     }
 
+    /// The number of rows in the map
+    ///
+    /// If there are any "full fragment" items then this is unknown and None is returned
+    pub fn len(&self) -> Option<u64> {
+        self.inner
+            .values()
+            .map(|row_id_selection| match row_id_selection {
+                RowIdSelection::Full => None,
+                RowIdSelection::Partial(indices) => Some(indices.len()),
+            })
+            .try_fold(0_u64, |acc, next| next.map(|next| next + acc))
+    }
+
+    /// An iterator of row ids
+    ///
+    /// If there are any "full fragment" items then this can't be calculated and None
+    /// is returned
+    pub fn row_ids(&self) -> Option<impl Iterator<Item = RowAddress> + '_> {
+        let inner_iters = self
+            .inner
+            .iter()
+            .filter_map(|(frag_id, row_id_selection)| match row_id_selection {
+                RowIdSelection::Full => None,
+                RowIdSelection::Partial(bitmap) => Some(
+                    bitmap
+                        .iter()
+                        .map(|row_offset| RowAddress::new_from_parts(*frag_id, row_offset)),
+                ),
+            })
+            .collect::<Vec<_>>();
+        if inner_iters.len() != self.inner.len() {
+            None
+        } else {
+            Some(inner_iters.into_iter().flatten())
+        }
+    }
+
     /// Add a bitmap for a single fragment
     pub fn insert_bitmap(&mut self, fragment: u32, bitmap: RoaringBitmap) {
         self.inner.insert(fragment, RowIdSelection::Partial(bitmap));
@@ -318,6 +358,12 @@ impl RowIdTreeMap {
             Some(RowIdSelection::Full) => true,
             Some(RowIdSelection::Partial(fragment_set)) => fragment_set.contains(row_id),
         }
+    }
+
+    pub fn remove_fragments(&mut self, frag_ids: impl IntoIterator<Item = u32>) {
+        let frag_id_set = frag_ids.into_iter().collect::<HashSet<_>>();
+        self.inner
+            .retain(|frag_id, _| frag_id_set.contains(frag_id));
     }
 
     /// Compute the serialized size of the set.

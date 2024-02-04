@@ -22,22 +22,29 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
-from lance.vector import vec_to_table
+
+torch = pytest.importorskip("torch")
+from lance.util import validate_vector_index  # noqa: E402
+from lance.vector import vec_to_table  # noqa: E402
 
 
-def create_table(nvec=1000, ndim=128):
+def create_table(nvec=1000, ndim=128, nans=0):
     mat = np.random.randn(nvec, ndim)
-    price = np.random.rand(nvec) * 100
+    if nans > 0:
+        nans_mat = np.empty((nans, ndim))
+        nans_mat[:] = np.nan
+        mat = np.concatenate((mat, nans_mat), axis=0)
+    price = np.random.rand(nvec + nans) * 100
 
     def gen_str(n):
         return "".join(random.choices(string.ascii_letters + string.digits, k=n))
 
-    meta = np.array([gen_str(100) for _ in range(nvec)])
+    meta = np.array([gen_str(100) for _ in range(nvec + nans)])
     tbl = (
         vec_to_table(data=mat)
         .append_column("price", pa.array(price))
         .append_column("meta", pa.array(meta))
-        .append_column("id", pa.array(range(nvec)))
+        .append_column("id", pa.array(range(nvec + nans)))
     )
     return tbl
 
@@ -105,11 +112,11 @@ def run(ds, q=None, assert_func=None):
 
 
 def test_flat(dataset):
-    print(run(dataset))
+    run(dataset)
 
 
 def test_ann(indexed_dataset):
-    print(run(indexed_dataset))
+    run(indexed_dataset)
 
 
 def test_ann_append(tmp_path):
@@ -125,7 +132,70 @@ def test_ann_append(tmp_path):
     def func(rs: pa.Table):
         assert rs["vector"][0].as_py() == q
 
-    print(run(dataset, q=np.array(q), assert_func=func))
+    run(dataset, q=np.array(q), assert_func=func)
+
+
+def test_index_with_nans(tmp_path):
+    # 1024 rows, the entire table should be sampled
+    tbl = create_table(nvec=1000, nans=24)
+
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        accelerator=torch.device("cpu"),
+    )
+    validate_vector_index(dataset, "vector")
+
+
+def test_index_with_no_centroid_movement(tmp_path):
+    # this test makes the centroids essentially [1..]
+    # this makes sure the early stop condition in the index building code
+    # doesn't do divide by zero
+    mat = np.concatenate([np.ones((256, 32))])
+
+    tbl = vec_to_table(data=mat)
+
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=1,
+        num_sub_vectors=4,
+        accelerator=torch.device("cpu"),
+    )
+    validate_vector_index(dataset, "vector")
+
+
+def test_index_with_pq_codebook(tmp_path):
+    tbl = create_table(nvec=1024, ndim=128)
+    dataset = lance.write_dataset(tbl, tmp_path)
+    pq_codebook = np.random.randn(4, 256, 128 // 4).astype(np.float32)
+
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=1,
+        num_sub_vectors=4,
+        ivf_centroids=np.random.randn(1, 128).astype(np.float32),
+        pq_codebook=pq_codebook,
+    )
+    validate_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
+
+    pq_codebook = pa.FixedShapeTensorArray.from_numpy_ndarray(pq_codebook)
+
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=1,
+        num_sub_vectors=4,
+        ivf_centroids=np.random.randn(1, 128).astype(np.float32),
+        pq_codebook=pq_codebook,
+        replace=True,
+    )
+    validate_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
 
 
 @pytest.mark.cuda
@@ -297,8 +367,6 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     if platform.system() == "Windows":
         expected_filepath = expected_filepath.replace("\\", "/")
     expected_statistics = {
-        "index_cache_entry_count": 1,
-        "index_cache_hit_rate": 0,
         "index_type": "IVF",
         "uuid": index_uuid,
         "uri": expected_filepath,
@@ -311,26 +379,29 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
             "nbits": 8,
             "num_sub_vectors": 8,
         },
-        "num_indexed_rows": 1000,
-        "num_unindexed_rows": 0,
     }
 
     with pytest.raises(KeyError, match='Index "non-existent_idx" not found'):
+        # increase 1 miss of index_cache.metadata_cache
         assert dataset_with_index.stats.index_stats("non-existent_idx")
     with pytest.raises(KeyError, match='Index "" not found'):
+        # increase 1 miss of index_cache.metadata_cache
         assert dataset_with_index.stats.index_stats("")
     with pytest.raises(TypeError):
         dataset_with_index.stats.index_stats()
 
+    # increase 1 hit of index_cache.metadata_cache
     actual_statistics = dataset_with_index.stats.index_stats("vector_idx")
-    partitions = actual_statistics.pop("partitions")
-    assert actual_statistics == expected_statistics
+    assert actual_statistics["num_indexed_rows"] == 1000
+    assert actual_statistics["num_unindexed_rows"] == 0
 
+    idx_stats = actual_statistics["indices"][0]
+    partitions = idx_stats.pop("partitions")
+    idx_stats.pop("centroids")
+    assert idx_stats == expected_statistics
     assert len(partitions) == 5
-    partition_keys = {"index", "length", "offset", "centroid"}
-    assert all([p["index"] == i for i, p in enumerate(partitions)])
+    partition_keys = {"size"}
     assert all([partition_keys == set(p.keys()) for p in partitions])
-    assert all([all([isinstance(c, float) for c in p["centroid"]]) for p in partitions])
 
 
 def test_optimize_index(dataset, tmp_path):
@@ -364,12 +435,10 @@ def create_uniform_table(min, max, nvec, offset, ndim=8):
     mat = np.random.uniform(min, max, (nvec, ndim))
     # rowid = np.arange(offset, offset + nvec)
     tbl = vec_to_table(data=mat)
-    tbl = pa.Table.from_pydict(
-        {
-            "vector": tbl.column(0).chunk(0),
-            "filterable": np.arange(offset, offset + nvec),
-        }
-    )
+    tbl = pa.Table.from_pydict({
+        "vector": tbl.column(0).chunk(0),
+        "filterable": np.arange(offset, offset + nvec),
+    })
     return tbl
 
 
@@ -437,12 +506,10 @@ def test_knn_with_deletions(tmp_path):
     values = pa.array(
         [x for val in range(50) for x in [float(val)] * 5], type=pa.float32()
     )
-    tbl = pa.Table.from_pydict(
-        {
-            "vector": pa.FixedSizeListArray.from_arrays(values, dims),
-            "filterable": pa.array(range(50)),
-        }
-    )
+    tbl = pa.Table.from_pydict({
+        "vector": pa.FixedSizeListArray.from_arrays(values, dims),
+        "filterable": pa.array(range(50)),
+    })
     dataset = lance.write_dataset(tbl, tmp_path, max_rows_per_group=10)
 
     dataset.delete("not (filterable % 5 == 0)")
@@ -493,26 +560,12 @@ def test_index_cache_size(tmp_path):
         index_cache_size=10,
     )
 
-    assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 1
-    )
     query_index(indexed_dataset, 1)
-    assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 2
-    )
-    assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_hit_rate"] == 0.5
-    )
+    assert np.isclose(indexed_dataset._ds.index_cache_hit_rate(), 0.4)
     query_index(indexed_dataset, 128)
-    assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 10
-    )
-
     indexed_dataset = lance.LanceDataset(indexed_dataset.uri, index_cache_size=5)
     query_index(indexed_dataset, 128)
-    assert (
-        indexed_dataset.stats.index_stats("vector_idx")["index_cache_entry_count"] == 5
-    )
+    assert indexed_dataset._ds.index_cache_entry_count() == 6
 
 
 def test_f16_index(tmp_path: Path):
@@ -553,21 +606,36 @@ def test_vector_with_nans(tmp_path: Path):
     row = dataset._take_rows([1])
     assert row["vector"]
 
-    # TODO: async_dataset hangs in pytest
-    # from lance.torch import preferred_device
-    # for device in [preferred_device(), None]:
-    for device in [None]:
-        ds = dataset.create_index(
-            "vector",
-            index_type="IVF_PQ",
-            num_partitions=2,
-            num_sub_vectors=2,
-            replace=True,
-            accelerator=device,
-        )
-        tbl = ds.to_table(
-            nearest={"column": "vector", "q": data[0:DIM], "k": TOTAL, "nprobes": 2},
-            with_row_id=True,
-        )
-        assert len(tbl) == TOTAL - 1
-        assert 1 not in tbl["_rowid"].to_numpy(), "Row with ID 1 is not in the index"
+    ds = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=2,
+        replace=True,
+    )
+    tbl = ds.to_table(
+        nearest={"column": "vector", "q": data[0:DIM], "k": TOTAL, "nprobes": 2},
+        with_row_id=True,
+    )
+    assert len(tbl) == TOTAL - 1
+    assert 1 not in tbl["_rowid"].to_numpy(), "Row with ID 1 is not in the index"
+
+
+def test_validate_vector_index(tmp_path: Path):
+    # make sure the sanity check is correctly catchting issues
+    ds = lance.write_dataset(create_table(), tmp_path)
+    validate_vector_index(ds, "vector", sample_size=100)
+
+    called = False
+
+    def direct_first_call_to_new_table(*args, **kwargs):
+        nonlocal called
+        if called:
+            return ds.to_table(*args, **kwargs)
+        called = True
+        return create_table()
+
+    # return a new random table so things fail
+    ds.sample = direct_first_call_to_new_table
+    with pytest.raises(ValueError, match="Vector index failed sanity check"):
+        validate_vector_index(ds, "vector", sample_size=100)

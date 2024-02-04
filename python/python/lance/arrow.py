@@ -27,6 +27,7 @@ from ._arrow.bf16 import (  # noqa: F401
     BFloat16Type,
     PandasBFloat16Array,
 )
+from .dependencies import numpy as np
 from .lance import bfloat16_array
 
 __all__ = [
@@ -255,8 +256,6 @@ class EncodedImageArray(ImageArray):
     separate record of encoding can be kept in a separate array outside this library.
     """
 
-    import numpy as np
-
     def __repr__(self):
         def pillow_metadata_decoder(images):
             import io
@@ -320,7 +319,6 @@ class EncodedImageArray(ImageArray):
         <lance.arrow.FixedShapeImageTensorArray object at 0x...>
         [[42, 42, 42, 255]]
         """
-        import numpy as np
 
         if not hasattr(pa, "FixedShapeTensorType"):
             raise NotImplementedError("This function requires PyArrow >= 12.0.0")
@@ -332,9 +330,9 @@ class EncodedImageArray(ImageArray):
 
                 from PIL import Image
 
-                return np.stack(
+                return np.stack([
                     Image.open(io.BytesIO(img)) for img in images.to_pylist()
-                )
+                ])
 
             def tensorflow_decoder(images):
                 import tensorflow as tf

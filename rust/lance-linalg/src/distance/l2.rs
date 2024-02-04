@@ -29,6 +29,9 @@ use half::{bf16, f16};
 use lance_arrow::{bfloat16::BFloat16Type, ArrowFloatType, FloatArray, FloatToArrayType};
 use num_traits::{AsPrimitive, Float};
 
+#[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
+use lance_core::utils::cpu::x86::AVX512_F16_SUPPORTED;
+
 use crate::simd::{
     f32::{f32x16, f32x8},
     SIMD,
@@ -119,12 +122,15 @@ mod kernel {
 impl L2 for Float16Type {
     #[inline]
     fn l2(x: &[f16], y: &[f16]) -> f32 {
-        #[cfg(any(
-            all(target_os = "macos", target_feature = "neon"),
-            all(target_os = "linux", feature = "avx512fp16")
-        ))]
+        #[cfg(all(target_os = "macos", target_feature = "neon"))]
         unsafe {
             kernel::l2_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
+        }
+        #[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
+        if *AVX512_F16_SUPPORTED {
+            unsafe { kernel::l2_f16(x.as_ptr(), y.as_ptr(), x.len() as u32) }
+        } else {
+            l2_scalar::<f16, 16>(x, y)
         }
         #[cfg(not(any(
             all(target_os = "macos", target_feature = "neon"),

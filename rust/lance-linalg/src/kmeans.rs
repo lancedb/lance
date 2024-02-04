@@ -212,9 +212,12 @@ impl KMeanMembership {
                     *old += new;
                 }
             });
+
+        let mut empty_clusters = 0;
+
         cluster_cnts.iter().enumerate().for_each(|(i, &cnt)| {
             if cnt == 0 {
-                warn!("KMeans: cluster {} is empty", i);
+                empty_clusters += 1;
                 new_centroids[i * dimension..(i + 1) * dimension]
                     .iter_mut()
                     .for_each(|v| *v = T::Native::nan());
@@ -226,6 +229,14 @@ impl KMeanMembership {
                     .for_each(|v| *v /= T::Native::from_u64(cnt).unwrap());
             }
         });
+
+        if empty_clusters as f32 / self.k as f32 > 0.1 {
+            warn!(
+                "KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
+                is too small to have a meaningful index (less than 5000 vectors) or has many duplicate vectors.",
+                empty_clusters, self.k
+            );
+        }
 
         split_clusters(&mut cluster_cnts, &mut new_centroids, dimension);
 
@@ -652,19 +663,16 @@ where
 ///
 /// If returns `None`, means the vector is not valid, i.e., all `NaN`.
 pub async fn compute_partitions<T: ArrowFloatType>(
-    centroids: &[T::Native],
-    vectors: &[T::Native],
+    centroids: Arc<T::ArrayType>,
+    vectors: Arc<T::ArrayType>,
     dimension: usize,
     metric_type: MetricType,
 ) -> Vec<Option<u32>>
 where
     <T::Native as FloatToArrayType>::ArrowType: Dot + Cosine + L2,
 {
-    let kmeans: KMeans<T> =
-        KMeans::with_centroids(Arc::new(centroids.to_vec().into()), dimension, metric_type);
-    let membership = kmeans
-        .compute_membership(Arc::new(vectors.to_vec().into()))
-        .await;
+    let kmeans: KMeans<T> = KMeans::with_centroids(centroids, dimension, metric_type);
+    let membership = kmeans.compute_membership(vectors).await;
     membership
         .cluster_id_and_distances
         .iter()
@@ -719,8 +727,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let actual = compute_partitions::<Float32Type>(
-            centroids.values(),
-            data.values(),
+            Arc::new(centroids),
+            Arc::new(data),
             DIM,
             MetricType::L2,
         )

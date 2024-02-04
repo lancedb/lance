@@ -29,8 +29,8 @@ use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::error::{box_error, InvalidInputSnafu};
-use lance_core::format::Fragment;
 use lance_datafusion::expr::safe_coerce_scalar;
+use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 use snafu::{location, Location, ResultExt};
 
@@ -340,6 +340,7 @@ impl UpdateJob {
         let manifest = commit_transaction(
             self.dataset.as_ref(),
             self.dataset.object_store(),
+            self.dataset.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),

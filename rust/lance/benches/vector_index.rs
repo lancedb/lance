@@ -20,18 +20,17 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::TryStreamExt;
-use lance::dataset::builder::DatasetBuilder;
-use lance_index::IndexType;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use rand::{self, Rng};
 
-use lance::dataset::{WriteMode, WriteParams};
+use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
 use lance::index::vector::VectorIndexParams;
-use lance::index::DatasetIndexExt;
-use lance::{arrow::as_fixed_size_list_array, dataset::Dataset};
-use lance_arrow::FixedSizeListArrayExt;
-use lance_index::vector::{ivf::IvfBuildParams, pq::PQBuildParams};
+use lance_arrow::{as_fixed_size_list_array, FixedSizeListArrayExt};
+use lance_index::{
+    vector::{ivf::IvfBuildParams, pq::PQBuildParams},
+    DatasetIndexExt, IndexType,
+};
 use lance_linalg::distance::MetricType;
 
 fn bench_ivf_pq_index(c: &mut Criterion) {

@@ -14,10 +14,12 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Generator, List, Literal, Union
 
 import lance
 from lance.dataset import LanceDataset
+from lance.dependencies import torch
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -73,6 +75,9 @@ class ShardedBatchIterator:
         batch_readahead: int = 8,
         with_row_id: bool = False,
     ):
+        warnings.warn(
+            "ShardedBatchIterator is deprecated, use :class:`Sampler` instead",
+        )
         self._rank = rank
         self._world_size = world_size
         self._batch_size = batch_size
@@ -101,12 +106,6 @@ class ShardedBatchIterator:
 
         Other parameters, see :py:meth:`ShardedBatchIterator.__init__`.
         """
-        try:
-            import torch
-        except ImportError:
-            raise ImportError(
-                "PyTorch is not installed, please install torch first before using ."
-            )
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         return ShardedBatchIterator(
@@ -146,7 +145,7 @@ class ShardedBatchIterator:
                 total,
                 self._world_size * self._batch_size,
             ):
-                yield start, start + self._batch_size
+                yield start, min(start + self._batch_size, total)
 
         return self._ds._ds.take_scan(
             _gen_ranges(),

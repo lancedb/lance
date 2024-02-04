@@ -50,9 +50,10 @@ def create_table(min, max, nvec, ndim=8):
     mat = np.random.uniform(min, max, (nvec, ndim))
     tbl = vec_to_table(data=mat)
     # Add id column for filtering
-    tbl = pa.Table.from_pydict(
-        {"vector": tbl.column(0).chunk(0), "id": np.arange(0, nvec)}
-    )
+    tbl = pa.Table.from_pydict({
+        "vector": tbl.column(0).chunk(0),
+        "id": np.arange(0, nvec),
+    })
     return tbl
 
 
@@ -92,7 +93,6 @@ def test_index_remapping(tmp_path: Path):
     # Compact the 2 fragments into 1.  Combined scan still not needed.
     dataset.optimize.compact_files()
     assert len(dataset.get_fragments()) == 1
-    print(dataset.get_fragments())
     check_index(has_knn_combined=False)
 
     # Add a new fragment and recalculate the index

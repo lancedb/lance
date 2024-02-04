@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use async_trait::async_trait;
+use lance_table::format::Fragment;
 
-use crate::format::Fragment;
 use crate::Result;
 
 /// Progress of writing a [Fragment].

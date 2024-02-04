@@ -56,7 +56,12 @@ impl HashJoiner {
         schema.field_with_name(on)?;
 
         // Hold all data in memory for simple implementation. Can do external sort later.
-        let batches = reader.collect::<std::result::Result<Vec<RecordBatch>, _>>()?;
+        // This is a blocking operation, so we'll run it in a separate thread.
+        let batches = tokio::task::spawn_blocking(|| {
+            reader.collect::<std::result::Result<Vec<RecordBatch>, _>>()
+        })
+        .await
+        .unwrap()?;
         if batches.is_empty() {
             return Err(Error::IO {
                 message: "HashJoiner: No data".to_string(),

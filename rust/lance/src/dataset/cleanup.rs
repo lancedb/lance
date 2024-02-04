@@ -46,14 +46,14 @@
 
 use chrono::{DateTime, Duration, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::{
+use lance_core::{Error, Result};
+use lance_io::object_store::ObjectStore;
+use lance_table::{
     format::{Index, Manifest},
     io::{
         deletion::deletion_file_path,
-        object_store::ObjectStore,
-        reader::{read_manifest, read_manifest_indexes},
+        manifest::{read_manifest, read_manifest_indexes},
     },
-    Error, Result,
 };
 use object_store::path::Path;
 use std::{
@@ -130,7 +130,6 @@ impl<'a> CleanupTask<'a> {
     async fn process_manifests(&'a self) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
-            .object_store
             .commit_handler
             .list_manifests(&self.dataset.base, &self.dataset.object_store.inner)
             .await?
@@ -461,7 +460,8 @@ mod tests {
         utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy},
         Error, Result,
     };
-    use lance_index::IndexType;
+    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_io::object_store::{ObjectStoreParams, WrappingObjectStore};
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
     use snafu::{location, Location};
@@ -469,14 +469,8 @@ mod tests {
 
     use crate::{
         dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
-        index::{
-            vector::{StageParams, VectorIndexParams},
-            DatasetIndexExt,
-        },
-        io::{
-            object_store::{ObjectStoreParams, WrappingObjectStore},
-            ObjectStore,
-        },
+        index::vector::{StageParams, VectorIndexParams},
+        io::ObjectStore,
     };
     use all_asserts::{assert_gt, assert_lt};
     use tempfile::{tempdir, TempDir};

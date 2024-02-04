@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "0.9.5"
+version = "0.9.12"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 rust-version = "1.65"
@@ -11,22 +11,28 @@ name = "lance"
 crate-type = ["cdylib"]
 
 [dependencies]
-arrow = { version = "49.0.0", features = ["pyarrow"] }
-arrow-array = "49.0"
-arrow-data = "49.0"
-arrow-schema = "49.0"
-object_store = "0.8.0"
+arrow = { version = "50.0.0", features = ["pyarrow"] }
+arrow-array = "50.0"
+arrow-data = "50.0"
+arrow-schema = "50.0"
+object_store = "0.9.0"
 async-trait = "0.1"
 chrono = "0.4.31"
 env_logger = "0.10"
 futures = "0.3"
-half = { version = "2.1", default-features = false, features = ["num-traits"] }
+half = { version = "2.3", default-features = false, features = [
+    "num-traits",
+    "std",
+] }
 lance = { path = "../rust/lance", features = ["tensorflow", "dynamodb"] }
 lance-arrow = { path = "../rust/lance-arrow" }
 lance-core = { path = "../rust/lance-core" }
 lance-datagen = { path = "../rust/lance-datagen", optional = true }
+lance-file = { path = "../rust/lance-file" }
 lance-index = { path = "../rust/lance-index" }
+lance-io = { path = "../rust/lance-io" }
 lance-linalg = { path = "../rust/lance-linalg" }
+lance-table = { path = "../rust/lance-table" }
 lazy_static = "1"
 log = "0.4"
 prost = "0.12"

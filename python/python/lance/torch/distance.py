@@ -16,7 +16,7 @@
 import logging
 from typing import Optional, Tuple
 
-import torch
+from lance.dependencies import torch
 
 __all__ = [
     "pairwise_cosine",
@@ -97,7 +97,7 @@ def cosine_distance(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Cosine pair-wise distances between two 2-D Tensors.
 
-    Cosine distance = 1 - |xy| / ||x|| * ||y||
+    Cosine distance = ``1 - |xy| / ||x|| * ||y||``
 
     Parameters
     ----------

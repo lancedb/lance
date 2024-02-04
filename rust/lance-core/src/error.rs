@@ -34,9 +34,11 @@ pub enum Error {
     },
     #[snafu(display("Dataset already exists: {uri}, {location}"))]
     DatasetAlreadyExists { uri: String, location: Location },
-    // #[snafu(display("Append with different schema: original={original} new={new}"))]
-    #[snafu(display("Append with different schema:"))]
-    SchemaMismatch {},
+    #[snafu(display("Append with different schema: {difference}"))]
+    SchemaMismatch {
+        difference: String,
+        location: Location,
+    },
     #[snafu(display("Dataset at path {path} was not found: {source}, {location}"))]
     DatasetNotFound {
         path: String,
@@ -75,6 +77,11 @@ pub enum Error {
     IO { message: String, location: Location },
     #[snafu(display("LanceError(Index): {message}, {location}"))]
     Index { message: String, location: Location },
+    #[snafu(display("Lance index not found: {identity}, {location}"))]
+    IndexNotFound {
+        identity: String,
+        location: Location,
+    },
     #[snafu(display("Cannot infer storage location from: {message}"))]
     InvalidTableLocation { message: String },
     /// Stream early stop
@@ -227,6 +234,7 @@ impl From<Error> for ArrowError {
     }
 }
 
+#[cfg(feature = "datafusion")]
 impl From<datafusion_sql::sqlparser::parser::ParserError> for Error {
     #[track_caller]
     fn from(e: datafusion_sql::sqlparser::parser::ParserError) -> Self {
@@ -237,6 +245,7 @@ impl From<datafusion_sql::sqlparser::parser::ParserError> for Error {
     }
 }
 
+#[cfg(feature = "datafusion")]
 impl From<datafusion_sql::sqlparser::tokenizer::TokenizerError> for Error {
     #[track_caller]
     fn from(e: datafusion_sql::sqlparser::tokenizer::TokenizerError) -> Self {
@@ -247,6 +256,7 @@ impl From<datafusion_sql::sqlparser::tokenizer::TokenizerError> for Error {
     }
 }
 
+#[cfg(feature = "datafusion")]
 impl From<Error> for datafusion_common::DataFusionError {
     #[track_caller]
     fn from(e: Error) -> Self {
@@ -254,6 +264,7 @@ impl From<Error> for datafusion_common::DataFusionError {
     }
 }
 
+#[cfg(feature = "datafusion")]
 impl From<datafusion_common::DataFusionError> for Error {
     #[track_caller]
     fn from(e: datafusion_common::DataFusionError) -> Self {

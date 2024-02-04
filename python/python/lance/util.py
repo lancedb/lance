@@ -12,22 +12,20 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from datetime import datetime, timedelta
-from typing import Literal, Optional, Union
+from __future__ import annotations
 
-import numpy as np
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Literal, Optional, Union
+
 import pyarrow as pa
 
+from .dependencies import _check_for_numpy, _check_for_pandas
+from .dependencies import numpy as np
+from .dependencies import pandas as pd
 from .lance import _KMeans
 
-try:
-    import pandas as pd
-
+if TYPE_CHECKING:
     ts_types = Union[datetime, pd.Timestamp, str]
-except ImportError:
-    pd = None
-    ts_types = Union[datetime, str]
-
 
 try:
     from pyarrow import FixedShapeTensorType
@@ -41,7 +39,7 @@ except ImportError:
 
 def sanitize_ts(ts: ts_types) -> datetime:
     """Returns a python datetime object from various timestamp input types."""
-    if pd and isinstance(ts, str):
+    if _check_for_pandas(ts) and isinstance(ts, str):
         ts = pd.to_datetime(ts).to_pydatetime()
     elif isinstance(ts, str):
         try:
@@ -50,7 +48,7 @@ def sanitize_ts(ts: ts_types) -> datetime:
             raise ValueError(
                 f"Failed to parse timestamp string {ts}. Try installing Pandas."
             )
-    elif pd and isinstance(ts, pd.Timestamp):
+    elif _check_for_pandas(ts) and isinstance(ts, pd.Timestamp):
         ts = ts.to_pydatetime()
     elif not isinstance(ts, datetime):
         raise TypeError(f"Unrecognized version timestamp {ts} of type {type(ts)}")
@@ -146,7 +144,7 @@ class KMeans:
                     f"got {len(data.type.shape)}-D"
                 )
             return self._to_fixed_size_list(data.storage)
-        elif isinstance(data, np.ndarray):
+        elif _check_for_numpy(data) and isinstance(data, np.ndarray):
             if len(data.shape) != 2:
                 raise ValueError(
                     f"Numpy array must be a 2-D array, got {len(data.shape)}-D"
@@ -178,3 +176,55 @@ class KMeans:
         """Predict the cluster for each vector in the data."""
         arr = self._to_fixed_size_list(data)
         return self._kmeans.predict(arr)
+
+
+def validate_vector_index(
+    dataset,
+    column: str,
+    refine_factor: int = 5,
+    sample_size: Optional[int] = None,
+    pass_threshold: float = 1.0,
+):
+    """Run in-sample queries and make sure that the recall
+    for k=1 is very high (should be near 100%)
+
+    Parameters
+    ----------
+    dataset: LanceDataset
+        The dataset to sanity check.
+    column: str
+        The column name of the vector column.
+    refine_factor: int, default=5
+        The refine factor to use for the nearest neighbor query.
+    sample_size: int, optional
+        The number of vectors to sample from the dataset.
+        If None, the entire dataset will be used.
+    pass_threshold: float, default=1.0
+        The minimum fraction of vectors that must pass the sanity check.
+        If less than this fraction of vectors pass, a ValueError will be raised.
+    """
+
+    data = dataset.to_table() if sample_size is None else dataset.sample(sample_size)
+    vecs = data[column].to_numpy(zero_copy_only=False)
+    passes = 0
+    total = len(vecs)
+
+    for vec in vecs:
+        if np.isnan(vec).any():
+            total -= 1
+            continue
+        distance = dataset.to_table(
+            nearest={
+                "column": column,
+                "q": vec,
+                "k": 1,
+                "nprobes": 1,
+                "refine_factor": refine_factor,
+            }
+        )["_distance"].to_pylist()[0]
+        passes += 1 if abs(distance) < 1e-6 else 0
+
+    if passes / total < pass_threshold:
+        raise ValueError(
+            f"Vector index failed sanity check, only {passes}/{total} passed"
+        )

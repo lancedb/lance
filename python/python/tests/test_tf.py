@@ -46,21 +46,17 @@ from lance.tf.tfrecord import infer_tfrecord_schema, read_tfrecord
 
 @pytest.fixture
 def tf_dataset(tmp_path):
-    df = pd.DataFrame(
-        {
-            "a": range(10000),
-            "s": [f"val-{i}" for i in range(10000)],
-            "vec": [[i * 0.2] * 128 for i in range(10000)],
-        }
-    )
+    df = pd.DataFrame({
+        "a": range(10000),
+        "s": [f"val-{i}" for i in range(10000)],
+        "vec": [[i * 0.2] * 128 for i in range(10000)],
+    })
 
-    schema = pa.schema(
-        [
-            pa.field("a", pa.int64()),
-            pa.field("s", pa.string()),
-            pa.field("vec", pa.list_(pa.float32(), 128)),
-        ]
-    )
+    schema = pa.schema([
+        pa.field("a", pa.int64()),
+        pa.field("s", pa.string()),
+        pa.field("vec", pa.list_(pa.float32(), 128)),
+    ])
     tbl = pa.Table.from_pandas(df, schema=schema)
     uri = tmp_path / "dataset.lance"
     lance.write_dataset(
@@ -206,19 +202,15 @@ def test_take_dataset(tf_dataset):
 
 def test_var_length_list(tmp_path):
     """Treat var length list as RaggedTensor."""
-    df = pd.DataFrame(
-        {
-            "a": range(200),
-            "l": [[i] * (i % 5 + 1) for i in range(200)],
-        }
-    )
+    df = pd.DataFrame({
+        "a": range(200),
+        "l": [[i] * (i % 5 + 1) for i in range(200)],
+    })
 
-    schema = pa.schema(
-        [
-            pa.field("a", pa.int64()),
-            pa.field("l", pa.list_(pa.int32())),
-        ]
-    )
+    schema = pa.schema([
+        pa.field("a", pa.int64()),
+        pa.field("l", pa.list_(pa.int32())),
+    ])
     tbl = pa.Table.from_pandas(df, schema=schema)
 
     uri = tmp_path / "dataset.lance"
@@ -245,22 +237,18 @@ def test_var_length_list(tmp_path):
 
 
 def test_nested_struct(tmp_path):
-    table = pa.table(
-        {
-            "x": pa.array(
-                [
-                    {
-                        "a": 1,
-                        "json": {"b": "hello", "x": b"abc"},
-                    },
-                    {
-                        "a": 24,
-                        "json": {"b": "world", "x": b"def"},
-                    },
-                ]
-            )
-        }
-    )
+    table = pa.table({
+        "x": pa.array([
+            {
+                "a": 1,
+                "json": {"b": "hello", "x": b"abc"},
+            },
+            {
+                "a": 24,
+                "json": {"b": "world", "x": b"def"},
+            },
+        ])
+    })
     uri = tmp_path / "dataset.lance"
     dataset = lance.write_dataset(table, uri)
 
@@ -298,9 +286,11 @@ def test_image_types(tmp_path):
     uris = ImageArray.from_array(path * 3)
     encoded_images = uris.read_uris()
     tensors = encoded_images.to_tensor()
-    table = pa.table(
-        {"uris": uris, "encoded_images": encoded_images, "tensor_images": tensors}
-    )
+    table = pa.table({
+        "uris": uris,
+        "encoded_images": encoded_images,
+        "tensor_images": tensors,
+    })
 
     uri = tmp_path / "dataset.lance"
     dataset = lance.write_dataset(table, uri)
@@ -370,39 +360,35 @@ def test_tfrecord_parsing(tmp_path, sample_tf_example):
 
     inferred_schema = infer_tfrecord_schema(str(path))
 
-    assert inferred_schema == pa.schema(
-        {
-            "1_int": pa.int64(),
-            "2_int_list": pa.list_(pa.int64()),
-            "3_float": pa.float32(),
-            "4_float_list": pa.list_(pa.float32()),
-            "5_bytes": pa.binary(),
-            "6_bytes_list": pa.list_(pa.binary()),
-            # tensors and strings assumed binary
-            "7_string": pa.binary(),
-            "8_tensor": pa.binary(),
-            "9_tensor_bf16": pa.binary(),
-        }
-    )
+    assert inferred_schema == pa.schema({
+        "1_int": pa.int64(),
+        "2_int_list": pa.list_(pa.int64()),
+        "3_float": pa.float32(),
+        "4_float_list": pa.list_(pa.float32()),
+        "5_bytes": pa.binary(),
+        "6_bytes_list": pa.list_(pa.binary()),
+        # tensors and strings assumed binary
+        "7_string": pa.binary(),
+        "8_tensor": pa.binary(),
+        "9_tensor_bf16": pa.binary(),
+    })
 
     inferred_schema = infer_tfrecord_schema(
         str(path),
         tensor_features=["8_tensor", "9_tensor_bf16"],
         string_features=["7_string"],
     )
-    assert inferred_schema == pa.schema(
-        {
-            "1_int": pa.int64(),
-            "2_int_list": pa.list_(pa.int64()),
-            "3_float": pa.float32(),
-            "4_float_list": pa.list_(pa.float32()),
-            "5_bytes": pa.binary(),
-            "6_bytes_list": pa.list_(pa.binary()),
-            "7_string": pa.string(),
-            "8_tensor": pa.fixed_shape_tensor(pa.float32(), [2, 3]),
-            "9_tensor_bf16": pa.fixed_shape_tensor(BFloat16Type(), [2, 3]),
-        }
-    )
+    assert inferred_schema == pa.schema({
+        "1_int": pa.int64(),
+        "2_int_list": pa.list_(pa.int64()),
+        "3_float": pa.float32(),
+        "4_float_list": pa.list_(pa.float32()),
+        "5_bytes": pa.binary(),
+        "6_bytes_list": pa.list_(pa.binary()),
+        "7_string": pa.string(),
+        "8_tensor": pa.fixed_shape_tensor(pa.float32(), [2, 3]),
+        "9_tensor_bf16": pa.fixed_shape_tensor(BFloat16Type(), [2, 3]),
+    })
 
     reader = read_tfrecord(str(path), inferred_schema)
     assert reader.schema == inferred_schema
@@ -420,26 +406,22 @@ def test_tfrecord_parsing(tmp_path, sample_tf_example):
     storage = pa.FixedSizeListArray.from_arrays(bf16_array, 6)
     bf16_array = pa.ExtensionArray.from_storage(tensor_type, storage)
 
-    expected_data = pa.table(
-        {
-            "1_int": pa.array([1]),
-            "2_int_list": pa.array([[1, 2, 3]]),
-            "3_float": pa.array([1.0], pa.float32()),
-            "4_float_list": pa.array([[1.0, 2.0, 3.0]], pa.list_(pa.float32())),
-            "5_bytes": pa.array([b"Hello, TensorFlow!"]),
-            "6_bytes_list": pa.array([[b"Hello, TensorFlow!", b"Hello, Lance!"]]),
-            "7_string": pa.array(["Hello, TensorFlow!"]),
-            "8_tensor": f32_array,
-            "9_tensor_bf16": bf16_array,
-        }
-    )
+    expected_data = pa.table({
+        "1_int": pa.array([1]),
+        "2_int_list": pa.array([[1, 2, 3]]),
+        "3_float": pa.array([1.0], pa.float32()),
+        "4_float_list": pa.array([[1.0, 2.0, 3.0]], pa.list_(pa.float32())),
+        "5_bytes": pa.array([b"Hello, TensorFlow!"]),
+        "6_bytes_list": pa.array([[b"Hello, TensorFlow!", b"Hello, Lance!"]]),
+        "7_string": pa.array(["Hello, TensorFlow!"]),
+        "8_tensor": f32_array,
+        "9_tensor_bf16": bf16_array,
+    })
 
     assert table == expected_data
 
 
 def test_tfrecord_roundtrip(tmp_path, sample_tf_example):
-    del sample_tf_example.features.feature["9_tensor_bf16"]
-
     serialized = sample_tf_example.SerializeToString()
 
     path = tmp_path / "test.tfrecord"
@@ -499,14 +481,12 @@ def test_tfrecord_parsing_nulls(tmp_path):
             writer.write(serialized)
 
     inferred_schema = infer_tfrecord_schema(str(path), tensor_features=["d"])
-    assert inferred_schema == pa.schema(
-        {
-            "a": pa.int64(),
-            "b": pa.list_(pa.int64()),
-            "c": pa.float32(),
-            "d": pa.fixed_shape_tensor(pa.float32(), [2, 3]),
-        }
-    )
+    assert inferred_schema == pa.schema({
+        "a": pa.int64(),
+        "b": pa.list_(pa.int64()),
+        "c": pa.float32(),
+        "d": pa.fixed_shape_tensor(pa.float32(), [2, 3]),
+    })
 
     tensor_type = pa.fixed_shape_tensor(pa.float32(), [2, 3])
     inner = pa.array([float(x) for x in range(1, 7)] + [None] * 12, pa.float32())
@@ -514,30 +494,24 @@ def test_tfrecord_parsing_nulls(tmp_path):
     f32_array = pa.ExtensionArray.from_storage(tensor_type, storage)
 
     data = read_tfrecord(str(path), inferred_schema).read_all()
-    expected = pa.table(
-        {
-            "a": pa.array([1, 1, 1]),
-            "b": pa.array([[1], [], [1, 2, 3]]),
-            "c": pa.array([1.0, None, 1.0], pa.float32()),
-            "d": f32_array,
-        }
-    )
+    expected = pa.table({
+        "a": pa.array([1, 1, 1]),
+        "b": pa.array([[1], [], [1, 2, 3]]),
+        "c": pa.array([1.0, None, 1.0], pa.float32()),
+        "d": f32_array,
+    })
 
     assert data == expected
 
     # can do projection
-    read_schema = pa.schema(
-        {
-            "a": pa.int64(),
-            "c": pa.float32(),
-        }
-    )
-    expected = pa.table(
-        {
-            "a": pa.array([1, 1, 1]),
-            "c": pa.array([1.0, None, 1.0], pa.float32()),
-        }
-    )
+    read_schema = pa.schema({
+        "a": pa.int64(),
+        "c": pa.float32(),
+    })
+    expected = pa.table({
+        "a": pa.array([1, 1, 1]),
+        "c": pa.array([1.0, None, 1.0], pa.float32()),
+    })
 
     data = read_tfrecord(str(path), read_schema).read_all()
     assert data == expected

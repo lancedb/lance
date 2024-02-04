@@ -24,11 +24,12 @@ use arrow_array::types::Float32Type;
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use lance_core::{io::Reader, Error, Result, ROW_ID_FIELD};
+use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_index::{
     vector::{Query, DIST_COL},
     Index, IndexType,
 };
+use lance_io::traits::Reader;
 use lance_linalg::distance::MetricType;
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
@@ -220,8 +221,8 @@ impl Index for DiskANNIndex {
         IndexType::Vector
     }
 
-    fn statistics(&self) -> Result<String> {
-        Ok(serde_json::to_string(&DiskANNIndexStatistics {
+    fn statistics(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(DiskANNIndexStatistics {
             index_type: "DiskANNIndex".to_string(),
             length: self.graph.len(),
         })?)

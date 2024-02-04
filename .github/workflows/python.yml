@@ -37,7 +37,7 @@ jobs:
         shell: bash
         working-directory: python
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
         lfs: true
@@ -50,8 +50,8 @@ jobs:
         pip install torch --index-url https://download.pytorch.org/whl/cpu
     - name: Lint Python
       run: |
-        ruff format --check python
-        ruff check python
+        ruff format --preview --check python
+        ruff check --preview python
     - name: Install dependencies
       run: |
         sudo apt update
@@ -75,14 +75,15 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: [ "8", "9", "10", "11" ]
+        python-minor-version: [ "8", "11", "12" ] # 3.11 because tensorflow does not support 3.12 yet.
+    name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
     runs-on: "ubuntu-22.04"
     defaults:
       run:
         shell: bash
         working-directory: python
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
         lfs: true
@@ -101,16 +102,17 @@ jobs:
       run: sudo rm -rf target/wheels
   linux-arm:
     timeout-minutes: 45
+    name: Python Linux 3.${{ matrix.python-minor-version }} ARM
     strategy:
       matrix:
-        python-minor-version: [ "11" ]
+        python-minor-version: [ "12" ]
     runs-on: buildjet-4vcpu-ubuntu-2204-arm
     defaults:
       run:
         shell: bash
         working-directory: python
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
         lfs: true
@@ -136,23 +138,21 @@ jobs:
       run: sudo rm -rf target/wheels
   mac:
     timeout-minutes: 45
-    strategy:
-      matrix:
-        mac-runner: [ "macos-13", "macos-13-xlarge" ]
-    runs-on: "${{ matrix.mac-runner }}"
+    name: Python macOS 3.12 ARM
+    runs-on: "macos-14"
     defaults:
       run:
         shell: bash
         working-directory: python
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
         lfs: true
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.10"
+        python-version: "3.12"
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: python
@@ -169,7 +169,7 @@ jobs:
         shell: powershell
         working-directory: python
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           lfs: true
@@ -210,14 +210,14 @@ jobs:
       # this one is for dynamodb
       DYNAMODB_ENDPOINT: http://localhost:8000
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
         lfs: true
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.11"
+        python-version: "3.12"
     - name: create s3
       run: aws s3 mb s3://lance-integtest --endpoint http://localhost:9000
     - name: create ddb

@@ -20,8 +20,9 @@ use futures::TryStreamExt;
 use snafu::{location, Location};
 
 use lance::dataset::Dataset;
-use lance::index::{vector::VectorIndexParams, DatasetIndexExt};
+use lance::index::vector::VectorIndexParams;
 use lance::{Error, Result};
+use lance_index::DatasetIndexExt;
 use lance_linalg::distance::MetricType;
 
 #[derive(Parser)]

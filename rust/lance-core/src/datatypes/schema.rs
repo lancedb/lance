@@ -24,8 +24,8 @@ use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use lance_arrow::*;
 use snafu::{location, Location};
 
-use super::field::Field;
-use crate::{format::pb, io::Reader, Error, Result};
+use super::field::{Field, SchemaCompareOptions};
+use crate::{Error, Result};
 
 /// Lance Schema.
 #[derive(Default, Debug, Clone)]
@@ -69,6 +69,102 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 }
 
 impl Schema {
+    pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
+        if self.fields.len() != expected.fields.len() {
+            false
+        } else {
+            self.fields
+                .iter()
+                .zip(&expected.fields)
+                .all(|(lhs, rhs)| lhs.compare_with_options(rhs, options))
+                && (!options.compare_metadata || self.metadata == expected.metadata)
+        }
+    }
+
+    pub fn explain_difference(
+        &self,
+        expected: &Self,
+        options: &SchemaCompareOptions,
+    ) -> Option<String> {
+        if self.fields.len() != expected.fields.len()
+            || !self
+                .fields
+                .iter()
+                .zip(expected.fields.iter())
+                .all(|(field, expected)| field.name == expected.name)
+        {
+            let self_fields = self
+                .fields
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<HashSet<_>>();
+            let expected_fields = expected
+                .fields
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<HashSet<_>>();
+            let missing = expected_fields
+                .difference(&self_fields)
+                .cloned()
+                .collect::<Vec<_>>();
+            let unexpected = self_fields
+                .difference(&expected_fields)
+                .cloned()
+                .collect::<Vec<_>>();
+            if missing.is_empty() && unexpected.is_empty() {
+                Some(format!(
+                    "fields in different order, expected: [{}], actual: [{}]",
+                    expected
+                        .fields
+                        .iter()
+                        .map(|f| f.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    self.fields
+                        .iter()
+                        .map(|f| f.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ))
+            } else {
+                Some(format!(
+                    "fields did not match, missing=[{}], unexpected=[{}]",
+                    missing.join(", "),
+                    unexpected.join(", ")
+                ))
+            }
+        } else {
+            let differences = self
+                .fields
+                .iter()
+                .zip(expected.fields.iter())
+                .flat_map(|(field, expected)| field.explain_difference(expected, options))
+                .collect::<Vec<_>>();
+            if differences.is_empty() {
+                if options.compare_metadata && self.metadata != expected.metadata {
+                    Some("schema metadata did not match expected schema metadata".to_string())
+                } else {
+                    None
+                }
+            } else {
+                Some(differences.join(", "))
+            }
+        }
+    }
+
+    pub fn check_compatible(&self, expected: &Self, options: &SchemaCompareOptions) -> Result<()> {
+        if !self.compare_with_options(expected, options) {
+            let difference = self.explain_difference(expected, options);
+            Err(Error::SchemaMismatch {
+                // unknown reason is messy but this shouldn't happen.
+                difference: difference.unwrap_or("unknown reason".to_string()),
+                location: location!(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     /// Project the columns over the schema.
     ///
     /// ```ignore
@@ -291,15 +387,6 @@ impl Schema {
         self.fields.iter().map(|f| f.max_id()).max()
     }
 
-    /// Load dictionary value array from manifest files.
-    // TODO: pub(crate)
-    pub async fn load_dictionary<'a>(&mut self, reader: &dyn Reader) -> Result<()> {
-        for field in self.fields.as_mut_slice() {
-            field.load_dictionary(reader).await?;
-        }
-        Ok(())
-    }
-
     /// Recursively attach set up dictionary values to the dictionary fields.
     // TODO: pub(crate)
     pub fn set_dictionary(&mut self, batch: &RecordBatch) -> Result<()> {
@@ -324,6 +411,29 @@ impl Schema {
 
     fn reset_id(&mut self) {
         self.fields.iter_mut().for_each(|f| f.reset_id());
+    }
+
+    /// Create a new schema by adding fields to the end of this schema
+    pub fn extend(&mut self, fields: &[ArrowField]) -> Result<()> {
+        let new_fields = fields
+            .iter()
+            .map(Field::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        self.fields.extend(new_fields);
+        // Validate this addition does not create any duplicate field names
+        let field_names = self.fields.iter().map(|f| &f.name).collect::<HashSet<_>>();
+        if field_names.len() != self.fields.len() {
+            Err(Error::Internal {
+                message: format!(
+                    "Attempt to add fields [{:?}] would lead to duplicate field names",
+                    fields.iter().map(|f| f.name()).collect::<Vec<_>>()
+                ),
+                location: location!(),
+            })
+        } else {
+            self.set_field_id();
+            Ok(())
+        }
     }
 
     /// Merge this schema from the other schema.
@@ -415,71 +525,6 @@ impl TryFrom<&Self> for Schema {
 
     fn try_from(schema: &Self) -> Result<Self> {
         Ok(schema.clone())
-    }
-}
-
-/// Convert list of protobuf `Field` to a Schema.
-impl From<&Vec<pb::Field>> for Schema {
-    fn from(fields: &Vec<pb::Field>) -> Self {
-        let mut schema = Self {
-            fields: vec![],
-            metadata: HashMap::default(),
-        };
-
-        fields.iter().for_each(|f| {
-            if f.parent_id == -1 {
-                schema.fields.push(Field::from(f));
-            } else {
-                let parent = schema.mut_field_by_id(f.parent_id).unwrap();
-                parent.children.push(Field::from(f));
-            }
-        });
-
-        schema
-    }
-}
-
-/// Convert list of protobuf `Field` and Metadata to a Schema.
-impl From<(&Vec<pb::Field>, HashMap<String, Vec<u8>>)> for Schema {
-    fn from((fields, metadata): (&Vec<pb::Field>, HashMap<String, Vec<u8>>)) -> Self {
-        let lance_metadata = metadata
-            .into_iter()
-            .map(|(key, value)| {
-                let string_value = String::from_utf8_lossy(&value).to_string();
-                (key, string_value)
-            })
-            .collect();
-
-        let schema_with_fields = Self::from(fields);
-        Self {
-            fields: schema_with_fields.fields,
-            metadata: lance_metadata,
-        }
-    }
-}
-
-/// Convert a Schema to a list of protobuf Field.
-impl From<&Schema> for Vec<pb::Field> {
-    fn from(schema: &Schema) -> Self {
-        let mut protos: Self = vec![];
-        schema.fields.iter().for_each(|f| {
-            protos.extend(Self::from(f));
-        });
-        protos
-    }
-}
-
-/// Convert a Schema to a list of protobuf Field and Metadata
-impl From<&Schema> for (Vec<pb::Field>, HashMap<String, Vec<u8>>) {
-    fn from(schema: &Schema) -> Self {
-        let fields: Vec<pb::Field> = schema.into();
-        let pb_metadata = schema
-            .metadata
-            .clone()
-            .into_iter()
-            .map(|(key, value)| (key, value.into_bytes()))
-            .collect();
-        (fields, pb_metadata)
     }
 }
 
@@ -632,48 +677,6 @@ mod tests {
         let projected = schema.project_by_schema(&projection).unwrap();
 
         assert_eq!(ArrowSchema::from(&projected), projection);
-    }
-
-    #[test]
-    fn test_schema_set_ids() {
-        let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("a", DataType::Int32, false),
-            ArrowField::new(
-                "b",
-                DataType::Struct(ArrowFields::from(vec![
-                    ArrowField::new("f1", DataType::Utf8, true),
-                    ArrowField::new("f2", DataType::Boolean, false),
-                    ArrowField::new("f3", DataType::Float32, false),
-                ])),
-                true,
-            ),
-            ArrowField::new("c", DataType::Float64, false),
-        ]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
-
-        let protos: Vec<pb::Field> = (&schema).into();
-        assert_eq!(
-            protos.iter().map(|p| p.id).collect::<Vec<_>>(),
-            (0..6).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn test_schema_metadata() {
-        let mut metadata: HashMap<String, String> = HashMap::new();
-        metadata.insert(String::from("k1"), String::from("v1"));
-        metadata.insert(String::from("k2"), String::from("v2"));
-
-        let arrow_schema = ArrowSchema::new_with_metadata(
-            vec![ArrowField::new("a", DataType::Int32, false)],
-            metadata,
-        );
-
-        let expected_schema = Schema::try_from(&arrow_schema).unwrap();
-        let (fields, meta): (Vec<pb::Field>, HashMap<String, Vec<u8>>) = (&expected_schema).into();
-
-        let schema = Schema::from((&fields, meta));
-        assert_eq!(expected_schema, schema);
     }
 
     #[test]
@@ -932,5 +935,39 @@ mod tests {
 
         let field = schema.field_by_id(3).unwrap();
         assert_eq!(field.name, "f2");
+    }
+
+    #[test]
+    fn test_explain_difference() {
+        let expected = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let expected = Schema::try_from(&expected).unwrap();
+
+        let mismatched = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, true),
+        ]);
+        let mismatched = Schema::try_from(&mismatched).unwrap();
+
+        assert_eq!(mismatched.explain_difference(&expected, &SchemaCompareOptions::default()), Some("`b` had mismatched children, missing=[f2] unexpected=[], `c` should have nullable=false but nullable=true".to_string()));
     }
 }

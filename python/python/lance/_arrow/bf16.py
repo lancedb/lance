@@ -17,8 +17,9 @@
 
 from typing import Any, Optional, Union
 
-import numpy as np
 import pyarrow as pa
+
+from lance.dependencies import numpy as np
 
 from ..lance import BFloat16
 from ..lance import bfloat16_array as bfloat16_array
@@ -53,7 +54,6 @@ class BFloat16Array(pa.ExtensionArray):
         if self.null_count > 0:
             raise ValueError("Cannot convert null values to numpy")
 
-        import numpy as np
         from ml_dtypes import bfloat16
 
         buffer = self.storage.buffers()[1]
@@ -182,8 +182,6 @@ else:
             return PandasBFloat16Array(bfloat16_array(scalars))
 
         def __getitem__(self, item):
-            import numpy as np
-
             if isinstance(item, int):
                 return self.data[item].as_py()
             elif isinstance(item, slice):

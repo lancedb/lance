@@ -23,7 +23,8 @@ use arrow_array::{
 use arrow_select::concat::concat_batches;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::*;
-use lance_core::io::WriteExt;
+use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
+use lance_io::traits::WriteExt;
 use lance_linalg::kernels::argmin;
 use lance_linalg::{
     distance::{cosine_distance_batch, dot_distance_batch, l2_distance, l2_distance_batch},
@@ -381,7 +382,9 @@ async fn write_index_file(
     };
 
     let pos = writer.write_protobuf(&metadata).await?;
-    writer.write_magics(pos).await?;
+    writer
+        .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+        .await?;
     writer.shutdown().await?;
 
     Ok(())

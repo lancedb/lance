@@ -27,13 +27,14 @@ import logging
 from functools import partial
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Union
 
-import numpy as np
 import pyarrow as pa
-import tensorflow as tf
 
 import lance
 from lance import LanceDataset
 from lance.arrow import EncodedImageType, FixedShapeImageTensorType, ImageURIType
+from lance.dependencies import _check_for_numpy
+from lance.dependencies import numpy as np
+from lance.dependencies import tensorflow as tf
 from lance.fragment import FragmentMetadata, LanceFragment
 
 if TYPE_CHECKING:
@@ -213,14 +214,16 @@ def from_lance(
 
     if isinstance(fragments, tf.data.Dataset):
         fragments = list(fragments.as_numpy_iterator())
-    elif isinstance(fragments, np.ndarray):
+    elif _check_for_numpy(fragments) and isinstance(fragments, np.ndarray):
         fragments = list(fragments)
 
     if fragments is not None:
 
         def gen_fragments(fragments):
             for f in fragments:
-                if isinstance(f, (int, np.integer)):
+                if isinstance(f, int) or (
+                    _check_for_numpy(f) and isinstance(f, np.integer)
+                ):
                     yield LanceFragment(dataset, int(f))
                 elif isinstance(f, FragmentMetadata):
                     yield LanceFragment(dataset, f.fragment_id)
@@ -261,9 +264,9 @@ def lance_fragments(dataset: Union[str, Path, LanceDataset]) -> tf.data.Dataset:
     """
     if not isinstance(dataset, LanceDataset):
         dataset = lance.dataset(dataset)
-    return tf.data.Dataset.from_tensor_slices(
-        [f.fragment_id for f in dataset.get_fragments()]
-    )
+    return tf.data.Dataset.from_tensor_slices([
+        f.fragment_id for f in dataset.get_fragments()
+    ])
 
 
 def _ith_batch(i: int, batch_size: int, total_size: int) -> Tuple[int, int]:

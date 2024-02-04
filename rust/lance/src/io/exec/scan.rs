@@ -31,12 +31,12 @@ use futures::{stream, Future};
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::ROW_ID_FIELD;
+use lance_table::format::Fragment;
 use tracing::Instrument;
 
 use crate::dataset::fragment::{FileFragment, FragmentReader};
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
-use crate::format::Fragment;
 
 async fn open_file(
     file_fragment: FileFragment,
@@ -44,10 +44,8 @@ async fn open_file(
     with_row_id: bool,
     with_make_deletions_null: bool,
 ) -> Result<FragmentReader> {
-    let mut reader = file_fragment.open(projection.as_ref()).await?;
-    if with_row_id {
-        reader.with_row_id();
-    };
+    let mut reader = file_fragment.open(projection.as_ref(), with_row_id).await?;
+
     if with_make_deletions_null {
         reader.with_make_deletions_null();
     };
@@ -305,9 +303,15 @@ impl ExecutionPlan for LanceScanExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if children.is_empty() {
+            Ok(self)
+        } else {
+            Err(DataFusionError::Internal(
+                "LanceScanExec cannot be assigned children".to_string(),
+            ))
+        }
     }
 
     fn execute(

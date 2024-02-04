@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import random
@@ -22,7 +23,6 @@ import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from functools import lru_cache
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -37,20 +37,37 @@ from typing import (
     Union,
 )
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 
+from .dependencies import (
+    _check_for_hugging_face,
+    _check_for_numpy,
+    _check_for_pandas,
+    torch,
+)
+from .dependencies import numpy as np
+from .dependencies import pandas as pd
 from .fragment import FragmentMetadata, LanceFragment
-from .lance import CleanupStats, _Dataset, _Operation, _Scanner, _write_dataset
+from .lance import (
+    CleanupStats,
+    _Dataset,
+    _MergeInsertBuilder,
+    _Operation,
+    _Scanner,
+    _write_dataset,
+)
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .optimize import Compaction
 from .util import td_to_micros
 
-try:
-    import pandas as pd
+if TYPE_CHECKING:
+    from pyarrow._compute import Expression
+
+    from .commit import CommitLock
+    from .progress import FragmentWriteProgress
 
     ReaderLike = Union[
         pd.Timestamp,
@@ -60,6 +77,7 @@ try:
         Iterable[RecordBatch],
         pa.RecordBatchReader,
     ]
+
     QueryVectorLike = Union[
         pd.Series,
         pa.Array,
@@ -67,28 +85,62 @@ try:
         np.ndarray,
         Iterable[float],
     ]
-except ImportError:
-    pd = None
-    ReaderLike = Union[
-        pa.Table,
-        pa.dataset.Dataset,
-        pa.dataset.Scanner,
-        Iterable[RecordBatch],
-        pa.RecordBatchReader,
-    ]
-    QueryVectorLike = Union[
-        pa.Array,
-        pa.Scalar,
-        np.ndarray,
-        Iterable[float],
-    ]
 
-if TYPE_CHECKING:
-    import torch
-    from pyarrow._compute import Expression
 
-    from .commit import CommitLock
-    from .progress import FragmentWriteProgress
+class MergeInsertBuilder(_MergeInsertBuilder):
+    def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
+        """Executes the merge insert operation
+
+        There is no return value but the original dataset will be updated.
+
+        Parameters
+        ----------
+
+        data_obj: ReaderLike
+            The new data to use as the source table for the operation.  This parameter
+            can be any source of data (e.g. table / dataset) that
+            :func:`~lance.write_dataset` accepts.
+        schema: Optional[pa.Schema]
+            The schema of the data.  This only needs to be supplied whenever the data
+            source is some kind of generator.
+        """
+        reader = _coerce_reader(data_obj, schema)
+        super(MergeInsertBuilder, self).execute(reader)
+
+    # These next three overrides exist only to document the methods
+
+    def when_matched_update_all(self):
+        """
+        Configure the operation to update matched rows
+
+        After this method is called, when the merge insert operation executes,
+        any rows that match both the source table and the target table will be
+        updated.  The rows from the target table will be removed and the rows
+        from the source table will be added.
+        """
+        return super(MergeInsertBuilder, self).when_matched_update_all()
+
+    def when_not_matched_insert_all(self):
+        """
+        Configure the operation to insert not matched rows
+
+        After this method is called, when the merge insert operation executes,
+        any rows that exist only in the source table will be inserted into
+        the target table.
+        """
+        return super(MergeInsertBuilder, self).when_not_matched_insert_all()
+
+    def when_not_matched_by_source_delete(self, expr: Optional[str] = None):
+        """
+        Configure the operation to delete source rows that do not match
+
+        After this method is called, when the merge insert operation executes,
+        any rows that exist only in the target table will be deleted.  An
+        optional filter can be specified to limit the scope of the delete
+        operation.  If given (as an SQL filter) then only rows which match
+        the filter will be deleted.
+        """
+        return super(MergeInsertBuilder, self).when_not_matched_by_source_delete(expr)
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -129,9 +181,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._uri
 
-    @lru_cache(maxsize=None)
     def list_indices(self) -> List[Dict[str, Any]]:
-        return self._ds.load_indices()
+        if getattr(self, "_list_indices_res", None) is None:
+            self._list_indices_res = self._ds.load_indices()
+        return self._list_indices_res
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
@@ -608,6 +661,37 @@ class LanceDataset(pa.dataset.Dataset):
 
         self._ds.merge(reader, left_on, right_on)
 
+    def drop_columns(self, columns: List[str]):
+        """Drop one or more columns from the dataset
+
+        Parameters
+        ----------
+        columns : list of str
+            The names of the columns to drop. These can be nested column references
+            (e.g. "a.b.c") or top-level column names (e.g. "a").
+
+        This is a metadata-only operation and does not remove the data from the
+        underlying storage. In order to remove the data, you must subsequently
+        call ``compact_files`` to rewrite the data without the removed columns and
+        then call ``cleanup_files`` to remove the old files.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.drop_columns(["a"])
+        >>> dataset.to_table().to_pandas()
+           b
+        0  a
+        1  b
+        2  c
+        """
+        self._ds.drop_columns(columns)
+        # Indices might have changed
+        self._list_indices_res = None
+
     def delete(self, predicate: Union[str, pa.compute.Expression]):
         """
         Delete rows from the dataset.
@@ -639,6 +723,66 @@ class LanceDataset(pa.dataset.Dataset):
         if isinstance(predicate, pa.compute.Expression):
             predicate = str(predicate)
         self._ds.delete(predicate)
+
+    def merge_insert(
+        self,
+        on: Union[str, Iterable[str]],
+    ):
+        """
+        Returns a builder that can be used to create a "merge insert" operation
+
+        This operation can add rows, update rows, and remove rows in a single
+        transaction. It is a very generic tool that can be used to create
+        behaviors like "insert if not exists", "update or insert (i.e. upsert)",
+        or even replace a portion of existing data with new data (e.g. replace
+        all data where month="january")
+
+        The merge insert operation works by combining new data from a
+        **source table** with existing data in a **target table** by using a
+        join.  There are three categories of records.
+
+        "Matched" records are records that exist in both the source table and
+        the target table. "Not matched" records exist only in the source table
+        (e.g. these are new data). "Not matched by source" records exist only
+        in the target table (this is old data).
+
+        The builder returned by this method can be used to customize what
+        should happen for each category of data.
+
+        Please note that the data will be reordered as part of this
+        operation.  This is because updated rows will be deleted from the
+        dataset and then reinserted at the end with the new values.  The
+        order of the newly inserted rows may fluctuate randomly because a
+        hash-join operation is used internally.
+
+        Parameters
+        ----------
+
+        on: Union[str, Iterable[str]]
+            A column (or columns) to join on.  This is how records from the
+            source table and target table are matched.  Typically this is some
+            kind of key or id column.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [2, 1, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> new_table = pa.table({"a": [2, 3, 4], "b": ["x", "y", "z"]})
+        >>> # Perform a "upsert" operation
+        >>> dataset.merge_insert("a")             \\
+        ...        .when_matched_update_all()     \\
+        ...        .when_not_matched_insert_all() \\
+        ...        .execute(new_table)
+        >>> dataset.to_table().sort_by("a").to_pandas()
+           a  b
+        0  1  b
+        1  2  x
+        2  3  y
+        3  4  z
+        """
+        return MergeInsertBuilder(self._ds, on)
 
     def update(
         self,
@@ -697,9 +841,22 @@ class LanceDataset(pa.dataset.Dataset):
     @property
     def latest_version(self) -> int:
         """
-        Returns the lastest version of the dataset
+        Returns the latest version of the dataset.
         """
         return self._ds.latest_version()
+
+    def checkout_version(self, version) -> "LanceDataset":
+        """
+        Load the given version of the dataset.
+
+        Unlike the :func:`dataset` constructor, this will re-use the
+        current cache.
+        This is a no-op if the dataset is already at the given version.
+        """
+        ds = copy.copy(self)
+        if version != ds.version:
+            ds._ds = self._ds.checkout_version(version)
+        return ds
 
     def restore(self):
         """
@@ -865,12 +1022,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         index_type = index_type.upper()
         if index_type != "BTREE":
-            raise NotImplementedError(
-                (
-                    'Only "BTREE" is supported for ',
-                    f"index_type.  Received {index_type}",
-                )
-            )
+            raise NotImplementedError((
+                'Only "BTREE" is supported for ',
+                f"index_type.  Received {index_type}",
+            ))
 
         self._ds.create_index([column], index_type, name, replace)
 
@@ -882,10 +1037,17 @@ class LanceDataset(pa.dataset.Dataset):
         metric: str = "L2",
         replace: bool = False,
         num_partitions: Optional[int] = None,
-        ivf_centroids: Optional[Union[np.ndarray, pa.FixedSizeListArray]] = None,
+        ivf_centroids: Optional[
+            Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+        ] = None,
+        pq_codebook: Optional[
+            Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+        ] = None,
         num_sub_vectors: Optional[int] = None,
         accelerator: Optional[Union[str, "torch.Device"]] = None,
         index_cache_size: Optional[int] = None,
+        shuffle_partition_batches: Optional[int] = None,
+        shuffle_partition_concurrency: Optional[int] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -908,9 +1070,16 @@ class LanceDataset(pa.dataset.Dataset):
             Replace the existing index if it exists.
         num_partitions : int, optional
             The number of partitions of IVF (Inverted File Index).
-        ivf_centroids : ``np.ndarray`` or ``pyarrow.FixedSizeListArray``. Optional.
+        ivf_centroids : ``np.ndarray``, ``pyarrow.FixedSizeListArray``
+        or ``pyarrow.FixedShapeTensorArray``. Optional.
             A ``num_partitions x dimension`` array of K-mean centroids for IVF
             clustering. If not provided, a new Kmean model will be trained.
+        pq_codebook : ``np.ndarray``, ``pyarrow.FixedSizeListArray``
+        or ``pyarrow.FixedShapeTensorArray``. Optional.
+            A ``num_sub_vectors x (2 ^ nbits * dimensions // num_sub_vectors)``
+            array of K-mean centroids for PQ codebook.
+            Note: nbits is always 8 for now.
+            If not provided, a new PQ model will be trained.
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
         accelerator : str or ``torch.Device``, optional
@@ -919,6 +1088,18 @@ class LanceDataset(pa.dataset.Dataset):
             If not set, use the CPU.
         index_cache_size : int, optional
             The size of the index cache in number of entries. Default value is 256.
+        shuffle_partition_batches : int, optional
+            The number of batches, using the row group size of the dataset, to include
+            in each shuffle partition. Default value is 10240.
+
+            Assuming the row group size is 1024, each shuffle partition will hold
+            10240 * 1024 = 10,485,760 rows. By making this value smaller, this shuffle
+            will consume less memory but will take longer to complete, and vice versa.
+        shuffle_partition_concurrency : int, optional
+            The number of shuffle partitions to process concurrently. Default value is 2
+
+            By making this value smaller, this shuffle will consume less memory but will
+            take longer to complete, and vice versa.
         kwargs :
             Parameters passed to the index building process.
 
@@ -1051,9 +1232,16 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 kwargs["precomputed_partitions_file"] = partitions_file
 
+            if (ivf_centroids is None) and (pq_codebook is not None):
+                raise ValueError(
+                    "ivf_centroids must be specified when pq_codebook is provided"
+                )
+
             if ivf_centroids is not None:
                 # User provided IVF centroids
-                if isinstance(ivf_centroids, np.ndarray):
+                if _check_for_numpy(ivf_centroids) and isinstance(
+                    ivf_centroids, np.ndarray
+                ):
                     if (
                         len(ivf_centroids.shape) != 2
                         or ivf_centroids.shape[0] != num_partitions
@@ -1075,6 +1263,39 @@ class LanceDataset(pa.dataset.Dataset):
                     [ivf_centroids], ["_ivf_centroids"]
                 )
                 kwargs["ivf_centroids"] = ivf_centroids_batch
+
+            if pq_codebook is not None:
+                # User provided IVF centroids
+                if _check_for_numpy(pq_codebook) and isinstance(
+                    pq_codebook, np.ndarray
+                ):
+                    if (
+                        len(pq_codebook.shape) != 3
+                        or pq_codebook.shape[0] != num_sub_vectors
+                        or pq_codebook.shape[1] != 256
+                    ):
+                        raise ValueError(
+                            f"PQ codebook must be 3D array: (sub_vectors, 256, dim), "
+                            f"got {pq_codebook.shape}"
+                        )
+                    if pq_codebook.dtype not in [np.float16, np.float32, np.float64]:
+                        raise TypeError(
+                            "PQ codebook must be floating number"
+                            + f"got {pq_codebook.dtype}"
+                        )
+                    values = pa.array(pq_codebook.reshape(-1))
+                    pq_codebook = pa.FixedSizeListArray.from_arrays(
+                        values, num_sub_vectors * 256
+                    )
+                pq_codebook_batch = pa.RecordBatch.from_arrays(
+                    [pq_codebook], ["_pq_codebook"]
+                )
+                kwargs["pq_codebook"] = pq_codebook_batch
+
+        if shuffle_partition_batches is not None:
+            kwargs["shuffle_partition_batches"] = shuffle_partition_batches
+        if shuffle_partition_concurrency is not None:
+            kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
         self._ds.create_index(column, index_type, name, replace, kwargs)
         return LanceDataset(self.uri, index_cache_size=index_cache_size)
@@ -1483,6 +1704,7 @@ class ScannerBuilder:
         self.ds = ds
         self._limit = 0
         self._filter = None
+        self._substrait_filter = None
         self._prefilter = None
         self._offset = None
         self._columns = None
@@ -1543,8 +1765,38 @@ class ScannerBuilder:
 
     def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder:
         if isinstance(filter, pa.compute.Expression):
-            filter = str(filter)
-        self._filter = filter
+            try:
+                from pyarrow.substrait import serialize_expressions
+
+                fields_without_lists = []
+                counter = 0
+                # Pyarrow cannot handle fixed size lists when converting
+                # types to Substrait. So we can't use those in our filter,
+                # which is ok for now but we need to replace them with some
+                # kind of placeholder because Substrait is going to use
+                # ordinal field references and we want to make sure those are
+                # correct.
+                for field in self.ds.schema:
+                    if pa.types.is_fixed_size_list(field.type):
+                        pos = counter
+                        counter += 1
+                        fields_without_lists.append(
+                            pa.field(f"__unlikely_name_placeholder_{pos}", pa.int8())
+                        )
+                    else:
+                        fields_without_lists.append(field)
+                # Serialize the pyarrow compute expression toSubstrait and use
+                # that as a filter.
+                scalar_schema = pa.schema(fields_without_lists)
+                self._substrait_filter = serialize_expressions(
+                    [filter], ["my_filter"], scalar_schema
+                )
+            except ImportError:
+                # serialize_expressions was introduced in pyarrow 14.  Fallback to
+                # stringifying the expression if pyarrow is too old
+                self._filter = str(filter)
+        else:
+            self._filter = filter
         return self
 
     def prefilter(self, prefilter: bool) -> ScannerBuilder:
@@ -1645,6 +1897,7 @@ class ScannerBuilder:
             self._fragments,
             self._with_row_id,
             self._use_stats,
+            self._substrait_filter,
         )
         return LanceScanner(scanner, self.ds)
 
@@ -1874,10 +2127,6 @@ class LanceStats:
             The name of the index to get statistics for.
         """
         index_stats = json.loads(self._ds.index_statistics(index_name))
-        index_stats["num_indexed_rows"] = self._ds.count_indexed_rows(index_name)
-        index_stats["num_unindexed_rows"] = self._ds.count_unindexed_rows(index_name)
-        index_stats["index_cache_entry_count"] = self._ds.index_cache_entry_count()
-        index_stats["index_cache_hit_rate"] = self._ds.index_cache_hit_rate()
         return index_stats
 
 
@@ -1900,6 +2149,7 @@ def write_dataset(
     data_obj: Reader-like
         The data to be written. Acceptable types are:
         - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, or RecordBatchReader
+        - Huggingface dataset
     uri: str or Path
         Where to write the dataset to (directory)
     schema: Schema, optional
@@ -1928,6 +2178,15 @@ def write_dataset(
         a custom class that defines hooks to be called when each fragment is
         starting to write and finishing writing.
     """
+    if _check_for_hugging_face(data_obj):
+        # Huggingface datasets
+        from .dependencies import datasets
+
+        if isinstance(data_obj, datasets.Dataset):
+            if schema is None:
+                schema = data_obj.features.arrow_schema
+            data_obj = data_obj.data.to_batches()
+
     reader = _coerce_reader(data_obj, schema)
     _validate_schema(reader.schema)
     # TODO add support for passing in LanceDataset and LanceScanner here
@@ -1953,7 +2212,7 @@ def write_dataset(
 def _coerce_reader(
     data_obj: ReaderLike, schema: Optional[pa.Schema] = None
 ) -> pa.RecordBatchReader:
-    if pd and isinstance(data_obj, pd.DataFrame):
+    if _check_for_pandas(data_obj) and isinstance(data_obj, pd.DataFrame):
         return pa.Table.from_pandas(data_obj, schema=schema).to_reader()
     elif isinstance(data_obj, pa.Table):
         return data_obj.to_reader()
@@ -1997,7 +2256,10 @@ def _coerce_query_vector(query: QueryVectorLike):
             query = query.value
         if isinstance(query.type, pa.FixedSizeListType):
             query = query.values
-    elif isinstance(query, (np.ndarray, list, tuple)):
+    elif isinstance(query, (list, tuple)) or (
+        _check_for_numpy(query),
+        isinstance(query, np.ndarray),
+    ):
         query = np.array(query).astype("float64")  # workaround for GH-608
         query = pa.FloatingPointArray.from_pandas(query, type=pa.float32())
     elif not isinstance(query, pa.Array):

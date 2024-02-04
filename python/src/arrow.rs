@@ -14,12 +14,13 @@
 
 use std::sync::Arc;
 
-use arrow::ffi_stream::{export_reader_into_raw, FFI_ArrowArrayStream};
+use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::pyarrow::*;
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{DataType, Field, Schema};
 use half::bf16;
 use lance::arrow::bfloat16::BFloat16Array;
+use lance_arrow::bfloat16::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
 use pyo3::{
     exceptions::PyValueError,
     ffi::Py_uintptr_t,
@@ -72,8 +73,8 @@ impl BFloat16 {
 }
 
 const EXPORT_METADATA: [(&str, &str); 2] = [
-    ("ARROW:extension:name", "lance.bfloat16"),
-    ("ARROW:extension:metadata", ""),
+    (ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME),
+    (ARROW_EXT_META_KEY, ""),
 ];
 
 #[pyfunction]
@@ -104,8 +105,7 @@ pub fn reader_to_pyarrow(
     py: Python,
     reader: Box<dyn RecordBatchReader + Send>,
 ) -> PyResult<PyObject> {
-    let mut stream = FFI_ArrowArrayStream::empty();
-    unsafe { export_reader_into_raw(reader, &mut stream) };
+    let mut stream = FFI_ArrowArrayStream::new(reader);
 
     let stream_ptr = (&mut stream) as *mut FFI_ArrowArrayStream;
     let module = py.import("pyarrow")?;

@@ -18,20 +18,16 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatchReader;
-use datafusion::error::DataFusionError;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::{StreamExt, TryStreamExt};
-use lance_core::{
-    datatypes::Schema,
-    format::Fragment,
-    io::{
-        object_store::{ObjectStore, ObjectStoreParams},
-        FileWriter,
-    },
-    Error, Result,
-};
+use futures::StreamExt;
+use lance_core::{datatypes::Schema, Result};
 use lance_datafusion::chunker::chunk_stream;
+use lance_datafusion::utils::reader_to_stream;
+use lance_file::writer::FileWriter;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_table::format::Fragment;
+use lance_table::io::commit::CommitHandler;
+use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use tracing::instrument;
 use uuid::Uuid;
@@ -39,6 +35,7 @@ use uuid::Uuid;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::DATA_DIR;
 
+pub mod merge_insert;
 pub mod update;
 
 /// The mode to write dataset.
@@ -80,6 +77,15 @@ pub struct WriteParams {
     pub store_params: Option<ObjectStoreParams>,
 
     pub progress: Arc<dyn WriteFragmentProgress>,
+
+    /// If present, dataset will use this to update the latest version
+    ///
+    /// If not set, the default will be based on the object store.  Generally this will
+    /// be RenameCommitHandler unless the object store does not handle atomic renames (e.g. S3)
+    ///
+    /// If a custom object store is provided (via store_params.object_store) then this
+    /// must also be provided.
+    pub commit_handler: Option<Arc<dyn CommitHandler>>,
 }
 
 impl Default for WriteParams {
@@ -93,39 +99,9 @@ impl Default for WriteParams {
             mode: WriteMode::Create,
             store_params: None,
             progress: Arc::new(NoopFragmentWriteProgress::new()),
+            commit_handler: None,
         }
     }
-}
-
-/// Convert reader to a stream and a schema.
-///
-/// Will peek the first batch to get the dictionaries for dictionary columns.
-///
-/// NOTE: this does not validate the schema. For example, for appends the schema
-/// should be checked to make sure it matches the existing dataset schema before
-/// writing.
-pub fn reader_to_stream(
-    batches: Box<dyn RecordBatchReader + Send>,
-) -> Result<(SendableRecordBatchStream, Schema)> {
-    let arrow_schema = batches.schema();
-    let mut schema: Schema = Schema::try_from(batches.schema().as_ref())?;
-    let mut peekable = batches.peekable();
-    if let Some(batch) = peekable.peek() {
-        if let Ok(b) = batch {
-            schema.set_dictionary(b)?;
-        } else {
-            return Err(Error::from(batch.as_ref().unwrap_err()));
-        }
-    }
-    schema.validate()?;
-
-    let stream = RecordBatchStreamAdapter::new(
-        arrow_schema,
-        futures::stream::iter(peekable).map_err(DataFusionError::from),
-    );
-    let stream = Box::pin(stream) as SendableRecordBatchStream;
-
-    Ok((stream, schema))
 }
 
 /// Writes the given data to the dataset and returns fragments.
@@ -143,7 +119,7 @@ pub async fn write_fragments(
         &params.store_params.clone().unwrap_or_default(),
     )
     .await?;
-    let (stream, schema) = reader_to_stream(Box::new(data))?;
+    let (stream, schema) = reader_to_stream(Box::new(data)).await?;
     write_fragments_internal(Arc::new(object_store), &base, &schema, stream, params).await
 }
 
@@ -169,7 +145,7 @@ pub async fn write_fragments_internal(
     let mut buffered_reader = chunk_stream(data, params.max_rows_per_group);
 
     let writer_generator = WriterGenerator::new(object_store, base_dir, schema);
-    let mut writer: Option<FileWriter> = None;
+    let mut writer: Option<FileWriter<ManifestDescribing>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
     while let Some(batch_chunk) = buffered_reader.next().await {
@@ -226,7 +202,7 @@ impl WriterGenerator {
         }
     }
 
-    pub async fn new_writer(&self) -> Result<(FileWriter, Fragment)> {
+    pub async fn new_writer(&self) -> Result<(FileWriter<ManifestDescribing>, Fragment)> {
         let data_file_path = format!("{}.lance", Uuid::new_v4());
 
         // Use temporary ID 0; will assign ID later.
@@ -252,6 +228,8 @@ mod tests {
 
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Schema as ArrowSchema};
+    use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
+    use futures::TryStreamExt;
 
     #[tokio::test]
     async fn test_chunking_large_batches() {

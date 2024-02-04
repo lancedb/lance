@@ -24,14 +24,15 @@ use async_trait::async_trait;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
+    stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
     RecordBatchStream as DFRecordBatchStream, SendableRecordBatchStream, Statistics,
 };
-use futures::stream::Stream;
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{flat::flat_search, Query, DIST_COL};
+use lance_io::stream::RecordBatchStream;
+use lance_table::format::Index;
 use snafu::{location, Location};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
@@ -39,10 +40,8 @@ use tracing::{instrument, Instrument};
 
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::dataset::Dataset;
-use crate::format::Index;
 use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::DatasetIndexInternalExt;
-use crate::io::RecordBatchStream;
 use crate::{Error, Result};
 
 /// KNN node for post-filtering.
@@ -140,11 +139,11 @@ impl DFRecordBatchStream for KNNFlatStream {
 /// - `input` schema does not have "_distance" column.
 #[derive(Debug)]
 pub struct KNNFlatExec {
-    /// Input node.
-    input: Arc<dyn ExecutionPlan>,
+    /// Inner input node.
+    pub input: Arc<dyn ExecutionPlan>,
 
-    /// The query to execute.
-    query: Query,
+    /// The vector query to execute.
+    pub query: Query,
 }
 
 impl DisplayAs for KNNFlatExec {
@@ -299,103 +298,41 @@ impl FilterLoader for SelectionVectorToPrefilter {
     }
 }
 
-/// KNN Node from reading a vector index.
-pub struct KNNIndexStream {
-    rx: Receiver<datafusion::error::Result<RecordBatch>>,
-    bg_thread: Option<JoinHandle<()>>,
-}
+fn knn_index_stream(
+    query: Query,
+    dataset: Arc<Dataset>,
+    index_meta: Vec<Index>,
+    allow_list_input: Option<Box<dyn FilterLoader>>,
+) -> impl DFRecordBatchStream {
+    let pre_filter = Arc::new(PreFilter::new(
+        dataset.clone(),
+        &index_meta,
+        allow_list_input,
+    ));
 
-impl KNNIndexStream {
-    async fn knn_stream(
-        query: Query,
-        dataset: Arc<Dataset>,
-        index_meta: Index,
-        allow_list_input: Option<Box<dyn FilterLoader>>,
-    ) -> Result<RecordBatch> {
-        let index = dataset
-            .open_vector_index(&query.column, &index_meta.uuid.to_string())
-            .await?;
-        let pre_filter = Arc::new(PreFilter::new(dataset, index_meta, allow_list_input));
-        index.search(&query, pre_filter).await
-    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(DIST_COL, DataType::Float32, true),
+        ROW_ID_FIELD.clone(),
+    ]));
 
-    #[instrument(level = "debug", skip_all, name = "KNNIndexStream::new")]
-    pub fn new(
-        dataset: Arc<Dataset>,
-        index: &Index,
-        query: &Query,
-        allow_list: Option<Box<dyn FilterLoader>>,
-    ) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(2);
-        let q = query.clone();
-        let index = index.clone();
-        let bg_thread = tokio::spawn(
-            async move {
-                let result = match Self::knn_stream(q, dataset, index, allow_list).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
-                            "Failed to calculate KNN: {e}"
-                        ))))
-                        .await
-                        .expect("KNNIndex failed to send message");
-                        return;
-                    }
-                };
-
-                if !tx.is_closed() {
-                    if let Err(e) = tx.send(Ok(result)).await {
-                        eprintln!("KNNIndex tx.send error: {e}")
-                    };
-                }
-                drop(tx);
-            }
-            .in_current_span(),
-        );
-
-        Self {
-            rx,
-            bg_thread: Some(bg_thread),
-        }
-    }
-}
-
-impl DFRecordBatchStream for KNNIndexStream {
-    fn schema(&self) -> arrow_schema::SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new(DIST_COL, DataType::Float32, true),
-            ROW_ID_FIELD.clone(),
-        ]))
-    }
-}
-
-impl Stream for KNNIndexStream {
-    type Item = std::result::Result<RecordBatch, datafusion::error::DataFusionError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = Pin::into_inner(self);
-        // We need to check the JoinHandle to make sure the thread hasn't panicked.
-        let bg_thread_completed = if let Some(bg_thread) = &mut this.bg_thread {
-            match bg_thread.poll_unpin(cx) {
-                Poll::Ready(Ok(())) => true,
-                Poll::Ready(Err(join_error)) => {
-                    return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
-                        "ExecNode(KNNIndexStream): thread panicked: {}",
-                        join_error
-                    )))));
-                }
-                Poll::Pending => false,
-            }
-        } else {
-            false
-        };
-        if bg_thread_completed {
-            // Need to take it, since we aren't allowed to poll if again after.
-            this.bg_thread.take();
-        }
-        // this.rx.
-        this.rx.poll_recv(cx)
-    }
+    let s = stream::iter(index_meta)
+        .zip(stream::repeat((
+            dataset.clone(),
+            pre_filter.clone(),
+            query.clone(),
+        )))
+        .map(|(idx, (ds, pre_filter, query))| async move {
+            let index = ds
+                .open_vector_index(&query.column, &idx.uuid.to_string())
+                .await?;
+            index.search(&query, pre_filter.clone()).await
+        })
+        .buffer_unordered(num_cpus::get())
+        .map(|r| {
+            r.map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {}", e)))
+        })
+        .boxed();
+    RecordBatchStreamAdapter::new(schema, s)
 }
 
 #[derive(Debug)]
@@ -416,7 +353,7 @@ pub struct KNNIndexExec {
     /// Prefiltering input
     prefilter_source: PreFilterSource,
     /// The index metadata
-    index: Index,
+    indices: Vec<Index>,
     /// The vector query to execute.
     query: Query,
 }
@@ -427,9 +364,10 @@ impl DisplayAs for KNNIndexExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "KNNIndex: name={}, k={}",
-                    self.index.uuid,
-                    self.query.k * self.query.refine_factor.unwrap_or(1) as usize
+                    "KNNIndex: name={}, k={}, deltas={}",
+                    self.indices[0].name,
+                    self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
+                    self.indices.len()
                 )
             }
         }
@@ -440,10 +378,16 @@ impl KNNIndexExec {
     /// Create a new [KNNIndexExec].
     pub fn try_new(
         dataset: Arc<Dataset>,
-        index: Index,
+        indices: &[Index],
         query: &Query,
         prefilter_source: PreFilterSource,
     ) -> Result<Self> {
+        if indices.is_empty() {
+            return Err(Error::IO {
+                message: "KNNIndexExec node: no index found for query".to_string(),
+                location: location!(),
+            });
+        }
         let schema = dataset.schema();
         if schema.field(query.column.as_str()).is_none() {
             return Err(Error::IO {
@@ -457,7 +401,7 @@ impl KNNIndexExec {
 
         Ok(Self {
             dataset,
-            index,
+            indices: indices.to_vec(),
             query: query.clone(),
             prefilter_source,
         })
@@ -516,10 +460,10 @@ impl ExecutionPlan for KNNIndexExec {
             PreFilterSource::None => None,
         };
 
-        Ok(Box::pin(KNNIndexStream::new(
+        Ok(Box::pin(knn_index_stream(
+            self.query.clone(),
             self.dataset.clone(),
-            &self.index,
-            &self.query,
+            self.indices.clone(),
             prefilter_loader,
         )))
     }

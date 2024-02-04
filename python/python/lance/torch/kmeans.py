@@ -16,11 +16,11 @@ import logging
 import time
 from typing import List, Literal, Optional, Tuple, Union
 
-import numpy as np
 import pyarrow as pa
-import torch
-from torch.utils.data import IterableDataset
 from tqdm import tqdm
+
+from lance.dependencies import _check_for_numpy, _check_for_torch, torch
+from lance.dependencies import numpy as np
 
 from . import preferred_device
 from .data import TensorDataset
@@ -98,7 +98,7 @@ class KMeans:
     ) -> torch.Tensor:
         if isinstance(data, pa.FixedSizeListArray):
             data = torch.from_numpy(np.stack(data.to_numpy(zero_copy_only=False)))
-        elif isinstance(data, np.ndarray):
+        elif _check_for_numpy(data) and isinstance(data, np.ndarray):
             data = torch.from_numpy(data)
         elif isinstance(data, torch.Tensor):
             # Good type
@@ -117,15 +117,22 @@ class KMeans:
         if self.centroids is not None:
             logging.debug("KMeans centroids already initialized")
             return
-        if isinstance(data, (np.ndarray, torch.Tensor)):
+
+        is_numpy = _check_for_numpy(data) and isinstance(data, np.ndarray)
+        if is_numpy or (_check_for_torch(data) and isinstance(data, torch.Tensor)):
             indices = np.random.choice(data.shape[0], self.k)
-            if isinstance(data, np.ndarray):
+            if is_numpy:
                 data = torch.from_numpy(data)
             self.centroids = data[indices]
 
     def fit(
         self,
-        data: Union[IterableDataset, np.ndarray, torch.Tensor, pa.FixedSizeListArray],
+        data: Union[
+            torch.utils.data.IterableDataset,
+            np.ndarray,
+            torch.Tensor,
+            pa.FixedSizeListArray,
+        ],
     ) -> None:
         """Fit - Train the kmeans model.
 
@@ -139,7 +146,9 @@ class KMeans:
             data = np.stack(data.to_numpy(zero_copy_only=False))
         elif isinstance(data, pa.FixedShapeTensorArray):
             data = data.to_numpy_ndarray()
-        if isinstance(data, (np.ndarray, torch.Tensor)):
+        if (_check_for_torch(data) and isinstance(data, torch.Tensor)) or (
+            _check_for_numpy(data) and isinstance(data, np.ndarray)
+        ):
             self._random_init(data)
             data = TensorDataset(data, batch_size=10240)
 
@@ -164,16 +173,19 @@ class KMeans:
     def _updated_centroids(
         self, centroids: torch.Tensor, counts: torch.Tensor
     ) -> torch.Tensor:
-        for idx, cnt in enumerate(counts.cpu()):
-            # split the largest cluster and remove empty cluster
-            if cnt == 0:
-                max_idx = torch.argmax(counts).item()
-                half_cnt = counts[max_idx] // 2
-                counts[idx], counts[max_idx] = half_cnt, half_cnt
-                centroids[idx] = centroids[max_idx] * 1.05
-                centroids[max_idx] = centroids[max_idx] / 1.05
-
         centroids = centroids / counts[:, None]
+        zero_counts = counts == 0
+        for idx in zero_counts.nonzero(as_tuple=False):
+            # split the largest cluster and remove empty cluster
+            max_idx = torch.argmax(counts).item()
+            # add 1% gassuian noise to the largest centroid
+            # do this twice so we effectively split the largest cluster into 2
+            # rand_like returns on [0, 1) so we need to shift it to [-0.5, 0.5)
+            noise = (torch.rand_like(centroids[idx]) - 0.5) * 0.01 + 1
+            centroids[idx] = centroids[max_idx] * noise
+            noise = (torch.rand_like(centroids[idx]) - 0.5) * 0.01 + 1
+            centroids[max_idx] = centroids[max_idx] * noise
+
         if self.metric == "cosine":
             # normalize the centroids
             centroids = torch.nn.functional.normalize(centroids)
@@ -189,7 +201,7 @@ class KMeans:
         return num_rows
 
     def _fit_once(
-        self, data: IterableDataset, epoch: int, last_dist: float = 0.0
+        self, data: torch.utils.data.IterableDataset, epoch: int, last_dist: float = 0.0
     ) -> float:
         """Train KMean once and return the total distance.
 
@@ -239,6 +251,16 @@ class KMeans:
             del ids
             del dists
             del chunk
+
+        # this happens when there are too many NaNs or the data is just the same
+        # vectors repeated over and over. Performance may be bad but we don't
+        # want to crash.
+        if total_dist == 0:
+            logging.warning(
+                "Kmeans::train: total_dist is 0, this is unusual."
+                " This could result in bad performance during search."
+            )
+            raise StopIteration("kmeans: converged")
 
         if abs(total_dist - last_dist) / total_dist < self.tolerance:
             raise StopIteration("kmeans: converged")

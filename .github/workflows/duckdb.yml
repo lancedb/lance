@@ -12,7 +12,7 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
-  
+
 jobs:
   Linux:
     runs-on: ubuntu-22.04
@@ -21,7 +21,7 @@ jobs:
       run:
         working-directory: ./integration/duckdb_lance
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install dependencies
         run: |
           sudo apt update
@@ -39,13 +39,13 @@ jobs:
       #     path: integration/duckdb/build/lance.duckdb_extension
       #     retention-days: 1
   MacOS:
-    runs-on: macos-13
+    runs-on: macos-14
     timeout-minutes: 40
     defaults:
       run:
         working-directory: ./integration/duckdb_lance
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install dependencies
         run: |
           brew install protobuf

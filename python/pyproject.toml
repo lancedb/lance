@@ -2,9 +2,7 @@
 name = "pylance"
 dependencies = ["pyarrow>=12", "numpy>=1.22"]
 description = "python wrapper for Lance columnar format"
-authors = [
-    { name = "Lance Devs", email = "dev@lancedb.com" },
-]
+authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
 license = { file = "LICENSE" }
 repository = "https://github.com/eto-ai/lance"
 readme = "README.md"
@@ -35,6 +33,7 @@ classifiers = [
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering",
 ]
@@ -48,23 +47,21 @@ build-backend = "maturin"
 
 [project.optional-dependencies]
 tests = [
-    "pandas",
-    "pytest",
-    "duckdb",
+    "datasets",
+    "duckdb; python_version<'3.12'", # TODO: remove when duckdb supports 3.12
     "ml_dtypes",
+    "pillow",
+    "pandas",
     "polars[pyarrow,pandas]",
-    "tensorflow",
+    "pytest",
+    "tensorflow; python_version<'3.12'", # TODO: remove when tensorflow supports 3.12
     "tqdm",
 ]
-benchmarks = [
-    "pytest-benchmark",
-]
-torch = [
-    "torch",
-]
+benchmarks = ["pytest-benchmark"]
+torch = ["torch"]
 
 [tool.ruff]
-select = ["F", "E", "W", "I", "G", "TCH", "PERF", "CPY001"]
+lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "CPY001", "B019"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -79,4 +76,13 @@ markers = [
     "gpu: tests which rely on pytorch and some kind of gpu",
     "slow",
     "torch: tests which rely on pytorch being installed",
+]
+filterwarnings = [
+    'error::FutureWarning',
+    'error::DeprecationWarning',
+    # Pandas 2.2 on Python 2.12
+    'ignore:.*datetime\.datetime\.utcfromtimestamp\(\) is deprecated.*:DeprecationWarning',
+    # Pytorch 2.2 on Python 2.12
+    'ignore:.*is deprecated and will be removed in Python 3\.14.*:DeprecationWarning',
+    'ignore:.*The distutils package is deprecated.*:DeprecationWarning',
 ]

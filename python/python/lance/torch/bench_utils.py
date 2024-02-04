@@ -16,9 +16,10 @@
 
 from typing import Optional, Tuple, Union
 
-import numpy as np
 import pyarrow as pa
-import torch
+
+from lance.dependencies import _check_for_numpy, torch
+from lance.dependencies import numpy as np
 
 from .. import LanceDataset
 from . import preferred_device
@@ -89,7 +90,7 @@ def ground_truth(
     """
     device = preferred_device(device=device)
 
-    if isinstance(query, np.ndarray):
+    if _check_for_numpy(query) and isinstance(query, np.ndarray):
         query = torch.from_numpy(query)
     query = query.to(device)
     metric_type = metric_type.lower()
@@ -142,9 +143,9 @@ def recall(expected: np.ndarray, actual: np.ndarray) -> np.ndarray:
         The ANN results
     """
     assert expected.shape == actual.shape
-    recalls = np.array(
-        [np.isin(exp, act).sum() / exp.shape[0] for exp, act in zip(expected, actual)]
-    )
+    recalls = np.array([
+        np.isin(exp, act).sum() / exp.shape[0] for exp, act in zip(expected, actual)
+    ])
     return recalls
 
 

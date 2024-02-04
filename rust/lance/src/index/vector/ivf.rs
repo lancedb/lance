@@ -17,18 +17,17 @@
 use std::{
     any::Any,
     collections::HashMap,
-    ops::RangeFull,
     sync::{Arc, Weak},
 };
 
 use arrow_arith::numeric::sub;
 use arrow_array::{
-    cast::{as_primitive_array, as_struct_array, AsArray},
+    cast::{as_struct_array, AsArray},
     types::{Float16Type, Float32Type, Float64Type},
-    Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array, UInt64Array,
+    Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::DataType;
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
 use futures::{
@@ -36,25 +35,28 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
-use lance_core::io::{
-    local::to_local_path, FileReader, ObjectWriter, Reader, RecordBatchStream, WriteExt, Writer,
-};
-use lance_core::{
-    datatypes::{Field, Schema},
-    encodings::plain::PlainEncoder,
-    format::Index as IndexMetadata,
-    Error, Result,
-};
+use lance_core::{datatypes::Field, Error, Result};
+use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use lance_index::{
+    optimize::OptimizeOptions,
     vector::{
-        ivf::IvfBuildParams,
+        ivf::{builder::load_precomputed_partitions, shuffler::shuffle_dataset, IvfBuildParams},
         pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
         Query, DIST_COL,
     },
     Index, IndexType,
 };
+use lance_io::{
+    encodings::plain::PlainEncoder,
+    local::to_local_path,
+    object_store::ObjectStore,
+    object_writer::ObjectWriter,
+    stream::RecordBatchStream,
+    traits::{Reader, WriteExt, Writer},
+};
 use lance_linalg::distance::{Cosine, Dot, MetricType, L2};
 use log::{debug, info};
+use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -65,15 +67,13 @@ use uuid::Uuid;
 #[cfg(feature = "opq")]
 use super::opq::train_opq;
 use super::{pq::PQIndex, utils::maybe_sample_training_data, VectorIndex};
+use crate::dataset::builder::DatasetBuilder;
 use crate::{
-    dataset::{Dataset, DATA_DIR},
+    dataset::Dataset,
     index::{
         pb,
         prefilter::PreFilter,
-        vector::{
-            ivf::{builder::shuffle_dataset_v2, io::write_index_partitions},
-            Transformer,
-        },
+        vector::{ivf::io::write_index_partitions, Transformer},
         INDEX_FILE_NAME,
     },
     session::Session,
@@ -182,70 +182,6 @@ impl IVFIndex {
         let batch = part_index.search(&query, pre_filter).await?;
         Ok(batch)
     }
-
-    pub(crate) async fn append(
-        &self,
-        dataset: &Dataset,
-        data: impl RecordBatchStream + Unpin + 'static,
-        metadata: &IndexMetadata,
-        column: &str,
-    ) -> Result<Uuid> {
-        let new_uuid = Uuid::new_v4();
-        let object_store = dataset.object_store();
-        let index_file = dataset
-            .indices_dir()
-            .child(new_uuid.to_string())
-            .child(INDEX_FILE_NAME);
-        let mut writer = object_store.create(&index_file).await?;
-
-        let pq_index = self
-            .sub_index
-            .as_any()
-            .downcast_ref::<PQIndex>()
-            .ok_or(Error::Index {
-                message: "Only support append to IVF_PQ".to_string(),
-                location: location!(),
-            })?;
-
-        // TODO: merge two IVF implementations.
-        let ivf = lance_index::vector::ivf::new_ivf_with_pq(
-            self.ivf.centroids.values(),
-            self.ivf.dimension(),
-            self.metric_type,
-            column,
-            pq_index.pq.clone(),
-            None,
-            None,
-        )?;
-
-        let shuffled = shuffle_dataset_v2(
-            data,
-            column,
-            ivf,
-            self.ivf.num_partitions() as u32,
-            pq_index.pq.num_sub_vectors(),
-        )
-        .await?;
-        let mut ivf_mut = Ivf::new(self.ivf.centroids.clone());
-        write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(self)).await?;
-        let metadata = IvfPQIndexMetadata {
-            name: metadata.name.clone(),
-            column: column.to_string(),
-            dimension: self.ivf.dimension() as u32,
-            dataset_version: dataset.version().version,
-            metric_type: self.metric_type,
-            ivf: ivf_mut,
-            pq: pq_index.pq.clone(),
-            transforms: vec![],
-        };
-
-        let metadata = pb::Index::try_from(&metadata)?;
-        let pos = writer.write_protobuf(&metadata).await?;
-        writer.write_magics(pos).await?;
-        writer.shutdown().await?;
-
-        Ok(new_uuid)
-    }
 }
 
 impl std::fmt::Debug for IVFIndex {
@@ -254,12 +190,121 @@ impl std::fmt::Debug for IVFIndex {
     }
 }
 
+// TODO: move to `lance-index` crate.
+///
+/// Returns (new_uuid, num_indices_merged)
+pub(crate) async fn optimize_vector_indices(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+    dataset_version: u64,
+    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
+    vector_column: &str,
+    existing_indices: &[Arc<dyn Index>],
+    options: &OptimizeOptions,
+) -> Result<(Uuid, usize)> {
+    // Senity check the indices
+    if existing_indices.is_empty() {
+        return Err(Error::Index {
+            message: "optimizing vector index: no existing index found".to_string(),
+            location: location!(),
+        });
+    }
+
+    let new_uuid = Uuid::new_v4();
+    let index_file = index_dir.child(new_uuid.to_string()).child(INDEX_FILE_NAME);
+    let mut writer = object_store.create(&index_file).await?;
+
+    let first_idx = existing_indices[0]
+        .as_any()
+        .downcast_ref::<IVFIndex>()
+        .ok_or(Error::Index {
+            message: "optimizing vector index: first index is not IVF".to_string(),
+            location: location!(),
+        })?;
+
+    let pq_index = first_idx
+        .sub_index
+        .as_any()
+        .downcast_ref::<PQIndex>()
+        .ok_or(Error::Index {
+            message: "optimizing vector index: it is not a IVF_PQ index".to_string(),
+            location: location!(),
+        })?;
+    let metric_type = first_idx.metric_type;
+    let dim = first_idx.ivf.dimension();
+
+    // TODO: merge `lance::vector::ivf::IVF` and `lance-index::vector::ivf::Ivf`` implementations.
+    let ivf = lance_index::vector::ivf::new_ivf_with_pq(
+        first_idx.ivf.centroids.values(),
+        first_idx.ivf.dimension(),
+        metric_type,
+        vector_column,
+        pq_index.pq.clone(),
+        None,
+    )?;
+
+    // Shuffled un-indexed data with partition.
+    let shuffled = if let Some(stream) = unindexed {
+        Some(
+            shuffle_dataset(
+                stream,
+                vector_column,
+                ivf,
+                None,
+                first_idx.ivf.num_partitions() as u32,
+                pq_index.pq.num_sub_vectors(),
+                10000,
+                2,
+                None,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let mut ivf_mut = Ivf::new(first_idx.ivf.centroids.clone());
+
+    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
+        0
+    } else {
+        existing_indices.len() - options.num_indices_to_merge
+    };
+
+    let indices_to_merge = existing_indices[start_pos..]
+        .iter()
+        .map(|idx| {
+            idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::Index {
+                message: "optimizing vector index: it is not a IVF index".to_string(),
+                location: location!(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(&indices_to_merge)).await?;
+    let metadata = IvfPQIndexMetadata {
+        name: format!("_{}_idx", vector_column),
+        column: vector_column.to_string(),
+        dimension: dim as u32,
+        dataset_version,
+        metric_type,
+        ivf: ivf_mut,
+        pq: pq_index.pq.clone(),
+        transforms: vec![],
+    };
+
+    let metadata = pb::Index::try_from(&metadata)?;
+    let pos = writer.write_protobuf(&metadata).await?;
+    writer
+        .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+        .await?;
+    writer.shutdown().await?;
+
+    Ok((new_uuid, existing_indices.len() - start_pos))
+}
+
 #[derive(Serialize)]
 pub struct IvfIndexPartitionStatistics {
-    index: usize,
-    length: u32,
-    offset: usize,
-    centroid: Vec<f32>,
+    size: u32,
 }
 
 #[derive(Serialize)]
@@ -271,6 +316,44 @@ pub struct IvfIndexStatistics {
     num_partitions: usize,
     sub_index: serde_json::Value,
     partitions: Vec<IvfIndexPartitionStatistics>,
+    centroids: Vec<Vec<f32>>,
+}
+
+fn centroids_to_vectors(centroids: &FixedSizeListArray) -> Result<Vec<Vec<f32>>> {
+    centroids
+        .iter()
+        .map(|v| {
+            if let Some(row) = v {
+                match row.data_type() {
+                    DataType::Float16 => Ok(row
+                        .as_primitive::<Float16Type>()
+                        .values()
+                        .iter()
+                        .map(|v| v.to_f32())
+                        .collect::<Vec<_>>()),
+                    DataType::Float32 => Ok(row.as_primitive::<Float32Type>().values().to_vec()),
+                    DataType::Float64 => Ok(row
+                        .as_primitive::<Float64Type>()
+                        .values()
+                        .iter()
+                        .map(|v| *v as f32)
+                        .collect::<Vec<_>>()),
+                    _ => Err(Error::Index {
+                        message: format!(
+                            "IVF centroids must be FixedSizeList of floating number, got: {}",
+                            row.data_type()
+                        ),
+                        location: location!(),
+                    }),
+                }
+            } else {
+                Err(Error::Index {
+                    message: "Invalid centroid".to_string(),
+                    location: location!(),
+                })
+            }
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -287,33 +370,25 @@ impl Index for IVFIndex {
         IndexType::Vector
     }
 
-    fn statistics(&self) -> Result<String> {
+    fn statistics(&self) -> Result<serde_json::Value> {
         let partitions_statistics = self
             .ivf
             .lengths
             .iter()
-            .enumerate()
-            .map(|(i, &len)| {
-                let centroid = self.ivf.centroids.value(i);
-                let centroid_arr: &Float32Array = as_primitive_array(centroid.as_ref());
-                IvfIndexPartitionStatistics {
-                    index: i,
-                    length: len,
-                    offset: self.ivf.offsets[i],
-                    centroid: centroid_arr.values().to_vec(),
-                }
-            })
+            .map(|&len| IvfIndexPartitionStatistics { size: len })
             .collect::<Vec<_>>();
 
-        Ok(serde_json::to_string(&IvfIndexStatistics {
+        let centroid_vecs = centroids_to_vectors(&self.ivf.centroids)?;
+
+        Ok(serde_json::to_value(IvfIndexStatistics {
             index_type: "IVF".to_string(),
             uuid: self.uuid.clone(),
             uri: to_local_path(self.reader.path()),
             metric_type: self.metric_type.to_string(),
             num_partitions: self.ivf.num_partitions(),
-            // TODO: Not ideal that we have to re-parse the JSON here
-            sub_index: serde_json::from_str(&self.sub_index.statistics()?)?,
+            sub_index: self.sub_index.statistics()?,
             partitions: partitions_statistics,
+            centroids: centroid_vecs,
         })?)
     }
 
@@ -527,7 +602,6 @@ impl Ivf {
             metric_type,
             vec![],
             None,
-            None,
         )?;
         internal.find_partitions(query, nprobes)
     }
@@ -618,10 +692,32 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
     Ok(field)
 }
 
-fn sanity_check_ivf_param(params: &IvfBuildParams) -> Result<()> {
-    if params.precomputed_partitons_file.is_some() && params.centroids.is_none() {
+fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
+    if ivf.precomputed_partitons_file.is_some() && ivf.centroids.is_none() {
         return Err(Error::Index {
-            message: "precomputed_partitons_file requires centroids to be set".to_string(),
+            message: "precomputed_partitions_file requires centroids to be set".to_string(),
+            location: location!(),
+        });
+    }
+
+    if ivf.precomputed_shuffle_buffers.is_some()
+        && (
+            // If either centroids or codebook is not set, precomputed_shuffle can't be used.
+            ivf.centroids.is_none() || pq.codebook.is_none()
+        )
+    {
+        return Err(Error::Index {
+            message: "precomputed_shuffle_buffers requires centroids AND codebook to be set"
+                .to_string(),
+            location: location!(),
+        });
+    }
+
+    if ivf.precomputed_shuffle_buffers.is_some() && ivf.precomputed_partitons_file.is_some() {
+        return Err(Error::Index {
+            message:
+                "precomputed_shuffle_buffers and precomputed_partitons_file are mutually exclusive"
+                    .to_string(),
             location: location!(),
         });
     }
@@ -639,7 +735,7 @@ pub async fn build_ivf_pq_index(
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
 ) -> Result<()> {
-    sanity_check_ivf_param(ivf_params)?;
+    sanity_check_params(ivf_params, pq_params)?;
 
     info!(
         "Building vector index: IVF{},{}PQ{}, metric={}",
@@ -729,7 +825,7 @@ pub async fn build_ivf_pq_index(
         train_ivf_model(training_data.as_ref().unwrap(), metric_type, ivf_params).await?
     };
     info!(
-        "Traied IVF model in {:02} seconds",
+        "Trained IVF model in {:02} seconds",
         start.elapsed().as_secs_f32()
     );
 
@@ -777,7 +873,6 @@ pub async fn build_ivf_pq_index(
             metric_type,
             vec![],
             None,
-            None,
         )?;
 
         info!(
@@ -815,54 +910,10 @@ pub async fn build_ivf_pq_index(
     let precomputed_partitions = match &ivf_params.precomputed_partitons_file {
         Some(file) => {
             info!("Loading precomputed partitions from file: {}", file);
-            let arrow_schema = ArrowSchema::new(vec![
-                ArrowField::new("row_id", DataType::UInt64, false),
-                ArrowField::new("partition", DataType::UInt32, false),
-            ]);
+            let ds = DatasetBuilder::from_uri(file).load().await?;
+            let stream = ds.scan().try_into_stream().await?;
 
-            let schema = Schema::try_from(&arrow_schema)?;
-
-            let reader = FileReader::try_new_with_fragment(
-                dataset.object_store.as_ref(),
-                &dataset.base.child(DATA_DIR).child(file.as_str()),
-                0,
-                None,
-                None,
-            )
-            .await?;
-
-            let mut partition_lookup = HashMap::with_capacity(reader.len());
-
-            for i in 0..reader.num_batches() {
-                let batch = reader.read_batch(i as i32, RangeFull, &schema).await?;
-                let row_ids = batch.column_by_name("row_id");
-                let partitions = batch.column_by_name("partition");
-                match (row_ids, partitions) {
-                    (Some(row_ids), Some(partitions)) => {
-                        let row_ids: &UInt64Array = as_primitive_array(row_ids.as_ref());
-                        let partitons_ids: &UInt32Array = as_primitive_array(partitions.as_ref());
-
-                        for (row_id, partition) in
-                            row_ids.values().iter().zip(partitons_ids.values().iter())
-                        {
-                            partition_lookup.insert(*row_id, *partition);
-                        }
-                    }
-                    _ => {
-                        return Err(Error::Index {
-                            message: "malformed partition file".into(),
-                            location: location!(),
-                        })
-                    }
-                }
-            }
-
-            info!(
-                "Loaded {} rows of precomputed partitions",
-                partition_lookup.len()
-            );
-
-            Some(partition_lookup)
+            Some(load_precomputed_partitions(stream, ds.count_rows().await?).await?)
         }
         None => None,
     };
@@ -878,6 +929,9 @@ pub async fn build_ivf_pq_index(
         metric_type,
         stream,
         precomputed_partitions,
+        ivf_params.shuffle_partition_batches,
+        ivf_params.shuffle_partition_concurrency,
+        ivf_params.precomputed_shuffle_buffers.clone(),
     )
     .await
 }
@@ -929,7 +983,7 @@ impl RemapPageTask {
     }
 }
 
-fn generate_remap_tasks(offsets: &Vec<usize>, lengths: &[u32]) -> Result<Vec<RemapPageTask>> {
+fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapPageTask>> {
     let mut tasks: Vec<RemapPageTask> = Vec::with_capacity(offsets.len() * 2 + 1);
 
     for (offset, length) in offsets.iter().zip(lengths.iter()) {
@@ -995,7 +1049,9 @@ pub(crate) async fn remap_index_file(
 
     let metadata = pb::Index::try_from(&metadata)?;
     let pos = writer.write_protobuf(&metadata).await?;
-    writer.write_magics(pos).await?;
+    writer
+        .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+        .await?;
     writer.shutdown().await?;
 
     Ok(())
@@ -1015,6 +1071,9 @@ async fn write_index_file(
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin + 'static,
     precomputed_partitons: Option<HashMap<u64, u32>>,
+    shuffle_partition_batches: usize,
+    shuffle_partition_concurrency: usize,
+    precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
     let object_store = dataset.object_store();
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
@@ -1031,6 +1090,9 @@ async fn write_index_file(
         metric_type,
         0..num_partitions,
         precomputed_partitons,
+        shuffle_partition_batches,
+        shuffle_partition_concurrency,
+        precomputed_shuffle_buffers,
     )
     .await?;
     info!("Built IVF partitions: {}s", start.elapsed().as_secs_f32());
@@ -1055,7 +1117,9 @@ async fn write_index_file(
 
     let metadata = pb::Index::try_from(&metadata)?;
     let pos = writer.write_protobuf(&metadata).await?;
-    writer.write_magics(pos).await?;
+    writer
+        .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+        .await?;
     writer.shutdown().await?;
 
     Ok(())
@@ -1121,6 +1185,7 @@ mod tests {
 
     use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
+    use lance_core::utils::address::RowAddress;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_seed, generate_scaled_random_array,
@@ -1130,9 +1195,8 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
-    use crate::{
-        format::RowAddress,
-        index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt, IndexType},
+    use crate::index::{
+        vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt, IndexType,
     };
 
     const DIM: usize = 32;
@@ -1500,7 +1564,7 @@ mod tests {
             .unwrap();
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
 
-        let index_meta = crate::format::Index {
+        let index_meta = lance_table::format::Index {
             uuid,
             dataset_version: 0,
             fields: Vec::new(),
@@ -1508,7 +1572,7 @@ mod tests {
             fragment_bitmap: None,
         };
 
-        let prefilter = Arc::new(PreFilter::new(dataset.clone(), index_meta, None));
+        let prefilter = Arc::new(PreFilter::new(dataset.clone(), &[index_meta], None));
 
         let is_not_remapped = Some;
         let is_remapped = |row_id| Some(row_id + BIG_OFFSET);

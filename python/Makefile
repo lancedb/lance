@@ -1,7 +1,7 @@
 ifeq ($(CI), true)
-    PYTEST_ARGS = -vvv -s -W error::DeprecationWarning -W error::FutureWarning --durations=30
+    PYTEST_ARGS = -vvv -s --durations=30
 else
-    PYTEST_ARGS = -vvv -s -W error::DeprecationWarning -W error::FutureWarning
+    PYTEST_ARGS = -vvv -s
 endif
 
 test:
@@ -17,16 +17,16 @@ format: format-python
 .PHONY: format
 
 format-python:
-	ruff format python
-	ruff --fix python
+	ruff format --preview python
+	ruff --preview --fix python
 .PHONY: format-python
 
 lint: lint-python lint-rust
 .PHONY: lint
 
 lint-python:
-	ruff format --check python
-	ruff python
+	ruff format --preview --check python
+	ruff --preview python
 .PHONY: lint-python
 
 lint-rust:

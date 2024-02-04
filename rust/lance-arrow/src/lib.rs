@@ -415,7 +415,7 @@ impl RecordBatchExt for RecordBatch {
         }
         let left_struct_array: StructArray = self.clone().into();
         let right_struct_array: StructArray = other.clone().into();
-        self.try_new_from_struct_array(merge(&left_struct_array, &right_struct_array)?)
+        self.try_new_from_struct_array(merge(&left_struct_array, &right_struct_array))
     }
 
     fn drop_column(&self, name: &str) -> Result<Self> {
@@ -495,7 +495,7 @@ fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
 }
 
 /// Merge the fields and columns of two RecordBatch's recursively
-fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> Result<StructArray> {
+fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> StructArray {
     let mut fields: Vec<Field> = vec![];
     let mut columns: Vec<ArrayRef> = vec![];
     let right_fields = right_struct_array.fields();
@@ -520,7 +520,7 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> R
                     (DataType::Struct(_), DataType::Struct(_)) => {
                         let left_sub_array = left_column.as_struct();
                         let right_sub_array = right_column.as_struct();
-                        let merged_sub_array = merge(left_sub_array, right_sub_array)?;
+                        let merged_sub_array = merge(left_sub_array, right_sub_array);
                         fields.push(Field::new(
                             left_field.name(),
                             merged_sub_array.data_type().clone(),
@@ -565,8 +565,7 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> R
         .map(Arc::new)
         .zip(columns.iter().cloned())
         .collect::<Vec<_>>();
-    StructArray::try_from(zipped)
-        .map_err(|e| ArrowError::ComputeError(format!("Failed to merge RecordBatch: {}", e)))
+    StructArray::from(zipped)
 }
 
 fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a ArrayRef> {
