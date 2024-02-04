@@ -76,6 +76,7 @@ jobs:
     strategy:
       matrix:
         python-minor-version: [ "8", "11", "12" ] # 3.11 because tensorflow does not support 3.12 yet.
+    run-name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
     runs-on: "ubuntu-22.04"
     defaults:
       run:
