@@ -35,6 +35,7 @@ _PANDAS_AVAILABLE = True
 _POLARS_AVAILABLE = True
 _TORCH_AVAILABLE = True
 _HUGGING_FACE_AVAILABLE = True
+_TENSORFLOW_AVAILABLE = True
 
 
 class _LazyModule(ModuleType):
@@ -56,6 +57,7 @@ class _LazyModule(ModuleType):
         "pandas": "pd.",
         "polars": "pl.",
         "torch": "torch.",
+        "tensorflow": "tf.",
     }
 
     def __init__(
@@ -169,6 +171,7 @@ if TYPE_CHECKING:
     import numpy
     import pandas
     import polars
+    import tensorflow
     import torch
 else:
     # heavy/optional third party libs
@@ -177,6 +180,7 @@ else:
     polars, _POLARS_AVAILABLE = _lazy_import("polars")
     torch, _TORCH_AVAILABLE = _lazy_import("torch")
     datasets, _HUGGING_FACE_AVAILABLE = _lazy_import("datasets")
+    tensorflow, _TENSORFLOW_AVAILABLE = _lazy_import("tensorflow")
 
 
 @lru_cache(maxsize=None)
@@ -219,18 +223,27 @@ def _check_for_hugging_face(obj: Any, *, check_type: bool = True) -> bool:
     )
 
 
+def _check_for_tensorflow(obj: Any, *, check_type: bool = True) -> bool:
+    return _TENSORFLOW_AVAILABLE and _might_be(
+        cast(Hashable, type(obj) if check_type else obj), "tensorflow"
+    )
+
+
 __all__ = [
     # lazy-load third party libs
+    "datasets",
     "numpy",
     "pandas",
     "polars",
+    "tensorflow",
     "torch",
     # lazy utilities
+    "_check_for_hugging_face",
     "_check_for_numpy",
     "_check_for_pandas",
     "_check_for_polars",
+    "_check_for_tensorflow",
     "_check_for_torch",
-    "_check_for_hugging_face",
     "_LazyModule",
     # exported flags/guards
     "_NUMPY_AVAILABLE",
@@ -238,4 +251,5 @@ __all__ = [
     "_POLARS_AVAILABLE",
     "_TORCH_AVAILABLE",
     "_HUGGING_FACE_AVAILABLE",
+    "_TENSORFLOW_AVAILABLE",
 ]

@@ -28,13 +28,13 @@ from functools import partial
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Union
 
 import pyarrow as pa
-import tensorflow as tf
 
 import lance
 from lance import LanceDataset
 from lance.arrow import EncodedImageType, FixedShapeImageTensorType, ImageURIType
 from lance.dependencies import _check_for_numpy
 from lance.dependencies import numpy as np
+from lance.dependencies import tensorflow as tf
 from lance.fragment import FragmentMetadata, LanceFragment
 
 if TYPE_CHECKING:

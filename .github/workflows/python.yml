@@ -75,7 +75,8 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: [ "8", "11" ]
+        python-minor-version: [ "8", "11", "12" ] # 3.11 because tensorflow does not support 3.12 yet.
+    name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
     runs-on: "ubuntu-22.04"
     defaults:
       run:
@@ -101,9 +102,10 @@ jobs:
       run: sudo rm -rf target/wheels
   linux-arm:
     timeout-minutes: 45
+    name: Python Linux 3.${{ matrix.python-minor-version }} ARM
     strategy:
       matrix:
-        python-minor-version: [ "11" ]
+        python-minor-version: [ "12" ]
     runs-on: buildjet-4vcpu-ubuntu-2204-arm
     defaults:
       run:
@@ -136,6 +138,7 @@ jobs:
       run: sudo rm -rf target/wheels
   mac:
     timeout-minutes: 45
+    name: Python macOS 3.12 ARM
     runs-on: "macos-14"
     defaults:
       run:
@@ -149,7 +152,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.11"
+        python-version: "3.12"
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: python
@@ -214,7 +217,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.11"
+        python-version: "3.12"
     - name: create s3
       run: aws s3 mb s3://lance-integtest --endpoint http://localhost:9000
     - name: create ddb

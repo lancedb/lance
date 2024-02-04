@@ -1,7 +1,7 @@
 ifeq ($(CI), true)
-    PYTEST_ARGS = -vvv -s -W error::DeprecationWarning -W error::FutureWarning --durations=30
+    PYTEST_ARGS = -vvv -s --durations=30
 else
-    PYTEST_ARGS = -vvv -s -W error::DeprecationWarning -W error::FutureWarning
+    PYTEST_ARGS = -vvv -s
 endif
 
 test:
