@@ -83,7 +83,7 @@ Generate Lance datasets using the `datagen.py` script.
 
 ```sh
 # -i is ivf partitions and -p is pq subvectors
-./index.py ~/.lancedb/gist1m.lance -i 256 -p 120
+./index.py ./.lancedb/gist1m.lance -i 256 -p 120
 ```
 
 ### Run benchmark
