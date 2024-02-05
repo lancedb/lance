@@ -1693,8 +1693,7 @@ impl Dataset {
 
     /// Modify columns in the dataset, changing their name, type, or nullability.
     ///
-    /// If a column has an index, it's index will be preserved or transformed to
-    /// the new type as part of the operation.
+    /// If a column has an index, it's index will be preserved.
     pub async fn alter_columns(&mut self, alterations: &[ColumnAlteration]) -> Result<()> {
         // Validate we aren't making nullable columns non-nullable and that all
         // the referenced columns actually exist.

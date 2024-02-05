@@ -634,7 +634,7 @@ impl Dataset {
         let alterations = alterations
             .iter()
             .map(|obj| {
-                let obj = PyAny::downcast::<PyDict>(obj)?;
+                let obj = obj.downcast::<PyDict>()?;
                 let path: String = obj
                     .get_item("path")?
                     .ok_or_else(|| PyValueError::new_err("path is required"))?
