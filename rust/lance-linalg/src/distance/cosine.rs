@@ -26,6 +26,7 @@ use arrow_array::{
     Array, FixedSizeListArray, Float32Array,
 };
 use arrow_schema::DataType;
+use half::bf16;
 use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 use num_traits::{AsPrimitive, FromPrimitive};
@@ -87,7 +88,20 @@ where
     }
 }
 
-impl Cosine for BFloat16Type {}
+impl Cosine for BFloat16Type {
+    fn cosine_fast(x: &[bf16], x_norm: f32, y: &[bf16]) -> f32 {
+        #[cfg(all(target_os = "linux", target_feature = "avx512bf16"))]
+        unsafe {
+            let y_norm = kernel::norm_l2_bf16(y.as_ptr(), y.len() as u32);
+            let xy = kernel::dot_bf16(x.as_ptr(), y.as_ptr(), x.len() as u32);
+            1 - xy / sqrt(x_norm / y_norm)
+        }
+        #[cfg(not(all(target_os = "linux", target_feature = "avx512bf16")))]
+        {
+            cosine_scalar(x, x_norm, y)
+        }
+    }
+}
 
 impl Cosine for Float16Type {}
 

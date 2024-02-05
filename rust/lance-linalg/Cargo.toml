@@ -35,6 +35,7 @@ cc = "1.0.83"
 
 [features]
 avx512fp16 = []
+avx512bf16 = []
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof = { workspace = true }

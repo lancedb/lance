@@ -100,9 +100,24 @@ fn norm_l2_f16_impl(arr: &[f16]) -> f32 {
     (sums.iter().copied().sum::<f32>() + sum).sqrt()
 }
 
+// `avx512bf16` is not supported in rustc yet. Once it is supported, we can
+// move it to target_feture.
+#[cfg(any(all(target_os = "linux", target_feature = "avx512bf16"),))]
+mod kernel {
+    use super::*;
+
+    extern "C" {
+        pub fn norm_l2_bf16(ptr: *const bf16, len: u32) -> f32;
+    }
+}
+
 impl Normalize<bf16> for &[bf16] {
-    #[inline]
     fn norm_l2(&self) -> f32 {
+        #[cfg(all(target_os = "linux", target_feature = "avx512bf16"))]
+        unsafe {
+            kernel::norm_l2_bf16(self.as_ptr(), self.len() as u32)
+        }
+        #[cfg(not(all(target_os = "linux", target_feature = "avx512bf16")))]
         norm_l2_impl::<bf16, 32>(self)
     }
 }

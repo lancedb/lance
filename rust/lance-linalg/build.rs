@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/simd/f16.c");
+    println!("cargo:rerun-if-changed=src/simd/bf16.c");
 
     if cfg!(all(target_os = "macos", target_feature = "neon")) {
         cc::Build::new()
@@ -34,5 +35,23 @@ fn main() {
             .flag("-Wextra")
             .flag("-Wpedantic")
             .compile("f16");
+    }
+
+    if cfg!(all(feature = "avx512bf16")) {
+        cc::Build::new()
+            .compiler("clang")
+            .std("c17")
+            .file("src/simd/bf16.c")
+            .flag("-march=sapphirerapids")
+            .flag("-ffast-math")
+            .flag("-mavx512f")
+            .flag("-mavx512vl")
+            .flag("-mavx512bf16")
+            .flag("-O3")
+            .flag("-Wall")
+            .flag("-Werror")
+            .flag("-Wextra")
+            .flag("-Wpedantic")
+            .compile("bf16");
     }
 }
