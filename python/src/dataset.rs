@@ -25,6 +25,7 @@ use chrono::Duration;
 
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::ColumnAlteration;
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
@@ -627,6 +628,40 @@ impl Dataset {
         let stream = self.ds.take_scan(slice_stream, projection, batch_readahead);
 
         Ok(PyArrowType(Box::new(LanceReader::from_stream(stream))))
+    }
+
+    fn alter_columns(&mut self, alterations: &PyList) -> PyResult<()> {
+        let alterations = alterations
+            .iter()
+            .map(|obj| {
+                let obj = obj.downcast::<PyDict>()?;
+                let path: String = obj
+                    .get_item("path")?
+                    .ok_or_else(|| PyValueError::new_err("path is required"))?
+                    .extract()?;
+                let name: Option<String> =
+                    obj.get_item("name")?.map(|n| n.extract()).transpose()?;
+                let nullable: Option<bool> =
+                    obj.get_item("nullable")?.map(|n| n.extract()).transpose()?;
+                let mut alteration = ColumnAlteration::new(path);
+                if let Some(name) = name {
+                    alteration = alteration.rename(name);
+                }
+                if let Some(nullable) = nullable {
+                    alteration = alteration.set_nullable(nullable);
+                }
+                Ok(alteration)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let mut new_self = self.ds.as_ref().clone();
+        new_self = RT
+            .spawn(None, async move {
+                new_self.alter_columns(&alterations).await.map(|_| new_self)
+            })?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
     }
 
     fn merge(

@@ -610,6 +610,43 @@ class LanceDataset(pa.dataset.Dataset):
         """
         raise NotImplementedError("Versioning not yet supported in Rust")
 
+    def alter_columns(self, *alterations: Iterable[Dict[str, Any]]):
+        """Alter column names and nullability.
+
+        Parameters
+        ----------
+        alterations : Iterable[Dict[str, Any]]
+            A sequence of dictionaries, each with the following keys:
+            - "path": str
+                The column path to alter. For a top-level column, this is the name.
+                For a nested column, this is the dot-separated path, e.g. "a.b.c".
+            - "name": str, optional
+                The new name of the column. If not specified, the column name is
+                not changed.
+            - "nullable": bool, optional
+                Whether the column should be nullable. If not specified, the column
+                nullability is not changed. Only non-nullable columns can be changed
+                to nullable. Currently, you cannot change a nullable column to
+                non-nullable.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> schema = pa.schema([pa.field('a', pa.int64()),
+        ...                     pa.field('b', pa.string(), nullable=False)])
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.alter_columns({"path": "a", "name": "x"},
+        ...                       {"path": "b", "nullable": True})
+        >>> dataset.to_table().to_pandas()
+           x  b
+        0  1  a
+        1  2  b
+        2  3  c
+        """
+        self._ds.alter_columns(list(alterations))
+
     def merge(
         self,
         data_obj: ReaderLike,
