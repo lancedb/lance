@@ -119,9 +119,9 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                 (Expr::Literal(_), Expr::Column(_) | Expr::GetIndexedField(_)) => {
                     if let Some(resolved_type) = resolve_column_type(right.as_ref(), schema) {
                         Ok(Expr::BinaryExpr(BinaryExpr {
-                            left: Box::new(resolve_value(right.as_ref(), &resolved_type)?),
+                            left: Box::new(resolve_value(left.as_ref(), &resolved_type)?),
                             op: *op,
-                            right: left.clone(),
+                            right: right.clone(),
                         }))
                     } else {
                         Ok(expr.clone())

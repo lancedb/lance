@@ -31,6 +31,11 @@ use crate::dataset::FileFragment;
 /// To use, call [`Updater::next`] to get the next [`RecordBatch`] as input,
 /// then call [`Updater::update`] to update the batch. Repeat until
 /// [`Updater::next`] returns `None`.
+///
+/// `write_schema` dictates the schema of the new file, while `final_schema` is
+/// the schema of the full fragment after the update. These are optional and if
+/// not specified, the updater will infer the write schema from the first batch
+/// of results and will append them to the current schema to get the final schema.
 pub struct Updater {
     fragment: FileFragment,
 
@@ -41,7 +46,11 @@ pub struct Updater {
 
     writer: Option<FileWriter<ManifestDescribing>>,
 
-    output_schema: Option<Schema>,
+    /// The final schema of the fragment after the update.
+    final_schema: Option<Schema>,
+
+    /// The schema the new files will be written in. This only contains new columns.
+    write_schema: Option<Schema>,
 
     batch_id: usize,
 
@@ -52,17 +61,31 @@ pub struct Updater {
 
 impl Updater {
     /// Create a new updater with source reader, and destination writer.
+    ///
+    /// The `schemas` parameter is a tuple of the write schema (just the new fields)
+    /// and the final schema (all the fields).
+    ///
+    /// If the schemas are not known, they can be None and will be inferred from
+    /// the first batch of results.
     pub(super) fn new(
         fragment: FileFragment,
         reader: FragmentReader,
         deletion_vector: DeletionVector,
+        schemas: Option<(Schema, Schema)>,
     ) -> Self {
+        let (write_schema, final_schema) = if let Some((write_schema, final_schema)) = schemas {
+            (Some(write_schema), Some(final_schema))
+        } else {
+            (None, None)
+        };
+
         Self {
             fragment,
             reader,
             last_input: None,
             writer: None,
-            output_schema: None,
+            write_schema,
+            final_schema,
             batch_id: 0,
             start_row_id: 0,
             deletion_vector,
@@ -98,23 +121,6 @@ impl Updater {
     ///
     /// Internal use only.
     async fn new_writer(&mut self, schema: Schema) -> Result<FileWriter<ManifestDescribing>> {
-        // Sanity check.
-        //
-        // To keep it simple, new schema must have no intersection with the existing schema.
-        let existing_schema = self.fragment.dataset().schema();
-        for field in schema.fields.iter() {
-            // Just check the first level names.
-            if existing_schema.field(&field.name).is_some() {
-                return Err(Error::IO {
-                    message: format!(
-                        "Append column: duplicated column {} already exists",
-                        field.name
-                    ),
-                    location: location!(),
-                });
-            }
-        }
-
         let file_name = format!("{}.lance", Uuid::new_v4());
         self.fragment.metadata.add_file(&file_name, &schema);
 
@@ -150,14 +156,23 @@ impl Updater {
         };
 
         if self.writer.is_none() {
-            let output_schema = batch.schema();
-            // Need to assign field id correctly here.
-            let merged = self.fragment.schema().merge(output_schema.as_ref())?;
-            // Get the schema with correct field id.
-            let schema = merged.project_by_schema(output_schema.as_ref())?;
-            self.output_schema = Some(merged);
+            if self.write_schema.is_none() {
+                // Need to infer the schema.
+                let output_schema = batch.schema();
+                self.final_schema = Some(self.fragment.schema().merge(output_schema.as_ref())?);
+                self.final_schema.as_ref().unwrap().validate()?;
+                self.write_schema = Some(
+                    self.final_schema
+                        .as_ref()
+                        .unwrap()
+                        .project_by_schema(output_schema.as_ref())?,
+                );
+            }
 
-            self.writer = Some(self.new_writer(schema).await?);
+            self.writer = Some(
+                self.new_writer(self.write_schema.as_ref().unwrap().clone())
+                    .await?,
+            );
         }
 
         let writer = self.writer.as_mut().unwrap();
@@ -197,8 +212,13 @@ impl Updater {
         Ok(self.fragment.metadata().clone())
     }
 
+    /// Get the final schema of the fragment after the update.
+    ///
+    /// This may be None if the schema is not known. This can happen if it was
+    /// not specified up front and the first batch of results has not yet been
+    /// processed.
     pub fn schema(&self) -> Option<&Schema> {
-        self.output_schema.as_ref()
+        self.final_schema.as_ref()
     }
 }
 
