@@ -22,6 +22,7 @@ from .dataset import (
     LanceScanner,
     MergeInsertBuilder,
     __version__,
+    batch_udf,
     write_dataset,
 )
 from .fragment import FragmentMetadata, LanceFragment
@@ -50,6 +51,7 @@ __all__ = [
     "dataset",
     "FragmentMetadata",
     "LanceFragment",
+    "batch_udf",
 ]
 
 

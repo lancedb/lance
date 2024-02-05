@@ -32,6 +32,7 @@ use lance::dataset::{
     UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
     WriteParams,
 };
+use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore};
 use lance::index::{
     scalar::ScalarIndexParams,
     vector::{diskann::DiskANNParams, VectorIndexParams},
@@ -1016,6 +1017,69 @@ impl Dataset {
         self.ds = Arc::new(new_self);
         Ok(())
     }
+
+    fn add_columns(
+        &mut self,
+        transforms: &PyAny,
+        read_columns: Option<Vec<String>>,
+    ) -> PyResult<()> {
+        let transforms = if let Ok(transforms) = transforms.extract::<&PyDict>() {
+            let expressions = transforms
+                .iter()
+                .map(|(k, v)| {
+                    let col = k.extract::<String>()?;
+                    let expr = v.extract::<String>()?;
+                    Ok((col, expr))
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            NewColumnTransform::SqlExpressions(expressions)
+        } else {
+            let append_schema: PyArrowType<ArrowSchema> =
+                transforms.getattr("output_schema")?.extract()?;
+            let output_schema = Arc::new(append_schema.0);
+
+            let result_checkpoint: Option<PyObject> = transforms.getattr("cache")?.extract()?;
+            let result_checkpoint =
+                result_checkpoint.map(|c| PyBatchUDFCheckpointWrapper { inner: c });
+
+            let udf_obj = transforms.to_object(transforms.py());
+            let mapper = move |batch: &RecordBatch| -> lance::Result<RecordBatch> {
+                Python::with_gil(|py| {
+                    let py_batch: PyArrowType<RecordBatch> = PyArrowType(batch.clone());
+                    let result = udf_obj
+                        .call_method1(py, "_call", (py_batch,))
+                        .map_err(|err| lance::Error::IO {
+                            message: format_python_error(err, py).unwrap(),
+                            location: location!(),
+                        })?;
+                    let result_batch: PyArrowType<RecordBatch> =
+                        result.extract(py).map_err(|err| lance::Error::IO {
+                            message: err.to_string(),
+                            location: location!(),
+                        })?;
+                    Ok(result_batch.0)
+                })
+            };
+
+            NewColumnTransform::BatchUDF(BatchUDF {
+                mapper: Box::new(mapper),
+                output_schema,
+                result_checkpoint: result_checkpoint
+                    .map(|c| Arc::new(c) as Arc<dyn UDFCheckpointStore>),
+            })
+        };
+
+        let mut new_self = self.ds.as_ref().clone();
+        let new_self = RT
+            .spawn(None, async move {
+                new_self.add_columns(transforms, read_columns).await?;
+                Ok(new_self)
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+
+        Ok(())
+    }
 }
 
 impl Dataset {
@@ -1141,5 +1205,100 @@ impl WriteFragmentProgress for PyWriteProgress {
             location: location!(),
         })?;
         Ok(())
+    }
+}
+
+/// Formats a Python error just as it would in Python interpreter.
+fn format_python_error(e: PyErr, py: Python) -> PyResult<String> {
+    let sys_mod = py.import("sys")?;
+    // the traceback is the third element of the tuple returned by sys.exc_info()
+    let traceback = sys_mod.call_method0("exc_info")?.get_item(2)?;
+
+    let tracback_mod = py.import("traceback")?;
+    let fmt_func = tracback_mod.getattr("format_exception")?;
+    let e_type = e.get_type(py).to_owned();
+    let formatted = fmt_func.call1((e_type, &e, traceback))?;
+    let lines: Vec<String> = formatted.extract()?;
+    Ok(lines.join(""))
+}
+
+struct PyBatchUDFCheckpointWrapper {
+    inner: PyObject,
+}
+
+impl PyBatchUDFCheckpointWrapper {
+    fn batch_info_to_py(&self, info: &BatchInfo, py: Python) -> PyResult<PyObject> {
+        self.inner
+            .getattr(py, "BatchInfo")?
+            .call1(py, (info.fragment_id, info.batch_index))
+    }
+}
+
+impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
+    fn get_batch(&self, info: &BatchInfo) -> lance::Result<Option<RecordBatch>> {
+        Python::with_gil(|py| {
+            let info = self.batch_info_to_py(info, py)?;
+            let batch = self.inner.call_method1(py, "get_batch", (info,))?;
+            let batch: Option<PyArrowType<RecordBatch>> = batch.extract(py)?;
+            Ok(batch.map(|b| b.0))
+        })
+        .map_err(|err: PyErr| lance_core::Error::IO {
+            message: format!("Failed to call get_batch() on UDFCheckpointer: {}", err),
+            location: location!(),
+        })
+    }
+
+    fn get_fragment(&self, fragment_id: u32) -> lance::Result<Option<Fragment>> {
+        let fragment_data = Python::with_gil(|py| {
+            let fragment = self
+                .inner
+                .call_method1(py, "get_fragment", (fragment_id,))?;
+            let fragment: Option<String> = fragment.extract(py)?;
+            Ok(fragment)
+        })
+        .map_err(|err: PyErr| lance_core::Error::IO {
+            message: format!("Failed to call get_fragment() on UDFCheckpointer: {}", err),
+            location: location!(),
+        })?;
+        fragment_data
+            .map(|data| {
+                serde_json::from_str(&data).map_err(|err| lance::Error::IO {
+                    message: format!("Failed to deserialize fragment data: {}", err),
+                    location: location!(),
+                })
+            })
+            .transpose()
+    }
+
+    fn insert_batch(&self, info: BatchInfo, batch: RecordBatch) -> lance::Result<()> {
+        Python::with_gil(|py| {
+            let info = self.batch_info_to_py(&info, py)?;
+            let batch = PyArrowType(batch);
+            self.inner.call_method1(py, "insert_batch", (info, batch))?;
+            Ok(())
+        })
+        .map_err(|err: PyErr| lance_core::Error::IO {
+            message: format!("Failed to call insert_batch() on UDFCheckpointer: {}", err),
+            location: location!(),
+        })
+    }
+
+    fn insert_fragment(&self, fragment: Fragment) -> lance_core::Result<()> {
+        let data = serde_json::to_string(&fragment).map_err(|err| lance_core::Error::IO {
+            message: format!("Failed to serialize fragment data: {}", err),
+            location: location!(),
+        })?;
+        Python::with_gil(|py| {
+            self.inner
+                .call_method1(py, "insert_fragment", (fragment.id, data))?;
+            Ok(())
+        })
+        .map_err(|err: PyErr| lance_core::Error::IO {
+            message: format!(
+                "Failed to call insert_fragment() on UDFCheckpointer: {}",
+                err
+            ),
+            location: location!(),
+        })
     }
 }

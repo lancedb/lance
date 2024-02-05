@@ -12,9 +12,13 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import os
+import uuid
 from pathlib import Path
 
 import lance
+import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
@@ -48,3 +52,103 @@ def test_drop_columns(tmp_path: Path):
     # Can't drop all columns
     with pytest.raises(ValueError):
         dataset.drop_columns(["c"])
+
+
+def test_add_columns_udf(tmp_path):
+    tab = pa.table({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(tab, tmp_path, max_rows_per_file=25)
+
+    @lance.batch_udf(
+        output_schema=pa.schema([pa.field("double_a", pa.int64())]),
+    )
+    def double_a(batch):
+        assert batch.schema.names == ["a"]
+        return pa.record_batch(
+            [pa.array([2 * x.as_py() for x in batch["a"]])], ["double_a"]
+        )
+
+    dataset.add_columns(double_a, read_columns=["a"])
+
+    expected = tab.append_column("double_a", pa.array([2 * x for x in range(100)]))
+    assert expected == dataset.to_table()
+
+    # Check: errors if produces inconsistent schema
+    @lance.batch_udf()
+    def make_new_col(batch):
+        col_name = str(uuid.uuid4())
+        return pa.record_batch([batch["a"]], [col_name])
+
+    with pytest.raises(
+        Exception, match="Output schema of function does not match the expected schema"
+    ):
+        dataset.add_columns(make_new_col)
+
+    # Schema inference and Pandas conversion
+    @lance.batch_udf()
+    def triple_a(batch):
+        return pd.DataFrame({"triple_a": [3 * x.as_py() for x in batch["a"]]})
+
+    dataset.add_columns(triple_a, read_columns=["a"])
+
+    expected = expected.append_column("triple_a", pa.array([3 * x for x in range(100)]))
+    assert expected == dataset.to_table()
+
+
+def test_add_columns_udf_caching(tmp_path):
+    tab = pa.table({
+        "a": range(100),
+        "b": range(100),
+    })
+    dataset = lance.write_dataset(tab, tmp_path, max_rows_per_file=20)
+
+    @lance.batch_udf(checkpoint_file=tmp_path / "cache.sqlite")
+    def double_a(batch):
+        if batch["a"][0].as_py() >= 50:
+            raise RuntimeError("I failed")
+        return pa.record_batch([pc.multiply(batch["a"], pa.scalar(2))], ["a_times_2"])
+
+    with pytest.raises(Exception):
+        dataset.add_columns(double_a, read_columns=["a"])
+
+    assert dataset.version == 1
+    assert "cache.sqlite" in os.listdir(tmp_path)
+
+    @lance.batch_udf(checkpoint_file=tmp_path / "cache.sqlite")
+    def double_a(batch):
+        # We should skip these batches if they are cached
+        # (It can be zero due to schema inference looking at the first batch.)
+        assert batch["a"][0].as_py() == 0 or batch["a"][0].as_py() >= 50
+        return pa.record_batch([pc.multiply(batch["a"], pa.scalar(2))], ["a_times_2"])
+
+    dataset.add_columns(double_a, read_columns=["a"])
+    assert dataset.schema.names == ["a", "b", "a_times_2"]
+
+    assert "cache.sqlite" not in os.listdir(tmp_path)
+
+
+def test_add_columns_exprs(tmp_path):
+    tab = pa.table({"a": range(100)})
+    dataset = lance.write_dataset(tab, tmp_path)
+    dataset.add_columns({"b": "a + 1"})
+    assert dataset.to_table() == pa.table({"a": range(100), "b": range(1, 101)})
+
+
+def test_query_after_merge(tmp_path):
+    # https://github.com/lancedb/lance/issues/1905
+    tab = pa.table({
+        "id": range(100),
+        "vec": pa.FixedShapeTensorArray.from_numpy_ndarray(
+            np.random.rand(100, 128).astype("float32")
+        ),
+    })
+    tab2 = pa.table({
+        "id": range(100),
+        "data": range(100, 200),
+    })
+    dataset = lance.write_dataset(tab, tmp_path)
+
+    dataset.merge(tab2, left_on="id")
+
+    dataset.to_table(
+        nearest=dict(column="vec", k=10, q=np.random.rand(128).astype("float32"))
+    )
