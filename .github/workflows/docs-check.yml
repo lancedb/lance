@@ -6,6 +6,7 @@ on:
   pull_request:
     paths:
       - docs/**
+      - .github/workflows/docs-check.yml
 
 env:
   # Disable full debug symbol generation to speed up CI build and keep memory down
