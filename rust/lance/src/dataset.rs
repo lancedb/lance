@@ -4305,6 +4305,8 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
     async fn test_rename_columns() -> Result<()> {
         let metadata: HashMap<String, String> = [("k1".into(), "v1".into())].into();
 
