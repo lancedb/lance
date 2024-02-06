@@ -12,8 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-"""Read Lance dataset as torch DataPipe.
-"""
+"""Read Lance dataset as torch DataPipe."""
 
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
