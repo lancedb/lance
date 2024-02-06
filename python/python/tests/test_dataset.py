@@ -71,6 +71,24 @@ def test_input_data(tmp_path: Path, schema, data):
     assert dataset.to_table() == input_data[0][1]
 
 
+def test_roundtrip_types(tmp_path: Path):
+    table = pa.table({
+        "dict": pa.array(["a", "b", "a"], pa.dictionary(pa.int8(), pa.string())),
+        # PyArrow doesn't support creating large_string dictionaries easily.
+        "large_dict": pa.DictionaryArray.from_arrays(
+            pa.array([0, 1, 1], pa.int8()), pa.array(["foo", "bar"], pa.large_string())
+        ),
+        "list": pa.array([["a", "b"], ["c", "d"], ["e", "f"]], pa.list_(pa.string())),
+        "large_list": pa.array(
+            [["a", "b"], ["c", "d"], ["e", "f"]], pa.large_list(pa.string())
+        ),
+    })
+
+    dataset = lance.write_dataset(table, tmp_path)
+    assert dataset.schema == table.schema
+    assert dataset.to_table() == table
+
+
 def test_dataset_overwrite(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
