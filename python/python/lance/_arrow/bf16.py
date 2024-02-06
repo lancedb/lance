@@ -12,8 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-"""Bfloat16 support.
-"""
+"""Bfloat16 support."""
 
 from typing import Any, Optional, Union
 
