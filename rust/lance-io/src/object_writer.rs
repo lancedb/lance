@@ -31,14 +31,25 @@ use crate::traits::Writer;
 ///
 #[pin_project]
 pub struct ObjectWriter {
-    // Note: this is a std Mutex. It MUST NOT be held across await points.
+    /// This writer is behind a Mutex because it is used both by the caller
+    /// to write data and by the background task to flush the data. The background
+    /// task never holds the mutex for longer than it takes to poll the flush
+    /// future once, so it should never block the caller for long.
+    ///
+    /// Note: this is a std Mutex. It MUST NOT be held across await points.
     #[pin]
     writer: Arc<Mutex<Pin<Box<dyn AsyncWrite + Send + Unpin>>>>,
 
     /// A task that flushes the data every 500ms. This is to make sure that the
-    /// futures within the writer are polled at least every 500ms.
+    /// futures within the writer are polled at least every 500ms. This is
+    /// necessary because the internal writer buffers data and holds up to 10
+    /// write request futures in FuturesUnordered. These futures only make
+    /// progress when polled, and if they are not polled for a while, they can
+    /// cause the requests to timeout.
     background_flusher: tokio::task::JoinHandle<()>,
 
+    /// When calling flush(), the background task may receive a ready error.
+    /// This channel is used to send the error to the main task.
     background_error: tokio::sync::oneshot::Receiver<std::io::Error>,
 
     // TODO: pub(crate)
