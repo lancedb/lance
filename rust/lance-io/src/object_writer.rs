@@ -77,6 +77,8 @@ impl ObjectWriter {
 
         let writer_ref = writer.clone();
         let background_flusher = tokio::task::spawn(async move {
+            // The background tasks continues forever, until it is cancelled by the
+            // the call to shutdown() on the writer.
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 match writer_ref.lock().unwrap().flush().now_or_never() {
@@ -104,6 +106,14 @@ impl ObjectWriter {
     }
 }
 
+impl Drop for ObjectWriter {
+    fn drop(&mut self) {
+        // If the writer is dropped, we need to make sure that the background
+        // task is cancelled. We do this by aborting the JoinHandle.
+        self.background_flusher.abort();
+    }
+}
+
 #[async_trait]
 impl Writer for ObjectWriter {
     async fn tell(&mut self) -> Result<usize> {
@@ -117,10 +127,12 @@ impl AsyncWrite for ObjectWriter {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.project();
+        let mut writer = this.writer.lock().unwrap();
+        // We lock the writer prior to checking for background errors to make
+        // sure we don't miss the error.
         if let Ok(err) = this.background_error.try_recv() {
             return Poll::Ready(Err(err));
         }
-        let mut writer = this.writer.lock().unwrap();
         writer.as_mut().poll_write(cx, buf).map_ok(|n| {
             *this.cursor += n;
             n
@@ -129,19 +141,20 @@ impl AsyncWrite for ObjectWriter {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.project();
+        let mut writer = this.writer.lock().unwrap();
         if let Ok(err) = this.background_error.try_recv() {
             return Poll::Ready(Err(err));
         }
-        let mut writer = this.writer.lock().unwrap();
         writer.as_mut().poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.project();
+        let mut writer = this.writer.lock().unwrap();
         if let Ok(err) = this.background_error.try_recv() {
             return Poll::Ready(Err(err));
         }
-        let mut writer = this.writer.lock().unwrap();
+        this.background_flusher.abort();
         writer.as_mut().poll_shutdown(cx)
     }
 }
