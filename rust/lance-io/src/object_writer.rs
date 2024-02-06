@@ -78,7 +78,7 @@ impl ObjectWriter {
         let writer_ref = writer.clone();
         let background_flusher = tokio::task::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 match writer_ref.lock().unwrap().flush().now_or_never() {
                     None => continue,
                     Some(Ok(_)) => continue,
