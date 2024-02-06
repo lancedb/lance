@@ -35,6 +35,7 @@ use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::{WriteExt, Writer};
 use object_store::path::Path;
 use snafu::{location, Location};
+use tokio::io::AsyncWriteExt;
 
 use crate::format::metadata::{Metadata, StatisticsMetadata};
 use crate::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
@@ -192,6 +193,12 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         }
         let batch_length = batches.iter().map(|b| b.num_rows() as i32).sum();
         self.metadata.push_batch_length(batch_length);
+
+        // It's imperative we complete any in-flight requests, since we are
+        // returning control to the caller. If the caller takes a long time to
+        // write the next batch, the in-flight requests will not be polled and
+        // may time out.
+        self.object_writer.flush().await?;
 
         self.batch_id += 1;
         Ok(())
