@@ -112,7 +112,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 
     # These next three overrides exist only to document the methods
 
-    def when_matched_update_all(self):
+    def when_matched_update_all(self, condition: Optional[str] = None):
         """
         Configure the operation to update matched rows
 
@@ -120,8 +120,12 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         any rows that match both the source table and the target table will be
         updated.  The rows from the target table will be removed and the rows
         from the source table will be added.
+
+        An optional condition may be specified.  This should be an SQL filter
+        and, if present, then only rows matching rows that also match this
+        filter will be updated.
         """
-        return super(MergeInsertBuilder, self).when_matched_update_all()
+        return super(MergeInsertBuilder, self).when_matched_update_all(condition)
 
     def when_not_matched_insert_all(self):
         """

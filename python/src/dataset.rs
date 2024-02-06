@@ -136,8 +136,18 @@ impl MergeInsertBuilder {
         Ok(Self { builder, dataset })
     }
 
-    pub fn when_matched_update_all(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
-        slf.builder.when_matched(WhenMatched::UpdateAll);
+    pub fn when_matched_update_all<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        condition: Option<&str>,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        let new_val = if let Some(expr) = condition {
+            let dataset = slf.dataset.borrow(slf.py());
+            WhenMatched::update_if(&dataset.ds, expr)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?
+        } else {
+            WhenMatched::UpdateAll
+        };
+        slf.builder.when_matched(new_val);
         Ok(slf)
     }
 
