@@ -13,9 +13,11 @@
 // limitations under the License.
 
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use object_store::{path::Path, MultipartId, ObjectStore};
 use pin_project::pin_project;
 use snafu::{location, Location};
@@ -29,9 +31,15 @@ use crate::traits::Writer;
 ///
 #[pin_project]
 pub struct ObjectWriter {
-    // TODO: wrap writer with a BufWriter.
+    // Note: this is a std Mutex. It MUST NOT be held across await points.
     #[pin]
-    writer: Box<dyn AsyncWrite + Send + Unpin>,
+    writer: Arc<Mutex<Pin<Box<dyn AsyncWrite + Send + Unpin>>>>,
+
+    /// A task that flushes the data every 500ms. This is to make sure that the
+    /// futures within the writer are polled at least every 500ms.
+    background_flusher: tokio::task::JoinHandle<()>,
+
+    background_error: tokio::sync::oneshot::Receiver<std::io::Error>,
 
     // TODO: pub(crate)
     pub multipart_id: MultipartId,
@@ -50,15 +58,38 @@ impl ObjectWriter {
                     location: location!(),
                 })?;
 
+        let writer = Arc::new(Mutex::new(Pin::new(writer)));
+
+        // If background task encounters an error, we use a channel to send the error
+        // to the main task.
+        let (error_sender, background_error) = tokio::sync::oneshot::channel();
+
+        let writer_ref = writer.clone();
+        let background_flusher = tokio::task::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                match writer_ref.lock().unwrap().flush().now_or_never() {
+                    None => continue,
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => {
+                        let _ = error_sender.send(e);
+                        break;
+                    }
+                }
+            }
+        });
+
         Ok(Self {
             writer,
+            background_flusher,
+            background_error,
             multipart_id,
             cursor: 0,
         })
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
-        Ok(self.writer.as_mut().shutdown().await?)
+        Ok(AsyncWriteExt::shutdown(self).await?)
     }
 }
 
@@ -74,19 +105,33 @@ impl AsyncWrite for ObjectWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let mut this = self.project();
-        this.writer.as_mut().poll_write(cx, buf).map_ok(|n| {
+        let this = self.project();
+        if let Ok(err) = this.background_error.try_recv() {
+            return Poll::Ready(Err(err));
+        }
+        let mut writer = this.writer.lock().unwrap();
+        writer.as_mut().poll_write(cx, buf).map_ok(|n| {
             *this.cursor += n;
             n
         })
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.project().writer.as_mut().poll_flush(cx)
+        let this = self.project();
+        if let Ok(err) = this.background_error.try_recv() {
+            return Poll::Ready(Err(err));
+        }
+        let mut writer = this.writer.lock().unwrap();
+        writer.as_mut().poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.project().writer.as_mut().poll_shutdown(cx)
+        let this = self.project();
+        if let Ok(err) = this.background_error.try_recv() {
+            return Poll::Ready(Err(err));
+        }
+        let mut writer = this.writer.lock().unwrap();
+        writer.as_mut().poll_shutdown(cx)
     }
 }
 
