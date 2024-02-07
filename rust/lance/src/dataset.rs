@@ -31,7 +31,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt, Stream};
 use lance_arrow::SchemaExt;
-use lance_core::datatypes::{Field, LogicalType, SchemaCompareOptions};
+use lance_core::datatypes::{Field, SchemaCompareOptions};
 use lance_datafusion::utils::reader_to_stream;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
@@ -1715,7 +1715,7 @@ impl Dataset {
         let mut next_field_id = new_schema.max_field_id().unwrap_or_default() + 1;
 
         for alteration in alterations {
-            let field = self.schema().field(&alteration.path).ok_or_else(|| {
+            let field_src = self.schema().field(&alteration.path).ok_or_else(|| {
                 Error::invalid_input(
                     format!("Column {} does not exist in the dataset", alteration.path),
                     location!(),
@@ -1724,7 +1724,7 @@ impl Dataset {
             if let Some(nullable) = alteration.nullable {
                 // TODO: in the future, we could check the values of the column to see if
                 //       they are all non-null and thus the column could be made non-nullable.
-                if field.nullable && !nullable {
+                if field_src.nullable && !nullable {
                     return Err(Error::invalid_input(
                         format!(
                             "Column {} is already nullable and thus cannot be made non-nullable",
@@ -1735,35 +1735,36 @@ impl Dataset {
                 }
             }
 
-            let field_mut = new_schema.mut_field_by_id(field.id).unwrap();
+            let field_dest = new_schema.mut_field_by_id(field_src.id).unwrap();
             if let Some(rename) = &alteration.rename {
-                field_mut.name = rename.clone();
+                field_dest.name = rename.clone();
             }
             if let Some(nullable) = alteration.nullable {
-                field_mut.nullable = nullable;
+                field_dest.nullable = nullable;
             }
 
             if let Some(data_type) = &alteration.data_type {
-                if !lance_arrow::cast::can_cast_types(&field.data_type(), data_type) {
+                if !lance_arrow::cast::can_cast_types(&field_src.data_type(), data_type) {
                     return Err(Error::invalid_input(
                         format!(
                             "Cannot cast column {} from {:?} to {:?}",
                             alteration.path,
-                            field.data_type(),
+                            field_src.data_type(),
                             data_type
                         ),
                         location!(),
                     ));
                 }
 
-                field_mut.logical_type = LogicalType::try_from(data_type)?;
+                let arrow_field = ArrowField::new(
+                    field_dest.name.clone(),
+                    data_type.clone(),
+                    field_dest.nullable,
+                );
+                *field_dest = Field::try_from(&arrow_field)?;
+                field_dest.set_id(field_src.parent_id, &mut next_field_id);
 
-                // We need to change the id of this field, since it now has a different location.
-                field_mut.id = next_field_id;
-                next_field_id += 1;
-
-                // TODO: how do we handle children?
-                cast_fields.push((field.clone(), field_mut.clone()));
+                cast_fields.push((field_src.clone(), field_dest.clone()));
             }
         }
 
@@ -2000,6 +2001,7 @@ mod tests {
     use crate::index::scalar::ScalarIndexParams;
     use crate::index::vector::VectorIndexParams;
 
+    use arrow_array::types::Int64Type;
     use arrow_array::{
         builder::StringDictionaryBuilder,
         cast::{as_string_array, as_struct_array},
@@ -2008,7 +2010,7 @@ mod tests {
         Int8DictionaryArray, RecordBatch, RecordBatchIterator, StringArray, UInt16Array,
         UInt32Array,
     };
-    use arrow_array::{FixedSizeListArray, Float16Array, Float64Array};
+    use arrow_array::{FixedSizeListArray, Float16Array, Float64Array, ListArray};
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
     use arrow_select::take::take;
@@ -4513,6 +4515,7 @@ mod tests {
                 DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 128),
                 false,
             ),
+            Field::new("l", DataType::new_list(DataType::Int32, true), true),
         ]));
 
         let nrows = 512;
@@ -4528,6 +4531,9 @@ mod tests {
                     )
                     .unwrap(),
                 ),
+                Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+                    (0..nrows).map(|i| Some(vec![Some(i), Some(i + 1)])),
+                )),
             ],
         )?;
 
@@ -4574,6 +4580,7 @@ mod tests {
                 DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 128),
                 false,
             ),
+            Field::new("l", DataType::new_list(DataType::Int32, true), true),
         ]);
         assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
 
@@ -4596,6 +4603,7 @@ mod tests {
                 DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 128),
                 false,
             ),
+            Field::new("l", DataType::new_list(DataType::Int32, true), true),
         ]);
         assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
 
@@ -4619,6 +4627,13 @@ mod tests {
             .await?;
         dataset.validate().await?;
 
+        // Finally, case list column to show we can handle children.
+        dataset
+            .alter_columns(&[ColumnAlteration::new("l".into())
+                .cast_to(DataType::new_list(DataType::Int64, true))])
+            .await?;
+        dataset.validate().await?;
+
         let expected_schema = ArrowSchema::new(vec![
             Field::new("i", DataType::Int64, false),
             Field::new("f", DataType::Float16, true),
@@ -4627,6 +4642,7 @@ mod tests {
                 DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float16, true)), 128),
                 false,
             ),
+            Field::new("l", DataType::new_list(DataType::Int64, true), true),
         ]);
         assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
 
@@ -4636,7 +4652,7 @@ mod tests {
 
         // Each fragment gains a file with the new columns
         dataset.fragments().iter().for_each(|f| {
-            assert_eq!(f.files.len(), 4);
+            assert_eq!(f.files.len(), 5);
         });
 
         let expected_data = RecordBatch::try_new(
@@ -4654,6 +4670,9 @@ mod tests {
                     ),
                     &Default::default(),
                 )?,
+                Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+                    (0..nrows as i64).map(|i| Some(vec![Some(i), Some(i + 1)])),
+                )),
             ],
         )?;
         let actual_data = dataset.scan().try_into_batch().await?;
