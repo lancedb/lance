@@ -1,7 +1,5 @@
 use std::io::Result;
 
-use rustc_version::{version_meta, Channel};
-
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=protos");
 
