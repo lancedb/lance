@@ -21,7 +21,10 @@ use lance_core::Result;
 
 pub mod decoder;
 pub mod encoder;
+pub mod encodings;
 pub mod format;
+#[cfg(test)]
+pub mod testing;
 
 /// A trait for an I/O service
 ///
