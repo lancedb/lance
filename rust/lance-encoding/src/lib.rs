@@ -19,6 +19,8 @@ use futures::future::BoxFuture;
 
 use lance_core::Result;
 
+pub mod decoder;
+pub mod encoder;
 pub mod format;
 
 /// A trait for an I/O service
