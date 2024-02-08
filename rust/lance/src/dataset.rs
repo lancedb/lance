@@ -15,6 +15,7 @@
 //! Lance Dataset
 //!
 
+use arrow::compute::CastOptions;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::Array;
@@ -1717,7 +1718,10 @@ impl Dataset {
         for alteration in alterations {
             let field_src = self.schema().field(&alteration.path).ok_or_else(|| {
                 Error::invalid_input(
-                    format!("Column {} does not exist in the dataset", alteration.path),
+                    format!(
+                        "Column \"{}\" does not exist in the dataset",
+                        alteration.path
+                    ),
                     location!(),
                 )
             })?;
@@ -1727,7 +1731,7 @@ impl Dataset {
                 if field_src.nullable && !nullable {
                     return Err(Error::invalid_input(
                         format!(
-                            "Column {} is already nullable and thus cannot be made non-nullable",
+                            "Column \"{}\" is already nullable and thus cannot be made non-nullable",
                             alteration.path
                         ),
                         location!(),
@@ -1747,7 +1751,7 @@ impl Dataset {
                 if !lance_arrow::cast::can_cast_types(&field_src.data_type(), data_type) {
                     return Err(Error::invalid_input(
                         format!(
-                            "Cannot cast column {} from {:?} to {:?}",
+                            "Cannot cast column \"{}\" from {:?} to {:?}",
                             alteration.path,
                             field_src.data_type(),
                             data_type
@@ -1803,7 +1807,11 @@ impl Dataset {
                     let new_column = lance_arrow::cast::cast_with_options(
                         &old_column,
                         &new.data_type(),
-                        &Default::default(),
+                        // Safe: false means it will error if the cast is lossy.
+                        &CastOptions {
+                            safe: false,
+                            ..Default::default()
+                        },
                     )?;
                     columns.push(new_column);
                     fields.push(Arc::new(ArrowField::from(new)));

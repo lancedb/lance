@@ -647,6 +647,23 @@ impl Dataset {
                     .get_item("data_type")?
                     .map(|n| n.extract())
                     .transpose()?;
+
+                for key in obj.keys().iter().map(|k| k.extract::<String>()) {
+                    let k = key?;
+                    if k != "path" && k != "name" && k != "nullable" && k != "data_type" {
+                        return Err(PyValueError::new_err(format!(
+                            "Unknown key: {}. Valid keys are name, nullable, and data_type.",
+                            k
+                        )));
+                    }
+                }
+
+                if name.is_none() && nullable.is_none() && data_type.is_none() {
+                    return Err(PyValueError::new_err(
+                        "At least one of name, nullable, or data_type must be specified",
+                    ));
+                }
+
                 let mut alteration = ColumnAlteration::new(path);
                 if let Some(name) = name {
                     alteration = alteration.rename(name);

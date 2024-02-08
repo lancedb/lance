@@ -611,7 +611,14 @@ class LanceDataset(pa.dataset.Dataset):
         raise NotImplementedError("Versioning not yet supported in Rust")
 
     def alter_columns(self, *alterations: Iterable[Dict[str, Any]]):
-        """Alter column names and nullability.
+        """Alter column name, data type, and nullability.
+
+        Columns that are renamed can keep any indices that are on them. However, if
+        the column is cast to a different type, its indices will be dropped.
+
+        Column types can be upcasted (such as int32 to int64) or downcasted
+        (such as int64 to int32). However, downcasting will fail if there are
+        any values that cannot be represented in the new type.
 
         Parameters
         ----------
@@ -631,9 +638,6 @@ class LanceDataset(pa.dataset.Dataset):
             - "data_type": pyarrow.DataType, optional
                 The new data type to cast the column to. If not specified, the column
                 data type is not changed.
-
-        Columns that are renamed can keep any indices that are on them. However, if
-        the column is casted to a different type, it's indices will be dropped.
 
         Examples
         --------

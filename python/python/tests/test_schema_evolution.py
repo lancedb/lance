@@ -160,7 +160,7 @@ def test_alter_columns(tmp_path: Path):
         pa.field("b", pa.string(), nullable=False),
     ])
     tab = pa.table(
-        {"a": pa.array([1, 2, 3]), "b": pa.array(["a", "b", "c"])}, schema=schema
+        {"a": pa.array([1, 2, 1024]), "b": pa.array(["a", "b", "c"])}, schema=schema
     )
 
     dataset = lance.write_dataset(tab, tmp_path)
@@ -177,7 +177,7 @@ def test_alter_columns(tmp_path: Path):
     assert dataset.schema == expected_schema
 
     expected_tab = pa.table(
-        {"x": pa.array([1, 2, 3]), "y": pa.array(["a", "b", "c"])},
+        {"x": pa.array([1, 2, 1024]), "y": pa.array(["a", "b", "c"])},
         schema=expected_schema,
     )
     assert dataset.to_table() == expected_tab
@@ -192,7 +192,21 @@ def test_alter_columns(tmp_path: Path):
     assert dataset.schema == expected_schema
 
     expected_tab = pa.table(
-        {"x": pa.array([1, 2, 3], type=pa.int32()), "y": pa.array(["a", "b", "c"])},
+        {"x": pa.array([1, 2, 1024], type=pa.int32()), "y": pa.array(["a", "b", "c"])},
         schema=expected_schema,
     )
     assert dataset.to_table() == expected_tab
+    with pytest.raises(Exception, match="Can't cast value 1024 to type Int8"):
+        dataset.alter_columns({"path": "x", "data_type": pa.int8()})
+
+    with pytest.raises(Exception, match='Column "q" does not exist'):
+        dataset.alter_columns({"path": "q", "name": "z"})
+
+    with pytest.raises(ValueError, match="Unknown key: type"):
+        dataset.alter_columns({"path": "x", "type": "string"})
+
+    with pytest.raises(
+        ValueError,
+        match="At least one of name, nullable, or data_type must be specified",
+    ):
+        dataset.alter_columns({"path": "x"})
