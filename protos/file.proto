@@ -16,6 +16,22 @@ syntax = "proto3";
 
 package lance.file;
   
+// A file descriptor that describes the contents of a Lance file
+message FileDescriptor {
+  // The schema of the file
+  Schema schema = 1;
+  // The number of rows in the file
+  uint64 length = 2;
+}
+
+// A schema which describes the data type of each of the columns
+message Schema {
+    // All fields in this file, including the nested fields.
+    repeated lance.file.Field fields = 1;
+    // Schema metadata.
+    map<string, bytes> metadata = 5;
+}
+
 // Metadata of one Lance file.
 message Metadata {
   // 4 was used for StatisticsMetadata in the past, but has been moved to prevent
