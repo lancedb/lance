@@ -3,6 +3,7 @@ members = [
     "lance-arrow",
     "lance-core",
     "lance-datagen",
+    "lance-encoding",
     "lance-file",
     "lance-index",
     "lance-io",
@@ -44,6 +45,7 @@ lance-arrow = { version = "=0.9.15", path = "./lance-arrow" }
 lance-core = { version = "=0.9.15", path = "./lance-core" }
 lance-datafusion = { version = "=0.9.15", path = "./lance-datafusion" }
 lance-datagen = { version = "=0.9.15", path = "./lance-datagen" }
+lance-encoding = { version = "=0.9.15", path = "./lance-encoding" }
 lance-file = { version = "=0.9.15", path = "./lance-file" }
 lance-index = { version = "=0.9.15", path = "./lance-index" }
 lance-io = { version = "=0.9.15", path = "./lance-io" }

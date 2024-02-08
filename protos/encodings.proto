@@ -1,0 +1,159 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * <p>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p>
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+package lance.encodings;
+ 
+// This file contains a specification for buffer encodings that can be used
+// to store and load Arrow data into a Lance file.
+//
+// # Types
+//
+// This standard assumes the user wants to load data into Arrow arrays and
+// explains how to map Arrow arrays into Lance files.  The input to a top
+// level encoding is an Arrow array.  The output is zero or more buffers.
+//
+// # Encoding Tree
+//
+// Most encodings are layered on top of each other.  These form a tree of
+// encodings with a single root node.  To encode an array you will typically
+// start with the root node and then take the output from that root encoding
+// and feed it into child encodings.  The decoding process works in reverse.
+//
+// # Multi-column Encodings
+//
+// Some Arrow arrays will map to more than one column of Lance data.  For
+// example, struct arrays and list arrays.  It can be difficult to know where
+// to draw the line between multiple columns and multiple buffers within a
+// column.  For example, a basic mapping for an Int32 array is a single column
+// with a validity buffer and a values buffer.  We could also map the Int32
+// array into two columns (a boolean column and a fixed-length-binary column)
+// but we do not choose to do so.
+//
+// There are a few points which help guide these decisions:
+//
+// * Columns cannot be "projected".  It is not possible to load part of a
+//   column.  For example, the typical encoding for a struct spreads the values
+//   across multiple columns.  This makes it possible to load individual fields
+//   of a struct.  A "packed" struct encoding encodes a struct into a single
+//   column.  When this encoding is used it is not possible to load a single
+//   field from the column.
+// * Columns require their output to be Arrow typed data.  Some encodings, such
+//   as compressed bitmaps, do not have a corresponding Arrow representation.
+//   While you could always shove these fields into variable length binary that
+//   is not very intuitive or useful.
+
+// A pointer to a buffer in a Lance file
+message Buffer {
+    // The location of the buffer in the file
+    uint64 file_offset = 1;
+    // The size, in bytes, of the buffer
+    uint64 buffer_size = 2;
+}
+
+// A buffer encoding where each row is a fixed number of bytes
+message Value {
+    // The buffer of values
+    Buffer buffer = 1;
+    // The number of bytes per value
+    uint64 bytes_per_value = 2;
+}
+
+// A buffer encoding for boolean data where each row is 1 bit
+// 
+// The data is stored with bit-endianess (e.g. what Arrow uses for validity
+// bitmaps and boolean arrays)
+message Bitmap {
+    // The buffer of values
+    Buffer buffer = 1;
+}
+
+// Encodings that decode into a single buffer of values
+message BufferEncoding {
+    oneof buffer_encoding {
+        Value value = 1;
+        Bitmap bitmap = 2;
+    }
+}
+
+// An array encoding for primitive fields where the validity information
+// is stored in a separate bitmap
+//
+// "primitive" fields are any field which can be represented in Arrow by
+// a fixed-size buffer of values and a validity buffer.  This includes
+// the fields you would expect (integers, floats, temporal types) as
+// well as null, boolean, and fixed size list/string/binary types.
+message Basic {
+  message NoNull {
+    BufferEncoding values = 1;
+  }
+  message AllNull {}
+  message SomeNull {
+    BufferEncoding validity = 1;
+    BufferEncoding values = 2;
+  }
+  oneof nullability {
+    // The array has no nulls and there is a single buffer needed
+    NoNull no_nulls = 1;
+    // The array may have nulls and we need two buffers
+    SomeNull some_nulls = 2;
+    // All values are null (no buffers needed)
+    AllNull all_nulls = 3;
+  }
+}
+
+// An array encoding for variable-length list fields
+message List {
+    // An array containing the offsets into the items array.
+    //
+    // This array will have (num_rows + 1), will have a data
+    // type of uint64, and will never have nulls.
+    //
+    // offsets[0] will always be 0.
+    //
+    // If the incoming list at index i is not null then offsets[i+1]
+    // will contain offsets[i] + len(list)
+    //
+    // If the incoming list at index i is null then offsets[i+1] will
+    // contain offsets[i] + num_items
+    //
+    // The length of the list at index i can then be found from
+    // the calculation (offsets[i+1] - offsets[i]) % num_items.  If
+    // the length is 0 the list is:
+    //   * offsets[i+1] == offsets[i] -> empty list
+    //   * offsets[i+1] > offsets[i+1] -> null list 
+    //
+    // The offsets array is always a uint64 array (even if the arrow type it
+    // maps to is using int32 or int64 offsets).  However, this array is an
+    // unsigned integer array with range [0, 2 * num_items] and so it should
+    // be bit packed accordingly.
+    ArrayEncoding offsets = 1;
+}
+
+// An array encoding for shredded structs that will never be null
+message SimpleStruct {}
+
+// Encodings that decode into an Arrow array
+message ArrayEncoding {
+    oneof array_encoding {
+        Basic basic = 1;
+        List list = 2;
+        SimpleStruct struct = 3;
+    }
+}
