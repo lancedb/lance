@@ -20,6 +20,7 @@ use std::hash::Hash;
 
 use lance_core::Result;
 use num_traits::{Float, PrimInt};
+use roaring::treemap::Iter;
 
 pub(crate) mod builder;
 mod storage;
@@ -59,8 +60,10 @@ pub trait SerializeToLance {
     async fn to_lance(&self, path: &str) -> Result<()>;
 }
 
+/// A wrapper for f32 to make it ordered, so that we can put it into
+/// a BTree or Heap
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub struct OrderedFloat(f32);
+pub(crate) struct OrderedFloat(f32);
 
 impl PartialOrd for OrderedFloat {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -82,13 +85,35 @@ impl From<f32> for OrderedFloat {
     }
 }
 
+/// Graph trait.
+///
+/// Type parameters
+/// ---------------
+/// K: Vertex Index type
+/// T: the data type of vector, i.e., ``f32`` or ``f16``.
+pub trait Graph<K: PrimInt = u32, T: Float = f32> {
+    /// Get the number of nodes in the graph.
+    fn len(&self) -> usize;
+
+    /// Get the neighbors of a graph node, identifyied by the index.
+    fn neighbors(&self, key: K) -> Option<Box<dyn Iterator<Item = K> + '_>>;
+
+    /// Distance from query vector to a node.
+    fn distance_to(&self, query: &[T], key: K) -> f32;
+
+    /// Distance between two nodes in the graph.
+    ///
+    /// Returns the distance between two nodes as float32.
+    fn distance_between(&self, a: K, b: K) -> f32;
+}
+
 /// Serializable Graph.
 ///
 /// Type parameters
 /// ----------------
 /// I : Vertex Index type
 /// V : the data type of vector, i.e., ``f32`` or ``f16``.
-pub struct Graph<I: PrimInt + Hash = u32, T: Float = f32> {
+struct InMemoryGraph<I: PrimInt + Hash = u32, T: Float = f32> {
     pub nodes: HashMap<I, GraphNode<I>>,
     phantom: std::marker::PhantomData<T>,
 }
@@ -111,7 +136,7 @@ pub struct Graph<I: PrimInt + Hash = u32, T: Float = f32> {
 /// A sorted list of ``(dist, node_id)`` pairs.
 ///
 pub(crate) fn beam_search<I: PrimInt + Hash>(
-    graph: &Graph<I>,
+    graph: impl Graph<I>,
     start: I,
     query: &[f32],
     k: usize,
@@ -134,11 +159,11 @@ pub(crate) fn beam_search<I: PrimInt + Hash>(
             if visited.contains(&neighbor) {
                 continue;
             }
-            visited.insert(*neighbor);
-            let dist = graph.distance_to(query, *neighbor).into();
+            visited.insert(neighbor);
+            let dist = graph.distance_to(query, neighbor).into();
             if dist < furtherst || results.len() < k {
-                results.insert(dist, *neighbor);
-                candidates.insert(dist, *neighbor);
+                results.insert(dist, neighbor);
+                candidates.insert(dist, neighbor);
             }
         }
         // Maintain the size of the result set.
@@ -149,7 +174,27 @@ pub(crate) fn beam_search<I: PrimInt + Hash>(
     Ok(results)
 }
 
-impl<I: PrimInt + Hash, T: Float> Graph<I, T> {
+impl<I: PrimInt + Hash, T: Float> Graph<I, T> for InMemoryGraph<I, T> {
+    fn neighbors(&self, key: I) -> Option<Box<dyn Iterator<Item = I> + '_>> {
+        self.nodes
+            .get(&key)
+            .map(|n| Box::new(n.neighbors.iter().copied()) as Box<dyn Iterator<Item = I>>)
+    }
+
+    fn distance_to(&self, query: &[T], idx: I) -> f32 {
+        todo!()
+    }
+
+    fn distance_between(&self, a: I, b: I) -> f32 {
+        todo!()
+    }
+
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
+impl<I: PrimInt + Hash, T: Float> InMemoryGraph<I, T> {
     pub fn new() -> Self {
         Self {
             nodes: HashMap::new(),
@@ -162,16 +207,6 @@ impl<I: PrimInt + Hash, T: Float> Graph<I, T> {
             nodes,
             phantom: std::marker::PhantomData,
         }
-    }
-
-    /// Distance from query vector to a node.
-    fn distance_to(&self, query: &[T], idx: I) -> f32 {
-        todo!()
-    }
-
-    /// Neightbours of a node.
-    fn neighbors(&self, id: I) -> Option<&[I]> {
-        self.nodes.get(&id).map(|n| n.neighbors.as_slice())
     }
 
     fn len(&self) -> usize {

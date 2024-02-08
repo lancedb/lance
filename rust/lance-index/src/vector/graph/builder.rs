@@ -14,8 +14,11 @@
 
 use std::collections::BTreeMap;
 
-use super::{Graph, GraphNode, OrderedFloat};
-use lance_core::Result;
+use lance_core::{Error, Result};
+use lance_linalg::distance::{DistanceFunc, MetricType};
+use snafu::{location, Location};
+
+use super::{Graph, GraphNode, InMemoryGraph, OrderedFloat};
 use crate::vector::graph::storage::VectorStorage;
 
 /// GraphNode during build.
@@ -35,7 +38,8 @@ impl GraphBuilderNode {
     }
 
     /// Prune the node and only keep `max_edges` edges.
-    /// Returns the list of pruned neighbors.
+    ///
+    /// Returns the ids of pruned neighbors.
     fn prune(&mut self, max_edges: usize) -> Vec<u32> {
         if self.neighbors.len() <= max_edges {
             return vec![];
@@ -50,8 +54,8 @@ impl GraphBuilderNode {
     }
 }
 
-impl From<GraphBuilderNode> for GraphNode<u32> {
-    fn from(node: GraphBuilderNode) -> Self {
+impl From<&GraphBuilderNode> for GraphNode<u32> {
+    fn from(node: &GraphBuilderNode) -> Self {
         GraphNode {
             id: node.id,
             neighbors: node.neighbors.values().copied().collect(),
@@ -59,16 +63,42 @@ impl From<GraphBuilderNode> for GraphNode<u32> {
     }
 }
 
-pub struct GraphBuilder {
+pub struct GraphBuilder<V: VectorStorage<f32>> {
     nodes: BTreeMap<u32, GraphBuilderNode>,
-    vectors: Box<dyn VectorStorage<f32>>
+    vectors: V,
+
+    dist_fn: Box<DistanceFunc>,
 }
 
-impl GraphBuilder {
-    pub fn new(vectors: Box<dyn VectorStorage<f32>>) -> Self {
+impl<V: VectorStorage<f32>> Graph<u32, f32> for GraphBuilder<V> {
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>> {
+        let node = self.nodes.get(&key)?;
+        Some(Box::new(node.neighbors.values().into_iter().copied()))
+    }
+
+    fn distance_to(&self, query: &[f32], key: u32) -> f32 {
+        let vec = self.vectors.get(key as usize);
+        (self.dist_fn)(query, vec)
+    }
+
+    fn distance_between(&self, a: u32, b: u32) -> f32 {
+        let from_vec = self.vectors.get(a as usize);
+        let to_vec = self.vectors.get(b as usize);
+        (self.dist_fn)(from_vec, to_vec)
+    }
+}
+
+impl<V: VectorStorage<f32>> GraphBuilder<V> {
+    /// Build from a [VectorStorage].
+    pub fn new(vectors: V) -> Self {
         Self {
             nodes: BTreeMap::new(),
             vectors,
+            dist_fn: MetricType::L2.func().into(),
         }
     }
 
@@ -79,14 +109,30 @@ impl GraphBuilder {
 
     /// Connect from one node to another.
     pub fn connect(&mut self, from: u32, to: u32) -> Result<()> {
-        let from = self.nodes.get_mut(&from).unwrap();
-        
-        from.neighbors.insert(to);
+        let distance: OrderedFloat = self.distance_between(from, to).into();
+
+        {
+            let from_node = self.nodes.get_mut(&from).ok_or_else(|| Error::Index {
+                message: format!("Node {} not found", from),
+                location: location!(),
+            })?;
+            from_node.neighbors.insert(distance, to);
+        }
+
+        {
+            let to_node = self.nodes.get_mut(&to).ok_or_else(|| Error::Index {
+                message: format!("Node {} not found", to),
+                location: location!(),
+            })?;
+            to_node.neighbors.insert(distance, from);
+        }
         Ok(())
     }
 
     /// Bidirectionally connect two nodes.
     pub fn bi_connect(&mut self, from: u32, to: u32) -> Result<()> {
+        let distance: OrderedFloat = self.distance_between(from, to).into();
+
         self.connect(from, to)?;
         self.connect(to, from)
     }
@@ -94,8 +140,13 @@ impl GraphBuilder {
     pub fn prune(&mut self, node: u32, max_edges: usize) {}
 
     /// Build the Graph.
-    pub fn build(self) -> Graph {
-        Graph::from_nodes(self.nodes.iter().map(|(id, node)| (id, node.into())).collect())
+    pub fn build(self) -> Box<dyn Graph> {
+        Box::new(InMemoryGraph::from_nodes(
+            self.nodes
+                .iter()
+                .map(|(&id, node)| (id, node.into()))
+                .collect(),
+        ))
     }
 }
 
@@ -103,12 +154,19 @@ impl GraphBuilder {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
+    use arrow_array::{types::Float32Type, Float32Array};
+    use lance_linalg::MatrixView;
+
     #[test]
     fn test_builder() {
-        let mut builder = GraphBuilder::new();
+        let arr = Float32Array::from_iter_values((0..120).map(|v| v as f32));
+        let mat = MatrixView::<Float32Type>::new(Arc::new(arr), 8);
+        let mut builder = GraphBuilder::new(mat);
         builder.insert(0);
         builder.insert(1);
-        builder.connect(0, 1);
+        builder.connect(0, 1).unwrap();
         let graph = builder.build();
         assert_eq!(graph.len(), 2);
     }

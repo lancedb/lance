@@ -12,27 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow_array::types::Float32Type;
+use lance_arrow::ArrowFloatType;
 use num_traits::Float;
 
 use lance_linalg::MatrixView;
 
 pub trait VectorStorage<T: Float> {
-    fn index(&self, idx: usize) -> &[T];
+    fn get(&self, idx: usize) -> &[T];
 }
 
-pub struct InMemoryVectorStorage {
-    data: MatrixView<Float32Type>,
-}
-
-impl InMemoryVectorStorage {
-    pub fn new(data: MatrixView<Float32Type>) -> Self {
-        Self { data }
-    }
-}
-
-impl VectorStorage<f32> for InMemoryVectorStorage {
-    fn index(&self, idx: usize) -> &[f32] {
-        self.data.row(idx).unwrap()
+impl<T: ArrowFloatType> VectorStorage<T::Native> for MatrixView<T> {
+    fn get(&self, idx: usize) -> &[T::Native] {
+        self.row(idx).unwrap()
     }
 }
