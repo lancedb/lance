@@ -137,7 +137,14 @@ impl<V: VectorStorage<f32>> GraphBuilder<V> {
         self.connect(to, from)
     }
 
-    pub fn prune(&mut self, node: u32, max_edges: usize) {}
+    pub fn prune(&mut self, node: u32, max_edges: usize) -> Result<()> {
+        let node = self.nodes.get_mut(&node).ok_or_else(|| Error::Index {
+            message: format!("Node {} not found", node),
+            location: location!(),
+        })?;
+        node.prune(max_edges);
+        Ok(())
+    }
 
     /// Build the Graph.
     pub fn build(self) -> Box<dyn Graph> {
