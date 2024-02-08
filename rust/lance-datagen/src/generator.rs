@@ -2,14 +2,16 @@ use std::{iter, marker::PhantomData, sync::Arc};
 
 use arrow::{
     array::ArrayData,
-    buffer::{BooleanBuffer, Buffer, OffsetBuffer},
+    buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer},
+    datatypes::ArrowPrimitiveType,
 };
 use arrow_array::{
     make_array,
     types::{ArrowDictionaryKeyType, BinaryType, ByteArrayType, Utf8Type},
-    Array, FixedSizeBinaryArray, FixedSizeListArray, RecordBatch, RecordBatchReader, StringArray,
+    Array, FixedSizeBinaryArray, FixedSizeListArray, PrimitiveArray, RecordBatch,
+    RecordBatchReader, StringArray, StructArray,
 };
-use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Field, Fields, Schema, SchemaRef};
 use rand::{Rng, RngCore, SeedableRng};
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -503,6 +505,52 @@ impl ArrayGenerator for RandomBooleanGenerator {
     }
 }
 
+// Instead of using the "standard distribution" and generating values there are some cases (e.g. f16 / decimal)
+// where we just generate random bytes because there is no rand support
+pub struct RandomBytesGenerator<T: ArrowPrimitiveType + Send + Sync> {
+    phantom: PhantomData<T>,
+    data_type: DataType,
+}
+
+impl<T: ArrowPrimitiveType + Send + Sync> RandomBytesGenerator<T> {
+    fn new(data_type: DataType) -> Self {
+        Self {
+            phantom: Default::default(),
+            data_type,
+        }
+    }
+
+    fn byte_width() -> Result<u64, ArrowError> {
+        T::DATA_TYPE.primitive_width().ok_or_else(|| ArrowError::InvalidArgumentError(format!("Cannot generate the data type {} with the RandomBytesGenerator because it is not a fixed-width bytes type", T::DATA_TYPE))).map(|val| val as u64)
+    }
+}
+
+impl<T: ArrowPrimitiveType + Send + Sync> ArrayGenerator for RandomBytesGenerator<T> {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let num_bytes = length.0 * Self::byte_width()?;
+        let mut bytes = vec![0; num_bytes as usize];
+        rng.fill_bytes(&mut bytes);
+        let bytes = ScalarBuffer::new(Buffer::from(bytes), 0, length.0 as usize);
+        Ok(Arc::new(
+            PrimitiveArray::<T>::new(bytes, None).with_data_type(self.data_type.clone()),
+        ))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        // We can't say 1/8th of a byte and 1 byte would be a pretty extreme over-count so let's leave
+        // it at None until someone needs this.  Then we can probably special case this (e.g. make a ByteCount::ONE_BIT)
+        Self::byte_width().map(ByteCount::from).ok()
+    }
+}
+
 pub struct RandomBinaryGenerator {
     bytes_per_element: ByteCount,
     scale_to_utf8: bool,
@@ -773,6 +821,51 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> ArrayGenerator for DictionaryGener
     }
 }
 
+struct RandomStructGenerator {
+    fields: Fields,
+    data_type: DataType,
+    child_gens: Vec<Box<dyn ArrayGenerator>>,
+}
+
+impl RandomStructGenerator {
+    fn new(fields: Fields, child_gens: Vec<Box<dyn ArrayGenerator>>) -> Self {
+        let data_type = DataType::Struct(fields.clone());
+        Self {
+            fields,
+            data_type,
+            child_gens,
+        }
+    }
+}
+
+impl ArrayGenerator for RandomStructGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let child_arrays = self
+            .child_gens
+            .iter_mut()
+            .map(|gen| gen.generate(length, rng))
+            .collect::<Result<Vec<_>, ArrowError>>()?;
+        let struct_arr = StructArray::new(self.fields.clone(), child_arrays, None);
+        Ok(Arc::new(struct_arr))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        let mut sum = 0;
+        for child_gen in &self.child_gens {
+            sum += child_gen.element_size_bytes()?.0;
+        }
+        Some(ByteCount::from(sum))
+    }
+}
+
 /// A RecordBatchReader that generates batches of the given size from the given array generators
 pub struct FixedSizeBatchGenerator {
     rng: rand_xoshiro::Xoshiro256PlusPlus,
@@ -968,15 +1061,18 @@ const MS_PER_DAY: i64 = 86400000;
 pub mod array {
 
     use arrow_array::types::{
-        ArrowPrimitiveType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        ArrowPrimitiveType, Decimal128Type, Decimal256Type, DurationMicrosecondType,
+        DurationMillisecondType, DurationNanosecondType, DurationSecondType, Float16Type,
+        Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, IntervalDayTimeType,
+        IntervalMonthDayNanoType, IntervalYearMonthType, UInt16Type, UInt32Type, UInt64Type,
+        UInt8Type,
     };
     use arrow_array::{
         ArrowNativeTypeOp, Date32Array, Date64Array, PrimitiveArray, Time32MillisecondArray,
         Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
         TimestampMicrosecondArray, TimestampNanosecondArray, TimestampSecondArray,
     };
-    use arrow_schema::TimeUnit;
+    use arrow_schema::{Fields, IntervalUnit, TimeUnit};
     use chrono::Utc;
     use rand::distributions::Uniform;
     use rand::prelude::Distribution;
@@ -1219,6 +1315,12 @@ pub mod array {
         Box::<PseduoUuidHexGenerator>::default()
     }
 
+    pub fn rand_primitive<T: ArrowPrimitiveType + Send + Sync>(
+        data_type: DataType,
+    ) -> Box<dyn ArrayGenerator> {
+        Box::new(RandomBytesGenerator::<T>::new(data_type))
+    }
+
     /// Create a generator of randomly sampled date32 values
     ///
     /// Instead of sampling the entire range, all values will be drawn from the last year as this
@@ -1321,16 +1423,6 @@ pub mod array {
         rand_timestamp_in_range(one_year_ago, now, data_type)
     }
 
-    pub fn rand_duration(data_type: &DataType) -> Box<dyn ArrayGenerator> {
-        let data_type_clone = data_type.clone();
-        Box::new(WrappedGenerator {
-            generator: rand::<Int64Type>(),
-            data_type: data_type.clone(),
-            element_size_bytes: Some(ByteCount(8)),
-            wrap_fn: Box::new(move |array| arrow_cast::cast(&array, &data_type_clone)),
-        })
-    }
-
     /// Create a generator of randomly sampled date64 values
     ///
     /// Instead of sampling the entire range, all values will be drawn from the last year as this
@@ -1374,6 +1466,14 @@ pub mod array {
         Box::<RandomBooleanGenerator>::default()
     }
 
+    pub fn rand_struct(fields: Fields) -> Box<dyn ArrayGenerator> {
+        let child_gens = fields
+            .iter()
+            .map(|f| rand_type(f.data_type()))
+            .collect::<Vec<_>>();
+        Box::new(RandomStructGenerator::new(fields, child_gens))
+    }
+
     /// Create a generator of random values
     pub fn rand_type(data_type: &DataType) -> Box<dyn ArrayGenerator> {
         match data_type {
@@ -1386,8 +1486,11 @@ pub mod array {
             DataType::UInt16 => rand::<UInt16Type>(),
             DataType::UInt32 => rand::<UInt32Type>(),
             DataType::UInt64 => rand::<UInt64Type>(),
+            DataType::Float16 => rand_primitive::<Float16Type>(data_type.clone()),
             DataType::Float32 => rand::<Float32Type>(),
             DataType::Float64 => rand::<Float64Type>(),
+            DataType::Decimal128(_, _) => rand_primitive::<Decimal128Type>(data_type.clone()),
+            DataType::Decimal256(_, _) => rand_primitive::<Decimal256Type>(data_type.clone()),
             DataType::Utf8 => rand_utf8(ByteCount::from(12)),
             DataType::Binary => rand_varbin(ByteCount::from(12)),
             DataType::Dictionary(key_type, value_type) => {
@@ -1397,12 +1500,23 @@ pub mod array {
                 rand_type(child.data_type()),
                 Dimension::from(*dimension as u32),
             ),
+            DataType::Duration(unit) => match unit {
+                TimeUnit::Second => rand::<DurationSecondType>(),
+                TimeUnit::Millisecond => rand::<DurationMillisecondType>(),
+                TimeUnit::Microsecond => rand::<DurationMicrosecondType>(),
+                TimeUnit::Nanosecond => rand::<DurationNanosecondType>(),
+            },
+            DataType::Interval(unit) => match unit {
+                IntervalUnit::DayTime => rand::<IntervalDayTimeType>(),
+                IntervalUnit::MonthDayNano => rand::<IntervalMonthDayNanoType>(),
+                IntervalUnit::YearMonth => rand::<IntervalYearMonthType>(),
+            },
             DataType::Date32 => rand_date32(),
             DataType::Date64 => rand_date64(),
             DataType::Time32(resolution) => rand_time32(resolution),
             DataType::Time64(resolution) => rand_time64(resolution),
             DataType::Timestamp(_, _) => rand_timestamp(data_type),
-            DataType::Duration(_) => rand_duration(data_type),
+            DataType::Struct(fields) => rand_struct(fields.clone()),
             _ => unimplemented!("random generation of {}", data_type),
         }
     }
