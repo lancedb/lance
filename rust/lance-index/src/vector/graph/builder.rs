@@ -63,8 +63,13 @@ impl From<&GraphBuilderNode> for GraphNode<u32> {
     }
 }
 
+/// Graph Builder.
+///
+///
 pub struct GraphBuilder<V: VectorStorage<f32>> {
     nodes: BTreeMap<u32, GraphBuilderNode>,
+
+    /// Storage for vectors.
     vectors: V,
 
     dist_fn: Box<DistanceFunc>,
@@ -176,5 +181,8 @@ mod tests {
         builder.connect(0, 1).unwrap();
         let graph = builder.build();
         assert_eq!(graph.len(), 2);
+
+        assert_eq!(graph.neighbors(0).unwrap().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(graph.neighbors(1).unwrap().collect::<Vec<_>>(), vec![0]);
     }
 }
