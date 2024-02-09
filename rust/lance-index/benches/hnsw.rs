@@ -59,7 +59,7 @@ criterion_group!(
         .measurement_time(Duration::from_secs(10))
         .sample_size(32)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_argmin);
+    targets = bench_hnsw);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
