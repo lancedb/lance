@@ -12,21 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Generic Graph implementations.
+//! Generic Graph implementation.
 //!
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
+use lance_arrow::FloatToArrayType;
 use lance_core::Result;
-use num_traits::{Float, PrimInt};
+use lance_linalg::distance::{Cosine, DistanceFunc, Dot, MetricType, L2};
+use num_traits::{AsPrimitive, Float, PrimInt};
 
 pub(crate) mod builder;
 mod storage;
 
-pub trait VectorStore {
-    fn index(&self, idx: usize) -> &[f32];
-}
+use storage::VectorStorage;
 
 pub struct GraphNode<I = u32> {
     pub id: I,
@@ -117,8 +117,11 @@ pub trait Graph<K: PrimInt = u32, T: Float = f32> {
 /// ----------------
 /// I : Vertex Index type
 /// V : the data type of vector, i.e., ``f32`` or ``f16``.
-struct InMemoryGraph<I: PrimInt + Hash = u32, T: Float = f32> {
+struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType, V: storage::VectorStorage<T>> {
     pub nodes: HashMap<I, GraphNode<I>>,
+    vectors: V,
+    metric_type: MetricType,
+    dist_fn: Box<DistanceFunc<T>>,
     phantom: std::marker::PhantomData<T>,
 }
 
@@ -178,7 +181,9 @@ pub(crate) fn beam_search<I: PrimInt + Hash>(
     Ok(results)
 }
 
-impl<I: PrimInt + Hash, T: Float> Graph<I, T> for InMemoryGraph<I, T> {
+impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType, V: storage::VectorStorage<T>>
+    Graph<I, T> for InMemoryGraph<I, T, V>
+{
     fn neighbors(&self, key: I) -> Option<Box<dyn Iterator<Item = I> + '_>> {
         self.nodes
             .get(&key)
@@ -186,11 +191,13 @@ impl<I: PrimInt + Hash, T: Float> Graph<I, T> for InMemoryGraph<I, T> {
     }
 
     fn distance_to(&self, query: &[T], idx: I) -> f32 {
-        todo!()
+        let vec = self.vectors.get(idx.as_());
+        (self.dist_fn)(query, vec)
     }
 
     fn distance_between(&self, a: I, b: I) -> f32 {
-        todo!()
+        let from_vec = self.vectors.get(a.as_());
+        self.distance_to(from_vec, b)
     }
 
     fn len(&self) -> usize {
@@ -198,10 +205,16 @@ impl<I: PrimInt + Hash, T: Float> Graph<I, T> for InMemoryGraph<I, T> {
     }
 }
 
-impl<I: PrimInt + Hash, T: Float> InMemoryGraph<I, T> {
-    fn from_nodes(nodes: HashMap<I, GraphNode<I>>) -> Self {
+impl<I: PrimInt + Hash, T: FloatToArrayType, V: VectorStorage<T>> InMemoryGraph<I, T, V>
+where
+    T::ArrowType: L2 + Cosine + Dot,
+{
+    fn from_builder(nodes: HashMap<I, GraphNode<I>>, vectors: V, metric_type: MetricType) -> Self {
         Self {
             nodes,
+            vectors,
+            metric_type,
+            dist_fn: metric_type.func::<T>().into(),
             phantom: std::marker::PhantomData,
         }
     }

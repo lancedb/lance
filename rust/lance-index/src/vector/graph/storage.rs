@@ -17,7 +17,7 @@ use num_traits::Float;
 
 use lance_linalg::MatrixView;
 
-pub trait VectorStorage<T: Float> {
+pub trait VectorStorage<T: Float>: Clone {
     fn get(&self, idx: usize) -> &[T];
 }
 

@@ -56,7 +56,7 @@ impl GraphBuilderNode {
 
 impl From<&GraphBuilderNode> for GraphNode<u32> {
     fn from(node: &GraphBuilderNode) -> Self {
-        GraphNode {
+        Self {
             id: node.id,
             neighbors: node.neighbors.values().copied().collect(),
         }
@@ -72,7 +72,9 @@ pub struct GraphBuilder<V: VectorStorage<f32>> {
     /// Storage for vectors.
     vectors: V,
 
-    dist_fn: Box<DistanceFunc>,
+    metric_type: MetricType,
+
+    dist_fn: Box<DistanceFunc<f32>>,
 }
 
 impl<V: VectorStorage<f32>> Graph<u32, f32> for GraphBuilder<V> {
@@ -97,14 +99,22 @@ impl<V: VectorStorage<f32>> Graph<u32, f32> for GraphBuilder<V> {
     }
 }
 
-impl<V: VectorStorage<f32>> GraphBuilder<V> {
+impl<V: VectorStorage<f32> + 'static> GraphBuilder<V> {
     /// Build from a [VectorStorage].
     pub fn new(vectors: V) -> Self {
         Self {
             nodes: BTreeMap::new(),
             vectors,
-            dist_fn: MetricType::L2.func().into(),
+            dist_fn: Box::new(MetricType::L2.func::<f32>() as DistanceFunc<f32>),
+            metric_type: MetricType::L2,
         }
+    }
+
+    /// Set metric type
+    pub fn metric_type(mut self, metric_type: MetricType) -> Self {
+        self.metric_type = metric_type;
+        self.dist_fn = Box::new(metric_type.func() as DistanceFunc<f32>);
+        self
     }
 
     /// Insert a node into the graph.
@@ -153,11 +163,13 @@ impl<V: VectorStorage<f32>> GraphBuilder<V> {
 
     /// Build the Graph.
     pub fn build(self) -> Box<dyn Graph> {
-        Box::new(InMemoryGraph::from_nodes(
+        Box::new(InMemoryGraph::from_builder(
             self.nodes
                 .iter()
                 .map(|(&id, node)| (id, node.into()))
                 .collect(),
+            self.vectors.clone(),
+            self.metric_type,
         ))
     }
 }
