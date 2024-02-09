@@ -16,7 +16,7 @@
 //!
 //!
 
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use arrow_array::types::Float32Type;
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -27,19 +27,43 @@ use lance_index::vector::hnsw::builder::HNSWBuilder;
 use lance_linalg::MatrixView;
 use lance_testing::datagen::generate_random_array_with_seed;
 
+fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
+    let mut dists = vec![];
+    for i in 0..mat.num_rows() {
+        let dist = lance_linalg::distance::l2_distance(query, mat.row(i).unwrap());
+        dists.push((dist, i as u32));
+    }
+    dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    dists.truncate(k);
+    dists.into_iter().map(|(_, i)| i).collect()
+}
+
 fn bench_hnsw(c: &mut Criterion) {
     const DIMENSION: usize = 1024;
     const TOTAL: usize = 65536;
     const SEED: [u8; 32] = [42; 32];
+    const K: usize = 10;
 
     let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
     let mat = MatrixView::<Float32Type>::new(data.into(), DIMENSION);
 
-    c.bench_function("create_hnsw(65535x1024)", |b| {
+    let query = mat.row(0).unwrap();
+    let gt = ground_truth(&mat, query, 10);
+    c.bench_function("create_hnsw(65535x1024,levels=4)", |b| {
         b.iter(|| {
             let hnsw = HNSWBuilder::new(mat.clone()).max_level(4).build().unwrap();
-            let uids = hnsw.search(mat.row(0).unwrap(), 10, 30).unwrap();
-            assert_eq!(uids.len(), 10);
+            let uids: HashSet<u32> = hnsw
+                .search(query, K, 300)
+                .unwrap()
+                .iter()
+                .map(|(i, _)| *i)
+                .collect();
+
+            assert_eq!(uids.len(), K);
+            println!(
+                "Recall = {:?}",
+                uids.intersection(&gt).count() as f32 / K as f32
+            );
         })
     });
 }

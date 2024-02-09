@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::min;
 use std::sync::Arc;
 
 use lance_linalg::distance::MetricType;
@@ -19,8 +20,7 @@ use rand::{thread_rng, Rng};
 
 use super::super::graph::beam_search;
 use super::{select_neighbors, HNSW};
-use crate::vector::graph::Graph;
-use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage};
+use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage, Graph};
 use lance_core::Result;
 
 /// Build a HNSW graph.
@@ -96,7 +96,10 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
     fn random_level(&self) -> u16 {
         let mut rng = thread_rng();
         let r = rng.gen::<f32>();
-        (-r.ln() * self.m_level_decay).floor() as u16
+        min(
+            (-r.ln() * self.m_level_decay).floor() as u16,
+            self.max_level,
+        )
     }
 
     /// Insert one node.
