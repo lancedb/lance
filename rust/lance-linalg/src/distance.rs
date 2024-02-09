@@ -34,7 +34,6 @@ pub use dot::*;
 pub use l2::*;
 use lance_arrow::FloatToArrayType;
 pub use norm_l2::*;
-use num_traits::Float;
 
 use crate::Result;
 

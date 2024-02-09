@@ -62,7 +62,7 @@ pub trait SerializeToLance {
 /// A wrapper for f32 to make it ordered, so that we can put it into
 /// a BTree or Heap
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub(crate) struct OrderedFloat(f32);
+pub(super) struct OrderedFloat(f32);
 
 impl PartialOrd for OrderedFloat {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -81,6 +81,12 @@ impl Ord for OrderedFloat {
 impl From<f32> for OrderedFloat {
     fn from(f: f32) -> Self {
         Self(f)
+    }
+}
+
+impl From<OrderedFloat> for f32 {
+    fn from(f: OrderedFloat) -> Self {
+        f.0
     }
 }
 
@@ -120,7 +126,6 @@ pub trait Graph<K: PrimInt = u32, T: Float = f32> {
 struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType, V: storage::VectorStorage<T>> {
     pub nodes: HashMap<I, GraphNode<I>>,
     vectors: V,
-    metric_type: MetricType,
     dist_fn: Box<DistanceFunc<T>>,
     phantom: std::marker::PhantomData<T>,
 }
@@ -142,7 +147,7 @@ struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType, V: storage::VectorS
 /// -------
 /// A sorted list of ``(dist, node_id)`` pairs.
 ///
-pub(crate) fn beam_search<I: PrimInt + Hash>(
+pub(super) fn beam_search<I: PrimInt + Hash>(
     graph: &dyn Graph<I>,
     start: &[I],
     query: &[f32],
@@ -213,7 +218,6 @@ where
         Self {
             nodes,
             vectors,
-            metric_type,
             dist_fn: metric_type.func::<T>().into(),
             phantom: std::marker::PhantomData,
         }
@@ -221,5 +225,4 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-}
+mod tests {}

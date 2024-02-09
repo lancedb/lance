@@ -104,17 +104,15 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
         for cur_level in self.levels.iter().rev().take(levels_to_search) {
             let candidates = beam_search(cur_level, &ep, vector, 1)?;
             let neighbours = select_neighbors(&candidates, 1);
-            assert!(neighbours.len() == 1);
-            ep = vec![neighbours[0]];
+            ep = neighbours.map(|(_, id)| id).collect();
         }
-
         for cur_level in self.levels.iter_mut().rev().take(levels_to_search) {
             let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
-            let neighbours = select_neighbors(&candidates, self.m_max);
-            for nb in neighbours.iter() {
+            let neighbours = select_neighbors(&candidates, self.m_max).collect::<Vec<_>>();
+            for (_, nb) in neighbours.iter() {
                 cur_level.connect(node, *nb)?;
             }
-            for nb in neighbours {
+            for (_, nb) in neighbours {
                 cur_level.prune(nb, self.m_max)?;
             }
             ep = candidates.values().copied().collect::<Vec<_>>();
