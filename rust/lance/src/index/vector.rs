@@ -28,6 +28,7 @@ pub mod pq;
 mod traits;
 mod utils;
 
+use arrow_array::FixedSizeListArray;
 use lance_index::vector::{ivf::IvfBuildParams, pq::PQBuildParams};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
@@ -313,6 +314,24 @@ pub(crate) async fn open_vector_index(
                         location: location!(),
                     });
                 }
+
+                let data = FixedSizeListArray::try_from(ivf_pb.centroids_tensor.as_ref().unwrap())?;
+                // train a PQ model on the IVF
+                let pq_param = PQBuildParams {
+                    // TODO: calculate the number of sub-vectors based on the dimensions of centroids
+                    num_sub_vectors: (data.value_length() / 16) as usize,
+                    num_bits: 8,
+                    use_opq: false,
+                    max_iters: 100,
+                    max_opq_iters: 0,
+                    codebook: None,
+                    sample_rate: 256,
+                };
+
+                let pq = pq_param.build(&data, MetricType::Cosine).await?;
+                let ivf_centroids_pq_codes = pq.transform(&data).await?;
+                log::info!("built pq model from ivf centroids tensor.");
+
                 let ivf = Ivf::try_from(ivf_pb)?;
                 last_stage = Some(Arc::new(IVFIndex::try_new(
                     dataset.session.clone(),
@@ -321,6 +340,8 @@ pub(crate) async fn open_vector_index(
                     reader.clone(),
                     last_stage.unwrap(),
                     metric_type,
+                    pq,
+                    ivf_centroids_pq_codes,
                 )?));
             }
             Some(Stage::Pq(pq_proto)) => {
