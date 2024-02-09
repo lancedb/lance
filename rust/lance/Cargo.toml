@@ -93,7 +93,7 @@ openblas-src = { version = "0.10.8", default-features = false, features = [
 ], optional = true }
 
 # Need this so we can prevent dynamic linking in binaries (see cli feature)
-lzma-sys = { version = "*" }
+lzma-sys = { version = "0.1" }
 
 [build-dependencies]
 prost-build.workspace = true
