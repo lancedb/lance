@@ -12,29 +12,59 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Generic Graph implementation.
+//! HNSW graph implementation.
+//!
+//! Hierarchical Navigable Small World (HNSW).
 //!
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use lance_core::Result;
+use lance_linalg::distance::MetricType;
 
 use super::graph::{Graph, OrderedFloat};
+use crate::vector::graph::beam_search;
 
 pub mod builder;
 
 pub struct HNSW {
-    pub layers: Vec<Box<dyn Graph>>,
-    pub entry: u32,
+    layers: Vec<Arc<dyn Graph>>,
+    metric_type: MetricType,
+    entry_point: u32,
+}
+
+impl HNSW {
+    fn from_builder(
+        layers: Vec<Arc<dyn Graph>>,
+        entry_point: u32,
+        metric_type: MetricType,
+    ) -> Self {
+        Self {
+            layers,
+            metric_type,
+            entry_point,
+        }
+    }
+
+    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<u32>> {
+        let mut ep = vec![self.entry_point];
+        let num_layers = self.layers.len();
+        for layer in self.layers.iter().rev().take(num_layers - 1) {
+            let candidates = beam_search(layer.as_ref(), &ep, query, 1)?;
+            ep = select_neighbors(&candidates, 1);
+        }
+        let candidates = beam_search(self.layers[0].as_ref(), &ep, query, ef)?;
+        Ok(select_neighbors(&candidates, k))
+    }
 }
 
 /// Select neighbors from the ordered candidate list.
 /// Algorithm 3 in the HNSW paper.
-fn select_neighbors(
-    orderd_candidates: &BTreeMap<OrderedFloat, u32>,
-    k: usize,
-) -> Vec<(OrderedFloat, u32)> {
+fn select_neighbors(orderd_candidates: &BTreeMap<OrderedFloat, u32>, k: usize) -> Vec<u32> {
     orderd_candidates
         .iter()
         .take(k)
-        .map(|(&d, &id)| (d, id))
+        .map(|(_, id)| *id)
         .collect()
 }

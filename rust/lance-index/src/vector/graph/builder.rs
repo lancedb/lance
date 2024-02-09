@@ -144,14 +144,6 @@ impl<V: VectorStorage<f32> + 'static> GraphBuilder<V> {
         Ok(())
     }
 
-    /// Bidirectionally connect two nodes.
-    pub fn bi_connect(&mut self, from: u32, to: u32) -> Result<()> {
-        let distance: OrderedFloat = self.distance_between(from, to).into();
-
-        self.connect(from, to)?;
-        self.connect(to, from)
-    }
-
     pub fn prune(&mut self, node: u32, max_edges: usize) -> Result<()> {
         let node = self.nodes.get_mut(&node).ok_or_else(|| Error::Index {
             message: format!("Node {} not found", node),

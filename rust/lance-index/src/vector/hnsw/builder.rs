@@ -105,16 +105,16 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
             let candidates = beam_search(cur_level, &ep, vector, 1)?;
             let neighbours = select_neighbors(&candidates, 1);
             assert!(neighbours.len() == 1);
-            ep = vec![neighbours[0].1];
+            ep = vec![neighbours[0]];
         }
 
         for cur_level in self.levels.iter_mut().rev().take(levels_to_search) {
             let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
             let neighbours = select_neighbors(&candidates, self.m_max);
-            for (dist, nb) in neighbours.iter() {
-                cur_level.bi_connect(node, *nb)?;
+            for nb in neighbours.iter() {
+                cur_level.connect(node, *nb)?;
             }
-            for (_, nb) in neighbours {
+            for nb in neighbours {
                 cur_level.prune(nb, self.m_max)?;
             }
             ep = candidates.values().copied().collect::<Vec<_>>();
@@ -125,22 +125,30 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
                 GraphBuilder::<V>::new(self.vectors.clone()).metric_type(self.metric_type);
             level.insert(node);
             self.levels.push(level);
+            self.entry_point = node;
         }
 
         Ok(())
     }
 
-    pub fn build(&mut self) -> HNSW {
+    pub fn build(&mut self) -> Result<HNSW> {
         let mut levels = Vec::with_capacity(self.max_level as usize);
         let level = GraphBuilder::<V>::new(self.vectors.clone()).metric_type(self.metric_type);
         levels.push(level);
-        let mut entry_point = 0;
-        let mut max_level = 0;
         levels.get_mut(0).unwrap().insert(0);
 
         for i in 1..self.vectors.len() {
-            self.insert(i as u32);
+            self.insert(i as u32)?;
         }
-        unimplemented!()
+
+        let graphs = levels
+            .into_iter()
+            .map(|l| l.build().into())
+            .collect::<Vec<_>>();
+        Ok(HNSW::from_builder(
+            graphs,
+            self.entry_point,
+            self.metric_type,
+        ))
     }
 }
