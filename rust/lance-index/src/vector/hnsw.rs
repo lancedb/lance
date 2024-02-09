@@ -28,6 +28,10 @@ use crate::vector::graph::beam_search;
 
 pub mod builder;
 
+pub use builder::HNSWBuilder;
+
+/// HNSW graph.
+///
 pub struct HNSW {
     layers: Vec<Arc<dyn Graph>>,
     metric_type: MetricType,
@@ -70,6 +74,7 @@ impl HNSW {
     ///    The size of dynamic candidate list
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<(u32, f32)>> {
         let mut ep = vec![self.entry_point];
+        println!("Search ep: {:?}", ep);
         let num_layers = self.layers.len();
         for layer in self.layers.iter().rev().take(num_layers - 1) {
             let candidates = beam_search(layer.as_ref(), &ep, query, 1)?;
@@ -83,10 +88,61 @@ impl HNSW {
 }
 
 /// Select neighbors from the ordered candidate list.
+///
 /// Algorithm 3 in the HNSW paper.
 fn select_neighbors(
     orderd_candidates: &BTreeMap<OrderedFloat, u32>,
     k: usize,
 ) -> impl Iterator<Item = (OrderedFloat, u32)> + '_ {
     orderd_candidates.iter().take(k).map(|(&d, &u)| (d, u))
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::types::Float32Type;
+    use lance_testing::datagen::generate_random_array;
+
+    use super::*;
+
+    use super::super::graph::OrderedFloat;
+    use lance_linalg::matrix::MatrixView;
+
+    #[test]
+    fn test_select_neighbors() {
+        let candidates: BTreeMap<OrderedFloat, u32> =
+            (1..6).map(|i| (OrderedFloat(i as f32), i)).collect();
+
+        let result = select_neighbors(&candidates, 3).collect::<Vec<_>>();
+        assert_eq!(
+            result,
+            vec![
+                (OrderedFloat(1.0), 1),
+                (OrderedFloat(2.0), 2),
+                (OrderedFloat(3.0), 3)
+            ]
+        );
+
+        assert_eq!(select_neighbors(&candidates, 0).collect::<Vec<_>>(), vec![]);
+
+        assert_eq!(
+            select_neighbors(&candidates, 8).collect::<Vec<_>>(),
+            vec![
+                (OrderedFloat(1.0), 1),
+                (OrderedFloat(2.0), 2),
+                (OrderedFloat(3.0), 3),
+                (OrderedFloat(4.0), 4),
+                (OrderedFloat(5.0), 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_hnsw() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 512;
+        let data = generate_random_array(TOTAL * DIM);
+        let mat = MatrixView::<Float32Type>::new(data.into(), DIM);
+        let hnsw = HNSWBuilder::new(mat).ef_construction(50).build().unwrap();
+        assert_eq!(hnsw.layers.len(), 1);
+    }
 }

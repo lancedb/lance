@@ -62,7 +62,7 @@ pub trait SerializeToLance {
 /// A wrapper for f32 to make it ordered, so that we can put it into
 /// a BTree or Heap
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub(super) struct OrderedFloat(f32);
+pub(crate) struct OrderedFloat(pub f32);
 
 impl PartialOrd for OrderedFloat {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
