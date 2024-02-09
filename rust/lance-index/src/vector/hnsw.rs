@@ -62,13 +62,6 @@ impl HNSW {
         }
     }
 
-    /// Private stats
-    fn stats(&self) {
-        for (i, layer) in self.layers.iter().enumerate() {
-            println!("Layer {}: {}", i, layer.len());
-        }
-    }
-
     /// Search for the nearest neighbors of the query vector.
     ///
     /// Parameters

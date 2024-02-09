@@ -20,10 +20,12 @@ use std::time::Duration;
 
 use arrow_array::types::Float32Type;
 use criterion::{criterion_group, criterion_main, Criterion};
-use lance_linalg::MatrixView;
-use lance_testing::datagen::generate_random_array_with_seed;
+#[cfg(target_os = "linux")]
+use pprof::criterion::{Output, PProfProfiler};
 
 use lance_index::vector::hnsw::builder::HNSWBuilder;
+use lance_linalg::MatrixView;
+use lance_testing::datagen::generate_random_array_with_seed;
 
 fn bench_hnsw(c: &mut Criterion) {
     const DIMENSION: usize = 1024;
