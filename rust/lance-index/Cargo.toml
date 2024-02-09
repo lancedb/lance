@@ -67,3 +67,7 @@ harness = false
 [[bench]]
 name = "pq_dist_table"
 harness = false
+
+[[bench]]
+name = "hnsw"
+harness = false
