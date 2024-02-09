@@ -24,7 +24,7 @@ use lance_linalg::distance::{Cosine, DistanceFunc, Dot, MetricType, L2};
 use num_traits::{AsPrimitive, Float, PrimInt};
 
 pub(crate) mod builder;
-mod storage;
+pub(super) mod storage;
 
 use storage::VectorStorage;
 

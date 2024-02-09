@@ -20,6 +20,7 @@ use lance_linalg::distance::MetricType;
 
 pub mod flat;
 pub mod graph;
+pub mod hnsw;
 pub mod ivf;
 pub mod kmeans;
 pub mod pq;

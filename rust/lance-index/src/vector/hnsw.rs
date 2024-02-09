@@ -12,23 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use lance_arrow::ArrowFloatType;
-use num_traits::Float;
+//! Generic Graph implementation.
+//!
 
-use lance_linalg::MatrixView;
+use super::graph::Graph;
 
-pub trait VectorStorage<T: Float>: Clone {
-    fn len(&self) -> usize;
+mod builder;
 
-    fn get(&self, idx: usize) -> &[T];
-}
-
-impl<T: ArrowFloatType> VectorStorage<T::Native> for MatrixView<T> {
-    fn get(&self, idx: usize) -> &[T::Native] {
-        self.row(idx).unwrap()
-    }
-
-    fn len(&self) -> usize {
-        self.num_rows()
-    }
+pub struct HNSW {
+    pub layers: Vec<Box<dyn Graph>>,
+    pub entry: u32,
 }
