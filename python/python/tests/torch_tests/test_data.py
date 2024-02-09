@@ -87,6 +87,52 @@ def test_iter_over_dataset(tmp_path):
     assert total_rows == 4096
 
 
+def test_iter_filter(tmp_path):
+    arr = pa.array(range(1000))
+    tbl = pa.Table.from_arrays([arr], ["ids"])
+
+    ds = lance.write_dataset(tbl, tmp_path / "data.lance", max_rows_per_group=32)
+
+    def check(dataset):
+        total_rows = 0
+        for batch in dataset:
+            assert torch.where(batch >= 300, True, False).all()
+            total_rows += batch.size(dim=0)
+            assert batch.dtype == torch.int64
+        assert total_rows == 700
+
+    # No shard_grandularity
+    check(
+        LanceDataset(
+            ds,
+            batch_size=10,
+            filter="ids >= 300",
+            columns=["ids"],
+        )
+    )
+
+    # shard_grandularity fragment ok
+    check(
+        LanceDataset(
+            ds,
+            batch_size=10,
+            filter="ids >= 300",
+            columns=["ids"],
+            sampler=ShardedFragmentSampler(0, 1),
+        )
+    )
+
+    # sampling fails
+    with pytest.raises(ValueError):
+        LanceDataset(
+            ds,
+            batch_size=10,
+            filter="ids >= 300",
+            samples=100,
+            columns=["ids"],
+        )
+
+
 def test_sharded_torch_dataset(tmp_path):
     arr = pa.array(range(1000))
     tbl = pa.Table.from_arrays([arr], ["ids"])
