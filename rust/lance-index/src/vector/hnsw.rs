@@ -35,6 +35,7 @@ pub use builder::HNSWBuilder;
 pub struct HNSW {
     layers: Vec<Arc<dyn Graph>>,
     metric_type: MetricType,
+    /// Entry point of the graph.
     entry_point: u32,
 }
 
@@ -74,7 +75,6 @@ impl HNSW {
     ///    The size of dynamic candidate list
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<(u32, f32)>> {
         let mut ep = vec![self.entry_point];
-        println!("Search ep: {:?}", ep);
         let num_layers = self.layers.len();
         for layer in self.layers.iter().rev().take(num_layers - 1) {
             let candidates = beam_search(layer.as_ref(), &ep, query, 1)?;

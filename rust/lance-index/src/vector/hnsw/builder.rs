@@ -30,14 +30,19 @@ pub struct HNSWBuilder<V: VectorStorage<f32>> {
     /// max level of
     max_level: u16,
 
+    /// M_l parameter in the paper.
+    m_level_decay: f32,
+
     /// max number of connections ifor each element per layers.
     m_max: usize,
 
     /// Size of the dynamic list for the candidates
     ef_construction: usize,
 
+    /// Metric type to compute the distance.
     metric_type: MetricType,
 
+    /// Vector storage for the graph.
     vectors: V,
 
     levels: Vec<GraphBuilder<V>>,
@@ -49,12 +54,13 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
     pub fn new(vectors: V) -> Self {
         Self {
             max_level: 8,
-            m_max: 16,
+            m_max: 32,
             ef_construction: 100,
             metric_type: MetricType::L2,
             vectors,
             levels: vec![],
             entry_point: 0,
+            m_level_decay: 1.0 / 8_f32.ln(),
         }
     }
 
@@ -67,6 +73,7 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
     /// The maximum level of the graph.
     pub fn max_level(mut self, max_level: u16) -> Self {
         self.max_level = max_level;
+        self.m_level_decay = 1.0 / (max_level as f32).ln();
         self
     }
 
@@ -83,11 +90,13 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
         self
     }
 
+    /// new node's level
+    ///
+    /// See paper `Algorithm 1`
     fn random_level(&self) -> u16 {
         let mut rng = thread_rng();
         let r = rng.gen::<f32>();
-        let level = (-r.ln() * (self.max_level as f32)).floor() as u16;
-        level
+        (-r.ln() * self.m_level_decay).floor() as u16
     }
 
     /// Insert one node.
