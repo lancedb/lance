@@ -46,6 +46,9 @@ tracing-chrome = "0.7.1"
 tracing-subscriber = "0.3.17"
 tracing = "0.1.37"
 
+# Prevent dynamic linking of lzma, which comes from datafusion
+lzma-sys = { version = "*", features = ["static"] }
+
 [features]
 datagen = ["lance-datagen"]
 avx512fp16 = ["lance/avx512fp16"]
