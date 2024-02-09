@@ -154,7 +154,7 @@ impl<V: VectorStorage<f32> + 'static> GraphBuilder<V> {
     }
 
     /// Build the Graph.
-    pub fn build(self) -> Box<dyn Graph> {
+    pub fn build(&self) -> Box<dyn Graph> {
         Box::new(InMemoryGraph::from_builder(
             self.nodes
                 .iter()

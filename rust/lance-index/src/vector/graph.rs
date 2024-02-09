@@ -19,9 +19,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
 use lance_arrow::FloatToArrayType;
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_linalg::distance::{Cosine, DistanceFunc, Dot, MetricType, L2};
 use num_traits::{AsPrimitive, Float, PrimInt};
+use snafu::{location, Location};
 
 pub(crate) mod builder;
 pub(super) mod storage;
@@ -147,7 +148,7 @@ struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType, V: storage::VectorS
 /// -------
 /// A sorted list of ``(dist, node_id)`` pairs.
 ///
-pub(super) fn beam_search<I: PrimInt + Hash>(
+pub(super) fn beam_search<I: PrimInt + Hash + std::fmt::Display>(
     graph: &dyn Graph<I>,
     start: &[I],
     query: &[f32],
@@ -166,7 +167,11 @@ pub(super) fn beam_search<I: PrimInt + Hash>(
         if dist < furtherst {
             break;
         }
-        let neighbors = graph.neighbors(current).unwrap();
+        let neighbors = graph.neighbors(current).ok_or_else(|| Error::Index {
+            message: format!("Node {} does not exist in the graph", current),
+            location: location!(),
+        })?;
+
         for neighbor in neighbors {
             if visited.contains(&neighbor) {
                 continue;

@@ -62,6 +62,13 @@ impl HNSW {
         }
     }
 
+    /// Private stats
+    fn stats(&self) {
+        for (i, layer) in self.layers.iter().enumerate() {
+            println!("Layer {}: {}", i, layer.len());
+        }
+    }
+
     /// Search for the nearest neighbors of the query vector.
     ///
     /// Parameters
@@ -143,6 +150,7 @@ mod tests {
         let data = generate_random_array(TOTAL * DIM);
         let mat = MatrixView::<Float32Type>::new(data.into(), DIM);
         let hnsw = HNSWBuilder::new(mat).ef_construction(50).build().unwrap();
-        assert_eq!(hnsw.layers.len(), 1);
+        assert!(hnsw.layers.len() > 1);
+        assert_eq!(hnsw.layers[0].len(), 512);
     }
 }

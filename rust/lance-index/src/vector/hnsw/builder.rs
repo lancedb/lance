@@ -85,7 +85,9 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
 
     fn random_level(&self) -> u16 {
         let mut rng = thread_rng();
-        (rng.gen::<f32>().ln() * self.max_level as f32).floor() as u16
+        let r = rng.gen::<f32>();
+        let level = (-r.ln() * (self.max_level as f32)).floor() as u16;
+        level
     }
 
     /// Insert one node.
@@ -93,7 +95,11 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
         let vector = self.vectors.get(node as usize);
         let level = self.random_level();
 
-        let levels_to_search = self.levels.len() - level as usize;
+        let levels_to_search = if self.levels.len() > level as usize {
+            self.levels.len() - level as usize - 1
+        } else {
+            0
+        };
         let mut ep = vec![self.entry_point];
 
         //
@@ -105,11 +111,12 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
         //  }
         // ```
         for cur_level in self.levels.iter().rev().take(levels_to_search) {
-            let candidates = beam_search(cur_level, &ep, vector, 1)?;
+            let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
             let neighbours = select_neighbors(&candidates, 1);
             ep = neighbours.map(|(_, id)| id).collect();
         }
-        for cur_level in self.levels.iter_mut().rev().take(levels_to_search) {
+        for cur_level in self.levels.iter_mut().rev().skip(levels_to_search) {
+            cur_level.insert(node);
             let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
             let neighbours = select_neighbors(&candidates, self.m_max).collect::<Vec<_>>();
             for (_, nb) in neighbours.iter() {
@@ -121,11 +128,7 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
             ep = candidates.values().copied().collect::<Vec<_>>();
         }
 
-        while level > self.levels.len() as u16 {
-            let mut level =
-                GraphBuilder::<V>::new(self.vectors.clone()).metric_type(self.metric_type);
-            level.insert(node);
-            self.levels.push(level);
+        if level > self.levels.len() as u16 {
             self.entry_point = node;
         }
 
@@ -140,20 +143,22 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
             self.m_max,
             self.ef_construction
         );
-        let mut levels = Vec::with_capacity(self.max_level as usize);
-        let level = GraphBuilder::<V>::new(self.vectors.clone()).metric_type(self.metric_type);
-        levels.push(level);
-        levels.get_mut(0).unwrap().insert(0);
+        for _ in 0..self.max_level {
+            let mut level =
+                GraphBuilder::<V>::new(self.vectors.clone()).metric_type(self.metric_type);
+            level.insert(0);
+            self.levels.push(level);
+        }
 
         for i in 1..self.vectors.len() {
             self.insert(i as u32)?;
         }
 
-        let graphs = levels
-            .into_iter()
+        let graphs = self
+            .levels
+            .iter()
             .map(|l| l.build().into())
             .collect::<Vec<Arc<dyn Graph>>>();
-        println!("Base layer: {:?}", graphs[0].len());
         Ok(HNSW::from_builder(
             graphs,
             self.entry_point,
