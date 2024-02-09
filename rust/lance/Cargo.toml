@@ -92,6 +92,9 @@ openblas-src = { version = "0.10.8", default-features = false, features = [
     "system",
 ], optional = true }
 
+# Need this so we can prevent dynamic linking in binaries (see cli feature)
+lzma-sys = { version = "0.1" }
+
 [build-dependencies]
 prost-build.workspace = true
 
@@ -111,7 +114,8 @@ tracing-chrome = "0.7.1"
 
 [features]
 avx512fp16 = ["lance-linalg/avx512fp16"]
-cli = ["clap"]
+# Prevent dynamic linking of lzma, which comes from datafusion
+cli = ["clap", "lzma-sys/static"]
 # opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
 tensorflow = ["tfrecord"]
 dynamodb = ["lance-table/dynamodb", "aws-sdk-dynamodb"]
