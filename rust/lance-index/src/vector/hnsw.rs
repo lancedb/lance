@@ -15,11 +15,26 @@
 //! Generic Graph implementation.
 //!
 
-use super::graph::Graph;
+use std::collections::BTreeMap;
 
-mod builder;
+use super::graph::{Graph, OrderedFloat};
+
+pub mod builder;
 
 pub struct HNSW {
     pub layers: Vec<Box<dyn Graph>>,
     pub entry: u32,
+}
+
+/// Select neighbors from the ordered candidate list.
+/// Algorithm 3 in the HNSW paper.
+fn select_neighbors(
+    orderd_candidates: &BTreeMap<OrderedFloat, u32>,
+    k: usize,
+) -> Vec<(OrderedFloat, u32)> {
+    orderd_candidates
+        .iter()
+        .take(k)
+        .map(|(&d, &id)| (d, id))
+        .collect()
 }

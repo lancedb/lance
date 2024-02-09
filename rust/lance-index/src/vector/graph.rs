@@ -143,17 +143,17 @@ struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType, V: storage::VectorS
 /// A sorted list of ``(dist, node_id)`` pairs.
 ///
 pub(crate) fn beam_search<I: PrimInt + Hash>(
-    graph: impl Graph<I>,
-    start: I,
+    graph: &dyn Graph<I>,
+    start: &[I],
     query: &[f32],
     k: usize,
 ) -> Result<BTreeMap<OrderedFloat, I>> {
-    let mut visited = HashSet::from([start]);
-    let mut candidates = BTreeMap::<OrderedFloat, I>::new();
-    let dist = graph.distance_to(query, start).into();
-    candidates.insert(dist, start);
-    let mut results = BTreeMap::<OrderedFloat, I>::new();
-    results.insert(dist, start);
+    let mut visited: HashSet<I> = start.iter().copied().collect();
+    let mut candidates = start
+        .iter()
+        .map(|&i| (graph.distance_to(query, i).into(), i))
+        .collect::<BTreeMap<_, _>>();
+    let mut results = candidates.clone();
 
     while !candidates.is_empty() {
         let (dist, current) = candidates.pop_first().expect("candidates is empty");
