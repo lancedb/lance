@@ -210,6 +210,7 @@ class Sampler(ABC):
         *args,
         batch_size: int = 128,
         columns: Optional[List[str]] = None,
+        filter: Optional[str] = None,
         batch_readahead: int = 16,
         with_row_id: bool = False,
         **kwargs,
@@ -231,6 +232,7 @@ class FragmentSampler(Sampler):
         *args,
         batch_size: int = 128,
         columns: Optional[List[str]] = None,
+        filter: Optional[str] = None,
         batch_readahead: int = 16,
         with_row_id: bool = False,
         **kwargs,
@@ -239,6 +241,7 @@ class FragmentSampler(Sampler):
             for batch in fragment.to_batches(
                 batch_size=batch_size,
                 columns=columns,
+                filter=filter,
                 with_row_id=with_row_id,
                 batch_readahead=batch_readahead,
             ):
@@ -346,6 +349,7 @@ class ShardedBatchSampler(Sampler):
         *args,
         batch_size: int = 128,
         columns: Optional[List[str]] = None,
+        filter: Optional[str] = None,
         batch_readahead: int = 16,
         with_row_id: Optional[bool] = None,
         **kwargs,
@@ -356,6 +360,9 @@ class ShardedBatchSampler(Sampler):
             warnings.warn(
                 "with_row_id is not supported for ShardedBatchSampler",
             )
+
+        if filter is not None:
+            raise ValueError("`filter` is not supported with ShardedBatchSampler")
 
         def _gen_ranges():
             for start in range(
