@@ -82,7 +82,7 @@ impl<V: VectorStorage<f32>> Graph<u32, f32> for GraphBuilder<V> {
 
     fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>> {
         let node = self.nodes.get(&key)?;
-        Some(Box::new(node.neighbors.values().into_iter().copied()))
+        Some(Box::new(node.neighbors.values().copied()))
     }
 
     fn distance_to(&self, query: &[f32], key: u32) -> f32 {

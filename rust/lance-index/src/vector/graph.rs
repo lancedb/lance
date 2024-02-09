@@ -20,7 +20,6 @@ use std::hash::Hash;
 
 use lance_core::Result;
 use num_traits::{Float, PrimInt};
-use roaring::treemap::Iter;
 
 pub(crate) mod builder;
 mod storage;
@@ -67,7 +66,7 @@ pub(crate) struct OrderedFloat(f32);
 
 impl PartialOrd for OrderedFloat {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 
@@ -94,6 +93,11 @@ impl From<f32> for OrderedFloat {
 pub trait Graph<K: PrimInt = u32, T: Float = f32> {
     /// Get the number of nodes in the graph.
     fn len(&self) -> usize;
+
+    /// Returns true if the graph is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Get the neighbors of a graph node, identifyied by the index.
     fn neighbors(&self, key: K) -> Option<Box<dyn Iterator<Item = K> + '_>>;
@@ -195,22 +199,11 @@ impl<I: PrimInt + Hash, T: Float> Graph<I, T> for InMemoryGraph<I, T> {
 }
 
 impl<I: PrimInt + Hash, T: Float> InMemoryGraph<I, T> {
-    pub fn new() -> Self {
-        Self {
-            nodes: HashMap::new(),
-            phantom: std::marker::PhantomData,
-        }
-    }
-
     fn from_nodes(nodes: HashMap<I, GraphNode<I>>) -> Self {
         Self {
             nodes,
             phantom: std::marker::PhantomData,
         }
-    }
-
-    fn len(&self) -> usize {
-        self.nodes.len()
     }
 }
 
