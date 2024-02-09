@@ -127,6 +127,7 @@ impl From<&Manifest> for Version {
 }
 
 /// Customize read behavior of a dataset.
+#[derive(Clone, Debug)]
 pub struct ReadParams {
     /// Cache size for index cache. If it is zero, index cache is disabled.
     ///
@@ -149,8 +150,8 @@ pub struct ReadParams {
     /// coordination between readers and writers and we can usually rely on the filesystem
     /// to do this coordination for us.
     ///
-    /// Some filesystems (e.g. S3) do not support atomic operations.  In this case, for
-    /// safety, we recommend an external commit mechnaism (such as dynamodb) and, on the
+    /// Some file systems (e.g. S3) do not support atomic operations.  In this case, for
+    /// safety, we recommend an external commit mechanism (such as dynamodb) and, on the
     /// read path, we need to reach out to that external mechanism to figure out the latest
     /// version of the dataset.
     ///
