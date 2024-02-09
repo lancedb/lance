@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use lance_linalg::distance::MetricType;
 use rand::{thread_rng, Rng};
 
 use super::super::graph::beam_search;
 use super::{select_neighbors, HNSW};
+use crate::vector::graph::Graph;
 use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage};
 use lance_core::Result;
 
@@ -130,6 +133,13 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
     }
 
     pub fn build(&mut self) -> Result<HNSW> {
+        log::info!(
+            "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
+            self.metric_type,
+            self.max_level,
+            self.m_max,
+            self.ef_construction
+        );
         let mut levels = Vec::with_capacity(self.max_level as usize);
         let level = GraphBuilder::<V>::new(self.vectors.clone()).metric_type(self.metric_type);
         levels.push(level);
@@ -142,7 +152,8 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
         let graphs = levels
             .into_iter()
             .map(|l| l.build().into())
-            .collect::<Vec<_>>();
+            .collect::<Vec<Arc<dyn Graph>>>();
+        println!("Base layer: {:?}", graphs[0].len());
         Ok(HNSW::from_builder(
             graphs,
             self.entry_point,

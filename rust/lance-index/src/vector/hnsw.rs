@@ -84,9 +84,9 @@ impl HNSW {
 
 /// Select neighbors from the ordered candidate list.
 /// Algorithm 3 in the HNSW paper.
-fn select_neighbors<'a>(
-    orderd_candidates: &'a BTreeMap<OrderedFloat, u32>,
+fn select_neighbors(
+    orderd_candidates: &BTreeMap<OrderedFloat, u32>,
     k: usize,
-) -> impl Iterator<Item = (OrderedFloat, u32)> + 'a {
-    orderd_candidates.into_iter().take(k).map(|(&d, &u)| (d, u))
+) -> impl Iterator<Item = (OrderedFloat, u32)> + '_ {
+    orderd_candidates.iter().take(k).map(|(&d, &u)| (d, u))
 }

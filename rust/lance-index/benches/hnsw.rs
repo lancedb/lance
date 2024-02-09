@@ -35,7 +35,9 @@ fn bench_hnsw(c: &mut Criterion) {
 
     c.bench_function("create_hnsw(65535x1024)", |b| {
         b.iter(|| {
-            let hnsw = HNSWBuilder::new(mat.clone()).build();
+            let hnsw = HNSWBuilder::new(mat.clone()).max_level(4).build().unwrap();
+            let uids = hnsw.search(mat.row(0).unwrap(), 10, 30).unwrap();
+            assert_eq!(uids.len(), 10);
         })
     });
 }
