@@ -99,13 +99,14 @@ fn select_neighbors(
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::types::Float32Type;
-    use lance_testing::datagen::generate_random_array;
-
     use super::*;
 
+    use std::collections::HashSet;
+
     use super::super::graph::OrderedFloat;
+    use arrow_array::types::Float32Type;
     use lance_linalg::matrix::MatrixView;
+    use lance_testing::datagen::generate_random_array;
 
     #[test]
     fn test_select_neighbors() {
@@ -164,5 +165,44 @@ mod tests {
                 }
             }
         });
+    }
+
+    fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
+        let mut dists = vec![];
+        for i in 0..mat.num_rows() {
+            let dist = lance_linalg::distance::l2_distance(query, mat.row(i).unwrap());
+            dists.push((dist, i as u32));
+        }
+        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        dists.truncate(k);
+        dists.into_iter().map(|(_, i)| i).collect()
+    }
+
+    #[test]
+    fn test_search() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        const MAX_EDGES: usize = 32;
+        const K: usize = 10;
+
+        let data = generate_random_array(TOTAL * DIM);
+        let mat = MatrixView::<Float32Type>::new(data.into(), DIM);
+        let q = mat.row(0).unwrap();
+
+        let hnsw = HNSWBuilder::new(mat.clone())
+            .max_num_edges(MAX_EDGES)
+            .ef_construction(50)
+            .build()
+            .unwrap();
+
+        let results: HashSet<u32> = hnsw
+            .search(q, 10, 100)
+            .unwrap()
+            .iter()
+            .map(|(i, _)| *i)
+            .collect();
+        let gt = ground_truth(&mat, q, K);
+        let recall = results.intersection(&gt).count() as f32 / K as f32;
+        assert!(recall >= 0.8, "Recall: {}", recall);
     }
 }
