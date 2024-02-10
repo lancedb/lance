@@ -191,7 +191,7 @@ mod tests {
 
         let hnsw = HNSWBuilder::new(mat.clone())
             .max_num_edges(MAX_EDGES)
-            .ef_construction(50)
+            .ef_construction(100)
             .build()
             .unwrap();
 
