@@ -139,11 +139,30 @@ mod tests {
     #[test]
     fn test_build_hnsw() {
         const DIM: usize = 32;
-        const TOTAL: usize = 512;
+        const TOTAL: usize = 2048;
+        const MAX_EDGES: usize = 32;
         let data = generate_random_array(TOTAL * DIM);
         let mat = MatrixView::<Float32Type>::new(data.into(), DIM);
-        let hnsw = HNSWBuilder::new(mat).ef_construction(50).build().unwrap();
+        let hnsw = HNSWBuilder::new(mat)
+            .max_num_edges(MAX_EDGES)
+            .ef_construction(50)
+            .build()
+            .unwrap();
         assert!(hnsw.layers.len() > 1);
-        assert_eq!(hnsw.layers[0].len(), 512);
+        assert_eq!(hnsw.layers[0].len(), TOTAL);
+
+        hnsw.layers.windows(2).for_each(|w| {
+            let (prev, next) = (w[0].as_ref(), w[1].as_ref());
+            assert!(prev.len() >= next.len());
+        });
+
+        hnsw.layers.iter().for_each(|layer| {
+            for i in 0..TOTAL {
+                // If the node exist on this layer, check its out-degree.
+                if let Some(neighbors) = layer.neighbors(i as u32) {
+                    assert!(neighbors.count() <= MAX_EDGES);
+                }
+            }
+        });
     }
 }
