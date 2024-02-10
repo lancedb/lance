@@ -32,6 +32,7 @@ pub mod norm_l2;
 pub use cosine::*;
 pub use dot::*;
 pub use l2::*;
+use lance_arrow::FloatToArrayType;
 pub use norm_l2::*;
 
 use crate::Result;
@@ -47,7 +48,7 @@ pub enum DistanceType {
 /// For backwards compatibility.
 pub type MetricType = DistanceType;
 
-pub type DistanceFunc = fn(&[f32], &[f32]) -> f32;
+pub type DistanceFunc<T> = fn(&[T], &[T]) -> f32;
 pub type BatchDistanceFunc = fn(&[f32], &[f32], usize) -> Arc<Float32Array>;
 pub type ArrowBatchDistanceFunc = fn(&dyn Array, &FixedSizeListArray) -> Result<Arc<Float32Array>>;
 
@@ -64,9 +65,12 @@ impl DistanceType {
     }
 
     /// Returns the distance function between two vectors.
-    pub fn func(&self) -> DistanceFunc {
+    pub fn func<T: FloatToArrayType>(&self) -> DistanceFunc<T>
+    where
+        T::ArrowType: L2 + Cosine + Dot,
+    {
         match self {
-            Self::L2 => l2::<f32>,
+            Self::L2 => l2,
             Self::Cosine => cosine_distance,
             Self::Dot => dot_distance,
         }

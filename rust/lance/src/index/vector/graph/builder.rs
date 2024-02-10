@@ -50,7 +50,7 @@ pub struct GraphBuilder<V: Vertex + Clone + Sync + Send> {
     metric_type: MetricType,
 
     /// Distance function.
-    distance_func: DistanceFunc,
+    distance_func: DistanceFunc<f32>,
 }
 
 impl<V: Vertex + Clone + Sync + Send> GraphBuilder<V> {
