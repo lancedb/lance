@@ -1825,4 +1825,72 @@ mod tests {
             ]))
         );
     }
+
+    #[tokio::test]
+    async fn test_create_ivf_pq_f16_with_codebook() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        const DIM: usize = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float16, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let codebook = Arc::new(generate_random_array_with_seed::<Float16Type>(
+            256 * DIM,
+            [22; 32],
+        ));
+        let params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            PQBuildParams::with_codebook(4, 8, codebook),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let results = dataset
+            .scan()
+            .nearest(
+                "vector",
+                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                5,
+            )
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 5);
+        let batch = &results[0];
+        assert_eq!(
+            batch.schema(),
+            Arc::new(Schema::new(vec![
+                Field::new(
+                    "vector",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float16, true)),
+                        DIM as i32,
+                    ),
+                    true,
+                ),
+                Field::new("_distance", DataType::Float32, true)
+            ]))
+        );
+    }
 }
