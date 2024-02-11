@@ -32,12 +32,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use arrow_array::{cast::AsArray, types::UInt64Type, BooleanArray, RecordBatch, RecordBatchReader};
-use arrow_schema::{DataType, Schema};
+use arrow_array::{
+    cast::AsArray, types::UInt64Type, BooleanArray, RecordBatch, RecordBatchReader, StructArray,
+};
+use arrow_schema::{DataType, Field, Schema};
 use datafusion::{
     execution::context::{SessionConfig, SessionContext},
     logical_expr::{Expr, JoinType},
-    physical_plan::{stream::RecordBatchStreamAdapter, PhysicalExpr, SendableRecordBatchStream},
+    physical_plan::{
+        stream::RecordBatchStreamAdapter, ColumnarValue, PhysicalExpr, SendableRecordBatchStream,
+    },
     scalar::ScalarValue,
 };
 
@@ -60,6 +64,40 @@ use crate::{
 };
 
 use super::write_fragments_internal;
+
+// "update if" expressions typically compare fields from the source table to the target table.
+// These tables have the same schema and so filter expressions need to differentiate.  To do that
+// we wrap the left side and the right side in a struct and make a single "combined schema"
+fn combined_schema(schema: &Schema) -> Schema {
+    let target = Field::new("target", DataType::Struct(schema.fields.clone()), false);
+    let source = Field::new("source", DataType::Struct(schema.fields.clone()), false);
+    Schema::new(vec![target, source])
+}
+
+// This takes a double-wide table (e.g. the result of the outer join below) and takes the left
+// half, puts it into a struct, then takes the right half, and puts that into a struct.  This
+// makes the table match the "combined schema" so we can apply an "update if" expression
+fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
+    // The schema of the combined batches will be:
+    // target_data_keys, target_data_non_keys, target_data_row_id, source_data_keys, source_data_non_keys
+    // The keys and non_keys on both sides will be equal
+    let num_fields = batch.num_columns();
+    debug_assert_eq!(num_fields % 2, 1);
+    let row_id_col = num_fields / 2;
+
+    let target_arrays = batch.columns()[0..row_id_col].to_vec();
+    let target = StructArray::new(schema.fields.clone(), target_arrays, None);
+
+    let source_arrays = batch.columns()[row_id_col + 1..].to_vec();
+    let source = StructArray::new(schema.fields.clone(), source_arrays, None);
+
+    let combined_schema = combined_schema(schema);
+    RecordBatch::try_new(
+        Arc::new(combined_schema),
+        vec![Arc::new(target), Arc::new(source)],
+    )
+    .unwrap()
+}
 
 /// Describes how rows should be handled when there is no matching row in the source table
 ///
@@ -99,6 +137,7 @@ impl WhenNotMatchedBySource {
 }
 
 /// Describes how rows should be handled when there is a match between the target table and source table
+#[derive(Debug, Clone, PartialEq)]
 pub enum WhenMatched {
     /// The row is deleted from the target table and a new row is inserted based on the source table
     ///
@@ -108,6 +147,26 @@ pub enum WhenMatched {
     ///
     /// This can be used to achieve find-or-create behavior
     DoNothing,
+    /// The row is updated (similar to UpdateAll) only for rows where the expression evaluates to
+    /// true
+    UpdateIf(Expr),
+}
+
+impl WhenMatched {
+    pub fn update_if(dataset: &Dataset, expr: &str) -> Result<Self> {
+        let dataset_schema: Schema = dataset.schema().into();
+        let combined_schema = combined_schema(&dataset_schema);
+        let planner = Planner::new(Arc::new(combined_schema));
+        let expr = planner
+            .parse_filter(expr)
+            .map_err(box_error)
+            .context(InvalidInputSnafu)?;
+        let expr = planner
+            .optimize_expr(expr)
+            .map_err(box_error)
+            .context(InvalidInputSnafu)?;
+        Ok(Self::UpdateIf(expr))
+    }
 }
 
 /// Describes how rows should be handled when there is no matching row in the target table
@@ -127,7 +186,7 @@ struct MergeInsertParams {
     // The column(s) to join on
     on: Vec<String>,
     // If true, then update all columns of the old data to the new data when there is a match
-    update_matched: bool,
+    when_matched: WhenMatched,
     // If true, then insert all columns of the new data when there is no match in the old data
     insert_not_matched: bool,
     // Controls whether data that is not matched by the source is deleted or not
@@ -204,7 +263,7 @@ impl MergeInsertBuilder {
             dataset,
             params: MergeInsertParams {
                 on,
-                update_matched: false,
+                when_matched: WhenMatched::DoNothing,
                 insert_not_matched: true,
                 delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
             },
@@ -213,10 +272,7 @@ impl MergeInsertBuilder {
 
     /// Specify what should happen when a target row matches a row in the source
     pub fn when_matched(&mut self, behavior: WhenMatched) -> &mut Self {
-        self.params.update_matched = match behavior {
-            WhenMatched::DoNothing => false,
-            WhenMatched::UpdateAll => true,
-        };
+        self.params.when_matched = behavior;
         self
     }
 
@@ -242,7 +298,7 @@ impl MergeInsertBuilder {
     /// Crate a merge insert job
     pub fn try_build(&mut self) -> Result<MergeInsertJob> {
         if !self.params.insert_not_matched
-            && !self.params.update_matched
+            && self.params.when_matched == WhenMatched::DoNothing
             && self.params.delete_not_matched_by_source == WhenNotMatchedBySource::Keep
         {
             return Err(Error::invalid_input(
@@ -417,6 +473,8 @@ struct Merger {
     deleted_rows: Arc<Mutex<RoaringTreemap>>,
     // Physical delete expression, only set if params.delete_not_matched_by_source is DeleteIf
     delete_expr: Option<Arc<dyn PhysicalExpr>>,
+    // Physical "when matched update if" expression, only set if params.when_matched is UpdateIf
+    match_filter_expr: Option<Arc<dyn PhysicalExpr>>,
     // The parameters controlling the merge
     params: MergeInsertParams,
     // The schema of the dataset, used to recover nullability information
@@ -440,9 +498,23 @@ impl Merger {
         } else {
             None
         };
+        let match_filter_expr = if let WhenMatched::UpdateIf(expr) = &params.when_matched {
+            let combined_schema = Arc::new(combined_schema(&schema));
+            let planner = Planner::new(combined_schema.clone());
+            let expr = planner.optimize_expr(expr.clone())?;
+            let match_expr = planner.create_physical_expr(&expr)?;
+            let data_type = match_expr.data_type(combined_schema.as_ref())?;
+            if data_type != DataType::Boolean {
+                return Err(Error::invalid_input(format!("Merge insert conditions must be expressions that return a boolean value, received a 'when matched update if' expression ({}) which has data type {}", expr, data_type), location!()));
+            }
+            Some(match_expr)
+        } else {
+            None
+        };
         Ok(Self {
             deleted_rows: Arc::new(Mutex::new(RoaringTreemap::new())),
             delete_expr,
+            match_filter_expr,
             params,
             schema,
         })
@@ -525,8 +597,26 @@ impl Merger {
         // borrow checker (the stream needs to be `sync` since it crosses an await point)
         let mut deleted_row_ids = self.deleted_rows.lock().unwrap();
 
-        if self.params.update_matched {
-            let matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
+        if self.params.when_matched != WhenMatched::DoNothing {
+            let mut matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
+            if let Some(match_filter) = self.match_filter_expr {
+                let unzipped = unzip_batch(&matched, &self.schema);
+                let filtered = match_filter.evaluate(&unzipped)?;
+                match filtered {
+                    ColumnarValue::Array(mask) => {
+                        // Some rows matched, filter down and replace those rows
+                        matched = arrow::compute::filter_record_batch(&matched, mask.as_boolean())?;
+                    }
+                    ColumnarValue::Scalar(scalar) => {
+                        if let ScalarValue::Boolean(Some(true)) = scalar {
+                            // All rows matched, go ahead and replace the whole batch
+                        } else {
+                            // Nothing matched, replace nothing
+                            matched = RecordBatch::new_empty(matched.schema().clone());
+                        }
+                    }
+                }
+            }
             let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
             deleted_row_ids.extend(row_ids.values());
             let matched = matched.project(&right_cols)?;
@@ -561,7 +651,7 @@ impl Merger {
                 let unmatched = arrow::compute::filter_record_batch(&batch, &left_only)?;
                 let to_delete = self.delete_expr.unwrap().evaluate(&unmatched)?;
                 match to_delete {
-                    datafusion::physical_plan::ColumnarValue::Array(mask) => {
+                    ColumnarValue::Array(mask) => {
                         let row_ids = arrow::compute::filter(
                             unmatched.column(row_id_col),
                             mask.as_boolean(),
@@ -569,7 +659,7 @@ impl Merger {
                         let row_ids = row_ids.as_primitive::<UInt64Type>();
                         deleted_row_ids.extend(row_ids.values());
                     }
-                    datafusion::physical_plan::ColumnarValue::Scalar(scalar) => {
+                    ColumnarValue::Scalar(scalar) => {
                         if let ScalarValue::Boolean(Some(true)) = scalar {
                             let row_ids = unmatched.column(row_id_col).as_primitive::<UInt64Type>();
                             deleted_row_ids.extend(row_ids.values());
@@ -586,7 +676,9 @@ impl Merger {
 #[cfg(test)]
 mod tests {
 
-    use arrow_array::{types::UInt32Type, RecordBatch, RecordBatchIterator, UInt32Array};
+    use arrow_array::{
+        types::UInt32Type, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
@@ -661,6 +753,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
+            Field::new("filterme", DataType::Utf8, false),
         ]));
 
         let batch = RecordBatch::try_new(
@@ -668,6 +761,7 @@ mod tests {
             vec![
                 Arc::new(UInt32Array::from(vec![1, 2, 3, 4, 5, 6])),
                 Arc::new(UInt32Array::from(vec![1, 1, 1, 1, 1, 1])),
+                Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
             ],
         )
         .unwrap();
@@ -683,6 +777,7 @@ mod tests {
             vec![
                 Arc::new(UInt32Array::from(vec![4, 5, 6, 7, 8, 9])),
                 Arc::new(UInt32Array::from(vec![2, 2, 2, 2, 2, 2])),
+                Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "C"])),
             ],
         )
         .unwrap();
@@ -706,7 +801,17 @@ mod tests {
             .unwrap();
         check(new_batch.clone(), job, &[1, 2, 3], &[4, 5, 6, 7, 8, 9]).await;
 
-        // update only, no delete (not real case, just use update)
+        // conditional upsert, no delete
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
+            .when_matched(
+                WhenMatched::update_if(&ds, "source.filterme != target.filterme").unwrap(),
+            )
+            .try_build()
+            .unwrap();
+        check(new_batch.clone(), job, &[1, 2, 3, 4, 5], &[6, 7, 8, 9]).await;
+
+        // update only, no delete (useful for bulk update)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
             .unwrap()
             .when_matched(WhenMatched::UpdateAll)
@@ -714,6 +819,17 @@ mod tests {
             .try_build()
             .unwrap();
         check(new_batch.clone(), job, &[1, 2, 3], &[4, 5, 6]).await;
+
+        // Conditional update
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
+            .when_matched(
+                WhenMatched::update_if(&ds, "source.filterme == target.filterme").unwrap(),
+            )
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap();
+        check(new_batch.clone(), job, &[1, 2, 3, 6], &[4, 5]).await;
 
         // No-op (will raise an error)
         assert!(MergeInsertBuilder::try_new(ds.clone(), keys.clone())

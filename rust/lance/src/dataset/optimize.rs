@@ -725,7 +725,7 @@ fn transpose_row_ids(
     mapping
 }
 
-async fn reserve_fragment_ids(dataset: &Dataset, fragments: &mut Vec<Fragment>) -> Result<()> {
+async fn reserve_fragment_ids(dataset: &Dataset, fragments: &mut [Fragment]) -> Result<()> {
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::ReserveFragments {

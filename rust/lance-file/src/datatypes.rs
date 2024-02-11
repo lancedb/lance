@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use lance_arrow::bfloat16::ARROW_EXT_NAME_KEY;
+use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Dictionary, Encoding, Field, LogicalType, Schema};
 use lance_core::{Error, Result};
 use lance_io::traits::Reader;
@@ -194,7 +195,7 @@ async fn load_field_dictionary<'a>(field: &mut Field, reader: &dyn Reader) -> Re
         if let Some(dict_info) = field.dictionary.as_mut() {
             use DataType::*;
             match value_type.as_ref() {
-                Utf8 | Binary => {
+                _ if value_type.is_binary_like() => {
                     dict_info.values = Some(
                         read_binary_array(
                             reader,

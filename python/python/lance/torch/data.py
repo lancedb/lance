@@ -12,8 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-"""Read Lance dataset as torch DataPipe.
-"""
+"""Read Lance dataset as torch DataPipe."""
 
 # PEP-585. Can be removed after deprecating python 3.8 support.
 from __future__ import annotations
@@ -173,7 +172,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
             The names of the column to read, by default None, which means reading all
             columns.
         filter : str, optional
-            If set, only rows that match the filter will be read.
+            If set, only rows that match the filter will be read.  Currently, this
+            can only be used when doing a full scan (`sampler` is None and
+            shard_granularity is None or "fragment" and `samples` is None)
         cache : str or bool, optional
             If set true, the dataset will be cached on disk from the first iteration.
             The following iterations will read from the cache.
@@ -220,7 +221,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 if rank is not None or world_size is not None:
                     warnings.warn(
                         "rank and world_size are deprecated,"
-                        + " use SharedFragmentSampler instead.",
+                        + " use ShardedFragmentSampler instead.",
                     )
                     sampler = ShardedFragmentSampler(rank=rank, world_size=world_size)
                 else:
@@ -232,10 +233,10 @@ class LanceDataset(torch.utils.data.IterableDataset):
             else:
                 raise ValueError("Invalid shard_granularity: {}")
 
-        self.sampler: Sampler = sampler
+        if filter is not None and self.samples > 0 or self.samples is None:
+            raise ValueError("`filter` is not supported with `samples`")
 
-        if (samples is not None or sampler is not None) and filter is not None:
-            raise ValueError("Does not support sampling over filtered dataset")
+        self.sampler: Sampler = sampler
 
         self.cache = cache
         self.cached_ds: Optional[CachedDataset] = None
@@ -259,6 +260,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 raw_stream = self.sampler(
                     self.dataset,
                     columns=self.columns,
+                    filter=self.filter,
                     batch_size=self.batch_size,
                     with_row_id=self.with_row_id,
                     batch_readahead=self.batch_readahead,

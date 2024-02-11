@@ -71,6 +71,24 @@ def test_input_data(tmp_path: Path, schema, data):
     assert dataset.to_table() == input_data[0][1]
 
 
+def test_roundtrip_types(tmp_path: Path):
+    table = pa.table({
+        "dict": pa.array(["a", "b", "a"], pa.dictionary(pa.int8(), pa.string())),
+        # PyArrow doesn't support creating large_string dictionaries easily.
+        "large_dict": pa.DictionaryArray.from_arrays(
+            pa.array([0, 1, 1], pa.int8()), pa.array(["foo", "bar"], pa.large_string())
+        ),
+        "list": pa.array([["a", "b"], ["c", "d"], ["e", "f"]], pa.list_(pa.string())),
+        "large_list": pa.array(
+            [["a", "b"], ["c", "d"], ["e", "f"]], pa.large_list(pa.string())
+        ),
+    })
+
+    dataset = lance.write_dataset(table, tmp_path)
+    assert dataset.schema == table.schema
+    assert dataset.to_table() == table
+
+
 def test_dataset_overwrite(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
@@ -839,7 +857,11 @@ def test_delete_data(tmp_path: Path):
 
 def test_merge_insert(tmp_path: Path):
     nrows = 1000
-    table = pa.Table.from_pydict({"a": range(nrows), "b": [1 for _ in range(nrows)]})
+    table = pa.Table.from_pydict({
+        "a": range(nrows),
+        "b": [1 for _ in range(nrows)],
+        "c": [x % 2 for x in range(nrows)],
+    })
     dataset = lance.write_dataset(
         table, tmp_path / "dataset", mode="create", max_rows_per_file=100
     )
@@ -848,6 +870,7 @@ def test_merge_insert(tmp_path: Path):
     new_table = pa.Table.from_pydict({
         "a": range(300, 300 + nrows),
         "b": [2 for _ in range(nrows)],
+        "c": [0 for _ in range(nrows)],
     })
 
     is_new = pc.field("b") == 2
@@ -875,6 +898,15 @@ def test_merge_insert(tmp_path: Path):
 
     dataset = lance.dataset(tmp_path / "dataset", version=version)
     dataset.restore()
+    dataset.merge_insert("a").when_not_matched_insert_all().when_matched_update_all(
+        "target.c == source.c"
+    ).execute(new_table)
+    table = dataset.to_table()
+    assert table.num_rows == 1300
+    assert table.filter(is_new).num_rows == 650
+
+    dataset = lance.dataset(tmp_path / "dataset", version=version)
+    dataset.restore()
     dataset.merge_insert("a").when_not_matched_by_source_delete().execute(new_table)
     table = dataset.to_table()
     assert table.num_rows == 700
@@ -896,6 +928,38 @@ def test_merge_insert(tmp_path: Path):
     dataset.restore()
     with pytest.raises(ValueError):
         dataset.merge_insert("a").execute(new_table)
+
+
+def test_merge_insert_conditional_upsert_example(tmp_path: Path):
+    table = pa.Table.from_pydict({
+        "id": [1, 2, 3, 4, 5],
+        "txNumber": [1, 1, 2, 2, 3],
+        "vector": pa.array([[1.0, 1.0] for _ in range(5)], pa.list_(pa.float32())),
+    })
+    dataset = lance.write_dataset(table, tmp_path / "dataset", mode="create")
+
+    new_table = pa.Table.from_pydict({
+        "id": [1, 2, 3, 4, 5],
+        "txNumber": [1, 2, 1, 2, 5],
+        "vector": pa.array([[2.0, 2.0] for _ in range(5)], pa.list_(pa.float32())),
+    })
+
+    dataset.merge_insert("id").when_matched_update_all(
+        "target.txNumber < source.txNumber"
+    ).execute(new_table)
+
+    table = dataset.to_table()
+
+    expected = pa.Table.from_pydict({
+        "id": [1, 2, 3, 4, 5],
+        "txNumber": [1, 2, 2, 2, 5],
+        "vector": pa.array(
+            [[1.0, 1.0], [2.0, 2.0], [1.0, 1.0], [1.0, 1.0], [2.0, 2.0]],
+            pa.list_(pa.float32()),
+        ),
+    })
+
+    assert table.sort_by("id") == expected
 
 
 def test_merge_insert_source_is_dataset(tmp_path: Path):

@@ -54,8 +54,7 @@ lance-datagen.workspace = true
 lance-testing.workspace = true
 pprof.workspace = true
 tempfile.workspace = true
-sqlparser = "0.39.0"
-datafusion-sql = "34.0.0"
+datafusion-sql.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
@@ -67,4 +66,8 @@ harness = false
 
 [[bench]]
 name = "pq_dist_table"
+harness = false
+
+[[bench]]
+name = "hnsw"
 harness = false
