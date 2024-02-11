@@ -37,12 +37,41 @@ def create_table(nvec=1000, ndim=128):
     )
     return tbl
 
+def create_nested_table(nvec=1000, ndim=128):
+    mat = np.random.randn(nvec, ndim)
+    price = np.random.rand(nvec) * 100
+
+    def gen_str(n):
+        return "".join(random.choices(string.ascii_letters + string.digits, k=n))
+
+    meta = np.array([gen_str(100) for _ in range(nvec)])
+    tbl = (
+        vec_to_table(data=mat)
+        .append_column("price", pa.array(price))
+        .append_column("meta", pa.array(meta))
+        .append_column("id", pa.array(range(nvec)))
+        .append_column("arr1",pa.array([[0,1,5]]*nvec))
+    )
+    return tbl
 
 @pytest.fixture()
 def dataset(tmp_path):
     tbl = create_table()
     yield lance.write_dataset(tbl, tmp_path)
 
+
+@pytest.fixture()
+def nested_indexed_dataset(tmp_path):
+    tbl = create_nested_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=2,
+    )
+    dataset.create_scalar_index("arr1", index_type="BTREE")
+    return dataset
 
 @pytest.fixture()
 def indexed_dataset(tmp_path):
@@ -62,6 +91,12 @@ def indexed_dataset(tmp_path):
 def data_table(indexed_dataset: lance.LanceDataset):
     return indexed_dataset.scanner().to_table()
 
+def test_load_nested_indices(nested_indexed_dataset: lance.LanceDataset):
+    indices = nested_indexed_dataset.list_indices()
+    vec_idx = next(idx for idx in indices if idx["type"] == "Vector")
+    scalar_idx = next(idx for idx in indices if idx["type"] == "Scalar")
+    assert vec_idx is not None
+    assert scalar_idx is not None
 
 def test_load_indices(indexed_dataset: lance.LanceDataset):
     indices = indexed_dataset.list_indices()
@@ -144,3 +179,5 @@ def test_indexed_vector_scan_postfilter(
     )
 
     assert scanner.to_table().num_rows == 0
+
+
