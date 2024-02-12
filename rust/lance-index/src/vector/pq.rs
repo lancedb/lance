@@ -16,6 +16,7 @@
 //!
 
 use std::any::Any;
+use std::io::Read;
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
@@ -28,7 +29,8 @@ use lance_linalg::distance::{
     cosine_distance_batch, dot_distance_batch, l2_distance_batch, Cosine, Dot, L2,
 };
 use lance_linalg::kernels::{argmin, argmin_value_float, normalize};
-use lance_linalg::simd::{f32::f32x8, i32::i32x8, SIMD};
+use lance_linalg::simd::f32::f32x8;
+use lance_linalg::simd::SIMD;
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 pub mod builder;
@@ -251,6 +253,44 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         Ok(distance_table)
     }
 
+    #[inline]
+    fn l2_distance_avx2(&self, distance_table: &[f32], code: &UInt8Array) -> Float32Array {
+        const VECTOR_TILE: usize = 64;
+        const CODEBOOK_TILE: usize = 8;
+        let iter = code
+            .values()
+            .chunks_exact(self.num_sub_vectors * VECTOR_TILE);
+        let distances = iter.clone().flat_map(|chunk| {
+            let mut sums = [0.0_f32; VECTOR_TILE];
+
+            // i = tile index of code-book
+            // Read `CODEBOOK_TILE` * 256 * 4 bytes(f32) each time
+            for i in (0..self.num_sub_vectors).step_by(CODEBOOK_TILE) {
+                let tiled_distance_tbl = &distance_table[i * 256..];
+                // vec_idx = tile index of vectors.
+                for vec_idx in 0..VECTOR_TILE {
+                    let vec_start_offset = (vec_idx * self.num_sub_vectors + i) as i32;
+                    let sum = chunk[vec_start_offset as usize..]
+                        .iter()
+                        .take(CODEBOOK_TILE)
+                        .enumerate()
+                        .map(|(k, c)| tiled_distance_tbl[k * 256 + *c as usize])
+                        .sum::<f32>();
+                    sums[vec_idx] += sum;
+                }
+            }
+
+            sums.into_iter()
+        });
+        let distances = distances.chain(iter.remainder().chunks(self.num_sub_vectors).map(|c| {
+            c.iter()
+                .enumerate()
+                .map(|(sub_vec_idx, code)| distance_table[sub_vec_idx * 256 + *code as usize])
+                .sum()
+        }));
+        Float32Array::from_iter_values(distances)
+    }
+
     /// Pre-compute L2 distance from the query to all code.
     ///
     /// It returns the squared L2 distance.
@@ -287,46 +327,24 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
             }
         }
 
-        if cfg!(target_feature = "avx2") && self.num_sub_vectors % 8 == 0 {
-            use std::arch::x86_64::*;
-
-            const VECTOR_TILE: usize = 64;
-            let iter = code
-                .values()
-                .chunks_exact(self.num_sub_vectors * VECTOR_TILE);
-            let distances = iter.flat_map(|chunk| {
-                let mut sums = [0.0_f32; VECTOR_TILE];
-
-                // i = tile index of code-book
-                // Read 2 * 256 * 4 bytes each time = 2KB
-                for i in (0..self.num_sub_vectors).step_by(2) {
-                    // let tiled_distance_tbl = unsafe { distance_table.as_ptr().add(i * 256) };
-                    let tiled_distance_tbl = &distance_table[i * 256..];
-                    // vec_idx = tile index of vectors.
-                    for vec_idx in 0..VECTOR_TILE {
-                        let vec_start_offset = (vec_idx * self.num_sub_vectors) as i32;
-                        let mut offsets = [i as i32 * 256; 8];
-                        sums[vec_idx] += tiled_distance_tbl[vec_start_offset as usize + i];
-                        sums[vec_idx] += tiled_distance_tbl[vec_start_offset as usize + i + 1];
-                    }
-                }
-
-                sums.into_iter()
-            });
-            Ok(Float32Array::from_iter_values(distances))
-        } else {
-            // Fallback implementation.
-            Ok(Float32Array::from_iter_values(
-                code.values().chunks_exact(self.num_sub_vectors).map(|c| {
-                    c.iter()
-                        .enumerate()
-                        .map(|(sub_vec_idx, centroid)| {
-                            distance_table[sub_vec_idx * 256 + *centroid as usize]
-                        })
-                        .sum()
-                }),
-            ))
+        #[cfg(target_feature = "avx2")]
+        {
+            if self.num_sub_vectors % 8 == 0 {
+                return Ok(self.l2_distance_avx2(&distance_table, code));
+            }
         }
+
+        // Fallback implementation.
+        Ok(Float32Array::from_iter_values(
+            code.values().chunks_exact(self.num_sub_vectors).map(|c| {
+                c.iter()
+                    .enumerate()
+                    .map(|(sub_vec_idx, centroid)| {
+                        distance_table[sub_vec_idx * 256 + *centroid as usize]
+                    })
+                    .sum()
+            }),
+        ))
     }
 
     /// Pre-compute dot product to each sub-centroids.
