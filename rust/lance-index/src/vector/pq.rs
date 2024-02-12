@@ -16,7 +16,6 @@
 //!
 
 use std::any::Any;
-use std::num;
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
