@@ -16,6 +16,7 @@
 //!
 
 use std::any::Any;
+use std::num;
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
@@ -287,8 +288,11 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         }
 
         // Tiling over PQ-code and Codebook.
+        //
+        // Works with any CPU architecture with more than 16KB L1 D-cache.
         const VECTOR_TILE: usize = 64;
         const CODEBOOK_TILE: usize = 8;
+        let num_centroids = num_centroids(self.num_bits);
         let iter = code
             .values()
             .chunks_exact(self.num_sub_vectors * VECTOR_TILE);
@@ -298,7 +302,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
             // i = tile index of code-book
             // Read `CODEBOOK_TILE` * 256 * 4 bytes(f32) each time
             for i in (0..self.num_sub_vectors).step_by(CODEBOOK_TILE) {
-                let tiled_distance_tbl = &distance_table[i * 256..];
+                let tiled_distance_tbl = &distance_table[i * num_centroids..];
                 // vec_idx = tile index of vectors.
                 for (vec_idx, sum) in sums.iter_mut().enumerate() {
                     let vec_start_offset = (vec_idx * self.num_sub_vectors + i) as i32;
@@ -315,13 +319,15 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
             sums.into_iter()
         });
         // Remainder
-        let distances = distances.chain(iter.remainder().chunks(self.num_sub_vectors).map(|c| {
+        let remainder = iter.remainder().chunks(self.num_sub_vectors).map(|c| {
             c.iter()
                 .enumerate()
-                .map(|(sub_vec_idx, code)| distance_table[sub_vec_idx * 256 + *code as usize])
-                .sum()
-        }));
-        Ok(Float32Array::from_iter_values(distances))
+                .map(|(sub_vec_idx, code)| {
+                    distance_table[sub_vec_idx * num_centroids + *code as usize]
+                })
+                .sum::<f32>()
+        });
+        Ok(Float32Array::from_iter_values(distances.chain(remainder)))
     }
 
     /// Pre-compute dot product to each sub-centroids.
