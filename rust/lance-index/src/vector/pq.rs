@@ -295,28 +295,23 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                 .values()
                 .chunks_exact(self.num_sub_vectors * VECTOR_TILE);
             let distances = iter.flat_map(|chunk| {
-                let mut sums = [f32x8::zeros(); VECTOR_TILE];
+                let mut sums = [0.0_f32; VECTOR_TILE];
 
                 // i = tile index of code-book
                 // Read 2 * 256 * 4 bytes each time = 2KB
-                for i in (0..self.num_sub_vectors).step_by(8) {
-                    let tiled_distance_tbl = unsafe { distance_table.as_ptr().add(i * 256) };
+                for i in (0..self.num_sub_vectors).step_by(2) {
+                    // let tiled_distance_tbl = unsafe { distance_table.as_ptr().add(i * 256) };
+                    let tiled_distance_tbl = &distance_table[i * 256..];
                     // vec_idx = tile index of vectors.
                     for vec_idx in 0..VECTOR_TILE {
                         let vec_start_offset = (vec_idx * self.num_sub_vectors) as i32;
                         let mut offsets = [i as i32 * 256; 8];
-                        for k in 0..8 {
-                            offsets[k] =
-                                *unsafe { chunk.get_unchecked(vec_start_offset as usize + i + k) }
-                                    as i32;
-                        }
-                        let offsets = unsafe { i32x8::load(offsets.as_ptr()) };
-                        let v = unsafe { _mm256_i32gather_ps::<4>(tiled_distance_tbl, offsets.0) };
-                        sums[vec_idx as usize] += f32x8(v);
+                        sums[vec_idx] += tiled_distance_tbl[vec_start_offset as usize + i];
+                        sums[vec_idx] += tiled_distance_tbl[vec_start_offset as usize + i + 1];
                     }
                 }
 
-                sums.into_iter().map(|s| s.reduce_sum())
+                sums.into_iter()
             });
             Ok(Float32Array::from_iter_values(distances))
         } else {
