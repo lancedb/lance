@@ -28,7 +28,7 @@ use super::{FloatSimd, SIMD};
 #[allow(non_camel_case_types)]
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
-pub struct f32x8(std::arch::x86_64::__m256);
+pub struct f32x8(pub std::arch::x86_64::__m256);
 
 /// 8 of 32-bit `f32` values. Use 256-bit SIMD if possible.
 #[allow(non_camel_case_types)]

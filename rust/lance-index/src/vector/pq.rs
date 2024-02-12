@@ -28,6 +28,7 @@ use lance_linalg::distance::{
     cosine_distance_batch, dot_distance_batch, l2_distance_batch, Cosine, Dot, L2,
 };
 use lance_linalg::kernels::{argmin, argmin_value_float, normalize};
+use lance_linalg::simd::{f32::f32x8, i32::i32x8, SIMD};
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 pub mod builder;
@@ -37,7 +38,6 @@ pub(crate) mod utils;
 pub use self::utils::num_centroids;
 use super::pb;
 pub use builder::PQBuildParams;
-use lance_linalg::simd::{f32::f32x8, SIMD};
 
 /// Product Quantization
 
@@ -271,7 +271,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                                 .for_each(|(idx, lane_chunk)| {
                                     let mut offsets: [i32; 16] = [(idx as i32 * 8) * 256; 16];
                                     lane_chunk.iter().enumerate().for_each(|(j, &code)| {
-                                        offsets[j] = (j * 256 + code as usize) as i32
+                                        offsets[j] += (j * 256 + code as usize) as i32
                                     });
                                     let simd_offsets = _mm512_loadu_epi32(offsets.as_ptr());
                                     let v = _mm512_i32gather_ps(
@@ -288,22 +288,39 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         }
 
         if cfg!(target_feature = "avx2") && self.num_sub_vectors % 8 == 0 {
-            Ok(Float32Array::from_iter_values(
-                code.values().chunks_exact(self.num_sub_vectors).map(|c| {
-                    let mut s = f32x8::zeros();
-                    c.chunks_exact(8).enumerate().for_each(|(idx, lane_chunk)| {
-                        let mut offsets: [i32; 8] = [idx as i32 * 8 * 256; 8];
-                        lane_chunk
-                            .iter()
-                            .enumerate()
-                            .for_each(|(j, &code)| offsets[j] = (j * 256 + code as usize) as i32);
-                        let v = f32x8::gather(&distance_table, &offsets);
-                        s += v;
-                    });
-                    s.reduce_sum()
-                }),
-            ))
+            use std::arch::x86_64::*;
+
+            const VECTOR_TILE: usize = 64;
+            let iter = code
+                .values()
+                .chunks_exact(self.num_sub_vectors * VECTOR_TILE);
+            let distances = iter.flat_map(|chunk| {
+                let mut sums = [f32x8::zeros(); VECTOR_TILE];
+
+                // i = tile index of code-book
+                // Read 2 * 256 * 4 bytes each time = 2KB
+                for i in (0..self.num_sub_vectors).step_by(8) {
+                    let tiled_distance_tbl = unsafe { distance_table.as_ptr().add(i * 256) };
+                    // vec_idx = tile index of vectors.
+                    for vec_idx in 0..VECTOR_TILE {
+                        let vec_start_offset = (vec_idx * self.num_sub_vectors) as i32;
+                        let mut offsets = [i as i32 * 256; 8];
+                        for k in 0..8 {
+                            offsets[k] =
+                                *unsafe { chunk.get_unchecked(vec_start_offset as usize + i + k) }
+                                    as i32;
+                        }
+                        let offsets = unsafe { i32x8::load(offsets.as_ptr()) };
+                        let v = unsafe { _mm256_i32gather_ps::<4>(tiled_distance_tbl, offsets.0) };
+                        sums[vec_idx as usize] += f32x8(v);
+                    }
+                }
+
+                sums.into_iter().map(|s| s.reduce_sum())
+            });
+            Ok(Float32Array::from_iter_values(distances))
         } else {
+            // Fallback implementation.
             Ok(Float32Array::from_iter_values(
                 code.values().chunks_exact(self.num_sub_vectors).map(|c| {
                     c.iter()
