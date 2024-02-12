@@ -250,40 +250,35 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         Ok(distance_table)
     }
 
+    #[inline]
+    fn l2_distance_avx512f(&self, distance_table: &[f32], code: &[u8]) -> Float32Array {
+        const VECTOR_TILE: usize = 64;
+        const CODEBOOK_TILE: usize = 16;
+        let num_centroids = num_centroids(self.num_bits);
+
+        Float32Array::from_iter_values(
+            code.chunks_exact(self.num_sub_vectors * VECTOR_TILE)
+                .flat_map(|c| {
+                    let mut sums = [0.0_f32; VECTOR_TILE];
+                    for i in (0..self.num_sub_vectors).step_by(CODEBOOK_TILE) {
+                        for (vec_idx, sum) in sums.iter_mut().enumerate() {
+                            let j = c[vec_idx * self.num_sub_vectors + i] as usize;
+                            *sum += distance_table[i * num_centroids + j];
+                        }
+                    }
+                    sums.into_iter()
+                }),
+        )
+    }
+
     /// Pre-compute L2 distance from the query to all code.
     ///
     /// It returns the squared L2 distance.
     fn l2_distances(&self, key: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
         let distance_table = self.build_l2_distance_table(key)?;
 
-        #[cfg(target_feature = "avx512f")]
-        {
-            if self.num_sub_vectors % 16 == 0 {
-                use std::arch::x86_64::*;
-                return Ok(Arc::new(Float32Array::from_iter_values(
-                    code.values()
-                        .chunks_exact(self.num_sub_vectors)
-                        .map(|c| unsafe {
-                            let mut s = _mm512_setzero_ps();
-                            c.chunks_exact(16)
-                                .enumerate()
-                                .for_each(|(idx, lane_chunk)| {
-                                    let mut offsets: [i32; 16] = [(idx as i32 * 8) * 256; 16];
-                                    lane_chunk.iter().enumerate().for_each(|(j, &code)| {
-                                        offsets[j] += (j * 256 + code as usize) as i32
-                                    });
-                                    let simd_offsets = _mm512_loadu_epi32(offsets.as_ptr());
-                                    let v = _mm512_i32gather_ps(
-                                        simd_offsets,
-                                        distance_table.as_ptr() as *const u8,
-                                        4,
-                                    );
-                                    s = _mm512_add_ps(s, v);
-                                });
-                            _mm512_reduce_add_ps(s)
-                        }),
-                )));
-            }
+        if cfg!(target_feature = "avx512f") {
+            return Ok(self.l2_distance_avx512f(&distance_table, code.values()));
         }
 
         // Tiling over PQ-code and Codebook.
