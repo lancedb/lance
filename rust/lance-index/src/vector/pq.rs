@@ -228,10 +228,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         Ok(total_distortion / data.num_rows() as f64)
     }
 
-    /// Pre-compute L2 distance from the query to all code.
-    ///
-    /// It returns the squared L2 distance.
-    fn l2_distance_table(&self, key: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
+    fn build_l2_distance_table(&self, key: &dyn Array) -> Result<Vec<f32>> {
         let key: &T::ArrayType = key.as_any().downcast_ref().ok_or(Error::Index {
             message: format!(
                 "Build L2 distance table, type mismatch: {}",
@@ -240,9 +237,6 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
             location: Default::default(),
         })?;
 
-        // Build distance table for each sub-centroid to the query key.
-        //
-        // Distance table: `[T::Native: num_sub_vectors(row) * num_centroids(column)]`.
         let mut distance_table = vec![];
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
@@ -254,6 +248,14 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                 let distances = l2_distance_batch(sub_vec, subvec_centroids, sub_vector_length);
                 distance_table.extend(distances);
             });
+        Ok(distance_table)
+    }
+
+    /// Pre-compute L2 distance from the query to all code.
+    ///
+    /// It returns the squared L2 distance.
+    fn l2_distances(&self, key: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
+        let distance_table = self.build_l2_distance_table(key)?;
 
         #[cfg(target_feature = "avx512f")]
         {
@@ -267,9 +269,9 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                             c.chunks_exact(16)
                                 .enumerate()
                                 .for_each(|(idx, lane_chunk)| {
-                                    let mut offsets: [i32; 16] = [0; 16];
+                                    let mut offsets: [i32; 16] = [(idx as i32 * 8) * 256; 16];
                                     lane_chunk.iter().enumerate().for_each(|(j, &code)| {
-                                        offsets[j] = ((idx * 8 + j) * 256 + code as usize) as i32
+                                        offsets[j] = (j * 256 + code as usize) as i32
                                     });
                                     let simd_offsets = _mm512_loadu_epi32(offsets.as_ptr());
                                     let v = _mm512_i32gather_ps(
@@ -290,10 +292,11 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                 code.values().chunks_exact(self.num_sub_vectors).map(|c| {
                     let mut s = f32x8::zeros();
                     c.chunks_exact(8).enumerate().for_each(|(idx, lane_chunk)| {
-                        let mut offsets: [i32; 8] = [0; 8];
-                        lane_chunk.iter().enumerate().for_each(|(j, &code)| {
-                            offsets[j] = ((idx * 8 + j) * 256 + code as usize) as i32
-                        });
+                        let mut offsets: [i32; 8] = [idx as i32 * 8 * 256; 8];
+                        lane_chunk
+                            .iter()
+                            .enumerate()
+                            .for_each(|(j, &code)| offsets[j] = (j * 256 + code as usize) as i32);
                         let v = f32x8::gather(&distance_table, &offsets);
                         s += v;
                     });
@@ -469,7 +472,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
 
     fn build_distance_table(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
         match self.metric_type {
-            MetricType::L2 => self.l2_distance_table(query, code),
+            MetricType::L2 => self.l2_distances(query, code),
             MetricType::Cosine => {
                 let query: &T::ArrayType = query.as_any().downcast_ref().ok_or(Error::Index {
                     message: format!(
@@ -484,7 +487,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
                 // L2 over normalized vectors:  ||x - y|| = x^2 + y^2 - 2 * xy = 1 + 1 - 2 * xy = 2 * (1 - xy)
                 // Cosine distance: 1 - |xy| / (||x|| * ||y||) = 1 - xy / (x^2 * y^2) = 1 - xy / (1 * 1) = 1 - xy
                 // Therefore, Cosine = L2 / 2
-                let l2_dists = self.l2_distance_table(&query, code)?;
+                let l2_dists = self.l2_distances(&query, code)?;
                 Ok(l2_dists.values().iter().map(|v| *v / 2.0).collect())
             }
             MetricType::Dot => self.dot_distance_table(query, code),
