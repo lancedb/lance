@@ -261,6 +261,8 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         distance_table: &[f32],
         code: &[u8],
     ) -> Float32Array {
+        use std::arch::x86_64::*;
+
         let num_centroids = num_centroids(self.num_bits);
 
         let iter = code.chunks_exact(self.num_sub_vectors * V);
@@ -269,9 +271,18 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
             for i in (0..self.num_sub_vectors).step_by(C) {
                 for (vec_idx, sum) in sums.iter_mut().enumerate() {
                     let vec_start = vec_idx * self.num_sub_vectors;
+                    let mut offsets = [(i * num_centroids) as i32; C];
                     for j in 0..C {
-                        let code_in_subvector = c[vec_start + j] as usize;
-                        *sum += distance_table[i * num_centroids + code_in_subvector];
+                        offsets[j] += c[vec_start + j] as i32;
+                    }
+                    unsafe {
+                        let simd_offsets = _mm512_loadu_epi32(offsets.as_ptr());
+                        let v = _mm512_i32gather_ps(
+                            simd_offsets,
+                            distance_table.as_ptr() as *const u8,
+                            4,
+                        );
+                        *sum += _mm512_reduce_add_ps(v);
                     }
                 }
             }

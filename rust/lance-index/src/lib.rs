@@ -14,6 +14,8 @@
 
 //! Lance secondary index library
 
+#![feature(stdarch_x86_avx512)]
+
 use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;
