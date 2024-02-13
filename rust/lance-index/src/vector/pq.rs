@@ -253,16 +253,25 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
     /// Compute L2 distance from the query to all code.
     ///
     /// Type parameters
+    /// ---------------
     /// - C: the tile size of code-book to run at once.
     /// - V: the tile size of PQ code to run at once.
+    ///
+    /// Parameters
+    /// ----------
+    /// - distance_table: the pre-computed L2 distance table.
+    ///   It is a flatten array of [num_sub_vectors, num_centroids] f32.
+    /// - code: the PQ code to be used to compute the distances.
+    ///
+    /// Returns
+    /// -------
+    ///  The squared L2 distance.
     #[inline]
     fn compute_l2_distance<const C: usize, const V: usize>(
         &self,
         distance_table: &[f32],
         code: &[u8],
     ) -> Float32Array {
-        use std::arch::x86_64::*;
-
         let num_centroids = num_centroids(self.num_bits);
 
         let iter = code.chunks_exact(self.num_sub_vectors * V);
@@ -271,18 +280,32 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
             for i in (0..self.num_sub_vectors).step_by(C) {
                 for (vec_idx, sum) in sums.iter_mut().enumerate() {
                     let vec_start = vec_idx * self.num_sub_vectors;
-                    let mut offsets = [(i * num_centroids) as i32; C];
-                    for j in 0..C {
-                        offsets[j] += c[vec_start + j] as i32;
+                    #[cfg(all(feature = "nightly", target_feature = "avx512f"))]
+                    {
+                        use std::arch::x86_64::*;
+                        let mut offsets = [(i * num_centroids) as i32; C];
+                        for j in 0..C {
+                            offsets[j] += c[vec_start + j] as i32;
+                        }
+                        unsafe {
+                            let simd_offsets = _mm512_loadu_epi32(offsets.as_ptr());
+                            let v = _mm512_i32gather_ps(
+                                simd_offsets,
+                                distance_table.as_ptr() as *const u8,
+                                4,
+                            );
+                            *sum += _mm512_reduce_add_ps(v);
+                        }
                     }
-                    unsafe {
-                        let simd_offsets = _mm512_loadu_epi32(offsets.as_ptr());
-                        let v = _mm512_i32gather_ps(
-                            simd_offsets,
-                            distance_table.as_ptr() as *const u8,
-                            4,
-                        );
-                        *sum += _mm512_reduce_add_ps(v);
+                    #[cfg(not(all(feature = "nightly", target_feature = "avx512f")))]
+                    {
+                        let s = c[vec_start as usize..]
+                            .iter()
+                            .take(C)
+                            .enumerate()
+                            .map(|(k, c)| distance_table[(i + k) * 256 + *c as usize])
+                            .sum::<f32>();
+                        *sum += s;
                     }
                 }
             }
@@ -306,10 +329,14 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
     fn l2_distances(&self, key: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
         let distance_table = self.build_l2_distance_table(key)?;
 
-        if cfg!(target_feature = "avx512f") {
-            return Ok(self.compute_l2_distance::<16, 64>(&distance_table, code.values()));
+        #[cfg(target_feature = "avx512f")]
+        {
+            Ok(self.compute_l2_distance::<16, 64>(&distance_table, code.values()))
         }
-        return Ok(self.compute_l2_distance::<8, 64>(&distance_table, code.values()));
+        #[cfg(not(target_feature = "avx512f"))]
+        {
+            Ok(self.compute_l2_distance::<8, 64>(&distance_table, code.values()))
+        }
     }
 
     /// Pre-compute dot product to each sub-centroids.
