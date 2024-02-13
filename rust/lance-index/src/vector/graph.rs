@@ -25,8 +25,11 @@ use num_traits::{AsPrimitive, Float, PrimInt};
 use snafu::{location, Location};
 
 pub(crate) mod builder;
+mod io;
+mod iter;
 pub(super) mod storage;
 
+use iter::Iter;
 use storage::VectorStorage;
 
 pub struct GraphNode<I = u32> {
@@ -47,17 +50,6 @@ impl<I> From<I> for GraphNode<I> {
             neighbors: vec![],
         }
     }
-}
-
-#[async_trait::async_trait]
-pub trait SerializeToLance {
-    /// Serialize the object to one single Lance file.
-    ///
-    /// Parameters
-    /// ----------
-    /// path : str
-    ///
-    async fn to_lance(&self, path: &str) -> Result<()>;
 }
 
 /// A wrapper for f32 to make it ordered, so that we can put it into
@@ -97,7 +89,7 @@ impl From<OrderedFloat> for f32 {
 /// ---------------
 /// K: Vertex Index type
 /// T: the data type of vector, i.e., ``f32`` or ``f16``.
-pub trait Graph<K: PrimInt = u32, T: Float = f32> {
+pub trait Graph<K: PrimInt + Hash = u32, T: Float = f32> {
     /// Get the number of nodes in the graph.
     fn len(&self) -> usize;
 
@@ -116,6 +108,9 @@ pub trait Graph<K: PrimInt = u32, T: Float = f32> {
     ///
     /// Returns the distance between two nodes as float32.
     fn distance_between(&self, a: K, b: K) -> f32;
+
+    /// Create a BFS iterator.
+    fn iter(&self) -> self::iter::Iter<'_, K, T>;
 }
 
 /// Serializable Graph.
@@ -212,6 +207,10 @@ impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType, V: storage::Ve
 
     fn len(&self) -> usize {
         self.nodes.len()
+    }
+
+    fn iter(&self) -> Iter<'_, I, T> {
+        Iter::new(self as &dyn Graph<I, T>, I::zero())
     }
 }
 

@@ -97,6 +97,10 @@ impl<V: VectorStorage<f32>> Graph<u32, f32> for GraphBuilder<V> {
         let to_vec = self.vectors.get(b as usize);
         (self.dist_fn)(from_vec, to_vec)
     }
+
+    fn iter(&self) -> super::iter::Iter<'_, u32, f32> {
+        todo!()
+    }
 }
 
 impl<V: VectorStorage<f32> + 'static> GraphBuilder<V> {
