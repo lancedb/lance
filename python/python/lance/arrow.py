@@ -43,12 +43,20 @@ __all__ = [
 ]
 
 
+def __is_pyarrow_string_type(t: pa.DataType) -> bool:
+    # TODO: allow string_view once available?
+    return pa.types.is_string(t) or pa.types.is_large_string(t)
+
+
+def __is_pyarrow_binary_type(t: pa.DataType) -> bool:
+    # TODO: allow binary_view once available?
+    return pa.types.is_binary(t) or pa.types.is_large_binary(t)
+
+
 class ImageURIType(pa.ExtensionType):
-    def __init__(self, storage_type=pa.string()):
+    def __init__(self, storage_type: pa.DataType = pa.string()):
         # TODO: allow string_view once available?
-        if not (
-            pa.types.is_string(storage_type) or pa.types.is_large_string(storage_type)
-        ):
+        if not __is_pyarrow_string_type(storage_type):
             raise ValueError("storage_type must be a string type")
         pa.ExtensionType.__init__(self, storage_type, "lance.arrow.image_uri")
 
@@ -67,11 +75,9 @@ class ImageURIType(pa.ExtensionType):
 
 
 class EncodedImageType(pa.ExtensionType):
-    def __init__(self, storage_type=pa.binary()):
+    def __init__(self, storage_type: pa.DataType = pa.binary()):
         # TODO: use pa.BinaryView once available?
-        if not (
-            pa.types.is_binary(storage_type) or pa.types.is_large_binary(storage_type)
-        ):
+        if not __is_pyarrow_binary_type(storage_type):
             raise ValueError("storage_type must be a binary type")
         pa.ExtensionType.__init__(self, storage_type, "lance.arrow.encoded_image")
 
@@ -183,7 +189,7 @@ class ImageURIArray(ImageArray):
         uris: Union[pa.StringArray, pa.LargeStringArray, Iterable[Union[str, Path]]],
     ):
         """
-        Create an ImageURIArray from an array or sequence of URIs.
+        Create an ImageURIArray from an array or iterable of URIs (such as a list).
 
         Parameters
         ----------
@@ -218,7 +224,7 @@ class ImageURIArray(ImageArray):
         ----------
         storage_type : pa.DataType, optional
             The storage type to use for the encoded images. Default is pa.binary().
-            To support larger arrays, use pa.large_binary().
+            To support arrays with more than 2GiB of data, use pa.large_binary().
 
         Returns
         -------
@@ -313,7 +319,7 @@ class EncodedImageArray(ImageArray):
     def to_tensor(
         self,
         decoder: Optional[
-            Callable[[pa.BinaryArray, pa.LargeBinaryArray], np.ndarray]
+            Callable[[Union[pa.BinaryArray, pa.LargeBinaryArray]], np.ndarray]
         ] = None,
     ):
         """
@@ -433,7 +439,7 @@ class FixedShapeImageTensorArray(ImageArray):
             An encoder function that takes a numpy.ndarray and returns an encoded image.
         storage_type : pa.DataType, optional
             The storage type to use for the encoded images. Default is pa.binary().
-            To support larger arrays, use pa.large_binary().
+            To support arrays with more than 2GiB of data, use pa.large_binary().
 
         Returns
         -------
