@@ -43,12 +43,12 @@ __all__ = [
 ]
 
 
-def __is_pyarrow_string_type(t: pa.DataType) -> bool:
+def _is_pyarrow_string_type(t: pa.DataType) -> bool:
     # TODO: allow string_view once available?
     return pa.types.is_string(t) or pa.types.is_large_string(t)
 
 
-def __is_pyarrow_binary_type(t: pa.DataType) -> bool:
+def _is_pyarrow_binary_type(t: pa.DataType) -> bool:
     # TODO: allow binary_view once available?
     return pa.types.is_binary(t) or pa.types.is_large_binary(t)
 
@@ -56,7 +56,7 @@ def __is_pyarrow_binary_type(t: pa.DataType) -> bool:
 class ImageURIType(pa.ExtensionType):
     def __init__(self, storage_type: pa.DataType = pa.string()):
         # TODO: allow string_view once available?
-        if not __is_pyarrow_string_type(storage_type):
+        if not _is_pyarrow_string_type(storage_type):
             raise ValueError("storage_type must be a string type")
         pa.ExtensionType.__init__(self, storage_type, "lance.arrow.image_uri")
 
@@ -77,7 +77,7 @@ class ImageURIType(pa.ExtensionType):
 class EncodedImageType(pa.ExtensionType):
     def __init__(self, storage_type: pa.DataType = pa.binary()):
         # TODO: use pa.BinaryView once available?
-        if not __is_pyarrow_binary_type(storage_type):
+        if not _is_pyarrow_binary_type(storage_type):
             raise ValueError("storage_type must be a binary type")
         pa.ExtensionType.__init__(self, storage_type, "lance.arrow.encoded_image")
 
