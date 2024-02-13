@@ -656,6 +656,14 @@ impl Scanner {
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        if self.projections.fields.is_empty() && !self.with_row_id {
+            return Err(Error::InvalidInput {
+                source:
+                    "no columns were selected and with_row_id is false, there is nothing to scan"
+                        .into(),
+                location: location!(),
+            });
+        }
         // Scalar indices are only used when prefiltering
         // TODO: Should we use them when postfiltering if there is no vector search?
         let use_scalar_index = self.prefilter || self.nearest.is_none();

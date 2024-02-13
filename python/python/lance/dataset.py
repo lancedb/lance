@@ -1897,8 +1897,6 @@ class ScannerBuilder:
         return self
 
     def columns(self, cols: Optional[list[str]] = None) -> ScannerBuilder:
-        if cols is not None and len(cols) == 0:
-            cols = None
         self._columns = cols
         return self
 

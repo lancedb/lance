@@ -76,7 +76,8 @@ def test_roundtrip_types(tmp_path: Path):
         "dict": pa.array(["a", "b", "a"], pa.dictionary(pa.int8(), pa.string())),
         # PyArrow doesn't support creating large_string dictionaries easily.
         "large_dict": pa.DictionaryArray.from_arrays(
-            pa.array([0, 1, 1], pa.int8()), pa.array(["foo", "bar"], pa.large_string())
+            pa.array([0, 1, 1], pa.int8()),
+            pa.array(["foo", "bar"], pa.large_string()),
         ),
         "list": pa.array([["a", "b"], ["c", "d"], ["e", "f"]], pa.list_(pa.string())),
         "large_list": pa.array(
@@ -1203,6 +1204,24 @@ def test_scan_with_batch_size(tmp_path: Path):
         assert batch.num_rows == 16
         df = batch.to_pandas()
         assert df["a"].iloc[0] == idx * 16
+
+
+def test_scan_no_columns(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    df = pd.DataFrame({"a": range(100)})
+    dataset = lance.write_dataset(df, base_dir)
+
+    # columns=[] can be used to get just the row ids
+    batches = dataset.scanner(columns=[], with_row_id=True).to_batches()
+
+    expected_schema = pa.schema([pa.field("_rowid", pa.uint64())])
+    for batch in batches:
+        print(batch.schema)
+        assert batch.schema == expected_schema
+
+    # if with_row_id is not True then columns=[] is an error
+    with pytest.raises(ValueError, match="no columns were selected"):
+        dataset.scanner(columns=[]).to_table()
 
 
 def test_scan_prefilter(tmp_path: Path):
