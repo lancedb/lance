@@ -1216,7 +1216,6 @@ def test_scan_no_columns(tmp_path: Path):
 
     expected_schema = pa.schema([pa.field("_rowid", pa.uint64())])
     for batch in batches:
-        print(batch.schema)
         assert batch.schema == expected_schema
 
     # if with_row_id is not True then columns=[] is an error
