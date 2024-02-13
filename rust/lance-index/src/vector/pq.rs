@@ -56,8 +56,9 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
     ///   PQ code column
     async fn transform(&self, data: &dyn Array) -> Result<ArrayRef>;
 
-    /// Build the distance lookup in `f32`.
-    fn build_distance_table(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array>;
+    /// Compute the distance between query vector to the PQ code.
+    ///
+    fn compute_distances(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array>;
 
     /// Get the centroids for one sub-vector.
     fn num_bits(&self) -> u32;
@@ -353,12 +354,12 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         }
     }
 
-    /// Pre-compute dot product to each sub-centroids.
     /// Parameters
+    /// ----------
     ///  - query: the query vector, with shape (dimension, )
     ///  - code: the PQ code in one partition.
     ///
-    fn dot_distance_table(&self, key: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
+    fn dot_distances(&self, key: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
         let key: &T::ArrayType = key.as_any().downcast_ref().ok_or(Error::Index {
             message: format!(
                 "Build Dot distance table, type mismatch: {}",
@@ -506,7 +507,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
         )?))
     }
 
-    fn build_distance_table(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
+    fn compute_distances(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
         match self.metric_type {
             MetricType::L2 => self.l2_distances(query, code),
             MetricType::Cosine => {
@@ -526,7 +527,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
                 let l2_dists = self.l2_distances(&query, code)?;
                 Ok(l2_dists.values().iter().map(|v| *v / 2.0).collect())
             }
-            MetricType::Dot => self.dot_distance_table(query, code),
+            MetricType::Dot => self.dot_distances(query, code),
         }
     }
 
@@ -670,7 +671,7 @@ mod tests {
         let pq_code = UInt8Array::from_iter_values((0..16 * TOTAL).map(|v| v as u8));
         let query = generate_random_array(DIM);
 
-        let dists = pq.build_distance_table(&query, &pq_code).unwrap();
+        let dists = pq.compute_distances(&query, &pq_code).unwrap();
 
         let sub_vec_len = DIM / 16;
         let expected = pq_code

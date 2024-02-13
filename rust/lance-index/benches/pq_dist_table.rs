@@ -49,7 +49,7 @@ fn dist_table(c: &mut Criterion) {
         format!("{},L2,PQ={},DIM={}", TOTAL, PQ, DIM).as_str(),
         |b| {
             b.iter(|| {
-                black_box(l2_pq.build_distance_table(&query, &code).unwrap().len());
+                black_box(l2_pq.compute_distances(&query, &code).unwrap().len());
             })
         },
     );
@@ -61,7 +61,7 @@ fn dist_table(c: &mut Criterion) {
         format!("{},Cosine,PQ={},DIM={}", TOTAL, PQ, DIM).as_str(),
         |b| {
             b.iter(|| {
-                black_box(cosine_pq.build_distance_table(&query, &code).unwrap());
+                black_box(cosine_pq.compute_distances(&query, &code).unwrap());
             })
         },
     );
