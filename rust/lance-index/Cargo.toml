@@ -60,11 +60,6 @@ datafusion-sql.workspace = true
 prost-build.workspace = true
 rustc_version.workspace = true
 
-[features]
-# Nightly flag will be automatically enabled when building with nightly.
-# See build.rs
-nightly = []
-
 [[bench]]
 name = "find_partitions"
 harness = false

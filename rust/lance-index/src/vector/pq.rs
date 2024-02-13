@@ -289,18 +289,26 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                     #[cfg(all(feature = "nightly", target_feature = "avx512f"))]
                     {
                         use std::arch::x86_64::*;
-                        let mut offsets = [(i * num_centroids) as i32; C];
-                        for k in 0..C {
-                            offsets[k] += (k * num_centroids) as i32 + c[vec_start + k] as i32;
-                        }
-                        unsafe {
-                            let simd_offsets = _mm512_loadu_epi32(offsets.as_ptr());
-                            let v = _mm512_i32gather_ps(
-                                simd_offsets,
-                                distance_table.as_ptr() as *const u8,
-                                4,
-                            );
-                            *sum += _mm512_reduce_add_ps(v);
+                        if i + C <= self.num_sub_vectors {
+                            let mut offsets = [(i * num_centroids) as i32; C];
+                            for k in 0..C {
+                                offsets[k] += (k * num_centroids) as i32 + c[vec_start + k] as i32;
+                            }
+                            unsafe {
+                                let simd_offsets = _mm512_loadu_epi32(offsets.as_ptr());
+                                let v = _mm512_i32gather_ps(
+                                    simd_offsets,
+                                    distance_table.as_ptr() as *const u8,
+                                    4,
+                                );
+                                *sum += _mm512_reduce_add_ps(v);
+                            }
+                        } else {
+                            let mut s = 0.0;
+                            for k in 0..self.num_sub_vectors - i {
+                                *sum += distance_table
+                                    [(i + k) * num_centroids + c[vec_start + k] as usize];
+                            }
                         }
                     }
                     #[cfg(not(any(feature = "nightly", target_feature = "avx512f")))]
