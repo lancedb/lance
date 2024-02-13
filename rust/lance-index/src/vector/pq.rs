@@ -299,7 +299,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                     }
                     #[cfg(not(all(feature = "nightly", target_feature = "avx512f")))]
                     {
-                        let s = c[vec_start..]
+                        let s = c[vec_start + i..]
                             .iter()
                             .take(C)
                             .enumerate()
@@ -569,6 +569,7 @@ mod tests {
         Float16Array, Float32Array,
     };
     use half::f16;
+    use lance_testing::datagen::generate_random_array;
     use num_traits::Zero;
 
     #[test]
@@ -635,5 +636,48 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("it is likely that distance is NaN"));
+    }
+
+    #[tokio::test]
+    async fn test_l2_distance() {
+        const DIM: usize = 512;
+        let codebook = Arc::new(Float32Array::from_iter_values(
+            (0..256 * DIM).map(|v| v as f32),
+        ));
+        let pq = ProductQuantizerImpl::<Float32Type> {
+            num_bits: 8,
+            num_sub_vectors: 16,
+            dimension: DIM,
+            codebook: codebook.clone(),
+            metric_type: MetricType::Cosine,
+        };
+        let pq_code = UInt8Array::from_iter_values((0..16).map(|v| v as u8));
+        let query = generate_random_array(DIM);
+
+        let dists = pq.build_distance_table(&query, &pq_code).unwrap();
+
+        let sub_vec_len = DIM / 16;
+        let expected = pq_code
+            .values()
+            .iter()
+            .enumerate()
+            .flat_map(|(sub_idx, c)| {
+                let subvec_centroids = pq.centroids(sub_idx);
+                println!(
+                    "sub_idx: {}, {}..{}, subvec_centroids: len={}",
+                    sub_idx,
+                    sub_idx * sub_vec_len,
+                    (sub_idx + 1) * sub_vec_len,
+                    subvec_centroids.len()
+                );
+                let subvec = &query.values()[sub_idx * sub_vec_len..(sub_idx + 1) * sub_vec_len];
+                l2_distance_batch(
+                    subvec,
+                    &subvec_centroids[*c as usize * sub_vec_len..(*c as usize + 1) * sub_vec_len],
+                    sub_vec_len,
+                )
+            })
+            .sum::<f32>();
+        assert_eq!(dists.values()[0], expected);
     }
 }
