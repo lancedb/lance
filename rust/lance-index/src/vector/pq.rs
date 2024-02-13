@@ -250,66 +250,31 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         Ok(distance_table)
     }
 
-    #[inline]
-    fn l2_distance_avx512f(&self, distance_table: &[f32], code: &[u8]) -> Float32Array {
-        const VECTOR_TILE: usize = 64;
-        const CODEBOOK_TILE: usize = 16;
-        let num_centroids = num_centroids(self.num_bits);
-
-        Float32Array::from_iter_values(
-            code.chunks_exact(self.num_sub_vectors * VECTOR_TILE)
-                .flat_map(|c| {
-                    let mut sums = [0.0_f32; VECTOR_TILE];
-                    for i in (0..self.num_sub_vectors).step_by(CODEBOOK_TILE) {
-                        for (vec_idx, sum) in sums.iter_mut().enumerate() {
-                            let j = c[vec_idx * self.num_sub_vectors + i] as usize;
-                            *sum += distance_table[i * num_centroids + j];
-                        }
-                    }
-                    sums.into_iter()
-                }),
-        )
-    }
-
-    /// Pre-compute L2 distance from the query to all code.
+    /// Compute L2 distance from the query to all code.
     ///
-    /// It returns the squared L2 distance.
-    fn l2_distances(&self, key: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
-        let distance_table = self.build_l2_distance_table(key)?;
-
-        if cfg!(target_feature = "avx512f") {
-            return Ok(self.l2_distance_avx512f(&distance_table, code.values()));
-        }
-
-        // Tiling over PQ-code and Codebook.
-        //
-        // Works with any CPU architecture with more than 16KB L1 D-cache.
-        const VECTOR_TILE: usize = 64;
-        const CODEBOOK_TILE: usize = 8;
+    /// Type parameters
+    /// - C: the tile size of code-book to run at once.
+    /// - V: the tile size of PQ code to run at once.
+    #[inline]
+    fn compute_l2_distance<const C: usize, const V: usize>(
+        &self,
+        distance_table: &[f32],
+        code: &[u8],
+    ) -> Float32Array {
         let num_centroids = num_centroids(self.num_bits);
-        let iter = code
-            .values()
-            .chunks_exact(self.num_sub_vectors * VECTOR_TILE);
-        let distances = iter.clone().flat_map(|chunk| {
-            let mut sums = [0.0_f32; VECTOR_TILE];
 
-            // i = tile index of code-book
-            // Read `CODEBOOK_TILE` * 256 * 4 bytes(f32) each time
-            for i in (0..self.num_sub_vectors).step_by(CODEBOOK_TILE) {
-                let tiled_distance_tbl = &distance_table[i * num_centroids..];
-                // vec_idx = tile index of vectors.
+        let iter = code.chunks_exact(self.num_sub_vectors * V);
+        let distances = iter.clone().flat_map(|c| {
+            let mut sums = [0.0_f32; V];
+            for i in (0..self.num_sub_vectors).step_by(C) {
                 for (vec_idx, sum) in sums.iter_mut().enumerate() {
-                    let vec_start_offset = (vec_idx * self.num_sub_vectors + i) as i32;
-                    let s = chunk[vec_start_offset as usize..]
-                        .iter()
-                        .take(CODEBOOK_TILE)
-                        .enumerate()
-                        .map(|(k, c)| tiled_distance_tbl[k * 256 + *c as usize])
-                        .sum::<f32>();
-                    *sum += s;
+                    let vec_start = vec_idx * self.num_sub_vectors;
+                    for j in 0..C {
+                        let code_in_subvector = c[vec_start + j] as usize;
+                        *sum += distance_table[i * num_centroids + code_in_subvector];
+                    }
                 }
             }
-
             sums.into_iter()
         });
         // Remainder
@@ -321,7 +286,19 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                 })
                 .sum::<f32>()
         });
-        Ok(Float32Array::from_iter_values(distances.chain(remainder)))
+        Float32Array::from_iter_values(distances.chain(remainder))
+    }
+
+    /// Pre-compute L2 distance from the query to all code.
+    ///
+    /// It returns the squared L2 distance.
+    fn l2_distances(&self, key: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
+        let distance_table = self.build_l2_distance_table(key)?;
+
+        if cfg!(target_feature = "avx512f") {
+            return Ok(self.compute_l2_distance::<16, 64>(&distance_table, code.values()));
+        }
+        return Ok(self.compute_l2_distance::<8, 64>(&distance_table, code.values()));
     }
 
     /// Pre-compute dot product to each sub-centroids.
