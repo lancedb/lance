@@ -30,35 +30,41 @@ use pprof::criterion::{Output, PProfProfiler};
 
 const PQ: usize = 96;
 const DIM: usize = 1536;
+const TOTAL: usize = 5 * 1024 * 1024;
 
 fn dist_table(c: &mut Criterion) {
     let codebook = Arc::new(generate_random_array_with_seed::<Float32Type>(
-        256 * PQ * DIM,
+        256 * DIM,
         [88; 32],
     ));
     let query = generate_random_array_with_seed::<Float32Type>(DIM, [32; 32]);
 
     let mut rnd = StdRng::from_seed([32; 32]);
-    const NUM_CODE: usize = 8192;
-    let code = UInt8Array::from_iter_values(repeat(rnd.gen::<u8>()).take(NUM_CODE * PQ));
+    let code = UInt8Array::from_iter_values(repeat(rnd.gen::<u8>()).take(TOTAL * PQ));
 
     let l2_pq =
         ProductQuantizerImpl::<Float32Type>::new(PQ, 8, DIM, codebook.clone(), MetricType::L2);
 
-    c.bench_function("L2", |b| {
-        b.iter(|| {
-            black_box(l2_pq.build_distance_table(&query, &code).unwrap().len());
-        })
-    });
+    c.bench_function(
+        format!("{},L2,PQ={},DIM={}", TOTAL, PQ, DIM).as_str(),
+        |b| {
+            b.iter(|| {
+                black_box(l2_pq.compute_distances(&query, &code).unwrap().len());
+            })
+        },
+    );
 
     let cosine_pq =
         ProductQuantizerImpl::<Float32Type>::new(PQ, 8, DIM, codebook.clone(), MetricType::Cosine);
 
-    c.bench_function("Cosine", |b| {
-        b.iter(|| {
-            black_box(cosine_pq.build_distance_table(&query, &code).unwrap());
-        })
-    });
+    c.bench_function(
+        format!("{},Cosine,PQ={},DIM={}", TOTAL, PQ, DIM).as_str(),
+        |b| {
+            b.iter(|| {
+                black_box(cosine_pq.compute_distances(&query, &code).unwrap());
+            })
+        },
+    );
 }
 
 #[cfg(target_os = "linux")]

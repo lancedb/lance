@@ -178,7 +178,7 @@ impl VectorIndex for PQIndex {
             }?;
 
             // Pre-compute distance table for each sub-vector.
-            let distances = pq.build_distance_table(query.key.as_ref(), &code)?;
+            let distances = pq.compute_distances(query.key.as_ref(), &code)?;
 
             debug_assert_eq!(distances.len(), row_ids.len());
 
