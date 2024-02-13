@@ -114,7 +114,6 @@ tracing-chrome = "0.7.1"
 
 [features]
 avx512fp16 = ["lance-linalg/avx512fp16"]
-nightly = ["lance-index/nightly"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["clap", "lzma-sys/static"]
 # opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
