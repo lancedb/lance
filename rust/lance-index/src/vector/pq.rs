@@ -299,7 +299,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                     }
                     #[cfg(not(all(feature = "nightly", target_feature = "avx512f")))]
                     {
-                        let s = c[vec_start as usize..]
+                        let s = c[vec_start..]
                             .iter()
                             .take(C)
                             .enumerate()
