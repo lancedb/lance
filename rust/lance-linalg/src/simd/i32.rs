@@ -25,7 +25,7 @@ use super::SIMD;
 #[allow(non_camel_case_types)]
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
-pub struct i32x8(pub __m256i);
+pub struct i32x8(pub(crate) __m256i);
 
 #[allow(non_camel_case_types)]
 #[cfg(target_arch = "aarch64")]
