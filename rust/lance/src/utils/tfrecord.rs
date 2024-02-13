@@ -553,7 +553,7 @@ fn convert_leaf(
     Ok((values, offsets))
 }
 
-fn compute_offsets(features: &Vec<Option<&Feature>>, type_info: &TypeInfo) -> OffsetBuffer<i32> {
+fn compute_offsets(features: &[Option<&Feature>], type_info: &TypeInfo) -> OffsetBuffer<i32> {
     let mut offsets: Vec<i32> = Vec::with_capacity(features.len() + 1);
     offsets.push(0);
 
@@ -598,7 +598,7 @@ fn compute_offsets(features: &Vec<Option<&Feature>>, type_info: &TypeInfo) -> Of
 // /// FixedShapeTensor definition:
 // /// https://arrow.apache.org/docs/format/CanonicalExtensions.html#fixed-shape-tensor
 fn convert_fixedshape_tensor(
-    features: &Vec<Option<&Feature>>,
+    features: &[Option<&Feature>],
     type_info: &TypeInfo,
 ) -> Result<(ArrayRef, Option<OffsetBuffer<i32>>)> {
     use arrow::array::*;

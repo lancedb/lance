@@ -1389,7 +1389,7 @@ mod tests {
             &mut self,
             index: &IVFIndex,
             prefilter: Arc<PreFilter>,
-            ids_to_test: &Vec<u64>,
+            ids_to_test: &[u64],
             row_id_map: F,
         ) {
             const ROWS_TO_TEST: u32 = 500;
