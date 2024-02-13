@@ -13,7 +13,9 @@
  */
 package com.lancedb.lance;
 
+import io.questdb.jar.jni.JarJniLoader;
 import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.jni.JniLoader;
 
 import java.io.Closeable;
 
@@ -28,7 +30,7 @@ public class Dataset implements Closeable {
   private long nativeDatasetHandle;
 
   static {
-    LanceNativeManager.loadLanceNative();
+    JarJniLoader.loadLib(Dataset.class, "/nativelib", "lance_jni");
   }
 
   private Dataset() {
@@ -39,8 +41,6 @@ public class Dataset implements Closeable {
   }
 
   private static native Dataset writeWithFFIStream(long ArrowStreamMemoryAddress, String path);
-
-  public native static Dataset write(NativeArrowArrayStream stream, String path);
 
   /**
    * Opens a dataset from the specified path using the native library.

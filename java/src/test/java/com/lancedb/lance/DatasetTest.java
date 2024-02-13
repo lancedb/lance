@@ -14,18 +14,15 @@
 package com.lancedb.lance;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.IntVector;
-import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowFileReader;
 import org.apache.arrow.vector.ipc.SeekableReadChannel;
-import org.apache.arrow.vector.ipc.message.ArrowBlock;
 import org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -58,30 +55,6 @@ public class DatasetTest {
   }
 
   @Test
-  void testWriteAndOpenPath() throws URISyntaxException, IOException {
-    Path path = Paths.get(DatasetTest.class.getResource("/random_access.arrow").toURI());
-    try(
-        BufferAllocator allocator = new RootAllocator();
-        ArrowFileReader reader = new ArrowFileReader(
-            new SeekableReadChannel(new ByteArrayReadableSeekableByteChannel(
-                Files.readAllBytes(path))), allocator)
-    ) {
-      System.out.println("Record batches in file: " + reader.getRecordBlocks().size());
-      for (ArrowBlock arrowBlock : reader.getRecordBlocks()) {
-        reader.loadRecordBatch(arrowBlock);
-        VectorSchemaRoot vectorSchemaRootRecover = reader.getVectorSchemaRoot();
-        System.out.print(vectorSchemaRootRecover.contentToTSVString());
-      }
-      NativeArrowArrayStream nativeStream = NativeArrowArrayStream.create();
-      Data.exportArrayStream(allocator, reader, nativeStream.getArrowArrayStream());
-      Path datasetPath = tempDir.resolve("new_dataset");
-      assertDoesNotThrow(() -> {
-        dataset = Dataset.write(nativeStream, datasetPath.toString());
-      });
-    }
-  }
-
-  @Test
   void testWriteStreamAndOpenPath() throws URISyntaxException, IOException {
     Path path = Paths.get(DatasetTest.class.getResource("/random_access.arrow").toURI());
     try(
@@ -95,8 +68,9 @@ public class DatasetTest {
       Path datasetPath = tempDir.resolve("new_dataset");
       assertDoesNotThrow(() -> {
         dataset = Dataset.write(arrowStream, datasetPath.toString());
+        assertEquals(9, dataset.countRows());
         Dataset datasetRead = Dataset.open(datasetPath.toString());
-
+        assertEquals(9, datasetRead.countRows());
       });
     }
   }
