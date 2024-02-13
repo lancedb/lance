@@ -16,6 +16,7 @@
 //!
 
 use std::any::Any;
+use std::cmp::min;
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
@@ -306,7 +307,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                     {
                         let s = c[vec_start + i..]
                             .iter()
-                            .take(C)
+                            .take(min(C, self.num_sub_vectors - i))
                             .enumerate()
                             .map(|(k, c)| distance_table[(i + k) * num_centroids + *c as usize])
                             .sum::<f32>();
