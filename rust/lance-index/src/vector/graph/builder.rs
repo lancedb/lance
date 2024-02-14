@@ -22,13 +22,18 @@ use super::{Graph, InMemoryGraph, OrderedFloat};
 use crate::vector::graph::storage::VectorStorage;
 
 /// GraphNode during build.
-pub(super) struct GraphBuilderNode {
+pub(crate) struct GraphBuilderNode {
     /// Node ID
-    id: u64,
-    /// Neighbors, sorted by the distance.
-    pub(super) neighbors: BTreeMap<OrderedFloat, u64>,
+    pub id: u64,
 
-    pub(super) row_id: u64,
+    /// Pointers to its neighbors, sorted by the distance to this node.
+    pub neighbors: BTreeMap<OrderedFloat, u64>,
+
+    /// Pointer to the next level of graph.
+    ///
+    /// If this is a base-layer in HNSW, this points to the vector storage, i.e,
+    /// as the `row_id` in Lance Dataset.
+    pub pointer: u64,
 }
 
 impl GraphBuilderNode {
@@ -36,8 +41,13 @@ impl GraphBuilderNode {
         Self {
             id,
             neighbors: BTreeMap::new(),
-            row_id: 0,
+            pointer: 0,
         }
+    }
+
+    /// Set the pointer of this node.
+    pub(crate) fn set_pointer(&mut self, pointer: u64) {
+        self.pointer = pointer;
     }
 
     /// Prune the node and only keep `max_edges` edges.
@@ -60,8 +70,8 @@ impl GraphBuilderNode {
 /// Graph Builder.
 ///
 ///
-pub struct GraphBuilder<V: VectorStorage<f32>> {
-    nodes: BTreeMap<u64, GraphBuilderNode>,
+pub(crate) struct GraphBuilder<V: VectorStorage<f32>> {
+    pub(crate) nodes: BTreeMap<u64, GraphBuilderNode>,
 
     /// Storage for vectors.
     vectors: V,

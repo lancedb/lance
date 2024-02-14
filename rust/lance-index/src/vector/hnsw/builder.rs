@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::cmp::min;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use lance_linalg::distance::MetricType;
@@ -155,6 +156,7 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
             self.m_max,
             self.ef_construction
         );
+
         for _ in 0..self.max_level {
             let mut level =
                 GraphBuilder::<V>::new(self.vectors.clone()).metric_type(self.metric_type);
@@ -166,6 +168,8 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
             self.insert(i as u64)?;
         }
 
+        remapping_levels(&mut self.levels);
+
         let graphs = self
             .levels
             .iter()
@@ -176,5 +180,68 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
             self.entry_point,
             self.metric_type,
         ))
+    }
+}
+
+/// Because each level is stored as a separate continous RecordBatch. We need to remap the pointers
+/// to the nodes in the previous level to the index in the current RecordBatch.
+fn remapping_levels<V: VectorStorage<f32> + 'static>(levels: &mut [GraphBuilder<V>]) {
+    for i in 1..levels.len() {
+        let prev_level = &levels[i - 1];
+        let mapping = prev_level
+            .nodes
+            .keys()
+            .enumerate()
+            .map(|(i, &id)| (id, i as u64))
+            .collect::<HashMap<_, _>>();
+        let cur_level = &mut levels[i];
+        for node in cur_level.nodes.values_mut() {
+            node.set_pointer(*mapping.get(&node.id).expect("Expect the pointer exists"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_array::types::Float32Type;
+    use lance_linalg::matrix::MatrixView;
+    use lance_testing::datagen::generate_random_array;
+
+    #[test]
+    fn test_remapping_levels() {
+        let data = generate_random_array(8 * 100);
+        let mat = MatrixView::<Float32Type>::new(Arc::new(data), 8);
+        let mut level0 = GraphBuilder::new(mat.clone());
+        for i in 0..100 {
+            level0.insert(i as u64);
+        }
+        let mut level1 = GraphBuilder::new(mat.clone());
+        for i in [0, 5, 10, 15, 20, 30, 40, 50] {
+            level1.insert(i as u64);
+        }
+        let mut level2 = GraphBuilder::new(mat.clone());
+        for i in [0, 10, 20, 50] {
+            level2.insert(i as u64);
+        }
+        let mut levels = [level0, level1, level2];
+        remapping_levels(&mut levels);
+        assert_eq!(
+            levels[1]
+                .nodes
+                .values()
+                .map(|n| n.pointer)
+                .collect::<Vec<_>>(),
+            vec![0, 5, 10, 15, 20, 30, 40, 50]
+        );
+        assert_eq!(
+            levels[2]
+                .nodes
+                .values()
+                .map(|n| n.pointer)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 4, 7]
+        );
     }
 }

@@ -27,7 +27,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use lance_arrow::FloatToArrayType;
-use lance_core::{Error, Result, ROW_ID_FIELD};
+use lance_core::{Error, Result};
 use lance_linalg::distance::{Cosine, DistanceFunc, Dot, MetricType, L2};
 use num_traits::{AsPrimitive, Float};
 use snafu::{location, Location};
@@ -43,6 +43,16 @@ use storage::VectorStorage;
 use self::builder::GraphBuilderNode;
 
 const NEIGHBORS_COL: &str = "__neighbors";
+const POINTER_COL: &str = "__pointer";
+
+lazy_static::lazy_static! {
+    /// NEIGHBORS field.
+    pub static ref NEIGHBORS_FIELD: Field = Field::new(NEIGHBORS_COL, DataType::List(Arc::new(Field::new(
+        "item", DataType::UInt64, true
+    ))), true);
+    /// POINTER field.
+    pub static ref POINTER_FIELD: Field = Field::new(POINTER_COL, DataType::UInt64, true);
+}
 
 /// A wrapper for f32 to make it ordered, so that we can put it into
 /// a BTree or Heap
@@ -217,26 +227,19 @@ where
         metric_type: MetricType,
     ) -> Self {
         let mut neighbours_builder = ListBuilder::new(UInt64Builder::new());
-        let mut row_id_builder = UInt64Builder::new();
+        let mut pointers_builder = UInt64Builder::new();
 
         for (_, node) in nodes.iter() {
-            row_id_builder.append_value(node.row_id);
+            pointers_builder.append_value(node.pointer as u64);
             neighbours_builder.append_value(node.neighbors.values().map(|&n| Some(n)));
         }
 
-        let schema = Schema::new(vec![
-            Field::new(
-                NEIGHBORS_COL,
-                DataType::new_list(DataType::UInt64, true),
-                true,
-            ),
-            ROW_ID_FIELD.clone(),
-        ]);
+        let schema = Schema::new(vec![NEIGHBORS_FIELD.clone(), POINTER_FIELD.clone()]);
 
         let neighbors = Arc::new(neighbours_builder.finish());
         let batch = RecordBatch::try_new(
             Arc::new(schema),
-            vec![neighbors.clone(), Arc::new(row_id_builder.finish())],
+            vec![neighbors.clone(), Arc::new(pointers_builder.finish())],
         )
         .unwrap();
 
@@ -248,6 +251,7 @@ where
         }
     }
 
+    /// The range of neighbours on the var-length list array.
     fn neighbor_range(&self, k: u64) -> Range<usize> {
         let neighbors_col = self.nodes.column_by_name(NEIGHBORS_COL).unwrap();
         let neighbors = neighbors_col.as_list::<i32>();
