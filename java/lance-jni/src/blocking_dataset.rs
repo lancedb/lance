@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow::ffi_stream::ArrowArrayStreamReader;
+use arrow::array::RecordBatchReader;
 use tokio::runtime::Runtime;
 
 use lance::Dataset;
@@ -24,7 +24,7 @@ pub struct BlockingDataset {
 }
 
 impl BlockingDataset {
-    pub fn write(reader: ArrowArrayStreamReader, uri: &str) -> Result<Self> {
+    pub fn write(reader: impl RecordBatchReader + Send + 'static, uri: &str) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
