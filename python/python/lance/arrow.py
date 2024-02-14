@@ -73,6 +73,14 @@ class ImageURIType(pa.ExtensionType):
     def __arrow_ext_scalar_class__(self):
         return ImageURIScalar
 
+    def __reduce__(self):
+        # Workaround to ensure pickle works in earlier versions of PyArrow
+        # https://github.com/apache/arrow/issues/35599
+        return type(self).__arrow_ext_deserialize__, (
+            self.storage_type,
+            self.__arrow_ext_serialize__(),
+        )
+
 
 class EncodedImageType(pa.ExtensionType):
     def __init__(self, storage_type: pa.DataType = pa.binary()):
@@ -93,6 +101,14 @@ class EncodedImageType(pa.ExtensionType):
 
     def __arrow_ext_scalar_class__(self):
         return EncodedImageScalar
+
+    def __reduce__(self):
+        # Workaround to ensure pickle works in earlier versions of PyArrow
+        # https://github.com/apache/arrow/issues/35599
+        return type(self).__arrow_ext_deserialize__, (
+            self.storage_type,
+            self.__arrow_ext_serialize__(),
+        )
 
 
 class FixedShapeImageTensorType(pa.ExtensionType):
@@ -125,6 +141,14 @@ class FixedShapeImageTensorType(pa.ExtensionType):
 
     def __arrow_ext_scalar_class__(self):
         return FixedShapeImageTensorScalar
+
+    def __reduce__(self):
+        # Workaround to ensure pickle works in earlier versions of PyArrow
+        # https://github.com/apache/arrow/issues/35599
+        return type(self).__arrow_ext_deserialize__, (
+            self.storage_type,
+            self.__arrow_ext_serialize__(),
+        )
 
 
 pa.register_extension_type(ImageURIType())
