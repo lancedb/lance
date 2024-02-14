@@ -230,7 +230,7 @@ where
         let mut pointers_builder = UInt64Builder::new();
 
         for (_, node) in nodes.iter() {
-            pointers_builder.append_value(node.pointer as u64);
+            pointers_builder.append_value(node.pointer);
             neighbours_builder.append_value(node.neighbors.values().map(|&n| Some(n)));
         }
 

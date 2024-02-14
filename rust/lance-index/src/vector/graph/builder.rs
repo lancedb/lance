@@ -22,7 +22,7 @@ use super::{Graph, InMemoryGraph, OrderedFloat};
 use crate::vector::graph::storage::VectorStorage;
 
 /// GraphNode during build.
-pub(crate) struct GraphBuilderNode {
+pub struct GraphBuilderNode {
     /// Node ID
     pub id: u64,
 
@@ -70,7 +70,7 @@ impl GraphBuilderNode {
 /// Graph Builder.
 ///
 ///
-pub(crate) struct GraphBuilder<V: VectorStorage<f32>> {
+pub struct GraphBuilder<V: VectorStorage<f32>> {
     pub(crate) nodes: BTreeMap<u64, GraphBuilderNode>,
 
     /// Storage for vectors.
