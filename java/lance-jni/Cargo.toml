@@ -7,8 +7,8 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-lance = {version = "=0.9.1", path="../../rust/lance"}
-arrow = { version = "49.0.0", optional = false, features = ["ffi"] }
+lance = { path="../../rust/lance" }
+arrow = { features = ["ffi"] }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",
     "macros",
