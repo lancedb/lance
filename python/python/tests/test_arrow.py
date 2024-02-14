@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 import os
+import pickle
 import re
 from pathlib import Path
 
@@ -24,6 +25,7 @@ import pytest
 from lance.arrow import (
     BFloat16,
     BFloat16Array,
+    FixedShapeImageTensorType,
     ImageArray,
     ImageURIArray,
     PandasBFloat16Array,
@@ -317,3 +319,22 @@ def test_roundtrip_image_tensor(tmp_path: Path):
     tensor_image_array_2 = tbl2.take(indices).column(2)
 
     assert tensor_image_array_2.type == tensor_image_array.type
+
+
+def test_image_array_pickle(tmp_path: Path, png_uris):
+    # Note: this test will only fail in PyArrow 12.0.0. It was fixed in 13.0.0.
+    uri_array = ImageURIArray.from_uris(png_uris)
+    encoded_array = uri_array.read_uris()
+    tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(
+        np.random.random((10, 1, 1, 4)).astype(np.uint8)
+    )
+    tensor_array = pa.ExtensionArray.from_storage(
+        FixedShapeImageTensorType(pa.uint8(), tensor_array.type.shape),
+        tensor_array.storage,
+    )
+
+    arrays = [uri_array, encoded_array, tensor_array]
+    for arr in arrays:
+        data = pickle.dumps(arr)
+        arr2 = pickle.loads(data)
+        assert arr == arr2
