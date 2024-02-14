@@ -15,11 +15,20 @@
 //! Generic Graph implementation.
 //!
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::hash::Hash;
+use std::sync::Arc;
 
+use arrow_array::UInt64Array;
+use arrow_array::{
+    builder::{ListBuilder, UInt64Builder},
+    cast::AsArray,
+    types::UInt64Type,
+    RecordBatch,
+};
+use arrow_schema::{DataType, Field, Schema};
 use lance_arrow::FloatToArrayType;
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_linalg::distance::{Cosine, DistanceFunc, Dot, MetricType, L2};
 use num_traits::{AsPrimitive, Float, PrimInt};
 use snafu::{location, Location};
@@ -31,6 +40,10 @@ pub(super) mod storage;
 
 use iter::Iter;
 use storage::VectorStorage;
+
+use self::builder::GraphBuilderNode;
+
+const NEIGHBORS_COL: &str = "__neighbors";
 
 pub struct GraphNode<I = u32> {
     pub id: I,
@@ -89,7 +102,7 @@ impl From<OrderedFloat> for f32 {
 /// ---------------
 /// K: Vertex Index type
 /// T: the data type of vector, i.e., ``f32`` or ``f16``.
-pub trait Graph<K: PrimInt + Hash = u32, T: Float = f32> {
+pub trait Graph<T: Float = f32> {
     /// Get the number of nodes in the graph.
     fn len(&self) -> usize;
 
@@ -99,31 +112,18 @@ pub trait Graph<K: PrimInt + Hash = u32, T: Float = f32> {
     }
 
     /// Get the neighbors of a graph node, identifyied by the index.
-    fn neighbors(&self, key: K) -> Option<Box<dyn Iterator<Item = K> + '_>>;
+    fn neighbors(&self, key: u64) -> Option<&>;
 
     /// Distance from query vector to a node.
-    fn distance_to(&self, query: &[T], key: K) -> f32;
+    fn distance_to(&self, query: &[T], key: u64) -> f32;
 
     /// Distance between two nodes in the graph.
     ///
     /// Returns the distance between two nodes as float32.
-    fn distance_between(&self, a: K, b: K) -> f32;
+    fn distance_between(&self, a: u64, b: u64) -> f32;
 
     /// Create a BFS iterator.
-    fn iter(&self) -> self::iter::Iter<'_, K, T>;
-}
-
-/// Serializable Graph.
-///
-/// Type parameters
-/// ----------------
-/// I : Vertex Index type
-/// V : the data type of vector, i.e., ``f32`` or ``f16``.
-struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType, V: storage::VectorStorage<T>> {
-    pub nodes: HashMap<I, GraphNode<I>>,
-    vectors: V,
-    dist_fn: Box<DistanceFunc<T>>,
-    phantom: std::marker::PhantomData<T>,
+    fn iter(&self) -> self::iter::Iter<'_, T>;
 }
 
 /// Beam search over a graph
@@ -143,13 +143,13 @@ struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType, V: storage::VectorS
 /// -------
 /// A sorted list of ``(dist, node_id)`` pairs.
 ///
-pub(super) fn beam_search<I: PrimInt + Hash + std::fmt::Display>(
-    graph: &dyn Graph<I>,
-    start: &[I],
+pub(super) fn beam_search(
+    graph: &dyn Graph,
+    start: &[u64],
     query: &[f32],
     k: usize,
-) -> Result<BTreeMap<OrderedFloat, I>> {
-    let mut visited: HashSet<I> = start.iter().copied().collect();
+) -> Result<BTreeMap<OrderedFloat, u64>> {
+    let mut visited: HashSet<u64> = start.iter().copied().collect();
     let mut candidates = start
         .iter()
         .map(|&i| (graph.distance_to(query, i).into(), i))
@@ -167,7 +167,7 @@ pub(super) fn beam_search<I: PrimInt + Hash + std::fmt::Display>(
             location: location!(),
         })?;
 
-        for neighbor in neighbors {
+        for &neighbor in neighbors.values() {
             if visited.contains(&neighbor) {
                 continue;
             }
@@ -186,44 +186,84 @@ pub(super) fn beam_search<I: PrimInt + Hash + std::fmt::Display>(
     Ok(results)
 }
 
-impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType, V: storage::VectorStorage<T>>
-    Graph<I, T> for InMemoryGraph<I, T, V>
-{
-    fn neighbors(&self, key: I) -> Option<Box<dyn Iterator<Item = I> + '_>> {
-        self.nodes
-            .get(&key)
-            .map(|n| Box::new(n.neighbors.iter().copied()) as Box<dyn Iterator<Item = I>>)
+/// Serializable Graph.
+///
+/// Type parameters
+/// ----------------
+/// I : Vertex Index type
+/// V : the data type of vector, i.e., ``f32`` or ``f16``.
+struct InMemoryGraph<T: FloatToArrayType, V: storage::VectorStorage<T>> {
+    /// Use a RecordBatch to store the graph.
+    pub nodes: RecordBatch,
+    vectors: V,
+    dist_fn: Box<DistanceFunc<T>>,
+}
+
+impl<T: FloatToArrayType, V: storage::VectorStorage<T>> Graph<T> for InMemoryGraph<T, V> {
+    fn neighbors<'a>(&'a self, key: u64) -> Option<Arc<UInt64Array>> {
+        let neighbors_col = self.nodes.column_by_name(NEIGHBORS_COL)?;
+        let neighbors = neighbors_col.as_list::<i32>().value(key as usize);
+        Some(neighbors.as_primitive::<UInt64Type>().clone().into())
     }
 
-    fn distance_to(&self, query: &[T], idx: I) -> f32 {
+    fn distance_to(&self, query: &[T], idx: u64) -> f32 {
         let vec = self.vectors.get(idx.as_());
         (self.dist_fn)(query, vec)
     }
 
-    fn distance_between(&self, a: I, b: I) -> f32 {
+    fn distance_between(&self, a: u64, b: u64) -> f32 {
         let from_vec = self.vectors.get(a.as_());
         self.distance_to(from_vec, b)
     }
 
     fn len(&self) -> usize {
-        self.nodes.len()
+        self.nodes.num_rows()
     }
 
-    fn iter(&self) -> Iter<'_, I, T> {
-        Iter::new(self as &dyn Graph<I, T>, I::zero())
+    fn iter(&self) -> Iter<'_, T> {
+        Iter::new(self as &dyn Graph<T>, 0)
     }
 }
 
-impl<I: PrimInt + Hash, T: FloatToArrayType, V: VectorStorage<T>> InMemoryGraph<I, T, V>
+impl<T: FloatToArrayType, V: VectorStorage<T>> InMemoryGraph<T, V>
 where
     T::ArrowType: L2 + Cosine + Dot,
 {
-    fn from_builder(nodes: HashMap<I, GraphNode<I>>, vectors: V, metric_type: MetricType) -> Self {
+    fn from_builder(
+        nodes: &BTreeMap<u64, GraphBuilderNode>,
+        vectors: V,
+        metric_type: MetricType,
+    ) -> Self {
+        let mut neighbours_builder = ListBuilder::new(UInt64Builder::new());
+        let mut row_id_builder = UInt64Builder::new();
+
+        for node in nodes.values() {
+            row_id_builder.append_value(node.row_id);
+            neighbours_builder.append_value(node.neighbors.values().map(|&n| Some(n)));
+        }
+
+        let schema = Schema::new(vec![
+            Field::new(
+                NEIGHBORS_COL,
+                DataType::new_list(DataType::UInt64, false),
+                true,
+            ),
+            ROW_ID_FIELD.clone(),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(neighbours_builder.finish()),
+                Arc::new(row_id_builder.finish()),
+            ],
+        )
+        .unwrap();
+
         Self {
-            nodes,
+            nodes: batch,
             vectors,
             dist_fn: metric_type.func::<T>().into(),
-            phantom: std::marker::PhantomData,
         }
     }
 }

@@ -36,7 +36,7 @@ pub struct HNSW {
     layers: Vec<Arc<dyn Graph>>,
     metric_type: MetricType,
     /// Entry point of the graph.
-    entry_point: u32,
+    entry_point: u64,
 }
 
 impl Debug for HNSW {
@@ -53,7 +53,7 @@ impl Debug for HNSW {
 impl HNSW {
     fn from_builder(
         layers: Vec<Arc<dyn Graph>>,
-        entry_point: u32,
+        entry_point: u64,
         metric_type: MetricType,
     ) -> Self {
         Self {
@@ -73,7 +73,7 @@ impl HNSW {
     ///    The number of nearest neighbors to search for.
     /// ef : usize
     ///    The size of dynamic candidate list
-    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<(u32, f32)>> {
+    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<(u64, f32)>> {
         let mut ep = vec![self.entry_point];
         let num_layers = self.layers.len();
         for layer in self.layers.iter().rev().take(num_layers - 1) {
@@ -91,9 +91,9 @@ impl HNSW {
 ///
 /// Algorithm 3 in the HNSW paper.
 fn select_neighbors(
-    orderd_candidates: &BTreeMap<OrderedFloat, u32>,
+    orderd_candidates: &BTreeMap<OrderedFloat, u64>,
     k: usize,
-) -> impl Iterator<Item = (OrderedFloat, u32)> + '_ {
+) -> impl Iterator<Item = (OrderedFloat, u64)> + '_ {
     orderd_candidates.iter().take(k).map(|(&d, &u)| (d, u))
 }
 
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn test_select_neighbors() {
-        let candidates: BTreeMap<OrderedFloat, u32> =
+        let candidates: BTreeMap<OrderedFloat, u64> =
             (1..6).map(|i| (OrderedFloat(i as f32), i)).collect();
 
         let result = select_neighbors(&candidates, 3).collect::<Vec<_>>();
@@ -160,18 +160,18 @@ mod tests {
         hnsw.layers.iter().for_each(|layer| {
             for i in 0..TOTAL {
                 // If the node exist on this layer, check its out-degree.
-                if let Some(neighbors) = layer.neighbors(i as u32) {
-                    assert!(neighbors.count() <= MAX_EDGES);
+                if let Some(neighbors) = layer.neighbors(i as u64) {
+                    assert!(neighbors.len() <= MAX_EDGES);
                 }
             }
         });
     }
 
-    fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
+    fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u64> {
         let mut dists = vec![];
         for i in 0..mat.num_rows() {
             let dist = lance_linalg::distance::l2_distance(query, mat.row(i).unwrap());
-            dists.push((dist, i as u32));
+            dists.push((dist, i as u64));
         }
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         dists.truncate(k);
@@ -195,7 +195,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let results: HashSet<u32> = hnsw
+        let results: HashSet<_> = hnsw
             .search(q, 10, 150)
             .unwrap()
             .iter()

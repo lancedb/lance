@@ -47,7 +47,7 @@ pub struct HNSWBuilder<V: VectorStorage<f32>> {
 
     levels: Vec<GraphBuilder<V>>,
 
-    entry_point: u32,
+    entry_point: u64,
 }
 
 impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
@@ -103,7 +103,7 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
     }
 
     /// Insert one node.
-    fn insert(&mut self, node: u32) -> Result<()> {
+    fn insert(&mut self, node: u64) -> Result<()> {
         let vector = self.vectors.get(node as usize);
         let level = self.random_level();
 
@@ -163,7 +163,7 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
         }
 
         for i in 1..self.vectors.len() {
-            self.insert(i as u32)?;
+            self.insert(i as u64)?;
         }
 
         let graphs = self

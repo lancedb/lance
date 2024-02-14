@@ -13,23 +13,22 @@
 // limitations under the License.
 
 use std::collections::{HashSet, VecDeque};
-use std::hash::Hash;
 
-use num_traits::{Float, PrimInt};
+use num_traits::Float;
 
 use super::Graph;
 
 /// Breath-first search iterator.
 ///
 /// Internal use only
-pub struct Iter<'a, K: PrimInt + Hash, T: Float> {
-    graph: &'a dyn Graph<K, T>,
-    queue: VecDeque<K>,
-    visited: HashSet<K>,
+pub struct Iter<'a, T: Float> {
+    graph: &'a dyn Graph<T>,
+    queue: VecDeque<u64>,
+    visited: HashSet<u64>,
 }
 
-impl<'a, K: PrimInt + Hash, T: Float> Iter<'a, K, T> {
-    pub(super) fn new(graph: &'a dyn Graph<K, T>, start: K) -> Self {
+impl<'a, T: Float> Iter<'a, T> {
+    pub(super) fn new(graph: &'a dyn Graph<T>, start: u64) -> Self {
         let mut visited = HashSet::new();
         visited.insert(start);
         Self {
@@ -40,13 +39,13 @@ impl<'a, K: PrimInt + Hash, T: Float> Iter<'a, K, T> {
     }
 }
 
-impl<'a, K: PrimInt + Hash, T: Float> Iterator for Iter<'a, K, T> {
-    type Item = K;
+impl<'a, T: Float> Iterator for Iter<'a, T> {
+    type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {
         let node = self.queue.pop_front()?;
         if let Some(neighbors) = self.graph.neighbors(node) {
-            for neighbor in neighbors {
+            for &neighbor in neighbors.values() {
                 if self.visited.insert(neighbor) {
                     self.queue.push_back(neighbor);
                 }
@@ -60,29 +59,38 @@ impl<'a, K: PrimInt + Hash, T: Float> Iterator for Iter<'a, K, T> {
 mod tests {
     use super::*;
 
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use arrow_array::{types::Float32Type, Float32Array};
     use lance_linalg::{distance::MetricType, MatrixView};
 
-    use crate::vector::graph::{GraphNode, InMemoryGraph};
+    use crate::vector::graph::builder::GraphBuilderNode;
+    use crate::vector::graph::{InMemoryGraph, OrderedFloat};
 
     #[test]
     fn test_bfs_iterator() {
-        let nodes = [
-            GraphNode::new(0, vec![1, 2]),
-            GraphNode::new(1, vec![3, 4]),
-            GraphNode::new(2, vec![5, 6]),
-            GraphNode::new(3, vec![0, 7, 5]),
-            GraphNode::new(4, vec![8, 1, 2, 4, 9, 10]),
-        ]
-        .into_iter()
-        .map(|n| (n.id, n))
-        .collect::<HashMap<_, _>>();
+        let mut builder_nodes = (0..5).map(|i| GraphBuilderNode::new(i)).collect::<Vec<_>>();
+        builder_nodes[0]
+            .neighbors
+            .extend([1, 2].map(|i| (OrderedFloat(i as f32), i as u64)));
+        builder_nodes[1]
+            .neighbors
+            .extend([3, 4].map(|i| (OrderedFloat(i as f32), i as u64)));
+        builder_nodes[2]
+            .neighbors
+            .extend([5, 6].map(|i| (OrderedFloat(i as f32), i as u64)));
+        builder_nodes[3]
+            .neighbors
+            .extend([0, 7, 5].map(|i| (OrderedFloat(i as f32), i as u64)));
+        builder_nodes[4]
+            .neighbors
+            .extend([8, 1, 2, 4, 9, 10].map(|i| (OrderedFloat(i as f32), i as u64)));
+
+        let nodes = builder_nodes.into_iter().map(|n| (n.id, n)).collect();
+
         let mat =
             MatrixView::<Float32Type>::new(Arc::new(Float32Array::from(Vec::<f32>::new())), 8);
-        let graph = InMemoryGraph::from_builder(nodes, mat, MetricType::L2);
+        let graph = InMemoryGraph::from_builder(&nodes, mat, MetricType::L2);
 
         let sorted_nodes = graph.iter().collect::<Vec<_>>();
         assert_eq!(sorted_nodes, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
