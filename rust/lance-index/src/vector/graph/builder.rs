@@ -105,6 +105,11 @@ impl<V: VectorStorage<f32>> Graph<f32> for GraphBuilder<V> {
     fn iter(&self) -> super::iter::Iter<'_, f32> {
         todo!()
     }
+
+    /// Get the pointer of a node.
+    fn pointer(&self, idx: u64) -> u64 {
+        self.nodes.get(&idx).unwrap().pointer
+    }
 }
 
 impl<V: VectorStorage<f32> + 'static> GraphBuilder<V> {

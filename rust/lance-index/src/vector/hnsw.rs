@@ -78,7 +78,10 @@ impl HNSW {
         let num_layers = self.layers.len();
         for layer in self.layers.iter().rev().take(num_layers - 1) {
             let candidates = beam_search(layer.as_ref(), &ep, query, 1)?;
-            ep = select_neighbors(&candidates, 1).map(|(_, id)| id).collect();
+            // ep is the pointers to the next layer
+            ep = select_neighbors(&candidates, 1)
+                .map(|(_, id)| layer.pointer(id))
+                .collect();
         }
         let candidates = beam_search(self.layers[0].as_ref(), &ep, query, ef)?;
         Ok(select_neighbors(&candidates, k)

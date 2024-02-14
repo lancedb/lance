@@ -113,6 +113,9 @@ pub trait Graph<T: Float = f32> {
 
     /// Create a BFS iterator.
     fn iter(&self) -> self::iter::Iter<'_, T>;
+
+    /// Get the pointer of a node.
+    fn pointer(&self, idx: u64) -> u64;
 }
 
 /// Beam search over a graph
@@ -206,6 +209,16 @@ where
     fn distance_between(&self, a: u64, b: u64) -> f32 {
         let from_vec = self.vectors.get(a.as_());
         self.distance_to(from_vec, b)
+    }
+
+    fn pointer(&self, idx: u64) -> u64 {
+        self.nodes
+            .column_by_name(POINTER_COL)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(idx as usize)
     }
 
     fn len(&self) -> usize {
