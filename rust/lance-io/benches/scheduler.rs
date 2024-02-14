@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bytes::Bytes;
 use lance_core::Result;
-use lance_io::{
-    object_store::ObjectStore,
-    scheduler::{BatchRequest, LoadedBatch, StoreScheduler},
-};
+use lance_io::{object_store::ObjectStore, scheduler::StoreScheduler};
 use object_store::path::Path;
 use rand::{seq::SliceRandom, RngCore};
 use std::{fmt::Display, process::Command, sync::Arc};
@@ -60,17 +58,13 @@ async fn create_data(num_bytes: u64) -> (Arc<ObjectStore>, Path) {
 
 const DATA_SIZE: u64 = 128 * 1024 * 1024;
 
-async fn drain_task<F: std::future::Future<Output = Result<LoadedBatch<()>>>>(
+async fn drain_task<F: std::future::Future<Output = Result<Vec<Bytes>>>>(
     mut rx: tokio::sync::mpsc::Receiver<F>,
 ) -> u64 {
     let mut bytes_received = 0;
     while let Some(fut) = rx.recv().await {
         let loaded = fut.await.unwrap();
-        bytes_received += loaded
-            .data_buffers
-            .iter()
-            .map(|bytes| bytes.len() as u64)
-            .sum::<u64>();
+        bytes_received += loaded.iter().map(|bytes| bytes.len() as u64).sum::<u64>();
     }
     bytes_received
 }
@@ -113,8 +107,7 @@ fn bench_full_read(c: &mut Criterion) {
                         let mut offset = 0;
                         while offset < DATA_SIZE {
                             #[allow(clippy::single_range_in_vec_init)]
-                            let req =
-                                BatchRequest::new_simple(vec![offset..(offset + params.page_size)]);
+                            let req = vec![offset..(offset + params.page_size)];
                             let req = file_scheduler.submit_request(req);
                             tx.send(req).await.unwrap();
                             offset += params.page_size;
@@ -207,8 +200,7 @@ fn bench_random_read(c: &mut Criterion) {
                                     })
                                     .collect::<Vec<_>>();
                                 idx += INDICES_PER_BATCH as usize;
-                                let req = BatchRequest::new_simple(iops);
-                                let req = file_scheduler.submit_request(req);
+                                let req = file_scheduler.submit_request(iops);
                                 tx.send(req).await.unwrap();
                             }
                             drop(tx);
