@@ -617,19 +617,23 @@ impl Merger {
                     }
                 }
             }
-            let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
-            deleted_row_ids.extend(row_ids.values());
-            let matched = matched.project(&right_cols)?;
-            // The payload columns of an outer join are always nullable.  We need to restore
-            // non-nullable to columns that were originally non-nullable.  This should be safe
-            // since the not_matched rows should all be valid on the right_cols
-            //
-            // Sadly we can't use with_schema because it doesn't let you toggle nullability
-            let matched = RecordBatch::try_new(
-                self.schema.clone(),
-                Vec::from_iter(matched.columns().iter().cloned()),
-            )?;
-            batches.push(Ok(matched));
+            // If the filter eliminated all rows then its important we don't try and write
+            // the batch at all.  Writing an empty batch currently panics
+            if matched.num_rows() > 0 {
+                let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
+                deleted_row_ids.extend(row_ids.values());
+                let matched = matched.project(&right_cols)?;
+                // The payload columns of an outer join are always nullable.  We need to restore
+                // non-nullable to columns that were originally non-nullable.  This should be safe
+                // since the not_matched rows should all be valid on the right_cols
+                //
+                // Sadly we can't use with_schema because it doesn't let you toggle nullability
+                let matched = RecordBatch::try_new(
+                    self.schema.clone(),
+                    Vec::from_iter(matched.columns().iter().cloned()),
+                )?;
+                batches.push(Ok(matched));
+            }
         }
         if self.params.insert_not_matched {
             let not_matched = arrow::compute::filter_record_batch(&batch, &right_only)?;
@@ -810,6 +814,15 @@ mod tests {
             .try_build()
             .unwrap();
         check(new_batch.clone(), job, &[1, 2, 3, 4, 5], &[6, 7, 8, 9]).await;
+
+        // conditional update, no matches
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_matched(WhenMatched::update_if(&ds, "target.filterme = 'z'").unwrap())
+            .try_build()
+            .unwrap();
+        check(new_batch.clone(), job, &[1, 2, 3, 4, 5, 6], &[]).await;
 
         // update only, no delete (useful for bulk update)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
