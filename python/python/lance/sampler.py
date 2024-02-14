@@ -380,7 +380,9 @@ class ShardedBatchSampler(Sampler):
             batch = batch.slice(rows_to_skip, batch.num_rows - rows_to_skip)
             # Take every Nth row
             indices = list(range(0, batch.num_rows, self._world_size))
-            rows_to_skip = (self._world_size - (batch.num_rows % self._world_size)) % 5
+            rows_to_skip = (
+                self._world_size - (batch.num_rows % self._world_size)
+            ) % self._world_size
             batch = batch.take(indices)
 
             # Add to our collection
