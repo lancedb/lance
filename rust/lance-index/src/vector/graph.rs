@@ -33,7 +33,6 @@ use num_traits::{AsPrimitive, Float};
 use snafu::{location, Location};
 
 pub(crate) mod builder;
-mod io;
 mod iter;
 pub(super) mod storage;
 
