@@ -962,6 +962,18 @@ def test_merge_insert_conditional_upsert_example(tmp_path: Path):
 
     assert table.sort_by("id") == expected
 
+    # No matches
+
+    new_table = pa.Table.from_pydict({
+        "id": [1, 2, 3, 4, 5],
+        "txNumber": [0, 0, 0, 0, 0],
+        "vector": pa.array([[2.0, 2.0] for _ in range(5)], pa.list_(pa.float32())),
+    })
+
+    dataset.merge_insert("id").when_matched_update_all(
+        "target.txNumber < source.txNumber"
+    ).execute(new_table)
+
 
 def test_merge_insert_source_is_dataset(tmp_path: Path):
     nrows = 1000
