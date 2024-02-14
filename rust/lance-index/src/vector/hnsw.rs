@@ -161,7 +161,7 @@ mod tests {
             for i in 0..TOTAL {
                 // If the node exist on this layer, check its out-degree.
                 if let Some(neighbors) = layer.neighbors(i as u64) {
-                    assert!(neighbors.len() <= MAX_EDGES);
+                    assert!(neighbors.count() <= MAX_EDGES);
                 }
             }
         });

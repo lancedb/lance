@@ -45,7 +45,7 @@ impl<'a, T: Float> Iterator for Iter<'a, T> {
     fn next(&mut self) -> Option<Self::Item> {
         let node = self.queue.pop_front()?;
         if let Some(neighbors) = self.graph.neighbors(node) {
-            for &neighbor in neighbors.values() {
+            for &neighbor in neighbors {
                 if self.visited.insert(neighbor) {
                     self.queue.push_back(neighbor);
                 }
@@ -86,7 +86,11 @@ mod tests {
             .neighbors
             .extend([8, 1, 2, 4, 9, 10].map(|i| (OrderedFloat(i as f32), i as u64)));
 
-        let nodes = builder_nodes.into_iter().map(|n| (n.id, n)).collect();
+        let nodes = builder_nodes
+            .into_iter()
+            .enumerate()
+            .map(|(id, n)| (id as u64, n))
+            .collect();
 
         let mat =
             MatrixView::<Float32Type>::new(Arc::new(Float32Array::from(Vec::<f32>::new())), 8);

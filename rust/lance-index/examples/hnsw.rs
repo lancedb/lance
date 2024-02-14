@@ -23,11 +23,11 @@ use lance_index::vector::hnsw::HNSWBuilder;
 use lance_linalg::MatrixView;
 use lance_testing::datagen::generate_random_array_with_seed;
 
-fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
+fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u64> {
     let mut dists = vec![];
     for i in 0..mat.num_rows() {
         let dist = lance_linalg::distance::l2_distance(query, mat.row(i).unwrap());
-        dists.push((dist, i as u32));
+        dists.push((dist, i as u64));
     }
     dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     dists.truncate(k);
@@ -53,7 +53,7 @@ fn main() {
                 .ef_construction(ef_construction)
                 .build()
                 .unwrap();
-            let results: HashSet<u32> = hnsw
+            let results: HashSet<_> = hnsw
                 .search(q, k, 100)
                 .unwrap()
                 .iter()

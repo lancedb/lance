@@ -14,7 +14,6 @@
 
 use std::collections::BTreeMap;
 
-use arrow_array::UInt64Array;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceFunc, MetricType};
 use snafu::{location, Location};
@@ -25,7 +24,7 @@ use crate::vector::graph::storage::VectorStorage;
 /// GraphNode during build.
 pub(super) struct GraphBuilderNode {
     /// Node ID
-    pub(super) id: u64,
+    id: u64,
     /// Neighbors, sorted by the distance.
     pub(super) neighbors: BTreeMap<OrderedFloat, u64>,
 
@@ -77,9 +76,9 @@ impl<V: VectorStorage<f32>> Graph<f32> for GraphBuilder<V> {
         self.nodes.len()
     }
 
-    fn neighbors(&self, key: u64) -> Option<Arc<UInt64Array>> {
+    fn neighbors<'a>(&'a self, key: u64) -> Option<Box<dyn Iterator<Item = &u64> + 'a>> {
         let node = self.nodes.get(&key)?;
-        Some(Arc::new(node.neighbors.values().copied()))
+        Some(Box::new(node.neighbors.values()))
     }
 
     fn distance_to(&self, query: &[f32], key: u64) -> f32 {
@@ -182,7 +181,13 @@ mod tests {
         let graph = builder.build();
         assert_eq!(graph.len(), 2);
 
-        assert_eq!(graph.neighbors(0).unwrap().collect::<Vec<_>>(), vec![1]);
-        assert_eq!(graph.neighbors(1).unwrap().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(
+            graph.neighbors(0).unwrap().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            graph.neighbors(1).unwrap().copied().collect::<Vec<_>>(),
+            vec![0]
+        );
     }
 }

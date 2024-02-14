@@ -16,21 +16,20 @@
 //!
 
 use std::collections::{BTreeMap, HashSet};
-use std::hash::Hash;
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::UInt64Array;
 use arrow_array::{
     builder::{ListBuilder, UInt64Builder},
     cast::AsArray,
-    types::UInt64Type,
     RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
 use lance_arrow::FloatToArrayType;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_linalg::distance::{Cosine, DistanceFunc, Dot, MetricType, L2};
-use num_traits::{AsPrimitive, Float, PrimInt};
+use num_traits::{AsPrimitive, Float};
 use snafu::{location, Location};
 
 pub(crate) mod builder;
@@ -112,7 +111,7 @@ pub trait Graph<T: Float = f32> {
     }
 
     /// Get the neighbors of a graph node, identifyied by the index.
-    fn neighbors(&self, key: u64) -> Option<&>;
+    fn neighbors<'a>(&'a self, key: u64) -> Option<Box<dyn Iterator<Item = &u64> + 'a>>;
 
     /// Distance from query vector to a node.
     fn distance_to(&self, query: &[T], key: u64) -> f32;
@@ -167,7 +166,7 @@ pub(super) fn beam_search(
             location: location!(),
         })?;
 
-        for &neighbor in neighbors.values() {
+        for &neighbor in neighbors {
             if visited.contains(&neighbor) {
                 continue;
             }
@@ -195,15 +194,18 @@ pub(super) fn beam_search(
 struct InMemoryGraph<T: FloatToArrayType, V: storage::VectorStorage<T>> {
     /// Use a RecordBatch to store the graph.
     pub nodes: RecordBatch,
+    neighbors: Arc<UInt64Array>,
     vectors: V,
     dist_fn: Box<DistanceFunc<T>>,
 }
 
-impl<T: FloatToArrayType, V: storage::VectorStorage<T>> Graph<T> for InMemoryGraph<T, V> {
-    fn neighbors<'a>(&'a self, key: u64) -> Option<Arc<UInt64Array>> {
-        let neighbors_col = self.nodes.column_by_name(NEIGHBORS_COL)?;
-        let neighbors = neighbors_col.as_list::<i32>().value(key as usize);
-        Some(neighbors.as_primitive::<UInt64Type>().clone().into())
+impl<T: FloatToArrayType, V: storage::VectorStorage<T>> Graph<T> for InMemoryGraph<T, V>
+where
+    T::ArrowType: L2 + Cosine + Dot,
+{
+    fn neighbors<'a>(&'a self, key: u64) -> Option<Box<dyn Iterator<Item = &u64> + 'a>> {
+        let range = self.neighbor_range(key);
+        Some(Box::new(self.neighbors.values()[range].iter()))
     }
 
     fn distance_to(&self, query: &[T], idx: u64) -> f32 {
@@ -237,7 +239,7 @@ where
         let mut neighbours_builder = ListBuilder::new(UInt64Builder::new());
         let mut row_id_builder = UInt64Builder::new();
 
-        for node in nodes.values() {
+        for (_, node) in nodes.iter() {
             row_id_builder.append_value(node.row_id);
             neighbours_builder.append_value(node.neighbors.values().map(|&n| Some(n)));
         }
@@ -245,26 +247,33 @@ where
         let schema = Schema::new(vec![
             Field::new(
                 NEIGHBORS_COL,
-                DataType::new_list(DataType::UInt64, false),
+                DataType::new_list(DataType::UInt64, true),
                 true,
             ),
             ROW_ID_FIELD.clone(),
         ]);
 
+        let neighbors = Arc::new(neighbours_builder.finish());
         let batch = RecordBatch::try_new(
             Arc::new(schema),
-            vec![
-                Arc::new(neighbours_builder.finish()),
-                Arc::new(row_id_builder.finish()),
-            ],
+            vec![neighbors.clone(), Arc::new(row_id_builder.finish())],
         )
         .unwrap();
 
         Self {
             nodes: batch,
+            neighbors: neighbors.values().as_primitive().clone().into(),
             vectors,
             dist_fn: metric_type.func::<T>().into(),
         }
+    }
+
+    fn neighbor_range(&self, k: u64) -> Range<usize> {
+        let neighbors_col = self.nodes.column_by_name(NEIGHBORS_COL).unwrap();
+        let neighbors = neighbors_col.as_list::<i32>();
+        let start = neighbors.value_offsets()[k as usize] as usize;
+        let end = start + neighbors.value_length(k as usize) as usize;
+        start..end
     }
 }
 
