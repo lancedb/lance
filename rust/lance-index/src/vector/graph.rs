@@ -44,26 +44,6 @@ use self::builder::GraphBuilderNode;
 
 const NEIGHBORS_COL: &str = "__neighbors";
 
-pub struct GraphNode<I = u32> {
-    pub id: I,
-    pub neighbors: Vec<I>,
-}
-
-impl<I> GraphNode<I> {
-    pub fn new(id: I, neighbors: Vec<I>) -> Self {
-        Self { id, neighbors }
-    }
-}
-
-impl<I> From<I> for GraphNode<I> {
-    fn from(id: I) -> Self {
-        Self {
-            id,
-            neighbors: vec![],
-        }
-    }
-}
-
 /// A wrapper for f32 to make it ordered, so that we can put it into
 /// a BTree or Heap
 #[derive(Debug, PartialEq, Clone, Copy)]
