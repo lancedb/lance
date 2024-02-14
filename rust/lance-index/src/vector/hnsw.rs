@@ -158,7 +158,7 @@ mod tests {
         });
 
         hnsw.layers.iter().for_each(|layer| {
-            for i in 0..TOTAL {
+            for i in 0..layer.len() {
                 // If the node exist on this layer, check its out-degree.
                 if let Some(neighbors) = layer.neighbors(i as u64) {
                     assert!(neighbors.count() <= MAX_EDGES);

@@ -16,13 +16,12 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use lance_core::Result;
 use lance_linalg::distance::MetricType;
 use rand::{thread_rng, Rng};
 
-use super::super::graph::beam_search;
 use super::{select_neighbors, HNSW};
-use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage, Graph};
-use lance_core::Result;
+use crate::vector::graph::{beam_search, builder::GraphBuilder, storage::VectorStorage, Graph};
 
 /// Build a HNSW graph.
 ///
@@ -148,6 +147,7 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
         Ok(())
     }
 
+    /// Build a sealed HNSW graph.
     pub fn build(&mut self) -> Result<HNSW> {
         log::info!(
             "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
@@ -195,8 +195,26 @@ fn remapping_levels<V: VectorStorage<f32> + 'static>(levels: &mut [GraphBuilder<
             .map(|(i, &id)| (id, i as u64))
             .collect::<HashMap<_, _>>();
         let cur_level = &mut levels[i];
+        let current_mapping = cur_level
+            .nodes
+            .keys()
+            .enumerate()
+            .map(|(idx, &id)| (id, idx as u64))
+            .collect::<HashMap<_, _>>();
         for node in cur_level.nodes.values_mut() {
             node.set_pointer(*mapping.get(&node.id).expect("Expect the pointer exists"));
+
+            // Remapping the neighbors within this level of graph.
+            node.neighbors = node
+                .neighbors
+                .iter()
+                .map(|(d, n)| {
+                    (
+                        *d,
+                        *current_mapping.get(n).expect("Expect the pointer exists"),
+                    )
+                })
+                .collect();
         }
     }
 }

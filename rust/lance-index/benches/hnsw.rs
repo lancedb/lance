@@ -40,7 +40,7 @@ fn bench_hnsw(c: &mut Criterion) {
     c.bench_function("create_hnsw(65535x1024,levels=4)", |b| {
         b.iter(|| {
             let hnsw = HNSWBuilder::new(mat.clone()).max_level(4).build().unwrap();
-            let uids: HashSet<u32> = hnsw
+            let uids: HashSet<u64> = hnsw
                 .search(query, K, 300)
                 .unwrap()
                 .iter()

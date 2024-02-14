@@ -69,7 +69,9 @@ mod tests {
 
     #[test]
     fn test_bfs_iterator() {
-        let mut builder_nodes = (0..5).map(|i| GraphBuilderNode::new(i)).collect::<Vec<_>>();
+        let mut builder_nodes = (0..11)
+            .map(|i| GraphBuilderNode::new(i))
+            .collect::<Vec<_>>();
         builder_nodes[0]
             .neighbors
             .extend([1, 2].map(|i| (OrderedFloat(i as f32), i as u64)));
