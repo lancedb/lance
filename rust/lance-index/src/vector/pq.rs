@@ -259,7 +259,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         {
             if self.num_sub_vectors % 16 == 0 {
                 use std::arch::x86_64::*;
-                return Ok(Arc::new(Float32Array::from_iter_values(
+                return Ok(Float32Array::from_iter_values(
                     code.values()
                         .chunks_exact(self.num_sub_vectors)
                         .map(|c| unsafe {
@@ -281,7 +281,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                                 });
                             _mm512_reduce_add_ps(s)
                         }),
-                )));
+                ));
             }
         }
 
