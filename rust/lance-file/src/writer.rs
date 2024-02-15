@@ -14,6 +14,7 @@
 
 mod statistics;
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
@@ -87,7 +88,7 @@ impl ManifestProvider for NotSelfDescribing {
 /// ```
 pub struct FileWriter<M: ManifestProvider + Send + Sync> {
     pub object_writer: ObjectWriter,
-    pub schema: Schema,
+    schema: Schema,
     batch_id: i32,
     page_table: PageTable,
     metadata: Metadata,
@@ -202,6 +203,16 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
 
         self.batch_id += 1;
         Ok(())
+    }
+
+    pub async fn finish_with_metadata(
+        &mut self,
+        metadata: &HashMap<String, String>,
+    ) -> Result<usize> {
+        self.schema
+            .metadata
+            .extend(metadata.iter().map(|(k, y)| (k.clone(), y.clone())));
+        self.finish().await
     }
 
     pub async fn finish(&mut self) -> Result<usize> {

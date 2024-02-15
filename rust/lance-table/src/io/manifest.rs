@@ -199,6 +199,7 @@ impl ManifestProvider for ManifestDescribing {
 #[cfg(test)]
 mod test {
     use arrow_array::{Int32Array, RecordBatch};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::format::SelfDescribingFileReader;
@@ -281,11 +282,9 @@ mod test {
         let batch =
             RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
         file_writer.write(&[batch.clone()]).await.unwrap();
-        file_writer
-            .schema
-            .metadata
-            .insert(String::from("lance:extra"), String::from("for_test"));
-        file_writer.finish().await.unwrap();
+        let mut metadata = HashMap::new();
+        metadata.insert(String::from("lance:extra"), String::from("for_test"));
+        file_writer.finish_with_metadata(&metadata).await.unwrap();
 
         let reader = FileReader::try_new_self_described(&store, &path, None)
             .await
