@@ -136,7 +136,7 @@ impl StoreScheduler {
     ///
     /// * object_store - the store to wrap
     /// * io_capacity - the maximum number of parallel requests that will be allowed
-    pub fn new(object_store: Arc<ObjectStore>, io_capacity: u32) -> Self {
+    pub fn new(object_store: Arc<ObjectStore>, io_capacity: u32) -> Arc<Self> {
         // TODO: we don't have any backpressure in place if the compute thread falls
         // behind.  The scheduler thread will schedule ALL of the I/O and then the
         // loaded data will eventually pile up.
@@ -153,15 +153,15 @@ impl StoreScheduler {
             io_submitter: reg_tx,
         };
         tokio::task::spawn(async move { run_io_loop(reg_rx, io_capacity).await });
-        scheduler
+        Arc::new(scheduler)
     }
 
     /// Open a file for reading
-    pub async fn open_file(&self, path: &Path) -> Result<FileScheduler> {
+    pub async fn open_file(self: &Arc<Self>, path: &Path) -> Result<FileScheduler> {
         let reader = self.object_store.open(path).await?;
         Ok(FileScheduler {
             reader: reader.into(),
-            root: self,
+            root: self.clone(),
         })
     }
 
@@ -215,12 +215,12 @@ impl StoreScheduler {
 }
 
 /// A throttled file reader
-pub struct FileScheduler<'a> {
+pub struct FileScheduler {
     reader: Arc<dyn Reader>,
-    root: &'a StoreScheduler,
+    root: Arc<StoreScheduler>,
 }
 
-impl<'a> FileScheduler<'a> {
+impl FileScheduler {
     /// Submit a batch of I/O requests to the reader
     ///
     /// The requests will be queued in a FIFO manner and, when all requests
