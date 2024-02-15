@@ -124,6 +124,7 @@ async fn do_write_manifest(
         manifest.index_section = Some(pos);
     }
 
+    println!("Writing manifest: {:?}", manifest);
     writer.write_struct(manifest).await
 }
 
@@ -198,11 +199,14 @@ impl ManifestProvider for ManifestDescribing {
 
 #[cfg(test)]
 mod test {
+    use arrow_array::{Int32Array, RecordBatch};
     use std::sync::Arc;
 
+    use crate::format::SelfDescribingFileReader;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
+    use lance_file::{reader::FileReader, writer::FileWriter};
     use rand::{distributions::Alphanumeric, Rng};
     use tokio::io::AsyncWriteExt;
 
@@ -252,5 +256,42 @@ mod test {
         test_roundtrip_manifest(0, 100_000).await;
         test_roundtrip_manifest(1000, 100_000).await;
         test_roundtrip_manifest(1000, 1000).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_schema_metadata() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/update_schema_metadata");
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut file_writer = FileWriter::<ManifestDescribing>::try_new(
+            &store,
+            &path,
+            schema.clone(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        let array = Int32Array::from_iter_values(0..10);
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
+        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer
+            .schema
+            .metadata
+            .insert(String::from("lance:extra"), String::from("for_test"));
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new_self_described(&store, &path, None)
+            .await
+            .unwrap();
+        let schema = ArrowSchema::from(reader.schema());
+        assert_eq!(schema.metadata().get("lance:extra").unwrap(), "for_test");
     }
 }

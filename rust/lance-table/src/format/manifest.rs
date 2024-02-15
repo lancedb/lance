@@ -323,6 +323,7 @@ impl ProtoStruct for Manifest {
 
 impl From<pb::Manifest> for Manifest {
     fn from(p: pb::Manifest) -> Self {
+        println!("pb: Manifest: {:?}", p);
         let timestamp_nanos = p.timestamp.map(|ts| {
             let sec = ts.seconds as u128 * 1e9 as u128;
             let nanos = ts.nanos as u128;
@@ -376,6 +377,10 @@ impl From<&Manifest> for pb::Manifest {
             })
         };
         let fields_with_meta: FieldsWithMeta = (&m.schema).into();
+        println!(
+            "From<&Manifest> for pb::Manifest: schema: {:?}",
+            fields_with_meta.metadata
+        );
         Self {
             fields: fields_with_meta.fields.0,
             version: m.version,
