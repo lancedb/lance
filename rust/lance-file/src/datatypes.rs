@@ -124,6 +124,7 @@ impl From<FieldsWithMeta> for Schema {
                 (key, string_value)
             })
             .collect();
+
         let schema_with_fields = Self::from(&fields_with_meta.fields);
         Self {
             fields: schema_with_fields.fields,
