@@ -226,6 +226,11 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         self.object_writer.tell().await
     }
 
+    /// Return the mutable reference to the internal ObjectWriter.
+    pub fn object_writer_mut(&mut self) -> &mut ObjectWriter {
+        &mut self.object_writer
+    }
+
     /// Returns the in-flight multipart ID.
     pub fn multipart_id(&self) -> &str {
         &self.object_writer.multipart_id
@@ -698,8 +703,6 @@ fn fields_in_batches<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::reader::FileReader;
-
     use super::*;
 
     use std::sync::Arc;
@@ -716,7 +719,10 @@ mod tests {
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema, TimeUnit,
     };
     use arrow_select::concat::concat_batches;
+    use lance_table::io::manifest::ManifestDescribing;
     use object_store::path::Path;
+
+    use crate::reader::FileReader;
 
     #[tokio::test]
     async fn test_write_file() {
@@ -1236,5 +1242,42 @@ mod tests {
 
         let batch = read_file_as_one_batch(&store, &path, schema).await;
         assert_eq!(batch.column_by_name("i").unwrap().as_ref(), &array);
+    }
+
+    #[tokio::test]
+    async fn test_update_schema_metadata() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/update_schema_metadata");
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut file_writer = FileWriter::<ManifestDescribing>::try_new(
+            &store,
+            &path,
+            schema.clone(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        let array = Int32Array::from_iter_values(0..10);
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
+        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer
+            .schema
+            .metadata
+            .insert(String::from("lance:extra"), String::from("for_test"));
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path, schema.clone())
+            .await
+            .unwrap();
+        let schema = ArrowSchema::from(reader.schema());
+        assert_eq!(schema.metadata().get("lance:extra").unwrap(), "for_test");
     }
 }
