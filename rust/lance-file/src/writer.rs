@@ -226,11 +226,6 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         self.object_writer.tell().await
     }
 
-    /// Return the mutable reference to the internal ObjectWriter.
-    pub fn object_writer_mut(&mut self) -> &mut ObjectWriter {
-        &mut self.object_writer
-    }
-
     /// Returns the in-flight multipart ID.
     pub fn multipart_id(&self) -> &str {
         &self.object_writer.multipart_id

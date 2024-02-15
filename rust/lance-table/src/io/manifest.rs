@@ -124,7 +124,6 @@ async fn do_write_manifest(
         manifest.index_section = Some(pos);
     }
 
-    println!("Writing manifest: {:?}", manifest);
     writer.write_struct(manifest).await
 }
 
