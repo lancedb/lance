@@ -213,16 +213,19 @@ def validate_vector_index(
         if np.isnan(vec).any():
             total -= 1
             continue
-        distance = dataset.to_table(
+        res = dataset.to_table(
             nearest={
                 "column": column,
                 "q": vec,
                 "k": 1,
                 "nprobes": 1,
                 "refine_factor": refine_factor,
-            }
-        )["_distance"].to_pylist()[0]
-        passes += 1 if abs(distance) < 1e-6 else 0
+            },
+            with_row_id=True,
+        )
+        passes += (
+            1 if (res[column].to_numpy(zero_copy_only=False)[0] == vec).all() else 0
+        )
 
     if passes / total < pass_threshold:
         raise ValueError(

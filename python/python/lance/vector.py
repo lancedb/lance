@@ -32,10 +32,10 @@ if TYPE_CHECKING:
     from . import LanceDataset
 
 
-def _normalize_vectors(vectors, ndim):
+def _normalize_vectors(vectors, ndim, dtype):
     if ndim is None:
         ndim = len(next(iter(vectors)))
-    values = np.array(vectors, dtype="float32").ravel()
+    values = np.array(vectors, dtype=dtype).ravel()
     return pa.FixedSizeListArray.from_arrays(values, list_size=ndim)
 
 
@@ -54,6 +54,7 @@ def vec_to_table(
     names: Optional[Union[str, list]] = None,
     ndim: Optional[int] = None,
     check_ndim: bool = True,
+    dtype: str = "float32",
 ) -> pa.Table:
     """
     Create a pyarrow Table containing vectors.
@@ -109,7 +110,7 @@ def vec_to_table(
         values = list(data.values())
         if check_ndim:
             ndim = _validate_ndim(values, ndim)
-        vectors = _normalize_vectors(values, ndim)
+        vectors = _normalize_vectors(values, ndim, dtype)
         ids = pa.array(data.keys())
         arrays = [ids, vectors]
     elif isinstance(data, list) or (
@@ -123,7 +124,7 @@ def vec_to_table(
             raise ValueError(f"names cannot be more than 1 got {len(names)}")
         if check_ndim:
             ndim = _validate_ndim(data, ndim)
-        vectors = _normalize_vectors(data, ndim)
+        vectors = _normalize_vectors(data, ndim, dtype)
         arrays = [vectors]
     else:
         raise NotImplementedError(
@@ -231,10 +232,12 @@ def compute_partitions(
         with_row_id=True,
         columns=[column],
     )
-    output_schema = pa.schema([
-        pa.field("row_id", pa.uint64()),
-        pa.field("partition", pa.uint32()),
-    ])
+    output_schema = pa.schema(
+        [
+            pa.field("row_id", pa.uint64()),
+            pa.field("partition", pa.uint32()),
+        ]
+    )
 
     def _partition_assignment() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
