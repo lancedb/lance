@@ -14,6 +14,7 @@
 
 mod statistics;
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
@@ -86,7 +87,7 @@ impl ManifestProvider for NotSelfDescribing {
 /// file_writer.shutdown();
 /// ```
 pub struct FileWriter<M: ManifestProvider + Send + Sync> {
-    object_writer: ObjectWriter,
+    pub object_writer: ObjectWriter,
     schema: Schema,
     batch_id: i32,
     page_table: PageTable,
@@ -202,6 +203,16 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
 
         self.batch_id += 1;
         Ok(())
+    }
+
+    pub async fn finish_with_metadata(
+        &mut self,
+        metadata: &HashMap<String, String>,
+    ) -> Result<usize> {
+        self.schema
+            .metadata
+            .extend(metadata.iter().map(|(k, y)| (k.clone(), y.clone())));
+        self.finish().await
     }
 
     pub async fn finish(&mut self) -> Result<usize> {
@@ -698,8 +709,6 @@ fn fields_in_batches<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::reader::FileReader;
-
     use super::*;
 
     use std::sync::Arc;
@@ -717,6 +726,8 @@ mod tests {
     };
     use arrow_select::concat::concat_batches;
     use object_store::path::Path;
+
+    use crate::reader::FileReader;
 
     #[tokio::test]
     async fn test_write_file() {
