@@ -1111,7 +1111,7 @@ mod tests {
                 min_values: Arc::new(Int64Array::from(vec![1, 4])),
                 max_values: Arc::new(Int64Array::from(vec![3, 5])),
             },
-            // 2FIXME: these max values shouldn't be incremented
+            // FIXME: these max values shouldn't be incremented
             // https://github.com/lancedb/lance/issues/1517
             Stats {
                 field_id: 6,
