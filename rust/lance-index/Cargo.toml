@@ -33,6 +33,7 @@ lance-datafusion.workspace = true
 lance-io.workspace = true
 lance-linalg.workspace = true
 lance-table.workspace = true
+lazy_static.workspace = true
 log.workspace = true
 num_cpus.workspace = true
 num-traits.workspace = true

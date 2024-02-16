@@ -15,18 +15,25 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use arrow_array::types::Float32Type;
 use lance_core::{Error, Result};
+use lance_linalg::{
+    distance::{DistanceFunc, MetricType},
+    MatrixView,
+};
 use snafu::{location, Location};
 
 use super::{memory::InMemoryVectorStorage, Graph, GraphNode, InMemoryGraph, OrderedFloat};
 use crate::vector::graph::storage::VectorStorage;
 
 /// GraphNode during build.
-struct GraphBuilderNode {
+pub(crate) struct GraphBuilderNode {
     /// Node ID
-    id: u32,
+    pub(crate) id: u32,
     /// Neighbors, sorted by the distance.
-    neighbors: BTreeMap<OrderedFloat, u32>,
+    pub(crate) neighbors: BTreeMap<OrderedFloat, u32>,
+
+    pub pointer: u32,
 }
 
 impl GraphBuilderNode {
@@ -34,6 +41,7 @@ impl GraphBuilderNode {
         Self {
             id,
             neighbors: BTreeMap::new(),
+            pointer: 0,
         }
     }
 
@@ -65,6 +73,7 @@ impl From<&GraphBuilderNode> for GraphNode<u32> {
 
 /// Graph Builder.
 ///
+/// [GraphBuilder] is used to build a graph in memory.
 ///
 pub struct GraphBuilder {
     nodes: BTreeMap<u32, GraphBuilderNode>,
@@ -78,9 +87,9 @@ impl Graph for GraphBuilder {
         self.nodes.len()
     }
 
-    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>> {
+    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = &u32> + '_>> {
         let node = self.nodes.get(&key)?;
-        Some(Box::new(node.neighbors.values().copied()))
+        Some(Box::new(node.neighbors.values()))
     }
 
     fn storage(&self) -> Arc<dyn VectorStorage> {
@@ -166,7 +175,7 @@ mod tests {
         let graph = builder.build(store);
         assert_eq!(graph.len(), 2);
 
-        assert_eq!(graph.neighbors(0).unwrap().collect::<Vec<_>>(), vec![1]);
-        assert_eq!(graph.neighbors(1).unwrap().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(graph.neighbors(0).unwrap().collect::<Vec<_>>(), vec![&1]);
+        assert_eq!(graph.neighbors(1).unwrap().collect::<Vec<_>>(), vec![&0]);
     }
 }

@@ -205,6 +205,12 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         Ok(())
     }
 
+    pub fn add_metadata(&mut self, key: &str, value: &str) {
+        self.schema
+            .metadata
+            .insert(key.to_string(), value.to_string());
+    }
+
     pub async fn finish_with_metadata(
         &mut self,
         metadata: &HashMap<String, String>,

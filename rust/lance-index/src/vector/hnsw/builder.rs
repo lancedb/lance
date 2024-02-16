@@ -13,14 +13,18 @@
 // limitations under the License.
 
 use std::cmp::min;
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_array::types::Float32Type;
 use lance_core::Result;
+use lance_linalg::{distance::MetricType, MatrixView};
 use rand::{thread_rng, Rng};
 
 use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
 use super::{select_neighbors, HNSW};
 use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage, Graph};
+use crate::vector::hnsw::HnswLevel;
 
 /// Build a HNSW graph.
 ///
@@ -162,6 +166,8 @@ impl HNSWBuilder {
             self.insert(i as u32)?;
         }
 
+        remapping_levels(&mut self.levels);
+
         let graphs = self
             .levels
             .iter()
@@ -172,5 +178,88 @@ impl HNSWBuilder {
             self.entry_point,
             self.vectors.metric_type(),
         ))
+    }
+}
+
+/// Because each level is stored as a separate continous RecordBatch. We need to remap the pointers
+/// to the nodes in the previous level to the index in the current RecordBatch.
+fn remapping_levels(levels: &mut [GraphBuilder]) {
+    for i in 1..levels.len() {
+        let prev_level = &levels[i - 1];
+        let mapping = prev_level
+            .nodes
+            .keys()
+            .enumerate()
+            .map(|(i, &id)| (id, i as u32))
+            .collect::<HashMap<_, _>>();
+        let cur_level = &mut levels[i];
+        let current_mapping = cur_level
+            .nodes
+            .keys()
+            .enumerate()
+            .map(|(idx, &id)| (id, idx as u32))
+            .collect::<HashMap<_, _>>();
+        for node in cur_level.nodes.values_mut() {
+            node.pointer = *mapping.get(&node.id).expect("Expect the pointer exists");
+
+            // Remapping the neighbors within this level of graph.
+            node.neighbors = node
+                .neighbors
+                .iter()
+                .map(|(d, n)| {
+                    (
+                        *d,
+                        *current_mapping.get(n).expect("Expect the pointer exists"),
+                    )
+                })
+                .collect();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use arrow_array::types::Float32Type;
+    use lance_linalg::matrix::MatrixView;
+    use lance_testing::datagen::generate_random_array;
+
+    #[test]
+    fn test_remapping_levels() {
+        let data = generate_random_array(8 * 100);
+        let mat = MatrixView::<Float32Type>::new(Arc::new(data), 8);
+        let mut level0 = GraphBuilder::new(mat.clone());
+        for i in 0..100 {
+            level0.insert(i as u32);
+        }
+        let mut level1 = GraphBuilder::new(mat.clone());
+        for i in [0, 5, 10, 15, 20, 30, 40, 50] {
+            level1.insert(i as u32);
+        }
+        let mut level2 = GraphBuilder::new(mat.clone());
+        for i in [0, 10, 20, 50] {
+            level2.insert(i as u32);
+        }
+        let mut levels = [level0, level1, level2];
+        remapping_levels(&mut levels);
+        assert_eq!(
+            levels[1]
+                .nodes
+                .values()
+                .map(|n| n.pointer)
+                .collect::<Vec<_>>(),
+            vec![0, 5, 10, 15, 20, 30, 40, 50]
+        );
+        assert_eq!(
+            levels[2]
+                .nodes
+                .values()
+                .map(|n| n.pointer)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 4, 7]
+        );
     }
 }
