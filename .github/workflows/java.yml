@@ -1,0 +1,60 @@
+name: Build and Run Java JNI Tests
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      - java/**
+      - rust/**
+      - .github/workflows/java.yml
+env:
+  # This env var is used by Swatinem/rust-cache@v2 for the cache
+  # key, so we set it to make sure it is always consistent.
+  CARGO_TERM_COLOR: always
+  # Disable full debug symbol generation to speed up CI build and keep memory down
+  # "1" means line tables only, which is useful for panic tracebacks.
+  RUSTFLAGS: "-C debuginfo=1"
+  RUST_BACKTRACE: "1"
+  # according to: https://matklad.github.io/2021/09/04/fast-rust-builds.html
+  # CI builds are faster with incremental disabled.
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "1"
+jobs:
+  linux-build:
+    runs-on: ubuntu-22.04
+    name: ubuntu-22.04 + Java 11 & 17
+    defaults:
+      run:
+        working-directory: ./java
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: java/java-jni
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: 'maven'
+      - run: echo "JAVA_17=$JAVA_HOME" >> $GITHUB_ENV
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 11
+          cache: 'maven'
+      - name: Build with Maven with Java 11
+        run: mvn package -DskipTests=true
+      - name: Running tests with Java 11
+        run: mvn test
+      - name: Running tests with Java 17
+        run: JAVA_HOME=$JAVA_17 JAVA_TOOL_OPTIONS="--add-opens=java.base/java.nio=ALL-UNNAMED" mvn test
+      
+
