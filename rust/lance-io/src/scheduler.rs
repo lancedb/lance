@@ -14,7 +14,7 @@
 
 use bytes::Bytes;
 use futures::channel::oneshot;
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use object_store::path::Path;
 use snafu::{location, Location};
 use std::future::Future;
@@ -215,6 +215,7 @@ impl StoreScheduler {
 }
 
 /// A throttled file reader
+#[derive(Clone)]
 pub struct FileScheduler {
     reader: Arc<dyn Reader>,
     root: Arc<StoreScheduler>,
@@ -230,6 +231,24 @@ impl FileScheduler {
         request: Vec<Range<u64>>,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
         self.root.submit_request(self.reader.clone(), request)
+    }
+
+    /// Submit a single IOP to the reader
+    ///
+    /// If you have multpile IOPS to perform then [`Self::submit_request`] is going
+    /// to be more efficient.
+    pub fn submit_single(&self, range: Range<u64>) -> impl Future<Output = Result<Bytes>> + Send {
+        self.submit_request(vec![range])
+            .map_ok(|vec_bytes| vec_bytes.into_iter().next().unwrap())
+    }
+
+    /// Provides access to the underlying reader
+    ///
+    /// Do not use this for reading data as it will bypass any I/O scheduling!
+    /// This is mainly exposed to allow metadata operations (e.g size, block_size,)
+    /// which either aren't IOPS or we don't throttle
+    pub fn reader(&self) -> &Arc<dyn Reader> {
+        &self.reader
     }
 }
 
