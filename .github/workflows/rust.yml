@@ -28,10 +28,14 @@ env:
 
 jobs:
   linux-build:
-    runs-on:
-      group: large-runners
-      labels: ubuntu-22.04-4core
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
+    strategy:
+      matrix:
+        toolchain:
+          - stable
+          - nightly
+    name: Rust test {{ matrix.toolchain }}
     defaults:
       run:
         working-directory: ./rust
@@ -44,6 +48,7 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
+          rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - name: Run cargo fmt
         run: cargo fmt --check
       # split everything us so we know what's slow.
@@ -51,12 +56,15 @@ jobs:
         run: |
           cargo build --all-features --tests
       - name: Start DynamoDB local for tests
+        if: ${{ matrix.toolchain == 'stable' }}
         run: |
           docker run -d -e AWS_ACCESS_KEY_ID=DUMMYKEY -e AWS_SECRET_ACCESS_KEY=DUMMYKEY -p 8000:8000 amazon/dynamodb-local
       - name: Run tests
+        if: ${{ matrix.toolchain == 'stable' }}
         run: |
           cargo test --features dynamodb,tensorflow,dynamodb_tests,cli
       - name: Build benchmarks
+        if: ${{ matrix.toolchain == 'stable' }}
         run: cargo build --benches
   linux-arm:
     runs-on: buildjet-4vcpu-ubuntu-2204-arm
@@ -99,13 +107,16 @@ jobs:
   mac-build:
     runs-on: "macos-14"
     timeout-minutes: 45
+    strategy:
+      matrix:
+        toolchain:
+          - stable
+          - nightly
     defaults:
       run:
         working-directory: ./rust/lance
     steps:
       - uses: actions/checkout@v4
-      - name: CPU features
-        run: sysctl -a | grep cpu
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
