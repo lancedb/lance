@@ -82,7 +82,7 @@ pub struct GraphBuilder {
     dist_fn: Box<DistanceFunc<f32>>,
 }
 
-impl Graph<u32, f32> for GraphBuilder {
+impl Graph<MatrixView<Float32Type>, u32, f32> for GraphBuilder {
     fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -103,8 +103,8 @@ impl Graph<u32, f32> for GraphBuilder {
         (self.dist_fn)(from_vec, to_vec)
     }
 
-    fn storage(&self) -> &Arc<dyn VectorStorage<f32>> {
-        &self.vectors as &Arc<dyn VectorStorage<f32>>
+    fn storage(&self) -> &Arc<MatrixView<Float32Type>> {
+        &self.vectors
     }
 }
 
@@ -163,7 +163,7 @@ impl GraphBuilder {
     }
 
     /// Build the Graph.
-    pub fn build(&self) -> Box<dyn Graph> {
+    pub fn build(&self) -> Box<dyn Graph<MatrixView<Float32Type>>> {
         Box::new(InMemoryGraph::from_builder(
             self.nodes
                 .iter()

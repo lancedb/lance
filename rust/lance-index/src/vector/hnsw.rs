@@ -23,23 +23,22 @@ use std::{collections::BTreeMap, fmt::Debug};
 use lance_core::Result;
 use lance_linalg::distance::MetricType;
 
+use super::graph::storage::VectorStorage;
 use super::graph::{Graph, OrderedFloat};
 use crate::vector::graph::beam_search;
-
 pub mod builder;
-
 pub use builder::HNSWBuilder;
 
 /// HNSW graph.
 ///
-pub struct HNSW {
-    layers: Vec<Arc<dyn Graph>>,
+pub struct HNSW<V: VectorStorage<f32>> {
+    layers: Vec<Arc<dyn Graph<V>>>,
     metric_type: MetricType,
     /// Entry point of the graph.
     entry_point: u32,
 }
 
-impl Debug for HNSW {
+impl<V: VectorStorage<f32>> Debug for HNSW<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -50,9 +49,9 @@ impl Debug for HNSW {
     }
 }
 
-impl HNSW {
+impl<V: VectorStorage<f32>> HNSW<V> {
     fn from_builder(
-        layers: Vec<Arc<dyn Graph>>,
+        layers: Vec<Arc<dyn Graph<V>>>,
         entry_point: u32,
         metric_type: MetricType,
     ) -> Self {

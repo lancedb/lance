@@ -22,6 +22,7 @@ use rand::{thread_rng, Rng};
 use super::super::graph::beam_search;
 use super::{select_neighbors, HNSW};
 use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage, Graph};
+use crate::vector::pq::storage::ProductQuantizationStorage;
 use lance_core::Result;
 
 /// Build a HNSW graph.
@@ -148,7 +149,7 @@ impl HNSWBuilder {
         Ok(())
     }
 
-    pub fn build(&mut self) -> Result<HNSW> {
+    pub fn build<V: VectorStorage<f32>>(&mut self, storage: V) -> Result<HNSW<V>> {
         log::info!(
             "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
             self.metric_type,
@@ -170,7 +171,7 @@ impl HNSWBuilder {
             .levels
             .iter()
             .map(|l| l.build().into())
-            .collect::<Vec<Arc<dyn Graph>>>();
+            .collect::<Vec<Arc<dyn Graph<V>>>>();
         Ok(HNSW::from_builder(
             graphs,
             self.entry_point,

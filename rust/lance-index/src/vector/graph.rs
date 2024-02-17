@@ -164,8 +164,8 @@ struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType> {
 /// -------
 /// A sorted list of ``(dist, node_id)`` pairs.
 ///
-pub(super) fn beam_search(
-    graph: &dyn Graph<u32>,
+pub(super) fn beam_search<V: VectorStorage<f32>>(
+    graph: &dyn Graph<V>,
     start: &[u32],
     query: &[f32],
     k: usize,
@@ -211,6 +211,8 @@ pub(super) fn beam_search(
 
 impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType>
     Graph<MatrixView<T::ArrowType>, I, T> for InMemoryGraph<I, T>
+where
+    T::ArrowType: L2 + Cosine + Dot,
 {
     fn neighbors(&self, key: I) -> Option<Box<dyn Iterator<Item = I> + '_>> {
         self.nodes
@@ -232,8 +234,8 @@ impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType>
         self.nodes.len()
     }
 
-    fn storage(&self) -> &Arc<dyn VectorStorage<f32>> {
-        todo!()
+    fn storage(&self) -> &Arc<MatrixView<T::ArrowType>> {
+        &self.vectors
     }
 }
 
