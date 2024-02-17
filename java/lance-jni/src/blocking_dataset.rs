@@ -15,7 +15,7 @@
 use arrow::array::RecordBatchReader;
 use tokio::runtime::Runtime;
 
-use lance::Dataset;
+use lance::dataset::{Dataset, WriteParams};
 use lance::Result;
 
 pub struct BlockingDataset {
@@ -24,13 +24,13 @@ pub struct BlockingDataset {
 }
 
 impl BlockingDataset {
-    pub fn write(reader: impl RecordBatchReader + Send + 'static, uri: &str) -> Result<Self> {
+    pub fn write(reader: impl RecordBatchReader + Send + 'static, uri: &str, params: Option<WriteParams>) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
 
         let inner = rt.block_on(
-            Dataset::write(reader, uri, Option::None)
+            Dataset::write(reader, uri, params)
         )?;
         Ok(BlockingDataset { inner, rt })
     }

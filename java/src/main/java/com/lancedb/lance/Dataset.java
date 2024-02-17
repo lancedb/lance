@@ -36,11 +36,14 @@ public class Dataset implements Closeable {
   private Dataset() {
   }
 
-  public static Dataset write(ArrowArrayStream stream, String path) {
-    return writeWithFFIStream(stream.memoryAddress(), path);
+  public static Dataset write(ArrowArrayStream stream, String path, WriteParams params) {
+    return writeWithFFIStream(stream.memoryAddress(), path,
+        params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(),
+        params.getMaxBytesPerFile(), params.getMode().name());
   }
 
-  private static native Dataset writeWithFFIStream(long ArrowStreamMemoryAddress, String path);
+  private static native Dataset writeWithFFIStream(long ArrowStreamMemoryAddress, String path,
+      int maxRowsPerFile, int maxRowsPerGroup, long maxBytesPerFile, String mode);
 
   /**
    * Opens a dataset from the specified path using the native library.
