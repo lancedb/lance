@@ -16,7 +16,6 @@
 //!
 
 use std::any::Any;
-use std::cmp::min;
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
@@ -32,15 +31,17 @@ use lance_linalg::kernels::{argmin, argmin_value_float, normalize};
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 pub mod builder;
+mod distance;
 pub mod transform;
 pub(crate) mod utils;
 
+use self::distance::{build_distance_table_l2, compute_l2_distance};
 pub use self::utils::num_centroids;
 use super::pb;
 pub use builder::PQBuildParams;
+use utils::get_sub_vector_centroids;
 
 /// Product Quantization
-
 #[async_trait::async_trait]
 pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
     fn as_any(&self) -> &dyn Any;
@@ -113,26 +114,6 @@ pub struct ProductQuantizerImpl<T: ArrowFloatType + Cosine + Dot + L2> {
     /// Codebook[sub_vector_id][pq_code]
     /// ```
     pub codebook: Arc<T::ArrayType>,
-}
-
-fn get_sub_vector_centroids<T: FloatToArrayType>(
-    codebook: &[T],
-    dimension: usize,
-    num_bits: impl Into<u32>,
-    num_sub_vectors: usize,
-    sub_vector_idx: usize,
-) -> &[T] {
-    assert!(
-        sub_vector_idx < num_sub_vectors,
-        "sub_vector idx: {}, num_sub_vectors: {}",
-        sub_vector_idx,
-        num_sub_vectors
-    );
-
-    let num_centroids = num_centroids(num_bits);
-    let sub_vector_width = dimension / num_sub_vectors;
-    &codebook[sub_vector_idx * num_centroids * sub_vector_width
-        ..(sub_vector_idx + 1) * num_centroids * sub_vector_width]
 }
 
 impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
@@ -242,19 +223,12 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
             ),
             location: Default::default(),
         })?;
-
-        let mut distance_table = vec![];
-
-        let sub_vector_length = self.dimension / self.num_sub_vectors;
-        key.as_slice()
-            .chunks_exact(sub_vector_length)
-            .enumerate()
-            .for_each(|(i, sub_vec)| {
-                let subvec_centroids = self.centroids(i);
-                let distances = l2_distance_batch(sub_vec, subvec_centroids, sub_vector_length);
-                distance_table.extend(distances);
-            });
-        Ok(distance_table)
+        Ok(build_distance_table_l2(
+            self.codebook.as_slice(),
+            self.num_bits,
+            self.num_sub_vectors,
+            key.as_slice(),
+        ))
     }
 
     /// Compute L2 distance from the query to all code.
@@ -279,63 +253,12 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         distance_table: &[f32],
         code: &[u8],
     ) -> Float32Array {
-        let num_centroids = num_centroids(self.num_bits);
-
-        let iter = code.chunks_exact(self.num_sub_vectors * V);
-        let distances = iter.clone().flat_map(|c| {
-            let mut sums = [0.0_f32; V];
-            for i in (0..self.num_sub_vectors).step_by(C) {
-                for (vec_idx, sum) in sums.iter_mut().enumerate() {
-                    let vec_start = vec_idx * self.num_sub_vectors;
-                    #[cfg(all(feature = "nightly", target_feature = "avx512f"))]
-                    {
-                        use std::arch::x86_64::*;
-                        if i + C <= self.num_sub_vectors {
-                            let mut offsets = [(i * num_centroids) as i32; C];
-                            for k in 0..C {
-                                offsets[k] += (k * num_centroids) as i32 + c[vec_start + k] as i32;
-                            }
-                            unsafe {
-                                let simd_offsets = _mm512_loadu_epi32(offsets.as_ptr());
-                                let v = _mm512_i32gather_ps(
-                                    simd_offsets,
-                                    distance_table.as_ptr() as *const u8,
-                                    4,
-                                );
-                                *sum += _mm512_reduce_add_ps(v);
-                            }
-                        } else {
-                            let mut s = 0.0;
-                            for k in 0..self.num_sub_vectors - i {
-                                *sum += distance_table
-                                    [(i + k) * num_centroids + c[vec_start + k] as usize];
-                            }
-                        }
-                    }
-                    #[cfg(not(any(feature = "nightly", target_feature = "avx512f")))]
-                    {
-                        let s = c[vec_start + i..]
-                            .iter()
-                            .take(min(C, self.num_sub_vectors - i))
-                            .enumerate()
-                            .map(|(k, c)| distance_table[(i + k) * num_centroids + *c as usize])
-                            .sum::<f32>();
-                        *sum += s;
-                    }
-                }
-            }
-            sums.into_iter()
-        });
-        // Remainder
-        let remainder = iter.remainder().chunks(self.num_sub_vectors).map(|c| {
-            c.iter()
-                .enumerate()
-                .map(|(sub_vec_idx, code)| {
-                    distance_table[sub_vec_idx * num_centroids + *code as usize]
-                })
-                .sum::<f32>()
-        });
-        Float32Array::from_iter_values(distances.chain(remainder))
+        Float32Array::from(compute_l2_distance::<C, V>(
+            distance_table,
+            self.num_bits,
+            self.num_sub_vectors,
+            code,
+        ))
     }
 
     /// Pre-compute L2 distance from the query to all code.
