@@ -14,6 +14,7 @@
 
 use lance_arrow::ArrowFloatType;
 use num_traits::{Float, ToPrimitive};
+use std::sync::Arc;
 
 use lance_linalg::{
     distance::{Cosine, Dot, MetricType, L2},
@@ -24,21 +25,28 @@ pub trait DistCalculator {
     fn distance(&self, ids: &[u32]) -> Vec<f32>;
 }
 
+/// Vector Storage is the abstraction to store the vectors.
+///
+/// It can be in-memory raw vectors or on disk PQ code.
+///
+/// It abstracts away the logic to compute the distance between vectors.
+///
+/// TODO: should we rename this to "VectorDistance"?;
 pub trait VectorStorage<T: Float> {
     fn len(&self) -> usize;
 
-    /// Create a distance calculator from query.
+    /// Create a [DistCalculator] to compute the distance between the query.
     ///
     fn dist_calculator(&self, query: &[f32], metric_type: MetricType) -> Box<dyn DistCalculator>;
 }
 
-struct InMemoryDistanceCal<'a, T: ArrowFloatType> {
-    vectors: &'a MatrixView<T>,
-    query: &'a [f32],
+struct InMemoryDistanceCal<T: ArrowFloatType + L2 + Cosine + Dot> {
+    vectors: Arc<MatrixView<T>>,
+    query: Vec<f32>,
     metric_type: MetricType,
 }
 
-impl<'a, T: ArrowFloatType + L2 + Cosine + Dot> DistCalculator for InMemoryDistanceCal<'_, T> {
+impl<T: ArrowFloatType + L2 + Cosine + Dot> DistCalculator for InMemoryDistanceCal<T> {
     fn distance(&self, ids: &[u32]) -> Vec<f32> {
         ids.iter()
             .map(|id| {
@@ -49,21 +57,21 @@ impl<'a, T: ArrowFloatType + L2 + Cosine + Dot> DistCalculator for InMemoryDista
                     .iter()
                     .map(|v| v.to_f32().unwrap())
                     .collect::<Vec<_>>();
-                self.metric_type.func()(self.query, &vector)
+                self.metric_type.func()(&self.query, &vector)
             })
             .collect()
     }
 }
 
-impl<T: ArrowFloatType + L2 + Cosine + Dot> VectorStorage<T::Native> for MatrixView<T> {
+impl<T: ArrowFloatType + L2 + Cosine + Dot + 'static> VectorStorage<T::Native> for MatrixView<T> {
     fn len(&self) -> usize {
         self.num_rows()
     }
 
     fn dist_calculator(&self, query: &[f32], metric_type: MetricType) -> Box<dyn DistCalculator> {
         Box::new(InMemoryDistanceCal {
-            vectors: self,
-            query,
+            vectors: Arc::new(self.clone()),
+            query: query.to_vec(),
             metric_type,
         })
     }
