@@ -11,19 +11,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package com.lancedb.lance;
 
 import io.questdb.jar.jni.JarJniLoader;
-import org.apache.arrow.c.ArrowArrayStream;
-import org.apache.arrow.c.jni.JniLoader;
-
 import java.io.Closeable;
 import java.util.Map;
+import org.apache.arrow.c.ArrowArrayStream;
 
 /**
  * Class representing a Lance dataset, interfacing with the native lance library.
  * This class provides functionality to open and manage datasets with native code.
- *
  * The native library is loaded statically and utilized through native methods.
  * It implements the {@link java.io.Closeable} interface to ensure proper resource management.
  */
@@ -38,10 +36,10 @@ public class Dataset implements Closeable {
   }
 
   public static Dataset write(ArrowArrayStream stream, String path, WriteParams params) {
-    return writeWithFFIStream(stream.memoryAddress(), path, params.toMap());
+    return writeWithFfiStream(stream.memoryAddress(), path, params.toMap());
   }
 
-  private static native Dataset writeWithFFIStream(long ArrowStreamMemoryAddress, String path,
+  private static native Dataset writeWithFfiStream(long arrowStreamMemoryAddress, String path,
       Map<String, Object> params);
 
   /**
@@ -50,11 +48,12 @@ public class Dataset implements Closeable {
    * @param path The file path of the dataset to open.
    * @return A new instance of {@link Dataset} linked to the opened dataset.
    */
-  public native static Dataset open(String path);
+  public static native Dataset open(String path);
 
   /**
    * Count the number of rows in the dataset.
-   * @return num of rows
+   *
+   * @return num of rows.
    */
   public native int countRows();
 

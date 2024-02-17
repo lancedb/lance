@@ -11,13 +11,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package com.lancedb.lance;
 
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
+/**
+ * Write Params for Write Operations of Lance.
+ */
 public class WriteParams {
+
+  /**
+   * Write Mode.
+   */
   public enum WriteMode {
     CREATE,
     APPEND,
@@ -37,6 +45,11 @@ public class WriteParams {
     this.mode = mode;
   }
 
+  /**
+   * Create a map of the key-value pair of write params.
+   *
+   * @return a map of write params
+   */
   public Map<String, Object> toMap() {
     Map<String, Object> params = new HashMap<>();
     maxRowsPerFile.ifPresent(value -> params.put("max_rows_per_file", value));
@@ -46,6 +59,10 @@ public class WriteParams {
     return params;
   }
 
+
+  /**
+   * A builder of WriteParams.
+   */
   public static class Builder {
     private Optional<Integer> maxRowsPerFile = Optional.empty();
     private Optional<Integer> maxRowsPerGroup = Optional.empty();
@@ -73,7 +90,7 @@ public class WriteParams {
     }
 
     public WriteParams build() {
-      return new WriteParams(this.maxRowsPerFile, this.maxRowsPerGroup, this.maxBytesPerFile, this.mode);
+      return new WriteParams(maxRowsPerFile, maxRowsPerGroup, maxBytesPerFile, mode);
     }
   }
 }

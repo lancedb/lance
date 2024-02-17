@@ -23,7 +23,7 @@ use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFFIStream<'local>(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     arrow_array_stream_addr: jlong,
