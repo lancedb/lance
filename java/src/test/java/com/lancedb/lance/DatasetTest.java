@@ -67,7 +67,8 @@ public class DatasetTest {
       Data.exportArrayStream(allocator, reader, arrowStream);
       Path datasetPath = tempDir.resolve("new_dataset");
       assertDoesNotThrow(() -> {
-        dataset = Dataset.write(arrowStream, datasetPath.toString());
+        dataset = Dataset.write(arrowStream, datasetPath.toString(),
+            new WriteParams.Builder().build());
         assertEquals(9, dataset.countRows());
         Dataset datasetRead = Dataset.open(datasetPath.toString());
         assertEquals(9, datasetRead.countRows());
