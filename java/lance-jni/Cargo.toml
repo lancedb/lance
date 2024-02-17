@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 lance = { path="../../rust/lance" }
-arrow = { features = ["ffi"] }
+arrow = { version = "50.0.0", features = ["ffi"] }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",
     "macros",
