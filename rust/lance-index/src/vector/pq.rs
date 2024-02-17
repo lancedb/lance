@@ -32,15 +32,17 @@ use lance_linalg::kernels::{argmin, argmin_value_float, normalize};
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 pub mod builder;
+mod distance;
 pub mod transform;
 pub(crate) mod utils;
 
+use self::distance::build_distance_table_l2;
 pub use self::utils::num_centroids;
 use super::pb;
 pub use builder::PQBuildParams;
+use utils::get_sub_vector_centroids;
 
 /// Product Quantization
-
 #[async_trait::async_trait]
 pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
     fn as_any(&self) -> &dyn Any;
@@ -113,26 +115,6 @@ pub struct ProductQuantizerImpl<T: ArrowFloatType + Cosine + Dot + L2> {
     /// Codebook[sub_vector_id][pq_code]
     /// ```
     pub codebook: Arc<T::ArrayType>,
-}
-
-fn get_sub_vector_centroids<T: FloatToArrayType>(
-    codebook: &[T],
-    dimension: usize,
-    num_bits: impl Into<u32>,
-    num_sub_vectors: usize,
-    sub_vector_idx: usize,
-) -> &[T] {
-    assert!(
-        sub_vector_idx < num_sub_vectors,
-        "sub_vector idx: {}, num_sub_vectors: {}",
-        sub_vector_idx,
-        num_sub_vectors
-    );
-
-    let num_centroids = num_centroids(num_bits);
-    let sub_vector_width = dimension / num_sub_vectors;
-    &codebook[sub_vector_idx * num_centroids * sub_vector_width
-        ..(sub_vector_idx + 1) * num_centroids * sub_vector_width]
 }
 
 impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
@@ -242,19 +224,12 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
             ),
             location: Default::default(),
         })?;
-
-        let mut distance_table = vec![];
-
-        let sub_vector_length = self.dimension / self.num_sub_vectors;
-        key.as_slice()
-            .chunks_exact(sub_vector_length)
-            .enumerate()
-            .for_each(|(i, sub_vec)| {
-                let subvec_centroids = self.centroids(i);
-                let distances = l2_distance_batch(sub_vec, subvec_centroids, sub_vector_length);
-                distance_table.extend(distances);
-            });
-        Ok(distance_table)
+        Ok(build_distance_table_l2::<T>(
+            self.codebook.as_slice(),
+            self.num_bits,
+            self.num_sub_vectors,
+            key.as_slice(),
+        ))
     }
 
     /// Compute L2 distance from the query to all code.

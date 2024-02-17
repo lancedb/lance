@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use lance_arrow::ArrowFloatType;
+use lance_arrow::{ArrowFloatType, FloatToArrayType};
 use lance_linalg::MatrixView;
 
 /// Divide a 2D vector in [`T::Array`] to `m` sub-vectors.
@@ -51,6 +51,26 @@ pub(super) fn divide_to_subvectors<T: ArrowFloatType>(
 // TODO: pub(crate)
 pub fn num_centroids(num_bits: impl Into<u32>) -> usize {
     2_usize.pow(num_bits.into())
+}
+
+pub(crate) fn get_sub_vector_centroids<T: FloatToArrayType>(
+    codebook: &[T],
+    dimension: usize,
+    num_bits: impl Into<u32>,
+    num_sub_vectors: usize,
+    sub_vector_idx: usize,
+) -> &[T] {
+    assert!(
+        sub_vector_idx < num_sub_vectors,
+        "sub_vector idx: {}, num_sub_vectors: {}",
+        sub_vector_idx,
+        num_sub_vectors
+    );
+
+    let num_centroids = num_centroids(num_bits);
+    let sub_vector_width = dimension / num_sub_vectors;
+    &codebook[sub_vector_idx * num_centroids * sub_vector_width
+        ..(sub_vector_idx + 1) * num_centroids * sub_vector_width]
 }
 
 #[cfg(test)]
