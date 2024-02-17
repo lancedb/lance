@@ -35,7 +35,6 @@ jobs:
         toolchain:
           - stable
           - nightly
-    name: Rust test {{ matrix.toolchain }}
     defaults:
       run:
         working-directory: ./rust
