@@ -121,6 +121,16 @@ impl ProductQuantizationStorage {
     }
 }
 
+struct PQDistCalculator {
+    lookup_table: Vec<f32>,
+}
+
+impl PQDistCalculator {
+    fn new() -> Self {
+
+    }
+}
+
 impl VectorStorage<f32> for ProductQuantizationStorage {
     fn len(&self) -> usize {
         self.batch.num_rows()
