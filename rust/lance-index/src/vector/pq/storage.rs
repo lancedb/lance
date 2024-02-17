@@ -20,12 +20,13 @@ use std::sync::Arc;
 
 use arrow_array::{
     cast::AsArray,
-    types::{Float32Type, UInt8Type},
+    types::{Float32Type, UInt64Type, UInt8Type},
     FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
 use arrow_schema::SchemaRef;
-use lance_core::Result;
+use lance_core::{Error, Result, ROW_ID};
 use lance_linalg::distance::MetricType;
+use snafu::{location, Location};
 
 use super::{ProductQuantizer, ProductQuantizerImpl};
 use crate::vector::{pq::transform::PQTransformer, transform::Transformer, PQ_CODE_COLUMN};
@@ -34,8 +35,10 @@ use crate::vector::{pq::transform::PQTransformer, transform::Transformer, PQ_COD
 pub struct ProductQuantizationStorage {
     codebook: Arc<Float32Array>,
     batch: RecordBatch,
-    // pq_code: Arc<UInt8Array>,
-    // row_ids: Arc<UInt64Array>,
+
+    // For easy access
+    pq_code: Arc<UInt8Array>,
+    row_ids: Arc<UInt64Array>,
 }
 
 impl ProductQuantizationStorage {
@@ -47,11 +50,53 @@ impl ProductQuantizationStorage {
         let codebook = quantizer.codebook.clone();
         let transform = PQTransformer::new(quantizer, vector_col, PQ_CODE_COLUMN);
         let batch = transform.transform(batch).await?;
+
+        let Some(row_ids) = batch.column_by_name(ROW_ID) else {
+            return Err(Error::Index {
+                message: "Row ID column not found from PQ storage".to_string(),
+                location: location!(),
+            });
+        };
+        let row_ids: Arc<UInt64Array> = row_ids
+            .as_primitive_opt::<UInt64Type>()
+            .ok_or(Error::Index {
+                message: "Row ID column is not of type UInt64".to_string(),
+                location: location!(),
+            })?
+            .clone()
+            .into();
+
+        let Some(pq_col) = batch.column_by_name(PQ_CODE_COLUMN) else {
+            return Err(Error::Index {
+                message: format!("{PQ_CODE_COLUMN} column not found from PQ storage"),
+                location: location!(),
+            });
+        };
+        let pq_code_fsl = pq_col.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "{PQ_CODE_COLUMN} column is not of type UInt8: {}",
+                pq_col.data_type()
+            ),
+            location: location!(),
+        })?;
+        let pq_code: Arc<UInt8Array> = pq_code_fsl
+            .values()
+            .as_primitive_opt::<UInt8Type>()
+            .ok_or(Error::Index {
+                message: format!(
+                    "{PQ_CODE_COLUMN} column is not of type UInt8: {}",
+                    pq_col.data_type()
+                ),
+                location: location!(),
+            })?
+            .clone()
+            .into();
+
         Ok(Self {
             codebook,
             batch,
-            // pq_code: pq_code.into(),
-            // row_ids,
+            pq_code,
+            row_ids,
         })
     }
 
