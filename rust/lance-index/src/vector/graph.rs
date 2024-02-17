@@ -209,8 +209,8 @@ pub(super) fn beam_search(
     Ok(results)
 }
 
-impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType> Graph<I, T>
-    for InMemoryGraph<I, T>
+impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType>
+    Graph<MatrixView<T::ArrowType>, I, T> for InMemoryGraph<I, T>
 {
     fn neighbors(&self, key: I) -> Option<Box<dyn Iterator<Item = I> + '_>> {
         self.nodes
