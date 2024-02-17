@@ -28,7 +28,7 @@ use lance_core::{Error, Result, ROW_ID};
 use lance_linalg::distance::MetricType;
 use snafu::{location, Location};
 
-use super::ProductQuantizerImpl;
+use super::{build_distance_table_l2, ProductQuantizerImpl};
 use crate::vector::{
     graph::storage::{DistCalculator, VectorStorage},
     pq::transform::PQTransformer,
@@ -48,7 +48,9 @@ pub struct ProductQuantizationStorage {
     batch: RecordBatch,
 
     // Metadata
+    num_bits: u32,
     num_sub_vectors: usize,
+    dimension: usize,
 
     // For easy access
     pq_code: Arc<UInt8Array>,
@@ -62,6 +64,8 @@ impl ProductQuantizationStorage {
         vector_col: &str,
     ) -> Result<Self> {
         let codebook = quantizer.codebook.clone();
+        let num_bits = quantizer.num_bits;
+        let dimension = quantizer.dimension;
         let num_sub_vectors = quantizer.num_sub_vectors;
         let transform = PQTransformer::new(quantizer, vector_col, PQ_CODE_COLUMN);
         let batch = transform.transform(batch).await?;
@@ -113,6 +117,8 @@ impl ProductQuantizationStorage {
             pq_code,
             row_ids,
             num_sub_vectors,
+            num_bits,
+            dimension,
         })
     }
 
@@ -122,12 +128,25 @@ impl ProductQuantizationStorage {
 }
 
 struct PQDistCalculator {
-    lookup_table: Vec<f32>,
+    distance_table: Vec<f32>,
 }
 
 impl PQDistCalculator {
-    fn new() -> Self {
-
+    fn new(
+        codebook: &[f32],
+        num_bits: u32,
+        num_sub_vectors: usize,
+        dimension: usize,
+        query: &[f32],
+    ) -> Self {
+        let distance_table = build_distance_table_l2::<Float32Type>(
+            codebook,
+            dimension,
+            num_bits,
+            num_sub_vectors,
+            query,
+        );
+        Self { distance_table }
     }
 }
 
