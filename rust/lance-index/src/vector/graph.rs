@@ -19,11 +19,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 
-use arrow_array::types::Float32Type;
 use lance_arrow::FloatToArrayType;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{Cosine, DistanceFunc, DistanceType, Dot, MetricType, L2};
-use lance_linalg::MatrixView;
+use lance_linalg::distance::{Cosine, DistanceFunc, Dot, MetricType, L2};
 use num_traits::{AsPrimitive, Float, PrimInt};
 use snafu::{location, Location};
 
@@ -124,14 +122,6 @@ pub trait Graph<V: VectorStorage<T>, K: PrimInt = u32, T: Float = f32> {
 
     /// Access to underline storage
     fn storage(&self) -> &Arc<V>;
-
-    /// Distance from query vector to a node.
-    fn distance_to(&self, query: &[T], key: K) -> f32;
-
-    /// Distance between two nodes in the graph.
-    ///
-    /// Returns the distance between two nodes as float32.
-    fn distance_between(&self, a: K, b: K) -> f32;
 }
 
 /// Serializable Graph.
@@ -140,9 +130,9 @@ pub trait Graph<V: VectorStorage<T>, K: PrimInt = u32, T: Float = f32> {
 /// ----------------
 /// I : Vertex Index type
 /// V : the data type of vector, i.e., ``f32`` or ``f16``.
-struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType> {
+struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType, V: VectorStorage<T>> {
     pub nodes: HashMap<I, GraphNode<I>>,
-    vectors: Arc<MatrixView<T::ArrowType>>,
+    vectors: Arc<V>,
     dist_fn: Box<DistanceFunc<T>>,
     phantom: std::marker::PhantomData<T>,
 }
@@ -164,7 +154,7 @@ struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType> {
 /// -------
 /// A sorted list of ``(dist, node_id)`` pairs.
 ///
-pub(super) fn beam_search<V: VectorStorage<f32>>(
+pub(super) fn beam_search<V: VectorStorage<f32> + 'static>(
     graph: &dyn Graph<V>,
     start: &[u32],
     query: &[f32],
@@ -173,9 +163,10 @@ pub(super) fn beam_search<V: VectorStorage<f32>>(
     let mut visited: HashSet<_> = start.iter().copied().collect();
     let dist_calc = graph.storage().dist_calculator(query, MetricType::L2);
     let mut candidates: BTreeMap<OrderedFloat, _> = dist_calc
-        .distance_batch(start)
+        .distance(start)
+        .iter()
         .zip(start)
-        .map(|(dist, id)| (dist.into(), *id))
+        .map(|(&dist, id)| (dist.into(), *id))
         .collect::<BTreeMap<_, _>>();
     let mut results = candidates.clone();
 
@@ -195,7 +186,7 @@ pub(super) fn beam_search<V: VectorStorage<f32>>(
                 continue;
             }
             visited.insert(neighbor);
-            let dist = dist_calc.distance(neighbor).into();
+            let dist = dist_calc.distance(&[neighbor])[0].into();
             if dist < furtherst || results.len() < k {
                 results.insert(dist, neighbor);
                 candidates.insert(dist, neighbor);
@@ -209,8 +200,8 @@ pub(super) fn beam_search<V: VectorStorage<f32>>(
     Ok(results)
 }
 
-impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType>
-    Graph<MatrixView<T::ArrowType>, I, T> for InMemoryGraph<I, T>
+impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType, V: VectorStorage<T>>
+    Graph<V, I, T> for InMemoryGraph<I, T, V>
 where
     T::ArrowType: L2 + Cosine + Dot,
 {
@@ -220,32 +211,23 @@ where
             .map(|n| Box::new(n.neighbors.iter().copied()) as Box<dyn Iterator<Item = I>>)
     }
 
-    fn distance_to(&self, query: &[T], idx: I) -> f32 {
-        let vec = self.vectors.row(idx.as_()).unwrap();
-        (self.dist_fn)(query, vec)
-    }
-
-    fn distance_between(&self, a: I, b: I) -> f32 {
-        let from_vec = self.vectors.row(a.as_()).unwrap();
-        self.distance_to(from_vec, b)
-    }
-
     fn len(&self) -> usize {
         self.nodes.len()
     }
 
-    fn storage(&self) -> &Arc<MatrixView<T::ArrowType>> {
+    fn storage(&self) -> &Arc<V> {
         &self.vectors
     }
 }
 
-impl<I: PrimInt + Hash, T: FloatToArrayType> InMemoryGraph<I, T>
+impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType, V: VectorStorage<T>>
+    InMemoryGraph<I, T, V>
 where
     T::ArrowType: L2 + Cosine + Dot,
 {
     fn from_builder(
         nodes: HashMap<I, GraphNode<I>>,
-        vectors: Arc<MatrixView<T::ArrowType>>,
+        vectors: Arc<V>,
         metric_type: MetricType,
     ) -> Self {
         Self {

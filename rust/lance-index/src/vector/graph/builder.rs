@@ -92,17 +92,6 @@ impl Graph<MatrixView<Float32Type>, u32, f32> for GraphBuilder {
         Some(Box::new(node.neighbors.values().copied()))
     }
 
-    fn distance_to(&self, query: &[f32], key: u32) -> f32 {
-        let vec = self.vectors.row(key as usize).unwrap();
-        (self.dist_fn)(query, vec)
-    }
-
-    fn distance_between(&self, a: u32, b: u32) -> f32 {
-        let from_vec = self.vectors.row(a as usize).unwrap();
-        let to_vec = self.vectors.row(b as usize).unwrap();
-        (self.dist_fn)(from_vec, to_vec)
-    }
-
     fn storage(&self) -> &Arc<MatrixView<Float32Type>> {
         &self.vectors
     }
@@ -110,10 +99,10 @@ impl Graph<MatrixView<Float32Type>, u32, f32> for GraphBuilder {
 
 impl GraphBuilder {
     /// Build from a [VectorStorage].
-    pub fn new(vectors: MatrixView<Float32Type>) -> Self {
+    pub fn new(vectors: Arc<MatrixView<Float32Type>>) -> Self {
         Self {
             nodes: BTreeMap::new(),
-            vectors: vectors.into(),
+            vectors,
             dist_fn: Box::new(MetricType::L2.func::<f32>() as DistanceFunc<f32>),
             metric_type: MetricType::L2,
         }
@@ -133,7 +122,9 @@ impl GraphBuilder {
 
     /// Connect from one node to another.
     pub fn connect(&mut self, from: u32, to: u32) -> Result<()> {
-        let distance: OrderedFloat = self.distance_between(from, to).into();
+        let from_vec = self.vectors.row(from as usize).unwrap();
+        let to_vec = self.vectors.row(to as usize).unwrap();
+        let distance: OrderedFloat = self.dist_fn.as_ref()(from_vec, to_vec).into();
 
         {
             let from_node = self.nodes.get_mut(&from).ok_or_else(|| Error::Index {
@@ -163,13 +154,13 @@ impl GraphBuilder {
     }
 
     /// Build the Graph.
-    pub fn build(&self) -> Box<dyn Graph<MatrixView<Float32Type>>> {
+    pub fn build<V: VectorStorage<f32> + 'static>(&self, storage: Arc<V>) -> Box<dyn Graph<V>> {
         Box::new(InMemoryGraph::from_builder(
             self.nodes
                 .iter()
                 .map(|(&id, node)| (id, node.into()))
                 .collect(),
-            self.vectors.clone(),
+            storage,
             self.metric_type,
         ))
     }
@@ -187,12 +178,12 @@ mod tests {
     #[test]
     fn test_builder() {
         let arr = Float32Array::from_iter_values((0..120).map(|v| v as f32));
-        let mat = MatrixView::<Float32Type>::new(Arc::new(arr), 8);
-        let mut builder = GraphBuilder::new(mat);
+        let mat = Arc::new(MatrixView::<Float32Type>::new(Arc::new(arr), 8));
+        let mut builder = GraphBuilder::new(mat.clone());
         builder.insert(0);
         builder.insert(1);
         builder.connect(0, 1).unwrap();
-        let graph = builder.build();
+        let graph = builder.build(mat);
         assert_eq!(graph.len(), 2);
 
         assert_eq!(graph.neighbors(0).unwrap().collect::<Vec<_>>(), vec![1]);

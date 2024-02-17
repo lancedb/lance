@@ -49,7 +49,7 @@ impl<V: VectorStorage<f32>> Debug for HNSW<V> {
     }
 }
 
-impl<V: VectorStorage<f32>> HNSW<V> {
+impl<V: VectorStorage<f32> + 'static> HNSW<V> {
     fn from_builder(
         layers: Vec<Arc<dyn Graph<V>>>,
         entry_point: u32,
@@ -142,11 +142,11 @@ mod tests {
         const TOTAL: usize = 2048;
         const MAX_EDGES: usize = 32;
         let data = generate_random_array(TOTAL * DIM);
-        let mat = MatrixView::<Float32Type>::new(data.into(), DIM);
-        let hnsw = HNSWBuilder::new(mat)
+        let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
+        let hnsw = HNSWBuilder::new(mat.clone())
             .max_num_edges(MAX_EDGES)
             .ef_construction(50)
-            .build()
+            .build(mat.clone())
             .unwrap();
         assert!(hnsw.layers.len() > 1);
         assert_eq!(hnsw.layers[0].len(), TOTAL);
@@ -185,13 +185,13 @@ mod tests {
         const K: usize = 10;
 
         let data = generate_random_array(TOTAL * DIM);
-        let mat = MatrixView::<Float32Type>::new(data.into(), DIM);
+        let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
         let q = mat.row(0).unwrap();
 
         let hnsw = HNSWBuilder::new(mat.clone())
             .max_num_edges(MAX_EDGES)
             .ef_construction(100)
-            .build()
+            .build(mat.clone())
             .unwrap();
 
         let results: HashSet<u32> = hnsw

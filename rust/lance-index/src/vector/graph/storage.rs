@@ -21,9 +21,7 @@ use lance_linalg::{
 };
 
 pub trait DistCalculator {
-    fn distance(&self, id: u32) -> f32;
-
-    fn distance_batch(&self, ids: &[u32]) -> Box<dyn Iterator<Item = f32>>;
+    fn distance(&self, ids: &[u32]) -> Vec<f32>;
 }
 
 pub trait VectorStorage<T: Float> {
@@ -41,25 +39,19 @@ struct InMemoryDistanceCal<'a, T: ArrowFloatType> {
 }
 
 impl<'a, T: ArrowFloatType + L2 + Cosine + Dot> DistCalculator for InMemoryDistanceCal<'_, T> {
-    fn distance(&self, id: u32) -> f32 {
-        let dists = self.distance_batch(&[id]);
-        dists.collect::<Vec<_>>().pop().unwrap()
-    }
-
-    fn distance_batch(&self, ids: &[u32]) -> Box<dyn Iterator<Item = f32>> {
-        let metric_type = self.metric_type;
-        let dist_fn = metric_type.func();
-        let mat = self.vectors.clone();
-        let query = self.query;
-        Box::new(ids.iter().map(move |&id| {
-            let vector = mat
-                .row(id as usize)
-                .unwrap()
-                .iter()
-                .map(|v| v.to_f32().unwrap())
-                .collect::<Vec<_>>();
-            dist_fn(query, &vector)
-        }))
+    fn distance(&self, ids: &[u32]) -> Vec<f32> {
+        ids.iter()
+            .map(|id| {
+                let vector = self
+                    .vectors
+                    .row(*id as usize)
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_f32().unwrap())
+                    .collect::<Vec<_>>();
+                self.metric_type.func()(self.query, &vector)
+            })
+            .collect()
     }
 }
 
