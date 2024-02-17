@@ -28,7 +28,7 @@ use lance_core::{Error, Result, ROW_ID};
 use lance_linalg::distance::MetricType;
 use snafu::{location, Location};
 
-use super::{build_distance_table_l2, ProductQuantizerImpl};
+use super::{distance::build_distance_table_l2, num_centroids, ProductQuantizerImpl};
 use crate::vector::{
     graph::storage::{DistCalculator, VectorStorage},
     pq::transform::PQTransformer,
@@ -127,8 +127,27 @@ impl ProductQuantizationStorage {
     }
 }
 
+impl VectorStorage<f32> for ProductQuantizationStorage {
+    fn len(&self) -> usize {
+        self.batch.num_rows()
+    }
+
+    fn dist_calculator(&self, query: &[f32], metric_type: MetricType) -> Box<dyn DistCalculator> {
+        Box::new(PQDistCalculator::new(
+            self.codebook.values(),
+            self.num_bits,
+            self.num_sub_vectors,
+            self.pq_code.clone(),
+            query,
+        ))
+    }
+}
+
 struct PQDistCalculator {
     distance_table: Vec<f32>,
+    pq_code: Arc<UInt8Array>,
+    num_sub_vectors: usize,
+    num_centroids: usize,
 }
 
 impl PQDistCalculator {
@@ -136,27 +155,37 @@ impl PQDistCalculator {
         codebook: &[f32],
         num_bits: u32,
         num_sub_vectors: usize,
-        dimension: usize,
+        pq_code: Arc<UInt8Array>,
         query: &[f32],
     ) -> Self {
-        let distance_table = build_distance_table_l2::<Float32Type>(
-            codebook,
-            dimension,
-            num_bits,
+        let distance_table = build_distance_table_l2(codebook, num_bits, num_sub_vectors, query);
+        Self {
+            distance_table,
             num_sub_vectors,
-            query,
-        );
-        Self { distance_table }
+            pq_code,
+            num_centroids: num_centroids(num_bits),
+        }
+    }
+
+    fn get_pq_code(&self, id: u32) -> &[u8] {
+        let start = id as usize * self.num_sub_vectors;
+        let end = start + self.num_sub_vectors;
+        &self.pq_code.values()[start..end]
     }
 }
 
-impl VectorStorage<f32> for ProductQuantizationStorage {
-    fn len(&self) -> usize {
-        self.batch.num_rows()
-    }
-
-    fn dist_calculator(&self, query: &[f32], metric_type: MetricType) -> Box<dyn DistCalculator> {
-        todo!()
+impl DistCalculator for PQDistCalculator {
+    fn distance(&self, ids: &[u32]) -> Vec<f32> {
+        ids.iter()
+            .map(|&id| {
+                let pq_code = self.get_pq_code(id);
+                pq_code
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &c)| self.distance_table[i * self.num_centroids + c as usize])
+                    .sum()
+            })
+            .collect()
     }
 }
 
