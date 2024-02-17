@@ -14,19 +14,22 @@
 
 use std::cmp::min;
 
-use lance_arrow::ArrowFloatType;
+use lance_arrow::FloatToArrayType;
 use lance_linalg::distance::{l2_distance_batch, L2};
 
 use super::{num_centroids, utils::get_sub_vector_centroids};
 
 /// Build a Distance Table from the query to each PQ centroid
 /// using L2 distance.
-pub(super) fn build_distance_table_l2<T: ArrowFloatType + L2>(
-    codebook: &[T::Native],
+pub(super) fn build_distance_table_l2<T: FloatToArrayType>(
+    codebook: &[T],
     num_bits: u32,
     num_sub_vectors: usize,
-    query: &[T::Native],
-) -> Vec<f32> {
+    query: &[T],
+) -> Vec<f32>
+where
+    T::ArrowType: L2,
+{
     let dimension = query.len();
 
     let sub_vector_length = dimension / num_sub_vectors;

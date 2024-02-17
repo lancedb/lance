@@ -223,7 +223,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
             ),
             location: Default::default(),
         })?;
-        Ok(build_distance_table_l2::<T>(
+        Ok(build_distance_table_l2(
             self.codebook.as_slice(),
             self.num_bits,
             self.num_sub_vectors,
