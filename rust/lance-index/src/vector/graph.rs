@@ -134,7 +134,6 @@ struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType, V: VectorStorage<T>
     pub nodes: HashMap<I, GraphNode<I>>,
     vectors: Arc<V>,
     dist_fn: Box<DistanceFunc<T>>,
-    phantom: std::marker::PhantomData<T>,
 }
 
 /// Beam search over a graph
@@ -234,7 +233,6 @@ where
             nodes,
             vectors,
             dist_fn: metric_type.func::<T>().into(),
-            phantom: std::marker::PhantomData,
         }
     }
 }

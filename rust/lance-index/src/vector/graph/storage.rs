@@ -37,6 +37,8 @@ pub trait VectorStorage<T: Float> {
 
     /// Create a [DistCalculator] to compute the distance between the query.
     ///
+    /// Using dist calcualtor can be more efficient as it can pre-compute some
+    /// values.
     fn dist_calculator(&self, query: &[f32], metric_type: MetricType) -> Box<dyn DistCalculator>;
 }
 

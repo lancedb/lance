@@ -148,7 +148,7 @@ impl HNSWBuilder {
         Ok(())
     }
 
-    pub fn build<V: VectorStorage<f32>>(&mut self, storage: Arc<V>) -> Result<HNSW<V>> {
+    pub fn build<V: VectorStorage<f32> + 'static>(&mut self, storage: Arc<V>) -> Result<HNSW<V>> {
         log::info!(
             "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
             self.metric_type,

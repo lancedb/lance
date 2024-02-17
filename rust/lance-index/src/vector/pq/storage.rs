@@ -133,8 +133,6 @@ impl VectorStorage<f32> for ProductQuantizationStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::vector::graph::storage;
-
     use super::*;
 
     use arrow_array::FixedSizeListArray;

@@ -17,6 +17,7 @@
 //! run with `cargo run --release --example hnsw`
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
 use lance_index::vector::hnsw::HNSWBuilder;
@@ -40,7 +41,7 @@ fn main() {
     const SEED: [u8; 32] = [42; 32];
 
     let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
-    let mat = MatrixView::<Float32Type>::new(data.into(), DIMENSION);
+    let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIMENSION));
 
     let q = mat.row(0).unwrap();
     let k = 10;
@@ -51,7 +52,7 @@ fn main() {
             let hnsw = HNSWBuilder::new(mat.clone())
                 .max_level(level)
                 .ef_construction(ef_construction)
-                .build()
+                .build(mat.clone())
                 .unwrap();
             let results: HashSet<u32> = hnsw
                 .search(q, k, 100)
