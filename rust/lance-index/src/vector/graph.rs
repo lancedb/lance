@@ -17,11 +17,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
+use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
 use lance_arrow::FloatToArrayType;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{Cosine, DistanceFunc, Dot, MetricType, L2};
+use lance_linalg::distance::{Cosine, DistanceFunc, DistanceType, Dot, MetricType, L2};
 use lance_linalg::MatrixView;
 use num_traits::{AsPrimitive, Float, PrimInt};
 use snafu::{location, Location};
@@ -93,13 +94,23 @@ impl From<OrderedFloat> for f32 {
     }
 }
 
+/// Distance calculator.
+///
+/// This trait is used to calculate a query vector to a stream of vector IDs.
+///
+pub trait DistanceCalculator {
+    /// Compute distances between one query vector to all the vectors in the
+    /// list of IDs.
+    fn compute_distances(&self, ids: &[u32]) -> Box<dyn Iterator<Item = f32>>;
+}
+
 /// Graph trait.
 ///
 /// Type parameters
 /// ---------------
 /// K: Vertex Index type
 /// T: the data type of vector, i.e., ``f32`` or ``f16``.
-pub trait Graph<K: PrimInt = u32, T: Float = f32> {
+pub trait Graph<V: VectorStorage<T>, K: PrimInt = u32, T: Float = f32> {
     /// Get the number of nodes in the graph.
     fn len(&self) -> usize;
 
@@ -110,6 +121,9 @@ pub trait Graph<K: PrimInt = u32, T: Float = f32> {
 
     /// Get the neighbors of a graph node, identifyied by the index.
     fn neighbors(&self, key: K) -> Option<Box<dyn Iterator<Item = K> + '_>>;
+
+    /// Access to underline storage
+    fn storage(&self) -> &Arc<V>;
 
     /// Distance from query vector to a node.
     fn distance_to(&self, query: &[T], key: K) -> f32;
@@ -128,7 +142,7 @@ pub trait Graph<K: PrimInt = u32, T: Float = f32> {
 /// V : the data type of vector, i.e., ``f32`` or ``f16``.
 struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType> {
     pub nodes: HashMap<I, GraphNode<I>>,
-    vectors: MatrixView<T::ArrowType>,
+    vectors: Arc<MatrixView<T::ArrowType>>,
     dist_fn: Box<DistanceFunc<T>>,
     phantom: std::marker::PhantomData<T>,
 }
@@ -150,16 +164,18 @@ struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType> {
 /// -------
 /// A sorted list of ``(dist, node_id)`` pairs.
 ///
-pub(super) fn beam_search<I: PrimInt + Hash + std::fmt::Display>(
-    graph: &dyn Graph<I>,
-    start: &[I],
+pub(super) fn beam_search(
+    graph: &dyn Graph<u32>,
+    start: &[u32],
     query: &[f32],
     k: usize,
-) -> Result<BTreeMap<OrderedFloat, I>> {
-    let mut visited: HashSet<I> = start.iter().copied().collect();
-    let mut candidates = start
-        .iter()
-        .map(|&i| (graph.distance_to(query, i).into(), i))
+) -> Result<BTreeMap<OrderedFloat, u32>> {
+    let mut visited: HashSet<_> = start.iter().copied().collect();
+    let dist_calc = graph.storage().dist_calculator(query, MetricType::L2);
+    let mut candidates: BTreeMap<OrderedFloat, _> = dist_calc
+        .distance_batch(start)
+        .zip(start)
+        .map(|(dist, id)| (dist.into(), *id))
         .collect::<BTreeMap<_, _>>();
     let mut results = candidates.clone();
 
@@ -179,7 +195,7 @@ pub(super) fn beam_search<I: PrimInt + Hash + std::fmt::Display>(
                 continue;
             }
             visited.insert(neighbor);
-            let dist = graph.distance_to(query, neighbor).into();
+            let dist = dist_calc.distance(neighbor).into();
             if dist < furtherst || results.len() < k {
                 results.insert(dist, neighbor);
                 candidates.insert(dist, neighbor);
@@ -215,6 +231,10 @@ impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType> Graph<I, T>
     fn len(&self) -> usize {
         self.nodes.len()
     }
+
+    fn storage(&self) -> &Arc<dyn VectorStorage<f32>> {
+        todo!()
+    }
 }
 
 impl<I: PrimInt + Hash, T: FloatToArrayType> InMemoryGraph<I, T>
@@ -223,7 +243,7 @@ where
 {
     fn from_builder(
         nodes: HashMap<I, GraphNode<I>>,
-        vectors: MatrixView<T::ArrowType>,
+        vectors: Arc<MatrixView<T::ArrowType>>,
         metric_type: MetricType,
     ) -> Self {
         Self {

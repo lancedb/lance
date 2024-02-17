@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
 use lance_core::{Error, Result};
@@ -74,7 +75,7 @@ pub struct GraphBuilder {
     nodes: BTreeMap<u32, GraphBuilderNode>,
 
     /// Storage for vectors.
-    vectors: MatrixView<Float32Type>,
+    vectors: Arc<MatrixView<Float32Type>>,
 
     metric_type: MetricType,
 
@@ -101,6 +102,10 @@ impl Graph<u32, f32> for GraphBuilder {
         let to_vec = self.vectors.row(b as usize).unwrap();
         (self.dist_fn)(from_vec, to_vec)
     }
+
+    fn storage(&self) -> &Arc<dyn VectorStorage<f32>> {
+        &self.vectors as &Arc<dyn VectorStorage<f32>>
+    }
 }
 
 impl GraphBuilder {
@@ -108,7 +113,7 @@ impl GraphBuilder {
     pub fn new(vectors: MatrixView<Float32Type>) -> Self {
         Self {
             nodes: BTreeMap::new(),
-            vectors,
+            vectors: vectors.into(),
             dist_fn: Box::new(MetricType::L2.func::<f32>() as DistanceFunc<f32>),
             metric_type: MetricType::L2,
         }

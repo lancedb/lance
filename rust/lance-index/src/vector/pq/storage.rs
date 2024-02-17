@@ -21,20 +21,27 @@ use std::sync::Arc;
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt64Type, UInt8Type},
-    FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
+    Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
 use arrow_schema::SchemaRef;
 use lance_core::{Error, Result, ROW_ID};
 use lance_linalg::distance::MetricType;
 use snafu::{location, Location};
 
-use super::{ProductQuantizer, ProductQuantizerImpl};
+use super::ProductQuantizerImpl;
 use crate::vector::{
-    graph::storage::VectorStorage, pq::transform::PQTransformer, transform::Transformer,
+    graph::storage::{DistCalculator, VectorStorage},
+    pq::transform::PQTransformer,
+    transform::Transformer,
     PQ_CODE_COLUMN,
 };
 
 /// Product Quantization Storage
+///
+/// It stores PQ code, as well as the row ID to the orignal vectors.
+///
+/// It is possible to store additonal metadata to accelerate filtering later.
+///
 #[derive(Clone)]
 pub struct ProductQuantizationStorage {
     codebook: Arc<Float32Array>,
@@ -118,6 +125,10 @@ impl VectorStorage<f32> for ProductQuantizationStorage {
     fn len(&self) -> usize {
         self.batch.num_rows()
     }
+
+    fn dist_calculator(&self, query: &[f32], metric_type: MetricType) -> Box<dyn DistCalculator> {
+        todo!()
+    }
 }
 
 #[cfg(test)]
@@ -126,6 +137,7 @@ mod tests {
 
     use super::*;
 
+    use arrow_array::FixedSizeListArray;
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID_FIELD;

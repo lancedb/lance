@@ -13,16 +13,66 @@
 // limitations under the License.
 
 use lance_arrow::ArrowFloatType;
-use num_traits::Float;
+use num_traits::{Float, ToPrimitive};
 
-use lance_linalg::MatrixView;
+use lance_linalg::{
+    distance::{Cosine, Dot, MetricType, L2},
+    MatrixView,
+};
 
-pub trait VectorStorage<T: Float>: Clone {
-    fn len(&self) -> usize;
+pub trait DistCalculator {
+    fn distance(&self, id: u32) -> f32;
+
+    fn distance_batch(&self, ids: &[u32]) -> Box<dyn Iterator<Item = f32>>;
 }
 
-impl<T: ArrowFloatType> VectorStorage<T::Native> for MatrixView<T> {
+pub trait VectorStorage<T: Float> {
+    fn len(&self) -> usize;
+
+    /// Create a distance calculator from query.
+    ///
+    fn dist_calculator(&self, query: &[f32], metric_type: MetricType) -> Box<dyn DistCalculator>;
+}
+
+struct InMemoryDistanceCal<'a, T: ArrowFloatType> {
+    vectors: &'a MatrixView<T>,
+    query: &'a [f32],
+    metric_type: MetricType,
+}
+
+impl<'a, T: ArrowFloatType + L2 + Cosine + Dot> DistCalculator for InMemoryDistanceCal<'_, T> {
+    fn distance(&self, id: u32) -> f32 {
+        let dists = self.distance_batch(&[id]);
+        dists.collect::<Vec<_>>().pop().unwrap()
+    }
+
+    fn distance_batch(&self, ids: &[u32]) -> Box<dyn Iterator<Item = f32>> {
+        let metric_type = self.metric_type;
+        let dist_fn = metric_type.func();
+        let mat = self.vectors.clone();
+        let query = self.query;
+        Box::new(ids.iter().map(move |&id| {
+            let vector = mat
+                .row(id as usize)
+                .unwrap()
+                .iter()
+                .map(|v| v.to_f32().unwrap())
+                .collect::<Vec<_>>();
+            dist_fn(query, &vector)
+        }))
+    }
+}
+
+impl<T: ArrowFloatType + L2 + Cosine + Dot> VectorStorage<T::Native> for MatrixView<T> {
     fn len(&self) -> usize {
         self.num_rows()
+    }
+
+    fn dist_calculator(&self, query: &[f32], metric_type: MetricType) -> Box<dyn DistCalculator> {
+        Box::new(InMemoryDistanceCal {
+            vectors: self,
+            query,
+            metric_type,
+        })
     }
 }
