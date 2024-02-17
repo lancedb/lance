@@ -19,15 +19,9 @@ use lance_linalg::MatrixView;
 
 pub trait VectorStorage<T: Float>: Clone {
     fn len(&self) -> usize;
-
-    fn get(&self, idx: usize) -> &[T];
 }
 
 impl<T: ArrowFloatType> VectorStorage<T::Native> for MatrixView<T> {
-    fn get(&self, idx: usize) -> &[T::Native] {
-        self.row(idx).unwrap()
-    }
-
     fn len(&self) -> usize {
         self.num_rows()
     }

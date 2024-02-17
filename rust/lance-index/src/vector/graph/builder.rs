@@ -14,8 +14,12 @@
 
 use std::collections::BTreeMap;
 
+use arrow_array::types::Float32Type;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{DistanceFunc, MetricType};
+use lance_linalg::{
+    distance::{DistanceFunc, MetricType},
+    MatrixView,
+};
 use snafu::{location, Location};
 
 use super::{Graph, GraphNode, InMemoryGraph, OrderedFloat};
@@ -66,18 +70,18 @@ impl From<&GraphBuilderNode> for GraphNode<u32> {
 /// Graph Builder.
 ///
 ///
-pub struct GraphBuilder<V: VectorStorage<f32>> {
+pub struct GraphBuilder {
     nodes: BTreeMap<u32, GraphBuilderNode>,
 
     /// Storage for vectors.
-    vectors: V,
+    vectors: MatrixView<Float32Type>,
 
     metric_type: MetricType,
 
     dist_fn: Box<DistanceFunc<f32>>,
 }
 
-impl<V: VectorStorage<f32>> Graph<u32, f32> for GraphBuilder<V> {
+impl Graph<u32, f32> for GraphBuilder {
     fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -88,20 +92,20 @@ impl<V: VectorStorage<f32>> Graph<u32, f32> for GraphBuilder<V> {
     }
 
     fn distance_to(&self, query: &[f32], key: u32) -> f32 {
-        let vec = self.vectors.get(key as usize);
+        let vec = self.vectors.row(key as usize).unwrap();
         (self.dist_fn)(query, vec)
     }
 
     fn distance_between(&self, a: u32, b: u32) -> f32 {
-        let from_vec = self.vectors.get(a as usize);
-        let to_vec = self.vectors.get(b as usize);
+        let from_vec = self.vectors.row(a as usize).unwrap();
+        let to_vec = self.vectors.row(b as usize).unwrap();
         (self.dist_fn)(from_vec, to_vec)
     }
 }
 
-impl<V: VectorStorage<f32> + 'static> GraphBuilder<V> {
+impl GraphBuilder {
     /// Build from a [VectorStorage].
-    pub fn new(vectors: V) -> Self {
+    pub fn new(vectors: MatrixView<Float32Type>) -> Self {
         Self {
             nodes: BTreeMap::new(),
             vectors,

@@ -29,12 +29,19 @@ use lance_linalg::distance::MetricType;
 use snafu::{location, Location};
 
 use super::{ProductQuantizer, ProductQuantizerImpl};
-use crate::vector::{pq::transform::PQTransformer, transform::Transformer, PQ_CODE_COLUMN};
+use crate::vector::{
+    graph::storage::VectorStorage, pq::transform::PQTransformer, transform::Transformer,
+    PQ_CODE_COLUMN,
+};
 
 /// Product Quantization Storage
+#[derive(Clone)]
 pub struct ProductQuantizationStorage {
     codebook: Arc<Float32Array>,
     batch: RecordBatch,
+
+    // Metadata
+    num_sub_vectors: usize,
 
     // For easy access
     pq_code: Arc<UInt8Array>,
@@ -48,6 +55,7 @@ impl ProductQuantizationStorage {
         vector_col: &str,
     ) -> Result<Self> {
         let codebook = quantizer.codebook.clone();
+        let num_sub_vectors = quantizer.num_sub_vectors;
         let transform = PQTransformer::new(quantizer, vector_col, PQ_CODE_COLUMN);
         let batch = transform.transform(batch).await?;
 
@@ -97,11 +105,18 @@ impl ProductQuantizationStorage {
             batch,
             pq_code,
             row_ids,
+            num_sub_vectors,
         })
     }
 
     pub fn schema(&self) -> SchemaRef {
         self.batch.schema()
+    }
+}
+
+impl VectorStorage<f32> for ProductQuantizationStorage {
+    fn len(&self) -> usize {
+        self.batch.num_rows()
     }
 }
 
@@ -147,8 +162,13 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_ids)]).unwrap();
 
-        let storage = ProductQuantizationStorage::new(pq, &batch, "vectors")
+        let storage = ProductQuantizationStorage::new(pq.clone(), &batch, "vectors")
             .await
             .unwrap();
+        assert_eq!(storage.len(), TOTAL);
+        assert_eq!(storage.num_sub_vectors, NUM_SUB_VECTORS);
+        assert_eq!(storage.codebook.len(), 256 * DIM);
+        assert_eq!(storage.pq_code.len(), TOTAL * NUM_SUB_VECTORS);
+        assert_eq!(storage.row_ids.len(), TOTAL);
     }
 }

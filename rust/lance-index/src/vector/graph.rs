@@ -18,9 +18,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
+use arrow_array::types::Float32Type;
 use lance_arrow::FloatToArrayType;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{Cosine, DistanceFunc, Dot, MetricType, L2};
+use lance_linalg::MatrixView;
 use num_traits::{AsPrimitive, Float, PrimInt};
 use snafu::{location, Location};
 
@@ -124,9 +126,9 @@ pub trait Graph<K: PrimInt = u32, T: Float = f32> {
 /// ----------------
 /// I : Vertex Index type
 /// V : the data type of vector, i.e., ``f32`` or ``f16``.
-struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType, V: storage::VectorStorage<T>> {
+struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType> {
     pub nodes: HashMap<I, GraphNode<I>>,
-    vectors: V,
+    vectors: MatrixView<T::ArrowType>,
     dist_fn: Box<DistanceFunc<T>>,
     phantom: std::marker::PhantomData<T>,
 }
@@ -191,8 +193,8 @@ pub(super) fn beam_search<I: PrimInt + Hash + std::fmt::Display>(
     Ok(results)
 }
 
-impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType, V: storage::VectorStorage<T>>
-    Graph<I, T> for InMemoryGraph<I, T, V>
+impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType> Graph<I, T>
+    for InMemoryGraph<I, T>
 {
     fn neighbors(&self, key: I) -> Option<Box<dyn Iterator<Item = I> + '_>> {
         self.nodes
@@ -201,12 +203,12 @@ impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType, V: storage::Ve
     }
 
     fn distance_to(&self, query: &[T], idx: I) -> f32 {
-        let vec = self.vectors.get(idx.as_());
+        let vec = self.vectors.row(idx.as_()).unwrap();
         (self.dist_fn)(query, vec)
     }
 
     fn distance_between(&self, a: I, b: I) -> f32 {
-        let from_vec = self.vectors.get(a.as_());
+        let from_vec = self.vectors.row(a.as_()).unwrap();
         self.distance_to(from_vec, b)
     }
 
@@ -215,11 +217,15 @@ impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType, V: storage::Ve
     }
 }
 
-impl<I: PrimInt + Hash, T: FloatToArrayType, V: VectorStorage<T>> InMemoryGraph<I, T, V>
+impl<I: PrimInt + Hash, T: FloatToArrayType> InMemoryGraph<I, T>
 where
     T::ArrowType: L2 + Cosine + Dot,
 {
-    fn from_builder(nodes: HashMap<I, GraphNode<I>>, vectors: V, metric_type: MetricType) -> Self {
+    fn from_builder(
+        nodes: HashMap<I, GraphNode<I>>,
+        vectors: MatrixView<T::ArrowType>,
+        metric_type: MetricType,
+    ) -> Self {
         Self {
             nodes,
             vectors,

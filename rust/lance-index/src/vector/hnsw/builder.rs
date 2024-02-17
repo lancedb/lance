@@ -15,7 +15,8 @@
 use std::cmp::min;
 use std::sync::Arc;
 
-use lance_linalg::distance::MetricType;
+use arrow_array::types::Float32Type;
+use lance_linalg::{distance::MetricType, MatrixView};
 use rand::{thread_rng, Rng};
 
 use super::super::graph::beam_search;
@@ -26,7 +27,7 @@ use lance_core::Result;
 /// Build a HNSW graph.
 ///
 /// Currently, the HNSW graph is fully built in memory.
-pub struct HNSWBuilder<V: VectorStorage<f32>> {
+pub struct HNSWBuilder {
     /// max level of
     max_level: u16,
 
@@ -43,15 +44,15 @@ pub struct HNSWBuilder<V: VectorStorage<f32>> {
     metric_type: MetricType,
 
     /// Vector storage for the graph.
-    vectors: V,
+    vectors: MatrixView<Float32Type>,
 
-    levels: Vec<GraphBuilder<V>>,
+    levels: Vec<GraphBuilder>,
 
     entry_point: u32,
 }
 
-impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
-    pub fn new(vectors: V) -> Self {
+impl HNSWBuilder {
+    pub fn new(vectors: MatrixView<Float32Type>) -> Self {
         Self {
             max_level: 8,
             m_max: 32,
@@ -104,7 +105,7 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
 
     /// Insert one node.
     fn insert(&mut self, node: u32) -> Result<()> {
-        let vector = self.vectors.get(node as usize);
+        let vector = self.vectors.row(node as usize).unwrap();
         let level = self.random_level();
 
         let levels_to_search = if self.levels.len() > level as usize {
@@ -156,8 +157,7 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
             self.ef_construction
         );
         for _ in 0..self.max_level {
-            let mut level =
-                GraphBuilder::<V>::new(self.vectors.clone()).metric_type(self.metric_type);
+            let mut level = GraphBuilder::new(self.vectors.clone()).metric_type(self.metric_type);
             level.insert(0);
             self.levels.push(level);
         }
