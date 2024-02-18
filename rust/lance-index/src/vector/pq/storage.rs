@@ -294,10 +294,19 @@ impl ProductQuantizationStorage {
             writer.write(&[slice]).await?;
         }
 
+        let index_metadata = IndexMetadata {
+            index_type: "PQ".to_string(),
+            metric_type: self.metric_type.to_string(),
+        };
+
         let mut schema_metadata = HashMap::new();
         schema_metadata.insert(
             PQ_METADTA_KEY.to_string(),
             serde_json::to_string(&metadata)?,
+        );
+        schema_metadata.insert(
+            INDEX_METADATA_SCHEMA_KEY.to_string(),
+            serde_json::to_string(&index_metadata)?,
         );
         writer.finish_with_metadata(&schema_metadata).await?;
         Ok(())

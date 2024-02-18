@@ -15,9 +15,7 @@
 use std::cmp::min;
 use std::sync::Arc;
 
-use arrow_array::types::Float32Type;
 use lance_core::Result;
-use lance_linalg::{distance::MetricType, MatrixView};
 use rand::{thread_rng, Rng};
 
 use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
@@ -27,6 +25,7 @@ use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage, Graph}
 /// Build a HNSW graph.
 ///
 /// Currently, the HNSW graph is fully built in memory.
+///
 pub struct HNSWBuilder {
     /// max level of
     max_level: u16,
@@ -40,9 +39,6 @@ pub struct HNSWBuilder {
     /// Size of the dynamic list for the candidates
     ef_construction: usize,
 
-    /// Metric type to compute the distance.
-    metric_type: MetricType,
-
     /// Vector storage for the graph.
     vectors: Arc<InMemoryVectorStorage>,
 
@@ -52,13 +48,12 @@ pub struct HNSWBuilder {
 }
 
 impl HNSWBuilder {
-    pub fn new(vectors: Arc<MatrixView<Float32Type>>, metric_type: MetricType) -> Self {
-        let vectors = Arc::new(InMemoryVectorStorage::new(vectors, metric_type));
+    /// Create a new [`HNSWBuilder`] with in memory vector storage.
+    pub fn new(vectors: Arc<InMemoryVectorStorage>) -> Self {
         Self {
             max_level: 8,
             m_max: 32,
             ef_construction: 100,
-            metric_type,
             vectors,
             levels: vec![],
             entry_point: 0,
@@ -143,10 +138,16 @@ impl HNSWBuilder {
         Ok(())
     }
 
-    pub fn build(&mut self, storage: Arc<dyn VectorStorage>) -> Result<HNSW> {
+    /// Build the graph, with the already provided `VectorStorage` as backing storage for HNSW graph.
+    pub fn build(&mut self) -> Result<HNSW> {
+        self.build_with(self.vectors.clone())
+    }
+
+    /// Build the graph, with the provided [`VectorStorage`] as backing storage for HNSW graph.
+    pub fn build_with(&mut self, storage: Arc<dyn VectorStorage>) -> Result<HNSW> {
         log::info!(
             "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
-            self.metric_type,
+            self.vectors.metric_type(),
             self.max_level,
             self.m_max,
             self.ef_construction
@@ -169,7 +170,7 @@ impl HNSWBuilder {
         Ok(HNSW::from_builder(
             graphs,
             self.entry_point,
-            self.metric_type,
+            self.vectors.metric_type(),
         ))
     }
 }

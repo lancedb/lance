@@ -24,7 +24,7 @@ use num_traits::{AsPrimitive, PrimInt};
 use snafu::{location, Location};
 
 pub(crate) mod builder;
-mod memory;
+pub mod memory;
 pub(super) mod storage;
 
 use storage::VectorStorage;

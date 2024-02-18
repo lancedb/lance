@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
 use lance_index::vector::{graph::memory::InMemoryVectorStorage, hnsw::HNSWBuilder};
-use lance_linalg::MatrixView;
+use lance_linalg::{distance::MetricType, MatrixView};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
@@ -50,10 +50,10 @@ fn main() {
 
     for level in [4, 8, 16, 32] {
         for ef_construction in [50, 100, 200, 400] {
-            let hnsw = HNSWBuilder::new(mat.clone())
+            let hnsw = HNSWBuilder::new(vector_store.clone())
                 .max_level(level)
                 .ef_construction(ef_construction)
-                .build(mat.clone())
+                .build()
                 .unwrap();
             let results: HashSet<u32> = hnsw
                 .search(q, k, 100)
