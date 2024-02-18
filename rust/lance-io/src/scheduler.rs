@@ -193,9 +193,9 @@ impl StoreScheduler {
                     dest.deliver_data(bytes.map(|bytes| (task_idx, bytes)));
                 }),
             };
-            self.io_submitter
-                .send(task)
-                .expect("I/O scheduler thread panic'd");
+            if self.io_submitter.send(task).is_err() {
+                panic!("unable to submit I/O because the I/O thread has panic'd");
+            }
         }
     }
 
