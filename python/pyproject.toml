@@ -63,6 +63,9 @@ torch = ["torch"]
 [tool.ruff]
 lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "CPY001", "B019"]
 
+[tool.ruff.lint.per-file-ignores]
+"*.pyi" = ["E302"]
+
 [tool.mypy]
 python_version = "3.11"
 check_untyped_defs = true
