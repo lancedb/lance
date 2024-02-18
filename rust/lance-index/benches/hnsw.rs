@@ -16,7 +16,7 @@
 //!
 //!
 
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use arrow_array::types::Float32Type;
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -34,12 +34,15 @@ fn bench_hnsw(c: &mut Criterion) {
     const K: usize = 10;
 
     let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
-    let mat = MatrixView::<Float32Type>::new(data.into(), DIMENSION);
+    let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIMENSION));
 
     let query = mat.row(0).unwrap();
     c.bench_function("create_hnsw(65535x1024,levels=4)", |b| {
         b.iter(|| {
-            let hnsw = HNSWBuilder::new(mat.clone()).max_level(4).build().unwrap();
+            let hnsw = HNSWBuilder::new(mat.clone())
+                .max_level(4)
+                .build(mat.clone())
+                .unwrap();
             let uids: HashSet<u32> = hnsw
                 .search(query, K, 300)
                 .unwrap()
