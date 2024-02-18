@@ -64,7 +64,7 @@ fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
 /// It reads arrow data from one data file.
 #[derive(Clone)]
 pub struct FileReader {
-    object_reader: Arc<dyn Reader>,
+    pub object_reader: Arc<dyn Reader>,
     metadata: Arc<Metadata>,
     page_table: Arc<PageTable>,
     schema: Schema,

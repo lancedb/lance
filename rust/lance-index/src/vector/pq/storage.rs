@@ -21,11 +21,14 @@ use std::{cmp::min, collections::HashMap, sync::Arc};
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt64Type, UInt8Type},
-    Float32Array, RecordBatch, UInt64Array, UInt8Array,
+    FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
 use lance_core::{Error, Result, ROW_ID};
-use lance_file::writer::FileWriter;
-use lance_io::traits::{WriteExt, Writer};
+use lance_file::{reader::FileReader, writer::FileWriter};
+use lance_io::{
+    traits::{WriteExt, Writer},
+    utils::read_message,
+};
 use lance_linalg::{distance::MetricType, MatrixView};
 use lance_table::io::manifest::ManifestDescribing;
 use serde::{Deserialize, Serialize};
@@ -74,18 +77,13 @@ pub struct ProductQuantizationStorage {
 }
 
 impl ProductQuantizationStorage {
-    pub async fn new(
-        quantizer: Arc<ProductQuantizerImpl<Float32Type>>,
-        batch: &RecordBatch,
-        vector_col: &str,
+    pub fn new(
+        codebook: Arc<Float32Array>,
+        batch: RecordBatch,
+        num_bits: u32,
+        num_sub_vectors: usize,
+        dimension: usize,
     ) -> Result<Self> {
-        let codebook = quantizer.codebook.clone();
-        let num_bits = quantizer.num_bits;
-        let dimension = quantizer.dimension;
-        let num_sub_vectors = quantizer.num_sub_vectors;
-        let transform = PQTransformer::new(quantizer, vector_col, PQ_CODE_COLUMN);
-        let batch = transform.transform(batch).await?;
-
         let Some(row_ids) = batch.column_by_name(ROW_ID) else {
             return Err(Error::Index {
                 message: "Row ID column not found from PQ storage".to_string(),
@@ -136,6 +134,54 @@ impl ProductQuantizationStorage {
             num_bits,
             dimension,
         })
+    }
+
+    pub async fn build(
+        quantizer: Arc<ProductQuantizerImpl<Float32Type>>,
+        batch: &RecordBatch,
+        vector_col: &str,
+    ) -> Result<Self> {
+        let codebook = quantizer.codebook.clone();
+        let num_bits = quantizer.num_bits;
+        let dimension = quantizer.dimension;
+        let num_sub_vectors = quantizer.num_sub_vectors;
+        let transform = PQTransformer::new(quantizer, vector_col, PQ_CODE_COLUMN);
+        let batch = transform.transform(batch).await?;
+
+        Self::new(codebook, batch, num_bits, num_sub_vectors, dimension)
+    }
+
+    pub async fn load(reader: &FileReader) -> Result<Self> {
+        let schema = reader.schema();
+        let metadata = schema.metadata.get(PQ_METADTA_KEY).ok_or(Error::Index {
+            message: format!(
+                "Reading PQ storage: metadata key {} not found",
+                PQ_METADTA_KEY
+            ),
+            location: location!(),
+        })?;
+        let pq_matadata: ProductQuantizationMetadata =
+            serde_json::from_str(metadata).map_err(|e| Error::Index {
+                message: format!("Failed to parse PQ metadata: {}", metadata),
+                location: location!(),
+            })?;
+        let codebook_tensor: pb::Tensor =
+            read_message(reader.object_reader.as_ref(), pq_matadata.codebook_position).await?;
+        let fsl = FixedSizeListArray::try_from(&codebook_tensor)?;
+
+        // Hard coded to float32 for now
+        let codebook = Arc::new(fsl.values().as_primitive::<Float32Type>().clone());
+
+        let total = reader.len();
+        let batch = reader.read_range(0..total, schema, None).await?;
+
+        Self::new(
+            codebook,
+            batch,
+            pq_matadata.num_bits,
+            pq_matadata.num_sub_vectors,
+            pq_matadata.dimension,
+        )
     }
 
     #[allow(dead_code)]
@@ -290,7 +336,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_ids)]).unwrap();
 
-        let storage = ProductQuantizationStorage::new(pq.clone(), &batch, "vectors")
+        let storage = ProductQuantizationStorage::build(pq.clone(), &batch, "vectors")
             .await
             .unwrap();
         assert_eq!(storage.len(), TOTAL);
