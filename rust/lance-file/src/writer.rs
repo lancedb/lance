@@ -212,6 +212,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         self.schema
             .metadata
             .extend(metadata.iter().map(|(k, y)| (k.clone(), y.clone())));
+        println!("WRite schemA: {:?}", self.schema.metadata);
         self.finish().await
     }
 

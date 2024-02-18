@@ -19,9 +19,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 
-use lance_arrow::FloatToArrayType;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{Cosine, DistanceFunc, Dot, MetricType, L2};
+use lance_linalg::distance::MetricType;
 use num_traits::{AsPrimitive, Float, PrimInt};
 use snafu::{location, Location};
 
@@ -130,10 +129,9 @@ pub trait Graph<V: VectorStorage<T>, K: PrimInt = u32, T: Float = f32> {
 /// ----------------
 /// I : Vertex Index type
 /// V : the data type of vector, i.e., ``f32`` or ``f16``.
-struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType, V: VectorStorage<T>> {
+struct InMemoryGraph<I: PrimInt + Hash, V: VectorStorage<f32>> {
     pub nodes: HashMap<I, GraphNode<I>>,
     vectors: Arc<V>,
-    dist_fn: Box<DistanceFunc<T>>,
 }
 
 /// Beam search over a graph
@@ -199,10 +197,8 @@ pub(super) fn beam_search<V: VectorStorage<f32> + 'static>(
     Ok(results)
 }
 
-impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType, V: VectorStorage<T>>
-    Graph<V, I, T> for InMemoryGraph<I, T, V>
-where
-    T::ArrowType: L2 + Cosine + Dot,
+impl<I: PrimInt + Hash + AsPrimitive<usize>, V: VectorStorage<f32>> Graph<V, I>
+    for InMemoryGraph<I, V>
 {
     fn neighbors(&self, key: I) -> Option<Box<dyn Iterator<Item = I> + '_>> {
         self.nodes
@@ -219,21 +215,13 @@ where
     }
 }
 
-impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType, V: VectorStorage<T>>
-    InMemoryGraph<I, T, V>
-where
-    T::ArrowType: L2 + Cosine + Dot,
-{
+impl<I: PrimInt + Hash + AsPrimitive<usize>, V: VectorStorage<f32>> InMemoryGraph<I, V> {
     fn from_builder(
         nodes: HashMap<I, GraphNode<I>>,
         vectors: Arc<V>,
-        metric_type: MetricType,
+        _metric_type: MetricType,
     ) -> Self {
-        Self {
-            nodes,
-            vectors,
-            dist_fn: metric_type.func::<T>().into(),
-        }
+        Self { nodes, vectors }
     }
 }
 

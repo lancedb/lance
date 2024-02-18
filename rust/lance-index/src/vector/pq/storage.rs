@@ -23,14 +23,17 @@ use arrow_array::{
     types::{Float32Type, UInt64Type, UInt8Type},
     FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
+use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
+    object_store::ObjectStore,
     traits::{WriteExt, Writer},
     utils::read_message,
 };
 use lance_linalg::{distance::MetricType, MatrixView};
-use lance_table::io::manifest::ManifestDescribing;
+use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
+use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
@@ -61,7 +64,7 @@ struct ProductQuantizationMetadata {
 ///
 /// It is possible to store additonal metadata to accelerate filtering later.
 ///
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ProductQuantizationStorage {
     codebook: Arc<Float32Array>,
     batch: RecordBatch,
@@ -76,6 +79,18 @@ pub struct ProductQuantizationStorage {
     row_ids: Arc<UInt64Array>,
 }
 
+impl PartialEq for ProductQuantizationStorage {
+    fn eq(&self, other: &Self) -> bool {
+        self.codebook.eq(&other.codebook)
+            && self.num_bits.eq(&other.num_bits)
+            && self.num_sub_vectors.eq(&other.num_sub_vectors)
+            && self.dimension.eq(&other.dimension)
+            // Ignore the schema because they might have different metadata.
+            && self.batch.columns().eq(other.batch.columns())
+    }
+}
+
+#[allow(dead_code)]
 impl ProductQuantizationStorage {
     pub fn new(
         codebook: Arc<Float32Array>,
@@ -136,6 +151,16 @@ impl ProductQuantizationStorage {
         })
     }
 
+    /// Build a PQ storage from ProductQuantizer and a RecordBatch.
+    ///
+    /// Parameters
+    /// ----------
+    /// quantizer: ProductQuantizer
+    ///    The quantizer used to transform the vectors.
+    /// batch: RecordBatch
+    ///   The batch of vectors to be transformed.
+    /// vector_col: &str
+    ///   The name of the column containing the vectors.
     pub async fn build(
         quantizer: Arc<ProductQuantizerImpl<Float32Type>>,
         batch: &RecordBatch,
@@ -151,8 +176,10 @@ impl ProductQuantizationStorage {
         Self::new(codebook, batch, num_bits, num_sub_vectors, dimension)
     }
 
-    pub async fn load(reader: &FileReader) -> Result<Self> {
+    pub async fn load(object_store: &ObjectStore, path: &Path) -> Result<Self> {
+        let reader = FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
+        println!("schema: {:?}", ArrowSchema::from(schema));
         let metadata = schema.metadata.get(PQ_METADTA_KEY).ok_or(Error::Index {
             message: format!(
                 "Reading PQ storage: metadata key {} not found",
@@ -161,7 +188,7 @@ impl ProductQuantizationStorage {
             location: location!(),
         })?;
         let pq_matadata: ProductQuantizationMetadata =
-            serde_json::from_str(metadata).map_err(|e| Error::Index {
+            serde_json::from_str(metadata).map_err(|_| Error::Index {
                 message: format!("Failed to parse PQ metadata: {}", metadata),
                 location: location!(),
             })?;
@@ -182,6 +209,10 @@ impl ProductQuantizationStorage {
             pq_matadata.num_sub_vectors,
             pq_matadata.dimension,
         )
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        self.batch.schema()
     }
 
     #[allow(dead_code)]
@@ -208,7 +239,7 @@ impl ProductQuantizationStorage {
             dimension: self.dimension,
         };
 
-        let batch_size: usize = 1024; // TODO: make it configurable
+        let batch_size: usize = 102400; // TODO: make it configurable
         for i in (0..self.batch.num_rows()).step_by(batch_size) {
             let offset = i * batch_size;
             let length = min(batch_size, self.batch.num_rows() - offset);
@@ -300,15 +331,15 @@ mod tests {
     use super::*;
 
     use arrow_array::FixedSizeListArray;
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::ROW_ID_FIELD;
+    use lance_core::{datatypes::Schema, ROW_ID_FIELD};
 
-    #[tokio::test]
-    async fn test_build_pq_storage() {
-        const DIM: usize = 32;
-        const TOTAL: usize = 512;
-        const NUM_SUB_VECTORS: usize = 16;
+    const DIM: usize = 32;
+    const TOTAL: usize = 512;
+    const NUM_SUB_VECTORS: usize = 16;
+
+    async fn create_pq_storage() -> ProductQuantizationStorage {
         let codebook = Arc::new(Float32Array::from_iter_values(
             (0..256 * DIM).map(|v| v as f32),
         ));
@@ -316,10 +347,11 @@ mod tests {
             NUM_SUB_VECTORS,
             8,
             DIM,
-            codebook.clone(),
+            codebook,
             MetricType::L2,
         ));
-        let schema = Schema::new(vec![
+
+        let schema = ArrowSchema::new(vec![
             Field::new(
                 "vectors",
                 DataType::FixedSizeList(
@@ -336,13 +368,43 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_ids)]).unwrap();
 
-        let storage = ProductQuantizationStorage::build(pq.clone(), &batch, "vectors")
+        ProductQuantizationStorage::build(pq.clone(), &batch, "vectors")
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_build_pq_storage() {
+        let storage = create_pq_storage().await;
         assert_eq!(storage.len(), TOTAL);
         assert_eq!(storage.num_sub_vectors, NUM_SUB_VECTORS);
         assert_eq!(storage.codebook.len(), 256 * DIM);
         assert_eq!(storage.pq_code.len(), TOTAL * NUM_SUB_VECTORS);
         assert_eq!(storage.row_ids.len(), TOTAL);
+    }
+
+    #[tokio::test]
+    async fn test_read_write_pq_storage() {
+        let storage = create_pq_storage().await;
+
+        let store = ObjectStore::memory();
+        let path = Path::from("pq_storage");
+        let schema = Schema::try_from(storage.schema().as_ref()).unwrap();
+        let mut file_writer = FileWriter::<ManifestDescribing>::try_new(
+            &store,
+            &path,
+            schema.clone(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        storage.write(&mut file_writer).await.unwrap();
+
+        let storage2 = ProductQuantizationStorage::load(&store, &path)
+            .await
+            .unwrap();
+
+        assert_eq!(storage, storage2);
     }
 }

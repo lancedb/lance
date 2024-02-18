@@ -249,7 +249,6 @@ impl FileReader {
     }
 
     /// Open one Lance data file for read.
-    // TODO: make this crate(pub) once the migration to lance-core is done.
     pub async fn try_new(object_store: &ObjectStore, path: &Path, schema: Schema) -> Result<Self> {
         Self::try_new_with_fragment_id(object_store, path, schema, 0, 0, None).await
     }
