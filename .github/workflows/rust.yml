@@ -63,6 +63,10 @@ jobs:
         if: ${{ matrix.toolchain == 'stable' }}
         run: |
           cargo test --features dynamodb,tensorflow,dynamodb_tests,cli
+      - name: Run tests (nightly)
+        if: ${{ matrix.toolchain != 'stable' }}
+        run: |
+          cargo test
       - name: Build benchmarks
         if: ${{ matrix.toolchain == 'stable' }}
         run: cargo build --benches
