@@ -20,11 +20,11 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use lance_core::{Error, Result};
-use lance_linalg::distance::MetricType;
-use num_traits::{AsPrimitive, Float, PrimInt};
+use num_traits::{AsPrimitive, PrimInt};
 use snafu::{location, Location};
 
 pub(crate) mod builder;
+mod memory;
 pub(super) mod storage;
 
 use storage::VectorStorage;
@@ -47,17 +47,6 @@ impl<I> From<I> for GraphNode<I> {
             neighbors: vec![],
         }
     }
-}
-
-#[async_trait::async_trait]
-pub trait SerializeToLance {
-    /// Serialize the object to one single Lance file.
-    ///
-    /// Parameters
-    /// ----------
-    /// path : str
-    ///
-    async fn to_lance(&self, path: &str) -> Result<()>;
 }
 
 /// A wrapper for f32 to make it ordered, so that we can put it into
@@ -107,7 +96,7 @@ pub trait DistanceCalculator {
 /// ---------------
 /// K: Vertex Index type
 /// T: the data type of vector, i.e., ``f32`` or ``f16``.
-pub trait Graph<V: VectorStorage<T>, K: PrimInt = u32, T: Float = f32> {
+pub trait Graph<K: PrimInt = u32> {
     /// Get the number of nodes in the graph.
     fn len(&self) -> usize;
 
@@ -120,7 +109,7 @@ pub trait Graph<V: VectorStorage<T>, K: PrimInt = u32, T: Float = f32> {
     fn neighbors(&self, key: K) -> Option<Box<dyn Iterator<Item = K> + '_>>;
 
     /// Access to underline storage
-    fn storage(&self) -> &Arc<V>;
+    fn storage(&self) -> Arc<dyn VectorStorage>;
 }
 
 /// Serializable Graph.
@@ -129,9 +118,9 @@ pub trait Graph<V: VectorStorage<T>, K: PrimInt = u32, T: Float = f32> {
 /// ----------------
 /// I : Vertex Index type
 /// V : the data type of vector, i.e., ``f32`` or ``f16``.
-struct InMemoryGraph<I: PrimInt + Hash, V: VectorStorage<f32>> {
+struct InMemoryGraph<I: PrimInt + Hash> {
     pub nodes: HashMap<I, GraphNode<I>>,
-    vectors: Arc<V>,
+    vectors: Arc<dyn VectorStorage>,
 }
 
 /// Beam search over a graph
@@ -151,14 +140,14 @@ struct InMemoryGraph<I: PrimInt + Hash, V: VectorStorage<f32>> {
 /// -------
 /// A sorted list of ``(dist, node_id)`` pairs.
 ///
-pub(super) fn beam_search<V: VectorStorage<f32> + 'static>(
-    graph: &dyn Graph<V>,
+pub(super) fn beam_search(
+    graph: &dyn Graph,
     start: &[u32],
     query: &[f32],
     k: usize,
 ) -> Result<BTreeMap<OrderedFloat, u32>> {
     let mut visited: HashSet<_> = start.iter().copied().collect();
-    let dist_calc = graph.storage().dist_calculator(query, MetricType::L2);
+    let dist_calc = graph.storage().dist_calculator(query);
     let mut candidates: BTreeMap<OrderedFloat, _> = dist_calc
         .distance(start)
         .iter()
@@ -197,9 +186,7 @@ pub(super) fn beam_search<V: VectorStorage<f32> + 'static>(
     Ok(results)
 }
 
-impl<I: PrimInt + Hash + AsPrimitive<usize>, V: VectorStorage<f32>> Graph<V, I>
-    for InMemoryGraph<I, V>
-{
+impl<I: PrimInt + Hash + AsPrimitive<usize>> Graph<I> for InMemoryGraph<I> {
     fn neighbors(&self, key: I) -> Option<Box<dyn Iterator<Item = I> + '_>> {
         self.nodes
             .get(&key)
@@ -210,17 +197,13 @@ impl<I: PrimInt + Hash + AsPrimitive<usize>, V: VectorStorage<f32>> Graph<V, I>
         self.nodes.len()
     }
 
-    fn storage(&self) -> &Arc<V> {
-        &self.vectors
+    fn storage(&self) -> Arc<dyn VectorStorage> {
+        self.vectors.clone()
     }
 }
 
-impl<I: PrimInt + Hash + AsPrimitive<usize>, V: VectorStorage<f32>> InMemoryGraph<I, V> {
-    fn from_builder(
-        nodes: HashMap<I, GraphNode<I>>,
-        vectors: Arc<V>,
-        _metric_type: MetricType,
-    ) -> Self {
+impl<I: PrimInt + Hash + AsPrimitive<usize>> InMemoryGraph<I> {
+    fn from_builder(nodes: HashMap<I, GraphNode<I>>, vectors: Arc<dyn VectorStorage>) -> Self {
         Self { nodes, vectors }
     }
 }

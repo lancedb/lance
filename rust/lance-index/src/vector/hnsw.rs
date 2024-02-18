@@ -23,7 +23,6 @@ use std::{collections::BTreeMap, fmt::Debug};
 use lance_core::Result;
 use lance_linalg::distance::MetricType;
 
-use super::graph::storage::VectorStorage;
 use super::graph::{Graph, OrderedFloat};
 use crate::vector::graph::beam_search;
 pub mod builder;
@@ -31,14 +30,14 @@ pub use builder::HNSWBuilder;
 
 /// HNSW graph.
 ///
-pub struct HNSW<V: VectorStorage<f32>> {
-    layers: Vec<Arc<dyn Graph<V>>>,
+pub struct HNSW {
+    layers: Vec<Arc<dyn Graph>>,
     metric_type: MetricType,
     /// Entry point of the graph.
     entry_point: u32,
 }
 
-impl<V: VectorStorage<f32>> Debug for HNSW<V> {
+impl Debug for HNSW {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -49,9 +48,9 @@ impl<V: VectorStorage<f32>> Debug for HNSW<V> {
     }
 }
 
-impl<V: VectorStorage<f32> + 'static> HNSW<V> {
+impl HNSW {
     fn from_builder(
-        layers: Vec<Arc<dyn Graph<V>>>,
+        layers: Vec<Arc<dyn Graph>>,
         entry_point: u32,
         metric_type: MetricType,
     ) -> Self {
@@ -103,6 +102,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::super::graph::OrderedFloat;
+    use crate::vector::graph::memory::InMemoryVectorStorage;
     use arrow_array::types::Float32Type;
     use lance_linalg::matrix::MatrixView;
     use lance_testing::datagen::generate_random_array;
@@ -143,10 +143,11 @@ mod tests {
         const MAX_EDGES: usize = 32;
         let data = generate_random_array(TOTAL * DIM);
         let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
-        let hnsw = HNSWBuilder::new(mat.clone())
+        let store = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
+        let hnsw = HNSWBuilder::new(mat.clone(), MetricType::L2)
             .max_num_edges(MAX_EDGES)
             .ef_construction(50)
-            .build(mat.clone())
+            .build(store.clone())
             .unwrap();
         assert!(hnsw.layers.len() > 1);
         assert_eq!(hnsw.layers[0].len(), TOTAL);
@@ -188,10 +189,13 @@ mod tests {
         let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
         let q = mat.row(0).unwrap();
 
-        let hnsw = HNSWBuilder::new(mat.clone())
+        let hnsw = HNSWBuilder::new(mat.clone(), MetricType::L2)
             .max_num_edges(MAX_EDGES)
             .ef_construction(100)
-            .build(mat.clone())
+            .build(Arc::new(InMemoryVectorStorage::new(
+                mat.clone(),
+                MetricType::L2,
+            )))
             .unwrap();
 
         let results: HashSet<u32> = hnsw

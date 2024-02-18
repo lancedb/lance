@@ -46,6 +46,7 @@ use crate::{
         transform::Transformer,
         PQ_CODE_COLUMN,
     },
+    IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
 };
 
 const PQ_METADTA_KEY: &str = "lance:pq";
@@ -74,6 +75,7 @@ pub struct ProductQuantizationStorage {
     num_bits: u32,
     num_sub_vectors: usize,
     dimension: usize,
+    metric_type: MetricType,
 
     // For easy access
     pq_code: Arc<UInt8Array>,
@@ -82,7 +84,8 @@ pub struct ProductQuantizationStorage {
 
 impl PartialEq for ProductQuantizationStorage {
     fn eq(&self, other: &Self) -> bool {
-        self.codebook.eq(&other.codebook)
+        self.metric_type.eq(&other.metric_type)
+            &&        self.codebook.eq(&other.codebook)
             && self.num_bits.eq(&other.num_bits)
             && self.num_sub_vectors.eq(&other.num_sub_vectors)
             && self.dimension.eq(&other.dimension)
@@ -99,6 +102,7 @@ impl ProductQuantizationStorage {
         num_bits: u32,
         num_sub_vectors: usize,
         dimension: usize,
+        metric_type: MetricType,
     ) -> Result<Self> {
         let Some(row_ids) = batch.column_by_name(ROW_ID) else {
             return Err(Error::Index {
@@ -149,6 +153,7 @@ impl ProductQuantizationStorage {
             num_sub_vectors,
             num_bits,
             dimension,
+            metric_type,
         })
     }
 
@@ -171,19 +176,56 @@ impl ProductQuantizationStorage {
         let num_bits = quantizer.num_bits;
         let dimension = quantizer.dimension;
         let num_sub_vectors = quantizer.num_sub_vectors;
+        let metric_type = quantizer.metric_type;
         let transform = PQTransformer::new(quantizer, vector_col, PQ_CODE_COLUMN);
         let batch = transform.transform(batch).await?;
 
-        Self::new(codebook, batch, num_bits, num_sub_vectors, dimension)
+        Self::new(
+            codebook,
+            batch,
+            num_bits,
+            num_sub_vectors,
+            dimension,
+            metric_type,
+        )
     }
 
     /// Load full PQ storage from disk.
+    ///
+    /// Parameters
+    /// ----------
+    /// object_store: &ObjectStore
+    ///   The object store to load the storage from.
+    /// path: &Path
+    ///  The path to the storage.
+    ///
+    /// Returns
+    /// --------
+    /// Self
     ///
     /// Currently it loads everything in memory.
     /// TODO: support lazy loading later.
     pub async fn load(object_store: &ObjectStore, path: &Path) -> Result<Self> {
         let reader = FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
+
+        let metadata_str = schema
+            .metadata
+            .get(INDEX_METADATA_SCHEMA_KEY)
+            .ok_or(Error::Index {
+                message: format!(
+                    "Reading PQ storage: index key {} not found",
+                    INDEX_METADATA_SCHEMA_KEY
+                ),
+                location: location!(),
+            })?;
+        let index_metadata: IndexMetadata =
+            serde_json::from_str(metadata_str).map_err(|_| Error::Index {
+                message: format!("Failed to parse index metadata: {}", metadata_str),
+                location: location!(),
+            })?;
+        let metric_type: MetricType = MetricType::try_from(index_metadata.metric_type.as_str())?;
+
         let metadata = schema.metadata.get(PQ_METADTA_KEY).ok_or(Error::Index {
             message: format!(
                 "Reading PQ storage: metadata key {} not found",
@@ -212,6 +254,7 @@ impl ProductQuantizationStorage {
             pq_matadata.num_bits,
             pq_matadata.num_sub_vectors,
             pq_matadata.dimension,
+            metric_type,
         )
     }
 
@@ -261,19 +304,23 @@ impl ProductQuantizationStorage {
     }
 }
 
-impl VectorStorage<f32> for ProductQuantizationStorage {
+impl VectorStorage for ProductQuantizationStorage {
     fn len(&self) -> usize {
         self.batch.num_rows()
     }
 
-    fn dist_calculator(&self, query: &[f32], metric_type: MetricType) -> Box<dyn DistCalculator> {
+    fn metric_type(&self) -> MetricType {
+        self.metric_type
+    }
+
+    fn dist_calculator(&self, query: &[f32]) -> Box<dyn DistCalculator> {
         Box::new(PQDistCalculator::new(
             self.codebook.values(),
             self.num_bits,
             self.num_sub_vectors,
             self.pq_code.clone(),
             query,
-            metric_type,
+            MetricType::L2,
         ))
     }
 }

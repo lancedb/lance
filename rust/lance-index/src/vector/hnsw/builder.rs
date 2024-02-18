@@ -16,13 +16,13 @@ use std::cmp::min;
 use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
+use lance_core::Result;
 use lance_linalg::{distance::MetricType, MatrixView};
 use rand::{thread_rng, Rng};
 
-use super::super::graph::beam_search;
+use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
 use super::{select_neighbors, HNSW};
 use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage, Graph};
-use lance_core::Result;
 
 /// Build a HNSW graph.
 ///
@@ -44,7 +44,7 @@ pub struct HNSWBuilder {
     metric_type: MetricType,
 
     /// Vector storage for the graph.
-    vectors: Arc<MatrixView<Float32Type>>,
+    vectors: Arc<InMemoryVectorStorage>,
 
     levels: Vec<GraphBuilder>,
 
@@ -52,23 +52,18 @@ pub struct HNSWBuilder {
 }
 
 impl HNSWBuilder {
-    pub fn new(vectors: Arc<MatrixView<Float32Type>>) -> Self {
+    pub fn new(vectors: Arc<MatrixView<Float32Type>>, metric_type: MetricType) -> Self {
+        let vectors = Arc::new(InMemoryVectorStorage::new(vectors, metric_type));
         Self {
             max_level: 8,
             m_max: 32,
             ef_construction: 100,
-            metric_type: MetricType::L2,
+            metric_type,
             vectors,
             levels: vec![],
             entry_point: 0,
             m_level_decay: 1.0 / 8_f32.ln(),
         }
-    }
-
-    /// Metric type
-    pub fn metric_type(mut self, metric_type: MetricType) -> Self {
-        self.metric_type = metric_type;
-        self
     }
 
     /// The maximum level of the graph.
@@ -105,7 +100,7 @@ impl HNSWBuilder {
 
     /// Insert one node.
     fn insert(&mut self, node: u32) -> Result<()> {
-        let vector = self.vectors.row(node as usize).unwrap();
+        let vector = self.vectors.vector(node);
         let level = self.random_level();
 
         let levels_to_search = if self.levels.len() > level as usize {
@@ -148,7 +143,7 @@ impl HNSWBuilder {
         Ok(())
     }
 
-    pub fn build<V: VectorStorage<f32> + 'static>(&mut self, storage: Arc<V>) -> Result<HNSW<V>> {
+    pub fn build(&mut self, storage: Arc<dyn VectorStorage>) -> Result<HNSW> {
         log::info!(
             "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
             self.metric_type,
@@ -157,7 +152,7 @@ impl HNSWBuilder {
             self.ef_construction
         );
         for _ in 0..self.max_level {
-            let mut level = GraphBuilder::new(self.vectors.clone()).metric_type(self.metric_type);
+            let mut level = GraphBuilder::new(self.vectors.clone());
             level.insert(0);
             self.levels.push(level);
         }
@@ -170,7 +165,7 @@ impl HNSWBuilder {
             .levels
             .iter()
             .map(|l| l.build(storage.clone()).into())
-            .collect::<Vec<Arc<dyn Graph<V>>>>();
+            .collect::<Vec<Arc<dyn Graph>>>();
         Ok(HNSW::from_builder(
             graphs,
             self.entry_point,

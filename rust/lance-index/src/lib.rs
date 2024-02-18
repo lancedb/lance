@@ -21,6 +21,7 @@ use std::{any::Any, sync::Arc};
 use async_trait::async_trait;
 use lance_core::Result;
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 
 pub mod optimize;
 pub mod scalar;
@@ -29,6 +30,7 @@ pub mod vector;
 pub use crate::traits::*;
 
 pub const INDEX_FILE_NAME: &str = "index.idx";
+const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 
 pub mod pb {
     #![allow(clippy::use_self)]
@@ -79,4 +81,11 @@ impl std::fmt::Display for IndexType {
 
 pub trait IndexParams: Send + Sync {
     fn as_any(&self) -> &dyn Any;
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub(crate) struct IndexMetadata {
+    #[serde(rename = "type")]
+    pub index_type: String,
+    pub metric_type: String,
 }

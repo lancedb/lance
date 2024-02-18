@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
-use lance_index::vector::hnsw::HNSWBuilder;
+use lance_index::vector::{graph::memory::InMemoryVectorStorage, hnsw::HNSWBuilder};
 use lance_linalg::MatrixView;
 use lance_testing::datagen::generate_random_array_with_seed;
 
@@ -42,6 +42,7 @@ fn main() {
 
     let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
     let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIMENSION));
+    let vector_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
 
     let q = mat.row(0).unwrap();
     let k = 10;
