@@ -46,7 +46,7 @@ jobs:
         workspaces: python
     - name: Install linting tools
       run: |
-        pip install ruff maturin tensorflow tqdm
+        pip install ruff==0.2.2 maturin tensorflow tqdm
         pip install torch --index-url https://download.pytorch.org/whl/cpu
     - name: Lint Python
       run: |
