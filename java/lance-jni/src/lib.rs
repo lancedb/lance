@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use crate::blocking_dataset::BlockingDataset;
+use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use jni::objects::{JObject, JString};
-use jni::JNIEnv;
 use jni::sys::{jint, jlong};
+use jni::JNIEnv;
 use snafu::{location, Location};
 
 use lance::dataset::{WriteMode, WriteParams};
@@ -40,32 +40,45 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFFIStream<'local>
         Err(_) => return JObject::null(),
     };
 
-    let write_params = match extract_write_params(&mut env,
-        &max_rows_per_file, &max_rows_per_group, &max_bytes_per_file, &mode) {
+    let write_params = match extract_write_params(
+        &mut env,
+        &max_rows_per_file,
+        &max_rows_per_group,
+        &max_bytes_per_file,
+        &mode,
+    ) {
         Ok(value) => value,
         Err(_) => return JObject::null(),
     };
 
     unsafe {
-        match ArrowArrayStreamReader::from_raw(arrow_array_stream_addr as *mut FFI_ArrowArrayStream) {
-            Ok(reader) => {
-                match BlockingDataset::write(reader, &path_str, Some(write_params)) {
-                    Ok(dataset) => attach_native_dataset(&mut env, dataset),
-                    Err(err) => {
-                        throw_java_exception(&mut env, format!("Failed to write from arrow array stream: {}", err).as_str());
-                        JObject::null()
-                    }
+        match ArrowArrayStreamReader::from_raw(arrow_array_stream_addr as *mut FFI_ArrowArrayStream)
+        {
+            Ok(reader) => match BlockingDataset::write(reader, &path_str, Some(write_params)) {
+                Ok(dataset) => attach_native_dataset(&mut env, dataset),
+                Err(err) => {
+                    throw_java_exception(
+                        &mut env,
+                        format!("Failed to write from arrow array stream: {}", err).as_str(),
+                    );
+                    JObject::null()
                 }
             },
             Err(err) => {
-                throw_java_exception(&mut env, &format!("Failed to extract arrow array stream: {}", err));
+                throw_java_exception(
+                    &mut env,
+                    &format!("Failed to extract arrow array stream: {}", err),
+                );
                 JObject::null()
             }
         }
     }
 }
 
-fn attach_native_dataset<'local>(env: &mut JNIEnv<'local>, dataset: BlockingDataset) -> JObject<'local> {
+fn attach_native_dataset<'local>(
+    env: &mut JNIEnv<'local>,
+    dataset: BlockingDataset,
+) -> JObject<'local> {
     let j_dataset = create_java_dataset_object(env);
     // This block sets a native Rust object (dataset) as a field in the Java object (j_dataset).
     // Caution: This creates a potential for memory leaks. The Rust object (dataset) is not
@@ -84,7 +97,7 @@ fn attach_native_dataset<'local>(env: &mut JNIEnv<'local>, dataset: BlockingData
                     "java/lang/RuntimeException",
                     format!("Failed to set native handle: {}", err),
                 )
-                    .expect("Error throwing exception");
+                .expect("Error throwing exception");
                 JObject::null()
             }
         }
@@ -92,15 +105,12 @@ fn attach_native_dataset<'local>(env: &mut JNIEnv<'local>, dataset: BlockingData
 }
 
 fn throw_java_exception(env: &mut JNIEnv, err_msg: &str) {
-    env.throw_new(
-        "java/lang/RuntimeException",
-        err_msg
-    ).expect("Error throwing exception");
+    env.throw_new("java/lang/RuntimeException", err_msg)
+        .expect("Error throwing exception");
 }
 
 fn create_java_dataset_object<'a>(env: &mut JNIEnv<'a>) -> JObject<'a> {
-    env
-        .new_object("com/lancedb/lance/Dataset", "()V", &[])
+    env.new_object("com/lancedb/lance/Dataset", "()V", &[])
         .expect("Failed to create Java Dataset instance")
 }
 
@@ -133,16 +143,14 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_countRows(
     mut env: JNIEnv,
     java_dataset: JObject,
 ) -> jint {
-    let dataset_guard = unsafe {
-        env.get_rust_field::<_, _, BlockingDataset>(java_dataset, "nativeDatasetHandle")
-    };
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, "nativeDatasetHandle") };
     match dataset_guard {
-        Ok(dataset) =>
-            dataset.count_rows()
-                .expect("Faild to get the row count from dataset's metadata.") as jint,
-        Err(_) => {
-            -1
-        }
+        Ok(dataset) => dataset
+            .count_rows()
+            .expect("Faild to get the row count from dataset's metadata.")
+            as jint,
+        Err(_) => -1,
     }
 }
 
@@ -154,14 +162,16 @@ fn extract_path_str(env: &mut JNIEnv, path: &JString) -> Result<String, Error> {
                 "java/lang/IllegalArgumentException",
                 format!("Invalid path string: {}", err),
             )
-                .expect("Error throwing exception");
-            Err(Error::InvalidTableLocation { message: format!("Invalid path string: {}", err)})
+            .expect("Error throwing exception");
+            Err(Error::InvalidTableLocation {
+                message: format!("Invalid path string: {}", err),
+            })
         }
     }
 }
 
-fn extract_write_params<'a>(
-    env: &mut JNIEnv<'a>,
+fn extract_write_params(
+    env: &mut JNIEnv,
     max_rows_per_file: &jint,
     max_rows_per_group: &jint,
     max_bytes_per_file: &jlong,
@@ -174,8 +184,11 @@ fn extract_write_params<'a>(
                 "java/lang/IllegalArgumentException",
                 format!("Invalid mode string: {}", err),
             )
-                .expect("Error throwing exception");
-            Err(Error::InvalidInput { source: "Invalid mode string".into(), location: location!() })
+            .expect("Error throwing exception");
+            Err(Error::InvalidInput {
+                source: "Invalid mode string".into(),
+                location: location!(),
+            })
         }
     }?;
 
@@ -186,11 +199,14 @@ fn extract_write_params<'a>(
         _ => {
             env.throw_new(
                 "java/lang/IllegalArgumentException",
-                format!("Unsupported write mode provided: {}", mode_str)
+                format!("Unsupported write mode provided: {}", mode_str),
             )
-                .expect("Error throwing exception");
-            return Err(Error::InvalidInput { source: "Invalid mode string".into(), location: location!() });
-        },
+            .expect("Error throwing exception");
+            return Err(Error::InvalidInput {
+                source: "Invalid mode string".into(),
+                location: location!(),
+            });
+        }
     };
 
     Ok(WriteParams {

@@ -33,6 +33,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: java/java-jni
+      - name: Lint Rust
+        run: |
+          cargo fmt --check
+          cargo clippy --all-features --tests -- -D warnings
+        working-directory: ./java/lance-jni
       - name: Install dependencies
         run: |
           sudo apt update
