@@ -64,6 +64,7 @@ struct ProductQuantizationMetadata {
 ///
 /// It is possible to store additonal metadata to accelerate filtering later.
 ///
+/// TODO: support f16/f64 later.
 #[derive(Clone, Debug)]
 pub struct ProductQuantizationStorage {
     codebook: Arc<Float32Array>,
@@ -179,7 +180,6 @@ impl ProductQuantizationStorage {
     pub async fn load(object_store: &ObjectStore, path: &Path) -> Result<Self> {
         let reader = FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
-        println!("schema: {:?}", ArrowSchema::from(schema));
         let metadata = schema.metadata.get(PQ_METADTA_KEY).ok_or(Error::Index {
             message: format!(
                 "Reading PQ storage: metadata key {} not found",
@@ -239,7 +239,7 @@ impl ProductQuantizationStorage {
             dimension: self.dimension,
         };
 
-        let batch_size: usize = 102400; // TODO: make it configurable
+        let batch_size: usize = 10240; // TODO: make it configurable
         for i in (0..self.batch.num_rows()).step_by(batch_size) {
             let offset = i * batch_size;
             let length = min(batch_size, self.batch.num_rows() - offset);
