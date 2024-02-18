@@ -22,8 +22,6 @@ pub mod diskann;
 #[allow(dead_code)]
 mod graph;
 pub mod ivf;
-#[cfg(feature = "opq")]
-pub mod opq;
 pub mod pq;
 mod traits;
 mod utils;
@@ -43,8 +41,6 @@ use self::{
 };
 
 use super::{pb, DatasetIndexInternalExt, IndexParams};
-#[cfg(feature = "opq")]
-use crate::index::vector::opq::{OPQIndex, OptimizedProductQuantizer};
 use crate::{
     dataset::Dataset,
     index::{
