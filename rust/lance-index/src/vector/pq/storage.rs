@@ -16,25 +16,41 @@
 //!
 //! Used as storage backend for Graph based algorithms.
 
-use std::sync::Arc;
+use std::{cmp::min, collections::HashMap, sync::Arc};
 
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt64Type, UInt8Type},
     Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
-use arrow_schema::SchemaRef;
 use lance_core::{Error, Result, ROW_ID};
-use lance_linalg::distance::MetricType;
+use lance_file::writer::FileWriter;
+use lance_io::traits::{WriteExt, Writer};
+use lance_linalg::{distance::MetricType, MatrixView};
+use lance_table::io::manifest::ManifestDescribing;
+use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
 use super::{distance::build_distance_table_l2, num_centroids, ProductQuantizerImpl};
-use crate::vector::{
-    graph::storage::{DistCalculator, VectorStorage},
-    pq::transform::PQTransformer,
-    transform::Transformer,
-    PQ_CODE_COLUMN,
+use crate::{
+    pb,
+    vector::{
+        graph::storage::{DistCalculator, VectorStorage},
+        pq::transform::PQTransformer,
+        transform::Transformer,
+        PQ_CODE_COLUMN,
+    },
 };
+
+const PQ_METADTA_KEY: &str = "lance:pq";
+
+#[derive(Serialize, Deserialize)]
+struct ProductQuantizationMetadata {
+    codebook_position: usize,
+    num_bits: u32,
+    num_sub_vectors: usize,
+    dimension: usize,
+}
 
 /// Product Quantization Storage
 ///
@@ -122,14 +138,45 @@ impl ProductQuantizationStorage {
         })
     }
 
-    pub fn schema(&self) -> SchemaRef {
-        self.batch.schema()
-    }
-
+    #[allow(dead_code)]
     pub fn get_row_ids(&self, ids: &[u32]) -> Vec<u64> {
         ids.iter()
             .map(|&id| self.row_ids.value(id as usize))
             .collect()
+    }
+
+    /// Write the PQ storage to disk.
+    pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
+        let pos = writer.object_writer.tell().await?;
+        let mat = MatrixView::<Float32Type>::new(self.codebook.clone(), self.dimension);
+        let codebook_tensor = pb::Tensor::from(&mat);
+        writer
+            .object_writer
+            .write_protobuf(&codebook_tensor)
+            .await?;
+
+        let metadata = ProductQuantizationMetadata {
+            codebook_position: pos,
+            num_bits: self.num_bits,
+            num_sub_vectors: self.num_sub_vectors,
+            dimension: self.dimension,
+        };
+
+        let batch_size: usize = 1024; // TODO: make it configurable
+        for i in (0..self.batch.num_rows()).step_by(batch_size) {
+            let offset = i * batch_size;
+            let length = min(batch_size, self.batch.num_rows() - offset);
+            let slice = self.batch.slice(offset, length);
+            writer.write(&[slice]).await?;
+        }
+
+        let mut schema_metadata = HashMap::new();
+        schema_metadata.insert(
+            PQ_METADTA_KEY.to_string(),
+            serde_json::to_string(&metadata)?,
+        );
+        writer.finish_with_metadata(&schema_metadata).await?;
+        Ok(())
     }
 }
 
