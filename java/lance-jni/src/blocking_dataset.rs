@@ -24,14 +24,16 @@ pub struct BlockingDataset {
 }
 
 impl BlockingDataset {
-    pub fn write(reader: impl RecordBatchReader + Send + 'static, uri: &str, params: Option<WriteParams>) -> Result<Self> {
+    pub fn write(
+        reader: impl RecordBatchReader + Send + 'static,
+        uri: &str,
+        params: Option<WriteParams>,
+    ) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
 
-        let inner = rt.block_on(
-            Dataset::write(reader, uri, params)
-        )?;
+        let inner = rt.block_on(Dataset::write(reader, uri, params))?;
         Ok(BlockingDataset { inner, rt })
     }
     pub fn open(uri: &str) -> Result<Self> {

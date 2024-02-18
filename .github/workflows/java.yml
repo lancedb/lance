@@ -33,6 +33,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: java/java-jni
+      - name: Run cargo fmt
+        run: cargo fmt --check
+        working-directory: ./java/lance-jni
       - name: Install dependencies
         run: |
           sudo apt update
