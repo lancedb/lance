@@ -25,9 +25,7 @@ use lance_linalg::distance::MetricType;
 
 use super::graph::{Graph, OrderedFloat};
 use crate::vector::graph::beam_search;
-
 pub mod builder;
-
 pub use builder::HNSWBuilder;
 
 /// HNSW graph.
@@ -104,6 +102,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::super::graph::OrderedFloat;
+    use crate::vector::graph::memory::InMemoryVectorStorage;
     use arrow_array::types::Float32Type;
     use lance_linalg::matrix::MatrixView;
     use lance_testing::datagen::generate_random_array;
@@ -143,8 +142,9 @@ mod tests {
         const TOTAL: usize = 2048;
         const MAX_EDGES: usize = 32;
         let data = generate_random_array(TOTAL * DIM);
-        let mat = MatrixView::<Float32Type>::new(data.into(), DIM);
-        let hnsw = HNSWBuilder::new(mat)
+        let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
+        let store = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
+        let hnsw = HNSWBuilder::new(store.clone())
             .max_num_edges(MAX_EDGES)
             .ef_construction(50)
             .build()
@@ -186,10 +186,11 @@ mod tests {
         const K: usize = 10;
 
         let data = generate_random_array(TOTAL * DIM);
-        let mat = MatrixView::<Float32Type>::new(data.into(), DIM);
+        let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
+        let vectors = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
         let q = mat.row(0).unwrap();
 
-        let hnsw = HNSWBuilder::new(mat.clone())
+        let hnsw = HNSWBuilder::new(vectors.clone())
             .max_num_edges(MAX_EDGES)
             .ef_construction(100)
             .build()

@@ -17,10 +17,11 @@
 //! run with `cargo run --release --example hnsw`
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
-use lance_index::vector::hnsw::HNSWBuilder;
-use lance_linalg::MatrixView;
+use lance_index::vector::{graph::memory::InMemoryVectorStorage, hnsw::HNSWBuilder};
+use lance_linalg::{distance::MetricType, MatrixView};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
@@ -40,7 +41,8 @@ fn main() {
     const SEED: [u8; 32] = [42; 32];
 
     let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
-    let mat = MatrixView::<Float32Type>::new(data.into(), DIMENSION);
+    let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIMENSION));
+    let vector_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
 
     let q = mat.row(0).unwrap();
     let k = 10;
@@ -48,7 +50,7 @@ fn main() {
 
     for level in [4, 8, 16, 32] {
         for ef_construction in [50, 100, 200, 400] {
-            let hnsw = HNSWBuilder::new(mat.clone())
+            let hnsw = HNSWBuilder::new(vector_store.clone())
                 .max_level(level)
                 .ef_construction(ef_construction)
                 .build()

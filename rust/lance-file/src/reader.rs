@@ -64,7 +64,7 @@ fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
 /// It reads arrow data from one data file.
 #[derive(Clone)]
 pub struct FileReader {
-    object_reader: Arc<dyn Reader>,
+    pub object_reader: Arc<dyn Reader>,
     metadata: Arc<Metadata>,
     page_table: Arc<PageTable>,
     schema: Schema,
@@ -249,7 +249,6 @@ impl FileReader {
     }
 
     /// Open one Lance data file for read.
-    // TODO: make this crate(pub) once the migration to lance-core is done.
     pub async fn try_new(object_store: &ObjectStore, path: &Path, schema: Schema) -> Result<Self> {
         Self::try_new_with_fragment_id(object_store, path, schema, 0, 0, None).await
     }

@@ -15,18 +15,18 @@
 use std::cmp::min;
 use std::sync::Arc;
 
-use lance_linalg::distance::MetricType;
+use lance_core::Result;
 use rand::{thread_rng, Rng};
 
-use super::super::graph::beam_search;
+use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
 use super::{select_neighbors, HNSW};
 use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage, Graph};
-use lance_core::Result;
 
 /// Build a HNSW graph.
 ///
 /// Currently, the HNSW graph is fully built in memory.
-pub struct HNSWBuilder<V: VectorStorage<f32>> {
+///
+pub struct HNSWBuilder {
     /// max level of
     max_level: u16,
 
@@ -39,35 +39,26 @@ pub struct HNSWBuilder<V: VectorStorage<f32>> {
     /// Size of the dynamic list for the candidates
     ef_construction: usize,
 
-    /// Metric type to compute the distance.
-    metric_type: MetricType,
-
     /// Vector storage for the graph.
-    vectors: V,
+    vectors: Arc<InMemoryVectorStorage>,
 
-    levels: Vec<GraphBuilder<V>>,
+    levels: Vec<GraphBuilder>,
 
     entry_point: u32,
 }
 
-impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
-    pub fn new(vectors: V) -> Self {
+impl HNSWBuilder {
+    /// Create a new [`HNSWBuilder`] with in memory vector storage.
+    pub fn new(vectors: Arc<InMemoryVectorStorage>) -> Self {
         Self {
             max_level: 8,
             m_max: 32,
             ef_construction: 100,
-            metric_type: MetricType::L2,
             vectors,
             levels: vec![],
             entry_point: 0,
             m_level_decay: 1.0 / 8_f32.ln(),
         }
-    }
-
-    /// Metric type
-    pub fn metric_type(mut self, metric_type: MetricType) -> Self {
-        self.metric_type = metric_type;
-        self
     }
 
     /// The maximum level of the graph.
@@ -104,7 +95,7 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
 
     /// Insert one node.
     fn insert(&mut self, node: u32) -> Result<()> {
-        let vector = self.vectors.get(node as usize);
+        let vector = self.vectors.vector(node);
         let level = self.random_level();
 
         let levels_to_search = if self.levels.len() > level as usize {
@@ -147,17 +138,22 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
         Ok(())
     }
 
+    /// Build the graph, with the already provided `VectorStorage` as backing storage for HNSW graph.
     pub fn build(&mut self) -> Result<HNSW> {
+        self.build_with(self.vectors.clone())
+    }
+
+    /// Build the graph, with the provided [`VectorStorage`] as backing storage for HNSW graph.
+    pub fn build_with(&mut self, storage: Arc<dyn VectorStorage>) -> Result<HNSW> {
         log::info!(
             "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
-            self.metric_type,
+            self.vectors.metric_type(),
             self.max_level,
             self.m_max,
             self.ef_construction
         );
         for _ in 0..self.max_level {
-            let mut level =
-                GraphBuilder::<V>::new(self.vectors.clone()).metric_type(self.metric_type);
+            let mut level = GraphBuilder::new(self.vectors.clone());
             level.insert(0);
             self.levels.push(level);
         }
@@ -169,12 +165,12 @@ impl<V: VectorStorage<f32> + 'static> HNSWBuilder<V> {
         let graphs = self
             .levels
             .iter()
-            .map(|l| l.build().into())
+            .map(|l| l.build(storage.clone()).into())
             .collect::<Vec<Arc<dyn Graph>>>();
         Ok(HNSW::from_builder(
             graphs,
             self.entry_point,
-            self.metric_type,
+            self.vectors.metric_type(),
         ))
     }
 }

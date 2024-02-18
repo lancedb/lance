@@ -53,7 +53,7 @@ pub fn num_centroids(num_bits: impl Into<u32>) -> usize {
     2_usize.pow(num_bits.into())
 }
 
-pub(crate) fn get_sub_vector_centroids<T: FloatToArrayType>(
+pub fn get_sub_vector_centroids<T: FloatToArrayType>(
     codebook: &[T],
     dimension: usize,
     num_bits: impl Into<u32>,

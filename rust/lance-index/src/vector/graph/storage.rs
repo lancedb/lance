@@ -12,23 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use lance_arrow::ArrowFloatType;
-use num_traits::Float;
+use lance_linalg::distance::MetricType;
 
-use lance_linalg::MatrixView;
-
-pub trait VectorStorage<T: Float>: Clone {
-    fn len(&self) -> usize;
-
-    fn get(&self, idx: usize) -> &[T];
+pub trait DistCalculator {
+    fn distance(&self, ids: &[u32]) -> Vec<f32>;
 }
 
-impl<T: ArrowFloatType> VectorStorage<T::Native> for MatrixView<T> {
-    fn get(&self, idx: usize) -> &[T::Native] {
-        self.row(idx).unwrap()
-    }
+/// Vector Storage is the abstraction to store the vectors.
+///
+/// It can be in-memory raw vectors or on disk PQ code.
+///
+/// It abstracts away the logic to compute the distance between vectors.
+///
+/// TODO: should we rename this to "VectorDistance"?;
+pub trait VectorStorage {
+    fn len(&self) -> usize;
 
-    fn len(&self) -> usize {
-        self.num_rows()
-    }
+    /// Return the metric type of the vectors.
+    fn metric_type(&self) -> MetricType;
+
+    /// Create a [DistCalculator] to compute the distance between the query.
+    ///
+    /// Using dist calcualtor can be more efficient as it can pre-compute some
+    /// values.
+    fn dist_calculator(&self, query: &[f32]) -> Box<dyn DistCalculator>;
 }
