@@ -57,6 +57,7 @@ tests = [
     "tensorflow; python_version<'3.12'", # TODO: remove when tensorflow supports 3.12
     "tqdm",
 ]
+dev = ["ruff==0.2.2"]
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
 
