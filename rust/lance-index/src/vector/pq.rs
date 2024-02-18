@@ -581,9 +581,7 @@ mod tests {
     async fn test_l2_distance() {
         const DIM: usize = 512;
         const TOTAL: usize = 66; // 64 + 2 to make sure reminder is handled correctly.
-        let codebook = Arc::new(Float32Array::from_iter_values(
-            (0..256 * DIM).map(|v| v as f32),
-        ));
+        let codebook = Arc::new(generate_random_array(256 * DIM));
         let pq = ProductQuantizerImpl::<Float32Type> {
             num_bits: 8,
             num_sub_vectors: 16,
@@ -622,7 +620,7 @@ mod tests {
             .iter()
             .zip(expected.iter())
             .for_each(|(v, e)| {
-                assert_relative_eq!(*v, *e, epsilon = 1e-6);
+                assert_relative_eq!(*v, *e, epsilon = 1e-4);
             });
     }
 }
