@@ -125,6 +125,12 @@ impl ProductQuantizationStorage {
     pub fn schema(&self) -> SchemaRef {
         self.batch.schema()
     }
+
+    pub fn get_row_ids(&self, ids: &[u32]) -> Vec<u64> {
+        ids.iter()
+            .map(|&id| self.row_ids.value(id as usize))
+            .collect()
+    }
 }
 
 impl VectorStorage<f32> for ProductQuantizationStorage {
@@ -139,10 +145,12 @@ impl VectorStorage<f32> for ProductQuantizationStorage {
             self.num_sub_vectors,
             self.pq_code.clone(),
             query,
+            metric_type,
         ))
     }
 }
 
+/// Distance calculator backed by PQ code.
 struct PQDistCalculator {
     distance_table: Vec<f32>,
     pq_code: Arc<UInt8Array>,
@@ -157,8 +165,13 @@ impl PQDistCalculator {
         num_sub_vectors: usize,
         pq_code: Arc<UInt8Array>,
         query: &[f32],
+        metric_type: MetricType,
     ) -> Self {
-        let distance_table = build_distance_table_l2(codebook, num_bits, num_sub_vectors, query);
+        let distance_table = if matches!(metric_type, MetricType::Cosine | MetricType::L2) {
+            build_distance_table_l2(codebook, num_bits, num_sub_vectors, query)
+        } else {
+            unimplemented!("Metric type not supported: {:?}", metric_type);
+        };
         Self {
             distance_table,
             num_sub_vectors,
