@@ -23,7 +23,7 @@ use arrow_array::{
     types::{Float32Type, UInt64Type, UInt8Type},
     FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
-use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use arrow_schema::SchemaRef;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
@@ -177,6 +177,10 @@ impl ProductQuantizationStorage {
         Self::new(codebook, batch, num_bits, num_sub_vectors, dimension)
     }
 
+    /// Load full PQ storage from disk.
+    ///
+    /// Currently it loads everything in memory.
+    /// TODO: support lazy loading later.
     pub async fn load(object_store: &ObjectStore, path: &Path) -> Result<Self> {
         let reader = FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
