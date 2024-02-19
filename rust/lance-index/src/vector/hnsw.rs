@@ -43,22 +43,23 @@ use super::graph::{
 use crate::vector::graph::beam_search;
 pub mod builder;
 pub use builder::HNSWBuilder;
+mod storage;
 
 const HNSW_TYPE: &str = "HNSW";
+const VECTOR_ID_COL: &str = "__vector_id";
 const POINTER_COL: &str = "__pointer";
 
 lazy_static::lazy_static! {
     /// POINTER field.
     ///
     pub static ref POINTER_FIELD: Field = Field::new(POINTER_COL, DataType::UInt32, true);
+
+    /// Id of the vector in the [VectorStorage].
+    pub static ref VECTOR_ID_FIELD: Field = Field::new(VECTOR_ID_COL, DataType::UInt32, true);
 }
 
 /// One level of the HNSW graph.
 ///
-/// Type parameters:
-/// ----------------
-/// T : Float
-///   The data type of the vectors?
 struct HnswLevel {
     /// All the nodes in this level.
     // TODO: we just load the whole level into memory without pagation.
@@ -97,6 +98,13 @@ impl HnswLevel {
             .clone()
             .into();
         let values: Arc<UInt32Array> = neighbors.values().as_primitive().clone().into();
+        let vector_ids: Arc<UInt32Array> = nodes
+            .column_by_name(VECTOR_ID_COL)
+            .unwrap()
+            .as_primitive()
+            .clone()
+            .into();
+        let vectors = Arc::new(storage::HnswRemappingStorage::new(vectors, vector_ids));
         Self {
             nodes,
             neighbors,
@@ -108,17 +116,24 @@ impl HnswLevel {
     fn from_builder(builder: &GraphBuilder, vectors: Arc<dyn VectorStorage>) -> Result<Self> {
         let mut neighbours_builder = ListBuilder::new(UInt32Builder::new());
         let mut pointers_builder = UInt32Builder::new();
+        let mut vector_id_builder = UInt32Builder::new();
 
         for (_, node) in builder.nodes.iter() {
             neighbours_builder.append_value(node.neighbors.values().map(|&n| Some(n)));
             pointers_builder.append_value(node.pointer);
+            vector_id_builder.append_value(node.id);
         }
 
-        let schema = Schema::new(vec![NEIGHBORS_FIELD.clone(), POINTER_FIELD.clone()]);
+        let schema = Schema::new(vec![
+            NEIGHBORS_FIELD.clone(),
+            VECTOR_ID_FIELD.clone(),
+            POINTER_FIELD.clone(),
+        ]);
         let batch = RecordBatch::try_new(
             schema.into(),
             vec![
                 Arc::new(neighbours_builder.finish()),
+                Arc::new(vector_id_builder.finish()),
                 Arc::new(pointers_builder.finish()),
             ],
         )?;

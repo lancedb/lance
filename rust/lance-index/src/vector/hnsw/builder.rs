@@ -260,5 +260,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 2, 4, 7]
         );
+
+        println!("{:?}", levels[2].nodes);
     }
 }

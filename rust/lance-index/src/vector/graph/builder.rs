@@ -22,12 +22,14 @@ use super::{memory::InMemoryVectorStorage, Graph, GraphNode, OrderedFloat};
 use crate::vector::graph::storage::VectorStorage;
 
 /// GraphNode during build.
+#[derive(Debug)]
 pub struct GraphBuilderNode {
     /// Node ID
     pub(crate) id: u32,
     /// Neighbors, sorted by the distance.
     pub(crate) neighbors: BTreeMap<OrderedFloat, u32>,
 
+    /// Pointer to the next level of graph, or acts as the idx
     pub pointer: u32,
 }
 
