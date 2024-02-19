@@ -29,6 +29,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import com.lancedb.lance.WriteParams.WriteMode;
+
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.file.Files;
@@ -68,7 +70,8 @@ public class DatasetTest {
       Path datasetPath = tempDir.resolve("new_dataset");
       assertDoesNotThrow(() -> {
         dataset = Dataset.write(arrowStream, datasetPath.toString(),
-            new WriteParams.Builder().build());
+            new WriteParams.Builder().withMaxRowsPerFile(10)
+            .withMaxRowsPerGroup(20).withMode(WriteMode.CREATE).build());
         assertEquals(9, dataset.countRows());
         Dataset datasetRead = Dataset.open(datasetPath.toString());
         assertEquals(9, datasetRead.countRows());

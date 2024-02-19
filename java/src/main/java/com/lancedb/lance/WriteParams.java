@@ -13,58 +13,67 @@
  */
 package com.lancedb.lance;
 
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+
 public class WriteParams {
-    public enum WriteMode {
-        CREATE,
-        APPEND,
-        OVERWRITE
+  public enum WriteMode {
+    CREATE,
+    APPEND,
+    OVERWRITE
+  }
+
+  private final Optional<Integer> maxRowsPerFile;
+  private final Optional<Integer> maxRowsPerGroup;
+  private final Optional<Long> maxBytesPerFile;
+  private final Optional<WriteMode> mode;
+
+  private WriteParams(Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
+      Optional<Long> maxBytesPerFile, Optional<WriteMode> mode) {
+    this.maxRowsPerFile = maxRowsPerFile;
+    this.maxRowsPerGroup = maxRowsPerGroup;
+    this.maxBytesPerFile = maxBytesPerFile;
+    this.mode = mode;
+  }
+
+  public Map<String, Object> toMap() {
+    Map<String, Object> params = new HashMap<>();
+    maxRowsPerFile.ifPresent(value -> params.put("max_rows_per_file", value));
+    maxRowsPerGroup.ifPresent(value -> params.put("max_rows_per_group", value));
+    maxBytesPerFile.ifPresent(value -> params.put("max_bytes_per_file", value));
+    mode.ifPresent(value -> params.put("mode", value.toString()));
+    return params;
+  }
+
+  public static class Builder {
+    private Optional<Integer> maxRowsPerFile = Optional.empty();
+    private Optional<Integer> maxRowsPerGroup = Optional.empty();
+    private Optional<Long> maxBytesPerFile = Optional.empty();
+    private Optional<WriteMode> mode = Optional.empty();
+
+    public Builder withMaxRowsPerFile(int maxRowsPerFile) {
+      this.maxRowsPerFile = Optional.of(maxRowsPerFile);
+      return this;
     }
 
-    private final int maxRowsPerFile;
-    private final int maxRowsPerGroup;
-    private final long maxBytesPerFile;
-    private final WriteMode mode;
-
-    private WriteParams(int maxRowsPerFile, int maxRowsPerGroup, long maxBytesPerFile, WriteMode mode) {
-        this.maxRowsPerFile = maxRowsPerFile;
-        this.maxRowsPerGroup = maxRowsPerGroup;
-        this.maxBytesPerFile = maxBytesPerFile;
-        this.mode = mode;
+    public Builder withMaxRowsPerGroup(int maxRowsPerGroup) {
+      this.maxRowsPerGroup = Optional.of(maxRowsPerGroup);
+      return this;
     }
 
-    public int getMaxRowsPerFile() { return maxRowsPerFile; }
-    public int getMaxRowsPerGroup() { return maxRowsPerGroup; }
-    public long getMaxBytesPerFile() { return maxBytesPerFile; }
-    public WriteMode getMode() { return mode; }
-
-    public static class Builder {
-        private int maxRowsPerFile = 1024 * 1024; // 1 million
-        private int maxRowsPerGroup = 1024;
-        private long maxBytesPerFile = 90L * 1024 * 1024 * 1024; // 90 GB
-        private WriteMode mode = WriteMode.CREATE;
-
-        public Builder withMaxRowsPerFile(int maxRowsPerFile) {
-            this.maxRowsPerFile = maxRowsPerFile;
-            return this;
-        }
-
-        public Builder withMaxRowsPerGroup(int maxRowsPerGroup) {
-            this.maxRowsPerGroup = maxRowsPerGroup;
-            return this;
-        }
-
-        public Builder withMaxBytesPerFile(long maxBytesPerFile) {
-            this.maxBytesPerFile = maxBytesPerFile;
-            return this;
-        }
-
-        public Builder withMode(WriteMode mode) {
-            this.mode = mode;
-            return this;
-        }
-
-        public WriteParams build() {
-            return new WriteParams(this.maxRowsPerFile, this.maxRowsPerGroup, this.maxBytesPerFile, this.mode);
-        }
+    public Builder withMaxBytesPerFile(long maxBytesPerFile) {
+      this.maxBytesPerFile = Optional.of(maxBytesPerFile);
+      return this;
     }
+
+    public Builder withMode(WriteMode mode) {
+      this.mode = Optional.of(mode);
+      return this;
+    }
+
+    public WriteParams build() {
+      return new WriteParams(this.maxRowsPerFile, this.maxRowsPerGroup, this.maxBytesPerFile, this.mode);
+    }
+  }
 }

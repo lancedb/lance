@@ -18,6 +18,7 @@ import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.jni.JniLoader;
 
 import java.io.Closeable;
+import java.util.Map;
 
 /**
  * Class representing a Lance dataset, interfacing with the native lance library.
@@ -37,13 +38,11 @@ public class Dataset implements Closeable {
   }
 
   public static Dataset write(ArrowArrayStream stream, String path, WriteParams params) {
-    return writeWithFFIStream(stream.memoryAddress(), path,
-        params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(),
-        params.getMaxBytesPerFile(), params.getMode().name());
+    return writeWithFFIStream(stream.memoryAddress(), path, params.toMap());
   }
 
   private static native Dataset writeWithFFIStream(long ArrowStreamMemoryAddress, String path,
-      int maxRowsPerFile, int maxRowsPerGroup, long maxBytesPerFile, String mode);
+      Map<String, Object> params);
 
   /**
    * Opens a dataset from the specified path using the native library.
