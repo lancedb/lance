@@ -29,7 +29,7 @@ use lance_testing::datagen::generate_random_array_with_seed;
 
 fn bench_hnsw(c: &mut Criterion) {
     const DIMENSION: usize = 1024;
-    const TOTAL: usize = 1 * 1024 * 1024;
+    const TOTAL: usize = 1024 * 1024;
     const SEED: [u8; 32] = [42; 32];
     const K: usize = 10;
 
