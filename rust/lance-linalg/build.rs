@@ -1,4 +1,26 @@
+// Copyright 2024 Lance Developers.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::env;
+
 fn main() {
+    let rust_toolchain = env::var("RUSTUP_TOOLCHAIN").unwrap();
+    if rust_toolchain.starts_with("nightly") {
+        // enable the 'nightly' feature flag
+        println!("cargo:rustc-cfg=feature=\"nightly\"");
+    }
+
     println!("cargo:rerun-if-changed=src/simd/f16.c");
 
     if cfg!(all(target_os = "macos", target_feature = "neon")) {
@@ -6,7 +28,6 @@ fn main() {
             .compiler("clang")
             .file("src/simd/f16.c")
             .flag("-mtune=apple-m1")
-            .flag("-ffast-math")
             .flag("-O3")
             .flag("-Wall")
             .flag("-Werror")
@@ -22,7 +43,6 @@ fn main() {
             .std("c17")
             .file("src/simd/f16.c")
             .flag("-march=sapphirerapids")
-            .flag("-ffast-math")
             .flag("-mavx512f")
             .flag("-mavx512vl")
             .flag("-mavx512bw")
