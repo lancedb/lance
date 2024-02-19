@@ -22,7 +22,7 @@ use super::{memory::InMemoryVectorStorage, Graph, GraphNode, OrderedFloat};
 use crate::vector::graph::storage::VectorStorage;
 
 /// GraphNode during build.
-pub(crate) struct GraphBuilderNode {
+pub struct GraphBuilderNode {
     /// Node ID
     pub(crate) id: u32,
     /// Neighbors, sorted by the distance.

@@ -200,21 +200,21 @@ impl HNSW {
             let index_metadata: SchemaIndexMetadata = serde_json::from_str(index_metadata)?;
             if index_metadata.type_ != "HNSW" {
                 return Err(Error::Index {
-                    message: format!("index type is not HNSW"),
+                    message: "index type is not HNSW".to_string(),
                     location: location!(),
                 });
             }
             MetricType::try_from(index_metadata.metric_type.as_str())?
         } else {
             return Err(Error::Index {
-                message: format!("index metadata not found in the schema"),
+                message: "index metadata not found in the schema".to_string(),
                 location: location!(),
             });
         };
         let hnsw_metadata: HnswMetadata =
             serde_json::from_str(schema.metadata.get("lance:hnsw").ok_or_else(|| {
                 Error::Index {
-                    message: format!("hnsw metadata not found in the schema"),
+                    message: "hnsw metadata not found in the schema".to_string(),
                     location: location!(),
                 }
             })?)?;
