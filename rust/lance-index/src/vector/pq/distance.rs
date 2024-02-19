@@ -81,7 +81,7 @@ pub(super) fn compute_l2_distance<const C: usize, const V: usize>(
                 #[cfg(all(feature = "nightly", target_feature = "avx512f"))]
                 {
                     use std::arch::x86_64::*;
-                    if i + C <= self.num_sub_vectors {
+                    if i + C <= num_sub_vectors {
                         let mut offsets = [(i * num_centroids) as i32; C];
                         for k in 0..C {
                             offsets[k] += (k * num_centroids) as i32 + c[vec_start + k] as i32;
@@ -97,7 +97,7 @@ pub(super) fn compute_l2_distance<const C: usize, const V: usize>(
                         }
                     } else {
                         let mut s = 0.0;
-                        for k in 0..self.num_sub_vectors - i {
+                        for k in 0..num_sub_vectors - i {
                             *sum +=
                                 distance_table[(i + k) * num_centroids + c[vec_start + k] as usize];
                         }
