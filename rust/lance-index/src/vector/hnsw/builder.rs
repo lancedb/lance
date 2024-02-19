@@ -16,14 +16,12 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::types::Float32Type;
 use lance_core::Result;
-use lance_linalg::{distance::MetricType, MatrixView};
 use rand::{thread_rng, Rng};
 
 use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
 use super::{select_neighbors, HNSW};
-use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage, Graph};
+use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage};
 use crate::vector::hnsw::HnswLevel;
 
 /// Build a HNSW graph.
@@ -171,8 +169,8 @@ impl HNSWBuilder {
         let graphs = self
             .levels
             .iter()
-            .map(|l| l.build(storage.clone()).into())
-            .collect::<Vec<Arc<dyn Graph>>>();
+            .map(|l| HnswLevel::from_builder(l, storage.clone()))
+            .collect::<Result<Vec<_>>>()?;
         Ok(HNSW::from_builder(
             graphs,
             self.entry_point,
@@ -224,22 +222,23 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::types::Float32Type;
-    use lance_linalg::matrix::MatrixView;
+    use lance_linalg::{distance::MetricType, matrix::MatrixView};
     use lance_testing::datagen::generate_random_array;
 
     #[test]
     fn test_remapping_levels() {
         let data = generate_random_array(8 * 100);
         let mat = MatrixView::<Float32Type>::new(Arc::new(data), 8);
-        let mut level0 = GraphBuilder::new(mat.clone());
+        let storage = Arc::new(InMemoryVectorStorage::new(mat.into(), MetricType::L2));
+        let mut level0 = GraphBuilder::new(storage.clone());
         for i in 0..100 {
             level0.insert(i as u32);
         }
-        let mut level1 = GraphBuilder::new(mat.clone());
+        let mut level1 = GraphBuilder::new(storage.clone());
         for i in [0, 5, 10, 15, 20, 30, 40, 50] {
             level1.insert(i as u32);
         }
-        let mut level2 = GraphBuilder::new(mat.clone());
+        let mut level2 = GraphBuilder::new(storage.clone());
         for i in [0, 10, 20, 50] {
             level2.insert(i as u32);
         }

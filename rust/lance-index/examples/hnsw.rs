@@ -53,7 +53,7 @@ fn main() {
             let hnsw = HNSWBuilder::new(vector_store.clone())
                 .max_level(level)
                 .ef_construction(ef_construction)
-                .build(mat.clone())
+                .build()
                 .unwrap();
             let results: HashSet<u32> = hnsw
                 .search(q, k, 100)

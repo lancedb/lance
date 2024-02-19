@@ -15,15 +15,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow_array::types::Float32Type;
 use lance_core::{Error, Result};
-use lance_linalg::{
-    distance::{DistanceFunc, MetricType},
-    MatrixView,
-};
 use snafu::{location, Location};
 
-use super::{memory::InMemoryVectorStorage, Graph, GraphNode, InMemoryGraph, OrderedFloat};
+use super::{memory::InMemoryVectorStorage, Graph, GraphNode, OrderedFloat};
 use crate::vector::graph::storage::VectorStorage;
 
 /// GraphNode during build.
@@ -76,7 +71,7 @@ impl From<&GraphBuilderNode> for GraphNode<u32> {
 /// [GraphBuilder] is used to build a graph in memory.
 ///
 pub struct GraphBuilder {
-    nodes: BTreeMap<u32, GraphBuilderNode>,
+    pub(crate) nodes: BTreeMap<u32, GraphBuilderNode>,
 
     /// Storage for vectors.
     vectors: Arc<InMemoryVectorStorage>,
@@ -141,17 +136,6 @@ impl GraphBuilder {
         node.prune(max_edges);
         Ok(())
     }
-
-    /// Build the Graph.
-    pub fn build(&self, storage: Arc<dyn VectorStorage>) -> Box<dyn Graph> {
-        Box::new(InMemoryGraph::from_builder(
-            self.nodes
-                .iter()
-                .map(|(&id, node)| (id, node.into()))
-                .collect(),
-            storage,
-        ))
-    }
 }
 
 #[cfg(test)]
@@ -172,10 +156,9 @@ mod tests {
         builder.insert(0);
         builder.insert(1);
         builder.connect(0, 1).unwrap();
-        let graph = builder.build(store);
-        assert_eq!(graph.len(), 2);
+        assert_eq!(builder.len(), 2);
 
-        assert_eq!(graph.neighbors(0).unwrap().collect::<Vec<_>>(), vec![&1]);
-        assert_eq!(graph.neighbors(1).unwrap().collect::<Vec<_>>(), vec![&0]);
+        assert_eq!(builder.neighbors(0).unwrap().collect::<Vec<_>>(), vec![&1]);
+        assert_eq!(builder.neighbors(1).unwrap().collect::<Vec<_>>(), vec![&0]);
     }
 }

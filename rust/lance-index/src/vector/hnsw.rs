@@ -17,23 +17,21 @@
 //! Hierarchical Navigable Small World (HNSW).
 //!
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
-use std::{collections::BTreeMap, fmt::Debug};
 
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
     ListArray, RecordBatch, UInt32Array,
 };
-use arrow_ord::ord::DynComparator;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_linalg::distance::MetricType;
 use lance_table::io::manifest::ManifestDescribing;
-use num_traits::Float;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::{location, Location};
@@ -107,7 +105,7 @@ impl HnswLevel {
         }
     }
 
-    fn from_builder(builder: &GraphBuilder, vectors: Arc<dyn VectorStorage>) -> Self {
+    fn from_builder(builder: &GraphBuilder, vectors: Arc<dyn VectorStorage>) -> Result<Self> {
         let mut neighbours_builder = ListBuilder::new(UInt32Builder::new());
         let mut pointers_builder = UInt32Builder::new();
 
@@ -150,8 +148,8 @@ impl Graph for HnswLevel {
         Some(Box::new(self.neighbors_values.values()[range].iter()))
     }
 
-    fn storage(&self) -> &Arc<dyn VectorStorage> {
-        &self.vectors
+    fn storage(&self) -> Arc<dyn VectorStorage> {
+        self.vectors.clone()
     }
 }
 
@@ -195,7 +193,8 @@ impl HNSW {
     /// Parameters
     /// ----------
     /// reader : &FileReader
-    pub async fn load(reader: &FileReader) -> Result<Self> {
+    /// vector_storage : Arc<dyn VectorStorage>
+    pub async fn load(reader: &FileReader, vector_storage: Arc<dyn VectorStorage>) -> Result<Self> {
         let schema = reader.schema();
         let mt = if let Some(index_metadata) = schema.metadata.get("lance:index") {
             let index_metadata: SchemaIndexMetadata = serde_json::from_str(index_metadata)?;
@@ -224,7 +223,7 @@ impl HNSW {
         for i in 0..hnsw_metadata.level_offsets.len() - 1 {
             let start = hnsw_metadata.level_offsets[i];
             let end = hnsw_metadata.level_offsets[i + 1];
-            levels.push(HnswLevel::load(reader, start..end).await?);
+            levels.push(HnswLevel::load(reader, start..end, vector_storage.clone()).await?);
         }
         Ok(Self {
             levels,
@@ -360,7 +359,7 @@ mod tests {
         let hnsw = HNSWBuilder::new(store.clone())
             .max_num_edges(MAX_EDGES)
             .ef_construction(50)
-            .build(mat.clone())
+            .build()
             .unwrap();
         assert!(hnsw.levels.len() > 1);
         assert_eq!(hnsw.levels[0].len(), TOTAL);
@@ -371,7 +370,7 @@ mod tests {
         });
 
         hnsw.levels.iter().for_each(|layer| {
-            for i in 0..TOTAL {
+            for i in 0..layer.len() {
                 // If the node exist on this layer, check its out-degree.
                 if let Some(neighbors) = layer.neighbors(i as u32) {
                     assert!(neighbors.count() <= MAX_EDGES);
@@ -406,7 +405,7 @@ mod tests {
         let hnsw = HNSWBuilder::new(vectors.clone())
             .max_num_edges(MAX_EDGES)
             .ef_construction(100)
-            .build(mat.clone())
+            .build()
             .unwrap();
 
         let results: HashSet<u32> = hnsw

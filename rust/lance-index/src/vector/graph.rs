@@ -15,14 +15,11 @@
 //! Generic Graph implementation.
 //!
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::Hash;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field};
 use lance_core::{Error, Result};
-use lance_linalg::distance::MetricType;
-use num_traits::{AsPrimitive, Float, PrimInt};
 use snafu::{location, Location};
 
 pub(crate) mod builder;
@@ -122,13 +119,6 @@ pub trait Graph {
     fn storage(&self) -> Arc<dyn VectorStorage>;
 }
 
-/// Serializable In-memory Graph.
-///
-struct InMemoryGraph {
-    pub nodes: HashMap<u32, GraphNode<u32>>,
-    vectors: Arc<dyn VectorStorage>,
-}
-
 /// Beam search over a graph
 ///
 /// This is the same as ``search-layer`` in HNSW.
@@ -190,28 +180,6 @@ pub(super) fn beam_search(
         }
     }
     Ok(results)
-}
-
-impl<I: PrimInt + Hash + AsPrimitive<usize>> Graph<I> for InMemoryGraph<I> {
-    fn neighbors(&self, key: I) -> Option<Box<dyn Iterator<Item = I> + '_>> {
-        self.nodes
-            .get(&key)
-            .map(|n| Box::new(n.neighbors.iter().copied()) as Box<dyn Iterator<Item = I>>)
-    }
-
-    fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
-    fn storage(&self) -> Arc<dyn VectorStorage> {
-        self.vectors.clone()
-    }
-}
-
-impl<I: PrimInt + Hash + AsPrimitive<usize>> InMemoryGraph<I> {
-    fn from_builder(nodes: HashMap<I, GraphNode<I>>, vectors: Arc<dyn VectorStorage>) -> Self {
-        Self { nodes, vectors }
-    }
 }
 
 #[cfg(test)]
