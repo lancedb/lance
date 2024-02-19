@@ -23,7 +23,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
 
-    if cfg!(all(target_os = "macos", target_feature = "neon")) {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         cc::Build::new()
             .compiler("clang")
             .file("src/simd/f16.c")
