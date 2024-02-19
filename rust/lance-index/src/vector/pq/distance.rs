@@ -103,7 +103,7 @@ pub(super) fn compute_l2_distance<const C: usize, const V: usize>(
                         }
                     }
                 }
-                #[cfg(not(any(feature = "nightly", target_feature = "avx512f")))]
+                #[cfg(not(all(feature = "nightly", target_feature = "avx512f")))]
                 {
                     let s = c[vec_start + i..]
                         .iter()
