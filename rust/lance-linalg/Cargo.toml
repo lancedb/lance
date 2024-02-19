@@ -23,6 +23,7 @@ num-traits = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+roaring = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }

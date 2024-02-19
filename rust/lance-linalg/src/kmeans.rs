@@ -36,6 +36,7 @@ use rand::prelude::*;
 use rand::Rng;
 use tracing::instrument;
 
+use crate::distance::l2_distance_batch_with_candidates;
 use crate::distance::{dot_distance_batch, norm_l2};
 use crate::kernels::{argmax, argmin_value_float, normalize};
 use crate::{
@@ -533,7 +534,7 @@ where
         }
     }
 
-    pub fn find_partitions(&self, query: &[T::Native], nprobes: usize) -> Result<UInt32Array> {
+    pub fn find_partitions(&self, query: &[T::Native], nprobes: usize, candidates: &[u32]) -> Result<UInt32Array> {
         if query.len() != self.dimension {
             return Err(Error::InvalidArgumentError(format!(
                 "KMeans::find_partitions: query dimension mismatch: {} != {}",
@@ -544,11 +545,11 @@ where
 
         let dists: Vec<f32> = match self.metric_type {
             MetricType::L2 => {
-                l2_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
+                l2_distance_batch_with_candidates(query, self.centroids.as_slice(), self.dimension, candidates).collect()
             }
             MetricType::Cosine => {
                 let normalized = normalize(query).collect::<Vec<_>>();
-                l2_distance_batch(&normalized, self.centroids.as_slice(), self.dimension).collect()
+                l2_distance_batch_with_candidates(&normalized, self.centroids.as_slice(), self.dimension, candidates).collect()
             }
             MetricType::Dot => {
                 dot_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
@@ -777,7 +778,7 @@ mod tests {
         ));
         let expected = sort_to_indices(&dists, None, Some(4)).unwrap();
 
-        let actual = kmeans.find_partitions(query, 4).unwrap();
+        let actual = kmeans.find_partitions(query, 4, &[]).unwrap();
         assert_eq!(expected, actual);
     }
 

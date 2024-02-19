@@ -201,7 +201,7 @@ pub trait Ivf: Send + Sync + std::fmt::Debug {
     ) -> Result<FixedSizeListArray>;
 
     /// Find the closest partitions for the query vector.
-    fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array>;
+    fn find_partitions(&self, query: &dyn Array, nprobes: usize, candidates: &[u32]) -> Result<UInt32Array>;
 
     /// Partition a batch of vectors into multiple batches, each batch contains vectors and other data.
     ///
@@ -410,7 +410,7 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
         Ok(FixedSizeListArray::try_new_from_values(arr, dim as i32)?)
     }
 
-    fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array> {
+    fn find_partitions(&self, query: &dyn Array, nprobes: usize, candidate: &[u32]) -> Result<UInt32Array> {
         let query = query
             .as_any()
             .downcast_ref::<T::ArrayType>()
@@ -428,7 +428,7 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
             self.dimension(),
             self.metric_type,
         );
-        Ok(kmeans.find_partitions(query.as_slice(), nprobes)?)
+        Ok(kmeans.find_partitions(query.as_slice(), nprobes, candidate)?)
     }
 
     async fn partition_transform(

@@ -54,7 +54,7 @@ use lance_io::{
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
 };
-use lance_linalg::distance::{Cosine, Dot, MetricType, L2};
+use lance_linalg::{distance::{Cosine, Dot, MetricType, L2}, kmeans::KMeans};
 use log::{debug, info};
 use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -100,6 +100,10 @@ pub struct IVFIndex {
     // hold a weak pointer to avoid cycles
     /// The session cache, used when fetching pages
     session: Weak<Session>,
+
+    pq: Arc<dyn ProductQuantizer>,
+
+    ivf_centroids_pq_codes: Arc<dyn Array>,
 }
 
 impl IVFIndex {
@@ -111,6 +115,8 @@ impl IVFIndex {
         reader: Arc<dyn Reader>,
         sub_index: Arc<dyn VectorIndex>,
         metric_type: MetricType,
+        pq: Arc<dyn ProductQuantizer>,
+        ivf_centroids_pq_codes: Arc<dyn Array>,
     ) -> Result<Self> {
         if !sub_index.is_loadable() {
             return Err(Error::Index {
@@ -125,6 +131,8 @@ impl IVFIndex {
             reader,
             sub_index,
             metric_type,
+            pq,
+            ivf_centroids_pq_codes,
         })
     }
 
@@ -407,9 +415,23 @@ impl Index for IVFIndex {
 impl VectorIndex for IVFIndex {
     #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+        let distances = self.pq.build_distance_table(&query.key, self.ivf_centroids_pq_codes.as_fixed_size_list().values().as_primitive())?;
+
+        let num_centroids = self.ivf.num_partitions();
+
+        let pq_candidates = query.nprobes * 5;
+        // search in at least 5% of the centroids
+        let pq_candidates = std::cmp::max(pq_candidates, num_centroids / 20);
+        // search in at most 20% of the centroids
+        let pq_candidates = std::cmp::max(pq_candidates, num_centroids / 5);
+        // but still has to be least as many as nprobes
+        let pq_candidates = std::cmp::max(pq_candidates, query.nprobes);
+
+        let pq_ids = sort_to_indices(&distances, None, Some(pq_candidates))?;
+
         let partition_ids =
             self.ivf
-                .find_partitions(&query.key, query.nprobes, self.metric_type)?;
+                .find_partitions(&query.key, query.nprobes, self.metric_type, &pq_ids)?;
         assert!(partition_ids.len() <= query.nprobes);
         let part_ids = partition_ids.values().to_vec();
         let batches = stream::iter(part_ids)
@@ -595,6 +617,7 @@ impl Ivf {
         query: &dyn Array,
         nprobes: usize,
         metric_type: MetricType,
+        pq_candidates: &UInt32Array,
     ) -> Result<UInt32Array> {
         let internal = lance_index::vector::ivf::new_ivf(
             self.centroids.values(),
@@ -603,7 +626,7 @@ impl Ivf {
             vec![],
             None,
         )?;
-        internal.find_partitions(query, nprobes)
+        internal.find_partitions(query, nprobes, pq_candidates.values())
     }
 
     /// Add the offset and length of one partition.

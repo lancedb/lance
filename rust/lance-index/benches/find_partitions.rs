@@ -42,7 +42,7 @@ fn bench_partitions(c: &mut Criterion) {
 
             c.bench_function(format!("IVF{},k={},L2", num_centroids, k).as_str(), |b| {
                 b.iter(|| {
-                    let _ = ivf.find_partitions(&query, *k);
+                    let _ = ivf.find_partitions(&query, *k, &[]);
                 })
             });
 
@@ -51,7 +51,7 @@ fn bench_partitions(c: &mut Criterion) {
                 format!("IVF{},k={},Cosine", num_centroids, k).as_str(),
                 |b| {
                     b.iter(|| {
-                        let _ = ivf.find_partitions(&query, *k);
+                        let _ = ivf.find_partitions(&query, *k, &[]);
                     })
                 },
             );

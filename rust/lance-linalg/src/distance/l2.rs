@@ -31,6 +31,7 @@ use num_traits::{AsPrimitive, Float};
 
 #[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
 use lance_core::utils::cpu::x86::AVX512_F16_SUPPORTED;
+use roaring::RoaringBitmap;
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -48,8 +49,20 @@ pub trait L2: ArrowFloatType {
         x: &'a [Self::Native],
         y: &'a [Self::Native],
         dimension: usize,
+        candidates: &[u32],
     ) -> Box<dyn Iterator<Item = f32> + 'a> {
-        Box::new(y.chunks_exact(dimension).map(|v| Self::l2(x, v)))
+        let set: RoaringBitmap = candidates.iter().copied().collect();
+        Box::new(y
+            .chunks_exact(dimension)
+            .enumerate()
+            .map(move |(idx, v)| {
+                if set.contains(idx as u32) {
+                    Self::l2(x, v)
+                } else {
+                    f32::INFINITY
+                }
+            })
+        )
     }
 }
 
@@ -152,9 +165,11 @@ impl L2 for Float32Type {
         x: &'a [Self::Native],
         y: &'a [Self::Native],
         dimension: usize,
+        candidates: &[u32],
     ) -> Box<dyn Iterator<Item = Self::Native> + 'a> {
         use self::f32::l2_once;
         // Dispatch based on the dimension.
+        let set: RoaringBitmap = candidates.iter().copied().collect();
         match dimension {
             8 => Box::new(
                 y.chunks_exact(dimension)
@@ -164,7 +179,17 @@ impl L2 for Float32Type {
                 y.chunks_exact(dimension)
                     .map(move |v| l2_once::<f32x16, 16>(x, v)),
             ),
-            _ => Box::new(y.chunks_exact(dimension).map(|v| Self::l2(x, v))),
+            _ => Box::new(y
+                .chunks_exact(dimension)
+                .enumerate()
+                .map(move |(idx, v)| {
+                    if set.contains(idx as u32) {
+                        Self::l2(x, v)
+                    } else {
+                        f32::INFINITY
+                    }
+                })
+            ),
         }
     }
 }
@@ -213,6 +238,19 @@ pub fn l2_distance_batch<'a, T: FloatToArrayType>(
     from: &'a [T],
     to: &'a [T],
     dimension: usize,
+
+) -> Box<dyn Iterator<Item = f32> + 'a>
+where
+    T::ArrowType: L2,
+{
+    l2_distance_batch_with_candidates(from, to, dimension, &[])
+}
+
+pub fn l2_distance_batch_with_candidates<'a, T: FloatToArrayType>(
+    from: &'a [T],
+    to: &'a [T],
+    dimension: usize,
+    candidates: &[u32],
 ) -> Box<dyn Iterator<Item = f32> + 'a>
 where
     T::ArrowType: L2,
@@ -220,7 +258,7 @@ where
     debug_assert_eq!(from.len(), dimension);
     debug_assert_eq!(to.len() % dimension, 0);
 
-    Box::new(T::ArrowType::l2_batch(from, to, dimension))
+    Box::new(T::ArrowType::l2_batch(from, to, dimension, candidates))
 }
 
 fn do_l2_distance_arrow_batch<T: ArrowFloatType + L2>(
