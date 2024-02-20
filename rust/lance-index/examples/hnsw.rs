@@ -35,7 +35,7 @@ struct Args {
     uri: String,
 
     /// Vector column name
-    #[arg(short, long, value_name = "NAME")]
+    #[arg(short, long, value_name = "NAME", default_value = "vector")]
     column: Option<String>,
 
     #[arg(long, default_value = "100")]
@@ -63,7 +63,7 @@ async fn main() {
     println!("Dataset schema: {:#?}", dataset.schema());
     let batches = dataset
         .scan()
-        .project(&["openai"])
+        .project(&[args.column.as_deref().unwrap_or("vector")])
         .unwrap()
         .try_into_stream()
         .await
