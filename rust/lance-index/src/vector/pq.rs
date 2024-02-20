@@ -476,7 +476,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
     }
 
     fn use_residual(&self) -> bool {
-        self.metric_type != MetricType::Cosine
+        matches!(self.metric_type, MetricType::L2 | MetricType::Cosine)
     }
 }
 

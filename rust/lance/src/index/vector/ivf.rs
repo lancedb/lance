@@ -1205,6 +1205,7 @@ mod tests {
     use std::collections::HashMap;
     use std::iter::repeat;
 
+    use arrow_array::types::UInt64Type;
     use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::utils::address::RowAddress;
@@ -1892,5 +1893,95 @@ mod tests {
                 Field::new("_distance", DataType::Float32, true)
             ]))
         );
+    }
+
+    #[tokio::test]
+    async fn test_check_cosine_normalization() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        const DIM: usize = 32;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = generate_random_array(1000 * DIM)
+            .values()
+            .iter()
+            .map(|&v| v + 1000.0)
+            .collect::<Float32Array>();
+        let fsl = FixedSizeListArray::try_new_from_values(arr.clone(), DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_pq(2, 8, 4, false, MetricType::Cosine, 50);
+        dataset
+            .create_index(&[&"vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let idx = dataset
+            .open_generic_index("vector", indices[0].uuid.to_string().as_str())
+            .await
+            .unwrap();
+        let ivf_idx = idx.as_any().downcast_ref::<IVFIndex>().unwrap();
+        // All centroids are normalized.
+        //
+        // If not normalized, the centroids should be on the mean of original vector space
+        assert!(ivf_idx
+            .ivf
+            .centroids
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .all(|&v| 0.0 <= v && v <= 1.0));
+
+        let pq_idx = ivf_idx
+            .sub_index
+            .as_any()
+            .downcast_ref::<PQIndex>()
+            .unwrap();
+        assert!(pq_idx
+            .pq
+            .codebook_as_fsl()
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .all(|&v| 0.0 <= v && v <= 1.0));
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+
+        let query_id = 0;
+        let query = &arr.slice(0, DIM);
+        let mut correct_times = 0;
+        for _ in 0..10 {
+            let results = dataset
+                .scan()
+                .with_row_id()
+                .nearest("vector", query, 1)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(results.num_rows(), 1);
+            let row_id = results
+                .column_by_name("_rowid")
+                .unwrap()
+                .as_primitive::<UInt64Type>()
+                .value(0);
+            if row_id == query_id {
+                correct_times += 1;
+            }
+        }
+
+        assert!(correct_times >= 9);
     }
 }
