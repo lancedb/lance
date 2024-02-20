@@ -800,20 +800,6 @@ pub async fn build_ivf_pq_index(
         }
         Ivf::new(centroids.clone())
     } else {
-        // Pre-transforms
-        if pq_params.use_opq {
-            #[cfg(not(feature = "opq"))]
-            return Err(Error::Index {
-                message: "Feature 'opq' is not installed.".to_string(),
-                location: location!(),
-            });
-            #[cfg(feature = "opq")]
-            {
-                let opq = train_opq(&training_data, pq_params).await?;
-                transforms.push(Box::new(opq));
-            }
-        }
-
         // Transform training data if necessary.
         for transform in transforms.iter() {
             if let Some(training_data) = &mut training_data {
@@ -906,13 +892,12 @@ pub async fn build_ivf_pq_index(
         // the time to compute them is not that bad.
         let part_ids = ivf2.compute_partitions(&training_data).await?;
 
-        let training_data = if metric_type == MetricType::Cosine {
-            // Do not run residual distance for cosine distance.
-            training_data
-        } else {
+        let training_data = if ivf_params.use_residual {
             span!(Level::INFO, "compute residual for PQ training")
                 .in_scope(|| ivf2.compute_residual(&training_data, Some(&part_ids)))
                 .await?
+        } else {
+            training_data
         };
         info!("Start train PQ: params={:#?}", pq_params);
         pq_params.build(&training_data, metric_type).await?
@@ -1959,10 +1944,9 @@ mod tests {
 
         let dataset = Dataset::open(test_uri).await.unwrap();
 
-        let query_id = 0;
-        let query = &arr.slice(0, DIM);
         let mut correct_times = 0;
-        for _ in 0..10 {
+        for query_id in 0..10 {
+            let query = &arr.slice(query_id * DIM, DIM);
             let results = dataset
                 .scan()
                 .with_row_id()
@@ -1977,11 +1961,12 @@ mod tests {
                 .unwrap()
                 .as_primitive::<UInt64Type>()
                 .value(0);
-            if row_id == query_id {
+            println!("Row id: {}", row_id);
+            if row_id == (query_id as u64) {
                 correct_times += 1;
             }
         }
 
-        assert!(correct_times >= 9);
+        assert!(correct_times >= 9, "correct: {}", correct_times);
     }
 }
