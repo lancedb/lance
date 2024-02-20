@@ -19,10 +19,28 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use arrow::array::AsArray;
 use arrow_array::types::Float32Type;
+use arrow_select::concat::concat;
+use clap::Parser;
+use futures::StreamExt;
+use lance::Dataset;
 use lance_index::vector::{graph::memory::InMemoryVectorStorage, hnsw::HNSWBuilder};
 use lance_linalg::{distance::MetricType, MatrixView};
-use lance_testing::datagen::generate_random_array_with_seed;
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Dataset URI
+    uri: String,
+
+    /// Vector column name
+    #[arg(short, long, value_name = "NAME")]
+    column: Option<String>,
+
+    #[arg(long, default_value = "100")]
+    ef: usize,
+}
 
 fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
     let mut dists = vec![];
@@ -35,13 +53,29 @@ fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashS
     dists.into_iter().map(|(_, i)| i).collect()
 }
 
-fn main() {
-    const TOTAL: usize = 65536;
-    const DIMENSION: usize = 1024;
-    const SEED: [u8; 32] = [42; 32];
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
 
-    let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
-    let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIMENSION));
+    let dataset = Dataset::open(&args.uri)
+        .await
+        .expect("Failed to open dataset");
+    println!("Dataset schema: {:#?}", dataset.schema());
+    let batches = dataset
+        .scan()
+        .project(&["openai"])
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .then(|batch| async move { batch.unwrap().column_by_name("openai").unwrap().clone() })
+        .collect::<Vec<_>>()
+        .await;
+    let arrs = batches.iter().map(|b| b.as_ref()).collect::<Vec<_>>();
+    let fsl = concat(&arrs).unwrap();
+    let mat = Arc::new(MatrixView::<Float32Type>::try_from(fsl.as_fixed_size_list()).unwrap());
+    println!("Loaded {:?} batches", mat.num_rows());
+
     let vector_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
 
     let q = mat.row(0).unwrap();
@@ -50,23 +84,29 @@ fn main() {
 
     for level in [4, 8, 16, 32] {
         for ef_construction in [50, 100, 200, 400] {
+            let now = std::time::Instant::now();
             let hnsw = HNSWBuilder::new(vector_store.clone())
                 .max_level(level)
                 .ef_construction(ef_construction)
                 .build()
                 .unwrap();
+            let construct_time = now.elapsed().as_secs_f32();
+            let now = std::time::Instant::now();
             let results: HashSet<u32> = hnsw
-                .search(q, k, 100)
+                .search(q, k, args.ef)
                 .unwrap()
                 .iter()
                 .map(|(i, _)| *i)
                 .collect();
+            let search_time = now.elapsed().as_micros();
             println!(
-                "level={}, ef_construct={}, ef={} recall={}",
+                "level={}, ef_construct={}, ef={} recall={}: construct={:.3}s search={:.3} us",
                 level,
                 ef_construction,
-                100,
-                results.intersection(&gt).count() as f32 / k as f32
+                args.ef,
+                results.intersection(&gt).count() as f32 / k as f32,
+                construct_time,
+                search_time
             );
         }
     }

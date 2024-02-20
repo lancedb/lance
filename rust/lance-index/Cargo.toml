@@ -50,9 +50,11 @@ tempfile.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
+clap = { workspace = true, features = ["derive"] }
 criterion.workspace = true
 lance-datagen.workspace = true
 lance-testing.workspace = true
+lance.workspace = true
 pprof.workspace = true
 tempfile.workspace = true
 datafusion-sql.workspace = true
