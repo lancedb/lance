@@ -184,10 +184,11 @@ def test_alter_columns(tmp_path: Path):
 
     dataset.alter_columns(
         {"path": "x", "data_type": pa.int32()},
+        {"path": "y", "data_type": pa.large_string()},
     )
     expected_schema = pa.schema([
         pa.field("x", pa.int32()),
-        pa.field("y", pa.string(), nullable=False),
+        pa.field("y", pa.large_string(), nullable=False),
     ])
     assert dataset.schema == expected_schema
 
@@ -198,6 +199,9 @@ def test_alter_columns(tmp_path: Path):
     assert dataset.to_table() == expected_tab
     with pytest.raises(Exception, match="Can't cast value 1024 to type Int8"):
         dataset.alter_columns({"path": "x", "data_type": pa.int8()})
+
+    with pytest.raises(Exception, match='Cannot cast column "x" from Int32 to Utf8'):
+        dataset.alter_columns({"path": "x", "data_type": pa.string()})
 
     with pytest.raises(Exception, match='Column "q" does not exist'):
         dataset.alter_columns({"path": "q", "name": "z"})

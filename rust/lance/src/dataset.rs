@@ -1513,6 +1513,30 @@ impl ColumnAlteration {
     }
 }
 
+/// Limit casts to same type. This is mostly to filter out weird casts like
+/// casting a string to a boolean or float to string.
+fn is_upcast_downcast(from_type: &DataType, to_type: &DataType) -> bool {
+    use DataType::*;
+    match from_type {
+        from_type if from_type.is_integer() => to_type.is_integer(),
+        from_type if from_type.is_floating() => to_type.is_floating(),
+        from_type if from_type.is_temporal() => to_type.is_temporal(),
+        Boolean => matches!(to_type, Boolean),
+        Utf8 | LargeUtf8 => matches!(to_type, Utf8 | LargeUtf8),
+        Binary | LargeBinary => matches!(to_type, Binary | LargeBinary),
+        Decimal128(_, _) | Decimal256(_, _) => {
+            matches!(to_type, Decimal128(_, _) | Decimal256(_, _))
+        }
+        List(from_field) | LargeList(from_field) | FixedSizeList(from_field, _) => match to_type {
+            List(to_field) | LargeList(to_field) | FixedSizeList(to_field, _) => {
+                is_upcast_downcast(from_field.data_type(), to_field.data_type())
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 // TODO: move all schema evolution methods to this impl and provide a dedicated
 // docs section to describe the schema evolution methods.
 impl Dataset {
@@ -1646,10 +1670,10 @@ impl Dataset {
     ) -> Result<Vec<Fragment>> {
         let read_columns_ref = read_columns.as_deref();
         let mapper_ref = mapper.as_ref();
-        let schemas_ref = &schemas;
         let fragments = futures::stream::iter(self.get_fragments())
             .then(|fragment| {
                 let cache_ref = result_cache.clone();
+                let schemas_ref = &schemas;
                 async move {
                     if let Some(cache) = &cache_ref {
                         let fragment_id = fragment.id() as u32;
@@ -1748,7 +1772,9 @@ impl Dataset {
             }
 
             if let Some(data_type) = &alteration.data_type {
-                if !lance_arrow::cast::can_cast_types(&field_src.data_type(), data_type) {
+                if !(lance_arrow::cast::can_cast_types(&field_src.data_type(), data_type)
+                    && is_upcast_downcast(&field_src.data_type(), data_type))
+                {
                     return Err(Error::invalid_input(
                         format!(
                             "Cannot cast column \"{}\" from {:?} to {:?}",
