@@ -25,7 +25,7 @@ pub trait DistCalculator {
 /// It abstracts away the logic to compute the distance between vectors.
 ///
 /// TODO: should we rename this to "VectorDistance"?;
-pub trait VectorStorage {
+pub trait VectorStorage: Send + Sync {
     fn len(&self) -> usize;
 
     /// Return the metric type of the vectors.
