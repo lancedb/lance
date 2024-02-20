@@ -36,6 +36,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::{location, Location};
 
+use self::storage::HnswRemappingStorage;
+
 use super::graph::{
     builder::GraphBuilder, storage::VectorStorage, Graph, OrderedFloat, NEIGHBORS_COL,
     NEIGHBORS_FIELD,
@@ -74,8 +76,11 @@ struct HnswLevel {
     /// The values of the neighbors array.
     neighbors_values: Arc<UInt32Array>,
 
+    /// Id of the vector in the [VectorStorage].
+    vector_ids: Arc<UInt32Array>,
+
     /// Vector storage of the graph.
-    vectors: Arc<dyn VectorStorage>,
+    vectors: Arc<HnswRemappingStorage>,
 }
 
 impl HnswLevel {
@@ -104,11 +109,15 @@ impl HnswLevel {
             .as_primitive()
             .clone()
             .into();
-        let vectors = Arc::new(storage::HnswRemappingStorage::new(vectors, vector_ids));
+        let vectors = Arc::new(storage::HnswRemappingStorage::new(
+            vectors,
+            vector_ids.clone(),
+        ));
         Self {
             nodes,
             neighbors,
             neighbors_values: values,
+            vector_ids,
             vectors,
         }
     }
@@ -150,6 +159,12 @@ impl HnswLevel {
         let start = self.neighbors.value_offsets()[idx as usize] as usize;
         let end = start + self.neighbors.value_length(idx as usize) as usize;
         start..end
+    }
+
+    fn pointers(&self, ids: &[u32]) -> Vec<u32> {
+        ids.iter()
+            .map(|&id| self.vector_ids.value(id as usize))
+            .collect()
     }
 }
 
@@ -272,9 +287,10 @@ impl HNSW {
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<(u32, f32)>> {
         let mut ep = vec![self.entry_point];
         let num_layers = self.levels.len();
-        for layer in self.levels.iter().rev().take(num_layers - 1) {
-            let candidates = beam_search(layer, &ep, query, 1)?;
+        for level in self.levels.iter().rev().take(num_layers - 1) {
+            let candidates = beam_search(level, &ep, query, 1)?;
             ep = select_neighbors(&candidates, 1).map(|(_, id)| id).collect();
+            ep = level.pointers(&ep);
         }
         let candidates = beam_search(&self.levels[0], &ep, query, ef)?;
         Ok(select_neighbors(&candidates, k)
