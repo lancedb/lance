@@ -18,15 +18,19 @@ use std::sync::Arc;
 use lance_core::{Error, Result};
 use snafu::{location, Location};
 
-use super::{memory::InMemoryVectorStorage, Graph, GraphNode, InMemoryGraph, OrderedFloat};
+use super::{memory::InMemoryVectorStorage, Graph, GraphNode, OrderedFloat};
 use crate::vector::graph::storage::VectorStorage;
 
 /// GraphNode during build.
-struct GraphBuilderNode {
+#[derive(Debug)]
+pub struct GraphBuilderNode {
     /// Node ID
-    id: u32,
+    pub(crate) id: u32,
     /// Neighbors, sorted by the distance.
-    neighbors: BTreeMap<OrderedFloat, u32>,
+    pub(crate) neighbors: BTreeMap<OrderedFloat, u32>,
+
+    /// Pointer to the next level of graph, or acts as the idx
+    pub pointer: u32,
 }
 
 impl GraphBuilderNode {
@@ -34,6 +38,7 @@ impl GraphBuilderNode {
         Self {
             id,
             neighbors: BTreeMap::new(),
+            pointer: 0,
         }
     }
 
@@ -65,9 +70,10 @@ impl From<&GraphBuilderNode> for GraphNode<u32> {
 
 /// Graph Builder.
 ///
+/// [GraphBuilder] is used to build a graph in memory.
 ///
 pub struct GraphBuilder {
-    nodes: BTreeMap<u32, GraphBuilderNode>,
+    pub(crate) nodes: BTreeMap<u32, GraphBuilderNode>,
 
     /// Storage for vectors.
     vectors: Arc<InMemoryVectorStorage>,
@@ -78,9 +84,9 @@ impl Graph for GraphBuilder {
         self.nodes.len()
     }
 
-    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>> {
+    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = &u32> + '_>> {
         let node = self.nodes.get(&key)?;
-        Some(Box::new(node.neighbors.values().copied()))
+        Some(Box::new(node.neighbors.values()))
     }
 
     fn storage(&self) -> Arc<dyn VectorStorage> {
@@ -132,17 +138,6 @@ impl GraphBuilder {
         node.prune(max_edges);
         Ok(())
     }
-
-    /// Build the Graph.
-    pub fn build(&self, storage: Arc<dyn VectorStorage>) -> Box<dyn Graph> {
-        Box::new(InMemoryGraph::from_builder(
-            self.nodes
-                .iter()
-                .map(|(&id, node)| (id, node.into()))
-                .collect(),
-            storage,
-        ))
-    }
 }
 
 #[cfg(test)]
@@ -163,10 +158,9 @@ mod tests {
         builder.insert(0);
         builder.insert(1);
         builder.connect(0, 1).unwrap();
-        let graph = builder.build(store);
-        assert_eq!(graph.len(), 2);
+        assert_eq!(builder.len(), 2);
 
-        assert_eq!(graph.neighbors(0).unwrap().collect::<Vec<_>>(), vec![1]);
-        assert_eq!(graph.neighbors(1).unwrap().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(builder.neighbors(0).unwrap().collect::<Vec<_>>(), vec![&1]);
+        assert_eq!(builder.neighbors(1).unwrap().collect::<Vec<_>>(), vec![&0]);
     }
 }

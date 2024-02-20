@@ -85,7 +85,7 @@ pub struct ProductQuantizationStorage {
 impl PartialEq for ProductQuantizationStorage {
     fn eq(&self, other: &Self) -> bool {
         self.metric_type.eq(&other.metric_type)
-            &&        self.codebook.eq(&other.codebook)
+            && self.codebook.eq(&other.codebook)
             && self.num_bits.eq(&other.num_bits)
             && self.num_sub_vectors.eq(&other.num_sub_vectors)
             && self.dimension.eq(&other.dimension)
@@ -329,7 +329,7 @@ impl VectorStorage for ProductQuantizationStorage {
             self.num_sub_vectors,
             self.pq_code.clone(),
             query,
-            MetricType::L2,
+            self.metric_type(),
         ))
     }
 }

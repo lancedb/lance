@@ -15,12 +15,11 @@
 //! Generic Graph implementation.
 //!
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::Hash;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use arrow_schema::{DataType, Field};
 use lance_core::{Error, Result};
-use num_traits::{AsPrimitive, PrimInt};
 use snafu::{location, Location};
 
 pub(crate) mod builder;
@@ -28,6 +27,14 @@ pub mod memory;
 pub(super) mod storage;
 
 use storage::VectorStorage;
+
+pub(crate) const NEIGHBORS_COL: &str = "__neighbors";
+
+lazy_static::lazy_static! {
+    /// NEIGHBORS field.
+    pub static ref NEIGHBORS_FIELD: Field =
+        Field::new(NEIGHBORS_COL, DataType::List(Field::new_list_field(DataType::UInt32, true).into()), true);
+}
 
 pub struct GraphNode<I = u32> {
     pub id: I,
@@ -96,7 +103,7 @@ pub trait DistanceCalculator {
 /// ---------------
 /// K: Vertex Index type
 /// T: the data type of vector, i.e., ``f32`` or ``f16``.
-pub trait Graph<K: PrimInt = u32> {
+pub trait Graph {
     /// Get the number of nodes in the graph.
     fn len(&self) -> usize;
 
@@ -106,21 +113,10 @@ pub trait Graph<K: PrimInt = u32> {
     }
 
     /// Get the neighbors of a graph node, identifyied by the index.
-    fn neighbors(&self, key: K) -> Option<Box<dyn Iterator<Item = K> + '_>>;
+    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = &u32> + '_>>;
 
     /// Access to underline storage
     fn storage(&self) -> Arc<dyn VectorStorage>;
-}
-
-/// Serializable Graph.
-///
-/// Type parameters
-/// ----------------
-/// I : Vertex Index type
-/// V : the data type of vector, i.e., ``f32`` or ``f16``.
-struct InMemoryGraph<I: PrimInt + Hash> {
-    pub nodes: HashMap<I, GraphNode<I>>,
-    vectors: Arc<dyn VectorStorage>,
 }
 
 /// Beam search over a graph
@@ -167,7 +163,7 @@ pub(super) fn beam_search(
             location: location!(),
         })?;
 
-        for neighbor in neighbors {
+        for &neighbor in neighbors {
             if visited.contains(&neighbor) {
                 continue;
             }
@@ -184,28 +180,6 @@ pub(super) fn beam_search(
         }
     }
     Ok(results)
-}
-
-impl<I: PrimInt + Hash + AsPrimitive<usize>> Graph<I> for InMemoryGraph<I> {
-    fn neighbors(&self, key: I) -> Option<Box<dyn Iterator<Item = I> + '_>> {
-        self.nodes
-            .get(&key)
-            .map(|n| Box::new(n.neighbors.iter().copied()) as Box<dyn Iterator<Item = I>>)
-    }
-
-    fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
-    fn storage(&self) -> Arc<dyn VectorStorage> {
-        self.vectors.clone()
-    }
-}
-
-impl<I: PrimInt + Hash + AsPrimitive<usize>> InMemoryGraph<I> {
-    fn from_builder(nodes: HashMap<I, GraphNode<I>>, vectors: Arc<dyn VectorStorage>) -> Self {
-        Self { nodes, vectors }
-    }
 }
 
 #[cfg(test)]
