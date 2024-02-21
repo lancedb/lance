@@ -14,7 +14,7 @@
 
 //! Hamming distance.
 
-/// Hamming distance between two buffers
+/// Hamming distance between two vectors.
 pub fn hamming(x: &[u8], y: &[u8]) -> u32 {
     x.iter()
         .zip(y.iter())
