@@ -1926,7 +1926,7 @@ mod tests {
             .as_primitive::<Float32Type>()
             .values()
             .iter()
-            .all(|&v| 0.0 <= v && v <= 1.0));
+            .all(|v| (0.0..=1.0).contains(v)));
 
         let pq_idx = ivf_idx
             .sub_index
@@ -1940,7 +1940,7 @@ mod tests {
             .as_primitive::<Float32Type>()
             .values()
             .iter()
-            .all(|&v| 0.0 <= v && v <= 1.0));
+            .all(|v| (0.0..=1.0).contains(v)));
 
         let dataset = Dataset::open(test_uri).await.unwrap();
 
