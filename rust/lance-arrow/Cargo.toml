@@ -17,6 +17,7 @@ crate-type = ["cdylib", "rlib"]
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-data = { workspace = true }
+arrow-cast ={ workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 half = { workspace = true }

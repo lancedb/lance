@@ -15,13 +15,14 @@
 //! Lance Dataset
 //!
 
+use arrow::compute::CastOptions;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::Array;
 use arrow_array::{
     cast::as_struct_array, RecordBatch, RecordBatchReader, StructArray, UInt64Array,
 };
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::interleave::interleave;
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::{prelude::*, Duration};
@@ -31,7 +32,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt, Stream};
 use lance_arrow::SchemaExt;
-use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::datatypes::{Field, SchemaCompareOptions};
 use lance_datafusion::utils::reader_to_stream;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
@@ -1483,7 +1484,8 @@ pub struct ColumnAlteration {
     pub rename: Option<String>,
     /// Whether the column is nullable. If None, the nullability will not be changed.
     pub nullable: Option<bool>,
-    // TODO: support changing data type.
+    /// The new data type of the column. If None, the data type will not be changed.
+    pub data_type: Option<DataType>,
 }
 
 impl ColumnAlteration {
@@ -1491,8 +1493,8 @@ impl ColumnAlteration {
         Self {
             path,
             rename: None,
-            // data_type: None,
             nullable: None,
+            data_type: None,
         }
     }
 
@@ -1504,6 +1506,35 @@ impl ColumnAlteration {
     pub fn set_nullable(mut self, nullable: bool) -> Self {
         self.nullable = Some(nullable);
         self
+    }
+
+    pub fn cast_to(mut self, data_type: DataType) -> Self {
+        self.data_type = Some(data_type);
+        self
+    }
+}
+
+/// Limit casts to same type. This is mostly to filter out weird casts like
+/// casting a string to a boolean or float to string.
+fn is_upcast_downcast(from_type: &DataType, to_type: &DataType) -> bool {
+    use DataType::*;
+    match from_type {
+        from_type if from_type.is_integer() => to_type.is_integer(),
+        from_type if from_type.is_floating() => to_type.is_floating(),
+        from_type if from_type.is_temporal() => to_type.is_temporal(),
+        Boolean => matches!(to_type, Boolean),
+        Utf8 | LargeUtf8 => matches!(to_type, Utf8 | LargeUtf8),
+        Binary | LargeBinary => matches!(to_type, Binary | LargeBinary),
+        Decimal128(_, _) | Decimal256(_, _) => {
+            matches!(to_type, Decimal128(_, _) | Decimal256(_, _))
+        }
+        List(from_field) | LargeList(from_field) | FixedSizeList(from_field, _) => match to_type {
+            List(to_field) | LargeList(to_field) | FixedSizeList(to_field, _) => {
+                is_upcast_downcast(from_field.data_type(), to_field.data_type())
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -1611,7 +1642,7 @@ impl Dataset {
         let schema = self.schema().merge(output_schema.as_ref())?;
 
         let fragments = self
-            .add_columns_impl(read_columns, mapper, result_checkpoint)
+            .add_columns_impl(read_columns, mapper, result_checkpoint, None)
             .await?;
         let operation = Operation::Merge { fragments, schema };
         let transaction = Transaction::new(self.manifest.version, operation, None);
@@ -1636,12 +1667,14 @@ impl Dataset {
         read_columns: Option<Vec<String>>,
         mapper: Box<dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send + Sync>,
         result_cache: Option<Arc<dyn UDFCheckpointStore>>,
+        schemas: Option<(Schema, Schema)>,
     ) -> Result<Vec<Fragment>> {
         let read_columns_ref = read_columns.as_deref();
         let mapper_ref = mapper.as_ref();
         let fragments = futures::stream::iter(self.get_fragments())
             .then(|fragment| {
                 let cache_ref = result_cache.clone();
+                let schemas_ref = &schemas;
                 async move {
                     if let Some(cache) = &cache_ref {
                         let fragment_id = fragment.id() as u32;
@@ -1651,7 +1684,9 @@ impl Dataset {
                         }
                     }
 
-                    let mut updater = fragment.updater(read_columns_ref).await?;
+                    let mut updater = fragment
+                        .updater(read_columns_ref, schemas_ref.clone())
+                        .await?;
 
                     let mut batch_index = 0;
                     // TODO: the structure of the updater prevents batch-level parallelism here,
@@ -1700,20 +1735,28 @@ impl Dataset {
         // the referenced columns actually exist.
         let mut new_schema = self.schema().clone();
 
+        // Mapping of old to new fields that need to be casted.
+        let mut cast_fields: Vec<(Field, Field)> = Vec::new();
+
+        let mut next_field_id = new_schema.max_field_id().unwrap_or_default() + 1;
+
         for alteration in alterations {
-            let field = self.schema().field(&alteration.path).ok_or_else(|| {
+            let field_src = self.schema().field(&alteration.path).ok_or_else(|| {
                 Error::invalid_input(
-                    format!("Column {} does not exist in the dataset", alteration.path),
+                    format!(
+                        "Column \"{}\" does not exist in the dataset",
+                        alteration.path
+                    ),
                     location!(),
                 )
             })?;
             if let Some(nullable) = alteration.nullable {
                 // TODO: in the future, we could check the values of the column to see if
                 //       they are all non-null and thus the column could be made non-nullable.
-                if field.nullable && !nullable {
+                if field_src.nullable && !nullable {
                     return Err(Error::invalid_input(
                         format!(
-                            "Column {} is already nullable and thus cannot be made non-nullable",
+                            "Column \"{}\" is already nullable and thus cannot be made non-nullable",
                             alteration.path
                         ),
                         location!(),
@@ -1721,23 +1764,110 @@ impl Dataset {
                 }
             }
 
-            let field_mut = new_schema.mut_field_by_id(field.id).unwrap();
+            let field_dest = new_schema.mut_field_by_id(field_src.id).unwrap();
             if let Some(rename) = &alteration.rename {
-                field_mut.name = rename.clone();
+                field_dest.name = rename.clone();
             }
             if let Some(nullable) = alteration.nullable {
-                field_mut.nullable = nullable;
+                field_dest.nullable = nullable;
+            }
+
+            if let Some(data_type) = &alteration.data_type {
+                if !(lance_arrow::cast::can_cast_types(&field_src.data_type(), data_type)
+                    && is_upcast_downcast(&field_src.data_type(), data_type))
+                {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "Cannot cast column \"{}\" from {:?} to {:?}",
+                            alteration.path,
+                            field_src.data_type(),
+                            data_type
+                        ),
+                        location!(),
+                    ));
+                }
+
+                let arrow_field = ArrowField::new(
+                    field_dest.name.clone(),
+                    data_type.clone(),
+                    field_dest.nullable,
+                );
+                *field_dest = Field::try_from(&arrow_field)?;
+                field_dest.set_id(field_src.parent_id, &mut next_field_id);
+
+                cast_fields.push((field_src.clone(), field_dest.clone()));
             }
         }
 
         new_schema.validate()?;
 
         // If we aren't casting a column, we don't need to touch the fragments.
-        let transaction = Transaction::new(
-            self.manifest.version,
-            Operation::Project { schema: new_schema },
-            None,
-        );
+        let transaction = if cast_fields.is_empty() {
+            Transaction::new(
+                self.manifest.version,
+                Operation::Project { schema: new_schema },
+                None,
+            )
+        } else {
+            // Otherwise, we need to re-write the relevant fields.
+            let read_columns = cast_fields
+                .iter()
+                .map(|(old, _new)| {
+                    let parts = self.schema().field_ancestry_by_id(old.id).unwrap();
+                    let part_names = parts.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+                    part_names.join(".")
+                })
+                .collect::<Vec<_>>();
+
+            let new_ids = cast_fields
+                .iter()
+                .map(|(_old, new)| new.id)
+                .collect::<Vec<_>>();
+            // This schema contains the exact field ids we want to write the new fields with.
+            let new_col_schema = new_schema.project_by_ids(&new_ids);
+
+            let mapper = move |batch: &RecordBatch| {
+                let mut fields = Vec::with_capacity(cast_fields.len());
+                let mut columns = Vec::with_capacity(batch.num_columns());
+                for (old, new) in &cast_fields {
+                    let old_column = batch[&old.name].clone();
+                    let new_column = lance_arrow::cast::cast_with_options(
+                        &old_column,
+                        &new.data_type(),
+                        // Safe: false means it will error if the cast is lossy.
+                        &CastOptions {
+                            safe: false,
+                            ..Default::default()
+                        },
+                    )?;
+                    columns.push(new_column);
+                    fields.push(Arc::new(ArrowField::from(new)));
+                }
+                let schema = Arc::new(ArrowSchema::new(fields));
+                Ok(RecordBatch::try_new(schema, columns)?)
+            };
+            let mapper = Box::new(mapper);
+
+            let fragments = self
+                .add_columns_impl(
+                    Some(read_columns),
+                    mapper,
+                    None,
+                    Some((new_col_schema, new_schema.clone())),
+                )
+                .await?;
+
+            Transaction::new(
+                self.manifest.version,
+                Operation::Merge {
+                    schema: new_schema,
+                    fragments,
+                },
+                None,
+            )
+        };
+
+        // TODO: adjust the indices here for the new schema
 
         let manifest = commit_transaction(
             self,
@@ -1906,6 +2036,7 @@ mod tests {
     use crate::index::scalar::ScalarIndexParams;
     use crate::index::vector::VectorIndexParams;
 
+    use arrow_array::types::Int64Type;
     use arrow_array::{
         builder::StringDictionaryBuilder,
         cast::{as_string_array, as_struct_array},
@@ -1914,11 +2045,12 @@ mod tests {
         Int8DictionaryArray, RecordBatch, RecordBatchIterator, StringArray, UInt16Array,
         UInt32Array,
     };
-    use arrow_array::{FixedSizeListArray, Float64Array};
+    use arrow_array::{FixedSizeListArray, Float16Array, Float64Array, ListArray};
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{DataType, Field, Fields as ArrowFields, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
+    use half::f16;
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
@@ -4403,6 +4535,183 @@ mod tests {
             metadata.clone(),
         );
         assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cast_column() -> Result<()> {
+        // Create a table with 2 scalar columns, 1 vector column
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("f", DataType::Float32, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 128),
+                false,
+            ),
+            Field::new("l", DataType::new_list(DataType::Int32, true), true),
+        ]));
+
+        let nrows = 512;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..nrows)),
+                Arc::new(Float32Array::from_iter_values((0..nrows).map(|i| i as f32))),
+                Arc::new(
+                    <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                        generate_random_array(128 * nrows as usize),
+                        128,
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+                    (0..nrows).map(|i| Some(vec![Some(i), Some(i + 1)])),
+                )),
+            ],
+        )?;
+
+        let test_dir = tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            test_uri,
+            None,
+        )
+        .await?;
+
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 50);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await?;
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await?;
+        dataset.validate().await?;
+
+        let indices = dataset.load_indices().await?;
+        assert_eq!(indices.len(), 2);
+
+        // Cast a scalar column to another type, nullability
+        dataset
+            .alter_columns(&[ColumnAlteration::new("f".into())
+                .cast_to(DataType::Float16)
+                .set_nullable(true)])
+            .await?;
+        dataset.validate().await?;
+        let expected_schema = ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("f", DataType::Float16, true),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 128),
+                false,
+            ),
+            Field::new("l", DataType::new_list(DataType::Int32, true), true),
+        ]);
+        assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
+
+        // Each fragment gains a file with the new columns
+        dataset.fragments().iter().for_each(|f| {
+            assert_eq!(f.files.len(), 2);
+        });
+
+        // Cast scalar column with index, should not keep index (TODO: keep it)
+        dataset
+            .alter_columns(&[ColumnAlteration::new("i".into()).cast_to(DataType::Int64)])
+            .await?;
+        dataset.validate().await?;
+
+        let expected_schema = ArrowSchema::new(vec![
+            Field::new("i", DataType::Int64, false),
+            Field::new("f", DataType::Float16, true),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 128),
+                false,
+            ),
+            Field::new("l", DataType::new_list(DataType::Int32, true), true),
+        ]);
+        assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
+
+        // We currently lose the index when casting a column
+        let indices = dataset.load_indices().await?;
+        assert_eq!(indices.len(), 1);
+
+        // Each fragment gains a file with the new columns
+        dataset.fragments().iter().for_each(|f| {
+            assert_eq!(f.files.len(), 3);
+        });
+
+        // Cast vector column, should not keep index (TODO: keep it)
+        dataset
+            .alter_columns(&[
+                ColumnAlteration::new("vec".into()).cast_to(DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float16, true)),
+                    128,
+                )),
+            ])
+            .await?;
+        dataset.validate().await?;
+
+        // Finally, case list column to show we can handle children.
+        dataset
+            .alter_columns(&[ColumnAlteration::new("l".into())
+                .cast_to(DataType::new_list(DataType::Int64, true))])
+            .await?;
+        dataset.validate().await?;
+
+        let expected_schema = ArrowSchema::new(vec![
+            Field::new("i", DataType::Int64, false),
+            Field::new("f", DataType::Float16, true),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float16, true)), 128),
+                false,
+            ),
+            Field::new("l", DataType::new_list(DataType::Int64, true), true),
+        ]);
+        assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
+
+        // We currently lose the index when casting a column
+        let indices = dataset.load_indices().await?;
+        assert_eq!(indices.len(), 0);
+
+        // Each fragment gains a file with the new columns
+        dataset.fragments().iter().for_each(|f| {
+            assert_eq!(f.files.len(), 5);
+        });
+
+        let expected_data = RecordBatch::try_new(
+            Arc::new(expected_schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..nrows as i64)),
+                Arc::new(Float16Array::from_iter_values(
+                    (0..nrows).map(|i| f16::from_f32(i as f32)),
+                )),
+                lance_arrow::cast::cast_with_options(
+                    batch["vec"].as_ref(),
+                    &DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float16, true)),
+                        128,
+                    ),
+                    &Default::default(),
+                )?,
+                Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+                    (0..nrows as i64).map(|i| Some(vec![Some(i), Some(i + 1)])),
+                )),
+            ],
+        )?;
+        let actual_data = dataset.scan().try_into_batch().await?;
+        assert_eq!(actual_data, expected_data);
 
         Ok(())
     }
