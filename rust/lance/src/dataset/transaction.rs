@@ -127,6 +127,7 @@ pub enum Operation {
     Merge {
         fragments: Vec<Fragment>,
         schema: Schema,
+        rewritten_indices: Vec<RewrittenIndex>,
     },
     /// Restore an old version of the database
     Restore { version: u64 },
@@ -736,11 +737,16 @@ impl TryFrom<&pb::Transaction> for Transaction {
             },
             Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
                 fragments,
+                rewritten_indices,
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
             })) => Operation::Merge {
                 fragments: fragments.iter().map(Fragment::from).collect(),
                 schema: Schema::from(&Fields(schema.clone())),
+                rewritten_indices: rewritten_indices
+                    .iter()
+                    .map(RewrittenIndex::try_from)
+                    .collect::<Result<_>>()?,
             },
             Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
                 Operation::Restore { version: *version }
@@ -779,10 +785,10 @@ impl TryFrom<&pb::Transaction> for Transaction {
     }
 }
 
-impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
+impl TryFrom<&pb::transaction::RewrittenIndex> for RewrittenIndex {
     type Error = Error;
 
-    fn try_from(message: &pb::transaction::rewrite::RewrittenIndex) -> Result<Self> {
+    fn try_from(message: &pb::transaction::RewrittenIndex) -> Result<Self> {
         Ok(Self {
             old_id: message
                 .old_id
@@ -868,9 +874,17 @@ impl From<&Transaction> for pb::Transaction {
                 new_indices: new_indices.iter().map(IndexMetadata::from).collect(),
                 removed_indices: removed_indices.iter().map(IndexMetadata::from).collect(),
             }),
-            Operation::Merge { fragments, schema } => {
+            Operation::Merge {
+                fragments,
+                schema,
+                rewritten_indices,
+            } => {
                 pb::transaction::Operation::Merge(pb::transaction::Merge {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                    rewritten_indices: rewritten_indices
+                        .iter()
+                        .map(|rewritten| rewritten.into())
+                        .collect(),
                     schema: Fields::from(schema).0,
                     schema_metadata: Default::default(), // TODO: handle metadata
                 })
@@ -906,7 +920,7 @@ impl From<&Transaction> for pb::Transaction {
     }
 }
 
-impl From<&RewrittenIndex> for pb::transaction::rewrite::RewrittenIndex {
+impl From<&RewrittenIndex> for pb::transaction::RewrittenIndex {
     fn from(value: &RewrittenIndex) -> Self {
         Self {
             old_id: Some((&value.old_id).into()),
@@ -965,6 +979,7 @@ mod tests {
             Operation::Merge {
                 fragments: vec![fragment0.clone(), fragment2.clone()],
                 schema: Schema::default(),
+                rewritten_indices: vec![],
             },
             Operation::Overwrite {
                 fragments: vec![fragment0.clone(), fragment2.clone()],
@@ -1059,6 +1074,7 @@ mod tests {
                 Operation::Merge {
                     fragments: vec![fragment0.clone(), fragment2.clone()],
                     schema: Schema::default(),
+                    rewritten_indices: vec![],
                 },
                 // Merge conflicts with everything except CreateIndex and ReserveFragments.
                 [true, false, true, true, true, true, false, true],

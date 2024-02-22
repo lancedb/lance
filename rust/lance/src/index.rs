@@ -22,6 +22,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_core::datatypes::Field;
 use lance_file::reader::FileReader;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
@@ -58,7 +59,7 @@ use crate::{dataset::Dataset, Error, Result};
 
 use self::append::merge_indices;
 use self::scalar::build_scalar_index;
-use self::vector::{build_vector_index, VectorIndex, VectorIndexParams};
+use self::vector::{build_vector_index, cast_vector_index, VectorIndex, VectorIndexParams};
 
 /// Builds index.
 #[async_trait]
@@ -122,6 +123,49 @@ pub(crate) async fn remap_index(
                 row_id_map,
             )
             .await?;
+        }
+    }
+
+    Ok(new_id)
+}
+
+pub(crate) async fn cast_index(
+    dataset: &Dataset,
+    index_id: &Uuid,
+    from_field: &Field,
+    to_field: &Field,
+) -> Result<Uuid> {
+    let indices = dataset.load_indices().await?;
+    let matched = indices
+        .iter()
+        .find(|i| i.uuid == *index_id)
+        .ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", index_id),
+            location: location!(),
+        })?;
+
+    if matched.fields.len() > 1 {
+        return Err(Error::Index {
+            message: "Casting indices with multiple fields is not supported".to_string(),
+            location: location!(),
+        });
+    }
+
+    let new_id = Uuid::new_v4();
+
+    let generic = dataset
+        .open_generic_index(&from_field.name, &index_id.to_string())
+        .await?;
+
+    match generic.index_type() {
+        IndexType::Scalar => {
+            return Err(Error::NotSupported {
+                source: "Casting scalar indices is not supported".into(),
+                location: location!(),
+            })
+        }
+        IndexType::Vector => {
+            cast_vector_index(dataset, generic, &new_id, from_field, to_field).await?;
         }
     }
 

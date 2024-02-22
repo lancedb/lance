@@ -35,6 +35,7 @@ use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, SchemaCompareOptions};
 use lance_datafusion::utils::reader_to_stream;
 use lance_file::datatypes::populate_schema_dictionary;
+use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::WriteExt;
@@ -70,10 +71,11 @@ use self::cleanup::RemovalStats;
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
-use self::transaction::{Operation, Transaction};
+use self::transaction::{Operation, RewrittenIndex, Transaction};
 use self::write::write_fragments_internal;
 use crate::datatypes::Schema;
 use crate::error::box_error;
+use crate::index::cast_index;
 use crate::io::commit::{commit_new_dataset, commit_transaction};
 use crate::io::exec::Planner;
 use crate::session::Session;
@@ -866,6 +868,7 @@ impl Dataset {
             Operation::Merge {
                 fragments: updated_fragments,
                 schema: new_schema,
+                rewritten_indices: vec![],
             },
             None,
         );
@@ -1643,7 +1646,11 @@ impl Dataset {
         let fragments = self
             .add_columns_impl(read_columns, mapper, result_checkpoint, None)
             .await?;
-        let operation = Operation::Merge { fragments, schema };
+        let operation = Operation::Merge {
+            fragments,
+            schema,
+            rewritten_indices: vec![],
+        };
         let transaction = Transaction::new(self.manifest.version, operation, None);
         let new_manifest = commit_transaction(
             self,
@@ -1825,6 +1832,8 @@ impl Dataset {
             // This schema contains the exact field ids we want to write the new fields with.
             let new_col_schema = new_schema.project_by_ids(&new_ids);
 
+            let cast_fields_copy = cast_fields.clone();
+
             let mapper = move |batch: &RecordBatch| {
                 let mut fields = Vec::with_capacity(cast_fields.len());
                 let mut columns = Vec::with_capacity(batch.num_columns());
@@ -1856,11 +1865,34 @@ impl Dataset {
                 )
                 .await?;
 
+            // Also need to cast the indices, if possible.
+            let vector_indices = self.load_indices().await?;
+            let mut rewritten_indices = Vec::new();
+            for (from_field, to_field) in cast_fields_copy.iter() {
+                let affected_indices = vector_indices
+                    .iter()
+                    .filter(|index| index.fields.len() == 1 && index.fields[0] == from_field.id)
+                    .collect::<Vec<_>>();
+                for index in affected_indices {
+                    let res = cast_index(&self, &index.uuid, from_field, to_field).await;
+                    match res {
+                        Ok(new_id) => rewritten_indices.push(RewrittenIndex {
+                            old_id: index.uuid.clone(),
+                            new_id,
+                        }),
+                        // If it's not yet supported, we just skip it.
+                        Err(Error::NotSupported { .. }) => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+
             Transaction::new(
                 self.manifest.version,
                 Operation::Merge {
                     schema: new_schema,
                     fragments,
+                    rewritten_indices,
                 },
                 None,
             )
@@ -4672,7 +4704,7 @@ mod tests {
             assert_eq!(f.files.len(), 3);
         });
 
-        // Cast vector column, should not keep index (TODO: keep it)
+        // Cast vector column, should keep it
         dataset
             .alter_columns(&[
                 ColumnAlteration::new("vec".into()).cast_to(DataType::FixedSizeList(
@@ -4702,9 +4734,9 @@ mod tests {
         ]);
         assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
 
-        // We currently lose the index when casting a column
+        // We keep vector indices when casting a column
         let indices = dataset.load_indices().await?;
-        assert_eq!(indices.len(), 0);
+        assert_eq!(indices.len(), 1);
 
         // Each fragment gains a file with the new columns
         dataset.fragments().iter().for_each(|f| {

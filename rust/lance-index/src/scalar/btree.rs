@@ -35,9 +35,7 @@ use datafusion_physical_expr::{
     PhysicalSortExpr,
 };
 use futures::{
-    future::BoxFuture,
-    stream::{self},
-    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
+    future::BoxFuture, stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{Error, Result};
 use lance_datafusion::{

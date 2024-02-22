@@ -27,11 +27,12 @@ mod utils;
 #[cfg(test)]
 mod fixture_test;
 
+use lance_core::datatypes::Field;
 use lance_file::reader::FileReader;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::{hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams};
-use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
+use lance_index::{Index, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
@@ -290,6 +291,17 @@ pub(crate) async fn remap_vector_index(
     )
     .await?;
     Ok(())
+}
+
+#[instrument(level = "debug", skip_all, fields(new_uuid = new_uuid.to_string(), dataset_uri = dataset.base.to_string(), column = from_field.name))]
+pub(crate) async fn cast_vector_index(
+    dataset: &Dataset,
+    index: Arc<dyn Index>,
+    new_uuid: &Uuid,
+    from_field: &Field,
+    to_field: &Field,
+) -> Result<()> {
+    todo!()
 }
 
 /// Open the Vector index on dataset, specified by the `uuid`.

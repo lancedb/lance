@@ -87,6 +87,15 @@ message Transaction {
     repeated IndexMetadata removed_indices = 2;
   }
 
+  // During a rewrite an index may be rewritten.  We only serialize the UUID
+  // since a rewrite should not change the other index parameters.
+  message RewrittenIndex {
+    // The id of the index that will be replaced
+    UUID old_id = 1;
+    // the id of the new index
+    UUID new_id = 2;
+  }
+
   // An operation that rewrites but does not change the data in the table. These
   // kinds of operations just rearrange data.
   message Rewrite {
@@ -102,15 +111,6 @@ message Transaction {
     //
     // These fragments IDs are not yet assigned.
     repeated DataFragment new_fragments = 2;
-
-    // During a rewrite an index may be rewritten.  We only serialize the UUID
-    // since a rewrite should not change the other index parameters.
-    message RewrittenIndex {
-      // The id of the index that will be replaced
-      UUID old_id = 1;
-      // the id of the new index
-      UUID new_id = 2;
-    }
 
     // A group of rewrite files that are all part of the same rewrite.
     message RewriteGroup {
@@ -139,6 +139,8 @@ message Transaction {
     repeated DataFragment fragments = 1;
     // The new schema
     repeated lance.file.Field schema = 2;
+    // Migrated index ids
+    repeated RewrittenIndex rewritten_indices = 4;
     // Schema metadata.
     map<string, bytes> schema_metadata = 3;
   }
