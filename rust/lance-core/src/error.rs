@@ -86,10 +86,13 @@ pub enum Error {
     InvalidTableLocation { message: String },
     /// Stream early stop
     Stop,
+    #[snafu(display("Wrapped error: {error}, {location}"))]
     Wrapped {
         error: BoxedError,
         location: Location,
     },
+    #[snafu(display("Cloned error: {message}, {location}"))]
+    Cloned { message: String, location: Location },
 }
 
 impl Error {
@@ -294,6 +297,31 @@ impl From<Error> for object_store::Error {
 #[track_caller]
 pub fn get_caller_location() -> &'static std::panic::Location<'static> {
     std::panic::Location::caller()
+}
+
+/// Wrap an error in a new error type that implements Clone
+///
+/// This is useful when two threads/streams share a common fallible source
+/// The base error will always have the full error.  Any cloned results will
+/// only have Error::Cloned with the to_string of the base error.
+pub struct CloneableError(pub Error);
+
+impl Clone for CloneableError {
+    fn clone(&self) -> Self {
+        Self(Error::Cloned {
+            message: self.0.to_string(),
+            location: std::panic::Location::caller().to_snafu_location(),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct CloneableResult<T: Clone>(pub std::result::Result<T, CloneableError>);
+
+impl<T: Clone> From<Result<T>> for CloneableResult<T> {
+    fn from(result: Result<T>) -> Self {
+        Self(result.map_err(CloneableError))
+    }
 }
 
 #[cfg(test)]
