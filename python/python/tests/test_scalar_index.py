@@ -99,7 +99,7 @@ def test_indexed_vector_scan(indexed_dataset: lance.LanceDataset, data_table: pa
 
     def check_result(table: pa.Table):
         assert table.num_rows == 1
-        assert table.num_columns == 3
+        assert table.num_columns == 2
 
         actual_price = table["price"][0]
         assert actual_price == expected_price
