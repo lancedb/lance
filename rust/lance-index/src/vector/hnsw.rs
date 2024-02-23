@@ -17,7 +17,7 @@
 //! Hierarchical Navigable Small World (HNSW).
 //!
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
@@ -336,6 +336,45 @@ fn select_neighbors(
     k: usize,
 ) -> impl Iterator<Item = (OrderedFloat, u32)> + '_ {
     orderd_candidates.iter().take(k).map(|(&d, &u)| (d, u))
+}
+
+/// Algorithm 4 in the HNSW paper.
+fn select_neighbors_heuristic(
+    graph: &dyn Graph,
+    orderd_candidates: &BTreeMap<OrderedFloat, u32>,
+    k: usize,
+    extended_candidates: bool,
+    keep_pruned_connections: bool,
+) -> impl Iterator<Item = (OrderedFloat, u32)> {
+    let mut results = BTreeMap::new();
+    let mut w = orderd_candidates.values().cloned().collect::<HashSet<_>>();
+    // W in paper
+    let mut candidates = orderd_candidates.clone();
+    if extended_candidates {
+        orderd_candidates.iter().for_each(|(_, &u)| {
+            if let Some(neighbors) = graph.neighbors(u).map(|n| n.cloned().collect::<Vec<_>>()) {
+                neighbors.iter().filter(|&n| !w.contains(n)).for_each(|n| {
+                    candidates.insert(OrderedFloat(0.0), *n);
+                });
+                w.extend(neighbors);
+            }
+        });
+    }
+    let mut discarded = BTreeMap::<OrderedFloat, u32>::new();
+    while !candidates.is_empty() && results.len() < k {
+        let (d, u) = candidates.pop_first().unwrap();
+        if let Some((&key, &value)) = results.first_key_value() {
+            if key < d {
+                candidates.insert(key, value);
+            } else {
+                discarded.insert(d, u);
+            }
+        } else {
+            results.insert(d, u);
+        }
+    }
+
+    results.into_iter()
 }
 
 #[cfg(test)]
