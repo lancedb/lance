@@ -22,13 +22,10 @@ use arrow_array::{cast::AsArray, Array, ArrayRef, UInt8Array};
 use lance_core::{Error, Result};
 use snafu::{location, Location};
 
+#[derive(Clone, Default)]
 pub struct BinaryQuantization {}
 
 impl BinaryQuantization {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     /// Transform an array of float vectors to binary vectors.
     pub async fn transform(&self, data: &dyn Array) -> Result<ArrayRef> {
         let fsl = data
@@ -56,7 +53,7 @@ impl BinaryQuantization {
         let code = data
             .values()
             .chunks_exact(dim)
-            .flat_map(|c| binary_quantization(c))
+            .flat_map(binary_quantization)
             .collect::<Vec<_>>();
 
         Ok(Arc::new(UInt8Array::from(code)))
@@ -73,17 +70,16 @@ fn binary_quantization(data: &[f32]) -> impl Iterator<Item=u8> + '_ {
             // Auto vectorized.
             // Before changing this code, please check the assembly output.
             let mut bits: u8 = 0;
-            for i in 0..8 {
-                bits |= (c[i].is_sign_positive() as u8) << i;
-            }
+            c.iter().enumerate().for_each(|(idx, v)| {
+                bits |= (v.is_sign_positive() as u8) << idx;
+            });
             bits
         })
         .chain(once(0).map(move |_| {
-            let c = iter.remainder();
             let mut bits: u8 = 0;
-            for i in 0..c.len() {
-                bits |= (c[i].is_sign_positive() as u8) << i;
-            }
+            iter.remainder().iter().enumerate().for_each(|(idx, v)| {
+                bits |= (v.is_sign_positive() as u8) << idx;
+            });
             bits
         }))
 }
