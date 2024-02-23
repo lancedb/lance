@@ -20,6 +20,7 @@ use std::sync::Arc;
 use arrow_array::types::Float32Type;
 use arrow_array::{cast::AsArray, Array, ArrayRef, UInt8Array};
 use lance_core::{Error, Result};
+use num_traits::Float;
 use snafu::{location, Location};
 
 #[derive(Clone, Default)]
@@ -63,7 +64,7 @@ impl BinaryQuantization {
 /// Binary quantization.
 ///
 /// Use the sign bit of the float vector to represent the binary vector.
-fn binary_quantization(data: &[f32]) -> impl Iterator<Item = u8> + '_ {
+fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item=u8> + '_ {
     let iter = data.chunks_exact(8);
     iter.clone()
         .map(|c| {
@@ -88,11 +89,22 @@ fn binary_quantization(data: &[f32]) -> impl Iterator<Item = u8> + '_ {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_binary_quantization() {
-        let data = vec![1.0, -1.0, 1.0, -5.0, -7.0, -1.0, 1.0, -1.0, -0.2, 1.2, 3.2];
+    use half::f16;
+
+    fn test_bq<T: Float>() {
+        let data: Vec<T> = [1.0, -1.0, 1.0, -5.0, -7.0, -1.0, 1.0, -1.0, -0.2, 1.2, 3.2]
+            .iter()
+            .map(|&v| T::from(v).unwrap())
+            .collect();
         let expected = vec![0b01000101, 0b00000110];
         let result = binary_quantization(&data).collect::<Vec<_>>();
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_binary_quantization() {
+        test_bq::<f16>();
+        test_bq::<f32>();
+        test_bq::<f64>();
     }
 }
