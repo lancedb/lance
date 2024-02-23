@@ -18,6 +18,7 @@
 use arrow_array::ArrayRef;
 use lance_linalg::distance::MetricType;
 
+pub mod bq;
 pub mod flat;
 pub mod graph;
 pub mod hnsw;
