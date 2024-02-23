@@ -64,7 +64,7 @@ impl BinaryQuantization {
 /// Binary quantization.
 ///
 /// Use the sign bit of the float vector to represent the binary vector.
-fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item=u8> + '_ {
+fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item = u8> + '_ {
     let iter = data.chunks_exact(8);
     iter.clone()
         .map(|c| {
