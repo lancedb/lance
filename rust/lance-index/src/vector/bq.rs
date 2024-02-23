@@ -89,7 +89,7 @@ fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item=u8> + '_ {
 mod tests {
     use super::*;
 
-    use half::f16;
+    use half::{bf16, f16};
 
     fn test_bq<T: Float>() {
         let data: Vec<T> = [1.0, -1.0, 1.0, -5.0, -7.0, -1.0, 1.0, -1.0, -0.2, 1.2, 3.2]
@@ -103,6 +103,7 @@ mod tests {
 
     #[test]
     fn test_binary_quantization() {
+        test_bq::<bf16>();
         test_bq::<f16>();
         test_bq::<f32>();
         test_bq::<f64>();
