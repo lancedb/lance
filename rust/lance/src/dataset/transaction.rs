@@ -489,6 +489,10 @@ impl Transaction {
             }
             Operation::Merge { ref fragments, .. } => {
                 final_fragments.extend(fragments.clone());
+
+                // Some fields that have indices may have been removed, so we should
+                // remove those indices as well.
+                Self::retain_relevant_indices(&mut final_indices, &schema)
             }
             Operation::Project { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());

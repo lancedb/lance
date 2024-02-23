@@ -376,15 +376,45 @@ impl Field {
             .collect::<Vec<_>>();
         if !children.is_empty() || filter(self) {
             Some(Self {
-                name: self.name.clone(),
-                id: self.id,
-                parent_id: self.parent_id,
-                logical_type: self.logical_type.clone(),
-                metadata: self.metadata.clone(),
-                encoding: self.encoding.clone(),
-                nullable: self.nullable,
                 children,
-                dictionary: self.dictionary.clone(),
+                ..self.clone()
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Create a new field by selecting fields by their ids.
+    ///
+    /// If a field has it's id in the list of ids then it will be included
+    /// in the new field. If a field is selected, all of it's parents will be
+    /// and all of it's children will be included.
+    ///
+    /// For example, for the schema:
+    ///
+    /// ```text
+    /// 0: x struct {
+    ///     1: y int32
+    ///     2: l list {
+    ///         3: z int32
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// If the ids are `[2]`, then this will include the parent `0` and the
+    /// child `3`.
+    pub(crate) fn project_by_ids(&self, ids: &[i32]) -> Option<Self> {
+        let children = self
+            .children
+            .iter()
+            .filter_map(|c| c.project_by_ids(ids))
+            .collect::<Vec<_>>();
+        if ids.contains(&self.id) {
+            Some(self.clone())
+        } else if !children.is_empty() {
+            Some(Self {
+                children,
+                ..self.clone()
             })
         } else {
             None
@@ -610,7 +640,7 @@ impl Field {
     }
 
     /// Recursively set field ID and parent ID for this field and all its children.
-    pub(super) fn set_id(&mut self, parent_id: i32, id_seed: &mut i32) {
+    pub fn set_id(&mut self, parent_id: i32, id_seed: &mut i32) {
         self.parent_id = parent_id;
         if self.id < 0 {
             self.id = *id_seed;

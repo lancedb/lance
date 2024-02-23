@@ -653,12 +653,36 @@ impl Dataset {
                     obj.get_item("name")?.map(|n| n.extract()).transpose()?;
                 let nullable: Option<bool> =
                     obj.get_item("nullable")?.map(|n| n.extract()).transpose()?;
+                let data_type: Option<PyArrowType<DataType>> = obj
+                    .get_item("data_type")?
+                    .map(|n| n.extract())
+                    .transpose()?;
+
+                for key in obj.keys().iter().map(|k| k.extract::<String>()) {
+                    let k = key?;
+                    if k != "path" && k != "name" && k != "nullable" && k != "data_type" {
+                        return Err(PyValueError::new_err(format!(
+                            "Unknown key: {}. Valid keys are name, nullable, and data_type.",
+                            k
+                        )));
+                    }
+                }
+
+                if name.is_none() && nullable.is_none() && data_type.is_none() {
+                    return Err(PyValueError::new_err(
+                        "At least one of name, nullable, or data_type must be specified",
+                    ));
+                }
+
                 let mut alteration = ColumnAlteration::new(path);
                 if let Some(name) = name {
                     alteration = alteration.rename(name);
                 }
                 if let Some(nullable) = nullable {
                     alteration = alteration.set_nullable(nullable);
+                }
+                if let Some(data_type) = data_type {
+                    alteration = alteration.cast_to(data_type.0);
                 }
                 Ok(alteration)
             })

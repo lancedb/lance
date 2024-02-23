@@ -55,6 +55,9 @@ pub struct IvfBuildParams {
     pub shuffle_partition_batches: usize,
 
     pub shuffle_partition_concurrency: usize,
+
+    /// Use residual vectors to build sub-vector.
+    pub use_residual: bool,
 }
 
 impl Default for IvfBuildParams {
@@ -68,6 +71,7 @@ impl Default for IvfBuildParams {
             precomputed_shuffle_buffers: None,
             shuffle_partition_batches: 1024 * 10,
             shuffle_partition_concurrency: 2,
+            use_residual: true,
         }
     }
 }
