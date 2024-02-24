@@ -138,6 +138,35 @@ impl GraphBuilder {
         node.prune(max_edges);
         Ok(())
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn stats(&self) -> GraphBuilderStats {
+        let mut max_edges = 0;
+        let mut total_edges = 0;
+        let mut total_distance = 0.0;
+
+        for node in self.nodes.values() {
+            let edges = node.neighbors.len();
+            total_edges += edges;
+            max_edges = max_edges.max(edges);
+            total_distance += node.neighbors.keys().map(|d| d.0).sum::<f32>();
+        }
+
+        GraphBuilderStats {
+            num_nodes: self.nodes.len(),
+            max_edges,
+            mean_edges: total_edges as f32 / self.nodes.len() as f32,
+            mean_distance: total_distance / total_edges as f32,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct GraphBuilderStats {
+    pub num_nodes: usize,
+    pub max_edges: usize,
+    pub mean_edges: f32,
+    pub mean_distance: f32,
 }
 
 #[cfg(test)]

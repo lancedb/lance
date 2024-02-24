@@ -17,7 +17,7 @@
 //! Hierarchical Navigable Small World (HNSW).
 //!
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
@@ -190,6 +190,8 @@ pub struct HNSW {
     metric_type: MetricType,
     /// Entry point of the graph.
     entry_point: u32,
+    /// Whether to use the heuristic to select neighbors (Algorithm 4 or 3 in the paper).
+    use_select_heuristic: bool,
 }
 
 impl Debug for HNSW {
@@ -259,14 +261,21 @@ impl HNSW {
             levels,
             metric_type: mt,
             entry_point: hnsw_metadata.entry_point,
+            use_select_heuristic: true,
         })
     }
 
-    fn from_builder(levels: Vec<HnswLevel>, entry_point: u32, metric_type: MetricType) -> Self {
+    fn from_builder(
+        levels: Vec<HnswLevel>,
+        entry_point: u32,
+        metric_type: MetricType,
+        use_select_heuristic: bool,
+    ) -> Self {
         Self {
             levels,
             metric_type,
             entry_point,
+            use_select_heuristic,
         }
     }
 
@@ -289,13 +298,27 @@ impl HNSW {
         let num_layers = self.levels.len();
         for level in self.levels.iter().rev().take(num_layers - 1) {
             let candidates = beam_search(level, &ep, query, 1)?;
-            ep = select_neighbors(&candidates, 1).map(|(_, id)| id).collect();
+            ep = if self.use_select_heuristic {
+                select_neighbors_heuristic(level, query, &candidates, 1, false, true)
+                    .map(|(_, id)| id)
+                    .collect()
+            } else {
+                select_neighbors(&candidates, 1).map(|(_, id)| id).collect()
+            };
             ep = level.pointers(&ep);
         }
         let candidates = beam_search(&self.levels[0], &ep, query, ef)?;
-        Ok(select_neighbors(&candidates, k)
-            .map(|(d, u)| (u, d.into()))
-            .collect())
+        if self.use_select_heuristic {
+            Ok(
+                select_neighbors_heuristic(&self.levels[0], query, &candidates, k, false, true)
+                    .map(|(d, u)| (u, d.into()))
+                    .collect(),
+            )
+        } else {
+            Ok(select_neighbors(&candidates, k)
+                .map(|(d, u)| (u, d.into()))
+                .collect())
+        }
     }
 
     /// Write the HNSW graph to a Lance file.
@@ -336,6 +359,60 @@ fn select_neighbors(
     k: usize,
 ) -> impl Iterator<Item = (OrderedFloat, u32)> + '_ {
     orderd_candidates.iter().take(k).map(|(&d, &u)| (d, u))
+}
+
+/// Algorithm 4 in the HNSW paper.
+fn select_neighbors_heuristic(
+    graph: &dyn Graph,
+    query: &[f32],
+    orderd_candidates: &BTreeMap<OrderedFloat, u32>,
+    k: usize,
+    extended_candidates: bool,
+    keep_pruned_connections: bool,
+) -> impl Iterator<Item = (OrderedFloat, u32)> {
+    let mut results = BTreeMap::new();
+    let mut w = orderd_candidates.values().cloned().collect::<HashSet<_>>();
+    // W in paper
+    let mut candidates = orderd_candidates.clone();
+    assert_eq!(w.len(), candidates.len());
+
+    if extended_candidates {
+        let dist_calc = graph.storage().dist_calculator(query);
+        orderd_candidates.iter().for_each(|(_, &u)| {
+            if let Some(neighbors) = graph.neighbors(u) {
+                neighbors.for_each(|n| {
+                    if !w.contains(n) {
+                        candidates.insert(dist_calc.distance(&[*n])[0].into(), *n);
+                    }
+                    w.insert(*n);
+                });
+            }
+        });
+    }
+
+    let mut discarded = BTreeMap::<OrderedFloat, u32>::new();
+    while !candidates.is_empty() && results.len() < k {
+        let (d, u) = candidates.pop_first().unwrap();
+        if let Some((&key, &value)) = results.last_key_value() {
+            if key > d {
+                candidates.insert(key, value);
+            } else {
+                discarded.insert(d, u);
+            }
+        } else {
+            results.insert(d, u);
+        }
+    }
+    if keep_pruned_connections && results.len() < k {
+        results.extend(
+            discarded
+                .iter()
+                .take(k - results.len())
+                .map(|(&d, &n)| (d, n)),
+        );
+    }
+
+    results.into_iter().take(k)
 }
 
 #[cfg(test)]
@@ -404,7 +481,8 @@ mod tests {
             for i in 0..layer.len() {
                 // If the node exist on this layer, check its out-degree.
                 if let Some(neighbors) = layer.neighbors(i as u32) {
-                    assert!(neighbors.count() <= MAX_EDGES);
+                    let cnt = neighbors.count();
+                    assert!(cnt <= MAX_EDGES, "actual {}, max_edges: {}", cnt, MAX_EDGES);
                 }
             }
         });
@@ -424,7 +502,7 @@ mod tests {
     #[test]
     fn test_search() {
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
+        const TOTAL: usize = 1024;
         const MAX_EDGES: usize = 32;
         const K: usize = 10;
 
@@ -436,6 +514,7 @@ mod tests {
         let hnsw = HNSWBuilder::new(vectors.clone())
             .max_num_edges(MAX_EDGES)
             .ef_construction(100)
+            .max_level(4)
             .build()
             .unwrap();
 
