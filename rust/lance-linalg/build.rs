@@ -41,11 +41,16 @@ fn main() {
         // Build a version with AVX512
         if let Err(err) = build_f16_with_flags("avx512", &["-march=sapphirerapids"]) {
             // It's likely the compiler doesn't support the sapphirerapids architecture
+            // Clang 12 and GCC 11 are the first versions with sapphire rapids support
             eprintln!("Skipping Sapphire Rapids build due to error: {}", err);
         } else {
-            println!("cargo:rustc-cfg=\"avx512\"");
+            // We create a special cfg so that we can detect we have in fact
+            // generated the AVX512 version of the f16 kernels.
+            println!("cargo:rustc-cfg=kernel_suppport=\"avx512\"");
         };
         // Build a version with AVX
+        // While GCC doesn't have support for _Float16 until GCC 12, clang
+        // has support for __fp16 going back to at least clang 6.
         build_f16_with_flags("avx2", &["-march=broadwell"]).unwrap();
         // There is no SSE instruction set for f16 -> f32 float conversion
     }

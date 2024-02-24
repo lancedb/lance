@@ -35,7 +35,9 @@ lance-testing = { path = "../lance-testing" }
 cc = "1.0.83"
 
 [features]
-default = ["fp16kernels"]
+# Enable compiling multiple C kernels for fp16 SIMD computations.
+# This requires GCC 12 or later or Clang 6 or later. (To get AVX-512 support,
+# you need Clang 11 or later.)
 fp16kernels = []
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

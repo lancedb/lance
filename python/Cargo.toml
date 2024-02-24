@@ -52,6 +52,7 @@ lzma-sys = { version = "*", features = ["static"] }
 
 [features]
 datagen = ["lance-datagen"]
+fp16kernels = ["lance/fp16kernels"]
 
 [build-dependencies]
 prost-build = "0.11"

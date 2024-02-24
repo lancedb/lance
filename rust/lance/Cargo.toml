@@ -96,6 +96,7 @@ env_logger = "0.10.0"
 tracing-chrome = "0.7.1"
 
 [features]
+fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["clap", "lzma-sys/static"]
 tensorflow = ["tfrecord"]
