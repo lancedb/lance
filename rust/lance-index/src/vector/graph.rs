@@ -87,6 +87,24 @@ impl From<OrderedFloat> for f32 {
     }
 }
 
+#[derive(Debug, Eq, PartialEq, PartialOrd, Ord)]
+pub(crate) struct OrderedNode {
+    pub id: u32,
+    pub dist: OrderedFloat,
+}
+
+impl From<(OrderedFloat, u32)> for OrderedNode {
+    fn from((dist, id): (OrderedFloat, u32)) -> Self {
+        Self { id, dist }
+    }
+}
+
+impl From<OrderedNode> for (OrderedFloat, u32) {
+    fn from(node: OrderedNode) -> Self {
+        (node.dist, node.id)
+    }
+}
+
 /// Distance calculator.
 ///
 /// This trait is used to calculate a query vector to a stream of vector IDs.

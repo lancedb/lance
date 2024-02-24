@@ -39,7 +39,7 @@ use snafu::{location, Location};
 use self::storage::HnswRemappingStorage;
 
 use super::graph::{
-    builder::GraphBuilder, storage::VectorStorage, Graph, OrderedFloat, NEIGHBORS_COL,
+    builder::GraphBuilder, storage::VectorStorage, Graph, OrderedFloat, OrderedNode, NEIGHBORS_COL,
     NEIGHBORS_FIELD,
 };
 use crate::vector::graph::beam_search;
@@ -359,24 +359,6 @@ fn select_neighbors(
     k: usize,
 ) -> impl Iterator<Item = (OrderedFloat, u32)> + '_ {
     orderd_candidates.iter().take(k).map(|(&d, &u)| (d, u))
-}
-
-#[derive(Debug, Eq, PartialEq, PartialOrd, Ord)]
-struct OrderedNode {
-    id: u32,
-    dist: OrderedFloat,
-}
-
-impl From<(OrderedFloat, u32)> for OrderedNode {
-    fn from((dist, id): (OrderedFloat, u32)) -> Self {
-        Self { id, dist }
-    }
-}
-
-impl From<OrderedNode> for (OrderedFloat, u32) {
-    fn from(node: OrderedNode) -> Self {
-        (node.dist, node.id)
-    }
 }
 
 /// Algorithm 4 in the HNSW paper.
