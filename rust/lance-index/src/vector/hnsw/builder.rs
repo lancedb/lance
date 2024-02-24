@@ -20,7 +20,8 @@ use lance_core::Result;
 use rand::{thread_rng, Rng};
 
 use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
-use super::{select_neighbors, HNSW};
+use super::{select_neighbors, select_neighbors_heuristic, HNSW};
+use crate::vector::graph::Graph;
 use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage};
 use crate::vector::hnsw::HnswLevel;
 
@@ -31,9 +32,6 @@ use crate::vector::hnsw::HnswLevel;
 pub struct HNSWBuilder {
     /// max level of
     max_level: u16,
-
-    /// M_l parameter in the paper.
-    m_level_decay: f32,
 
     /// max number of connections ifor each element per layers.
     m_max: usize,
@@ -47,6 +45,8 @@ pub struct HNSWBuilder {
     levels: Vec<GraphBuilder>,
 
     entry_point: u32,
+
+    use_select_heuristic: bool,
 }
 
 impl HNSWBuilder {
@@ -59,14 +59,13 @@ impl HNSWBuilder {
             vectors,
             levels: vec![],
             entry_point: 0,
-            m_level_decay: 1.0 / 8_f32.ln(),
+            use_select_heuristic: true,
         }
     }
 
     /// The maximum level of the graph.
     pub fn max_level(mut self, max_level: u16) -> Self {
         self.max_level = max_level;
-        self.m_level_decay = 1.0 / (max_level as f32).ln();
         self
     }
 
@@ -83,16 +82,28 @@ impl HNSWBuilder {
         self
     }
 
+    pub fn use_select_heuristic(mut self, flag: bool) -> Self {
+        self.use_select_heuristic = flag;
+        self
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.levels[0].len()
+    }
+
+    #[inline]
+    fn m_l(&self) -> f32 {
+        1.0 / (self.len() as f32).ln()
+    }
+
     /// new node's level
     ///
     /// See paper `Algorithm 1`
     fn random_level(&self) -> u16 {
         let mut rng = thread_rng();
         let r = rng.gen::<f32>();
-        min(
-            (-r.ln() * self.m_level_decay).floor() as u16,
-            self.max_level,
-        )
+        min((-r.ln() * self.m_l()).floor() as u16, self.max_level)
     }
 
     /// Insert one node.
@@ -106,6 +117,7 @@ impl HNSWBuilder {
             0
         };
         let mut ep = vec![self.entry_point];
+        let query = self.vectors.vector(self.entry_point);
 
         //
         // Search for entry point in paper.
@@ -117,20 +129,41 @@ impl HNSWBuilder {
         // ```
         for cur_level in self.levels.iter().rev().take(levels_to_search) {
             let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
-            let neighbours = select_neighbors(&candidates, 1);
-            ep = neighbours.map(|(_, id)| id).collect();
+            ep = if self.use_select_heuristic {
+                select_neighbors_heuristic(cur_level, query, &candidates, 1, true, true)
+                    .map(|(_, id)| cur_level.nodes[&id].pointer)
+                    .collect()
+            } else {
+                select_neighbors(&candidates, 1)
+                    .map(|(_, id)| cur_level.nodes[&id].pointer)
+                    .collect()
+            };
         }
+        // println!(
+        //     "Ep after firs few leevels: level_to={} {:?} {:?}",
+        //     level, ep, node
+        // );
+
+        let m = self.levels[0].nodes.len();
         for cur_level in self.levels.iter_mut().rev().skip(levels_to_search) {
             cur_level.insert(node);
             let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
-            let neighbours = select_neighbors(&candidates, self.m_max).collect::<Vec<_>>();
+            let neighbours: Vec<_> = if self.use_select_heuristic {
+                select_neighbors_heuristic(cur_level, query, &candidates, m, true, true).collect()
+            } else {
+                select_neighbors(&candidates, m).collect()
+            };
+
             for (_, nb) in neighbours.iter() {
                 cur_level.connect(node, *nb)?;
             }
             for (_, nb) in neighbours {
                 cur_level.prune(nb, self.m_max)?;
             }
-            ep = candidates.values().copied().collect::<Vec<_>>();
+            ep = candidates
+                .values()
+                .map(|id| cur_level.nodes[id].pointer)
+                .collect();
         }
 
         if level > self.levels.len() as u16 {
@@ -166,6 +199,10 @@ impl HNSWBuilder {
 
         remapping_levels(&mut self.levels);
 
+        for (i, level) in self.levels.iter().enumerate() {
+            println!("Level {} stats: {:#?}", i, level.stats());
+        }
+
         let graphs = self
             .levels
             .iter()
@@ -175,6 +212,7 @@ impl HNSWBuilder {
             graphs,
             self.entry_point,
             self.vectors.metric_type(),
+            self.use_select_heuristic,
         ))
     }
 }
