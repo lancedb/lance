@@ -496,14 +496,8 @@ impl DatasetIndexInternalExt for Dataset {
         match &proto.implementation {
             Some(Implementation::VectorIndex(vector_index)) => {
                 let dataset = Arc::new(self.clone());
-                crate::index::vector::open_vector_index(
-                    dataset,
-                    column,
-                    uuid,
-                    vector_index,
-                    reader,
-                )
-                .await
+                crate::index::vector::open_vector_index(dataset, column, uuid, vector_index, reader)
+                    .await
             }
             None => Err(Error::Internal {
                 message: "Index proto was missing implementation field".into(),
