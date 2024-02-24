@@ -23,36 +23,41 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
 
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        cc::Build::new()
-            .compiler("clang")
-            .file("src/simd/f16.c")
-            .flag("-mtune=apple-m1")
-            .flag("-O3")
-            .flag("-Wall")
-            .flag("-Werror")
-            .flag("-Wextra")
-            .flag("-Wpedantic")
-            .compile("f16");
+    if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        // Build a version with NEON
+        build_f16_with_flags("neon", &["-mtune=apple-m1"]);
     }
 
-    if cfg!(all(target_os = "linux", feature = "avx512fp16")) {
-        // No fp16 without AVX512fp16
-        cc::Build::new()
-            .compiler("clang")
-            .std("c17")
-            .file("src/simd/f16.c")
-            .flag("-march=sapphirerapids")
-            .flag("-mavx512f")
-            .flag("-mavx512vl")
-            .flag("-mavx512bw")
-            .flag("-mavx512vnni")
-            .flag("-mavx512fp16")
-            .flag("-O3")
-            .flag("-Wall")
-            .flag("-Werror")
-            .flag("-Wextra")
-            .flag("-Wpedantic")
-            .compile("f16");
+    if cfg!(target_arch = "x86_64") {
+        // Build a version with AVX512
+        build_f16_with_flags("avx512", &["-march=sapphirerapids", "-ffast-math"]);
+        // Build a version with AVX
+        build_f16_with_flags("avx2", &["-march=broadwell", "-ffast-math"]);
+        // There is no SSE instruction set for f16 -> f32 float conversion
     }
+
+    // Build a version with no flags
+    build_f16_with_flags("base", &[]);
+}
+
+fn build_f16_with_flags(suffix: &str, flags: &[&str]) {
+    let mut builder = cc::Build::new();
+    builder
+        .compiler("clang")
+        .std("c17")
+        .file("src/simd/f16.c")
+        .flag("-ffast-math")
+        .flag("-O3")
+        .flag("-Wall")
+        .flag("-Werror")
+        .flag("-Wextra")
+        .flag("-Wpedantic")
+        // We pass in the suffix to make sure the symbol names are unique
+        .flag(&format!("-DSUFFIX=_{}", suffix));
+
+    for flag in flags {
+        builder.flag(flag);
+    }
+
+    builder.compile(&format!("f16_{}", suffix));
 }

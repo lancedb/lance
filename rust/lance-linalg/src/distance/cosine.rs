@@ -29,6 +29,7 @@ use arrow_schema::DataType;
 use half::f16;
 use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
+use lance_core::utils::cpu::{SimdSupport, FP16_SIMD_SUPPORT};
 use num_traits::{AsPrimitive, FromPrimitive};
 
 use super::dot::dot;
@@ -90,38 +91,39 @@ where
 
 impl Cosine for BFloat16Type {}
 
-#[cfg(any(
-    all(target_os = "macos", target_feature = "neon"),
-    all(target_os = "linux", feature = "avx512fp16")
-))]
 mod kernel {
     use super::*;
 
+    // These are the `cosine_f16` function in f16.c. Our build.rs script compiles
+    // a version of this file for each SIMD level with different suffixes.
     extern "C" {
-        pub fn cosine_f16(ptr_x: *const f16, x_norm: f32, ptr_y: *const f16, dimension: u32)
-            -> f32;
+        pub fn cosine_f16_base(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
+        #[cfg(target_arch = "aarch64")]
+        pub fn cosine_f16_neon(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
+        #[cfg(target_arch = "x86_64")]
+        pub fn cosine_f16_avx512(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
+        #[cfg(target_arch = "x86_64")]
+        pub fn cosine_f16_avx2(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
     }
 }
 
 impl Cosine for Float16Type {
     fn cosine_fast(x: &[f16], x_norm: f32, y: &[f16]) -> f32 {
-        #[cfg(all(target_os = "macos", target_feature = "neon"))]
-        unsafe {
-            kernel::cosine_f16(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+        match *FP16_SIMD_SUPPORT {
+            #[cfg(target_arch = "aarch64")]
+            SimdSupport::Neon => unsafe {
+                kernel::cosine_f16_neon(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+            },
+            #[cfg(target_arch = "x86_64")]
+            SimdSupport::Avx512 => unsafe {
+                kernel::cosine_f16_avx512(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+            },
+            #[cfg(target_arch = "x86_64")]
+            SimdSupport::Avx2 => unsafe {
+                kernel::cosine_f16_avx2(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+            },
+            _ => unsafe { kernel::cosine_f16_base(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32) },
         }
-
-        #[cfg(all(target_os = "linux", feature = "avx512fp16"))]
-        if *AVX512_F16_SUPPORTED {
-            unsafe { kernel::cosine_f16(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32) }
-        } else {
-            f16::cosine_fast(x, x_norm, y)
-        }
-
-        #[cfg(not(any(
-            all(target_os = "macos", target_feature = "neon"),
-            feature = "avx512fp16"
-        )))]
-        f16::cosine_fast(x, x_norm, y)
     }
 }
 

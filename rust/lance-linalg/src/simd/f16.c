@@ -16,12 +16,14 @@
 #include <stdint.h>
 #include <math.h>
 
-#ifdef __X86_64__
-#include <immintrin.h>
-#endif // __X86_64__
+// Because we might be compiling this library multiple times, we need to
+// add a suffix to each of the function names.
+#define FUNC_CAT_INNER(A, B) A##B
+#define FUNC_CAT(A, B) FUNC_CAT_INNER(A, B)
+#define FUNC(N) FUNC_CAT(N, SUFFIX)
 
 /// Works on NEON + FP16 or AVX512FP16
-float norm_l2_f16(const _Float16 *data, uint32_t dimension) {
+float FUNC(norm_l2_f16)(const _Float16 *data, uint32_t dimension) {
   float sum = 0;
 
 #pragma clang loop unroll(enable) vectorize(enable) interleave(enable)
@@ -36,7 +38,7 @@ float norm_l2_f16(const _Float16 *data, uint32_t dimension) {
 /// @param y A f16 vector
 /// @param dimension The dimension of the vectors
 /// @return The dot product of the two vectors.
-float dot_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
+float FUNC(dot_f16)(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
   float sum = 0;
 
 #pragma clang loop unroll(enable) interleave(enable) vectorize(enable)
@@ -46,7 +48,7 @@ float dot_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
   return sum;
 }
 
-float l2_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
+float FUNC(l2_f16)(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
   float sum = 0.0;
 
 #pragma clang loop unroll(enable) interleave(enable) vectorize(enable)
@@ -57,7 +59,7 @@ float l2_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
   return sum;
 }
 
-float cosine_f16(const _Float16 *x, float x_norm, const _Float16 *y, uint32_t dimension) {
+float FUNC(cosine_f16)(const _Float16 *x, float x_norm, const _Float16 *y, uint32_t dimension) {
   float dot = 0.0;
   float l2_y = 0.0;
 

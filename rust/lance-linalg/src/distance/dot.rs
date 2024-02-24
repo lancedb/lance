@@ -25,6 +25,7 @@ use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
+use lance_core::utils::cpu::{SimdSupport, FP16_SIMD_SUPPORT};
 use num_traits::real::Real;
 use num_traits::AsPrimitive;
 
@@ -100,39 +101,39 @@ impl Dot for BFloat16Type {
     }
 }
 
-#[cfg(any(
-    all(target_os = "macos", target_feature = "neon"),
-    all(target_os = "linux", feature = "avx512fp16")
-))]
 mod kernel {
     use super::*;
 
+    // These are the `dot_f16` function in f16.c. Our build.rs script compiles
+    // a version of this file for each SIMD level with different suffixes.
     extern "C" {
-        pub fn dot_f16(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        pub fn dot_f16_base(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "aarch64")]
+        pub fn dot_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "x86_64")]
+        pub fn dot_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "x86_64")]
+        pub fn dot_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
     }
 }
 
 impl Dot for Float16Type {
     #[inline]
     fn dot(x: &[f16], y: &[f16]) -> f32 {
-        #[cfg(all(target_os = "macos", target_feature = "neon"))]
-        unsafe {
-            kernel::dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32)
-        }
-
-        #[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
-        if *AVX512_F16_SUPPORTED {
-            unsafe { kernel::dot_f16(x.as_ptr(), y.as_ptr(), x.len() as u32) }
-        } else {
-            dot_scalar::<f16, 16>(x, y)
-        }
-
-        #[cfg(not(any(
-            all(target_os = "macos", target_feature = "neon"),
-            all(target_os = "linux", feature = "avx512fp16")
-        )))]
-        {
-            dot_scalar::<f16, 16>(x, y)
+        match *FP16_SIMD_SUPPORT {
+            #[cfg(target_arch = "aarch64")]
+            SimdSupport::Neon => unsafe {
+                kernel::dot_f16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(target_arch = "x86_64")]
+            SimdSupport::Avx512 => unsafe {
+                kernel::dot_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(target_arch = "x86_64")]
+            SimdSupport::Avx2 => unsafe {
+                kernel::dot_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            _ => unsafe { kernel::dot_f16_base(x.as_ptr(), y.as_ptr(), x.len() as u32) },
         }
     }
 }
