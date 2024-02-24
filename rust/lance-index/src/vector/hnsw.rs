@@ -412,7 +412,7 @@ fn select_neighbors_heuristic(
         );
     }
 
-    results.into_iter()
+    results.into_iter().take(k)
 }
 
 #[cfg(test)]
