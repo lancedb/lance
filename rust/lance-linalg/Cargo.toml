@@ -36,7 +36,7 @@ cc = "1.0.83"
 
 [features]
 # Enable compiling multiple C kernels for fp16 SIMD computations.
-# This requires GCC 12 or later or Clang 6 or later. (To get AVX-512 support,
+# This requires GCC 12 / Clang 6 or later. (To get AVX-512 support,
 # you need Clang 11 or later.)
 fp16kernels = []
 
