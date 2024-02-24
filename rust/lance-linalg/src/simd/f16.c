@@ -22,12 +22,19 @@
 #define FUNC_CAT(A, B) FUNC_CAT_INNER(A, B)
 #define FUNC(N) FUNC_CAT(N, SUFFIX)
 
+// TODO: I wonder if we could re-purpose this macro to compile bf16 kernels?
+#if defined(__clang__)
 // Note: we use __fp16 instead of _Float16 because Clang < 15.0.0 does not
 // support it well for most targets. __fp16 works for our purposes here since
 // we are always casting it to float anyways. This doesn't make a difference
 // in the compiled assembly code for these functions.
+#define FP16 __fp16
+#elif defined(__GNUC__) || defined(__GNUG__)
+#define FP16 _Float16
+#endif
+// Note: MSVC doesn't support _Float16 yet, so we can't use it here.
 
-float FUNC(norm_l2_f16)(const __fp16 *data, uint32_t dimension) {
+float FUNC(norm_l2_f16)(const FP16 *data, uint32_t dimension) {
   float sum = 0;
 
 #pragma clang loop unroll(enable) vectorize(enable) interleave(enable)
@@ -42,7 +49,7 @@ float FUNC(norm_l2_f16)(const __fp16 *data, uint32_t dimension) {
 /// @param y A f16 vector
 /// @param dimension The dimension of the vectors
 /// @return The dot product of the two vectors.
-float FUNC(dot_f16)(const __fp16 *x, const __fp16 *y, uint32_t dimension) {
+float FUNC(dot_f16)(const FP16 *x, const FP16 *y, uint32_t dimension) {
   float sum = 0;
 
 #pragma clang loop unroll(enable) interleave(enable) vectorize(enable)
@@ -52,7 +59,7 @@ float FUNC(dot_f16)(const __fp16 *x, const __fp16 *y, uint32_t dimension) {
   return sum;
 }
 
-float FUNC(l2_f16)(const __fp16 *x, const __fp16 *y, uint32_t dimension) {
+float FUNC(l2_f16)(const FP16 *x, const FP16 *y, uint32_t dimension) {
   float sum = 0.0;
 
 #pragma clang loop unroll(enable) interleave(enable) vectorize(enable)
@@ -63,7 +70,7 @@ float FUNC(l2_f16)(const __fp16 *x, const __fp16 *y, uint32_t dimension) {
   return sum;
 }
 
-float FUNC(cosine_f16)(const __fp16 *x, float x_norm, const __fp16 *y, uint32_t dimension) {
+float FUNC(cosine_f16)(const FP16 *x, float x_norm, const FP16 *y, uint32_t dimension) {
   float dot = 0.0;
   float l2_y = 0.0;
 
