@@ -109,7 +109,7 @@ mod kernel {
     extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn dot_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(avx512, target_arch = "x86_64")]
         pub fn dot_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn dot_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
@@ -124,7 +124,7 @@ impl Dot for Float16Type {
             SimdSupport::Neon => unsafe {
                 kernel::dot_f16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
-            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
+            #[cfg(all(feature = "fp16kernels", avx512, target_arch = "x86_64"))]
             SimdSupport::Avx512 => unsafe {
                 kernel::dot_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },

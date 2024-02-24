@@ -31,22 +31,27 @@ fn main() {
 
     if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
         // Build a version with NEON
-        build_f16_with_flags("neon", &["-mtune=apple-m1"]);
+        build_f16_with_flags("neon", &["-mtune=apple-m1"]).unwrap();
     } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
         // Build a version with NEON
-        build_f16_with_flags("neon", &["-march=armv8.2-a+fp16"]);
+        build_f16_with_flags("neon", &["-march=armv8.2-a+fp16"]).unwrap();
     }
 
     if cfg!(target_arch = "x86_64") {
         // Build a version with AVX512
-        build_f16_with_flags("avx512", &["-march=sapphirerapids"]);
+        if let Err(err) = build_f16_with_flags("avx512", &["-march=sapphirerapids"]) {
+            // It's likely the compiler doesn't support the sapphirerapids architecture
+            eprintln!("Skipping Sapphire Rapids build due to error: {}", err);
+        } else {
+            println!("cargo:rustc-cfg=\"avx512\"");
+        };
         // Build a version with AVX
-        build_f16_with_flags("avx2", &["-march=broadwell"]);
+        build_f16_with_flags("avx2", &["-march=broadwell"]).unwrap();
         // There is no SSE instruction set for f16 -> f32 float conversion
     }
 }
 
-fn build_f16_with_flags(suffix: &str, flags: &[&str]) {
+fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
     let mut builder = cc::Build::new();
     builder
         // TODO: why specify the compiler?
@@ -56,7 +61,7 @@ fn build_f16_with_flags(suffix: &str, flags: &[&str]) {
         .flag("-ffast-math")
         .flag("-O3")
         .flag("-Wall")
-        .flag("-Werror")
+        // .flag("-Werror")
         .flag("-Wextra")
         // Pedantic will complain about _Float16 in some versions of GCC
         // .flag("-Wpedantic")
@@ -67,5 +72,5 @@ fn build_f16_with_flags(suffix: &str, flags: &[&str]) {
         builder.flag(flag);
     }
 
-    builder.compile(&format!("f16_{}", suffix));
+    builder.try_compile(&format!("f16_{}", suffix))
 }
