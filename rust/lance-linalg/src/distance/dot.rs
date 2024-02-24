@@ -25,7 +25,9 @@ use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
-use lance_core::utils::cpu::{SimdSupport, FP16_SIMD_SUPPORT};
+#[cfg(feature = "fp16kernels")]
+use lance_core::utils::cpu::SimdSupport;
+use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
 use num_traits::real::Real;
 use num_traits::AsPrimitive;
 
@@ -98,13 +100,13 @@ impl Dot for BFloat16Type {
     }
 }
 
+#[cfg(feature = "fp16kernels")]
 mod kernel {
     use super::*;
 
     // These are the `dot_f16` function in f16.c. Our build.rs script compiles
     // a version of this file for each SIMD level with different suffixes.
     extern "C" {
-        pub fn dot_f16_base(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "aarch64")]
         pub fn dot_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
@@ -118,19 +120,19 @@ impl Dot for Float16Type {
     #[inline]
     fn dot(x: &[f16], y: &[f16]) -> f32 {
         match *FP16_SIMD_SUPPORT {
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
                 kernel::dot_f16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
             SimdSupport::Avx512 => unsafe {
                 kernel::dot_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
             SimdSupport::Avx2 => unsafe {
                 kernel::dot_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
-            _ => unsafe { kernel::dot_f16_base(x.as_ptr(), y.as_ptr(), x.len() as u32) },
+            _ => dot_scalar::<f16, 16>(x, y),
         }
     }
 }

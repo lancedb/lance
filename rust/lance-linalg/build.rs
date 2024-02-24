@@ -23,6 +23,12 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
 
+    if !cfg!(any(feature = "fp16kernels", target_os = "windows")) {
+        // We only compile the f16 kernels if the feature is enabled
+        // MSVC does not support the f16 type, so we also skip it on Windows.
+        return;
+    }
+
     if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-mtune=apple-m1"]);
@@ -38,9 +44,6 @@ fn main() {
         build_f16_with_flags("avx2", &["-march=broadwell"]);
         // There is no SSE instruction set for f16 -> f32 float conversion
     }
-
-    // Build a version with no flags
-    build_f16_with_flags("base", &[]);
 }
 
 fn build_f16_with_flags(suffix: &str, flags: &[&str]) {
@@ -55,7 +58,8 @@ fn build_f16_with_flags(suffix: &str, flags: &[&str]) {
         .flag("-Wall")
         .flag("-Werror")
         .flag("-Wextra")
-        .flag("-Wpedantic")
+        // Pedantic will complain about _Float16 in some versions of GCC
+        // .flag("-Wpedantic")
         // We pass in the suffix to make sure the symbol names are unique
         .flag(&format!("-DSUFFIX=_{}", suffix));
 

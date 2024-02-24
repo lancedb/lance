@@ -15,7 +15,10 @@
 use std::iter::Sum;
 
 use half::{bf16, f16};
-use lance_core::utils::cpu::{SimdSupport, FP16_SIMD_SUPPORT};
+#[cfg(feature = "fp16kernels")]
+use lance_core::utils::cpu::SimdSupport;
+#[allow(unused_imports)]
+use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
 use num_traits::{AsPrimitive, Float};
 
 use crate::simd::{
@@ -29,13 +32,13 @@ pub trait Normalize<T: Float> {
     fn norm_l2(&self) -> f32;
 }
 
+#[cfg(feature = "fp16kernels")]
 mod kernel {
     use super::*;
 
     // These are the `norm_l2_f16` function in f16.c. Our build.rs script compiles
     // a version of this file for each SIMD level with different suffixes.
     extern "C" {
-        pub fn norm_l2_f16_base(ptr: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "aarch64")]
         pub fn norm_l2_f16_neon(ptr: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
@@ -49,21 +52,52 @@ impl Normalize<f16> for &[f16] {
     #[inline]
     fn norm_l2(&self) -> f32 {
         match *FP16_SIMD_SUPPORT {
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
                 kernel::norm_l2_f16_neon(self.as_ptr(), self.len() as u32)
             },
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
             SimdSupport::Avx512 => unsafe {
                 kernel::norm_l2_f16_avx512(self.as_ptr(), self.len() as u32)
             },
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
             SimdSupport::Avx2 => unsafe {
                 kernel::norm_l2_f16_avx2(self.as_ptr(), self.len() as u32)
             },
-            _ => unsafe { kernel::norm_l2_f16_base(self.as_ptr(), self.len() as u32) },
+            _ => norm_l2_f16_impl(self),
         }
     }
+}
+
+#[inline]
+fn norm_l2_f16_impl(arr: &[f16]) -> f32 {
+    // Please run `cargo bench --bench norm_l2" on Apple Silicon when
+    // change the following code.
+    const LANES: usize = 16;
+    let chunks = arr.chunks_exact(LANES);
+    let sum = if chunks.remainder().is_empty() {
+        0.0
+    } else {
+        chunks
+            .remainder()
+            .iter()
+            .map(|v| v.to_f32().powi(2))
+            .sum::<f32>()
+    };
+
+    let mut sums: [f32; LANES] = [0_f32; LANES];
+    for chk in chunks {
+        // Convert to f32
+        let mut f32_vals: [f32; LANES] = [0_f32; LANES];
+        for i in 0..LANES {
+            f32_vals[i] = chk[i].to_f32();
+        }
+        // Vectorized multiply
+        for i in 0..LANES {
+            sums[i] += f32_vals[i].powi(2);
+        }
+    }
+    (sums.iter().copied().sum::<f32>() + sum).sqrt()
 }
 
 impl Normalize<bf16> for &[bf16] {

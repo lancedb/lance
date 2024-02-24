@@ -34,6 +34,10 @@ lance-testing = { path = "../lance-testing" }
 [build-dependencies]
 cc = "1.0.83"
 
+[features]
+default = ["fp16kernels"]
+fp16kernels = []
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof = { workspace = true }
 
