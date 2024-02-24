@@ -34,10 +34,6 @@ lance-testing = { path = "../lance-testing" }
 [build-dependencies]
 cc = "1.0.83"
 
-[features]
-avx512fp16 = []
-static-dispatch = []
-
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof = { workspace = true }
 

@@ -29,9 +29,6 @@ use lance_core::utils::cpu::{SimdSupport, FP16_SIMD_SUPPORT};
 use num_traits::real::Real;
 use num_traits::AsPrimitive;
 
-#[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
-use lance_core::utils::cpu::x86::AVX512_F16_SUPPORTED;
-
 use crate::simd::{
     f32::{f32x16, f32x8},
     SIMD,
