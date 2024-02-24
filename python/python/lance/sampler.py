@@ -404,6 +404,12 @@ class ShardedBatchSampler(Sampler):
                 rows_accumulated = big_batch.num_rows
                 if big_batch.num_rows > 0:
                     accumulated_batches.append(big_batch)
+        # deliver any batches left over, they will be <= batch
+        # size but that is ok because we are done
+        last_batch = (
+            pa.Table.from_batches(accumulated_batches).combine_chunks().to_batches()[0]
+        )
+        yield last_batch
 
     def _sample_filtered(
         self,
