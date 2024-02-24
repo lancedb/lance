@@ -139,10 +139,8 @@ impl HNSWBuilder {
                     .collect()
             };
         }
-        // println!(
-        //     "Ep after firs few leevels: level_to={} {:?} {:?}",
-        //     level, ep, node
-        // );
+
+        println!("Self max edges: {}", self.m_max);
 
         let m = self.levels[0].nodes.len();
         for cur_level in self.levels.iter_mut().rev().skip(levels_to_search) {
@@ -160,6 +158,7 @@ impl HNSWBuilder {
             for (_, nb) in neighbours {
                 cur_level.prune(nb, self.m_max)?;
             }
+            cur_level.prune(node, self.m_max)?;
             ep = candidates
                 .values()
                 .map(|id| cur_level.nodes[id].pointer)
@@ -198,10 +197,6 @@ impl HNSWBuilder {
         }
 
         remapping_levels(&mut self.levels);
-
-        for (i, level) in self.levels.iter().enumerate() {
-            println!("Level {} stats: {:#?}", i, level.stats());
-        }
 
         let graphs = self
             .levels
