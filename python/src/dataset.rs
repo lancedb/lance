@@ -34,10 +34,7 @@ use lance::dataset::{
     WriteParams,
 };
 use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore};
-use lance::index::{
-    scalar::ScalarIndexParams,
-    vector::{diskann::DiskANNParams, VectorIndexParams},
-};
+use lance::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
 use lance_index::optimize::OptimizeOptions;
@@ -56,7 +53,7 @@ use pyo3::types::{PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
-    types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong},
+    types::{IntoPyDict, PyBool, PyDict, PyInt, PyLong},
     PyObject, PyResult,
 };
 use snafu::{location, Location};
@@ -864,7 +861,7 @@ impl Dataset {
     ) -> PyResult<()> {
         let idx_type = match index_type.to_uppercase().as_str() {
             "BTREE" => IndexType::Scalar,
-            "IVF_PQ" | "DISKANN" => IndexType::Vector,
+            "IVF_PQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -965,29 +962,6 @@ impl Dataset {
                 Box::new(VectorIndexParams::with_ivf_pq_params(
                     m_type, ivf_params, pq_params,
                 ))
-            }
-            "DISKANN" => {
-                let mut params = DiskANNParams::default();
-                let mut m_type = MetricType::L2;
-                if let Some(kwargs) = kwargs {
-                    if let Some(mt) = kwargs.get_item("metric_type")? {
-                        m_type = MetricType::try_from(mt.to_string().to_lowercase().as_str())
-                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-                    }
-
-                    if let Some(n) = kwargs.get_item("r")? {
-                        params.r = PyAny::downcast::<PyInt>(n)?.extract()?
-                    };
-
-                    if let Some(n) = kwargs.get_item("alpha")? {
-                        params.alpha = PyAny::downcast::<PyFloat>(n)?.extract()?
-                    };
-
-                    if let Some(n) = kwargs.get_item("l")? {
-                        params.l = PyAny::downcast::<PyInt>(n)?.extract()?
-                    };
-                }
-                Box::new(VectorIndexParams::with_diskann_params(m_type, params))
             }
             _ => {
                 return Err(PyValueError::new_err(format!(
