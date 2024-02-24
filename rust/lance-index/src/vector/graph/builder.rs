@@ -149,7 +149,7 @@ impl GraphBuilder {
             let edges = node.neighbors.len();
             total_edges += edges;
             max_edges = max_edges.max(edges);
-            total_distance += node.neighbors.iter().map(|(d, _)| d.0).sum::<f32>();
+            total_distance += node.neighbors.keys().map(|d| d.0).sum::<f32>();
         }
 
         GraphBuilderStats {

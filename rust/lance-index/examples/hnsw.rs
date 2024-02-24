@@ -61,14 +61,15 @@ async fn main() {
         .await
         .expect("Failed to open dataset");
     println!("Dataset schema: {:#?}", dataset.schema());
+    let column = args.column.as_deref().unwrap_or("vector");
     let batches = dataset
         .scan()
-        .project(&[args.column.as_deref().unwrap_or("vector")])
+        .project(&[column])
         .unwrap()
         .try_into_stream()
         .await
         .unwrap()
-        .then(|batch| async move { batch.unwrap().column_by_name("openai").unwrap().clone() })
+        .then(|batch| async move { batch.unwrap().column_by_name(column).unwrap().clone() })
         .collect::<Vec<_>>()
         .await;
     let arrs = batches.iter().map(|b| b.as_ref()).collect::<Vec<_>>();

@@ -403,15 +403,13 @@ fn select_neighbors_heuristic(
             results.insert(d, u);
         }
     }
-    if keep_pruned_connections {
-        if results.len() < k {
-            results.extend(
-                discarded
-                    .iter()
-                    .take(k - results.len())
-                    .map(|(&d, &n)| (d, n)),
-            );
-        }
+    if keep_pruned_connections && results.len() < k {
+        results.extend(
+            discarded
+                .iter()
+                .take(k - results.len())
+                .map(|(&d, &n)| (d, n)),
+        );
     }
 
     results.into_iter()

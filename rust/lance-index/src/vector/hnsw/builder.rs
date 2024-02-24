@@ -140,8 +140,6 @@ impl HNSWBuilder {
             };
         }
 
-        println!("Self max edges: {}", self.m_max);
-
         let m = self.levels[0].nodes.len();
         for cur_level in self.levels.iter_mut().rev().skip(levels_to_search) {
             cur_level.insert(node);
