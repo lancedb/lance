@@ -501,7 +501,6 @@ impl DatasetIndexInternalExt for Dataset {
                     column,
                     uuid,
                     vector_index,
-                    index_dir,
                     reader,
                 )
                 .await
