@@ -17,7 +17,7 @@
 //! Hierarchical Navigable Small World (HNSW).
 //!
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
@@ -299,7 +299,7 @@ impl HNSW {
         for level in self.levels.iter().rev().take(num_layers - 1) {
             let candidates = beam_search(level, &ep, query, 1)?;
             ep = if self.use_select_heuristic {
-                select_neighbors_heuristic(level, query, &candidates, 1, false, true)
+                select_neighbors_heuristic(level, query, &candidates, 1, false)
                     .map(|(_, id)| id)
                     .collect()
             } else {
@@ -310,7 +310,7 @@ impl HNSW {
         let candidates = beam_search(&self.levels[0], &ep, query, ef)?;
         if self.use_select_heuristic {
             Ok(
-                select_neighbors_heuristic(&self.levels[0], query, &candidates, k, false, true)
+                select_neighbors_heuristic(&self.levels[0], query, &candidates, k, false)
                     .map(|(d, u)| (u, d.into()))
                     .collect(),
             )
@@ -361,58 +361,59 @@ fn select_neighbors(
     orderd_candidates.iter().take(k).map(|(&d, &u)| (d, u))
 }
 
+#[derive(Debug, Eq, PartialEq, PartialOrd, Ord)]
+struct OrderedNode {
+    id: u32,
+    dist: OrderedFloat,
+}
+
+impl From<(OrderedFloat, u32)> for OrderedNode {
+    fn from((dist, id): (OrderedFloat, u32)) -> Self {
+        Self { id, dist }
+    }
+}
+
+impl From<OrderedNode> for (OrderedFloat, u32) {
+    fn from(node: OrderedNode) -> Self {
+        (node.dist, node.id)
+    }
+}
+
 /// Algorithm 4 in the HNSW paper.
+///
+///
+/// Modifies to the original algorithm:
+/// 1. Do not use keepPrunedConnections, we use a heap to capture nearest neighbors.
 fn select_neighbors_heuristic(
     graph: &dyn Graph,
     query: &[f32],
     orderd_candidates: &BTreeMap<OrderedFloat, u32>,
     k: usize,
-    extended_candidates: bool,
-    keep_pruned_connections: bool,
+    extend_candidates: bool,
 ) -> impl Iterator<Item = (OrderedFloat, u32)> {
-    let mut results = BTreeMap::new();
-    let mut w = orderd_candidates.values().cloned().collect::<HashSet<_>>();
-    // W in paper
-    let mut candidates = orderd_candidates.clone();
-    assert_eq!(w.len(), candidates.len());
+    let mut heap: BinaryHeap<OrderedNode> = BinaryHeap::from_iter(
+        orderd_candidates
+            .iter()
+            .map(|(&d, &u)| OrderedNode { id: u, dist: d }),
+    );
 
-    if extended_candidates {
+    if extend_candidates {
         let dist_calc = graph.storage().dist_calculator(query);
+        let mut visited = heap.iter().map(|n| n.id).collect::<HashSet<_>>();
         orderd_candidates.iter().for_each(|(_, &u)| {
             if let Some(neighbors) = graph.neighbors(u) {
-                neighbors.for_each(|n| {
-                    if !w.contains(n) {
-                        candidates.insert(dist_calc.distance(&[*n])[0].into(), *n);
+                neighbors.for_each(|&n| {
+                    if !visited.contains(&n) {
+                        let d: OrderedFloat = dist_calc.distance(&[n])[0].into();
+                        heap.push((d, n).into());
                     }
-                    w.insert(*n);
+                    visited.insert(n);
                 });
             }
         });
     }
 
-    let mut discarded = BTreeMap::<OrderedFloat, u32>::new();
-    while !candidates.is_empty() && results.len() < k {
-        let (d, u) = candidates.pop_first().unwrap();
-        if let Some((&key, &value)) = results.last_key_value() {
-            if key > d {
-                candidates.insert(key, value);
-            } else {
-                discarded.insert(d, u);
-            }
-        } else {
-            results.insert(d, u);
-        }
-    }
-    if keep_pruned_connections && results.len() < k {
-        results.extend(
-            discarded
-                .iter()
-                .take(k - results.len())
-                .map(|(&d, &n)| (d, n)),
-        );
-    }
-
-    results.into_iter().take(k)
+    heap.into_iter().take(k).map(|n| n.into())
 }
 
 #[cfg(test)]
