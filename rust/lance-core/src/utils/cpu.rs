@@ -51,8 +51,6 @@ lazy_static! {
 mod x86 {
     use core::arch::x86_64::__cpuid;
 
-    use lazy_static::lazy_static;
-
     #[inline]
     fn check_flag(x: usize, position: u32) -> bool {
         x & (1 << position) != 0

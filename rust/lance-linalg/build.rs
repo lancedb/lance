@@ -26,6 +26,9 @@ fn main() {
     if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-mtune=apple-m1"]);
+    } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+        // Build a version with NEON
+        build_f16_with_flags("neon", &["-march=armv8.2-a+fp16"]);
     }
 
     if cfg!(target_arch = "x86_64") {
@@ -37,7 +40,7 @@ fn main() {
     }
 
     // Build a version with no flags
-    build_f16_with_flags("base", &[]);
+    build_f16_with_flags("base", &["-msse2"]);
 }
 
 fn build_f16_with_flags(suffix: &str, flags: &[&str]) {
