@@ -225,6 +225,9 @@ def test_sample_batches_with_filter(tmp_path: Path):
     # - - - 26 -
     # ...
     all_ids = list(chain.from_iterable([batch.cpu().numpy() for batch in ds]))
+    # Half of the data is filtered out, divided amongst 5 workers s
+    # each should see 1/10th of the data
+    assert len(all_ids) == 1000
     assert all_ids == [6 + (10 * i) for i in range(len(all_ids))]
 
     # Now test with random order
