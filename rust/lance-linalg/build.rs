@@ -33,20 +33,21 @@ fn main() {
 
     if cfg!(target_arch = "x86_64") {
         // Build a version with AVX512
-        build_f16_with_flags("avx512", &["-march=sapphirerapids", "-ffast-math"]);
+        build_f16_with_flags("avx512", &["-march=sapphirerapids"]);
         // Build a version with AVX
-        build_f16_with_flags("avx2", &["-march=broadwell", "-ffast-math"]);
+        build_f16_with_flags("avx2", &["-march=broadwell"]);
         // There is no SSE instruction set for f16 -> f32 float conversion
     }
 
     // Build a version with no flags
-    build_f16_with_flags("base", &["-msse2"]);
+    build_f16_with_flags("base", &[]);
 }
 
 fn build_f16_with_flags(suffix: &str, flags: &[&str]) {
     let mut builder = cc::Build::new();
     builder
-        .compiler("clang")
+        // TODO: why specify the compiler?
+        // .compiler("clang")
         .std("c17")
         .file("src/simd/f16.c")
         .flag("-ffast-math")
