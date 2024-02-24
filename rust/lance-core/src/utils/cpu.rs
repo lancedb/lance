@@ -86,6 +86,7 @@ mod aarch64 {
 mod aarch64 {
     pub fn has_neon_f16_support() -> bool {
         // See: https://github.com/rust-lang/libc/blob/7ce81ca7aeb56aae7ca0237ef9353d58f3d7d2f1/src/unix/linux_like/linux/gnu/b64/aarch64/mod.rs#L533
-        libc::getauxval(libc::AT_HWCAP) & libc::HWCAP_FPHP != 0
+        let flags = unsafe { libc::getauxval(libc::AT_HWCAP) };
+        flags & libc::HWCAP_FPHP != 0
     }
 }
