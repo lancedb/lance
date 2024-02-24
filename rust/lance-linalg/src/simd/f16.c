@@ -14,6 +14,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <math.h>
 
 #ifdef __X86_64__
 #include <immintrin.h>
@@ -54,4 +55,20 @@ float l2_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
     sum += s * s;
   }
   return sum;
+}
+
+float cosine_f16(const _Float16 *x, float x_norm, const _Float16 *y, uint32_t dimension) {
+  float dot = 0.0;
+  float l2_y = 0.0;
+
+  // Instead of using functions above, we combine the loop to reduce overhead
+  // of the fp16 to fp32 conversion.
+#pragma clang loop unroll(enable) interleave(enable) vectorize(enable)
+  for (uint32_t i = 0; i < dimension; i++) {
+    float y_i = (float) y[i];
+    dot += (float) x[i] * y_i;
+    l2_y += y_i * y_i;
+  }
+
+  return dot / (x_norm * sqrtf(l2_y));
 }
