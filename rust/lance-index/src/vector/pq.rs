@@ -30,9 +30,10 @@ use lance_linalg::distance::{
 use lance_linalg::kernels::{argmin, argmin_value_float, normalize};
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
+
 pub mod builder;
 mod distance;
-pub(crate) mod storage;
+pub mod storage;
 pub mod transform;
 pub(crate) mod utils;
 
@@ -75,13 +76,15 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
 
     /// Whether to use residual as input or not.
     fn use_residual(&self) -> bool;
+
+    fn metric_type(&self) -> MetricType;
 }
 
 /// Product Quantization, optimized for [Apache Arrow] buffer memory layout.
 ///
 //
 // TODO: move this to be pub(crate) once we have a better way to test it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProductQuantizerImpl<T: ArrowFloatType + Cosine + Dot + L2> {
     /// Number of bits for the centroids.
     ///
@@ -477,6 +480,10 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
 
     fn use_residual(&self) -> bool {
         matches!(self.metric_type, MetricType::L2 | MetricType::Cosine)
+    }
+
+    fn metric_type(&self) -> MetricType {
+        self.metric_type
     }
 }
 

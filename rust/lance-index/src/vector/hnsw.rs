@@ -17,17 +17,19 @@
 //! Hierarchical Navigable Small World (HNSW).
 //!
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
 
+use arrow::datatypes::UInt32Type;
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
     ListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use itertools::Itertools;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_linalg::distance::MetricType;
@@ -36,16 +38,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::{location, Location};
 
-use self::storage::HnswRemappingStorage;
-
 use super::graph::{
-    builder::GraphBuilder, storage::VectorStorage, Graph, OrderedFloat, NEIGHBORS_COL,
+    builder::GraphBuilder, storage::VectorStorage, Graph, OrderedFloat, OrderedNode, NEIGHBORS_COL,
     NEIGHBORS_FIELD,
 };
 use crate::vector::graph::beam_search;
+
 pub mod builder;
+
 pub use builder::HNSWBuilder;
-mod storage;
 
 const HNSW_TYPE: &str = "HNSW";
 const VECTOR_ID_COL: &str = "__vector_id";
@@ -63,6 +64,11 @@ lazy_static::lazy_static! {
 /// One level of the HNSW graph.
 ///
 struct HnswLevel {
+    /// Vector ID to the node index in `nodes`.
+    /// The node on different layer share the same Vector ID, which is the index
+    /// in the [VectorStorage].
+    id_to_node: HashMap<u32, usize>,
+
     /// All the nodes in this level.
     // TODO: we just load the whole level into memory without pagation.
     nodes: RecordBatch,
@@ -76,11 +82,8 @@ struct HnswLevel {
     /// The values of the neighbors array.
     neighbors_values: Arc<UInt32Array>,
 
-    /// Id of the vector in the [VectorStorage].
-    vector_ids: Arc<UInt32Array>,
-
     /// Vector storage of the graph.
-    vectors: Arc<HnswRemappingStorage>,
+    vectors: Arc<dyn VectorStorage>,
 }
 
 impl HnswLevel {
@@ -103,47 +106,41 @@ impl HnswLevel {
             .clone()
             .into();
         let values: Arc<UInt32Array> = neighbors.values().as_primitive().clone().into();
-        let vector_ids: Arc<UInt32Array> = nodes
+        let id_to_node = nodes
             .column_by_name(VECTOR_ID_COL)
             .unwrap()
-            .as_primitive()
-            .clone()
-            .into();
-        let vectors = Arc::new(storage::HnswRemappingStorage::new(
-            vectors,
-            vector_ids.clone(),
-        ));
+            .as_primitive::<UInt32Type>()
+            .values()
+            .iter()
+            .enumerate()
+            .map(|(idx, &vec_id)| (vec_id, idx))
+            .collect::<HashMap<u32, usize>>();
         Self {
             nodes,
             neighbors,
             neighbors_values: values,
-            vector_ids,
+            id_to_node,
             vectors,
         }
     }
 
     fn from_builder(builder: &GraphBuilder, vectors: Arc<dyn VectorStorage>) -> Result<Self> {
         let mut neighbours_builder = ListBuilder::new(UInt32Builder::new());
-        let mut pointers_builder = UInt32Builder::new();
         let mut vector_id_builder = UInt32Builder::new();
 
-        for (_, node) in builder.nodes.iter() {
-            neighbours_builder.append_value(node.neighbors.values().map(|&n| Some(n)));
-            pointers_builder.append_value(node.pointer);
+        for &id in builder.nodes.keys().sorted() {
+            let node = builder.nodes.get(&id).unwrap();
+            assert_eq!(node.id, id);
+            neighbours_builder.append_value(node.neighbors.clone().iter().map(|n| Some(n.id)));
             vector_id_builder.append_value(node.id);
         }
 
-        let schema = Schema::new(vec![
-            NEIGHBORS_FIELD.clone(),
-            VECTOR_ID_FIELD.clone(),
-            POINTER_FIELD.clone(),
-        ]);
+        let schema = Schema::new(vec![NEIGHBORS_FIELD.clone(), VECTOR_ID_FIELD.clone()]);
         let batch = RecordBatch::try_new(
             schema.into(),
             vec![
                 Arc::new(neighbours_builder.finish()),
                 Arc::new(vector_id_builder.finish()),
-                Arc::new(pointers_builder.finish()),
             ],
         )?;
 
@@ -155,16 +152,11 @@ impl HnswLevel {
     }
 
     /// Range of neighbors for the given node, specified by its index.
-    fn neighbors_range(&self, idx: u32) -> Range<usize> {
-        let start = self.neighbors.value_offsets()[idx as usize] as usize;
-        let end = start + self.neighbors.value_length(idx as usize) as usize;
+    fn neighbors_range(&self, id: u32) -> Range<usize> {
+        let idx = self.id_to_node[&id];
+        let start = self.neighbors.value_offsets()[idx] as usize;
+        let end = start + self.neighbors.value_length(idx) as usize;
         start..end
-    }
-
-    fn pointers(&self, ids: &[u32]) -> Vec<u32> {
-        ids.iter()
-            .map(|&id| self.vector_ids.value(id as usize))
-            .collect()
     }
 }
 
@@ -173,9 +165,11 @@ impl Graph for HnswLevel {
         self.nodes.num_rows()
     }
 
-    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = &u32> + '_>> {
+    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>> {
         let range = self.neighbors_range(key);
-        Some(Box::new(self.neighbors_values.values()[range].iter()))
+        Some(Box::new(
+            self.neighbors_values.values()[range].iter().copied(),
+        ))
     }
 
     fn storage(&self) -> Arc<dyn VectorStorage> {
@@ -224,8 +218,8 @@ impl HNSW {
     ///
     /// Parameters
     /// ----------
-    /// reader : &FileReader
-    /// vector_storage : Arc<dyn VectorStorage>
+    /// - *reader*: the file reader to read the graph from.
+    /// - *vector_storage*: A preloaded [VectorStorage] storage.
     pub async fn load(reader: &FileReader, vector_storage: Arc<dyn VectorStorage>) -> Result<Self> {
         let schema = reader.schema();
         let mt = if let Some(index_metadata) = schema.metadata.get("lance:index") {
@@ -279,6 +273,7 @@ impl HNSW {
         }
     }
 
+    /// The Arrow schema of the graph.
     pub fn schema(&self) -> SchemaRef {
         self.levels[0].schema()
     }
@@ -287,30 +282,30 @@ impl HNSW {
     ///
     /// Parameters
     /// ----------
-    /// query : &[f32]
-    ///     The query vector.
-    /// k : usize
-    ///    The number of nearest neighbors to search for.
-    /// ef : usize
-    ///    The size of dynamic candidate list
+    /// - *query* : the query vector.
+    /// - *k* : the number of nearest neighbors to search for.
+    /// - *ef* : the size of dynamic candidate list.
+    ///
+    /// Returns
+    /// -------
+    /// A list of `(id_in_graph, distance)` pairs. Or Error if the search failed.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<(u32, f32)>> {
         let mut ep = vec![self.entry_point];
         let num_layers = self.levels.len();
         for level in self.levels.iter().rev().take(num_layers - 1) {
             let candidates = beam_search(level, &ep, query, 1)?;
             ep = if self.use_select_heuristic {
-                select_neighbors_heuristic(level, query, &candidates, 1, false, true)
+                select_neighbors_heuristic(level, query, &candidates, 1, false)
                     .map(|(_, id)| id)
                     .collect()
             } else {
                 select_neighbors(&candidates, 1).map(|(_, id)| id).collect()
             };
-            ep = level.pointers(&ep);
         }
         let candidates = beam_search(&self.levels[0], &ep, query, ef)?;
         if self.use_select_heuristic {
             Ok(
-                select_neighbors_heuristic(&self.levels[0], query, &candidates, k, false, true)
+                select_neighbors_heuristic(&self.levels[0], query, &candidates, k, false)
                     .map(|(d, u)| (u, d.into()))
                     .collect(),
             )
@@ -362,57 +357,41 @@ fn select_neighbors(
 }
 
 /// Algorithm 4 in the HNSW paper.
+///
+///
+/// Modifies to the original algorithm:
+/// 1. Do not use keepPrunedConnections, we use a heap to capture nearest neighbors.
 fn select_neighbors_heuristic(
     graph: &dyn Graph,
     query: &[f32],
     orderd_candidates: &BTreeMap<OrderedFloat, u32>,
     k: usize,
-    extended_candidates: bool,
-    keep_pruned_connections: bool,
+    extend_candidates: bool,
 ) -> impl Iterator<Item = (OrderedFloat, u32)> {
-    let mut results = BTreeMap::new();
-    let mut w = orderd_candidates.values().cloned().collect::<HashSet<_>>();
-    // W in paper
-    let mut candidates = orderd_candidates.clone();
-    assert_eq!(w.len(), candidates.len());
+    let mut heap: BinaryHeap<OrderedNode> = BinaryHeap::from_iter(
+        orderd_candidates
+            .iter()
+            .map(|(&d, &u)| OrderedNode { id: u, dist: d }),
+    );
 
-    if extended_candidates {
+    if extend_candidates {
         let dist_calc = graph.storage().dist_calculator(query);
+        let mut visited = HashSet::with_capacity(orderd_candidates.len() * 64);
+        visited.extend(orderd_candidates.values());
         orderd_candidates.iter().for_each(|(_, &u)| {
             if let Some(neighbors) = graph.neighbors(u) {
                 neighbors.for_each(|n| {
-                    if !w.contains(n) {
-                        candidates.insert(dist_calc.distance(&[*n])[0].into(), *n);
+                    if !visited.contains(&n) {
+                        let d: OrderedFloat = dist_calc.distance(&[n])[0].into();
+                        heap.push((d, n).into());
                     }
-                    w.insert(*n);
+                    visited.insert(n);
                 });
             }
         });
     }
 
-    let mut discarded = BTreeMap::<OrderedFloat, u32>::new();
-    while !candidates.is_empty() && results.len() < k {
-        let (d, u) = candidates.pop_first().unwrap();
-        if let Some((&key, &value)) = results.last_key_value() {
-            if key > d {
-                candidates.insert(key, value);
-            } else {
-                discarded.insert(d, u);
-            }
-        } else {
-            results.insert(d, u);
-        }
-    }
-    if keep_pruned_connections && results.len() < k {
-        results.extend(
-            discarded
-                .iter()
-                .take(k - results.len())
-                .map(|(&d, &n)| (d, n)),
-        );
-    }
-
-    results.into_iter().take(k)
+    heap.into_sorted_vec().into_iter().take(k).map(|n| n.into())
 }
 
 #[cfg(test)]
@@ -438,7 +417,7 @@ mod tests {
             vec![
                 (OrderedFloat(1.0), 1),
                 (OrderedFloat(2.0), 2),
-                (OrderedFloat(3.0), 3)
+                (OrderedFloat(3.0), 3),
             ]
         );
 
@@ -478,9 +457,9 @@ mod tests {
         });
 
         hnsw.levels.iter().for_each(|layer| {
-            for i in 0..layer.len() {
+            for &i in layer.id_to_node.keys() {
                 // If the node exist on this layer, check its out-degree.
-                if let Some(neighbors) = layer.neighbors(i as u32) {
+                if let Some(neighbors) = layer.neighbors(i) {
                     let cnt = neighbors.count();
                     assert!(cnt <= MAX_EDGES, "actual {}, max_edges: {}", cnt, MAX_EDGES);
                 }

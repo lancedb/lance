@@ -55,7 +55,6 @@ pub struct PQBuildParams {
     /// Max number of iterations to train Optimized Product Quantization,
     /// if `use_opq` is true.
     pub max_opq_iters: usize,
-
     /// User provided codebook.
     pub codebook: Option<ArrayRef>,
 
