@@ -469,7 +469,7 @@ mod tests {
 
     use crate::{
         dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
-        index::vector::{StageParams, VectorIndexParams},
+        index::vector::VectorIndexParams,
         io::ObjectStore,
     };
     use all_asserts::{assert_gt, assert_lt};
@@ -627,10 +627,8 @@ mod tests {
 
         async fn create_some_index(&self) -> Result<()> {
             let mut db = self.open().await?;
-            let index_params = Box::new(VectorIndexParams {
-                stages: vec![StageParams::DiskANN(Default::default())],
-                metric_type: MetricType::L2,
-            });
+            let index_params =
+                Box::new(VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 5));
             db.create_index(
                 &["indexable"],
                 IndexType::Vector,
@@ -903,8 +901,8 @@ mod tests {
 
         let before_count = fixture.count_files().await.unwrap();
         assert_eq!(before_count.num_index_files, 1);
-        // Two user data files and one lance file for the index
-        assert_eq!(before_count.num_data_files, 3);
+        // Two user data files
+        assert_eq!(before_count.num_data_files, 2);
         // Creating an index creates a new manifest so there are 4 total
         assert_eq!(before_count.num_manifest_files, 4);
 

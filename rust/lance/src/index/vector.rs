@@ -18,9 +18,6 @@
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
-pub mod diskann;
-#[allow(dead_code)]
-mod graph;
 pub mod ivf;
 pub mod pq;
 mod traits;
@@ -30,7 +27,6 @@ use lance_index::vector::{ivf::IvfBuildParams, pq::PQBuildParams};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
-use object_store::path::Path;
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
@@ -43,13 +39,7 @@ use self::{
 use super::{pb, DatasetIndexInternalExt, IndexParams};
 use crate::{
     dataset::Dataset,
-    index::{
-        pb::vector_index_stage::Stage,
-        vector::{
-            diskann::{DiskANNIndex, DiskANNParams},
-            ivf::Ivf,
-        },
-    },
+    index::{pb::vector_index_stage::Stage, vector::ivf::Ivf},
     Error, Result,
 };
 pub use traits::*;
@@ -60,8 +50,6 @@ pub enum StageParams {
     Ivf(IvfBuildParams),
 
     PQ(PQBuildParams),
-
-    DiskANN(DiskANNParams),
 }
 
 /// The parameters to build vector index.
@@ -121,14 +109,6 @@ impl VectorIndexParams {
             metric_type,
         }
     }
-
-    pub fn with_diskann_params(metric_type: MetricType, diskann: DiskANNParams) -> Self {
-        let stages = vec![StageParams::DiskANN(diskann)];
-        Self {
-            stages,
-            metric_type,
-        }
-    }
 }
 
 impl IndexParams for VectorIndexParams {
@@ -145,14 +125,6 @@ fn is_ivf_pq(stages: &[StageParams]) -> bool {
 
     matches!(&stages[len - 1], StageParams::PQ(_))
         && matches!(&stages[len - 2], StageParams::Ivf(_))
-}
-
-fn is_diskann(stages: &[StageParams]) -> bool {
-    if stages.is_empty() {
-        return false;
-    }
-    let last = stages.last().unwrap();
-    matches!(last, StageParams::DiskANN(_))
 }
 
 /// Build a Vector Index
@@ -198,16 +170,6 @@ pub(crate) async fn build_vector_index(
             pq_params,
         )
         .await?
-    } else if is_diskann(stages) {
-        // This is DiskANN index.
-        use self::diskann::build_diskann_index;
-        let StageParams::DiskANN(params) = stages.last().unwrap() else {
-            return Err(Error::Index {
-                message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                location: location!(),
-            });
-        };
-        build_diskann_index(dataset, column, name, uuid, params.clone()).await?;
     } else {
         return Err(Error::Index {
             message: format!("Build Vector Index: invalid stages: {:?}", stages),
@@ -259,13 +221,12 @@ pub(crate) async fn remap_vector_index(
 }
 
 /// Open the Vector index on dataset, specified by the `uuid`.
-#[instrument(level = "debug", skip(dataset, vec_idx, index_dir, reader))]
+#[instrument(level = "debug", skip(dataset, vec_idx, reader))]
 pub(crate) async fn open_vector_index(
     dataset: Arc<Dataset>,
     column: &str,
     uuid: &str,
     vec_idx: &lance_index::pb::VectorIndex,
-    index_dir: Path,
     reader: Arc<dyn Reader>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let metric_type = pb::VectorMetricType::try_from(vec_idx.metric_type)?.into();
@@ -329,20 +290,11 @@ pub(crate) async fn open_vector_index(
                 let pq = lance_index::vector::pq::builder::from_proto(pq_proto, metric_type)?;
                 last_stage = Some(Arc::new(PQIndex::new(pq, metric_type)));
             }
-            Some(Stage::Diskann(diskann_proto)) => {
-                if last_stage.is_some() {
-                    return Err(Error::Index {
-                        message: format!(
-                            "DiskANN should be the only stage, but we got stages: {:?}",
-                            vec_idx.stages
-                        ),
-                        location: location!(),
-                    });
-                };
-                let graph_path = index_dir.child(diskann_proto.filename.as_str());
-                let diskann =
-                    Arc::new(DiskANNIndex::try_new(dataset.clone(), column, &graph_path).await?);
-                last_stage = Some(diskann);
+            Some(Stage::Diskann(_)) => {
+                return Err(Error::Index {
+                    message: "DiskANN support is removed from Lance.".to_string(),
+                    location: location!(),
+                });
             }
             _ => {}
         }
