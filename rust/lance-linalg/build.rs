@@ -23,7 +23,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
 
-    if !cfg!(any(feature = "fp16kernels", target_os = "windows")) {
+    if cfg!(any(not(feature = "fp16kernels"), target_os = "windows")) {
         // We only compile the f16 kernels if the feature is enabled
         // MSVC does not support the f16 type, so we also skip it on Windows.
         return;
