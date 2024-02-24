@@ -21,13 +21,13 @@
 
 /// Works on NEON + FP16 or AVX512FP16
 float norm_l2_f16(const _Float16 *data, uint32_t dimension) {
-  _Float16 sum = 0;
+  float sum = 0;
 
 #pragma clang loop unroll(enable) vectorize(enable) interleave(enable)
   for (uint32_t i = 0; i < dimension; i++) {
-    sum += data[i] * data[i];
+    sum += (float) data[i] * (float) data[i];
   }
-  return (float) sum;
+  return sum;
 }
 
 /// @brief Dot product of two f16 vectors.
@@ -36,22 +36,22 @@ float norm_l2_f16(const _Float16 *data, uint32_t dimension) {
 /// @param dimension The dimension of the vectors
 /// @return The dot product of the two vectors.
 float dot_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
-  _Float16 sum = 0;
+  float sum = 0;
 
 #pragma clang loop unroll(enable) interleave(enable) vectorize(enable)
   for (uint32_t i = 0; i < dimension; i++) {
-    sum += x[i] * y[i];
+    sum += (float) x[i] * (float) y[i];
   }
-  return (float) sum;
+  return sum;
 }
 
 float l2_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
-  _Float16 sum = 0.0;
+  float sum = 0.0;
 
-#pragma clang loop unroll(enable) interleave(enable) vectorize_width(32)
+#pragma clang loop unroll(enable) interleave(enable) vectorize(enable)
   for (uint32_t i = 0; i < dimension; i++) {
-    _Float16 s = x[i] - y[i];
+    float s = x[i] - y[i];
     sum += s * s;
   }
-  return (float) sum;
+  return sum;
 }

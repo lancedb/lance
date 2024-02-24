@@ -16,7 +16,7 @@ use std::iter::repeat_with;
 
 use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
-    Float32Array,
+    Float32Array, Float16Array,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use half::bf16;
@@ -87,8 +87,23 @@ fn bench_distance(c: &mut Criterion) {
     });
 
     run_bench::<Float16Type>(c);
-    run_bench::<Float32Type>(c);
 
+    let target: Float16Array =
+        generate_random_array_with_seed::<Float16Type>(TOTAL * DIMENSION, [42; 32]);
+        c.bench_function("norm_l2(f16, SIMD)", |b| {
+            b.iter(|| {
+                black_box(
+                    target
+                        .values()
+                        .chunks_exact(DIMENSION)
+                        .map(|arr| arr.norm_l2())
+                        .collect::<Vec<_>>(),
+                )
+            });
+        });
+    
+
+    run_bench::<Float32Type>(c);
     // 1M of 1024 D vectors. 4GB in memory.
     let target: Float32Array =
         generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, [42; 32]);
