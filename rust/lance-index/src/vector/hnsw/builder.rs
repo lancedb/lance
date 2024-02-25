@@ -73,12 +73,14 @@ impl HNSWBuilder {
     }
 
     /// The maximum level of the graph.
+    /// The default value is `8`.
     pub fn max_level(mut self, max_level: u16) -> Self {
         self.max_level = max_level;
         self
     }
 
     /// The maximum number of connections for each node per layer.
+    /// The default value is `64`.
     pub fn max_num_edges(mut self, m_max: usize) -> Self {
         self.m_max = m_max;
         self
@@ -86,6 +88,8 @@ impl HNSWBuilder {
 
     /// Number of candidates to be considered when searching for the nearest neighbors
     /// during the construction of the graph.
+    ///
+    /// The default value is `100`.
     pub fn ef_construction(mut self, ef_construction: usize) -> Self {
         self.ef_construction = ef_construction;
         self
@@ -93,12 +97,17 @@ impl HNSWBuilder {
 
     /// Whether to expend to search candidate neighbors during heuristic search.
     ///
+    /// The default value is `false`.
+    ///
     /// See `extendCandidates` parameter in the paper (Algorithm 4)
     pub fn extend_candidates(mut self, flag: bool) -> Self {
         self.extend_candidates = flag;
         self
     }
 
+    /// Use select heuristic when searching for the nearest neighbors.
+    ///
+    /// See algorithm 4 in HNSW paper.
     pub fn use_select_heuristic(mut self, flag: bool) -> Self {
         self.use_select_heuristic = flag;
         self
@@ -120,8 +129,8 @@ impl HNSWBuilder {
         min(
             (m as f32).log(self.log_base).ceil() as u16
                 - (rng.gen::<f32>() * self.vectors.len() as f32)
-                    .log(self.log_base)
-                    .ceil() as u16,
+                .log(self.log_base)
+                .ceil() as u16,
             self.max_level,
         )
     }
@@ -191,7 +200,7 @@ impl HNSWBuilder {
         self.build_with(self.vectors.clone())
     }
 
-    /// Build the graph, with the provided [`VectorStorage`] as backing storage for HNSW graph.
+    /// Build the graph, with the provided [VectorStorage] as backing storage for HNSW graph.
     pub fn build_with(&mut self, storage: Arc<dyn VectorStorage>) -> Result<HNSW> {
         log::info!(
             "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",

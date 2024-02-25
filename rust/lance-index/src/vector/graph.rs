@@ -26,7 +26,8 @@ pub(crate) mod builder;
 pub mod memory;
 pub(super) mod storage;
 
-use storage::VectorStorage;
+/// Vector storage to back a graph.
+pub use storage::VectorStorage;
 
 pub(crate) const NEIGHBORS_COL: &str = "__neighbors";
 
@@ -124,7 +125,7 @@ impl From<OrderedNode> for (OrderedFloat, u32) {
 pub trait DistanceCalculator {
     /// Compute distances between one query vector to all the vectors in the
     /// list of IDs.
-    fn compute_distances(&self, ids: &[u32]) -> Box<dyn Iterator<Item = f32>>;
+    fn compute_distances(&self, ids: &[u32]) -> Box<dyn Iterator<Item=f32>>;
 }
 
 /// Graph trait.
@@ -143,7 +144,7 @@ pub trait Graph {
     }
 
     /// Get the neighbors of a graph node, identifyied by the index.
-    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>>;
+    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item=u32> + '_>>;
 
     /// Access to underline storage
     fn storage(&self) -> Arc<dyn VectorStorage>;
