@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use std::cmp::min;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
+use itertools::Itertools;
 use lance_core::Result;
 use rand::{thread_rng, Rng};
 
@@ -140,7 +141,7 @@ impl HNSWBuilder {
             };
         }
 
-        let m = self.levels[0].nodes.len();
+        let m = self.len();
         for cur_level in self.levels.iter_mut().rev().skip(levels_to_search) {
             cur_level.insert(node);
             let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
@@ -196,6 +197,10 @@ impl HNSWBuilder {
 
         remapping_levels(&mut self.levels);
 
+        for (i, level) in self.levels.iter().enumerate() {
+            println!("Level {}: {:#?}", i, level.stats());
+        }
+
         let graphs = self
             .levels
             .iter()
@@ -218,6 +223,7 @@ fn remapping_levels(levels: &mut [GraphBuilder]) {
         let mapping = prev_level
             .nodes
             .keys()
+            .sorted()
             .enumerate()
             .map(|(i, &id)| (id, i as u32))
             .collect::<HashMap<_, _>>();
@@ -225,6 +231,7 @@ fn remapping_levels(levels: &mut [GraphBuilder]) {
         let current_mapping = cur_level
             .nodes
             .keys()
+            .sorted()
             .enumerate()
             .map(|(idx, &id)| (id, idx as u32))
             .collect::<HashMap<_, _>>();
@@ -232,16 +239,13 @@ fn remapping_levels(levels: &mut [GraphBuilder]) {
             node.pointer = *mapping.get(&node.id).expect("Expect the pointer exists");
 
             // Remapping the neighbors within this level of graph.
-            node.neighbors = node
-                .neighbors
-                .iter()
-                .map(|(d, n)| {
-                    (
-                        *d,
-                        *current_mapping.get(n).expect("Expect the pointer exists"),
-                    )
-                })
-                .collect();
+            let mut new_neighbors = node.neighbors.clone().into_vec();
+            for neighbor in &mut new_neighbors {
+                neighbor.id = *current_mapping
+                    .get(&neighbor.id)
+                    .expect("Expect the pointer exists");
+            }
+            node.neighbors = BinaryHeap::from(new_neighbors);
         }
     }
 }
@@ -280,6 +284,7 @@ mod tests {
                 .nodes
                 .values()
                 .map(|n| n.pointer)
+                .sorted()
                 .collect::<Vec<_>>(),
             vec![0, 5, 10, 15, 20, 30, 40, 50]
         );
@@ -288,6 +293,7 @@ mod tests {
                 .nodes
                 .values()
                 .map(|n| n.pointer)
+                .sorted()
                 .collect::<Vec<_>>(),
             vec![0, 2, 4, 7]
         );

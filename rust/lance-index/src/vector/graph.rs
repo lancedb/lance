@@ -87,7 +87,7 @@ impl From<OrderedFloat> for f32 {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Debug, Eq, PartialEq, PartialOrd, Ord, Clone)]
 pub(crate) struct OrderedNode {
     pub id: u32,
     pub dist: OrderedFloat,
@@ -131,7 +131,7 @@ pub trait Graph {
     }
 
     /// Get the neighbors of a graph node, identifyied by the index.
-    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = &u32> + '_>>;
+    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>>;
 
     /// Access to underline storage
     fn storage(&self) -> Arc<dyn VectorStorage>;
@@ -181,7 +181,7 @@ pub(super) fn beam_search(
             location: location!(),
         })?;
 
-        for &neighbor in neighbors {
+        for neighbor in neighbors {
             if visited.contains(&neighbor) {
                 continue;
             }

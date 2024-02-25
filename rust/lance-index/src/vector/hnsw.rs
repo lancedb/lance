@@ -128,7 +128,13 @@ impl HnswLevel {
         let mut vector_id_builder = UInt32Builder::new();
 
         for (_, node) in builder.nodes.iter() {
-            neighbours_builder.append_value(node.neighbors.values().map(|&n| Some(n)));
+            neighbours_builder.append_value(
+                node.neighbors
+                    .clone()
+                    .into_sorted_vec()
+                    .iter()
+                    .map(|n| Some(n.id)),
+            );
             pointers_builder.append_value(node.pointer);
             vector_id_builder.append_value(node.id);
         }
@@ -173,9 +179,11 @@ impl Graph for HnswLevel {
         self.nodes.num_rows()
     }
 
-    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = &u32> + '_>> {
+    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>> {
         let range = self.neighbors_range(key);
-        Some(Box::new(self.neighbors_values.values()[range].iter()))
+        Some(Box::new(
+            self.neighbors_values.values()[range].iter().copied(),
+        ))
     }
 
     fn storage(&self) -> Arc<dyn VectorStorage> {
@@ -381,10 +389,11 @@ fn select_neighbors_heuristic(
 
     if extend_candidates {
         let dist_calc = graph.storage().dist_calculator(query);
-        let mut visited = heap.iter().map(|n| n.id).collect::<HashSet<_>>();
+        let mut visited = HashSet::with_capacity(orderd_candidates.len() * 64);
+        visited.extend(orderd_candidates.values());
         orderd_candidates.iter().for_each(|(_, &u)| {
             if let Some(neighbors) = graph.neighbors(u) {
-                neighbors.for_each(|&n| {
+                neighbors.for_each(|n| {
                     if !visited.contains(&n) {
                         let d: OrderedFloat = dist_calc.distance(&[n])[0].into();
                         heap.push((d, n).into());
@@ -395,7 +404,7 @@ fn select_neighbors_heuristic(
         });
     }
 
-    heap.into_iter().take(k).map(|n| n.into())
+    heap.into_sorted_vec().into_iter().take(k).map(|n| n.into())
 }
 
 #[cfg(test)]
