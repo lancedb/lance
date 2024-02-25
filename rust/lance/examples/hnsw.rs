@@ -114,5 +114,4 @@ async fn main() {
             search_time
         );
     }
-
 }
