@@ -16,7 +16,7 @@ use std::cmp::min;
 use std::sync::Arc;
 
 use lance_core::Result;
-use log::{log_enabled, Level::Info};
+use log::{info, log_enabled, Level::Info};
 use rand::{thread_rng, Rng};
 
 use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
