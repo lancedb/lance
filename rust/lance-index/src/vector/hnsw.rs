@@ -165,7 +165,7 @@ impl Graph for HnswLevel {
         self.nodes.num_rows()
     }
 
-    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>> {
+    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item=u32> + '_>> {
         let range = self.neighbors_range(key);
         Some(Box::new(
             self.neighbors_values.values()[range].iter().copied(),
@@ -273,7 +273,8 @@ impl HNSW {
         }
     }
 
-    pub(crate) fn schema(&self) -> SchemaRef {
+    /// The Arrow schema of the graph.
+    pub fn schema(&self) -> SchemaRef {
         self.levels[0].schema()
     }
 
@@ -351,7 +352,7 @@ impl HNSW {
 fn select_neighbors(
     orderd_candidates: &BTreeMap<OrderedFloat, u32>,
     k: usize,
-) -> impl Iterator<Item = (OrderedFloat, u32)> + '_ {
+) -> impl Iterator<Item=(OrderedFloat, u32)> + '_ {
     orderd_candidates.iter().take(k).map(|(&d, &u)| (d, u))
 }
 
@@ -366,7 +367,7 @@ fn select_neighbors_heuristic(
     orderd_candidates: &BTreeMap<OrderedFloat, u32>,
     k: usize,
     extend_candidates: bool,
-) -> impl Iterator<Item = (OrderedFloat, u32)> {
+) -> impl Iterator<Item=(OrderedFloat, u32)> {
     let mut heap: BinaryHeap<OrderedNode> = BinaryHeap::from_iter(
         orderd_candidates
             .iter()
