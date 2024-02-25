@@ -44,6 +44,9 @@ struct Args {
     /// Max number of edges of each node.
     #[arg(long, default_value = "64")]
     max_edges: usize,
+
+    #[arg(long, default_value = "7")]
+    max_level: u16,
 }
 
 fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
@@ -90,7 +93,7 @@ async fn main() {
     for ef_construction in [50, 100, 200, 400] {
         let now = std::time::Instant::now();
         let hnsw = HNSWBuilder::new(vector_store.clone())
-            .max_level(7)
+            .max_level(args.max_level)
             .max_num_edges(args.max_edges)
             .ef_construction(ef_construction)
             .build()
@@ -106,7 +109,7 @@ async fn main() {
         let search_time = now.elapsed().as_micros();
         println!(
             "level={}, ef_construct={}, ef={} recall={}: construct={:.3}s search={:.3} us",
-            level,
+            args.max_level,
             ef_construction,
             args.ef,
             results.intersection(&gt).count() as f32 / k as f32,
