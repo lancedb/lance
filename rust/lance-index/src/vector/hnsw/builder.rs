@@ -269,10 +269,16 @@ mod tests {
         for i in 0..100 {
             level0.insert(i as u32);
         }
+        level0.connect(0, 50).unwrap();
+        level0.connect(1, 60).unwrap();
         let mut level1 = GraphBuilder::new(storage.clone());
         for i in [0, 5, 10, 15, 20, 30, 40, 50] {
             level1.insert(i as u32);
         }
+        level1.connect(0, 10).unwrap();
+        level1.connect(0, 20).unwrap();
+        level1.connect(5, 30).unwrap();
+        level1.connect(5, 20).unwrap();
         let mut level2 = GraphBuilder::new(storage.clone());
         for i in [0, 10, 20, 50] {
             level2.insert(i as u32);
@@ -288,6 +294,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 5, 10, 15, 20, 30, 40, 50]
         );
+        assert_eq!(
+            levels[1].neighbors(0).unwrap().collect::<Vec<_>>(),
+            vec![2, 4]
+        );
+        assert_eq!(
+            levels[1].neighbors(1).unwrap().collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+
         assert_eq!(
             levels[2]
                 .nodes

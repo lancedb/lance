@@ -28,6 +28,7 @@ use arrow_array::{
     ListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use itertools::Itertools;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_linalg::distance::MetricType;
@@ -127,7 +128,8 @@ impl HnswLevel {
         let mut pointers_builder = UInt32Builder::new();
         let mut vector_id_builder = UInt32Builder::new();
 
-        for (_, node) in builder.nodes.iter() {
+        for id in builder.nodes.keys().sorted() {
+            let node = builder.nodes.get(id).unwrap();
             neighbours_builder.append_value(
                 node.neighbors
                     .clone()

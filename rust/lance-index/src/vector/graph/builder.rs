@@ -206,5 +206,15 @@ mod tests {
 
         assert_eq!(builder.neighbors(0).unwrap().collect::<Vec<_>>(), vec![1]);
         assert_eq!(builder.neighbors(1).unwrap().collect::<Vec<_>>(), vec![0]);
+
+        builder.insert(4);
+        builder.connect(0, 4).unwrap();
+        assert_eq!(builder.len(), 3);
+
+        assert_eq!(
+            builder.neighbors(0).unwrap().collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+        assert_eq!(builder.neighbors(1).unwrap().collect::<Vec<_>>(), vec![0]);
     }
 }
