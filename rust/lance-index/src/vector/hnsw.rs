@@ -22,6 +22,7 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
 
+use arrow::datatypes::UInt32Type;
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
@@ -64,6 +65,11 @@ lazy_static::lazy_static! {
 /// One level of the HNSW graph.
 ///
 struct HnswLevel {
+    /// Vector ID to the node index in `nodes`.
+    /// The node on different layer share the same Vector ID, which is the index
+    /// in the [VectorStorage].
+    id_to_node: HashMap<u32, usize>,
+
     /// All the nodes in this level.
     // TODO: we just load the whole level into memory without pagation.
     nodes: RecordBatch,
@@ -77,11 +83,8 @@ struct HnswLevel {
     /// The values of the neighbors array.
     neighbors_values: Arc<UInt32Array>,
 
-    /// Id of the vector in the [VectorStorage].
-    vector_ids: Arc<UInt32Array>,
-
     /// Vector storage of the graph.
-    vectors: Arc<HnswRemappingStorage>,
+    vectors: Arc<dyn VectorStorage>,
 }
 
 impl HnswLevel {
@@ -104,32 +107,31 @@ impl HnswLevel {
             .clone()
             .into();
         let values: Arc<UInt32Array> = neighbors.values().as_primitive().clone().into();
-        let vector_ids: Arc<UInt32Array> = nodes
+        let id_to_node = nodes
             .column_by_name(VECTOR_ID_COL)
             .unwrap()
-            .as_primitive()
-            .clone()
-            .into();
-        let vectors = Arc::new(storage::HnswRemappingStorage::new(
-            vectors,
-            vector_ids.clone(),
-        ));
+            .as_primitive::<UInt32Type>()
+            .values()
+            .iter()
+            .enumerate()
+            .map(|(idx, &vec_id)| (vec_id, idx))
+            .collect::<HashMap<u32, usize>>();
         Self {
             nodes,
             neighbors,
             neighbors_values: values,
-            vector_ids,
+            id_to_node,
             vectors,
         }
     }
 
     fn from_builder(builder: &GraphBuilder, vectors: Arc<dyn VectorStorage>) -> Result<Self> {
         let mut neighbours_builder = ListBuilder::new(UInt32Builder::new());
-        let mut pointers_builder = UInt32Builder::new();
         let mut vector_id_builder = UInt32Builder::new();
 
-        for id in builder.nodes.keys().sorted() {
-            let node = builder.nodes.get(id).unwrap();
+        for &id in builder.nodes.keys().sorted() {
+            let node = builder.nodes.get(&id).unwrap();
+            assert_eq!(node.id, id);
             neighbours_builder.append_value(
                 node.neighbors
                     .clone()
@@ -137,21 +139,15 @@ impl HnswLevel {
                     .iter()
                     .map(|n| Some(n.id)),
             );
-            pointers_builder.append_value(node.pointer);
             vector_id_builder.append_value(node.id);
         }
 
-        let schema = Schema::new(vec![
-            NEIGHBORS_FIELD.clone(),
-            VECTOR_ID_FIELD.clone(),
-            POINTER_FIELD.clone(),
-        ]);
+        let schema = Schema::new(vec![NEIGHBORS_FIELD.clone(), VECTOR_ID_FIELD.clone()]);
         let batch = RecordBatch::try_new(
             schema.into(),
             vec![
                 Arc::new(neighbours_builder.finish()),
                 Arc::new(vector_id_builder.finish()),
-                Arc::new(pointers_builder.finish()),
             ],
         )?;
 
@@ -163,16 +159,11 @@ impl HnswLevel {
     }
 
     /// Range of neighbors for the given node, specified by its index.
-    fn neighbors_range(&self, idx: u32) -> Range<usize> {
-        let start = self.neighbors.value_offsets()[idx as usize] as usize;
-        let end = start + self.neighbors.value_length(idx as usize) as usize;
+    fn neighbors_range(&self, id: u32) -> Range<usize> {
+        let idx = self.id_to_node[&id];
+        let start = self.neighbors.value_offsets()[idx] as usize;
+        let end = start + self.neighbors.value_length(idx) as usize;
         start..end
-    }
-
-    fn pointers(&self, ids: &[u32]) -> Vec<u32> {
-        ids.iter()
-            .map(|&id| self.vector_ids.value(id as usize))
-            .collect()
     }
 }
 
@@ -315,9 +306,12 @@ impl HNSW {
             } else {
                 select_neighbors(&candidates, 1).map(|(_, id)| id).collect()
             };
-            ep = level.pointers(&ep);
         }
         let candidates = beam_search(&self.levels[0], &ep, query, ef)?;
+        println!(
+            "Level 0 candidates: {:?}, starting ep: {:#?}",
+            candidates, ep
+        );
         if self.use_select_heuristic {
             Ok(
                 select_neighbors_heuristic(&self.levels[0], query, &candidates, k, false)
@@ -472,7 +466,7 @@ mod tests {
         });
 
         hnsw.levels.iter().for_each(|layer| {
-            for i in 0..layer.len() {
+            for &i in layer.id_to_node.keys() {
                 // If the node exist on this layer, check its out-degree.
                 if let Some(neighbors) = layer.neighbors(i as u32) {
                     let cnt = neighbors.count();
@@ -519,6 +513,7 @@ mod tests {
             .map(|(i, _)| *i)
             .collect();
         let gt = ground_truth(&mat, q, K);
+        println!("Results: {:?} GT: {:?}", results, gt);
         let recall = results.intersection(&gt).count() as f32 / K as f32;
         assert!(recall >= 0.7, "Recall: {}", recall);
     }

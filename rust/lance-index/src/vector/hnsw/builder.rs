@@ -16,7 +16,6 @@ use std::cmp::min;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
-use itertools::Itertools;
 use lance_core::Result;
 use rand::{thread_rng, Rng};
 
@@ -30,6 +29,9 @@ use crate::vector::hnsw::HnswLevel;
 ///
 /// Currently, the HNSW graph is fully built in memory.
 ///
+/// During the build, the graph is built layer by layer.
+///
+/// Each node in the graph has a global ID which is the index on the base layer.
 pub struct HNSWBuilder {
     /// max level of
     max_level: u16,
@@ -132,12 +134,10 @@ impl HNSWBuilder {
             let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
             ep = if self.use_select_heuristic {
                 select_neighbors_heuristic(cur_level, query, &candidates, 1, true)
-                    .map(|(_, id)| cur_level.nodes[&id].pointer)
+                    .map(|(_, id)| id)
                     .collect()
             } else {
-                select_neighbors(&candidates, 1)
-                    .map(|(_, id)| cur_level.nodes[&id].pointer)
-                    .collect()
+                select_neighbors(&candidates, 1).map(|(_, id)| id).collect()
             };
         }
 
@@ -158,10 +158,7 @@ impl HNSWBuilder {
                 cur_level.prune(nb, self.m_max)?;
             }
             cur_level.prune(node, self.m_max)?;
-            ep = candidates
-                .values()
-                .map(|id| cur_level.nodes[id].pointer)
-                .collect();
+            ep = candidates.values().copied().collect();
         }
 
         if level > self.levels.len() as u16 {
@@ -195,8 +192,6 @@ impl HNSWBuilder {
             self.insert(i as u32)?;
         }
 
-        remapping_levels(&mut self.levels);
-
         for (i, level) in self.levels.iter().enumerate() {
             println!("Level {}: {:#?}", i, level.stats());
         }
@@ -212,107 +207,5 @@ impl HNSWBuilder {
             self.vectors.metric_type(),
             self.use_select_heuristic,
         ))
-    }
-}
-
-/// Because each level is stored as a separate continous RecordBatch. We need to remap the pointers
-/// to the nodes in the previous level to the index in the current RecordBatch.
-fn remapping_levels(levels: &mut [GraphBuilder]) {
-    for i in 1..levels.len() {
-        let prev_level = &levels[i - 1];
-        let mapping = prev_level
-            .nodes
-            .keys()
-            .sorted()
-            .enumerate()
-            .map(|(i, &id)| (id, i as u32))
-            .collect::<HashMap<_, _>>();
-        let cur_level = &mut levels[i];
-        let current_mapping = cur_level
-            .nodes
-            .keys()
-            .sorted()
-            .enumerate()
-            .map(|(idx, &id)| (id, idx as u32))
-            .collect::<HashMap<_, _>>();
-        for node in cur_level.nodes.values_mut() {
-            node.pointer = *mapping.get(&node.id).expect("Expect the pointer exists");
-
-            // Remapping the neighbors within this level of graph.
-            let mut new_neighbors = node.neighbors.clone().into_vec();
-            for neighbor in &mut new_neighbors {
-                neighbor.id = *current_mapping
-                    .get(&neighbor.id)
-                    .expect("Expect the pointer exists");
-            }
-            node.neighbors = BinaryHeap::from(new_neighbors);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use std::sync::Arc;
-
-    use arrow_array::types::Float32Type;
-    use lance_linalg::{distance::MetricType, matrix::MatrixView};
-    use lance_testing::datagen::generate_random_array;
-
-    #[test]
-    fn test_remapping_levels() {
-        let data = generate_random_array(8 * 100);
-        let mat = MatrixView::<Float32Type>::new(Arc::new(data), 8);
-        let storage = Arc::new(InMemoryVectorStorage::new(mat.into(), MetricType::L2));
-        let mut level0 = GraphBuilder::new(storage.clone());
-        for i in 0..100 {
-            level0.insert(i as u32);
-        }
-        level0.connect(0, 50).unwrap();
-        level0.connect(1, 60).unwrap();
-        let mut level1 = GraphBuilder::new(storage.clone());
-        for i in [0, 5, 10, 15, 20, 30, 40, 50] {
-            level1.insert(i as u32);
-        }
-        level1.connect(0, 10).unwrap();
-        level1.connect(0, 20).unwrap();
-        level1.connect(5, 30).unwrap();
-        level1.connect(5, 20).unwrap();
-        let mut level2 = GraphBuilder::new(storage.clone());
-        for i in [0, 10, 20, 50] {
-            level2.insert(i as u32);
-        }
-        let mut levels = [level0, level1, level2];
-        remapping_levels(&mut levels);
-        assert_eq!(
-            levels[1]
-                .nodes
-                .values()
-                .map(|n| n.pointer)
-                .sorted()
-                .collect::<Vec<_>>(),
-            vec![0, 5, 10, 15, 20, 30, 40, 50]
-        );
-        assert_eq!(
-            levels[1].neighbors(0).unwrap().collect::<Vec<_>>(),
-            vec![2, 4]
-        );
-        assert_eq!(
-            levels[1].neighbors(1).unwrap().collect::<Vec<_>>(),
-            vec![4, 5]
-        );
-
-        assert_eq!(
-            levels[2]
-                .nodes
-                .values()
-                .map(|n| n.pointer)
-                .sorted()
-                .collect::<Vec<_>>(),
-            vec![0, 2, 4, 7]
-        );
-
-        println!("{:?}", levels[2].nodes);
     }
 }

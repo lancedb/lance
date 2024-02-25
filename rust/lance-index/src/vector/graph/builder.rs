@@ -30,9 +30,6 @@ pub struct GraphBuilderNode {
 
     /// Neighbors, sorted by the distance.
     pub(crate) neighbors: BinaryHeap<OrderedNode>,
-
-    /// Pointer to the next level of graph, or acts as the idx
-    pub pointer: u32,
 }
 
 impl GraphBuilderNode {
@@ -40,7 +37,6 @@ impl GraphBuilderNode {
         Self {
             id,
             neighbors: BinaryHeap::new(),
-            pointer: 0,
         }
     }
 
