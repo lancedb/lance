@@ -16,6 +16,7 @@ use std::cmp::min;
 use std::sync::Arc;
 
 use lance_core::Result;
+use log::{log_enabled, Level::Info};
 use rand::{thread_rng, Rng};
 
 use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
@@ -117,10 +118,10 @@ impl HNSWBuilder {
         // We use log10 instead of log(e), so each layer has about 1/10 of its bottom layer.
         let m = self.vectors.len();
         min(
-            (m as f32).log(self.log_base).floor() as u16
+            (m as f32).log(self.log_base).ceil() as u16
                 - (rng.gen::<f32>() * self.vectors.len() as f32)
                     .log(self.log_base)
-                    .floor() as u16,
+                    .ceil() as u16,
             self.max_level,
         )
     }
@@ -209,8 +210,10 @@ impl HNSWBuilder {
             self.insert(i as u32)?;
         }
 
-        for (i, level) in self.levels.iter().enumerate() {
-            println!("Level {}: {:#?}", i, level.stats());
+        if log_enabled!(Info) {
+            for (i, level) in self.levels.iter().enumerate() {
+                info!("HNSW level {}: {:#?}", i, level.stats());
+            }
         }
 
         let graphs = self
