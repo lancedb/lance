@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Builder of Hnsw Graph.
+
 use std::cmp::min;
 use std::sync::Arc;
 
@@ -129,8 +131,8 @@ impl HNSWBuilder {
         min(
             (m as f32).log(self.log_base).ceil() as u16
                 - (rng.gen::<f32>() * self.vectors.len() as f32)
-                .log(self.log_base)
-                .ceil() as u16,
+                    .log(self.log_base)
+                    .ceil() as u16,
             self.max_level,
         )
     }

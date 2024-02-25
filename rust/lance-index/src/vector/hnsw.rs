@@ -218,8 +218,8 @@ impl HNSW {
     ///
     /// Parameters
     /// ----------
-    /// reader : &FileReader
-    /// vector_storage : Arc<dyn VectorStorage>
+    /// - *reader*: the file reader to read the graph from.
+    /// - *vector_storage*: A preloaded [VectorStorage] storage.
     pub async fn load(reader: &FileReader, vector_storage: Arc<dyn VectorStorage>) -> Result<Self> {
         let schema = reader.schema();
         let mt = if let Some(index_metadata) = schema.metadata.get("lance:index") {
@@ -273,7 +273,7 @@ impl HNSW {
         }
     }
 
-    pub fn schema(&self) -> SchemaRef {
+    pub(crate) fn schema(&self) -> SchemaRef {
         self.levels[0].schema()
     }
 
@@ -281,12 +281,13 @@ impl HNSW {
     ///
     /// Parameters
     /// ----------
-    /// query : &[f32]
-    ///     The query vector.
-    /// k : usize
-    ///    The number of nearest neighbors to search for.
-    /// ef : usize
-    ///    The size of dynamic candidate list
+    /// - *query* : the query vector.
+    /// - *k* : the number of nearest neighbors to search for.
+    /// - *ef* : the size of dynamic candidate list.
+    ///
+    /// Returns
+    /// -------
+    /// A list of `(id_in_graph, distance)` pairs. Or Error if the search failed.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<(u32, f32)>> {
         let mut ep = vec![self.entry_point];
         let num_layers = self.levels.len();
