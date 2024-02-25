@@ -96,7 +96,7 @@ impl HNSWBuilder {
 
     #[inline]
     fn m_l(&self) -> f32 {
-        1.0 / (self.max_level as f32).ln()
+        1.0 / (self.vectors.len() as f32).ln()
     }
 
     /// new node's level

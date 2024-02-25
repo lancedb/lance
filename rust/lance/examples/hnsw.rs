@@ -40,6 +40,10 @@ struct Args {
 
     #[arg(long, default_value = "100")]
     ef: usize,
+
+    /// Max number of edges of each node.
+    #[arg(long, default_value = "64")]
+    max_edges: usize,
 }
 
 fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
@@ -88,6 +92,7 @@ async fn main() {
             let now = std::time::Instant::now();
             let hnsw = HNSWBuilder::new(vector_store.clone())
                 .max_level(level)
+                .max_num_edges(args.max_edges)
                 .ef_construction(ef_construction)
                 .build()
                 .unwrap();
