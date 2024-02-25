@@ -48,6 +48,10 @@ pub struct HNSWBuilder {
 
     entry_point: u32,
 
+    extend_candidates: bool,
+
+    log_base: f32,
+
     use_select_heuristic: bool,
 }
 
@@ -56,11 +60,13 @@ impl HNSWBuilder {
     pub fn new(vectors: Arc<InMemoryVectorStorage>) -> Self {
         Self {
             max_level: 8,
-            m_max: 32,
+            m_max: 64,
             ef_construction: 100,
             vectors,
             levels: vec![],
             entry_point: 0,
+            extend_candidates: false,
+            log_base: 10.0,
             use_select_heuristic: true,
         }
     }
@@ -84,6 +90,14 @@ impl HNSWBuilder {
         self
     }
 
+    /// Whether to expend to search candidate neighbors during heuristic search.
+    ///
+    /// See `extendCandidates` parameter in the paper (Algorithm 4)
+    pub fn extend_candidates(mut self, flag: bool) -> Self {
+        self.extend_candidates = flag;
+        self
+    }
+
     pub fn use_select_heuristic(mut self, flag: bool) -> Self {
         self.use_select_heuristic = flag;
         self
@@ -94,18 +108,21 @@ impl HNSWBuilder {
         self.levels[0].len()
     }
 
-    #[inline]
-    fn m_l(&self) -> f32 {
-        1.0 / (self.vectors.len() as f32).ln()
-    }
-
-    /// new node's level
+    /// New node's level
     ///
     /// See paper `Algorithm 1`
     fn random_level(&self) -> u16 {
         let mut rng = thread_rng();
-        let r = rng.gen::<f32>();
-        min((-r.ln() * self.m_l()).floor() as u16, self.max_level)
+        // This is different to the paper.
+        // We use log10 instead of log(e), so each layer has about 1/10 of its bottom layer.
+        let m = self.vectors.len();
+        min(
+            (m as f32).log(self.log_base).floor() as u16
+                - (rng.gen::<f32>() * self.vectors.len() as f32)
+                    .log(self.log_base)
+                    .floor() as u16,
+            self.max_level,
+        )
     }
 
     /// Insert one node.
@@ -132,7 +149,7 @@ impl HNSWBuilder {
         for cur_level in self.levels.iter().rev().take(levels_to_search) {
             let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
             ep = if self.use_select_heuristic {
-                select_neighbors_heuristic(cur_level, query, &candidates, 1, true)
+                select_neighbors_heuristic(cur_level, query, &candidates, 1, self.extend_candidates)
                     .map(|(_, id)| id)
                     .collect()
             } else {
@@ -145,7 +162,8 @@ impl HNSWBuilder {
             cur_level.insert(node);
             let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
             let neighbours: Vec<_> = if self.use_select_heuristic {
-                select_neighbors_heuristic(cur_level, query, &candidates, m, true).collect()
+                select_neighbors_heuristic(cur_level, query, &candidates, m, self.extend_candidates)
+                    .collect()
             } else {
                 select_neighbors(&candidates, m).collect()
             };
@@ -189,6 +207,10 @@ impl HNSWBuilder {
 
         for i in 1..self.vectors.len() {
             self.insert(i as u32)?;
+        }
+
+        for (i, level) in self.levels.iter().enumerate() {
+            println!("Level {}: {:#?}", i, level.stats());
         }
 
         let graphs = self

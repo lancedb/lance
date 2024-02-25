@@ -91,7 +91,7 @@ async fn main() {
         for ef_construction in [50, 100, 200, 400] {
             let now = std::time::Instant::now();
             let hnsw = HNSWBuilder::new(vector_store.clone())
-                .max_level(level)
+                .max_level(7)
                 .max_num_edges(args.max_edges)
                 .ef_construction(ef_construction)
                 .build()
