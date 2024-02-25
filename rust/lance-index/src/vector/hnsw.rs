@@ -457,7 +457,7 @@ mod tests {
         hnsw.levels.iter().for_each(|layer| {
             for &i in layer.id_to_node.keys() {
                 // If the node exist on this layer, check its out-degree.
-                if let Some(neighbors) = layer.neighbors(i as u32) {
+                if let Some(neighbors) = layer.neighbors(i) {
                     let cnt = neighbors.count();
                     assert!(cnt <= MAX_EDGES, "actual {}, max_edges: {}", cnt, MAX_EDGES);
                 }
