@@ -87,10 +87,16 @@ impl From<OrderedFloat> for f32 {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, PartialOrd, Ord, Clone)]
+#[derive(Debug, Eq, PartialEq, Ord, Clone)]
 pub(crate) struct OrderedNode {
     pub id: u32,
     pub dist: OrderedFloat,
+}
+
+impl PartialOrd for OrderedNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.dist.partial_cmp(&other.dist)
+    }
 }
 
 impl From<(OrderedFloat, u32)> for OrderedNode {

@@ -38,16 +38,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::{location, Location};
 
-use self::storage::HnswRemappingStorage;
-
 use super::graph::{
     builder::GraphBuilder, storage::VectorStorage, Graph, OrderedFloat, OrderedNode, NEIGHBORS_COL,
     NEIGHBORS_FIELD,
 };
 use crate::vector::graph::beam_search;
+
 pub mod builder;
+
 pub use builder::HNSWBuilder;
-mod storage;
 
 const HNSW_TYPE: &str = "HNSW";
 const VECTOR_ID_COL: &str = "__vector_id";
@@ -132,13 +131,7 @@ impl HnswLevel {
         for &id in builder.nodes.keys().sorted() {
             let node = builder.nodes.get(&id).unwrap();
             assert_eq!(node.id, id);
-            neighbours_builder.append_value(
-                node.neighbors
-                    .clone()
-                    .into_sorted_vec()
-                    .iter()
-                    .map(|n| Some(n.id)),
-            );
+            neighbours_builder.append_value(node.neighbors.clone().iter().map(|n| Some(n.id)));
             vector_id_builder.append_value(node.id);
         }
 
@@ -172,7 +165,7 @@ impl Graph for HnswLevel {
         self.nodes.num_rows()
     }
 
-    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>> {
+    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item=u32> + '_>> {
         let range = self.neighbors_range(key);
         Some(Box::new(
             self.neighbors_values.values()[range].iter().copied(),
@@ -308,10 +301,6 @@ impl HNSW {
             };
         }
         let candidates = beam_search(&self.levels[0], &ep, query, ef)?;
-        println!(
-            "Level 0 candidates: {:?}, starting ep: {:#?}",
-            candidates, ep
-        );
         if self.use_select_heuristic {
             Ok(
                 select_neighbors_heuristic(&self.levels[0], query, &candidates, k, false)
@@ -361,7 +350,7 @@ impl HNSW {
 fn select_neighbors(
     orderd_candidates: &BTreeMap<OrderedFloat, u32>,
     k: usize,
-) -> impl Iterator<Item = (OrderedFloat, u32)> + '_ {
+) -> impl Iterator<Item=(OrderedFloat, u32)> + '_ {
     orderd_candidates.iter().take(k).map(|(&d, &u)| (d, u))
 }
 
@@ -376,7 +365,7 @@ fn select_neighbors_heuristic(
     orderd_candidates: &BTreeMap<OrderedFloat, u32>,
     k: usize,
     extend_candidates: bool,
-) -> impl Iterator<Item = (OrderedFloat, u32)> {
+) -> impl Iterator<Item=(OrderedFloat, u32)> {
     let mut heap: BinaryHeap<OrderedNode> = BinaryHeap::from_iter(
         orderd_candidates
             .iter()
@@ -426,7 +415,7 @@ mod tests {
             vec![
                 (OrderedFloat(1.0), 1),
                 (OrderedFloat(2.0), 2),
-                (OrderedFloat(3.0), 3)
+                (OrderedFloat(3.0), 3),
             ]
         );
 
@@ -513,7 +502,6 @@ mod tests {
             .map(|(i, _)| *i)
             .collect();
         let gt = ground_truth(&mat, q, K);
-        println!("Results: {:?} GT: {:?}", results, gt);
         let recall = results.intersection(&gt).count() as f32 / K as f32;
         assert!(recall >= 0.7, "Recall: {}", recall);
     }

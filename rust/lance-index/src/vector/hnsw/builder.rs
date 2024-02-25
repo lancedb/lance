@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::cmp::min;
-use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
 use lance_core::Result;
@@ -97,7 +96,7 @@ impl HNSWBuilder {
 
     #[inline]
     fn m_l(&self) -> f32 {
-        1.0 / (self.len() as f32).ln()
+        1.0 / (self.max_level as f32).ln()
     }
 
     /// new node's level
@@ -190,10 +189,6 @@ impl HNSWBuilder {
 
         for i in 1..self.vectors.len() {
             self.insert(i as u32)?;
-        }
-
-        for (i, level) in self.levels.iter().enumerate() {
-            println!("Level {}: {:#?}", i, level.stats());
         }
 
         let graphs = self
