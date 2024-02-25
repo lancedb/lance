@@ -87,33 +87,32 @@ async fn main() {
     let k = 10;
     let gt = ground_truth(&mat, q, k);
 
-    for level in [4, 8, 16, 32] {
-        for ef_construction in [50, 100, 200, 400] {
-            let now = std::time::Instant::now();
-            let hnsw = HNSWBuilder::new(vector_store.clone())
-                .max_level(7)
-                .max_num_edges(args.max_edges)
-                .ef_construction(ef_construction)
-                .build()
-                .unwrap();
-            let construct_time = now.elapsed().as_secs_f32();
-            let now = std::time::Instant::now();
-            let results: HashSet<u32> = hnsw
-                .search(q, k, args.ef)
-                .unwrap()
-                .iter()
-                .map(|(i, _)| *i)
-                .collect();
-            let search_time = now.elapsed().as_micros();
-            println!(
-                "level={}, ef_construct={}, ef={} recall={}: construct={:.3}s search={:.3} us",
-                level,
-                ef_construction,
-                args.ef,
-                results.intersection(&gt).count() as f32 / k as f32,
-                construct_time,
-                search_time
-            );
-        }
+    for ef_construction in [50, 100, 200, 400] {
+        let now = std::time::Instant::now();
+        let hnsw = HNSWBuilder::new(vector_store.clone())
+            .max_level(7)
+            .max_num_edges(args.max_edges)
+            .ef_construction(ef_construction)
+            .build()
+            .unwrap();
+        let construct_time = now.elapsed().as_secs_f32();
+        let now = std::time::Instant::now();
+        let results: HashSet<u32> = hnsw
+            .search(q, k, args.ef)
+            .unwrap()
+            .iter()
+            .map(|(i, _)| *i)
+            .collect();
+        let search_time = now.elapsed().as_micros();
+        println!(
+            "level={}, ef_construct={}, ef={} recall={}: construct={:.3}s search={:.3} us",
+            level,
+            ef_construction,
+            args.ef,
+            results.intersection(&gt).count() as f32 / k as f32,
+            construct_time,
+            search_time
+        );
     }
+
 }
