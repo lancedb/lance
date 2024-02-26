@@ -51,7 +51,8 @@ fn main() {
         // Build a version with AVX
         // While GCC doesn't have support for _Float16 until GCC 12, clang
         // has support for __fp16 going back to at least clang 6.
-        build_f16_with_flags("avx2", &["-march=broadwell"]).unwrap();
+        // We use haswell since it's the oldest CPUs on AWS.
+        build_f16_with_flags("avx2", &["-march=haswell"]).unwrap();
         // There is no SSE instruction set for f16 -> f32 float conversion
     }
 }
