@@ -28,7 +28,7 @@ jobs:
     - name: Check out main
       uses: actions/checkout@v4
       with:
-        ref: ${GITHUB_REF##*/}
+        ref: ${{ github.ref }}
         persist-credentials: false
         fetch-depth: 0
         lfs: true
@@ -52,6 +52,6 @@ jobs:
       uses: ad-m/github-push-action@master
       with:
         github_token: ${{ secrets.LANCE_RELEASE_TOKEN }}
-        branch: ${GITHUB_REF##*/}
+        branch: ${{ github.ref }}
         tags: true
 
