@@ -23,5 +23,5 @@ runs:
     working-directory: rust
     shell: bash
     run: |
-      cargo install cargo-workspaces
+      cargo install cargo-workspaces --version 0.2.44
       cargo ws version --no-git-commit -y --exact --force 'lance*' ${{ inputs.part }}
