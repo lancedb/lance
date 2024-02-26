@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Builder of Hnsw Graph.
+
 use std::cmp::min;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use lance_core::Result;
+use log::{info, log_enabled, Level::Info};
 use rand::{thread_rng, Rng};
 
 use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
@@ -29,6 +31,9 @@ use crate::vector::hnsw::HnswLevel;
 ///
 /// Currently, the HNSW graph is fully built in memory.
 ///
+/// During the build, the graph is built layer by layer.
+///
+/// Each node in the graph has a global ID which is the index on the base layer.
 pub struct HNSWBuilder {
     /// max level of
     max_level: u16,
@@ -46,6 +51,10 @@ pub struct HNSWBuilder {
 
     entry_point: u32,
 
+    extend_candidates: bool,
+
+    log_base: f32,
+
     use_select_heuristic: bool,
 }
 
@@ -54,22 +63,26 @@ impl HNSWBuilder {
     pub fn new(vectors: Arc<InMemoryVectorStorage>) -> Self {
         Self {
             max_level: 8,
-            m_max: 32,
+            m_max: 64,
             ef_construction: 100,
             vectors,
             levels: vec![],
             entry_point: 0,
+            extend_candidates: false,
+            log_base: 10.0,
             use_select_heuristic: true,
         }
     }
 
     /// The maximum level of the graph.
+    /// The default value is `8`.
     pub fn max_level(mut self, max_level: u16) -> Self {
         self.max_level = max_level;
         self
     }
 
     /// The maximum number of connections for each node per layer.
+    /// The default value is `64`.
     pub fn max_num_edges(mut self, m_max: usize) -> Self {
         self.m_max = m_max;
         self
@@ -77,11 +90,26 @@ impl HNSWBuilder {
 
     /// Number of candidates to be considered when searching for the nearest neighbors
     /// during the construction of the graph.
+    ///
+    /// The default value is `100`.
     pub fn ef_construction(mut self, ef_construction: usize) -> Self {
         self.ef_construction = ef_construction;
         self
     }
 
+    /// Whether to expend to search candidate neighbors during heuristic search.
+    ///
+    /// The default value is `false`.
+    ///
+    /// See `extendCandidates` parameter in the paper (Algorithm 4)
+    pub fn extend_candidates(mut self, flag: bool) -> Self {
+        self.extend_candidates = flag;
+        self
+    }
+
+    /// Use select heuristic when searching for the nearest neighbors.
+    ///
+    /// See algorithm 4 in HNSW paper.
     pub fn use_select_heuristic(mut self, flag: bool) -> Self {
         self.use_select_heuristic = flag;
         self
@@ -92,18 +120,21 @@ impl HNSWBuilder {
         self.levels[0].len()
     }
 
-    #[inline]
-    fn m_l(&self) -> f32 {
-        1.0 / (self.len() as f32).ln()
-    }
-
-    /// new node's level
+    /// New node's level
     ///
     /// See paper `Algorithm 1`
     fn random_level(&self) -> u16 {
         let mut rng = thread_rng();
-        let r = rng.gen::<f32>();
-        min((-r.ln() * self.m_l()).floor() as u16, self.max_level)
+        // This is different to the paper.
+        // We use log10 instead of log(e), so each layer has about 1/10 of its bottom layer.
+        let m = self.vectors.len();
+        min(
+            (m as f32).log(self.log_base).ceil() as u16
+                - (rng.gen::<f32>() * self.vectors.len() as f32)
+                    .log(self.log_base)
+                    .ceil() as u16,
+            self.max_level,
+        )
     }
 
     /// Insert one node.
@@ -130,22 +161,21 @@ impl HNSWBuilder {
         for cur_level in self.levels.iter().rev().take(levels_to_search) {
             let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
             ep = if self.use_select_heuristic {
-                select_neighbors_heuristic(cur_level, query, &candidates, 1, true, true)
-                    .map(|(_, id)| cur_level.nodes[&id].pointer)
+                select_neighbors_heuristic(cur_level, query, &candidates, 1, self.extend_candidates)
+                    .map(|(_, id)| id)
                     .collect()
             } else {
-                select_neighbors(&candidates, 1)
-                    .map(|(_, id)| cur_level.nodes[&id].pointer)
-                    .collect()
+                select_neighbors(&candidates, 1).map(|(_, id)| id).collect()
             };
         }
 
-        let m = self.levels[0].nodes.len();
+        let m = self.len();
         for cur_level in self.levels.iter_mut().rev().skip(levels_to_search) {
             cur_level.insert(node);
             let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
             let neighbours: Vec<_> = if self.use_select_heuristic {
-                select_neighbors_heuristic(cur_level, query, &candidates, m, true, true).collect()
+                select_neighbors_heuristic(cur_level, query, &candidates, m, self.extend_candidates)
+                    .collect()
             } else {
                 select_neighbors(&candidates, m).collect()
             };
@@ -157,10 +187,7 @@ impl HNSWBuilder {
                 cur_level.prune(nb, self.m_max)?;
             }
             cur_level.prune(node, self.m_max)?;
-            ep = candidates
-                .values()
-                .map(|id| cur_level.nodes[id].pointer)
-                .collect();
+            ep = candidates.values().copied().collect();
         }
 
         if level > self.levels.len() as u16 {
@@ -175,7 +202,7 @@ impl HNSWBuilder {
         self.build_with(self.vectors.clone())
     }
 
-    /// Build the graph, with the provided [`VectorStorage`] as backing storage for HNSW graph.
+    /// Build the graph, with the provided [VectorStorage] as backing storage for HNSW graph.
     pub fn build_with(&mut self, storage: Arc<dyn VectorStorage>) -> Result<HNSW> {
         log::info!(
             "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
@@ -194,7 +221,11 @@ impl HNSWBuilder {
             self.insert(i as u32)?;
         }
 
-        remapping_levels(&mut self.levels);
+        if log_enabled!(Info) {
+            for (i, level) in self.levels.iter().enumerate() {
+                info!("HNSW level {}: {:#?}", i, level.stats());
+            }
+        }
 
         let graphs = self
             .levels
@@ -207,91 +238,5 @@ impl HNSWBuilder {
             self.vectors.metric_type(),
             self.use_select_heuristic,
         ))
-    }
-}
-
-/// Because each level is stored as a separate continous RecordBatch. We need to remap the pointers
-/// to the nodes in the previous level to the index in the current RecordBatch.
-fn remapping_levels(levels: &mut [GraphBuilder]) {
-    for i in 1..levels.len() {
-        let prev_level = &levels[i - 1];
-        let mapping = prev_level
-            .nodes
-            .keys()
-            .enumerate()
-            .map(|(i, &id)| (id, i as u32))
-            .collect::<HashMap<_, _>>();
-        let cur_level = &mut levels[i];
-        let current_mapping = cur_level
-            .nodes
-            .keys()
-            .enumerate()
-            .map(|(idx, &id)| (id, idx as u32))
-            .collect::<HashMap<_, _>>();
-        for node in cur_level.nodes.values_mut() {
-            node.pointer = *mapping.get(&node.id).expect("Expect the pointer exists");
-
-            // Remapping the neighbors within this level of graph.
-            node.neighbors = node
-                .neighbors
-                .iter()
-                .map(|(d, n)| {
-                    (
-                        *d,
-                        *current_mapping.get(n).expect("Expect the pointer exists"),
-                    )
-                })
-                .collect();
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use std::sync::Arc;
-
-    use arrow_array::types::Float32Type;
-    use lance_linalg::{distance::MetricType, matrix::MatrixView};
-    use lance_testing::datagen::generate_random_array;
-
-    #[test]
-    fn test_remapping_levels() {
-        let data = generate_random_array(8 * 100);
-        let mat = MatrixView::<Float32Type>::new(Arc::new(data), 8);
-        let storage = Arc::new(InMemoryVectorStorage::new(mat.into(), MetricType::L2));
-        let mut level0 = GraphBuilder::new(storage.clone());
-        for i in 0..100 {
-            level0.insert(i as u32);
-        }
-        let mut level1 = GraphBuilder::new(storage.clone());
-        for i in [0, 5, 10, 15, 20, 30, 40, 50] {
-            level1.insert(i as u32);
-        }
-        let mut level2 = GraphBuilder::new(storage.clone());
-        for i in [0, 10, 20, 50] {
-            level2.insert(i as u32);
-        }
-        let mut levels = [level0, level1, level2];
-        remapping_levels(&mut levels);
-        assert_eq!(
-            levels[1]
-                .nodes
-                .values()
-                .map(|n| n.pointer)
-                .collect::<Vec<_>>(),
-            vec![0, 5, 10, 15, 20, 30, 40, 50]
-        );
-        assert_eq!(
-            levels[2]
-                .nodes
-                .values()
-                .map(|n| n.pointer)
-                .collect::<Vec<_>>(),
-            vec![0, 2, 4, 7]
-        );
-
-        println!("{:?}", levels[2].nodes);
     }
 }

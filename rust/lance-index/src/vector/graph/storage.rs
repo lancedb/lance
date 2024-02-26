@@ -28,6 +28,11 @@ pub trait DistCalculator {
 pub trait VectorStorage: Send + Sync {
     fn len(&self) -> usize;
 
+    /// Returns true if this graph is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Return the metric type of the vectors.
     fn metric_type(&self) -> MetricType;
 

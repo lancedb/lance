@@ -26,7 +26,8 @@ pub(crate) mod builder;
 pub mod memory;
 pub(super) mod storage;
 
-use storage::VectorStorage;
+/// Vector storage to back a graph.
+pub use storage::VectorStorage;
 
 pub(crate) const NEIGHBORS_COL: &str = "__neighbors";
 
@@ -87,6 +88,36 @@ impl From<OrderedFloat> for f32 {
     }
 }
 
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub(crate) struct OrderedNode {
+    pub id: u32,
+    pub dist: OrderedFloat,
+}
+
+impl PartialOrd for OrderedNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.dist.cmp(&other.dist))
+    }
+}
+
+impl Ord for OrderedNode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.dist.cmp(&other.dist)
+    }
+}
+
+impl From<(OrderedFloat, u32)> for OrderedNode {
+    fn from((dist, id): (OrderedFloat, u32)) -> Self {
+        Self { id, dist }
+    }
+}
+
+impl From<OrderedNode> for (OrderedFloat, u32) {
+    fn from(node: OrderedNode) -> Self {
+        (node.dist, node.id)
+    }
+}
+
 /// Distance calculator.
 ///
 /// This trait is used to calculate a query vector to a stream of vector IDs.
@@ -113,7 +144,7 @@ pub trait Graph {
     }
 
     /// Get the neighbors of a graph node, identifyied by the index.
-    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = &u32> + '_>>;
+    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>>;
 
     /// Access to underline storage
     fn storage(&self) -> Arc<dyn VectorStorage>;
@@ -163,7 +194,7 @@ pub(super) fn beam_search(
             location: location!(),
         })?;
 
-        for &neighbor in neighbors {
+        for neighbor in neighbors {
             if visited.contains(&neighbor) {
                 continue;
             }

@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
 use lance_core::{Error, Result};
 use snafu::{location, Location};
 
+use super::OrderedNode;
 use super::{memory::InMemoryVectorStorage, Graph, GraphNode, OrderedFloat};
 use crate::vector::graph::storage::VectorStorage;
 
@@ -26,44 +27,48 @@ use crate::vector::graph::storage::VectorStorage;
 pub struct GraphBuilderNode {
     /// Node ID
     pub(crate) id: u32,
-    /// Neighbors, sorted by the distance.
-    pub(crate) neighbors: BTreeMap<OrderedFloat, u32>,
 
-    /// Pointer to the next level of graph, or acts as the idx
-    pub pointer: u32,
+    /// Neighbors, sorted by the distance.
+    pub(crate) neighbors: BinaryHeap<OrderedNode>,
 }
 
 impl GraphBuilderNode {
     fn new(id: u32) -> Self {
         Self {
             id,
-            neighbors: BTreeMap::new(),
-            pointer: 0,
+            neighbors: BinaryHeap::new(),
         }
+    }
+
+    fn add_neighbor(&mut self, distance: f32, id: u32) {
+        self.neighbors.push(OrderedNode {
+            dist: OrderedFloat(distance),
+            id,
+        });
     }
 
     /// Prune the node and only keep `max_edges` edges.
     ///
     /// Returns the ids of pruned neighbors.
-    fn prune(&mut self, max_edges: usize) -> Vec<u32> {
-        if self.neighbors.len() <= max_edges {
-            return vec![];
-        }
-
-        let mut pruned = Vec::with_capacity(self.neighbors.len() - max_edges);
+    fn prune(&mut self, max_edges: usize) {
         while self.neighbors.len() > max_edges {
-            let (_, node) = self.neighbors.pop_last().unwrap();
-            pruned.push(node)
+            self.neighbors.pop();
         }
-        pruned
     }
 }
 
 impl From<&GraphBuilderNode> for GraphNode<u32> {
     fn from(node: &GraphBuilderNode) -> Self {
+        let neighbors = node
+            .neighbors
+            .clone()
+            .into_sorted_vec()
+            .into_iter()
+            .map(|n| n.id)
+            .collect::<Vec<_>>();
         Self {
             id: node.id,
-            neighbors: node.neighbors.values().copied().collect(),
+            neighbors,
         }
     }
 }
@@ -73,7 +78,7 @@ impl From<&GraphBuilderNode> for GraphNode<u32> {
 /// [GraphBuilder] is used to build a graph in memory.
 ///
 pub struct GraphBuilder {
-    pub(crate) nodes: BTreeMap<u32, GraphBuilderNode>,
+    pub(crate) nodes: HashMap<u32, GraphBuilderNode>,
 
     /// Storage for vectors.
     vectors: Arc<InMemoryVectorStorage>,
@@ -84,9 +89,15 @@ impl Graph for GraphBuilder {
         self.nodes.len()
     }
 
-    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = &u32> + '_>> {
+    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>> {
         let node = self.nodes.get(&key)?;
-        Some(Box::new(node.neighbors.values()))
+        Some(Box::new(
+            node.neighbors
+                .clone()
+                .into_sorted_vec()
+                .into_iter()
+                .map(|n| n.id),
+        ))
     }
 
     fn storage(&self) -> Arc<dyn VectorStorage> {
@@ -98,7 +109,7 @@ impl GraphBuilder {
     /// Build from a [VectorStorage].
     pub fn new(vectors: Arc<InMemoryVectorStorage>) -> Self {
         Self {
-            nodes: BTreeMap::new(),
+            nodes: HashMap::new(),
             vectors,
         }
     }
@@ -110,14 +121,14 @@ impl GraphBuilder {
 
     /// Connect from one node to another.
     pub fn connect(&mut self, from: u32, to: u32) -> Result<()> {
-        let distance: OrderedFloat = self.vectors.distance_between(from, to).into();
+        let distance = self.vectors.distance_between(from, to);
 
         {
             let from_node = self.nodes.get_mut(&from).ok_or_else(|| Error::Index {
                 message: format!("Node {} not found", from),
                 location: location!(),
             })?;
-            from_node.neighbors.insert(distance, to);
+            from_node.add_neighbor(distance, to)
         }
 
         {
@@ -125,7 +136,7 @@ impl GraphBuilder {
                 message: format!("Node {} not found", to),
                 location: location!(),
             })?;
-            to_node.neighbors.insert(distance, from);
+            to_node.add_neighbor(distance, from);
         }
         Ok(())
     }
@@ -149,7 +160,7 @@ impl GraphBuilder {
             let edges = node.neighbors.len();
             total_edges += edges;
             max_edges = max_edges.max(edges);
-            total_distance += node.neighbors.keys().map(|d| d.0).sum::<f32>();
+            total_distance += node.neighbors.iter().map(|n| n.dist.0).sum::<f32>();
         }
 
         GraphBuilderStats {
@@ -189,7 +200,17 @@ mod tests {
         builder.connect(0, 1).unwrap();
         assert_eq!(builder.len(), 2);
 
-        assert_eq!(builder.neighbors(0).unwrap().collect::<Vec<_>>(), vec![&1]);
-        assert_eq!(builder.neighbors(1).unwrap().collect::<Vec<_>>(), vec![&0]);
+        assert_eq!(builder.neighbors(0).unwrap().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(builder.neighbors(1).unwrap().collect::<Vec<_>>(), vec![0]);
+
+        builder.insert(4);
+        builder.connect(0, 4).unwrap();
+        assert_eq!(builder.len(), 3);
+
+        assert_eq!(
+            builder.neighbors(0).unwrap().collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+        assert_eq!(builder.neighbors(1).unwrap().collect::<Vec<_>>(), vec![0]);
     }
 }
