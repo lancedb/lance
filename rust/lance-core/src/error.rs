@@ -307,6 +307,7 @@ pub fn get_caller_location() -> &'static std::panic::Location<'static> {
 pub struct CloneableError(pub Error);
 
 impl Clone for CloneableError {
+    #[track_caller]
     fn clone(&self) -> Self {
         Self(Error::Cloned {
             message: self.0.to_string(),
