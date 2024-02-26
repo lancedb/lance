@@ -28,7 +28,7 @@ from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
 
-def create_table(nvec=1000, ndim=128, nans=0):
+def create_table(nvec=1000, ndim=128, nans=0, dtype="float32"):
     mat = np.random.randn(nvec, ndim)
     if nans > 0:
         nans_mat = np.empty((nans, ndim))
@@ -41,7 +41,7 @@ def create_table(nvec=1000, ndim=128, nans=0):
 
     meta = np.array([gen_str(100) for _ in range(nvec + nans)])
     tbl = (
-        vec_to_table(data=mat)
+        vec_to_table(data=mat, dtype=dtype)
         .append_column("price", pa.array(price))
         .append_column("meta", pa.array(meta))
         .append_column("id", pa.array(range(nvec + nans)))
@@ -435,10 +435,12 @@ def create_uniform_table(min, max, nvec, offset, ndim=8):
     mat = np.random.uniform(min, max, (nvec, ndim))
     # rowid = np.arange(offset, offset + nvec)
     tbl = vec_to_table(data=mat)
-    tbl = pa.Table.from_pydict({
-        "vector": tbl.column(0).chunk(0),
-        "filterable": np.arange(offset, offset + nvec),
-    })
+    tbl = pa.Table.from_pydict(
+        {
+            "vector": tbl.column(0).chunk(0),
+            "filterable": np.arange(offset, offset + nvec),
+        }
+    )
     return tbl
 
 
@@ -506,10 +508,12 @@ def test_knn_with_deletions(tmp_path):
     values = pa.array(
         [x for val in range(50) for x in [float(val)] * 5], type=pa.float32()
     )
-    tbl = pa.Table.from_pydict({
-        "vector": pa.FixedSizeListArray.from_arrays(values, dims),
-        "filterable": pa.array(range(50)),
-    })
+    tbl = pa.Table.from_pydict(
+        {
+            "vector": pa.FixedSizeListArray.from_arrays(values, dims),
+            "filterable": pa.array(range(50)),
+        }
+    )
     dataset = lance.write_dataset(tbl, tmp_path, max_rows_per_group=10)
 
     dataset.delete("not (filterable % 5 == 0)")
@@ -639,3 +643,22 @@ def test_validate_vector_index(tmp_path: Path):
     ds.sample = direct_first_call_to_new_table
     with pytest.raises(ValueError, match="Vector index failed sanity check"):
         validate_vector_index(ds, "vector", sample_size=100)
+
+
+def test_validate_vector_index_fp16_torch(tmp_path: Path):
+    # make sure the sanity check is correctly catching issues
+    # need higher dims here to catch fp16 precision issues
+
+    ds = lance.write_dataset(create_table(nvec=2048, dtype="float16"), tmp_path)
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        metric="cosine",
+        num_partitions=4,
+        num_sub_vectors=16,
+        accelerator=torch.device("cpu"),
+        replace=True,
+    )
+    # fp16 can have some IVF issues
+    # where the vectors are assigned to the wrong partition
+    validate_vector_index(ds, "vector", nprobes=1, sample_size=100, pass_threshold=0.95)
