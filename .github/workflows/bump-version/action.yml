@@ -20,7 +20,6 @@ runs:
       cargo install cargo-bump
       cargo bump ${{ inputs.part }}
   - name: Synchronize rust version
-    working-directory: rust
     shell: bash
     run: |
       cargo install cargo-workspaces --version 0.2.44
