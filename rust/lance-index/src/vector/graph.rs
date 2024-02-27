@@ -186,7 +186,7 @@ pub(super) fn beam_search(
     while !candidates.is_empty() {
         let (dist, current) = candidates.pop_first().expect("candidates is empty");
         let furtherst = *results.last_key_value().expect("results set is empty").0;
-        if dist < furtherst {
+        if dist > furtherst {
             break;
         }
         let neighbors = graph.neighbors(current).ok_or_else(|| Error::Index {
@@ -199,15 +199,15 @@ pub(super) fn beam_search(
                 continue;
             }
             visited.insert(neighbor);
+            let furtherst = *results.last_key_value().expect("results set is empty").0;
             let dist = dist_calc.distance(&[neighbor])[0].into();
             if dist < furtherst || results.len() < k {
                 results.insert(dist, neighbor);
                 candidates.insert(dist, neighbor);
+                if results.len() > k {
+                    results.pop_last();
+                }
             }
-        }
-        // Maintain the size of the result set.
-        while results.len() > k {
-            results.pop_last();
         }
     }
     Ok(results)
