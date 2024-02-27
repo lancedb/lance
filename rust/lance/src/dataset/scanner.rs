@@ -1522,7 +1522,7 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Int32Array, LargeStringArray, PrimitiveArray,
+        ArrayRef, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray, PrimitiveArray,
         RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
@@ -1530,10 +1530,11 @@ mod test {
     use arrow_select::take;
     use datafusion::logical_expr::{col, lit};
     use futures::TryStreamExt;
+    use half::f16;
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_index::{vector::DIST_COL, DatasetIndexExt, IndexType};
-    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use tempfile::{tempdir, TempDir};
 
     use super::*;
@@ -2872,6 +2873,60 @@ mod test {
             } else {
                 assert!(!bool_arr.value(i));
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_column_casting_function() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(RandomVector::new().named("vec".to_owned())));
+        Dataset::write(data_gen.batch(32), test_uri, None)
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(32, dataset.scan().count_rows().await.unwrap());
+
+        let mut scanner = dataset.scan();
+
+        let scan_res = scanner
+            .project_with_transform(&[("f16", "_cast_list_f16(vec)")])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(1, scan_res.num_columns());
+        assert_eq!(32, scan_res.num_rows());
+        assert_eq!("f16", scan_res.schema().field(0).name());
+
+        let mut scanner = dataset.scan();
+        let scan_res_original = scanner
+            .project(&["vec"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let f32_col: &Float32Array = scan_res_original
+            .column_by_name("vec")
+            .unwrap()
+            .as_fixed_size_list()
+            .values()
+            .as_primitive();
+        let f16_col: &Float16Array = scan_res
+            .column_by_name("f16")
+            .unwrap()
+            .as_fixed_size_list()
+            .values()
+            .as_primitive();
+
+        for (f32_val, f16_val) in f32_col.iter().zip(f16_col.iter()) {
+            let f32_val = f32_val.unwrap();
+            let f16_val = f16_val.unwrap();
+            assert_eq!(f16::from_f32(f32_val), f16_val);
         }
     }
 

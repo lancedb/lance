@@ -17,6 +17,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
+use arrow::compute::CastOptions;
 use arrow_array::ListArray;
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
@@ -24,7 +25,9 @@ use arrow_select::concat::concat;
 use datafusion::common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion};
 use datafusion::common::DFSchema;
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::{GetFieldAccess, GetIndexedField};
+use datafusion::logical_expr::{
+    ColumnarValue, GetFieldAccess, GetIndexedField, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+};
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
@@ -40,6 +43,7 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
+use lance_arrow::cast::cast_with_options;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_index::scalar::expression::{
     apply_scalar_indices, IndexInformationProvider, ScalarIndexExpr,
@@ -74,6 +78,105 @@ impl FilterPlan {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CastListF16Udf {
+    signature: Signature,
+}
+
+impl CastListF16Udf {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::any(1, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for CastListF16Udf {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "_cast_list_f16"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[ArrowDataType]) -> DFResult<ArrowDataType> {
+        let input = &arg_types[0];
+        match input {
+            ArrowDataType::FixedSizeList(field, size) => {
+                if field.data_type() != &ArrowDataType::Float32
+                    && field.data_type() != &ArrowDataType::Float16
+                {
+                    return Err(datafusion::error::DataFusionError::Execution(
+                        "cast_list_f16 only supports list of float32 or float16".to_string(),
+                    ));
+                }
+                Ok(ArrowDataType::FixedSizeList(
+                    Arc::new(Field::new(
+                        field.name(),
+                        ArrowDataType::Float16,
+                        field.is_nullable(),
+                    )),
+                    *size,
+                ))
+            }
+            ArrowDataType::List(field) => {
+                if field.data_type() != &ArrowDataType::Float32
+                    && field.data_type() != &ArrowDataType::Float16
+                {
+                    return Err(datafusion::error::DataFusionError::Execution(
+                        "cast_list_f16 only supports list of float32 or float16".to_string(),
+                    ));
+                }
+                Ok(ArrowDataType::List(Arc::new(Field::new(
+                    field.name(),
+                    ArrowDataType::Float16,
+                    field.is_nullable(),
+                ))))
+            }
+            _ => Err(datafusion::error::DataFusionError::Execution(
+                "cast_list_f16 only supports FixedSizeList/List arguments".to_string(),
+            )),
+        }
+    }
+
+    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
+        let ColumnarValue::Array(arr) = &args[0] else {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "cast_list_f16 only supports array arguments".to_string(),
+            ));
+        };
+
+        let to_type = match arr.data_type() {
+            ArrowDataType::FixedSizeList(field, size) => ArrowDataType::FixedSizeList(
+                Arc::new(Field::new(
+                    field.name(),
+                    ArrowDataType::Float16,
+                    field.is_nullable(),
+                )),
+                *size,
+            ),
+            ArrowDataType::List(field) => ArrowDataType::List(Arc::new(Field::new(
+                field.name(),
+                ArrowDataType::Float16,
+                field.is_nullable(),
+            ))),
+            _ => {
+                return Err(datafusion::error::DataFusionError::Execution(
+                    "cast_list_f16 only supports array arguments".to_string(),
+                ));
+            }
+        };
+
+        let res = cast_with_options(arr.as_ref(), &to_type, &CastOptions::default())?;
+        Ok(ColumnarValue::Array(res))
+    }
+}
+
 // Adapter that instructs datafusion how lance expects expressions to be interpreted
 #[derive(Default)]
 struct LanceContextProvider {
@@ -91,9 +194,13 @@ impl ContextProvider for LanceContextProvider {
         )))
     }
 
-    fn get_function_meta(&self, _: &str) -> Option<Arc<datafusion_physical_expr::udf::ScalarUDF>> {
-        // UDFs not supported yet
-        None
+    fn get_function_meta(&self, f: &str) -> Option<Arc<ScalarUDF>> {
+        match f {
+            // TODO: cast should go thru CAST syntax instead of UDF
+            // Going thru UDF makes it hard for the optimizer to find no-ops
+            "_cast_list_f16" => Some(Arc::new(ScalarUDF::new_from_impl(CastListF16Udf::new()))),
+            _ => None,
+        }
     }
 
     fn get_aggregate_meta(&self, _: &str) -> Option<Arc<datafusion::logical_expr::AggregateUDF>> {
