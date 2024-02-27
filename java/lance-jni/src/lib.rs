@@ -24,7 +24,7 @@ use lance::dataset::{WriteMode, WriteParams};
 use lazy_static::lazy_static;
 
 lazy_static! {
-    static ref RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+    static ref RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime");
@@ -56,26 +56,25 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>
         }
     };
 
-    unsafe {
-        match ArrowArrayStreamReader::from_raw(arrow_array_stream_addr as *mut FFI_ArrowArrayStream)
-        {
-            Ok(reader) => match BlockingDataset::write(reader, &path_str, Some(write_params)) {
-                Ok(dataset) => attach_native_dataset(&mut env, dataset),
-                Err(err) => {
-                    jni_helpers::throw_java_exception(
-                        &mut env,
-                        format!("Failed to write from arrow array stream: {}", err).as_str(),
-                    );
-                    JObject::null()
-                }
-            },
+    let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
+    let stream = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) };
+    match stream {
+        Ok(reader) => match BlockingDataset::write(reader, &path_str, Some(write_params)) {
+            Ok(dataset) => attach_native_dataset(&mut env, dataset),
             Err(err) => {
                 jni_helpers::throw_java_exception(
                     &mut env,
-                    &format!("Failed to extract arrow array stream: {}", err),
+                    format!("Failed to write from arrow array stream: {}", err).as_str(),
                 );
                 JObject::null()
             }
+        },
+        Err(err) => {
+            jni_helpers::throw_java_exception(
+                &mut env,
+                &format!("Failed to extract arrow array stream: {}", err),
+            );
+            JObject::null()
         }
     }
 }

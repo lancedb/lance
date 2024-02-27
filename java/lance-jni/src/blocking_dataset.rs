@@ -32,12 +32,9 @@ impl BlockingDataset {
         let inner = RT.block_on(Dataset::write(reader, uri, params))?;
         Ok(Self { inner })
     }
-    pub fn open(uri: &str) -> Result<Self> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
 
-        let inner = rt.block_on(Dataset::open(uri))?;
+    pub fn open(uri: &str) -> Result<Self> {
+        let inner = RT.block_on(Dataset::open(uri))?;
         Ok(Self { inner })
     }
 

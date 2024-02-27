@@ -15,12 +15,7 @@ crate-type = ["cdylib"]
 [dependencies]
 lance.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
-tokio = { workspace = true, features = [
-    "rt-multi-thread",
-    "macros",
-    "fs",
-    "sync",
-] }
+tokio = { workspace = true }
 jni = "0.21.1"
 snafu.workspace = true
 lazy_static.workspace = true
