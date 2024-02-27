@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 import warnings
 from pathlib import Path
-from typing import Iterable, Literal, Optional, Union
+from typing import Dict, Iterable, List, Literal, Optional, Union
 
 import pyarrow as pa
 
@@ -145,7 +145,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         dataset: Union[torch.utils.data.Dataset, str, Path],
         batch_size: int,
         *args,
-        columns: Optional[list[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[str] = None,
         samples: Optional[int] = 0,
         cache: Optional[Union[str, bool]] = None,

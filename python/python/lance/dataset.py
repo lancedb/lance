@@ -213,7 +213,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def scanner(
         self,
-        columns: Optional[list[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
@@ -232,9 +232,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         Parameters
         ----------
-        columns: list of str, default None
+        columns: list of str, or dict of str to str default None
             List of column names to be fetched.
-            All columns if None or unspecified.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
         filter: pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
             `Lance filter pushdown <https://lancedb.github.io/lance/read_and_write.html#filter-push-down>`_
@@ -328,7 +329,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def to_table(
         self,
-        columns: Optional[list[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
@@ -346,9 +347,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         Parameters
         ----------
-        columns: list of str, default None
+        columns: list of str, or dict of str to str default None
             List of column names to be fetched.
-            All columns if None or unspecified.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
         filter : pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
             `Lance filter pushdown <https://lancedb.github.io/lance/read_and_write.html#filter-push-down>`_
@@ -443,7 +445,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def to_batches(
         self,
-        columns: Optional[list[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
@@ -487,7 +489,7 @@ class LanceDataset(pa.dataset.Dataset):
     def sample(
         self,
         num_rows: int,
-        columns: Optional[List[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         randomize_order: bool = True,
         **kwargs,
     ) -> pa.Table:
@@ -497,9 +499,10 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         num_rows: int
             number of rows to retrieve
-        columns: list of strings, optional
-            list of column names to be fetched.  All columns are fetched
-            if not specified.
+        columns: list of str, or dict of str to str default None
+            List of column names to be fetched.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
         **kwargs : dict, optional
             see scanner() method for full parameter description.
 
@@ -518,7 +521,7 @@ class LanceDataset(pa.dataset.Dataset):
     def take(
         self,
         indices: Union[List[int], pa.Array],
-        columns: Optional[List[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         **kwargs,
     ) -> pa.Table:
         """Select rows of data by index.
@@ -527,9 +530,10 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         indices : Array or array-like
             indices of rows to select in the dataset.
-        columns: list of strings, optional
-            List of column names to be fetched. All columns are fetched
-            if not specified.
+        columns: list of str, or dict of str to str default None
+            List of column names to be fetched.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
         **kwargs : dict, optional
             See scanner() method for full parameter description.
 
@@ -542,7 +546,7 @@ class LanceDataset(pa.dataset.Dataset):
     def _take_rows(
         self,
         row_ids: Union[List[int], pa.Array],
-        columns: Optional[List[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         **kargs,
     ) -> pa.Table:
         """Select rows by row_ids.
@@ -553,9 +557,10 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         row_ids : List Array or array-like
             row IDs to select in the dataset.
-        columns: list of strings, optional
-            List of column names to be fetched. All columns are fetched
-            if not specified.
+        columns: list of str, or dict of str to str default None
+            List of column names to be fetched.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
         **kwargs : dict, optional
             See scanner() method for full parameter description.
 
@@ -1865,6 +1870,7 @@ class ScannerBuilder:
         self._prefilter = None
         self._offset = None
         self._columns = None
+        self._columns_with_transform = None
         self._nearest = None
         self._batch_size: Optional[int] = None
         self._batch_readahead: Optional[int] = None
@@ -1914,8 +1920,19 @@ class ScannerBuilder:
         self._offset = n
         return self
 
-    def columns(self, cols: Optional[list[str]] = None) -> ScannerBuilder:
-        self._columns = cols
+    def columns(
+        self, cols: Optional[Union[List[str], Dict[str, str]]] = None
+    ) -> ScannerBuilder:
+        if cols is None:
+            self._columns = None
+        elif isinstance(cols, dict):
+            self._columns_with_transform = list(cols.items())
+        elif isinstance(cols, list):
+            self._columns = cols
+        else:
+            raise TypeError(
+                f"columns must be a list or dict[name, expression], got {type(cols)}"
+            )
         return self
 
     def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder:
@@ -2040,6 +2057,7 @@ class ScannerBuilder:
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
+            self._columns_with_transform,
             self._filter,
             self._prefilter,
             self._limit,

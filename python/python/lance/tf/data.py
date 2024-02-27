@@ -145,7 +145,7 @@ def column_to_tensor(array: pa.Array, tensor_spec: tf.TensorSpec) -> tf.Tensor:
 def from_lance(
     dataset: Union[str, Path, LanceDataset],
     *,
-    columns: Optional[List[str]] = None,
+    columns: Optional[Union[List[str], Dict[str, str]]] = None,
     batch_size: int = 256,
     filter: Optional[str] = None,
     fragments: Union[Iterable[int], Iterable[LanceFragment], tf.data.Dataset] = None,
@@ -326,7 +326,7 @@ def lance_take_batches(
     dataset: Union[str, Path, LanceDataset],
     batch_ranges: Iterable[Tuple[int, int]],
     *,
-    columns: Optional[List[str]] = None,
+    columns: Optional[Union[List[str], Dict[str, str]]] = None,
     output_signature: Optional[Dict[str, tf.TypeSpec]] = None,
     batch_readahead: int = 10,
 ) -> tf.data.Dataset:
