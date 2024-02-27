@@ -184,6 +184,8 @@ pub struct HNSW {
     metric_type: MetricType,
     /// Entry point of the graph.
     entry_point: u32,
+
+    #[allow(dead_code)]
     /// Whether to use the heuristic to select neighbors (Algorithm 4 or 3 in the paper).
     use_select_heuristic: bool,
 }
