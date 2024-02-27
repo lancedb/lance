@@ -481,9 +481,9 @@ mod tests {
     #[test]
     fn test_search() {
         const DIM: usize = 32;
-        const TOTAL: usize = 1024;
-        const MAX_EDGES: usize = 32;
-        const K: usize = 10;
+        const TOTAL: usize = 10_000;
+        const MAX_EDGES: usize = 30;
+        const K: usize = 100;
 
         let data = generate_random_array(TOTAL * DIM);
         let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
@@ -498,7 +498,7 @@ mod tests {
             .unwrap();
 
         let results: HashSet<u32> = hnsw
-            .search(q, 10, 150)
+            .search(q, K, 128)
             .unwrap()
             .iter()
             .map(|(i, _)| *i)
@@ -506,6 +506,6 @@ mod tests {
         let gt = ground_truth(&mat, q, K);
         let recall = results.intersection(&gt).count() as f32 / K as f32;
         // TODO: improve the recall.
-        assert!(recall >= 0.3, "Recall: {}", recall);
+        assert!(recall >= 0.9, "Recall: {}", recall);
     }
 }
