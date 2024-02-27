@@ -184,6 +184,8 @@ pub struct HNSW {
     metric_type: MetricType,
     /// Entry point of the graph.
     entry_point: u32,
+
+    #[allow(dead_code)]
     /// Whether to use the heuristic to select neighbors (Algorithm 4 or 3 in the paper).
     use_select_heuristic: bool,
 }
@@ -292,28 +294,16 @@ impl HNSW {
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<(u32, f32)>> {
         let mut ep = vec![self.entry_point];
         let num_layers = self.levels.len();
+
         for level in self.levels.iter().rev().take(num_layers - 1) {
             let candidates = beam_search(level, &ep, query, 1)?;
-            ep = if self.use_select_heuristic {
-                select_neighbors_heuristic(level, query, &candidates, 1, false)
-                    .map(|(_, id)| id)
-                    .collect()
-            } else {
-                select_neighbors(&candidates, 1).map(|(_, id)| id).collect()
-            };
+            ep = select_neighbors(&candidates, 1).map(|(_, id)| id).collect();
         }
+
         let candidates = beam_search(&self.levels[0], &ep, query, ef)?;
-        if self.use_select_heuristic {
-            Ok(
-                select_neighbors_heuristic(&self.levels[0], query, &candidates, k, false)
-                    .map(|(d, u)| (u, d.into()))
-                    .collect(),
-            )
-        } else {
-            Ok(select_neighbors(&candidates, k)
-                .map(|(d, u)| (u, d.into()))
-                .collect())
-        }
+        Ok(select_neighbors(&candidates, k)
+            .map(|(d, u)| (u, d.into()))
+            .collect())
     }
 
     /// Write the HNSW graph to a Lance file.
