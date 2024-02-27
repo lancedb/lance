@@ -153,16 +153,15 @@ fn attach_native_dataset<'local>(
     // 1. The Java object (`j_dataset`) should implement the `java.io.Closeable` interface.
     // 2. Users of this Java object should be instructed to always use it within a try-with-resources
     //    statement (or manually call the `close()` method) to ensure that `self.close()` is invoked.
-        match unsafe { env.set_rust_field(&j_dataset, "nativeDatasetHandle", dataset) } {
-            Ok(_) => j_dataset,
-            Err(err) => {
-                env.throw_new(
-                    "java/lang/RuntimeException",
-                    format!("Failed to set native handle: {}", err),
-                )
-                .expect("Error throwing exception");
-                JObject::null()
-            }
+    match unsafe { env.set_rust_field(&j_dataset, "nativeDatasetHandle", dataset) } {
+        Ok(_) => j_dataset,
+        Err(err) => {
+            env.throw_new(
+                "java/lang/RuntimeException",
+                format!("Failed to set native handle: {}", err),
+            )
+            .expect("Error throwing exception");
+            JObject::null()
         }
     }
 }
