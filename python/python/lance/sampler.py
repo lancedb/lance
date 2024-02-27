@@ -24,7 +24,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from heapq import heappush, heappushpop
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, List, Optional, TypeVar, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, TypeVar, Union
 
 import pyarrow as pa
 
@@ -47,7 +47,7 @@ __all__ = [
 def _efficient_sample(
     dataset: lance.LanceDataset,
     n: int,
-    columns: list[str],
+    columns: Optional[Union[List[str], Dict[str, str]]],
     batch_size: int,
     max_takes: int,
 ) -> Generator[pa.RecordBatch, None, None]:
@@ -120,7 +120,7 @@ def _efficient_sample(
 def maybe_sample(
     dataset: Union[str, Path, lance.LanceDataset],
     n: int,
-    columns: Union[list[str], str],
+    columns: Union[list[str], dict[str, str], str],
     batch_size: int = 10240,
     max_takes: int = 2048,
 ) -> Generator[pa.RecordBatch, None, None]:
@@ -132,7 +132,7 @@ def maybe_sample(
         The dataset to sample from.
     n : int
         The number of records to sample.
-    columns : Union[list[str], str]
+    columns : Union[list[str], dict[str, str], str]
         The columns to load.
     batch_size : int, optional
         The batch size to use when loading the data, by default 10240.
@@ -209,7 +209,7 @@ class Sampler(ABC):
         ds: lance.LanceDataset,
         *args,
         batch_size: int = 128,
-        columns: Optional[List[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[str] = None,
         batch_readahead: int = 16,
         with_row_id: bool = False,
@@ -231,7 +231,7 @@ class FragmentSampler(Sampler):
         dataset: lance.LanceDataset,
         *args,
         batch_size: int = 128,
-        columns: Optional[List[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[str] = None,
         batch_readahead: int = 16,
         with_row_id: bool = False,
@@ -364,7 +364,7 @@ class ShardedBatchSampler(Sampler):
         self,
         dataset: lance.LanceDataset,
         batch_size: int,
-        columns: Optional[List[str]],
+        columns: Optional[Union[List[str], Dict[str, str]]],
         batch_readahead: int,
         filter: str,
     ) -> Generator[lance.RecordBatch, None, None]:
@@ -415,7 +415,7 @@ class ShardedBatchSampler(Sampler):
         self,
         dataset: lance.LanceDataset,
         batch_size: int,
-        columns: Optional[List[str]],
+        columns: Optional[Union[List[str], Dict[str, str]]],
         batch_readahead: int,
         filter: str,
     ) -> Generator[lance.RecordBatch, None, None]:
@@ -455,7 +455,7 @@ class ShardedBatchSampler(Sampler):
         self,
         dataset: lance.LanceDataset,
         batch_size: int,
-        columns: Optional[List[str]],
+        columns: Optional[Union[List[str], Dict[str, str]]],
         batch_readahead: int,
     ) -> Generator[lance.RecordBatch, None, None]:
         total = dataset.count_rows()
@@ -484,7 +484,7 @@ class ShardedBatchSampler(Sampler):
         dataset: lance.LanceDataset,
         *args,
         batch_size: int = 128,
-        columns: Optional[List[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[str] = None,
         batch_readahead: int = 16,
         with_row_id: Optional[bool] = None,

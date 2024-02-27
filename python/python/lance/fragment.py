@@ -18,7 +18,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable, Iterator, List, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Union,
+)
 
 import pyarrow as pa
 
@@ -242,7 +251,7 @@ class LanceFragment(pa.dataset.Fragment):
     def scanner(
         self,
         *,
-        columns: Optional[list[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: Optional[int] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
@@ -265,13 +274,17 @@ class LanceFragment(pa.dataset.Fragment):
 
         return LanceScanner(s, self._ds)
 
-    def take(self, indices, columns: Optional[list[str]] = None) -> pa.Table:
+    def take(
+        self,
+        indices,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+    ) -> pa.Table:
         return pa.Table.from_batches([self._fragment.take(indices, columns=columns)])
 
     def to_batches(
         self,
         *,
-        columns: Optional[list[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: Optional[int] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
@@ -291,7 +304,7 @@ class LanceFragment(pa.dataset.Fragment):
 
     def to_table(
         self,
-        columns: Optional[list[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
         offset: Optional[int] = None,

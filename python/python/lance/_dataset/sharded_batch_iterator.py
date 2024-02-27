@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING, Generator, List, Literal, Union
+from typing import TYPE_CHECKING, Dict, Generator, List, Literal, Optional, Union
 
 import lance
 from lance.dataset import LanceDataset
@@ -40,8 +40,10 @@ class ShardedBatchIterator:
         The rank (id) of the shard in total `world_rank` shards.
     world_rank: int
         Total number of shards.
-    columns: list of strs, optional
-        Select columns to scan.
+    columns: list of str, or dict of str to str default None
+        List of column names to be fetched.
+        Or a dictionary of column names to SQL expressions.
+        All columns are fetched if None or unspecified.
     batch_size: int, optional
         The batch size of each shard.
     granularity: str, optional
@@ -69,7 +71,7 @@ class ShardedBatchIterator:
         rank: int,
         world_size: int,
         *,
-        columns: List[str] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: int = 1024 * 10,
         granularity: Literal["fragment", "batch"] = "fragment",
         batch_readahead: int = 8,
@@ -94,7 +96,7 @@ class ShardedBatchIterator:
     def from_torch(
         data: Union[str, Path, LanceDataset],
         *,
-        columns: List[str] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: int = 1024 * 10,
         granularity: Literal["fragment", "batch"] = "fragment",
         batch_readahead: int = 8,

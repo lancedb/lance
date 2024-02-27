@@ -382,6 +382,7 @@ impl Dataset {
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
+        columns_with_transform: Option<Vec<(String, String)>>,
         filter: Option<String>,
         prefilter: Option<bool>,
         limit: Option<i64>,
@@ -397,10 +398,23 @@ impl Dataset {
         substrait_filter: Option<Vec<u8>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
-        if let Some(c) = columns {
-            scanner
-                .project(&c)
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        match (columns, columns_with_transform) {
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "Cannot specify both columns and columns_with_transform",
+                ))
+            }
+            (Some(c), None) => {
+                scanner
+                    .project(&c)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            (None, Some(ct)) => {
+                scanner
+                    .project_with_transform(&ct)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            (None, None) => {}
         }
         if let Some(f) = filter {
             if substrait_filter.is_some() {

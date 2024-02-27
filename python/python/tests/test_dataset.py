@@ -1519,3 +1519,19 @@ def test_sharded_iterator_non_full_batch(tmp_path: Path):
 
     # Can read partial batches
     assert len(set(range(1100, 1186)) - set(batches.to_pylist())) == 0
+
+
+def test_dynamic_projection(tmp_path: Path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table1, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    table2 = dataset.to_table(
+        columns={
+            "bool": "a > 5",
+        }
+    )
+
+    expected = pa.Table.from_pylist([{"bool": False}, {"bool": True}])
+    assert expected == table2
