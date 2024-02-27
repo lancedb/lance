@@ -13,6 +13,7 @@ members = [
     "rust/lance-test-macros",
     "rust/lance-testing",
 ]
+exclude = ["python"]
 # Python package needs to be built by maturin.
 resolver = "2"
 
