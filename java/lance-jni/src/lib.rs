@@ -211,10 +211,10 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_releaseNativeDataset(
     mut env: JNIEnv,
     obj: JObject,
 ) {
-    unsafe {
-        let dataset: BlockingDataset = env
-            .take_rust_field(obj, "nativeDatasetHandle")
-            .expect("Failed to take native dataset handle");
-        dataset.close()
-    }
+    let dataset: BlockingDataset = unsafe { 
+        env
+        .take_rust_field(obj, "nativeDatasetHandle")
+        .expect("Failed to take native dataset handle")
+    };
+    dataset.close()
 }
