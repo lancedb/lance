@@ -38,7 +38,6 @@ use datafusion::physical_plan::{
     ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::scalar::ScalarValue;
-use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
@@ -188,21 +187,6 @@ pub struct Scanner {
     fragments: Option<Vec<Fragment>>,
 }
 
-/// lifted from datafusion
-/// If e is a direct column reference, returns the field level
-/// metadata for that field, if any. Otherwise returns None
-fn get_field_metadata(
-    e: &Arc<dyn PhysicalExpr>,
-    input_schema: &ArrowSchema,
-) -> Option<HashMap<String, String>> {
-    // Look up field by index in schema (not NAME as there can be more than one
-    // column with the same name)
-    e.as_any()
-        .downcast_ref::<Column>()
-        .map(|column| input_schema.field(column.index()).metadata())
-        .cloned()
-}
-
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection = dataset.schema().clone();
@@ -282,7 +266,7 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
-        let planner = Planner::new(self.schema()?);
+        let planner = Planner::new(Arc::new(self.dataset.schema().into()));
         let mut output = HashMap::new();
         let mut physical_cols_set = HashSet::new();
         let mut physical_cols = vec![];
@@ -570,11 +554,9 @@ impl Scanner {
     }
 
     /// The Arrow schema of the output, including projections and vector / _distance
-    pub fn schema(&self) -> Result<SchemaRef> {
-        let schema = self
-            .output_schema()
-            .map(|s| SchemaRef::new(ArrowSchema::from(s.as_ref())))?;
-        Ok(schema)
+    pub async fn schema(&self) -> Result<SchemaRef> {
+        let plan = self.create_plan().await?;
+        Ok(plan.schema())
     }
 
     /// The schema of the Scanner from lance physical takes
@@ -672,26 +654,6 @@ impl Scanner {
         }
 
         Ok(output_expr)
-    }
-
-    /// The schema of the Scanner output
-    pub(crate) fn output_schema(&self) -> Result<Arc<Schema>> {
-        let arrow_schema = self.physical_schema()?.as_ref().into();
-        let output_expr = self.output_expr()?;
-
-        let mut fields = vec![];
-        for (expr, name) in output_expr {
-            let dtype = expr.data_type(&arrow_schema)?;
-            let nullable = expr.nullable(&arrow_schema)?;
-
-            let mut field = ArrowField::new(name, dtype, nullable);
-            field.set_metadata(get_field_metadata(&expr, &arrow_schema).unwrap_or_default());
-
-            fields.push(field);
-        }
-        let schema = (&ArrowSchema::new(fields)).try_into()?;
-
-        Ok(Arc::new(schema))
     }
 
     /// Create a stream from the Scanner.

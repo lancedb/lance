@@ -50,9 +50,8 @@ impl Scanner {
 impl Scanner {
     #[getter(schema)]
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
-        self_
-            .scanner
-            .schema()
+        let scanner = self_.scanner.clone();
+        RT.spawn(Some(self_.py()), async move { scanner.schema().await })?
             .map(|s| s.to_pyarrow(self_.py()))
             .map_err(|err| PyValueError::new_err(err.to_string()))?
     }
