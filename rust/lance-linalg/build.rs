@@ -39,7 +39,8 @@ fn main() {
 
     if cfg!(target_arch = "x86_64") {
         // Build a version with AVX512
-        if let Err(err) = build_f16_with_flags("avx512", &["-march=sapphirerapids"]) {
+        if let Err(err) = build_f16_with_flags("avx512", &["-march=sapphirerapids", "-mavx512fp16"])
+        {
             // It's likely the compiler doesn't support the sapphirerapids architecture
             // Clang 12 and GCC 11 are the first versions with sapphire rapids support
             eprintln!("Skipping Sapphire Rapids build due to error: {}", err);
@@ -65,6 +66,7 @@ fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
         .std("c17")
         .file("src/simd/f16.c")
         .flag("-ffast-math")
+        .flag("-funroll-loops")
         .flag("-O3")
         .flag("-Wall")
         // .flag("-Werror")
