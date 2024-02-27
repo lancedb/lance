@@ -159,7 +159,7 @@ impl HNSWBuilder {
         //  }
         // ```
         for cur_level in self.levels.iter().rev().take(levels_to_search) {
-            let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
+            let candidates = beam_search(cur_level, &ep, vector, 1)?;
             ep = if self.use_select_heuristic {
                 select_neighbors_heuristic(cur_level, query, &candidates, 1, self.extend_candidates)
                     .map(|(_, id)| id)
