@@ -1,0 +1,21 @@
+[package]
+name = "lance-jni"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+readme.workspace = true
+license.workspace = true
+description = "JNI bindings for Lance Columnar format"
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+lance.workspace = true
+arrow = { workspace = true, features = ["ffi"] }
+tokio = { workspace = true }
+jni = "0.21.1"
+snafu.workspace = true
+lazy_static.workspace = true

@@ -35,9 +35,6 @@ jobs:
         toolchain:
           - stable
           - nightly
-    defaults:
-      run:
-        working-directory: ./rust
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -73,9 +70,6 @@ jobs:
   linux-arm:
     runs-on: buildjet-4vcpu-ubuntu-2204-arm
     timeout-minutes: 30
-    defaults:
-      run:
-        working-directory: ./rust
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -94,9 +88,6 @@ jobs:
   clippy:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
-    defaults:
-      run:
-        working-directory: ./rust
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
