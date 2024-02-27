@@ -78,9 +78,9 @@ def run(ds, q=None, assert_func=None):
             expected_columns.extend(ds.schema.names)
         else:
             expected_columns.extend(columns)
-        for c in ["vector", "_distance"]:
-            if c not in expected_columns:
-                expected_columns.append(c)
+        # TODO: _distance shouldn't be returned by default either
+        if "_distance" not in expected_columns:
+            expected_columns.append("_distance")
 
         for filter_ in filters:
             for rf in refine:
@@ -130,6 +130,8 @@ def test_ann_append(tmp_path):
     q = new_data["vector"][0].as_py()
 
     def func(rs: pa.Table):
+        if "vector" not in rs:
+            return
         assert rs["vector"][0].as_py() == q
 
     run(dataset, q=np.array(q), assert_func=func)

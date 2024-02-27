@@ -607,7 +607,10 @@ impl Planner {
     }
 
     pub fn get_physical_optimizer() -> PhysicalOptimizer {
-        PhysicalOptimizer::with_rules(vec![Arc::new(crate::io::exec::optimizer::CoalesceTake)])
+        PhysicalOptimizer::with_rules(vec![
+            Arc::new(crate::io::exec::optimizer::CoalesceTake),
+            Arc::new(crate::io::exec::optimizer::SimplifyProjection),
+        ])
     }
 }
 
