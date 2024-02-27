@@ -13,14 +13,14 @@
 // limitations under the License.
 
 use arrow::array::RecordBatchReader;
-use tokio::runtime::Runtime;
 
 use lance::dataset::{Dataset, WriteParams};
 use lance::Result;
 
+use crate::RT;
+
 pub struct BlockingDataset {
     inner: Dataset,
-    rt: Runtime,
 }
 
 impl BlockingDataset {
@@ -29,12 +29,8 @@ impl BlockingDataset {
         uri: &str,
         params: Option<WriteParams>,
     ) -> Result<Self> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-
-        let inner = rt.block_on(Dataset::write(reader, uri, params))?;
-        Ok(BlockingDataset { inner, rt })
+        let inner = RT.block_on(Dataset::write(reader, uri, params))?;
+        Ok(Self { inner })
     }
     pub fn open(uri: &str) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -42,11 +38,12 @@ impl BlockingDataset {
             .build()?;
 
         let inner = rt.block_on(Dataset::open(uri))?;
-        Ok(BlockingDataset { inner, rt })
+        Ok(Self { inner })
     }
 
     pub fn count_rows(&self) -> Result<usize> {
-        self.rt.block_on(self.inner.count_rows())
+        RT.block_on(self.inner.count_rows())
     }
+
     pub fn close(&self) {}
 }

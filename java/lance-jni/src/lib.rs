@@ -21,6 +21,14 @@ use jni::objects::{JMap, JObject, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+}
 
 #[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>(
@@ -172,9 +180,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_open<'local>(
     _obj: JObject,
     path: JString,
 ) -> JObject<'local> {
-    let path_str = match jni_helpers::extract_path_str(&mut env, &path) {
-        Ok(value) => value,
-        Err(_) => return JObject::null(),
+    let Ok(path_str) = jni_helpers::extract_path_str(&mut env, &path) else {
+        return JObject::null();
     };
 
     match BlockingDataset::open(&path_str) {
@@ -211,10 +218,9 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_releaseNativeDataset(
     mut env: JNIEnv,
     obj: JObject,
 ) {
-    let dataset: BlockingDataset = unsafe { 
-        env
-        .take_rust_field(obj, "nativeDatasetHandle")
-        .expect("Failed to take native dataset handle")
+    let dataset: BlockingDataset = unsafe {
+        env.take_rust_field(obj, "nativeDatasetHandle")
+            .expect("Failed to take native dataset handle")
     };
     dataset.close()
 }

@@ -1,19 +1,26 @@
 [package]
 name = "lance-jni"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+repository.workspace = true
+readme.workspace = true
+license.workspace = true
+description = "JNI bindings for Lance Columnar format"
+keywords.workspace = true
+categories.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-lance = { path="../../rust/lance" }
-arrow = { version = "50.0.0", features = ["ffi"] }
-tokio = { version = "1.23", features = [
+lance.workspace = true
+arrow = { workspace = true, features = ["ffi"] }
+tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
     "fs",
     "sync",
 ] }
 jni = "0.21.1"
-snafu = "0.7.4"
+snafu.workspace = true
+lazy_static.workspace = true
