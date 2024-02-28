@@ -21,6 +21,7 @@ pub trait FromJObject<T> {
     fn extract(&self) -> Result<T>;
 }
 
+/// Convert a Rust type into a Java Object.
 pub trait IntoJava {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> JObject<'a>;
 }
@@ -65,6 +66,10 @@ pub trait JMapExt {
     fn get_i32(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i32>>;
 
     fn get_i64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i64>>;
+
+    fn get_f32(&self, env: &mut JNIEnv, key: &str) -> Result<Option<f32>>;
+
+    fn get_f64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<f64>>;
 }
 
 fn get_map_value<T>(env: &mut JNIEnv, map: &JMap, key: &str) -> Result<Option<T>>
@@ -99,6 +104,14 @@ impl JMapExt for JMap<'_, '_, '_> {
     }
 
     fn get_i64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i64>> {
+        get_map_value(env, self, key)
+    }
+
+    fn get_f32(&self, env: &mut JNIEnv, key: &str) -> Result<Option<f32>> {
+        get_map_value(env, self, key)
+    }
+
+    fn get_f64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<f64>> {
         get_map_value(env, self, key)
     }
 }
