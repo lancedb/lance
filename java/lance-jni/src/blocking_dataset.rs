@@ -14,10 +14,11 @@
 
 use arrow::array::RecordBatchReader;
 
+use jni::objects::JObject;
+use jni::JNIEnv;
 use lance::dataset::{Dataset, WriteParams};
 
-use crate::Result;
-use crate::RT;
+use crate::{traits::IntoJava, Result, RT};
 
 pub struct BlockingDataset {
     inner: Dataset,
@@ -43,4 +44,42 @@ impl BlockingDataset {
     }
 
     pub fn close(&self) {}
+}
+
+impl IntoJava for BlockingDataset {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> JObject<'a> {
+        attach_native_dataset(env, self)
+    }
+}
+
+fn attach_native_dataset<'local>(
+    env: &mut JNIEnv<'local>,
+    dataset: BlockingDataset,
+) -> JObject<'local> {
+    let j_dataset = create_java_dataset_object(env);
+    // This block sets a native Rust object (dataset) as a field in the Java object (j_dataset).
+    // Caution: This creates a potential for memory leaks. The Rust object (dataset) is not
+    // automatically garbage-collected by Java, and its memory will not be freed unless
+    // explicitly handled.
+    //
+    // To prevent memory leaks, ensure the following:
+    // 1. The Java object (`j_dataset`) should implement the `java.io.Closeable` interface.
+    // 2. Users of this Java object should be instructed to always use it within a try-with-resources
+    //    statement (or manually call the `close()` method) to ensure that `self.close()` is invoked.
+    match unsafe { env.set_rust_field(&j_dataset, "nativeDatasetHandle", dataset) } {
+        Ok(_) => j_dataset,
+        Err(err) => {
+            env.throw_new(
+                "java/lang/RuntimeException",
+                format!("Failed to set native handle: {}", err),
+            )
+            .expect("Error throwing exception");
+            JObject::null()
+        }
+    }
+}
+
+fn create_java_dataset_object<'a>(env: &mut JNIEnv<'a>) -> JObject<'a> {
+    env.new_object("com/lancedb/lance/Dataset", "()V", &[])
+        .expect("Failed to create Java Dataset instance")
 }

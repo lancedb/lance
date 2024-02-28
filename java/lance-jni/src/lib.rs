@@ -19,6 +19,7 @@ use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
 use lazy_static::lazy_static;
 use snafu::{location, Location};
+use traits::IntoJava;
 
 macro_rules! ok_or_throw {
     ($env:expr, $result:expr) => {
@@ -34,9 +35,9 @@ macro_rules! ok_or_throw {
 
 mod blocking_dataset;
 pub mod error;
-mod jni_helpers;
+mod traits;
 
-use self::jni_helpers::{FromJString, JMapExt};
+use self::traits::{FromJString, JMapExt};
 use crate::blocking_dataset::BlockingDataset;
 pub use error::{Error, Result};
 
@@ -72,7 +73,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>
         env,
         BlockingDataset::write(reader, &path_str, Some(write_params))
     );
-    attach_native_dataset(&mut env, dataset)
+    dataset.into_java(&mut env)
 }
 
 pub fn extract_write_params(env: &mut JNIEnv, params: &JObject) -> Result<WriteParams> {
@@ -92,38 +93,6 @@ pub fn extract_write_params(env: &mut JNIEnv, params: &JObject) -> Result<WriteP
     Ok(write_params)
 }
 
-fn attach_native_dataset<'local>(
-    env: &mut JNIEnv<'local>,
-    dataset: BlockingDataset,
-) -> JObject<'local> {
-    let j_dataset = create_java_dataset_object(env);
-    // This block sets a native Rust object (dataset) as a field in the Java object (j_dataset).
-    // Caution: This creates a potential for memory leaks. The Rust object (dataset) is not
-    // automatically garbage-collected by Java, and its memory will not be freed unless
-    // explicitly handled.
-    //
-    // To prevent memory leaks, ensure the following:
-    // 1. The Java object (`j_dataset`) should implement the `java.io.Closeable` interface.
-    // 2. Users of this Java object should be instructed to always use it within a try-with-resources
-    //    statement (or manually call the `close()` method) to ensure that `self.close()` is invoked.
-    match unsafe { env.set_rust_field(&j_dataset, "nativeDatasetHandle", dataset) } {
-        Ok(_) => j_dataset,
-        Err(err) => {
-            env.throw_new(
-                "java/lang/RuntimeException",
-                format!("Failed to set native handle: {}", err),
-            )
-            .expect("Error throwing exception");
-            JObject::null()
-        }
-    }
-}
-
-fn create_java_dataset_object<'a>(env: &mut JNIEnv<'a>) -> JObject<'a> {
-    env.new_object("com/lancedb/lance/Dataset", "()V", &[])
-        .expect("Failed to create Java Dataset instance")
-}
-
 #[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Dataset_open<'local>(
     mut env: JNIEnv<'local>,
@@ -132,17 +101,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_open<'local>(
 ) -> JObject<'local> {
     let path_str: String = ok_or_throw!(env, path.extract(&mut env));
 
-    match BlockingDataset::open(&path_str) {
-        Ok(dataset) => attach_native_dataset(&mut env, dataset),
-        Err(err) => {
-            env.throw_new(
-                "java/lang/RuntimeException",
-                format!("Failed to open dataset: {}", err),
-            )
-            .expect("Error throwing exception");
-            JObject::null()
-        }
-    }
+    let dataset = ok_or_throw!(env, BlockingDataset::open(&path_str));
+    dataset.into_java(&mut env)
 }
 
 #[no_mangle]

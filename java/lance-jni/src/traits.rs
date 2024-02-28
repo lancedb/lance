@@ -21,6 +21,10 @@ pub trait FromJObject<T> {
     fn extract(&self) -> Result<T>;
 }
 
+pub trait IntoJava {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> JObject<'a>;
+}
+
 impl FromJObject<i32> for JObject<'_> {
     fn extract(&self) -> Result<i32> {
         Ok(JValue::from(self).i()?)
