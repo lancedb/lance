@@ -18,6 +18,7 @@ use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
 use lazy_static::lazy_static;
+use snafu::{location, Location};
 
 macro_rules! ok_or_throw {
     ($env:expr, $result:expr) => {
@@ -59,9 +60,13 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>
     let write_params = ok_or_throw!(&env, extract_write_params(&mut env, &params));
 
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
-    let reader = ok_or_throw!(&env, unsafe {
-        ArrowArrayStreamReader::from_raw(stream_ptr)
-    });
+    let reader = ok_or_throw!(
+        &env,
+        unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }.map_err(|e| Error::Arrow {
+            message: e.to_string(),
+            location: location!(),
+        })
+    );
     match BlockingDataset::write(reader, &path_str, Some(write_params)) {
         Ok(dataset) => attach_native_dataset(&mut env, dataset),
         Err(err) => {
