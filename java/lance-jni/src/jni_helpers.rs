@@ -51,6 +51,16 @@ impl FromJObject<f64> for JObject<'_> {
     }
 }
 
+pub trait FromJString {
+    fn extract(&self, env: &JNIEnv) -> Result<String>;
+}
+
+impl FromJString for JString<'_> {
+    fn extract(&self, env: &JNIEnv) -> Result<String> {
+        Ok(env.get_string(self)?.into())
+    }
+}
+
 pub trait JMapExt {
     fn get_string(&self, env: &mut JNIEnv, key: &str) -> Result<Option<String>>;
 
@@ -64,7 +74,7 @@ impl JMapExt for JMap<'_, '_, '_> {
         let key_obj: JObject = env.new_string(key)?.into();
         if let Some(value) = self.get(env, &key_obj)? {
             let value_str: JString = value.into();
-            Ok(Some(env.get_string(&value_str)?.into()))
+            Ok(Some(value_str.extract(env)?))
         } else {
             Ok(None)
         }

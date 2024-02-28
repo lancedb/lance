@@ -35,7 +35,7 @@ mod blocking_dataset;
 pub mod error;
 mod jni_helpers;
 
-use self::jni_helpers::{FromJObject, JMapExt};
+use self::jni_helpers::{FromJObject, FromJString, JMapExt};
 use crate::blocking_dataset::BlockingDataset;
 pub use error::{Error, Result};
 
@@ -54,7 +54,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>
     path: JString,
     params: JObject,
 ) -> JObject<'local> {
-    let path_str: String = ok_or_throw!(&env, env.get_string(&path).into());
+    let path_str: String = ok_or_throw!(&env, path.extract(&env));
 
     let write_params = ok_or_throw!(&env, extract_write_params(&mut env, &params));
 
@@ -129,9 +129,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_open<'local>(
     _obj: JObject,
     path: JString,
 ) -> JObject<'local> {
-    let Ok(path_str) = jni_helpers::extract_path_str(&mut env, &path) else {
-        return JObject::null();
-    };
+    let path_str: String = ok_or_throw!(&env, path.extract(&env));
 
     match BlockingDataset::open(&path_str) {
         Ok(dataset) => attach_native_dataset(&mut env, dataset),
