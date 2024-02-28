@@ -15,8 +15,8 @@
 use arrow::array::RecordBatchReader;
 
 use lance::dataset::{Dataset, WriteParams};
-use lance::Result;
 
+use crate::Result;
 use crate::RT;
 
 pub struct BlockingDataset {
@@ -39,7 +39,7 @@ impl BlockingDataset {
     }
 
     pub fn count_rows(&self) -> Result<usize> {
-        RT.block_on(self.inner.count_rows())
+        Ok(RT.block_on(self.inner.count_rows())?)
     }
 
     pub fn close(&self) {}

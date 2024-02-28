@@ -25,7 +25,7 @@ macro_rules! ok_or_throw {
         match $result {
             Ok(value) => value,
             Err(err) => {
-                err.throw($env);
+                err.throw(&mut $env);
                 return JObject::null();
             }
         }
@@ -36,7 +36,7 @@ mod blocking_dataset;
 pub mod error;
 mod jni_helpers;
 
-use self::jni_helpers::{FromJObject, FromJString, JMapExt};
+use self::jni_helpers::{FromJString, JMapExt};
 use crate::blocking_dataset::BlockingDataset;
 pub use error::{Error, Result};
 
@@ -55,28 +55,24 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>
     path: JString,
     params: JObject,
 ) -> JObject<'local> {
-    let path_str: String = ok_or_throw!(&env, path.extract(&env));
+    let path_str: String = ok_or_throw!(env, path.extract(&mut env));
 
-    let write_params = ok_or_throw!(&env, extract_write_params(&mut env, &params));
+    let write_params = ok_or_throw!(env, extract_write_params(&mut env, &params));
 
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = ok_or_throw!(
-        &env,
+        env,
         unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }.map_err(|e| Error::Arrow {
             message: e.to_string(),
             location: location!(),
         })
     );
-    match BlockingDataset::write(reader, &path_str, Some(write_params)) {
-        Ok(dataset) => attach_native_dataset(&mut env, dataset),
-        Err(err) => {
-            jni_helpers::throw_java_exception(
-                &mut env,
-                format!("Failed to write from arrow array stream: {}", err).as_str(),
-            );
-            JObject::null()
-        }
-    }
+
+    let dataset = ok_or_throw!(
+        env,
+        BlockingDataset::write(reader, &path_str, Some(write_params))
+    );
+    attach_native_dataset(&mut env, dataset)
 }
 
 pub fn extract_write_params(env: &mut JNIEnv, params: &JObject) -> Result<WriteParams> {
@@ -134,7 +130,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_open<'local>(
     _obj: JObject,
     path: JString,
 ) -> JObject<'local> {
-    let path_str: String = ok_or_throw!(&env, path.extract(&env));
+    let path_str: String = ok_or_throw!(env, path.extract(&mut env));
 
     match BlockingDataset::open(&path_str) {
         Ok(dataset) => attach_native_dataset(&mut env, dataset),

@@ -13,15 +13,9 @@
 // limitations under the License.
 
 use jni::objects::{JMap, JObject, JString, JValue};
-use jni::strings::JavaStr;
 use jni::JNIEnv;
 
-use crate::{Error, Result};
-
-pub fn throw_java_exception(env: &mut JNIEnv, err_msg: &str) {
-    env.throw_new("java/lang/RuntimeException", err_msg)
-        .expect("Error throwing exception");
-}
+use crate::Result;
 
 pub trait FromJObject<T> {
     fn extract(&self) -> Result<T>;
@@ -52,11 +46,11 @@ impl FromJObject<f64> for JObject<'_> {
 }
 
 pub trait FromJString {
-    fn extract(&self, env: &JNIEnv) -> Result<String>;
+    fn extract(&self, env: &mut JNIEnv) -> Result<String>;
 }
 
 impl FromJString for JString<'_> {
-    fn extract(&self, env: &JNIEnv) -> Result<String> {
+    fn extract(&self, env: &mut JNIEnv) -> Result<String> {
         Ok(env.get_string(self)?.into())
     }
 }

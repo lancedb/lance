@@ -55,9 +55,9 @@ impl TryFrom<&str> for WriteMode {
 
     fn try_from(value: &str) -> Result<Self> {
         match value.to_lowercase().as_str() {
-            "create" => Ok(WriteMode::Create),
-            "append" => Ok(WriteMode::Append),
-            "overwrite" => Ok(WriteMode::Overwrite),
+            "create" => Ok(Self::Create),
+            "append" => Ok(Self::Append),
+            "overwrite" => Ok(Self::Overwrite),
             _ => Err(Error::IO {
                 message: format!("Invalid write mode: {}", value),
                 location: location!(),
