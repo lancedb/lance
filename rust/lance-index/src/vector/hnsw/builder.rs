@@ -174,8 +174,8 @@ impl HNSWBuilder {
                 select_neighbors(&candidates, m).collect()
             };
 
-            for (_, nb) in neighbours.iter() {
-                cur_level.connect(node, *nb)?;
+            for (distance, nb) in neighbours.iter() {
+                cur_level.connect(node, *nb, Some(*distance))?;
             }
             for (_, nb) in neighbours {
                 cur_level.prune(nb, self.m_max)?;
