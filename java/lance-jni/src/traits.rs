@@ -67,6 +67,22 @@ pub trait JMapExt {
     fn get_i64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i64>>;
 }
 
+fn get_map_value<T>(env: &mut JNIEnv, map: &JMap, key: &str) -> Result<Option<T>>
+where
+    for<'a> JObject<'a>: FromJObject<T>,
+{
+    let key_obj: JObject = env.new_string(key)?.into();
+    if let Some(value) = map.get(env, &key_obj)? {
+        if value.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(value.extract()?))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
 impl JMapExt for JMap<'_, '_, '_> {
     fn get_string(&self, env: &mut JNIEnv, key: &str) -> Result<Option<String>> {
         let key_obj: JObject = env.new_string(key)?.into();
@@ -79,20 +95,10 @@ impl JMapExt for JMap<'_, '_, '_> {
     }
 
     fn get_i32(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i32>> {
-        let key_obj: JObject = env.new_string(key)?.into();
-        if let Some(value) = self.get(env, &key_obj)? {
-            Ok(Some(value.extract()?))
-        } else {
-            Ok(None)
-        }
+        get_map_value(env, self, key)
     }
 
     fn get_i64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i64>> {
-        let key_obj: JObject = env.new_string(key)?.into();
-        if let Some(value) = self.get(env, &key_obj)? {
-            Ok(Some(value.extract()?))
-        } else {
-            Ok(None)
-        }
+        get_map_value(env, self, key)
     }
 }
