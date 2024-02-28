@@ -187,6 +187,13 @@ pub struct Scanner {
     fragments: Option<Vec<Fragment>>,
 }
 
+fn escape_column_name(name: &str) -> String {
+    name.split('.')
+        .map(|s| format!("`{}`", s))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection = dataset.schema().clone();
@@ -254,7 +261,7 @@ impl Scanner {
         self.project_with_transform(
             &columns
                 .iter()
-                .map(|c| (c.as_ref(), format!("`{}`", c.as_ref())))
+                .map(|c| (c.as_ref(), escape_column_name(c.as_ref())))
                 .collect::<Vec<_>>(),
         )
     }
@@ -3397,6 +3404,71 @@ mod test {
                 expected, plan_desc
             )
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_project_nested() -> Result<()> {
+        let struct_i_field = ArrowField::new("i", DataType::Int32, true);
+        let struct_o_field = ArrowField::new("o", DataType::Utf8, true);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "struct",
+                DataType::Struct(vec![struct_i_field.clone(), struct_o_field.clone()].into()),
+                true,
+            ),
+            ArrowField::new("s", DataType::Utf8, true),
+        ]));
+
+        let input_batches: Vec<RecordBatch> = (0..5)
+            .map(|i| {
+                let struct_i_arr: Arc<Int32Array> =
+                    Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20));
+                let struct_o_arr: Arc<StringArray> = Arc::new(StringArray::from_iter_values(
+                    (i * 20..(i + 1) * 20).map(|v| format!("o-{:02}", v)),
+                ));
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(StructArray::from(vec![
+                            (Arc::new(struct_i_field.clone()), struct_i_arr as ArrayRef),
+                            (Arc::new(struct_o_field.clone()), struct_o_arr as ArrayRef),
+                        ])),
+                        Arc::new(StringArray::from_iter_values(
+                            (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let batches =
+            RecordBatchIterator::new(input_batches.clone().into_iter().map(Ok), schema.clone());
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+
+        let batches = dataset
+            .scan()
+            .project(&["struct.i"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert!(batch.column_by_name("struct.i").is_some());
         Ok(())
     }
 
