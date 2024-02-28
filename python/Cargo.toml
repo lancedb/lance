@@ -5,6 +5,7 @@ edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 rust-version = "1.65"
 exclude = ["python/lance/conftest.py"]
+publish = false
 
 [lib]
 name = "lance"
