@@ -40,11 +40,8 @@ impl GraphBuilderNode {
         }
     }
 
-    fn add_neighbor(&mut self, distance: f32, id: u32) {
-        self.neighbors.push(OrderedNode {
-            dist: OrderedFloat(distance),
-            id,
-        });
+    fn add_neighbor(&mut self, distance: OrderedFloat, id: u32) {
+        self.neighbors.push(OrderedNode { dist: distance, id });
     }
 
     /// Prune the node and only keep `max_edges` edges.
@@ -120,8 +117,8 @@ impl GraphBuilder {
     }
 
     /// Connect from one node to another.
-    pub fn connect(&mut self, from: u32, to: u32) -> Result<()> {
-        let distance = self.vectors.distance_between(from, to);
+    pub fn connect(&mut self, from: u32, to: u32, distance: Option<OrderedFloat>) -> Result<()> {
+        let distance = distance.unwrap_or_else(|| self.vectors.distance_between(from, to).into());
 
         {
             let from_node = self.nodes.get_mut(&from).ok_or_else(|| Error::Index {
@@ -197,14 +194,14 @@ mod tests {
         let mut builder = GraphBuilder::new(store.clone());
         builder.insert(0);
         builder.insert(1);
-        builder.connect(0, 1).unwrap();
+        builder.connect(0, 1, None).unwrap();
         assert_eq!(builder.len(), 2);
 
         assert_eq!(builder.neighbors(0).unwrap().collect::<Vec<_>>(), vec![1]);
         assert_eq!(builder.neighbors(1).unwrap().collect::<Vec<_>>(), vec![0]);
 
         builder.insert(4);
-        builder.connect(0, 4).unwrap();
+        builder.connect(0, 4, None).unwrap();
         assert_eq!(builder.len(), 3);
 
         assert_eq!(
