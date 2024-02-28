@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
-        working-directory: ./rust
+        working-directory: .
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -29,4 +29,4 @@ jobs:
         with:
           registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           args: '--all-features'
-          path: ./rust
+          path: .

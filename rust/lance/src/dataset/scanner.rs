@@ -38,7 +38,6 @@ use datafusion::physical_plan::{
     ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::scalar::ScalarValue;
-use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
@@ -188,19 +187,11 @@ pub struct Scanner {
     fragments: Option<Vec<Fragment>>,
 }
 
-/// lifted from datafusion
-/// If e is a direct column reference, returns the field level
-/// metadata for that field, if any. Otherwise returns None
-fn get_field_metadata(
-    e: &Arc<dyn PhysicalExpr>,
-    input_schema: &ArrowSchema,
-) -> Option<HashMap<String, String>> {
-    // Look up field by index in schema (not NAME as there can be more than one
-    // column with the same name)
-    e.as_any()
-        .downcast_ref::<Column>()
-        .map(|column| input_schema.field(column.index()).metadata())
-        .cloned()
+fn escape_column_name(name: &str) -> String {
+    name.split('.')
+        .map(|s| format!("`{}`", s))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 impl Scanner {
@@ -270,7 +261,7 @@ impl Scanner {
         self.project_with_transform(
             &columns
                 .iter()
-                .map(|c| (c.as_ref(), format!("`{}`", c.as_ref())))
+                .map(|c| (c.as_ref(), escape_column_name(c.as_ref())))
                 .collect::<Vec<_>>(),
         )
     }
@@ -282,7 +273,7 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
-        let planner = Planner::new(self.schema()?);
+        let planner = Planner::new(Arc::new(self.dataset.schema().into()));
         let mut output = HashMap::new();
         let mut physical_cols_set = HashSet::new();
         let mut physical_cols = vec![];
@@ -570,11 +561,9 @@ impl Scanner {
     }
 
     /// The Arrow schema of the output, including projections and vector / _distance
-    pub fn schema(&self) -> Result<SchemaRef> {
-        let schema = self
-            .output_schema()
-            .map(|s| SchemaRef::new(ArrowSchema::from(s.as_ref())))?;
-        Ok(schema)
+    pub async fn schema(&self) -> Result<SchemaRef> {
+        let plan = self.create_plan().await?;
+        Ok(plan.schema())
     }
 
     /// The schema of the Scanner from lance physical takes
@@ -672,26 +661,6 @@ impl Scanner {
         }
 
         Ok(output_expr)
-    }
-
-    /// The schema of the Scanner output
-    pub(crate) fn output_schema(&self) -> Result<Arc<Schema>> {
-        let arrow_schema = self.physical_schema()?.as_ref().into();
-        let output_expr = self.output_expr()?;
-
-        let mut fields = vec![];
-        for (expr, name) in output_expr {
-            let dtype = expr.data_type(&arrow_schema)?;
-            let nullable = expr.nullable(&arrow_schema)?;
-
-            let mut field = ArrowField::new(name, dtype, nullable);
-            field.set_metadata(get_field_metadata(&expr, &arrow_schema).unwrap_or_default());
-
-            fields.push(field);
-        }
-        let schema = (&ArrowSchema::new(fields)).try_into()?;
-
-        Ok(Arc::new(schema))
     }
 
     /// Create a stream from the Scanner.
@@ -3435,6 +3404,71 @@ mod test {
                 expected, plan_desc
             )
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_project_nested() -> Result<()> {
+        let struct_i_field = ArrowField::new("i", DataType::Int32, true);
+        let struct_o_field = ArrowField::new("o", DataType::Utf8, true);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "struct",
+                DataType::Struct(vec![struct_i_field.clone(), struct_o_field.clone()].into()),
+                true,
+            ),
+            ArrowField::new("s", DataType::Utf8, true),
+        ]));
+
+        let input_batches: Vec<RecordBatch> = (0..5)
+            .map(|i| {
+                let struct_i_arr: Arc<Int32Array> =
+                    Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20));
+                let struct_o_arr: Arc<StringArray> = Arc::new(StringArray::from_iter_values(
+                    (i * 20..(i + 1) * 20).map(|v| format!("o-{:02}", v)),
+                ));
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(StructArray::from(vec![
+                            (Arc::new(struct_i_field.clone()), struct_i_arr as ArrayRef),
+                            (Arc::new(struct_o_field.clone()), struct_o_arr as ArrayRef),
+                        ])),
+                        Arc::new(StringArray::from_iter_values(
+                            (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let batches =
+            RecordBatchIterator::new(input_batches.clone().into_iter().map(Ok), schema.clone());
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+
+        let batches = dataset
+            .scan()
+            .project(&["struct.i"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert!(batch.column_by_name("struct.i").is_some());
         Ok(())
     }
 
