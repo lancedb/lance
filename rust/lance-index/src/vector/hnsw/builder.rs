@@ -85,7 +85,7 @@ impl HNSWBuilder {
         self
     }
 
-    /// The maximum number of connections for each node per layer.
+    /// The number of connections to establish while inserting new element
     /// The default value is `30`.
     pub fn num_edges(mut self, m: usize) -> Self {
         self.m = m;
