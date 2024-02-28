@@ -126,11 +126,6 @@ impl HNSWBuilder {
         self
     }
 
-    #[inline]
-    fn len(&self) -> usize {
-        self.levels[0].len()
-    }
-
     /// New node's level
     ///
     /// See paper `Algorithm 1`
