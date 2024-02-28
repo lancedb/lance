@@ -12,16 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod blocking_dataset;
-mod jni_helpers;
-
-use crate::blocking_dataset::BlockingDataset;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use jni::objects::{JMap, JObject, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
 use lazy_static::lazy_static;
+
+macro_rules! ok_or_throw {
+    ($env:expr, $result:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(err) => {
+                err.throw($env);
+                return JObject::null();
+            }
+        }
+    };
+}
+
+mod blocking_dataset;
+pub mod error;
+mod jni_helpers;
+
+use self::jni_helpers::{FromJObject, JMapExt};
+use crate::blocking_dataset::BlockingDataset;
+pub use error::{Error, Result};
 
 lazy_static! {
     static ref RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_multi_thread()
@@ -38,104 +54,40 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>
     path: JString,
     params: JObject,
 ) -> JObject<'local> {
-    let path_str = match jni_helpers::extract_path_str(&mut env, &path) {
-        Ok(value) => value,
-        Err(err_str) => {
-            env.throw_new("java/lang/IllegalArgumentException", err_str)
-                .expect("Error throwing exception");
-            return JObject::null();
-        }
-    };
+    let path_str: String = ok_or_throw!(&env, env.get_string(&path).into());
 
-    let write_params = match extract_write_params(&mut env, &params) {
-        Ok(value) => value,
-        Err(err_str) => {
-            env.throw_new("java/lang/IllegalArgumentException", err_str)
-                .expect("Error throwing exception");
-            return JObject::null();
-        }
-    };
+    let write_params = ok_or_throw!(&env, extract_write_params(&mut env, &params));
 
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
-    let stream = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) };
-    match stream {
-        Ok(reader) => match BlockingDataset::write(reader, &path_str, Some(write_params)) {
-            Ok(dataset) => attach_native_dataset(&mut env, dataset),
-            Err(err) => {
-                jni_helpers::throw_java_exception(
-                    &mut env,
-                    format!("Failed to write from arrow array stream: {}", err).as_str(),
-                );
-                JObject::null()
-            }
-        },
+    let reader = ok_or_throw!(&env, unsafe {
+        ArrowArrayStreamReader::from_raw(stream_ptr)
+    });
+    match BlockingDataset::write(reader, &path_str, Some(write_params)) {
+        Ok(dataset) => attach_native_dataset(&mut env, dataset),
         Err(err) => {
             jni_helpers::throw_java_exception(
                 &mut env,
-                &format!("Failed to extract arrow array stream: {}", err),
+                format!("Failed to write from arrow array stream: {}", err).as_str(),
             );
             JObject::null()
         }
     }
 }
 
-pub fn extract_write_params(env: &mut JNIEnv, params: &JObject) -> Result<WriteParams, String> {
-    let params_map = JMap::from_env(env, params)
-        .map_err(|err| format!("Failed to extract JMap write parameters: {}", err))?;
+pub fn extract_write_params(env: &mut JNIEnv, params: &JObject) -> Result<WriteParams> {
+    let params_map = JMap::from_env(env, params)?;
 
     let mut write_params = WriteParams::default();
 
-    jni_helpers::extract_and_process_jni_map_value::<i32, _>(
-        env,
-        &params_map,
-        "max_rows_per_file",
-        |v| {
-            write_params.max_rows_per_file = v as usize;
-            Ok(())
-        },
-    )?;
-
-    jni_helpers::extract_and_process_jni_map_value::<i32, _>(
-        env,
-        &params_map,
-        "max_rows_per_group",
-        |v| {
-            write_params.max_rows_per_group = v as usize;
-            Ok(())
-        },
-    )?;
-
-    jni_helpers::extract_and_process_jni_map_value::<i64, _>(
-        env,
-        &params_map,
-        "max_bytes_per_file",
-        |v| {
-            write_params.max_bytes_per_file = v as usize;
-            Ok(())
-        },
-    )?;
-
-    jni_helpers::extract_and_process_jni_map_value::<String, _>(
-        env,
-        &params_map,
-        "mode",
-        |mode_str| match mode_str.to_uppercase().as_str() {
-            "CREATE" => {
-                write_params.mode = WriteMode::Create;
-                Ok(())
-            }
-            "APPEND" => {
-                write_params.mode = WriteMode::Append;
-                Ok(())
-            }
-            "OVERWRITE" => {
-                write_params.mode = WriteMode::Overwrite;
-                Ok(())
-            }
-            _ => Err(format!("Unsupported write mode provided: {}", mode_str)),
-        },
-    )?;
-
+    if let Some(max_rows) = params_map.get_i32(env, "max_row_per_file")? {
+        write_params.max_rows_per_group = max_rows as usize;
+    }
+    if let Some(max_bytes) = params_map.get_i64(env, "max_bytes_per_file")? {
+        write_params.max_bytes_per_file = max_bytes as usize;
+    }
+    if let Some(mode) = params_map.get_string(env, "mode")? {
+        write_params.mode = WriteMode::try_from(mode.as_str())?;
+    }
     Ok(write_params)
 }
 

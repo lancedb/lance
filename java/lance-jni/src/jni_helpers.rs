@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,76 +12,79 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use jni::objects::{JMap, JObject, JString};
+use jni::objects::{JMap, JObject, JString, JValue};
+use jni::strings::JavaStr;
 use jni::JNIEnv;
+
+use crate::{Error, Result};
 
 pub fn throw_java_exception(env: &mut JNIEnv, err_msg: &str) {
     env.throw_new("java/lang/RuntimeException", err_msg)
         .expect("Error throwing exception");
 }
 
-pub fn extract_path_str(env: &mut JNIEnv, path: &JString) -> Result<String, String> {
-    match env.get_string(path) {
-        Ok(path) => Ok(path.into()),
-        Err(err) => Err(format!("Invalid path string: {}", err)),
+pub trait FromJObject<T> {
+    fn extract(&self) -> Result<T>;
+}
+
+impl FromJObject<i32> for JObject<'_> {
+    fn extract(&self) -> Result<i32> {
+        Ok(JValue::from(self).i()?)
     }
 }
 
-pub trait ExtractJniValue {
-    // extract JNI JObject to rust type
-    fn extract(env: &mut JNIEnv, obj: JObject) -> Result<Self, String>
-    where
-        Self: Sized;
-}
-
-impl ExtractJniValue for i32 {
-    fn extract(env: &mut JNIEnv, obj: JObject) -> Result<Self, String> {
-        env.call_method(obj, "intValue", "()I", &[])
-            .and_then(|jvalue| jvalue.i())
-            .map_err(|e| e.to_string())
+impl FromJObject<i64> for JObject<'_> {
+    fn extract(&self) -> Result<i64> {
+        Ok(JValue::from(self).j()?)
     }
 }
 
-impl ExtractJniValue for i64 {
-    fn extract(env: &mut JNIEnv, obj: JObject) -> Result<Self, String> {
-        env.call_method(obj, "longValue", "()J", &[])
-            .and_then(|jvalue| jvalue.j())
-            .map_err(|e| e.to_string())
+impl FromJObject<f32> for JObject<'_> {
+    fn extract(&self) -> Result<f32> {
+        Ok(JValue::from(self).f()?)
     }
 }
 
-impl ExtractJniValue for String {
-    fn extract(env: &mut JNIEnv, obj: JObject) -> Result<Self, String> {
-        env.get_string(&JString::from(obj))
-            .map(|jstr| jstr.into())
-            .map_err(|e| e.to_string())
+impl FromJObject<f64> for JObject<'_> {
+    fn extract(&self) -> Result<f64> {
+        Ok(JValue::from(self).d()?)
     }
 }
 
-pub fn extract_and_process_jni_map_value<T, F>(
-    env: &mut JNIEnv,
-    map: &JMap,
-    key: &str,
-    mut process: F,
-) -> Result<(), String>
-where
-    T: ExtractJniValue,
-    F: FnMut(T) -> Result<(), String>, // func to apply to return value
-{
-    let key_obj = env
-        .new_string(key)
-        .map(JObject::from)
-        .map_err(|e| e.to_string())?;
+pub trait JMapExt {
+    fn get_string(&self, env: &mut JNIEnv, key: &str) -> Result<Option<String>>;
 
-    match map.get(env, &key_obj) {
-        Ok(Some(value_obj)) => {
-            if !value_obj.is_null() {
-                let value = T::extract(env, value_obj)?;
-                process(value)?;
-            }
-            Ok(())
+    fn get_i32(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i32>>;
+
+    fn get_i64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i64>>;
+}
+
+impl JMapExt for JMap<'_, '_, '_> {
+    fn get_string(&self, env: &mut JNIEnv, key: &str) -> Result<Option<String>> {
+        let key_obj: JObject = env.new_string(key)?.into();
+        if let Some(value) = self.get(env, &key_obj)? {
+            let value_str: JString = value.into();
+            Ok(Some(env.get_string(&value_str)?.into()))
+        } else {
+            Ok(None)
         }
-        Ok(None) => Ok(()), // Key is not present in the map, so we do nothing
-        Err(e) => Err(e.to_string()),
+    }
+
+    fn get_i32(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i32>> {
+        let key_obj: JObject = env.new_string(key)?.into();
+        if let Some(value) = self.get(env, &key_obj)? {
+            Ok(Some(value.extract()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn get_i64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i64>> {
+        let key_obj: JObject = env.new_string(key)?.into();
+        if let Some(value) = self.get(env, &key_obj)? {
+            Ok(Some(value.extract()?))
+        } else {
+            Ok(None)
+        }
     }
 }
