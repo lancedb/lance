@@ -23,7 +23,6 @@ use rand::{thread_rng, Rng};
 
 use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
 use super::{select_neighbors, select_neighbors_heuristic, HNSW};
-use crate::vector::graph::Graph;
 use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage};
 use crate::vector::hnsw::HnswLevel;
 
