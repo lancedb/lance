@@ -20,7 +20,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatchReader;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
-use lance_core::{datatypes::Schema, Result};
+use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::chunk_stream;
 use lance_datafusion::utils::reader_to_stream;
 use lance_file::writer::FileWriter;
@@ -29,6 +29,7 @@ use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
+use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -47,6 +48,22 @@ pub enum WriteMode {
     Append,
     /// Overwrite a dataset as a new version, or create new dataset if not exist.
     Overwrite,
+}
+
+impl TryFrom<&str> for WriteMode {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value.to_lowercase().as_str() {
+            "create" => Ok(Self::Create),
+            "append" => Ok(Self::Append),
+            "overwrite" => Ok(Self::Overwrite),
+            _ => Err(Error::IO {
+                message: format!("Invalid write mode: {}", value),
+                location: location!(),
+            }),
+        }
+    }
 }
 
 /// Dataset Write Parameters
