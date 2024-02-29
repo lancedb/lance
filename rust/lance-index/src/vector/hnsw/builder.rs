@@ -23,7 +23,7 @@ use rand::{thread_rng, Rng};
 
 use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
 use super::{select_neighbors, select_neighbors_heuristic, HNSW};
-use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage};
+use crate::vector::graph::{builder::GraphBuilder, greedy_search, storage::VectorStorage};
 use crate::vector::hnsw::HnswLevel;
 
 /// Build a HNSW graph.
@@ -152,7 +152,7 @@ impl HNSWBuilder {
         } else {
             0
         };
-        let mut ep = vec![self.entry_point];
+        let mut ep = self.entry_point;
         let query = self.vectors.vector(self.entry_point);
 
         //
@@ -164,14 +164,14 @@ impl HNSWBuilder {
         //  }
         // ```
         for cur_level in self.levels.iter().rev().take(levels_to_search) {
-            let candidates = beam_search(cur_level, &ep, vector, 1)?;
-            ep = select_neighbors(&candidates, 1).map(|(_, id)| id).collect()
+            ep = greedy_search(cur_level, ep, vector)?.1;
         }
 
+        let mut ep = vec![ep];
         for cur_level in self.levels.iter_mut().rev().skip(levels_to_search) {
             cur_level.insert(node);
             let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
-            let neighbours: Vec<_> = if self.use_select_heuristic {
+            let neighbors: Vec<_> = if self.use_select_heuristic {
                 select_neighbors_heuristic(
                     cur_level,
                     query,
@@ -184,10 +184,10 @@ impl HNSWBuilder {
                 select_neighbors(&candidates, self.m).collect()
             };
 
-            for (distance, nb) in neighbours.iter() {
+            for (distance, nb) in neighbors.iter() {
                 cur_level.connect(node, *nb, Some(*distance))?;
             }
-            for (_, nb) in neighbours {
+            for (_, nb) in neighbors {
                 cur_level.prune(nb, self.m_max)?;
             }
             cur_level.prune(node, self.m_max)?;
