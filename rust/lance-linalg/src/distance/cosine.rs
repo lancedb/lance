@@ -26,8 +26,12 @@ use arrow_array::{
     Array, FixedSizeListArray, Float32Array,
 };
 use arrow_schema::DataType;
+use half::f16;
 use lance_arrow::bfloat16::BFloat16Type;
 use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
+#[cfg(feature = "fp16kernels")]
+use lance_core::utils::cpu::SimdSupport;
+use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
 use num_traits::{AsPrimitive, FromPrimitive};
 
 use super::dot::dot;
@@ -89,7 +93,45 @@ where
 
 impl Cosine for BFloat16Type {}
 
-impl Cosine for Float16Type {}
+#[cfg(feature = "fp16kernels")]
+mod kernel {
+    use super::*;
+
+    // These are the `cosine_f16` function in f16.c. Our build.rs script compiles
+    // a version of this file for each SIMD level with different suffixes.
+    extern "C" {
+        #[cfg(target_arch = "aarch64")]
+        pub fn cosine_f16_neon(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
+        #[cfg(all(kernel_suppport = "avx512", target_arch = "x86_64"))]
+        pub fn cosine_f16_avx512(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
+        #[cfg(target_arch = "x86_64")]
+        pub fn cosine_f16_avx2(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
+    }
+}
+
+impl Cosine for Float16Type {
+    fn cosine_fast(x: &[f16], x_norm: f32, y: &[f16]) -> f32 {
+        match *FP16_SIMD_SUPPORT {
+            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
+            SimdSupport::Neon => unsafe {
+                kernel::cosine_f16_neon(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+            },
+            #[cfg(all(
+                feature = "fp16kernels",
+                kernel_suppport = "avx512",
+                target_arch = "x86_64"
+            ))]
+            SimdSupport::Avx512 => unsafe {
+                kernel::cosine_f16_avx512(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
+            SimdSupport::Avx2 => unsafe {
+                kernel::cosine_f16_avx2(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+            },
+            _ => cosine_scalar(x, x_norm, y),
+        }
+    }
+}
 
 /// f32 kernels for Cosine
 mod f32 {

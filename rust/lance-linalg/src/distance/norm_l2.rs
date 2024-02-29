@@ -15,10 +15,11 @@
 use std::iter::Sum;
 
 use half::{bf16, f16};
+#[cfg(feature = "fp16kernels")]
+use lance_core::utils::cpu::SimdSupport;
+#[allow(unused_imports)]
+use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
 use num_traits::{AsPrimitive, Float};
-
-#[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
-use lance_core::utils::cpu::x86::AVX512_F16_SUPPORTED;
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -31,45 +32,48 @@ pub trait Normalize<T: Float> {
     fn norm_l2(&self) -> f32;
 }
 
-// `avx512fp16` is not supported in rustc yet. Once it is supported, we can
-// move it to target_feture.
-#[cfg(any(
-    all(target_os = "macos", target_feature = "neon"),
-    feature = "avx512fp16"
-))]
+#[cfg(feature = "fp16kernels")]
 mod kernel {
     use super::*;
 
+    // These are the `norm_l2_f16` function in f16.c. Our build.rs script compiles
+    // a version of this file for each SIMD level with different suffixes.
     extern "C" {
-        pub fn norm_l2_f16(ptr: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "aarch64")]
+        pub fn norm_l2_f16_neon(ptr: *const f16, len: u32) -> f32;
+        #[cfg(all(kernel_suppport = "avx512", target_arch = "x86_64"))]
+        pub fn norm_l2_f16_avx512(ptr: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "x86_64")]
+        pub fn norm_l2_f16_avx2(ptr: *const f16, len: u32) -> f32;
     }
 }
 
 impl Normalize<f16> for &[f16] {
-    // #[inline]
+    #[inline]
     fn norm_l2(&self) -> f32 {
-        #[cfg(all(target_os = "macos", target_feature = "neon"))]
-        unsafe {
-            kernel::norm_l2_f16(self.as_ptr(), self.len() as u32)
+        match *FP16_SIMD_SUPPORT {
+            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
+            SimdSupport::Neon => unsafe {
+                kernel::norm_l2_f16_neon(self.as_ptr(), self.len() as u32)
+            },
+            #[cfg(all(
+                feature = "fp16kernels",
+                kernel_suppport = "avx512",
+                target_arch = "x86_64"
+            ))]
+            SimdSupport::Avx512 => unsafe {
+                kernel::norm_l2_f16_avx512(self.as_ptr(), self.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
+            SimdSupport::Avx2 => unsafe {
+                kernel::norm_l2_f16_avx2(self.as_ptr(), self.len() as u32)
+            },
+            _ => norm_l2_f16_impl(self),
         }
-
-        #[cfg(all(target_os = "linux", feature = "avx512fp16", target_arch = "x86_64"))]
-        if *AVX512_F16_SUPPORTED {
-            unsafe { kernel::norm_l2_f16(self.as_ptr(), self.len() as u32) }
-        } else {
-            norm_l2_f16_impl(self)
-        }
-
-        #[cfg(not(any(
-            all(target_os = "macos", target_feature = "neon"),
-            feature = "avx512fp16"
-        )))]
-        norm_l2_f16_impl(self)
     }
 }
 
 #[inline]
-#[cfg(not(all(target_os = "macos", target_feature = "neon")))]
 fn norm_l2_f16_impl(arr: &[f16]) -> f32 {
     // Please run `cargo bench --bench norm_l2" on Apple Silicon when
     // change the following code.

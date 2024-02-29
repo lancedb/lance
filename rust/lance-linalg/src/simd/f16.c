@@ -14,20 +14,34 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <math.h>
 
-#ifdef __X86_64__
-#include <immintrin.h>
-#endif // __X86_64__
+// Because we might be compiling this library multiple times, we need to
+// add a suffix to each of the function names.
+#define FUNC_CAT_INNER(A, B) A##B
+#define FUNC_CAT(A, B) FUNC_CAT_INNER(A, B)
+#define FUNC(N) FUNC_CAT(N, SUFFIX)
 
-/// Works on NEON + FP16 or AVX512FP16
-float norm_l2_f16(const _Float16 *data, uint32_t dimension) {
-  _Float16 sum = 0;
+// TODO: I wonder if we could re-purpose this macro to compile bf16 kernels?
+#if defined(__clang__)
+// Note: we use __fp16 instead of _Float16 because Clang < 15.0.0 does not
+// support it well for most targets. __fp16 works for our purposes here since
+// we are always casting it to float anyways. This doesn't make a difference
+// in the compiled assembly code for these functions.
+#define FP16 __fp16
+#elif defined(__GNUC__) || defined(__GNUG__)
+#define FP16 _Float16
+#endif
+// Note: MSVC doesn't support _Float16 yet, so we can't use it here.
+
+float FUNC(norm_l2_f16)(const FP16 *data, uint32_t dimension) {
+  float sum = 0;
 
 #pragma clang loop unroll(enable) vectorize(enable) interleave(enable)
   for (uint32_t i = 0; i < dimension; i++) {
-    sum += data[i] * data[i];
+    sum += (float) data[i] * (float) data[i];
   }
-  return (float) sum;
+  return sqrtf(sum);
 }
 
 /// @brief Dot product of two f16 vectors.
@@ -35,23 +49,39 @@ float norm_l2_f16(const _Float16 *data, uint32_t dimension) {
 /// @param y A f16 vector
 /// @param dimension The dimension of the vectors
 /// @return The dot product of the two vectors.
-float dot_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
-  _Float16 sum = 0;
+float FUNC(dot_f16)(const FP16 *x, const FP16 *y, uint32_t dimension) {
+  float sum = 0;
 
 #pragma clang loop unroll(enable) interleave(enable) vectorize(enable)
   for (uint32_t i = 0; i < dimension; i++) {
-    sum += x[i] * y[i];
+    sum += (float) x[i] * (float) y[i];
   }
-  return (float) sum;
+  return sum;
 }
 
-float l2_f16(const _Float16 *x, const _Float16 *y, uint32_t dimension) {
-  _Float16 sum = 0.0;
+float FUNC(l2_f16)(const FP16 *x, const FP16 *y, uint32_t dimension) {
+  float sum = 0.0;
 
-#pragma clang loop unroll(enable) interleave(enable) vectorize_width(32)
+#pragma clang loop unroll(enable) interleave(enable) vectorize(enable)
   for (uint32_t i = 0; i < dimension; i++) {
-    _Float16 s = x[i] - y[i];
+    float s = x[i] - y[i];
     sum += s * s;
   }
-  return (float) sum;
+  return sum;
+}
+
+float FUNC(cosine_f16)(const FP16 *x, float x_norm, const FP16 *y, uint32_t dimension) {
+  float dot = 0.0;
+  float l2_y = 0.0;
+
+  // Instead of using functions above, we combine the loop to reduce overhead
+  // of the fp16 to fp32 conversion.
+#pragma clang loop unroll(enable) interleave(enable) vectorize(enable)
+  for (uint32_t i = 0; i < dimension; i++) {
+    float y_i = (float) y[i];
+    dot += (float) x[i] * y_i;
+    l2_y += y_i * y_i;
+  }
+
+  return 1.0 - dot / (x_norm * sqrtf(l2_y));
 }

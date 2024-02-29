@@ -35,6 +35,10 @@ jobs:
         toolchain:
           - stable
           - nightly
+    env:
+      # Need up-to-date compilers for kernels
+      CC: gcc-12
+      CXX: g++-12
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -84,7 +88,7 @@ jobs:
         run: cargo fmt --check
       - name: Run tests
         run: |
-          cargo test -- --test-threads 1
+          cargo test --all-features -- --test-threads 1
   clippy:
     runs-on: ubuntu-22.04
     timeout-minutes: 30

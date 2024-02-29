@@ -17,6 +17,7 @@ futures = { workspace = true }
 half = { workspace = true }
 lance-arrow = { workspace = true }
 lance-core = { workspace = true }
+lazy_static = { workspace = true }
 log = { workspace = true }
 num_cpus = { workspace = true }
 num-traits = { workspace = true }
@@ -34,7 +35,10 @@ lance-testing = { path = "../lance-testing" }
 cc = "1.0.83"
 
 [features]
-avx512fp16 = []
+# Enable compiling multiple C kernels for fp16 SIMD computations.
+# This requires GCC 12 / Clang 6 or later. (To get AVX-512 support,
+# you need Clang 11 or later.)
+fp16kernels = []
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof = { workspace = true }
