@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
+mod fixture_test;
 pub mod ivf;
 pub mod pq;
 mod traits;
