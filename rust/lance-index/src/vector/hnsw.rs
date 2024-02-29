@@ -299,7 +299,7 @@ impl HNSW {
             ep = greedy_search(level, ep, query)?.1;
         }
 
-        let candidates = beam_search(&self.levels[0], &vec![ep], query, ef)?;
+        let candidates = beam_search(&self.levels[0], &[ep], query, ef)?;
         Ok(select_neighbors(&candidates, k)
             .map(|(d, u)| (u, d.into()))
             .collect())
