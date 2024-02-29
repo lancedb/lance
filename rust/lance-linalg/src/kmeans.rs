@@ -36,6 +36,7 @@ use rand::prelude::*;
 use tracing::instrument;
 
 use crate::distance::dot_distance_batch;
+use crate::distance::norm_l2::Normalize;
 use crate::kernels::{argmax, argmin_value_float};
 use crate::{
     distance::{
@@ -126,7 +127,7 @@ where
 /// Randomly initialize kmeans centroids.
 ///
 ///
-async fn kmeans_random_init<T: ArrowFloatType + Dot + L2>(
+async fn kmeans_random_init<T: ArrowFloatType + Dot + L2 + Normalize>(
     data: &T::ArrayType,
     dimension: usize,
     k: usize,
@@ -183,7 +184,7 @@ fn split_clusters<T: Float + DivAssign>(cnts: &mut [u64], centroids: &mut [T], d
 
 impl KMeanMembership {
     /// Reconstruct a KMeans model from the membership.
-    async fn to_kmeans<T: ArrowFloatType + Dot + L2>(
+    async fn to_kmeans<T: ArrowFloatType + Dot + L2 + Normalize>(
         &self,
         data: &[T::Native],
     ) -> Result<KMeans<T>> {
@@ -292,7 +293,7 @@ impl KMeanMembership {
 
 impl<T: ArrowFloatType> KMeans<T>
 where
-    T: L2 + Dot,
+    T: L2 + Dot + Normalize,
     T::Native: AsPrimitive<f32>,
 {
     fn empty(k: usize, dimension: usize, metric_type: MetricType) -> Self {
@@ -655,7 +656,7 @@ pub async fn compute_partitions<T: ArrowFloatType>(
     metric_type: MetricType,
 ) -> Vec<Option<u32>>
 where
-    <T::Native as FloatToArrayType>::ArrowType: Dot + L2,
+    <T::Native as FloatToArrayType>::ArrowType: Dot + L2 + Normalize,
 {
     let kmeans: KMeans<T> = KMeans::with_centroids(centroids, dimension, metric_type);
     let membership = kmeans.compute_membership(vectors).await;

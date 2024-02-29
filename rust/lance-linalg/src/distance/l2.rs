@@ -67,10 +67,13 @@ where
 ///
 /// This is pub for test/benchmark only. use [l2] instead.
 #[inline]
-pub fn l2_scalar<T: Float + Sum + AddAssign + AsPrimitive<f32>, const LANES: usize>(
+pub fn l2_scalar<T, Output: Float + Sum + AddAssign + 'static, const LANES: usize>(
     from: &[T],
     to: &[T],
-) -> f32 {
+) -> Output
+where
+    T: AsPrimitive<Output>,
+{
     let x_chunks = from.chunks_exact(LANES);
     let y_chunks = to.chunks_exact(LANES);
 
@@ -80,30 +83,30 @@ pub fn l2_scalar<T: Float + Sum + AddAssign + AsPrimitive<f32>, const LANES: usi
             .iter()
             .zip(y_chunks.remainder())
             .map(|(&x, &y)| {
-                let diff = x - y;
+                let diff = x.as_() - y.as_();
                 diff * diff
             })
-            .sum()
+            .sum::<Output>()
     } else {
-        T::zero()
+        Output::zero()
     };
 
-    let mut sums = [T::zero(); LANES];
+    let mut sums = [Output::zero(); LANES];
     for (x, y) in x_chunks.zip(y_chunks) {
         for i in 0..LANES {
-            let diff = x[i] - y[i];
+            let diff = x[i].as_() - y[i].as_();
             sums[i] += diff * diff;
         }
     }
 
-    (s + sums.iter().copied().sum()).as_()
+    s + sums.iter().copied().sum()
 }
 
 impl L2 for BFloat16Type {
     #[inline]
     fn l2(x: &[bf16], y: &[bf16]) -> f32 {
         // TODO: add SIMD support
-        l2_scalar::<bf16, 16>(x, y)
+        l2_scalar::<bf16, f32, 16>(x, y)
     }
 }
 
@@ -143,7 +146,7 @@ impl L2 for Float16Type {
             SimdSupport::Avx2 => unsafe {
                 kernel::l2_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
-            _ => l2_scalar::<f16, 16>(x, y),
+            _ => l2_scalar::<f16, f32, 16>(x, y),
         }
     }
 }
@@ -151,7 +154,7 @@ impl L2 for Float16Type {
 impl L2 for Float32Type {
     #[inline]
     fn l2(x: &[f32], y: &[f32]) -> f32 {
-        l2_scalar::<f32, 32>(x, y)
+        l2_scalar::<f32, f32, 32>(x, y)
     }
 
     fn l2_batch<'a>(
@@ -179,7 +182,8 @@ impl L2 for Float64Type {
     #[inline]
     fn l2(x: &[f64], y: &[f64]) -> f32 {
         // TODO: add SIMD support
-        l2_scalar::<f64, 8>(x, y)
+        // TODO: should we let this return f64 to avoid overflow?
+        l2_scalar::<f64, f64, 8>(x, y) as f32
     }
 }
 
@@ -288,6 +292,10 @@ mod tests {
     use approx::assert_relative_eq;
     use arrow_array::Float32Array;
 
+    use crate::test_utils::{
+        arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
+    };
+
     #[test]
     fn test_euclidean_distance() {
         let mat = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
@@ -383,5 +391,54 @@ mod tests {
 
         let d = l2_distance_batch(q.values(), values.values(), 32).collect::<Vec<_>>();
         assert_relative_eq!(0.319_357_84, d[0]);
+    }
+
+    /// Reference implementation of L2 distance.
+    ///
+    /// Note that we skip the final square root step for performance reasons.
+    fn l2_distance_reference(x: &[f64], y: &[f64]) -> f64 {
+        x.iter()
+            .zip(y.iter())
+            .map(|(x, y)| (*x - *y).powi(2))
+            .sum::<f64>()
+    }
+
+    fn do_l2_test<T: FloatToArrayType>(x: &[T], y: &[T])
+    where
+        T::ArrowType: L2,
+    {
+        let x_f64 = x.iter().map(|v| v.to_f64().unwrap()).collect::<Vec<f64>>();
+        let y_f64 = y.iter().map(|v| v.to_f64().unwrap()).collect::<Vec<f64>>();
+
+        let result = l2(x, y);
+        let reference = l2_distance_reference(&x_f64, &y_f64);
+
+        assert_relative_eq!(result as f64, reference, max_relative = 1e-6);
+    }
+
+    // Test L2 distance over different types.
+    // * L2 is valid over the entire range of f16.
+    // * L2 is valid over f32 and bf16 in the range of +-1e12.
+    // * L2 for f64 should match the reference implementation.
+    proptest::proptest! {
+        #[test]
+        fn test_l2_distance_f16((x, y) in arbitrary_vector_pair(arbitrary_f16, 4..4048)) {
+            do_l2_test(&x, &y);
+        }
+
+        #[test]
+        fn test_l2_distance_bf16((x, y) in arbitrary_vector_pair(arbitrary_bf16, 4..4048)){
+            do_l2_test(&x, &y);
+        }
+
+        #[test]
+        fn test_l2_distance_f32((x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)){
+            do_l2_test(&x, &y);
+        }
+
+        #[test]
+        fn test_l2_distance_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
+            do_l2_test(&x, &y);
+        }
     }
 }

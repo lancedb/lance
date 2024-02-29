@@ -43,30 +43,33 @@ use crate::Result;
 // Please make sure run `cargo bench --bench dot` with and without AVX-512 before any change.
 // Tested `target-features`: avx512f,avx512vl,f16c
 #[inline]
-fn dot_scalar<T: Real + Sum + AddAssign + AsPrimitive<f32>, const LANES: usize>(
+fn dot_scalar<T, Output: Real + Sum + AddAssign + 'static, const LANES: usize>(
     from: &[T],
     to: &[T],
-) -> f32 {
+) -> Output
+where
+    T: AsPrimitive<Output>,
+{
     let x_chunks = to.chunks_exact(LANES);
     let y_chunks = from.chunks_exact(LANES);
     let sum = if x_chunks.remainder().is_empty() {
-        T::zero()
+        Output::zero()
     } else {
         x_chunks
             .remainder()
             .iter()
             .zip(y_chunks.remainder().iter())
-            .map(|(&x, &y)| x * y)
-            .sum::<T>()
+            .map(|(&x, &y)| x.as_() * y.as_())
+            .sum::<Output>()
     };
     // Use known size to allow LLVM to kick in auto-vectorization.
-    let mut sums = [T::zero(); LANES];
+    let mut sums = [Output::zero(); LANES];
     for (x, y) in x_chunks.zip(y_chunks) {
         for i in 0..LANES {
-            sums[i] += x[i] * y[i];
+            sums[i] += x[i].as_() * y[i].as_();
         }
     }
-    (sum + sums.iter().copied().sum::<T>()).as_()
+    sum + sums.iter().copied().sum::<Output>()
 }
 
 /// Dot product.
@@ -96,7 +99,7 @@ pub trait Dot: ArrowFloatType {
 impl Dot for BFloat16Type {
     #[inline]
     fn dot(x: &[bf16], y: &[bf16]) -> f32 {
-        dot_scalar::<bf16, 32>(x, y)
+        dot_scalar::<bf16, f32, 32>(x, y)
     }
 }
 
@@ -136,7 +139,7 @@ impl Dot for Float16Type {
             SimdSupport::Avx2 => unsafe {
                 kernel::dot_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
-            _ => dot_scalar::<f16, 16>(x, y),
+            _ => dot_scalar::<f16, f32, 16>(x, y),
         }
     }
 }
@@ -200,7 +203,7 @@ impl Dot for Float32Type {
 impl Dot for Float64Type {
     #[inline]
     fn dot(x: &[f64], y: &[f64]) -> f32 {
-        dot_scalar::<f64, 8>(x, y)
+        dot_scalar::<f64, f64, 8>(x, y) as f32
     }
 }
 
@@ -281,6 +284,10 @@ pub fn dot_distance_arrow_batch(
 mod tests {
 
     use super::*;
+    use crate::test_utils::{
+        arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
+    };
+    use approx::assert_relative_eq;
     use num_traits::FromPrimitive;
 
     #[test]
@@ -302,5 +309,59 @@ mod tests {
         let x: Vec<f64> = (20..40).map(|v| f64::from_i32(v).unwrap()).collect();
         let y: Vec<f64> = (120..140).map(|v| f64::from_i32(v).unwrap()).collect();
         assert_eq!(Float64Type::dot(&x, &y), dot(&x, &y));
+    }
+
+    /// Reference implementation of dot product.
+    fn dot_scalar_ref(x: &[f64], y: &[f64]) -> f32 {
+        x.iter().zip(y.iter()).map(|(&x, &y)| x * y).sum::<f64>() as f32
+    }
+
+    // Accuracy of dot product depends on the size of the components
+    // of the vector.
+    fn max_error(x: &[f64], y: &[f64]) -> f32 {
+        let dot = x
+            .iter()
+            .cloned()
+            .zip(y.iter().cloned())
+            .map(|(x, y)| x.abs() * y.abs())
+            .sum::<f64>();
+        (1e-6_f64 * dot) as f32
+    }
+
+    fn do_dot_test<T: FloatToArrayType>(x: &[T], y: &[T])
+    where
+        T::ArrowType: Dot,
+    {
+        let f64_x = x.iter().map(|&v| v.as_()).collect::<Vec<f64>>();
+        let f64_y = y.iter().map(|&v| v.as_()).collect::<Vec<f64>>();
+
+        let expected = dot_scalar_ref(&f64_x, &f64_y);
+        let result = dot(x, y);
+
+        let max_error = max_error(&f64_x, &f64_y);
+
+        assert_relative_eq!(expected, result, epsilon = max_error);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_dot_f16((x, y) in arbitrary_vector_pair(arbitrary_f16, 4..4048)) {
+            do_dot_test(&x, &y);
+        }
+
+        #[test]
+        fn test_dot_bf16((x, y) in arbitrary_vector_pair(arbitrary_bf16, 4..4048)){
+            do_dot_test(&x, &y);
+        }
+
+        #[test]
+        fn test_dot_f32((x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)){
+            do_dot_test(&x, &y);
+        }
+
+        #[test]
+        fn test_dot_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
+            do_dot_test(&x, &y);
+        }
     }
 }

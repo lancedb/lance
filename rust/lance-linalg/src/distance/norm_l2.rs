@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::iter::Sum;
+use std::{iter::Sum, ops::AddAssign};
 
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use half::{bf16, f16};
+use lance_arrow::{bfloat16::BFloat16Type, ArrowFloatType, FloatToArrayType};
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 #[allow(unused_imports)]
@@ -27,9 +29,9 @@ use crate::simd::{
 };
 
 /// L2 normalization
-pub trait Normalize<T: Float> {
+pub trait Normalize: ArrowFloatType {
     /// L2 Normalization over a Vector.
-    fn norm_l2(&self) -> f32;
+    fn norm_l2(vector: &[Self::Native]) -> f32;
 }
 
 #[cfg(feature = "fp16kernels")]
@@ -48,13 +50,13 @@ mod kernel {
     }
 }
 
-impl Normalize<f16> for &[f16] {
+impl Normalize for Float16Type {
     #[inline]
-    fn norm_l2(&self) -> f32 {
+    fn norm_l2(vector: &[Self::Native]) -> f32 {
         match *FP16_SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
-                kernel::norm_l2_f16_neon(self.as_ptr(), self.len() as u32)
+                kernel::norm_l2_f16_neon(vector.as_ptr(), vector.len() as u32)
             },
             #[cfg(all(
                 feature = "fp16kernels",
@@ -62,102 +64,81 @@ impl Normalize<f16> for &[f16] {
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512 => unsafe {
-                kernel::norm_l2_f16_avx512(self.as_ptr(), self.len() as u32)
+                kernel::norm_l2_f16_avx512(vector.as_ptr(), vector.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
             SimdSupport::Avx2 => unsafe {
-                kernel::norm_l2_f16_avx2(self.as_ptr(), self.len() as u32)
+                kernel::norm_l2_f16_avx2(vector.as_ptr(), vector.len() as u32)
             },
-            _ => norm_l2_f16_impl(self),
+            _ => norm_l2_impl::<f16, f32, 32>(vector),
         }
     }
 }
 
-#[inline]
-fn norm_l2_f16_impl(arr: &[f16]) -> f32 {
-    // Please run `cargo bench --bench norm_l2" on Apple Silicon when
-    // change the following code.
-    const LANES: usize = 16;
-    let chunks = arr.chunks_exact(LANES);
-    let sum = if chunks.remainder().is_empty() {
-        0.0
-    } else {
-        chunks
-            .remainder()
-            .iter()
-            .map(|v| v.to_f32().powi(2))
-            .sum::<f32>()
-    };
-
-    let mut sums: [f32; LANES] = [0_f32; LANES];
-    for chk in chunks {
-        // Convert to f32
-        let mut f32_vals: [f32; LANES] = [0_f32; LANES];
-        for i in 0..LANES {
-            f32_vals[i] = chk[i].to_f32();
-        }
-        // Vectorized multiply
-        for i in 0..LANES {
-            sums[i] += f32_vals[i].powi(2);
-        }
-    }
-    (sums.iter().copied().sum::<f32>() + sum).sqrt()
-}
-
-impl Normalize<bf16> for &[bf16] {
+impl Normalize for BFloat16Type {
     #[inline]
-    fn norm_l2(&self) -> f32 {
-        norm_l2_impl::<bf16, 32>(self)
+    fn norm_l2(vector: &[Self::Native]) -> f32 {
+        norm_l2_impl::<bf16, f32, 32>(vector)
     }
 }
 
-impl Normalize<f32> for &[f32] {
+impl Normalize for Float32Type {
     #[inline]
-    fn norm_l2(&self) -> f32 {
-        let dim = self.len();
+    fn norm_l2(vector: &[Self::Native]) -> f32 {
+        let dim = vector.len();
         if dim % 16 == 0 {
             let mut sum = f32x16::zeros();
             for i in (0..dim).step_by(16) {
-                let x = unsafe { f32x16::load_unaligned(self.as_ptr().add(i)) };
+                let x = unsafe { f32x16::load_unaligned(vector.as_ptr().add(i)) };
                 sum += x * x;
             }
             sum.reduce_sum().sqrt()
         } else if dim % 8 == 0 {
             let mut sum = f32x8::zeros();
             for i in (0..dim).step_by(8) {
-                let x = unsafe { f32x8::load_unaligned(self.as_ptr().add(i)) };
+                let x = unsafe { f32x8::load_unaligned(vector.as_ptr().add(i)) };
                 sum += x * x;
             }
             sum.reduce_sum().sqrt()
         } else {
             // Fallback to scalar
-            norm_l2(self)
+            norm_l2_impl::<f32, f32, 16>(vector)
         }
     }
 }
 
-impl Normalize<f64> for &[f64] {
+impl Normalize for Float64Type {
     #[inline]
-    fn norm_l2(&self) -> f32 {
-        norm_l2(self)
+    fn norm_l2(vector: &[Self::Native]) -> f32 {
+        norm_l2_impl::<f64, f64, 8>(vector) as f32
     }
 }
 
+/// NOTE: this is only pub for benchmarking purposes
 #[inline]
-fn norm_l2_impl<T: Float + Sum + AsPrimitive<f32>, const LANES: usize>(vector: &[T]) -> f32 {
+pub fn norm_l2_impl<T, Output: Float + Sum + 'static + AddAssign, const LANES: usize>(
+    vector: &[T],
+) -> Output
+where
+    T: AsPrimitive<Output>,
+{
     let chunks = vector.chunks_exact(LANES);
     let sum = if chunks.remainder().is_empty() {
-        T::zero()
+        Output::zero()
     } else {
-        chunks.remainder().iter().map(|&v| v.powi(2)).sum::<T>()
+        chunks
+            .remainder()
+            .iter()
+            .map(|&v| v.as_().powi(2))
+            .sum::<Output>()
     };
-    let mut sums = [T::zero(); LANES];
+    let mut sums = [Output::zero(); LANES];
     for chunk in chunks {
         for i in 0..LANES {
-            sums[i] = sums[i].add(chunk[i].powi(2));
+            sums[i] += chunk[i].as_().powi(2);
         }
     }
-    (sum + sums.iter().copied().sum::<T>()).sqrt().as_()
+    (sum + sums.iter().copied().sum::<Output>()).sqrt()
 }
 
 /// Normalize a vector.
@@ -165,54 +146,59 @@ fn norm_l2_impl<T: Float + Sum + AsPrimitive<f32>, const LANES: usize>(vector: &
 /// The parameters must be cache line aligned. For example, from
 /// Arrow Arrays, i.e., Float32Array
 #[inline]
-pub fn norm_l2<T: Float + Sum + AsPrimitive<f32>>(vector: &[T]) -> f32 {
-    const LANES: usize = 16;
-    norm_l2_impl::<T, LANES>(vector)
+pub fn norm_l2<T: FloatToArrayType>(vector: &[T]) -> f32
+where
+    T::ArrowType: Normalize,
+{
+    T::ArrowType::norm_l2(vector)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Debug;
-
-    use approx::assert_relative_eq;
-    use num_traits::FromPrimitive;
-
     use super::*;
+    use crate::test_utils::{arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64};
+    use approx::assert_relative_eq;
+    use proptest::prelude::*;
 
-    fn do_norm_l2_test<T: Float + FromPrimitive + Sum + Debug>()
-    where
-        for<'a> &'a [T]: Normalize<T>,
-    {
-        let data = (1..=37)
-            .map(|v| T::from_i32(v).unwrap())
-            .collect::<Vec<T>>();
-
-        let result = data.as_slice().norm_l2();
-        assert_relative_eq!(
-            result as f64,
-            (1..=37)
-                .map(|v| f64::from_i32(v * v).unwrap())
-                .sum::<f64>()
-                .sqrt(),
-            max_relative = 1.0,
-        );
-
-        let not_aligned = (&data[2..]).norm_l2();
-        assert_relative_eq!(
-            not_aligned as f64,
-            (3..=37)
-                .map(|v| f64::from_i32(v * v).unwrap())
-                .sum::<f64>()
-                .sqrt(),
-            max_relative = 1.0,
-        );
+    /// Reference implementation of L2 norm.
+    fn norm_l2_reference(data: &[f64]) -> f32 {
+        data.iter().map(|v| (*v * *v)).sum::<f64>().sqrt() as f32
     }
 
-    #[test]
-    fn test_norm_l2() {
-        do_norm_l2_test::<bf16>();
-        do_norm_l2_test::<f16>();
-        do_norm_l2_test::<f32>();
-        do_norm_l2_test::<f64>();
+    fn do_norm_l2_test<T: FloatToArrayType>(data: &[T])
+    where
+        T::ArrowType: Normalize,
+    {
+        let f64_data = data
+            .iter()
+            .map(|v| v.to_f64().unwrap())
+            .collect::<Vec<f64>>();
+
+        let result = norm_l2(data);
+        let reference = norm_l2_reference(&f64_data);
+
+        assert_relative_eq!(result, reference, max_relative = 1e-6);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_l2_norm_f16(data in prop::collection::vec(arbitrary_f16(), 4..4048)) {
+            do_norm_l2_test(&data);
+        }
+
+        #[test]
+        fn test_l2_norm_bf16(data in prop::collection::vec(arbitrary_bf16(), 4..4048)){
+            do_norm_l2_test(&data);
+        }
+
+        #[test]
+        fn test_l2_norm_f32(data in prop::collection::vec(arbitrary_f32(), 4..4048)){
+            do_norm_l2_test(&data);
+        }
+
+        #[test]
+        fn test_l2_norm_f64(data in prop::collection::vec(arbitrary_f64(), 4..4048)){
+            do_norm_l2_test(&data);
+        }
     }
 }
