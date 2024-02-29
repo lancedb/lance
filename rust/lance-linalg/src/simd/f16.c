@@ -41,7 +41,7 @@ float FUNC(norm_l2_f16)(const FP16 *data, uint32_t dimension) {
   for (uint32_t i = 0; i < dimension; i++) {
     sum += (float) data[i] * (float) data[i];
   }
-  return sum;
+  return sqrtf(sum);
 }
 
 /// @brief Dot product of two f16 vectors.
@@ -83,5 +83,5 @@ float FUNC(cosine_f16)(const FP16 *x, float x_norm, const FP16 *y, uint32_t dime
     l2_y += y_i * y_i;
   }
 
-  return dot / (x_norm * sqrtf(l2_y));
+  return 1.0 - dot / (x_norm * sqrtf(l2_y));
 }
