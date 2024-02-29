@@ -219,6 +219,16 @@ pub(super) fn beam_search(
 ///
 /// Parameters
 /// ----------
+/// graph : Graph
+///    The graph to search.
+/// start : u32
+///   The index starting point.
+/// query : &[f32]
+///   The query vector.
+///
+/// Returns
+/// -------
+/// A ``(dist, node_id)`` pair.
 ///
 pub(super) fn greedy_search(
     graph: &dyn Graph,
