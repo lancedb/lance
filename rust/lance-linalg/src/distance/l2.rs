@@ -67,13 +67,14 @@ where
 ///
 /// This is pub for test/benchmark only. use [l2] instead.
 #[inline]
-pub fn l2_scalar<T, Output: Float + Sum + AddAssign + 'static, const LANES: usize>(
+pub fn l2_scalar<
+    T: AsPrimitive<Output>,
+    Output: Float + Sum + AddAssign + 'static,
+    const LANES: usize,
+>(
     from: &[T],
     to: &[T],
-) -> Output
-where
-    T: AsPrimitive<Output>,
-{
+) -> Output {
     let x_chunks = from.chunks_exact(LANES);
     let y_chunks = to.chunks_exact(LANES);
 
@@ -411,9 +412,9 @@ mod tests {
         let y_f64 = y.iter().map(|v| v.to_f64().unwrap()).collect::<Vec<f64>>();
 
         let result = l2(x, y);
-        let reference = l2_distance_reference(&x_f64, &y_f64);
+        let reference = l2_distance_reference(&x_f64, &y_f64) as f32;
 
-        assert_relative_eq!(result as f64, reference, max_relative = 1e-6);
+        assert_relative_eq!(result, reference, max_relative = 1e-6);
     }
 
     // Test L2 distance over different types.

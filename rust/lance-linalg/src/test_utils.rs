@@ -62,11 +62,6 @@ pub fn arbitrary_f64() -> impl Strategy<Value = f64> {
     (NORMAL | SUBNORMAL | POSITIVE | NEGATIVE).prop_map(move |val: f64| val * scaling)
 }
 
-/// Arbitrary finite f16 vector.
-// pub fn artibrary_vector<T>(values: impl Strategy<Value = T>, dim_range: std::ops::Range<usize>) -> impl Strategy<Value = Vec<T>> {
-//     prop::collection::vec(values, dim_range)
-// }
-
 /// Two arbitrary vectors with matching dimensions
 pub fn arbitrary_vector_pair<T: std::fmt::Debug, S>(
     values: impl Fn() -> S + 'static,

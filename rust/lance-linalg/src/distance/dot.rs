@@ -43,13 +43,14 @@ use crate::Result;
 // Please make sure run `cargo bench --bench dot` with and without AVX-512 before any change.
 // Tested `target-features`: avx512f,avx512vl,f16c
 #[inline]
-fn dot_scalar<T, Output: Real + Sum + AddAssign + 'static, const LANES: usize>(
+fn dot_scalar<
+    T: AsPrimitive<Output>,
+    Output: Real + Sum + AddAssign + 'static,
+    const LANES: usize,
+>(
     from: &[T],
     to: &[T],
-) -> Output
-where
-    T: AsPrimitive<Output>,
-{
+) -> Output {
     let x_chunks = to.chunks_exact(LANES);
     let y_chunks = from.chunks_exact(LANES);
     let sum = if x_chunks.remainder().is_empty() {

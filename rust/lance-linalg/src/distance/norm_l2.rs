@@ -116,12 +116,13 @@ impl Normalize for Float64Type {
 
 /// NOTE: this is only pub for benchmarking purposes
 #[inline]
-pub fn norm_l2_impl<T, Output: Float + Sum + 'static + AddAssign, const LANES: usize>(
-    vector: &[T],
-) -> Output
-where
+pub fn norm_l2_impl<
     T: AsPrimitive<Output>,
-{
+    Output: Float + Sum + 'static + AddAssign,
+    const LANES: usize,
+>(
+    vector: &[T],
+) -> Output {
     let chunks = vector.chunks_exact(LANES);
     let sum = if chunks.remainder().is_empty() {
         Output::zero()
