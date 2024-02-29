@@ -220,7 +220,6 @@ pub(super) fn beam_search(
 /// Parameters
 /// ----------
 ///
-
 pub(super) fn greedy_search(
     graph: &dyn Graph,
     start: u32,
@@ -230,14 +229,17 @@ pub(super) fn greedy_search(
     let dist_calc = graph.storage().dist_calculator(query);
     let mut closest_dist = dist_calc.distance(&[start])[0];
     loop {
-        let neighbors = graph.neighbors(current).ok_or_else(|| Error::Index {
-            message: format!("Node {} does not exist in the graph", current),
-            location: location!(),
-        })?;
+        let neighbors: Vec<_> = graph
+            .neighbors(current)
+            .ok_or_else(|| Error::Index {
+                message: format!("Node {} does not exist in the graph", current),
+                location: location!(),
+            })?
+            .collect();
+        let distances = dist_calc.distance(&neighbors);
 
         let mut next = None;
-        for neighbor in neighbors {
-            let dist = dist_calc.distance(&[neighbor])[0];
+        for (neighbor, dist) in neighbors.into_iter().zip(distances) {
             if dist < closest_dist {
                 closest_dist = dist;
                 next = Some(neighbor);
