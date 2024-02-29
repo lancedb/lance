@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,33 +15,37 @@
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{
     cast::{as_primitive_array, AsArray},
-    FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
+    Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
-// Re-export
-use lance_core::utils::address::RowAddress;
-use lance_core::ROW_ID_FIELD;
-pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizerImpl};
+use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
 use lance_index::{
     vector::{pq::ProductQuantizer, Query, DIST_COL},
     Index, IndexType,
 };
-use lance_io::traits::Reader;
-use lance_io::utils::read_fixed_stride_array;
+use lance_io::{traits::Reader, utils::read_fixed_stride_array};
 use lance_linalg::distance::MetricType;
+use log::info;
 use roaring::RoaringBitmap;
 use serde_json::json;
 use snafu::{location, Location};
-use tracing::instrument;
+use tracing::{instrument, span, Level};
 
+// Re-export
+pub use lance_index::vector::pq::{PQBuildParams, ProductQuantizerImpl};
+use lance_linalg::kernels::normalize_fsl;
+
+use super::ivf::Ivf;
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
-use crate::{arrow::*, utils::tokio::spawn_cpu};
+use crate::index::vector::utils::maybe_sample_training_data;
+use crate::{arrow::*, utils::tokio::spawn_cpu, Dataset};
 use crate::{Error, Result};
 
 /// Product Quantization Index.
@@ -263,5 +267,233 @@ impl VectorIndex for PQIndex {
     }
 }
 
+pub(super) async fn build_pq_model(
+    dataset: &Dataset,
+    column: &str,
+    dim: usize,
+    metric_type: MetricType,
+    params: &PQBuildParams,
+    ivf: Option<&Ivf>,
+) -> Result<Arc<dyn ProductQuantizer>> {
+    if let Some(codebook) = &params.codebook {
+        return match codebook.data_type() {
+            DataType::Float16 => Ok(Arc::new(ProductQuantizerImpl::<Float16Type>::new(
+                params.num_sub_vectors,
+                params.num_bits as u32,
+                dim,
+                Arc::new(codebook.as_primitive().clone()),
+                metric_type,
+            ))),
+            DataType::Float32 => Ok(Arc::new(ProductQuantizerImpl::<Float32Type>::new(
+                params.num_sub_vectors,
+                params.num_bits as u32,
+                dim,
+                Arc::new(codebook.as_primitive().clone()),
+                metric_type,
+            ))),
+            DataType::Float64 => Ok(Arc::new(ProductQuantizerImpl::<Float64Type>::new(
+                params.num_sub_vectors,
+                params.num_bits as u32,
+                dim,
+                Arc::new(codebook.as_primitive().clone()),
+                metric_type,
+            ))),
+            _ => {
+                return Err(Error::Index {
+                    message: format!("Wrong codebook data type: {:?}", codebook.data_type()),
+                    location: location!(),
+                });
+            }
+        };
+    }
+    info!(
+        "Start to train PQ code: PQ{}, bits={}",
+        params.num_sub_vectors, params.num_bits
+    );
+    let expected_sample_size =
+        lance_index::vector::pq::num_centroids(params.num_bits as u32) * params.sample_rate;
+    info!(
+        "Loading training data for PQ. Sample size: {}",
+        expected_sample_size
+    );
+    let start = std::time::Instant::now();
+    let mut training_data =
+        maybe_sample_training_data(dataset, column, expected_sample_size).await?;
+    info!(
+        "Finished loading training data in {:02} seconds",
+        start.elapsed().as_secs_f32()
+    );
+
+    info!(
+        "starting to compute partitions for PQ training, sample size: {}",
+        training_data.value_length()
+    );
+
+    if metric_type == MetricType::Cosine {
+        training_data = normalize_fsl(&training_data)?;
+    }
+
+    let training_data = if let Some(ivf) = ivf {
+        // Compute residual for PQ training.
+        //
+        // TODO: consolidate IVF models to `lance_index`.
+        let ivf2 = lance_index::vector::ivf::new_ivf(
+            ivf.centroids.values(),
+            ivf.dimension(),
+            MetricType::L2,
+            vec![],
+            None,
+        )?;
+        println!("Compute residual for PQ training");
+        span!(Level::INFO, "compute residual for PQ training")
+            .in_scope(|| ivf2.compute_residual(&training_data, None))
+            .await?;
+        if metric_type == MetricType::Cosine {
+            normalize_fsl(&training_data)?
+        } else {
+            training_data
+        }
+    } else {
+        training_data
+    };
+    info!("Start train PQ: params={:#?}", params);
+    let pq = params.build(&training_data, MetricType::L2).await?;
+    info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
+    Ok(pq)
+}
+
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::index::vector::ivf::build_ivf_model;
+    use arrow_array::RecordBatchIterator;
+    use arrow_schema::{Field, Schema};
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_testing::datagen::generate_random_array_with_range;
+    use std::ops::Range;
+    use tempfile::tempdir;
+
+    const DIM: usize = 128;
+    async fn generate_dataset(
+        test_uri: &str,
+        range: Range<f32>,
+    ) -> (Dataset, Arc<FixedSizeListArray>) {
+        let vectors = generate_random_array_with_range(1000 * DIM, range);
+        let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
+            .into_iter()
+            .collect();
+
+        let schema = Arc::new(
+            Schema::new(vec![Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                true,
+            )])
+            .with_metadata(metadata),
+        );
+        let fsl = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
+        let batch = RecordBatch::try_new(schema.clone(), vec![fsl.clone()]).unwrap();
+
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        (Dataset::write(batches, test_uri, None).await.unwrap(), fsl)
+    }
+
+    #[tokio::test]
+    async fn test_build_pq_model_l2() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let (dataset, _) = generate_dataset(test_uri, 100.0..120.0).await;
+
+        let centroids = generate_random_array_with_range(4 * DIM, -1.0..1.0);
+        let fsl = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
+        let ivf = Ivf::new(fsl.into());
+        let params = PQBuildParams::new(16, 8);
+        let pq = build_pq_model(&dataset, "vector", DIM, MetricType::L2, &params, Some(&ivf))
+            .await
+            .unwrap();
+
+        assert_eq!(pq.num_sub_vectors(), 16);
+        assert_eq!(pq.num_bits(), 8);
+        assert_eq!(pq.dimension(), DIM);
+
+        let codebook = pq.codebook_as_fsl();
+        assert_eq!(codebook.len(), 256);
+        codebook
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .for_each(|v| {
+                assert!((99.0..121.0).contains(v));
+            });
+    }
+
+    #[tokio::test]
+    async fn test_build_pq_model_cosine() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let (dataset, vectors) = generate_dataset(test_uri, 100.0..120.0).await;
+
+        let ivf_params = IvfBuildParams::new(4);
+        let ivf = build_ivf_model(&dataset, "vector", DIM, MetricType::Cosine, &ivf_params)
+            .await
+            .unwrap();
+        let params = PQBuildParams::new(16, 8);
+        let pq = build_pq_model(
+            &dataset,
+            "vector",
+            DIM,
+            MetricType::Cosine,
+            &params,
+            Some(&ivf),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(pq.num_sub_vectors(), 16);
+        assert_eq!(pq.num_bits(), 8);
+        assert_eq!(pq.dimension(), DIM);
+
+        let codebook = pq.codebook_as_fsl();
+        assert_eq!(codebook.len(), 256);
+        codebook
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .for_each(|v| {
+                assert!((-1.0..1.0).contains(v));
+            });
+
+        let vectors = normalize_fsl(&vectors).unwrap();
+        let row = vectors.slice(0, 1);
+
+        let ivf2 = lance_index::vector::ivf::new_ivf(
+            ivf.centroids.values(),
+            ivf.dimension(),
+            MetricType::L2,
+            vec![],
+            None,
+        )
+        .unwrap();
+
+        let residual_query = ivf2.compute_residual(&row, None).await.unwrap();
+        let pq_code = pq.transform(&residual_query).await.unwrap();
+        let distances = pq
+            .compute_distances(
+                &residual_query.value(0),
+                pq_code.as_fixed_size_list().values().as_primitive(),
+            )
+            .unwrap();
+        assert!(
+            distances.values().iter().all(|&d| d <= 0.001),
+            "distances: {:?}",
+            distances
+        );
+    }
+}

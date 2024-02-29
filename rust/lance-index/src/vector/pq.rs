@@ -27,7 +27,7 @@ use lance_core::{Error, Result};
 use lance_linalg::distance::{
     cosine_distance_batch, dot_distance_batch, l2_distance_batch, Cosine, Dot, L2,
 };
-use lance_linalg::kernels::{argmin, argmin_value_float, normalize};
+use lance_linalg::kernels::{argmin, argmin_value_float, normalize, normalize_fsl};
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 pub mod builder;
@@ -331,7 +331,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
             .as_fixed_size_list_opt()
             .ok_or(Error::Index {
                 message: format!(
-                    "Expect to be a float vector array, got: {:?}",
+                    "Expect to be a FixedSizeList<float> vector array, got: {:?} array",
                     data.data_type()
                 ),
                 location: location!(),
@@ -340,23 +340,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
 
         let fsl = if self.metric_type == MetricType::Cosine {
             // Normalize cosine vectors to unit length.
-            let values = fsl
-                .values()
-                .as_any()
-                .downcast_ref::<T::ArrayType>()
-                .ok_or(Error::Index {
-                    message: format!(
-                        "Expect to be a float vector array, got: {:?}",
-                        fsl.value_type()
-                    ),
-                    location: location!(),
-                })?
-                .as_slice()
-                .chunks(self.dimension)
-                .flat_map(normalize)
-                .collect::<Vec<_>>();
-            let data = T::ArrayType::from(values);
-            FixedSizeListArray::try_new_from_values(data, self.dimension as i32)?
+            normalize_fsl(&fsl)?
         } else {
             fsl
         };
@@ -435,20 +419,21 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
         match self.metric_type {
             MetricType::L2 => self.l2_distances(query, code),
             MetricType::Cosine => {
-                let query: &T::ArrayType = query.as_any().downcast_ref().ok_or(Error::Index {
-                    message: format!(
-                        "Build cosine distance table, type mismatch: {}",
-                        query.data_type()
-                    ),
-                    location: Default::default(),
-                })?;
-
-                // Normalized query vector.
-                let query = T::ArrayType::from(normalize(query.as_slice()).collect::<Vec<_>>());
+                // let query: &T::ArrayType = query.as_any().downcast_ref().ok_or(Error::Index {
+                //     message: format!(
+                //         "Build cosine distance table, type mismatch: {}",
+                //         query.data_type()
+                //     ),
+                //     location: Default::default(),
+                // })?;
+                // println!("PQ: compute_distance: cosine");
+                //
+                // // Normalized query vector.
+                // let query = T::ArrayType::from(normalize(query.as_slice()).collect::<Vec<_>>());
                 // L2 over normalized vectors:  ||x - y|| = x^2 + y^2 - 2 * xy = 1 + 1 - 2 * xy = 2 * (1 - xy)
                 // Cosine distance: 1 - |xy| / (||x|| * ||y||) = 1 - xy / (x^2 * y^2) = 1 - xy / (1 * 1) = 1 - xy
                 // Therefore, Cosine = L2 / 2
-                let l2_dists = self.l2_distances(&query, code)?;
+                let l2_dists = self.l2_distances(query, code)?;
                 Ok(l2_dists.values().iter().map(|v| *v / 2.0).collect())
             }
             MetricType::Dot => self.dot_distances(query, code),

@@ -100,18 +100,16 @@ impl PQBuildParams {
         data: &MatrixView<T>,
         metric_type: MetricType,
     ) -> Result<Arc<dyn ProductQuantizer + 'static>> {
-        let (data, mt) = if metric_type == MetricType::Cosine {
-            // Use normalize L2 to train for cosine distance.
-            (data.normalize(), MetricType::L2)
-        } else {
-            (data.clone(), metric_type)
-        };
-
         let sub_vectors = divide_to_subvectors(&data, self.num_sub_vectors);
         let num_centroids = 2_usize.pow(self.num_bits as u32);
         let dimension = data.num_columns();
         let sub_vector_dimension = dimension / self.num_sub_vectors;
-        const REDOS: usize = 1;
+
+        let (data, mt) = if metric_type == MetricType::Cosine {
+            (data.normalize(), MetricType::L2)
+        } else {
+            (data.clone(), metric_type)
+        };
 
         let d = stream::iter(sub_vectors.into_iter())
             .map(|sub_vec| async move {
@@ -149,6 +147,8 @@ impl PQBuildParams {
     }
 
     /// Build a [ProductQuantizer] from the given data.
+    ///
+    /// If the [MetricType] is [MetricType::Cosine], the input data will be normalized.
     pub async fn build(
         &self,
         data: &dyn Array,

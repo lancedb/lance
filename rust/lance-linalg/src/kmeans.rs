@@ -36,8 +36,8 @@ use rand::prelude::*;
 use rand::Rng;
 use tracing::instrument;
 
-use crate::distance::{dot_distance_batch, norm_l2};
-use crate::kernels::{argmax, argmin_value_float, normalize};
+use crate::distance::dot_distance_batch;
+use crate::kernels::{argmax, argmin_value_float};
 use crate::{
     distance::{
         dot_distance,
@@ -240,16 +240,6 @@ impl KMeanMembership {
 
         split_clusters(&mut cluster_cnts, &mut new_centroids, dimension);
 
-        if self.metric_type == MetricType::Cosine {
-            // Need normalize centroids
-            for i in 0..self.k {
-                let norm = norm_l2(&new_centroids[i * dimension..(i + 1) * dimension]);
-                new_centroids[i * dimension..(i + 1) * dimension]
-                    .iter_mut()
-                    .for_each(|v| *v /= T::Native::from_f32(norm).unwrap());
-            }
-        }
-
         Ok(KMeans {
             centroids: Arc::new(new_centroids.into()),
             dimension,
@@ -365,6 +355,8 @@ where
     }
 
     /// Train a [`KMeans`] model with full parameters.
+    ///
+    /// If the MetricType is `Cosine`, the input vectors will be normalized with each iteration.
     pub async fn new_with_params(
         data: &FixedSizeListArray,
         k: usize,
@@ -402,7 +394,7 @@ where
         let mut best_kmeans = Self::empty(k, dimension, params.metric_type);
         let mut best_stddev = f32::MAX;
 
-        let rng = rand::rngs::SmallRng::from_entropy();
+        let rng = SmallRng::from_entropy();
         for redo in 1..=params.redos {
             let mut kmeans = if let Some(centroids) = params.centroids.as_ref() {
                 // Use existing centroids.
@@ -475,8 +467,6 @@ where
     ///
     /// - *data*: a `N * dimension` floating array. Not necessarily normalized.
     ///
-    /// If the metric type is cosine, the vector will be normalized internally.
-    ///
     pub async fn compute_membership(&self, data: Arc<T::ArrayType>) -> KMeanMembership {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
@@ -499,12 +489,7 @@ where
                                 .collect();
                         }
                         MetricType::Cosine => {
-                            let normalized = values
-                                .chunks(dimension)
-                                .flat_map(normalize)
-                                .collect::<Vec<_>>();
-                            return compute_partitions_l2(centroids_array, &normalized, dimension)
-                                .collect();
+                            panic!("KMeans: Cosine distance is not supported yet");
                         }
                         MetricType::Dot => values
                             .chunks_exact(dimension)
@@ -547,8 +532,9 @@ where
                 l2_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
             }
             MetricType::Cosine => {
-                let normalized = normalize(query).collect::<Vec<_>>();
-                l2_distance_batch(&normalized, self.centroids.as_slice(), self.dimension).collect()
+                panic!(
+                    "KMeans::find_partitions: cosine is not supported, use Normalized L2 instead"
+                );
             }
             MetricType::Dot => {
                 dot_distance_batch(query, self.centroids.as_slice(), self.dimension).collect()
@@ -686,9 +672,7 @@ mod tests {
     use std::iter::repeat;
 
     use super::*;
-    use approx::{assert_relative_eq, relative_eq};
 
-    use crate::distance::cosine_distance_batch;
     use arrow_array::types::Float32Type;
     use arrow_array::Float32Array;
     use lance_arrow::*;
@@ -737,51 +721,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cosine_kmeans() {
-        const DIM: usize = 2;
-        let data = Float32Array::from(vec![1.0, 0.0, 0.0, 1.0, -1.0, -1.0, -2.0, -2.5_f32]);
-        let vectors = FixedSizeListArray::try_new_from_values(data, DIM as i32).unwrap();
-        let params: KMeansParams<Float32Type> = KMeansParams::cosine();
-
-        let expected_x = 0.5_f32.powf(0.5);
-
-        let kmeans = KMeans::new_with_params(&vectors, 2, &params).await.unwrap();
-        assert!(kmeans
-            .centroids
-            .as_slice()
-            .iter()
-            .any(|&v| relative_eq!(expected_x, v) || relative_eq!(-0.7808688, v)));
-
-        // All centroids are normalized
-        kmeans.centroids.as_slice().chunks(DIM).for_each(|cent| {
-            assert_relative_eq!(1.0, cent.iter().map(|&x| x.powi(2)).sum::<f32>());
-        })
-    }
-
-    #[tokio::test]
-    async fn test_cosine_find_partitions() {
-        const DIM: usize = 8;
-        const K: usize = 16;
-        let data = generate_random_array(DIM * K * 100);
-        let vectors = FixedSizeListArray::try_new_from_values(data.clone(), DIM as i32).unwrap();
-        let params = KMeansParams::<Float32Type>::cosine();
-        let kmeans = KMeans::new_with_params(&vectors, K, &params).await.unwrap();
-
-        // Use cosine distance to brute-force to find the nearest neighbors.
-        // without normalization.
-        let query = &data.as_slice()[0..DIM];
-        let dists = Float32Array::from_iter_values(cosine_distance_batch(
-            query,
-            kmeans.centroids.as_slice(),
-            DIM,
-        ));
-        let expected = sort_to_indices(&dists, None, Some(4)).unwrap();
-
-        let actual = kmeans.find_partitions(query, 4).unwrap();
-        assert_eq!(expected, actual);
-    }
-
-    #[tokio::test]
     async fn test_l2_with_nans() {
         const DIM: usize = 8;
         const K: usize = 32;
@@ -809,23 +748,5 @@ mod tests {
             .cluster_id_and_distances
             .iter()
             .for_each(|cd| assert!(cd.is_none()));
-    }
-
-    #[tokio::test]
-    async fn test_train_cosine_kmeans_with_invalid_values() {
-        const DIM: usize = 8;
-        const K: usize = 32;
-        const NUM_CENTROIDS: usize = 16 * 2048;
-        let centroids = Arc::new(generate_random_array(DIM * NUM_CENTROIDS));
-        for val in [0.0, f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
-            let values = Float32Array::from_iter_values(repeat(val).take(DIM * K));
-            let kmeans =
-                KMeans::<Float32Type>::with_centroids(centroids.clone(), DIM, MetricType::Cosine);
-            let membership = kmeans.compute_membership(values.into()).await;
-            membership
-                .cluster_id_and_distances
-                .iter()
-                .for_each(|cd| assert!(cd.is_none()));
-        }
     }
 }

@@ -26,6 +26,8 @@ use async_trait::async_trait;
 use snafu::{location, Location};
 
 pub use builder::IvfBuildParams;
+use datafusion_expr::AggregateFunction::Median;
+use futures::{stream, StreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::kmeans::KMeans;
@@ -34,12 +36,20 @@ use lance_linalg::{
     MatrixView,
 };
 
-use crate::vector::ivf::transform::IvfTransformer;
+pub mod builder;
+pub mod shuffler;
+mod transformer;
+
+use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
+use crate::vector::normalize::NormalizeTransformer;
 use crate::vector::{
     pq::{transform::PQTransformer, ProductQuantizer},
     residual::ResidualTransform,
     transform::Transformer,
 };
+pub use builder::IvfBuildParams;
+use lance_linalg::kernels::normalize_fsl;
+use lance_linalg::kmeans::KMeans;
 
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 
@@ -375,7 +385,6 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> Ivf for IvfImpl<T> {
                 ),
                 location: Default::default(),
             })?;
-        // todo: hold kmeans in this struct.
         let kmeans = KMeans::<T>::with_centroids(
             self.centroids.data().clone(),
             self.dimension(),
