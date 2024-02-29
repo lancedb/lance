@@ -23,7 +23,6 @@ use rand::{thread_rng, Rng};
 
 use super::super::graph::{beam_search, memory::InMemoryVectorStorage};
 use super::{select_neighbors, select_neighbors_heuristic, HNSW};
-use crate::vector::graph::Graph;
 use crate::vector::graph::{builder::GraphBuilder, storage::VectorStorage};
 use crate::vector::hnsw::HnswLevel;
 
@@ -38,7 +37,10 @@ pub struct HNSWBuilder {
     /// max level of
     max_level: u16,
 
-    /// max number of connections ifor each element per layers.
+    /// number of connections to establish while inserting new element
+    m: usize,
+
+    /// max number of connections for each element per layers.
     m_max: usize,
 
     /// Size of the dynamic list for the candidates
@@ -63,6 +65,7 @@ impl HNSWBuilder {
     pub fn new(vectors: Arc<InMemoryVectorStorage>) -> Self {
         Self {
             max_level: 8,
+            m: 30,
             m_max: 64,
             ef_construction: 100,
             vectors,
@@ -78,6 +81,13 @@ impl HNSWBuilder {
     /// The default value is `8`.
     pub fn max_level(mut self, max_level: u16) -> Self {
         self.max_level = max_level;
+        self
+    }
+
+    /// The number of connections to establish while inserting new element
+    /// The default value is `30`.
+    pub fn num_edges(mut self, m: usize) -> Self {
+        self.m = m;
         self
     }
 
@@ -113,11 +123,6 @@ impl HNSWBuilder {
     pub fn use_select_heuristic(mut self, flag: bool) -> Self {
         self.use_select_heuristic = flag;
         self
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.levels[0].len()
     }
 
     /// New node's level
@@ -163,15 +168,20 @@ impl HNSWBuilder {
             ep = select_neighbors(&candidates, 1).map(|(_, id)| id).collect()
         }
 
-        let m = self.len();
         for cur_level in self.levels.iter_mut().rev().skip(levels_to_search) {
             cur_level.insert(node);
             let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
             let neighbours: Vec<_> = if self.use_select_heuristic {
-                select_neighbors_heuristic(cur_level, query, &candidates, m, self.extend_candidates)
-                    .collect()
+                select_neighbors_heuristic(
+                    cur_level,
+                    query,
+                    &candidates,
+                    self.m,
+                    self.extend_candidates,
+                )
+                .collect()
             } else {
-                select_neighbors(&candidates, m).collect()
+                select_neighbors(&candidates, self.m).collect()
             };
 
             for (distance, nb) in neighbours.iter() {
