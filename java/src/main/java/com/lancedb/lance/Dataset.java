@@ -16,6 +16,7 @@ package com.lancedb.lance;
 
 import io.questdb.jar.jni.JarJniLoader;
 import java.io.Closeable;
+import java.util.List;
 import java.util.Map;
 import org.apache.arrow.c.ArrowArrayStream;
 
@@ -56,6 +57,12 @@ public class Dataset implements Closeable {
    * @return num of rows.
    */
   public native int countRows();
+
+  /** Get all fragments in this dataset.
+   *
+   * @return A list of {@link Fragment}.
+   */
+  public native List<Fragment> getFragments();
 
   /**
    * Closes this dataset and releases any system resources associated with it.
