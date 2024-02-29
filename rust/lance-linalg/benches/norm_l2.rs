@@ -33,6 +33,7 @@ use pprof::criterion::{Output, PProfProfiler};
 const DIMENSION: usize = 1024;
 const TOTAL: usize = 1024 * 1024; // 1M vectors
 
+#[allow(clippy::type_complexity)]
 fn run_bench<T: ArrowFloatType>(
     c: &mut Criterion,
     target: &[T::Native],
