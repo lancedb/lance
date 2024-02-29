@@ -571,7 +571,7 @@ pub(crate) struct Ivf {
 }
 
 impl Ivf {
-    fn new(centroids: Arc<FixedSizeListArray>) -> Self {
+    pub(super) fn new(centroids: Arc<FixedSizeListArray>) -> Self {
         Self {
             centroids,
             offsets: vec![],
@@ -607,7 +607,7 @@ impl Ivf {
     }
 
     /// Add the offset and length of one partition.
-    fn add_partition(&mut self, offset: usize, len: u32) {
+    pub(super) fn add_partition(&mut self, offset: usize, len: u32) {
         self.offsets.push(offset);
         self.lengths.push(len);
     }

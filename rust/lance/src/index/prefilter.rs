@@ -55,10 +55,10 @@ pub struct PreFilter {
     // Expressing these as tasks allows us to start calculating the block list
     // and allow list at the same time we start searching the query.  We will await
     // these tasks only when we've done as much work as we can without them.
-    deleted_ids: Option<Arc<SharedPrerequisite<Arc<RowIdTreeMap>>>>,
-    filtered_ids: Option<Arc<SharedPrerequisite<RowIdMask>>>,
+    pub(super) deleted_ids: Option<Arc<SharedPrerequisite<Arc<RowIdTreeMap>>>>,
+    pub(super) filtered_ids: Option<Arc<SharedPrerequisite<RowIdMask>>>,
     // When the tasks are finished this is the combined filter
-    final_mask: Mutex<OnceCell<RowIdMask>>,
+    pub(super) final_mask: Mutex<OnceCell<RowIdMask>>,
 }
 
 impl PreFilter {
