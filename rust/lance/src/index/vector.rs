@@ -18,11 +18,13 @@
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
-mod fixture_test;
 pub mod ivf;
 pub mod pq;
 mod traits;
 mod utils;
+
+#[cfg(test)]
+mod fixture_test;
 
 use lance_index::vector::{ivf::IvfBuildParams, pq::PQBuildParams};
 use lance_io::traits::Reader;

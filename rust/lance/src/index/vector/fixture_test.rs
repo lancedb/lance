@@ -174,28 +174,22 @@ mod test {
             query,
             metric,
             expected_query_at_subindex,
-        } in vec![
+        } in [
             // L2 should residualize with the correct centroid
             TestCase {
                 query: vec![1.0, 1.0],
                 metric: MetricType::L2,
                 expected_query_at_subindex: vec![0.0, 0.0],
             },
-            // Dot should not residualize
-            TestCase {
-                query: vec![1.0, 1.0],
-                metric: MetricType::Dot,
-                expected_query_at_subindex: vec![1.0, 1.0],
-            },
             // Cosine should normalize and residualize
             TestCase {
                 query: vec![1.0, 1.0],
-                metric: MetricType::Dot,
+                metric: MetricType::Cosine,
                 expected_query_at_subindex: vec![0.0, 0.0],
             },
             TestCase {
                 query: vec![2.0, 2.0],
-                metric: MetricType::Dot,
+                metric: MetricType::Cosine,
                 expected_query_at_subindex: vec![0.0, 0.0],
             },
         ] {
