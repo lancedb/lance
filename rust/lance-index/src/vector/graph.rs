@@ -185,8 +185,8 @@ pub(super) fn beam_search(
 
     while !candidates.is_empty() {
         let (dist, current) = candidates.pop_first().expect("candidates is empty");
-        let furtherst = *results.last_key_value().expect("results set is empty").0;
-        if dist > furtherst {
+        let furthest = *results.last_key_value().expect("results set is empty").0;
+        if dist > furthest {
             break;
         }
         let neighbors = graph.neighbors(current).ok_or_else(|| Error::Index {
@@ -199,9 +199,9 @@ pub(super) fn beam_search(
                 continue;
             }
             visited.insert(neighbor);
-            let furtherst = *results.last_key_value().expect("results set is empty").0;
+            let furthest = *results.last_key_value().expect("results set is empty").0;
             let dist = dist_calc.distance(&[neighbor])[0].into();
-            if dist < furtherst || results.len() < k {
+            if dist < furthest || results.len() < k {
                 results.insert(dist, neighbor);
                 candidates.insert(dist, neighbor);
                 if results.len() > k {
@@ -211,6 +211,59 @@ pub(super) fn beam_search(
         }
     }
     Ok(results)
+}
+
+/// Greedy search over a graph
+///
+/// This searches for only one result, only used for finding the entry point
+///
+/// Parameters
+/// ----------
+/// graph : Graph
+///    The graph to search.
+/// start : u32
+///   The index starting point.
+/// query : &[f32]
+///   The query vector.
+///
+/// Returns
+/// -------
+/// A ``(dist, node_id)`` pair.
+///
+pub(super) fn greedy_search(
+    graph: &dyn Graph,
+    start: u32,
+    query: &[f32],
+) -> Result<(OrderedFloat, u32)> {
+    let mut current = start;
+    let dist_calc = graph.storage().dist_calculator(query);
+    let mut closest_dist = dist_calc.distance(&[start])[0];
+    loop {
+        let neighbors: Vec<_> = graph
+            .neighbors(current)
+            .ok_or_else(|| Error::Index {
+                message: format!("Node {} does not exist in the graph", current),
+                location: location!(),
+            })?
+            .collect();
+        let distances = dist_calc.distance(&neighbors);
+
+        let mut next = None;
+        for (neighbor, dist) in neighbors.into_iter().zip(distances) {
+            if dist < closest_dist {
+                closest_dist = dist;
+                next = Some(neighbor);
+            }
+        }
+
+        if let Some(next) = next {
+            current = next;
+        } else {
+            break;
+        }
+    }
+
+    Ok((OrderedFloat(closest_dist), current))
 }
 
 #[cfg(test)]

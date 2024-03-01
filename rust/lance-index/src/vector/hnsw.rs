@@ -39,8 +39,8 @@ use serde_json::json;
 use snafu::{location, Location};
 
 use super::graph::{
-    builder::GraphBuilder, storage::VectorStorage, Graph, OrderedFloat, OrderedNode, NEIGHBORS_COL,
-    NEIGHBORS_FIELD,
+    builder::GraphBuilder, greedy_search, storage::VectorStorage, Graph, OrderedFloat, OrderedNode,
+    NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
 use crate::vector::graph::beam_search;
 
@@ -292,15 +292,14 @@ impl HNSW {
     /// -------
     /// A list of `(id_in_graph, distance)` pairs. Or Error if the search failed.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<(u32, f32)>> {
-        let mut ep = vec![self.entry_point];
+        let mut ep = self.entry_point;
         let num_layers = self.levels.len();
 
         for level in self.levels.iter().rev().take(num_layers - 1) {
-            let candidates = beam_search(level, &ep, query, 1)?;
-            ep = select_neighbors(&candidates, 1).map(|(_, id)| id).collect();
+            ep = greedy_search(level, ep, query)?.1;
         }
 
-        let candidates = beam_search(&self.levels[0], &ep, query, ef)?;
+        let candidates = beam_search(&self.levels[0], &[ep], query, ef)?;
         Ok(select_neighbors(&candidates, k)
             .map(|(d, u)| (u, d.into()))
             .collect())
