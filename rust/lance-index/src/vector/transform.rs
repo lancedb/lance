@@ -127,4 +127,31 @@ mod tests {
             [2.0 / 8.0_f32.sqrt(); 2]
         );
     }
+
+    #[tokio::test]
+    async fn test_normalize_transformer_with_output_column() {
+        let data = Float32Array::from_iter_values([1.0, 1.0, 2.0, 2.0].into_iter());
+        let fsl = FixedSizeListArray::try_new_from_values(data, 2).unwrap();
+        let schema = Schema::new(vec![Field::new(
+            "v",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl.clone())]).unwrap();
+        let transformer = NormalizeTransformer::new_with_output("v", "o");
+        let output = transformer.transform(&batch).await.unwrap();
+        let input = output.column_by_name("v").unwrap();
+        assert_eq!(input.as_ref(), &fsl);
+        let actual = output.column_by_name("o").unwrap();
+        let act_fsl = actual.as_fixed_size_list();
+        assert_eq!(act_fsl.len(), 2);
+        assert_relative_eq!(
+            act_fsl.value(0).as_primitive::<Float32Type>().values()[..],
+            [1.0 / 2.0_f32.sqrt(); 2]
+        );
+        assert_relative_eq!(
+            act_fsl.value(1).as_primitive::<Float32Type>().values()[..],
+            [2.0 / 8.0_f32.sqrt(); 2]
+        );
+    }
 }
