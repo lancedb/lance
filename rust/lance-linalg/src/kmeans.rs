@@ -669,7 +669,7 @@ pub async fn compute_partitions<T: ArrowFloatType>(
     metric_type: MetricType,
 ) -> Vec<Option<u32>>
 where
-    <T::Native as FloatToArrayType>::ArrowType: Dot + Cosine + L2,
+    <T::Native as FloatToArrayType>::ArrowType: Dot + L2,
 {
     let kmeans: KMeans<T> = KMeans::with_centroids(centroids, dimension, metric_type);
     let membership = kmeans.compute_membership(vectors).await;
