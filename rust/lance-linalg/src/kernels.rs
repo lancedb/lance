@@ -165,9 +165,9 @@ where
         Error::SchemaError(format!("Convert FixedSizeList to MatrixView failed: {}", e))
     })?;
     let normalized = mat.normalize();
-    Ok(normalized.try_into().map_err(|e| {
+    normalized.try_into().map_err(|e| {
         Error::SchemaError(format!("Convert MatrixView to FixedSizeList failed: {}", e))
-    })?)
+    })
 }
 
 /// L2 normalize a [FixedSizeListArray] (of vectors).
