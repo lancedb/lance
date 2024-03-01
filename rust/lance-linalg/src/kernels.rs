@@ -17,17 +17,17 @@ use std::iter::Sum;
 use std::sync::Arc;
 use std::{collections::hash_map::DefaultHasher, hash::Hash, hash::Hasher};
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{
     cast::{as_largestring_array, as_primitive_array, as_string_array, AsArray},
     types::{
-        Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
     Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, FixedSizeListArray, GenericStringArray,
     OffsetSizeTrait, PrimitiveArray, UInt64Array,
 };
 use arrow_schema::{ArrowError, DataType};
+use lance_arrow::ArrowFloatType;
 use num_traits::{bounds::Bounded, Float, Num};
 
 use crate::{Error, MatrixView, Result};

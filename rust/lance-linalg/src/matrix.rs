@@ -215,6 +215,63 @@ impl<T: ArrowFloatType> MatrixView<T> {
         // todo!("normalize")
     }
 
+    /// Dot multiply
+    #[cfg(feature = "opq")]
+    pub fn dot(&self, rhs: &Self) -> Result<Self> {
+        use cblas::{sgemm, Layout, Transpose};
+
+        let m = self.num_rows() as i32;
+        let k = self.num_columns() as i32;
+        let n = rhs.num_columns() as i32;
+        if self.num_columns() != rhs.num_rows() {
+            return Err(Error::Arrow {
+                message: format!(
+                    "MatMul dimension mismatch: A({m}x{k}) * B({}x{n}",
+                    rhs.num_rows()
+                ),
+            });
+        }
+
+        let mut c_builder = Float32Builder::with_capacity((m * n) as usize);
+        unsafe { c_builder.append_trusted_len_iter((0..n * m).map(|_| 0.0)) }
+
+        let (trans_a, lda) = if self.transpose {
+            (Transpose::Ordinary, m)
+        } else {
+            (Transpose::None, k)
+        };
+        let (trans_b, ldb) = if rhs.transpose {
+            (Transpose::Ordinary, k)
+        } else {
+            (Transpose::None, n)
+        };
+        unsafe {
+            sgemm(
+                Layout::RowMajor,
+                trans_a,
+                trans_b,
+                m,
+                n,
+                k,
+                1.0,
+                self.data.values(),
+                lda,
+                rhs.data.values(),
+                ldb,
+                0.0,
+                c_builder.values_slice_mut(),
+                n,
+            )
+        }
+
+        let data = Arc::new(c_builder.finish());
+        Ok(Self {
+            data,
+            num_columns: n as usize,
+            transpose: false,
+        })
+    }
+
     /// Sample `n` rows from the matrix.
     pub fn sample(&self, n: usize) -> Self {
         let rng = SmallRng::from_entropy();
@@ -301,14 +358,6 @@ impl<T: ArrowFloatType + ArrowPrimitiveType> TryFrom<&FixedSizeListArray> for Ma
     }
 }
 
-impl<T: ArrowFloatType> TryFrom<MatrixView<T>> for FixedSizeListArray {
-    type Error = Error;
-
-    fn try_from(value: MatrixView<T>) -> Result<Self> {
-        Self::try_new_from_values(value.data.as_ref().clone(), value.num_columns as i32)
-    }
-}
-
 /// Iterator over the matrix one row at a time.
 pub struct MatrixRowIter<'a, T: ArrowFloatType> {
     data: &'a MatrixView<T>,
@@ -329,13 +378,54 @@ impl<'a, T: ArrowFloatType> Iterator for MatrixRowIter<'a, T> {
 mod tests {
     use std::collections::HashSet;
 
-    use arrow_array::{
-        types::{Float32Type, Float64Type},
-        Float32Array,
-    };
+    use arrow_array::Float32Array;
+
+    #[cfg(feature = "opq")]
+    use approx::assert_relative_eq;
+    use arrow_array::types::{Float32Type, Float64Type};
     use lance_arrow::FixedSizeListArrayExt;
 
     use super::*;
+
+    #[test]
+    #[cfg(feature = "opq")]
+    fn test_matrix_dot() {
+        // A[2,3]
+        let a_data = Arc::new(Float32Array::from_iter((1..=6).map(|v| v as f32)));
+        let a = MatrixView::new(a_data, 3);
+
+        // B[3,2]
+        let b_data = Arc::new(Float32Array::from_iter_values([
+            2.0, 3.0, 6.0, 7.0, 10.0, 11.0,
+        ]));
+        let b = MatrixView::new(b_data, 2);
+
+        let c = a.dot(&b).unwrap();
+        let expected = vec![44.0, 50.0, 98.0, 113.0];
+        c.data.values().iter().zip(expected).for_each(|(&a, b)| {
+            assert_relative_eq!(a, b, epsilon = 0.0001);
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "opq")]
+    fn test_dot_on_transposed_mat() {
+        // A[2,3]
+        let a_data = Arc::new(Float32Array::from_iter((1..=6).map(|v| v as f32)));
+        let a = MatrixView::<Float32Array>::new(a_data, 3);
+
+        // B[3,2]
+        let b_data = Arc::new(Float32Array::from_iter_values([
+            2.0, 3.0, 6.0, 7.0, 10.0, 11.0,
+        ]));
+        let b = MatrixView::<Float32Array>::new(b_data, 2);
+
+        let c_t = b.transpose().dot(&a.transpose()).unwrap();
+        let expected = vec![44.0, 98.0, 50.0, 113.0];
+        c_t.data.values().iter().zip(expected).for_each(|(&a, b)| {
+            assert_relative_eq!(a, b, epsilon = 0.0001);
+        });
+    }
 
     #[test]
     fn test_sample_matrix() {
