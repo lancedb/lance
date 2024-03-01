@@ -289,7 +289,7 @@ mod tests {
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
     };
     use approx::assert_relative_eq;
-    use num_traits::FromPrimitive;
+    use num_traits::{Float, FromPrimitive};
 
     #[test]
     fn test_dot() {
@@ -319,14 +319,21 @@ mod tests {
 
     // Accuracy of dot product depends on the size of the components
     // of the vector.
-    fn max_error(x: &[f64], y: &[f64]) -> f32 {
+    // Imagine that each `x_i` can vary by `є * |x_i|`. Similarly for `y_i`.
+    // (Basically, it's accurate to ±(1 + є) * |x_i|).
+    // Error for `sum(x, y)` is `є_x + є_y`. Error for multiple is `є_x * x + є_y * y`.
+    // See: https://www.geol.lsu.edu/jlorenzo/geophysics/uncertainties/Uncertaintiespart2.html
+    // The multiplication of `x_i` and `y_i` can vary by `(є * |x_i|) * |y_i| + (є * |y_i|) * |x_i|`.
+    // This simplifies to `2 * є * (|x_i| + |y_i|)`.
+    // So the error for the sum of all the multiplications is `є * sum(|x_i| + |y_i|)`.
+    fn max_error<T: Float + AsPrimitive<f64>>(x: &[f64], y: &[f64]) -> f32 {
         let dot = x
             .iter()
             .cloned()
             .zip(y.iter().cloned())
             .map(|(x, y)| x.abs() * y.abs())
             .sum::<f64>();
-        (1e-6_f64 * dot) as f32
+        (2.0 * T::epsilon().as_() * dot) as f32
     }
 
     fn do_dot_test<T: FloatToArrayType>(x: &[T], y: &[T])
@@ -339,7 +346,7 @@ mod tests {
         let expected = dot_scalar_ref(&f64_x, &f64_y);
         let result = dot(x, y);
 
-        let max_error = max_error(&f64_x, &f64_y);
+        let max_error = max_error::<T>(&f64_x, &f64_y);
 
         assert_relative_eq!(expected, result, epsilon = max_error);
     }
