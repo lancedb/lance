@@ -17,22 +17,24 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use arrow_array::types::UInt32Type;
 use arrow_array::{
     cast::AsArray, Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::Field;
 use futures::{stream, StreamExt};
-use lance_arrow::{ArrowFloatType, RecordBatchExt};
-use lance_core::Result;
-use lance_linalg::distance::{Dot, MetricType, L2};
-use lance_linalg::MatrixView;
 use log::info;
 use snafu::{location, Location};
 use tracing::{instrument, Instrument};
 
-use super::Ivf;
-use super::PART_ID_COLUMN;
+use lance_arrow::{ArrowFloatType, RecordBatchExt};
+use lance_core::Result;
+use lance_linalg::distance::{Dot, MetricType, L2};
+use lance_linalg::MatrixView;
+
 use crate::vector::transform::Transformer;
+
+use super::PART_ID_COLUMN;
 
 /// Ivf Transformer
 ///
@@ -154,9 +156,52 @@ impl<T: ArrowFloatType + L2 + Dot + ArrowPrimitiveType> Transformer for IvfTrans
     }
 }
 
-pub struct PartitionFilter {
+#[derive(Debug)]
+pub(super) struct PartitionFilter {
     /// The partition column name.
     column: String,
     /// The partition range to filter.
     partition_range: Range<u32>,
+}
+
+impl PartitionFilter {
+    pub fn new(column: impl AsRef<str>, partition_range: Range<u32>) -> Self {
+        Self {
+            column: column.as_ref().to_owned(),
+            partition_range,
+        }
+    }
+
+    fn filter_row_ids(&self, partition_ids: &[u32]) -> Vec<u32> {
+        partition_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &part_id)| {
+                if self.partition_range.contains(&part_id) {
+                    Some(idx as u32)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl Transformer for PartitionFilter {
+    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        // TODO: use datafusion execute?
+        let arr = batch
+            .column_by_name(&self.column)
+            .ok_or_else(|| lance_core::Error::Index {
+                message: format!(
+                    "PartitionFilter: column {} not found in the RecordBatch",
+                    self.column
+                ),
+                location: location!(),
+            })?;
+        let part_ids = arr.as_primitive::<UInt32Type>();
+        let indices = UInt32Array::from(self.filter_row_ids(part_ids.values()));
+        Ok(batch.take(&indices)?)
+    }
 }

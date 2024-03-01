@@ -19,36 +19,34 @@ use std::sync::Arc;
 
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{
-    cast::AsArray, types::UInt32Type, Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch,
-    UInt32Array,
+    cast::AsArray, Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::{DataType, Field};
-use arrow_select::take::take;
 use async_trait::async_trait;
-use futures::{stream, StreamExt};
+use futures::StreamExt;
+use snafu::{location, Location};
+
+pub use builder::IvfBuildParams;
 use lance_arrow::*;
 use lance_core::{Error, Result};
+use lance_linalg::kmeans::KMeans;
 use lance_linalg::{
     distance::{Cosine, Dot, MetricType, L2},
     MatrixView,
 };
-use log::info;
-use snafu::{location, Location};
-use tracing::{instrument, Instrument};
 
-pub mod builder;
-pub mod shuffler;
-mod transform;
-
-use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 use crate::vector::ivf::transform::IvfTransformer;
 use crate::vector::{
     pq::{transform::PQTransformer, ProductQuantizer},
     residual::ResidualTransform,
     transform::Transformer,
 };
-pub use builder::IvfBuildParams;
-use lance_linalg::kmeans::KMeans;
+
+use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
+
+pub mod builder;
+pub mod shuffler;
+mod transform;
 
 fn new_ivf_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveType>(
     centroids: &T::ArrayType,
@@ -243,9 +241,6 @@ pub struct IvfImpl<T: ArrowFloatType + Dot + L2> {
 
     /// Metric type to compute pair-wise vector distance.
     metric_type: MetricType,
-
-    /// Only covers a range of partitions.
-    partition_range: Option<Range<u32>>,
 }
 
 impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
@@ -254,7 +249,7 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
         metric_type: MetricType,
         vector_column: &str,
         transforms: Vec<Arc<dyn Transformer>>,
-        range: Option<Range<u32>>,
+        _range: Option<Range<u32>>,
     ) -> Self {
         let ivf_transform = Arc::new(IvfTransformer::new(
             centroids.clone(),
@@ -266,7 +261,6 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
             metric_type,
             transforms,
             ivf_transform,
-            partition_range: range,
         }
     }
 
@@ -294,6 +288,13 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
         ));
         transforms.push(ivf_transform.clone() as Arc<dyn Transformer>);
 
+        if let Some(range) = range {
+            transforms.push(Arc::new(transform::PartitionFilter::new(
+                PART_ID_COLUMN,
+                range,
+            )));
+        }
+
         if pq.use_residual() {
             transforms.push(Arc::new(ResidualTransform::new(
                 centroids.clone(),
@@ -317,7 +318,6 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
             metric_type,
             transforms,
             ivf_transform,
-            partition_range: range,
         }
     }
 
@@ -415,22 +415,6 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> Ivf for IvfImpl<T> {
         } else {
             batch.clone()
         };
-
-        // let (part_ids, batch) = if let Some(part_range) = self.partition_range.as_ref() {
-        //     let idx_in_range: UInt32Array = part_ids
-        //         .iter()
-        //         .enumerate()
-        //         .filter(|(_idx, part_id)| part_id.map(|r| part_range.contains(&r)).unwrap_or(false))
-        //         .map(|(idx, _)| idx as u32)
-        //         .collect();
-        //     let part_ids = take(&part_ids, &idx_in_range, None)?
-        //         .as_primitive::<UInt32Type>()
-        //         .clone();
-        //     let batch = batch.take(&idx_in_range)?;
-        //     (part_ids, batch)
-        // } else {
-        //     (part_ids, batch.clone())
-        // };
 
         // Transform each batch
         for transform in self.transforms.as_slice() {
