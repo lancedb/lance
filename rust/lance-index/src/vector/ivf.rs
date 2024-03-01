@@ -222,7 +222,6 @@ pub trait Ivf: Send + Sync + std::fmt::Debug {
     async fn partition_transform(
         &self,
         batch: &RecordBatch,
-        column: &str,
         partition_ids: Option<UInt32Array>,
     ) -> Result<RecordBatch>;
 }
@@ -279,6 +278,8 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
         range: Option<Range<u32>>,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
+
+        // Re-enable it after search path fixed.
         // if metric_type == MetricType::Cosine {
         //     transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
         //         vector_column,
@@ -406,46 +407,30 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> Ivf for IvfImpl<T> {
     async fn partition_transform(
         &self,
         batch: &RecordBatch,
-        column: &str,
         partition_ids: Option<UInt32Array>,
     ) -> Result<RecordBatch> {
-        let vector_arr = batch.column_by_name(column).ok_or(Error::Index {
-            message: format!("Column {} does not exist.", column),
-            location: location!(),
-        })?;
-        let data = vector_arr.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "Column {} is not a vector type: {}",
-                column,
-                vector_arr.data_type()
-            ),
-            location: location!(),
-        })?;
-
-        let part_ids = if let Some(part_ids) = partition_ids {
-            part_ids
+        let mut batch = if let Some(part_ids) = partition_ids {
+            let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), false);
+            batch.try_with_column(field, Arc::new(part_ids))?
         } else {
-            self.compute_partitions(data).await?
+            batch.clone()
         };
 
-        let (part_ids, batch) = if let Some(part_range) = self.partition_range.as_ref() {
-            let idx_in_range: UInt32Array = part_ids
-                .iter()
-                .enumerate()
-                .filter(|(_idx, part_id)| part_id.map(|r| part_range.contains(&r)).unwrap_or(false))
-                .map(|(idx, _)| idx as u32)
-                .collect();
-            let part_ids = take(&part_ids, &idx_in_range, None)?
-                .as_primitive::<UInt32Type>()
-                .clone();
-            let batch = batch.take(&idx_in_range)?;
-            (part_ids, batch)
-        } else {
-            (part_ids, batch.clone())
-        };
-
-        let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), false);
-        let mut batch = batch.try_with_column(field, Arc::new(part_ids))?;
+        // let (part_ids, batch) = if let Some(part_range) = self.partition_range.as_ref() {
+        //     let idx_in_range: UInt32Array = part_ids
+        //         .iter()
+        //         .enumerate()
+        //         .filter(|(_idx, part_id)| part_id.map(|r| part_range.contains(&r)).unwrap_or(false))
+        //         .map(|(idx, _)| idx as u32)
+        //         .collect();
+        //     let part_ids = take(&part_ids, &idx_in_range, None)?
+        //         .as_primitive::<UInt32Type>()
+        //         .clone();
+        //     let batch = batch.take(&idx_in_range)?;
+        //     (part_ids, batch)
+        // } else {
+        //     (part_ids, batch.clone())
+        // };
 
         // Transform each batch
         for transform in self.transforms.as_slice() {

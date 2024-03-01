@@ -159,8 +159,7 @@ pub async fn shuffle_dataset(
                         None
                     };
 
-                    ivf.partition_transform(&batch, col_ref.as_ref(), part_ids)
-                        .await
+                    ivf.partition_transform(&batch, part_ids).await
                 })
             })
             .buffer_unordered(num_cpus::get())
