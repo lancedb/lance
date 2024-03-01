@@ -23,7 +23,6 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
-use futures::StreamExt;
 use snafu::{location, Location};
 
 pub use builder::IvfBuildParams;

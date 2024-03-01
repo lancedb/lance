@@ -42,7 +42,7 @@ use crate::{
     distance::{
         dot_distance,
         l2::{l2, l2_distance_batch, L2},
-        Cosine, Dot, MetricType,
+        Dot, MetricType,
     },
     kernels::argmin_value,
     matrix::MatrixView,

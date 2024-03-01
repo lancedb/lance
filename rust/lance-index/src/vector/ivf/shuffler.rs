@@ -81,7 +81,6 @@ fn get_temp_dir() -> Result<Path> {
 #[allow(clippy::too_many_arguments)]
 pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
-    column: &str,
     ivf: Arc<dyn crate::vector::ivf::Ivf>,
     precomputed_partitions: Option<HashMap<u64, u32>>,
     num_partitions: u32,
@@ -90,8 +89,6 @@ pub async fn shuffle_dataset(
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
-    let column: Arc<str> = column.into();
-
     // TODO: dynamically detect schema from the transforms.
     let schema = Arc::new(arrow_schema::Schema::new(vec![
         ROW_ID_FIELD.clone(),
@@ -131,8 +128,6 @@ pub async fn shuffle_dataset(
         let stream = data
             .zip(repeat_with(move || ivf.clone()))
             .map(move |(b, ivf)| {
-                let col_ref = column.clone();
-
                 // If precomputed_partitions map is provided, use it
                 // for fast partitions.
                 let partition_map = precomputed_partitions

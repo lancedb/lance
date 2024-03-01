@@ -18,9 +18,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::types::UInt32Type;
-use arrow_array::{
-    cast::AsArray, Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, UInt32Array,
-};
+use arrow_array::{cast::AsArray, Array, ArrowPrimitiveType, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use futures::{stream, StreamExt};
 use log::info;

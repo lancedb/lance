@@ -70,7 +70,6 @@ pub(super) async fn build_partitions(
 
     let stream = shuffle_dataset(
         data,
-        column,
         ivf_model,
         precomputed_partitons,
         ivf.num_partitions() as u32,
