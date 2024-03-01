@@ -37,6 +37,7 @@ use tracing::{instrument, Instrument};
 
 pub mod builder;
 pub mod shuffler;
+mod transform;
 
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 use crate::vector::{
