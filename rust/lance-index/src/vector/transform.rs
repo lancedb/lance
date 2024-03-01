@@ -135,11 +135,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_normalize_transformer_16() {
-        let data = Float16Array::from_iter_values(
-            [1.0_f32, 1.0, 2.0, 2.0]
-                .into_iter()
-                .map(|v| f16::from_f32(v)),
-        );
+        let data =
+            Float16Array::from_iter_values([1.0_f32, 1.0, 2.0, 2.0].into_iter().map(f16::from_f32));
         let fsl = FixedSizeListArray::try_new_from_values(data, 2).unwrap();
         let schema = Schema::new(vec![Field::new(
             "v",
@@ -152,7 +149,7 @@ mod tests {
         let actual = output.column_by_name("v").unwrap();
         let act_fsl = actual.as_fixed_size_list();
         assert_eq!(act_fsl.len(), 2);
-        let expect_1 = vec![f16::from_f32_const(1.0) / f16::from_f32_const(2.0).sqrt(); 2];
+        let expect_1 = [f16::from_f32_const(1.0) / f16::from_f32_const(2.0).sqrt(); 2];
         act_fsl
             .value(0)
             .as_primitive::<Float16Type>()
@@ -161,7 +158,7 @@ mod tests {
             .zip(expect_1.iter())
             .for_each(|(a, b)| assert!(a - b <= f16::epsilon()));
 
-        let expect_2 = vec![f16::from_f32_const(2.0) / f16::from_f32_const(8.0).sqrt(); 2];
+        let expect_2 = [f16::from_f32_const(2.0) / f16::from_f32_const(8.0).sqrt(); 2];
         act_fsl
             .value(1)
             .as_primitive::<Float16Type>()
