@@ -94,30 +94,6 @@ impl Transformer for NormalizeTransformer {
     }
 }
 
-/// A chain of transformers, applied to a [`RecordBatch`] in order.
-#[derive(Debug)]
-pub struct TransformerChain {
-    transformers: Vec<Arc<dyn Transformer>>,
-}
-
-impl TransformerChain {
-    /// Create a new instance of `TransformerChain`.
-    pub fn new(transformers: Vec<Arc<dyn Transformer>>) -> Self {
-        Self { transformers }
-    }
-}
-
-#[async_trait]
-impl Transformer for TransformerChain {
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let mut batch = batch.clone();
-        for transformer in self.transformers.iter() {
-            batch = transformer.transform(&batch).await?;
-        }
-        Ok(batch)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

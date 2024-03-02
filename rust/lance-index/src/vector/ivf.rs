@@ -21,7 +21,7 @@ use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{
     cast::AsArray, Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, UInt32Array,
 };
-use arrow_schema::{DataType, Field};
+use arrow_schema::DataType;
 use async_trait::async_trait;
 use snafu::{location, Location};
 
