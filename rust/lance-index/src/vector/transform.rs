@@ -18,10 +18,12 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, Array, RecordBatch};
-use arrow_schema::Field;
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::{cast::AsArray, Array, ArrowPrimitiveType, RecordBatch, UInt32Array};
+use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use lance_arrow::RecordBatchExt;
+use num_traits::Float;
 use snafu::{location, Location};
 
 use lance_core::{Error, Result};
@@ -90,6 +92,77 @@ impl Transformer for NormalizeTransformer {
             return Ok(batch.try_with_column(field, Arc::new(norm))?);
         } else {
             return Ok(batch.replace_column_by_name(&self.input_column, Arc::new(norm))?);
+        }
+    }
+}
+
+/// Only keep the vectors that is finite number, filter out NaN and Inf.
+#[derive(Debug)]
+pub(crate) struct KeepFiniteVectors {
+    column: String,
+}
+
+impl KeepFiniteVectors {
+    pub fn new(column: impl AsRef<str>) -> Self {
+        Self {
+            column: column.as_ref().to_owned(),
+        }
+    }
+}
+
+fn is_all_finite<T: ArrowPrimitiveType>(arr: &dyn Array) -> bool
+where
+    T::Native: Float,
+{
+    !arr.as_primitive::<T>()
+        .values()
+        .iter()
+        .any(|&v| !v.is_finite())
+}
+
+#[async_trait]
+impl Transformer for KeepFiniteVectors {
+    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let arr = batch.column_by_name(&self.column).ok_or(Error::Index {
+            message: format!(
+                "KeepFiniteVectors: column {} not found in RecordBatch",
+                self.column
+            ),
+            location: location!(),
+        })?;
+        let data = arr.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "KeepFiniteVectors: column {} is not a fixed size list: {}",
+                self.column,
+                arr.data_type()
+            ),
+            location: location!(),
+        })?;
+
+        let valid = data
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, arr)| {
+                arr.and_then(|data| {
+                    let is_valid = match data.data_type() {
+                        DataType::Float16 => is_all_finite::<Float16Type>(&data),
+                        DataType::Float32 => is_all_finite::<Float32Type>(&data),
+                        DataType::Float64 => is_all_finite::<Float64Type>(&data),
+                        _ => false,
+                    };
+                    if is_valid {
+                        Some(idx as u32)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        if valid.len() < batch.num_rows() {
+            let indices = UInt32Array::from(valid);
+            Ok(batch.take(&indices)?)
+        } else {
+            Ok(batch.clone())
         }
     }
 }

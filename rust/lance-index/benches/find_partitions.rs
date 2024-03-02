@@ -38,7 +38,7 @@ fn bench_partitions(c: &mut Criterion) {
         let matrix = MatrixView::<Float32Type>::new(centroids.clone(), DIMENSION);
 
         for k in &[1, 10, 50] {
-            let ivf = IvfImpl::new(matrix.clone(), MetricType::L2, vec![], None);
+            let ivf = IvfImpl::new(matrix.clone(), MetricType::L2, "vector", vec![], None);
 
             c.bench_function(format!("IVF{},k={},L2", num_centroids, k).as_str(), |b| {
                 b.iter(|| {
@@ -46,7 +46,7 @@ fn bench_partitions(c: &mut Criterion) {
                 })
             });
 
-            let ivf = IvfImpl::new(matrix.clone(), MetricType::Cosine, vec![], None);
+            let ivf = IvfImpl::new(matrix.clone(), MetricType::Cosine, "vector", vec![], None);
             c.bench_function(
                 format!("IVF{},k={},Cosine", num_centroids, k).as_str(),
                 |b| {
