@@ -42,6 +42,7 @@ use lance_io::ReadBatchParams;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 
+use crate::vector::transform::{KeepFiniteVectors, Transformer};
 use crate::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use log::info;
@@ -81,6 +82,7 @@ fn get_temp_dir() -> Result<Path> {
 #[allow(clippy::too_many_arguments)]
 pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
+    column: &str,
     ivf: Arc<dyn crate::vector::ivf::Ivf>,
     precomputed_partitions: Option<HashMap<u64, u32>>,
     num_partitions: u32,
@@ -124,6 +126,7 @@ pub async fn shuffle_dataset(
             Schema::try_from(schema.as_ref())?,
         )?;
 
+        let column = column.to_owned();
         let precomputed_partitions = precomputed_partitions.map(Arc::new);
         let stream = data
             .zip(repeat_with(move || ivf.clone()))
@@ -134,6 +137,7 @@ pub async fn shuffle_dataset(
                     .as_ref()
                     .cloned()
                     .unwrap_or(Arc::new(HashMap::new()));
+                let nan_filter = KeepFiniteVectors::new(&column);
 
                 tokio::task::spawn(async move {
                     let mut batch = b?;
@@ -169,13 +173,13 @@ pub async fn shuffle_dataset(
                                     .enumerate()
                                     .filter_map(|(idx, v)| v.map(|_| idx as u32)),
                             );
-                            assert_eq!(
-                                indices.len(),
-                                batch.num_rows() - part_ids.null_count() as usize
-                            );
+                            assert_eq!(indices.len(), batch.num_rows() - part_ids.null_count());
                             batch = batch.take(&indices)?;
                         }
                     }
+
+                    // Filter out NaNs/Infs
+                    batch = nan_filter.transform(&batch).await?;
 
                     ivf.transform(&batch).await
                 })

@@ -248,6 +248,7 @@ pub(crate) async fn optimize_vector_indices(
         Some(
             shuffle_dataset(
                 stream,
+                vector_column,
                 ivf,
                 None,
                 first_idx.ivf.num_partitions() as u32,
