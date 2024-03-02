@@ -787,6 +787,8 @@ pub(super) async fn build_ivf_model(
         start.elapsed().as_secs_f32()
     );
 
+    // If metric type is cosine, normalize the training data, and after this point,
+    // treat the metric type as L2.
     let (training_data, mt) = if metric_type == MetricType::Cosine {
         let training_data = normalize_fsl(&training_data)?;
         (training_data, MetricType::L2)
