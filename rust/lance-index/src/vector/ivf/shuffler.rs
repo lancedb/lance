@@ -92,7 +92,7 @@ pub async fn shuffle_dataset(
     // TODO: dynamically detect schema from the transforms.
     let schema = Arc::new(arrow_schema::Schema::new(vec![
         ROW_ID_FIELD.clone(),
-        Field::new(PART_ID_COLUMN, DataType::UInt32, false),
+        Field::new(PART_ID_COLUMN, DataType::UInt32, true),
         Field::new(
             PQ_CODE_COLUMN,
             DataType::FixedSizeList(
@@ -143,17 +143,38 @@ pub async fn shuffle_dataset(
                             message: "column does not exist".to_string(),
                             location: location!(),
                         })?;
-                        let part_ids = row_ids
-                            .as_primitive::<UInt64Type>()
-                            .values()
-                            .iter()
-                            .filter_map(|row_id| partition_map.get(row_id).copied())
-                            .collect::<Vec<_>>();
+                        let part_ids = UInt32Array::from_iter(
+                            row_ids
+                                .as_primitive::<UInt64Type>()
+                                .values()
+                                .iter()
+                                .map(|row_id| partition_map.get(row_id).copied()),
+                        );
                         let part_ids = UInt32Array::from(part_ids);
-                        batch = batch.try_with_column(
-                            Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), false),
-                            Arc::new(part_ids),
-                        )?;
+                        batch = batch
+                            .try_with_column(
+                                Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true),
+                                Arc::new(part_ids.clone()),
+                            )
+                            .expect("failed to add part id column");
+
+                        if part_ids.null_count() > 0 {
+                            info!(
+                                "Filter out rows without valid partition IDs: null_count={}",
+                                part_ids.null_count()
+                            );
+                            let indices = UInt32Array::from_iter(
+                                part_ids
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(idx, v)| v.map(|_| idx as u32)),
+                            );
+                            assert_eq!(
+                                indices.len(),
+                                batch.num_rows() - part_ids.null_count() as usize
+                            );
+                            batch = batch.take(&indices)?;
+                        }
                     }
 
                     ivf.transform(&batch).await
@@ -473,7 +494,7 @@ impl IvfShuffler {
                 // TODO: dynamically detect schema from the transforms.
                 let schema = Arc::new(ArrowSchema::new(vec![
                     ROW_ID_FIELD.clone(),
-                    ArrowField::new(PART_ID_COLUMN, DataType::UInt32, false),
+                    ArrowField::new(PART_ID_COLUMN, DataType::UInt32, true),
                     ArrowField::new(
                         PQ_CODE_COLUMN,
                         DataType::FixedSizeList(
@@ -568,7 +589,7 @@ mod test {
     fn make_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
             ROW_ID_FIELD.clone(),
-            ArrowField::new(PART_ID_COLUMN, DataType::UInt32, false),
+            ArrowField::new(PART_ID_COLUMN, DataType::UInt32, true),
             ArrowField::new(
                 PQ_CODE_COLUMN,
                 DataType::FixedSizeList(

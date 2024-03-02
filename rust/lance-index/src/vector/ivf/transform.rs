@@ -149,7 +149,7 @@ impl<T: ArrowFloatType + L2 + Dot + ArrowPrimitiveType> Transformer for IvfTrans
 
         let mat = MatrixView::<T>::try_from(fsl)?;
         let part_ids = self.compute_partitions(&mat).await;
-        let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), false);
+        let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true);
         Ok(batch.try_with_column(field, Arc::new(part_ids))?)
     }
 }
