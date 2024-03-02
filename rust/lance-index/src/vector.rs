@@ -24,7 +24,6 @@ pub mod graph;
 pub mod hnsw;
 pub mod ivf;
 pub mod kmeans;
-mod normalize;
 pub mod pq;
 pub mod residual;
 pub mod transform;

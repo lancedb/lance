@@ -167,6 +167,7 @@ impl VectorIndex for PQIndex {
             });
         }
         pre_filter.wait_for_ready().await?;
+        println!("PQIndex::search: metric type: {:?}", self.metric_type);
 
         let code = self.code.as_ref().unwrap().clone();
         let row_ids = self.row_ids.as_ref().unwrap().clone();
@@ -267,6 +268,15 @@ impl VectorIndex for PQIndex {
     }
 }
 
+/// Train Product Quantizer model.
+///
+/// Parameters:
+/// - `dataset`: The dataset to train the PQ model.
+/// - `column`: The column name of the dataset.
+/// - `dim`: The dimension of the vectors.
+/// - `metric_type`: The metric type of the vectors.
+/// - `params`: The parameters to train the PQ model.
+/// - `ivf`: If provided, the IVF model to compute the residual for PQ training.
 pub(super) async fn build_pq_model(
     dataset: &Dataset,
     column: &str,
@@ -334,6 +344,8 @@ pub(super) async fn build_pq_model(
         training_data = normalize_fsl(&training_data)?;
     }
 
+    println!("PQ Training, ivf: {:?} ", ivf);
+
     let training_data = if let Some(ivf) = ivf {
         // Compute residual for PQ training.
         //
@@ -345,7 +357,6 @@ pub(super) async fn build_pq_model(
             vec![],
             None,
         )?;
-        println!("Compute residual for PQ training");
         span!(Level::INFO, "compute residual for PQ training")
             .in_scope(|| ivf2.compute_residual(&training_data, None))
             .await?

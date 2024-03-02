@@ -489,7 +489,7 @@ where
                                 .collect();
                         }
                         MetricType::Cosine => {
-                            panic!("KMeans: Cosine distance is not supported yet");
+                            panic!("KMeans: should not use cosine distance to train kmeans, use L2 instead.");
                         }
                         MetricType::Dot => values
                             .chunks_exact(dimension)

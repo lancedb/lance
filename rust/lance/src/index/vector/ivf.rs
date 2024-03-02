@@ -412,14 +412,12 @@ impl VectorIndex for IVFIndex {
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
         let mut query = query.clone();
         let mt = if self.metric_type == MetricType::Cosine {
-            println!("IVFIndex::search: self.metric_type == MetricType::Cosine, normalizing arrow");
             let key = normalize_arrow(&query.key)?;
             query.key = key;
             MetricType::L2
         } else {
             self.metric_type
         };
-        let mt = self.metric_type;
 
         let partition_ids = self.ivf.find_partitions(&query.key, query.nprobes, mt)?;
         assert!(partition_ids.len() <= query.nprobes);
@@ -1621,8 +1619,7 @@ mod tests {
         let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
         let ivf_params = IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
 
-        let codebook = Arc::new(generate_random_array(256 * DIM));
-        let pq_params = PQBuildParams::with_codebook(4, 8, codebook);
+        let pq_params = PQBuildParams::new(4, 8);
 
         let params =
             VectorIndexParams::with_ivf_pq_params(MetricType::Cosine, ivf_params, pq_params);
@@ -1648,11 +1645,16 @@ mod tests {
         assert_eq!(5, results[0].num_rows());
         for batch in results.iter() {
             let dist = &batch["_distance"];
-            assert!(dist
-                .as_primitive::<Float32Type>()
+            dist.as_primitive::<Float32Type>()
                 .values()
                 .iter()
-                .all(|v| (0.0..2.0).contains(v)));
+                .for_each(|v| {
+                    assert!(
+                        (0.0..2.0).contains(v),
+                        "Expect cosine value in range [0.0, 2.0], got: {}",
+                        v
+                    )
+                });
         }
     }
 
