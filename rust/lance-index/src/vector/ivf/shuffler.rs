@@ -25,14 +25,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::types::UInt64Type;
 use arrow_array::{
-    cast::AsArray, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array, UInt8Array,
+    cast::AsArray, types::UInt64Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
+    UInt64Array, UInt8Array,
 };
 use arrow_schema::{DataType, Field as ArrowField, Field, Schema as ArrowSchema};
 use futures::stream::repeat_with;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
-use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::datatypes::Schema;
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
@@ -136,9 +136,9 @@ pub async fn shuffle_dataset(
                     .unwrap_or(Arc::new(HashMap::new()));
 
                 tokio::task::spawn(async move {
-                    let batch = b?;
+                    let mut batch = b?;
 
-                    let part_ids = if !partition_map.is_empty() {
+                    if !partition_map.is_empty() {
                         let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
                             message: "column does not exist".to_string(),
                             location: location!(),
@@ -149,12 +149,14 @@ pub async fn shuffle_dataset(
                             .iter()
                             .filter_map(|row_id| partition_map.get(row_id).copied())
                             .collect::<Vec<_>>();
-                        Some(UInt32Array::from(part_ids))
-                    } else {
-                        None
-                    };
+                        let part_ids = UInt32Array::from(part_ids);
+                        batch = batch.try_with_column(
+                            Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), false),
+                            Arc::new(part_ids),
+                        )?;
+                    }
 
-                    ivf.partition_transform(&batch, part_ids).await
+                    ivf.transform(&batch).await
                 })
             })
             .buffer_unordered(num_cpus::get())

@@ -170,7 +170,7 @@ pub fn new_ivf_with_pq(
 /// IVF - IVF file partition
 ///
 #[async_trait]
-pub trait Ivf: Send + Sync + std::fmt::Debug {
+pub trait Ivf: Send + Sync + std::fmt::Debug + Transformer {
     /// Compute the partitions for each vector in the input data.
     ///
     /// Parameters
@@ -202,25 +202,6 @@ pub trait Ivf: Send + Sync + std::fmt::Debug {
 
     /// Find the closest partitions for the query vector.
     fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array>;
-
-    /// Partition a batch of vectors into multiple batches, each batch contains vectors and other data.
-    ///
-    /// It transforms a [RecordBatch] that contains one vector column into a record batch with
-    /// schema `(PART_ID_COLUMN, ...)`, where [PART_ID_COLUMN] has the partition id for each vector.
-    ///
-    /// Parameters
-    /// ----------
-    /// - *batch*: input [RecordBatch]
-    /// - *column: the name of the vector column to be partitioned and transformed.
-    /// - *partion_ids*: optional precomputed partition IDs for each vector.
-    /// Note that the vector column might be transformed by the `transforms` in the IVF.
-    ///
-    /// **Warning**: unstable API.
-    async fn partition_transform(
-        &self,
-        batch: &RecordBatch,
-        partition_ids: Option<UInt32Array>,
-    ) -> Result<RecordBatch>;
 }
 
 /// IVF - IVF file partition
@@ -402,24 +383,15 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> Ivf for IvfImpl<T> {
         );
         Ok(kmeans.find_partitions(query.as_slice(), nprobes)?)
     }
+}
 
-    async fn partition_transform(
-        &self,
-        batch: &RecordBatch,
-        partition_ids: Option<UInt32Array>,
-    ) -> Result<RecordBatch> {
-        let mut batch = if let Some(part_ids) = partition_ids {
-            let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), false);
-            batch.try_with_column(field, Arc::new(part_ids))?
-        } else {
-            batch.clone()
-        };
-
-        // Transform each batch
+#[async_trait]
+impl<T: ArrowFloatType + Dot + L2> Transformer for IvfImpl<T> {
+    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let mut batch = batch.clone();
         for transform in self.transforms.as_slice() {
             batch = transform.transform(&batch).await?;
         }
-
         Ok(batch)
     }
 }
