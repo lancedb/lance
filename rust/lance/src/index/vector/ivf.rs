@@ -796,7 +796,7 @@ pub(super) async fn build_ivf_model(
 
     info!("Start to train IVF model");
     let start = std::time::Instant::now();
-    let ivf = train_ivf_model(&training_data, metric_type, params).await?;
+    let ivf = train_ivf_model(&training_data, mt, params).await?;
     info!(
         "Trained IVF model in {:02} seconds",
         start.elapsed().as_secs_f32()

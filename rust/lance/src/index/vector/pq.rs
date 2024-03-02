@@ -330,6 +330,7 @@ pub(super) async fn build_pq_model(
     );
 
     if metric_type == MetricType::Cosine {
+        info!("Normalize training data for PQ training: Cosine");
         training_data = normalize_fsl(&training_data)?;
     }
 
@@ -347,12 +348,7 @@ pub(super) async fn build_pq_model(
         println!("Compute residual for PQ training");
         span!(Level::INFO, "compute residual for PQ training")
             .in_scope(|| ivf2.compute_residual(&training_data, None))
-            .await?;
-        if metric_type == MetricType::Cosine {
-            normalize_fsl(&training_data)?
-        } else {
-            training_data
-        }
+            .await?
     } else {
         training_data
     };
