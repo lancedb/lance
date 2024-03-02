@@ -26,30 +26,23 @@ use async_trait::async_trait;
 use snafu::{location, Location};
 
 pub use builder::IvfBuildParams;
-use datafusion_expr::AggregateFunction::Median;
 use futures::{stream, StreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::kmeans::KMeans;
 use lance_linalg::{
     distance::{Cosine, Dot, MetricType, L2},
+    kernels::normalize_fsl,
     MatrixView,
 };
 
-pub mod builder;
-pub mod shuffler;
-mod transformer;
-
-use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
+use crate::vector::ivf::transform::IvfTransformer;
 use crate::vector::normalize::NormalizeTransformer;
 use crate::vector::{
     pq::{transform::PQTransformer, ProductQuantizer},
     residual::ResidualTransform,
     transform::Transformer,
 };
-pub use builder::IvfBuildParams;
-use lance_linalg::kernels::normalize_fsl;
-use lance_linalg::kmeans::KMeans;
 
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 
@@ -264,11 +257,11 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
 
         // Re-enable it after search path fixed.
-        // if metric_type == MetricType::Cosine {
-        //     transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
-        //         vector_column,
-        //     )));
-        // };
+        if metric_type == MetricType::Cosine {
+            transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
+                vector_column,
+            )));
+        };
 
         // TODO: add range filter
         let ivf_transform = Arc::new(IvfTransformer::new(

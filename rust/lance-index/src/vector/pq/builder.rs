@@ -100,16 +100,18 @@ impl PQBuildParams {
         data: &MatrixView<T>,
         metric_type: MetricType,
     ) -> Result<Arc<dyn ProductQuantizer + 'static>> {
+        assert_ne!(
+            metric_type,
+            MetricType::Cosine,
+            "PQ code does not support cosine"
+        );
+
+        const REDOS: usize = 1;
+
         let sub_vectors = divide_to_subvectors(&data, self.num_sub_vectors);
         let num_centroids = 2_usize.pow(self.num_bits as u32);
         let dimension = data.num_columns();
         let sub_vector_dimension = dimension / self.num_sub_vectors;
-
-        let (data, mt) = if metric_type == MetricType::Cosine {
-            (data.normalize(), MetricType::L2)
-        } else {
-            (data.clone(), metric_type)
-        };
 
         let d = stream::iter(sub_vectors.into_iter())
             .map(|sub_vec| async move {
@@ -122,7 +124,7 @@ impl PQBuildParams {
                     self.max_iters as u32,
                     REDOS,
                     rng.clone(),
-                    mt,
+                    metric_type,
                     self.sample_rate,
                 )
                 .await
