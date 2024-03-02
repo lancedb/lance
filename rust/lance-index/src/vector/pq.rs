@@ -24,9 +24,7 @@ use async_trait::async_trait;
 use lance_arrow::floats::FloatArray;
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{
-    cosine_distance_batch, dot_distance_batch, l2_distance_batch, Cosine, Dot, L2,
-};
+use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
 use lance_linalg::kernels::{argmin, argmin_value_float, normalize_fsl};
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
@@ -82,7 +80,7 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
 //
 // TODO: move this to be pub(crate) once we have a better way to test it.
 #[derive(Debug)]
-pub struct ProductQuantizerImpl<T: ArrowFloatType + Cosine + Dot + L2> {
+pub struct ProductQuantizerImpl<T: ArrowFloatType + Dot + L2> {
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
@@ -117,7 +115,7 @@ pub struct ProductQuantizerImpl<T: ArrowFloatType + Cosine + Dot + L2> {
     pub codebook: Arc<T::ArrayType>,
 }
 
-impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
+impl<T: ArrowFloatType + Dot + L2> ProductQuantizerImpl<T> {
     /// Create a [`ProductQuantizer`] with pre-trained codebook.
     pub fn new(
         m: usize,
@@ -201,11 +199,11 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                             lance_linalg::distance::DistanceType::L2 => {
                                 l2_distance_batch(sub_vec, centroids, sub_vector_width)
                             }
-                            lance_linalg::distance::DistanceType::Cosine => {
-                                cosine_distance_batch(sub_vec, centroids, sub_vector_width)
-                            }
                             lance_linalg::distance::DistanceType::Dot => {
                                 dot_distance_batch(sub_vec, centroids, sub_vector_width)
+                            }
+                            lance_linalg::distance::DistanceType::Cosine => {
+                                panic!("There should not be cosine for PQ");
                             }
                         };
                         argmin_value_float(distances).map(|(_, v)| v).unwrap_or(0.0)
@@ -321,7 +319,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
 }
 
 #[async_trait]
-impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for ProductQuantizerImpl<T> {
+impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantizerImpl<T> {
     fn as_any(&self) -> &dyn Any {
         self
     }
