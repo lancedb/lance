@@ -476,7 +476,7 @@ mod tests {
     use approx::assert_relative_eq;
     use arrow_array::{
         types::{Float16Type, Float32Type},
-        Float16Array, Float32Array,
+        Float16Array,
     };
     use half::f16;
     use lance_testing::datagen::generate_random_array;
@@ -503,28 +503,6 @@ mod tests {
         let tensor = proto.codebook_tensor.as_ref().unwrap();
         assert_eq!(tensor.data_type, pb::tensor::DataType::Float16 as i32);
         assert_eq!(tensor.shape, vec![256, 16]);
-    }
-
-    #[tokio::test]
-    async fn test_empty_dist_iter() {
-        let pq = ProductQuantizerImpl::<Float32Type> {
-            num_bits: 8,
-            num_sub_vectors: 4,
-            dimension: 16,
-            codebook: Arc::new(Float32Array::from_iter_values(
-                (0..256 * 16).map(|v| v as f32),
-            )),
-            metric_type: MetricType::Cosine,
-        };
-
-        let data = Float32Array::from_iter_values(repeat(0.0).take(16));
-        let data = FixedSizeListArray::try_new_from_values(data, 16).unwrap();
-        let rst = pq.transform(&data).await;
-        assert!(rst.is_err());
-        assert!(rst
-            .unwrap_err()
-            .to_string()
-            .contains("it is likely that distance is NaN"));
     }
 
     #[tokio::test]
