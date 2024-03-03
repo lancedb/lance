@@ -838,15 +838,13 @@ pub async fn build_ivf_pq_index(
     };
 
     let ivf_model = build_ivf_model(dataset, column, dim, metric_type, ivf_params).await?;
-    let pq = build_pq_model(
-        dataset,
-        column,
-        dim,
-        metric_type,
-        pq_params,
-        Some(&ivf_model),
-    )
-    .await?;
+
+    let ivf_residual = if matches!(metric_type, MetricType::Cosine | MetricType::L2) {
+        Some(&ivf_model)
+    } else {
+        None
+    };
+    let pq = build_pq_model(dataset, column, dim, metric_type, pq_params, ivf_residual).await?;
 
     // Transform data, compute residuals and sort by partition ids.
     let mut scanner = dataset.scan();
