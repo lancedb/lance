@@ -34,7 +34,7 @@ pub enum Error {
     },
     #[snafu(display("Dataset already exists: {uri}, {location}"))]
     DatasetAlreadyExists { uri: String, location: Location },
-    #[snafu(display("Append with different schema: {difference}"))]
+    #[snafu(display("Append with different schema: {difference}, location: {location}"))]
     SchemaMismatch {
         difference: String,
         location: Location,
