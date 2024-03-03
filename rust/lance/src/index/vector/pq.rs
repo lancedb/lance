@@ -167,7 +167,6 @@ impl VectorIndex for PQIndex {
             });
         }
         pre_filter.wait_for_ready().await?;
-        println!("PQIndex::search: metric type: {:?}", self.metric_type);
 
         let code = self.code.as_ref().unwrap().clone();
         let row_ids = self.row_ids.as_ref().unwrap().clone();
@@ -350,8 +349,6 @@ pub(super) async fn build_pq_model(
         info!("Normalize training data for PQ training: Cosine");
         training_data = normalize_fsl(&training_data)?;
     }
-
-    println!("PQ Training, ivf: {:?} ", ivf);
 
     let training_data = if let Some(ivf) = ivf {
         // Compute residual for PQ training.
