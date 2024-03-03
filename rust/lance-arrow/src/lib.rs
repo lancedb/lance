@@ -26,7 +26,7 @@ use arrow_array::{
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema};
 use arrow_select::take::take;
-use rand::{prelude::*, rngs::SmallRng, SeedableRng};
+use rand::prelude::*;
 
 pub mod schema;
 pub use schema::*;

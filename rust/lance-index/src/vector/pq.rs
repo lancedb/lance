@@ -21,7 +21,6 @@ use std::sync::Arc;
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array};
 use async_trait::async_trait;
-use lance_arrow::floats::FloatArray;
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
