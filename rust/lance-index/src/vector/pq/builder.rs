@@ -27,7 +27,7 @@ use arrow_schema::DataType;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::{ArrowFloatType, FloatArray};
 use lance_core::{Error, Result};
-use lance_linalg::distance::{Cosine, Dot, L2};
+use lance_linalg::distance::{Dot, L2};
 use lance_linalg::{distance::MetricType, MatrixView};
 use rand::{self, SeedableRng};
 use snafu::{location, Location};
@@ -95,23 +95,23 @@ impl PQBuildParams {
         }
     }
 
-    pub async fn build_from_matrix<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
+    pub async fn build_from_matrix<T: ArrowFloatType + Dot + L2 + 'static>(
         &self,
         data: &MatrixView<T>,
         metric_type: MetricType,
     ) -> Result<Arc<dyn ProductQuantizer + 'static>> {
-        let (data, mt) = if metric_type == MetricType::Cosine {
-            // Use normalize L2 to train for cosine distance.
-            (data.normalize(), MetricType::L2)
-        } else {
-            (data.clone(), metric_type)
-        };
+        assert_ne!(
+            metric_type,
+            MetricType::Cosine,
+            "PQ code does not support cosine"
+        );
 
-        let sub_vectors = divide_to_subvectors(&data, self.num_sub_vectors);
+        const REDOS: usize = 1;
+
+        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
         let num_centroids = 2_usize.pow(self.num_bits as u32);
         let dimension = data.num_columns();
         let sub_vector_dimension = dimension / self.num_sub_vectors;
-        const REDOS: usize = 1;
 
         let d = stream::iter(sub_vectors.into_iter())
             .map(|sub_vec| async move {
@@ -124,7 +124,7 @@ impl PQBuildParams {
                     self.max_iters as u32,
                     REDOS,
                     rng.clone(),
-                    mt,
+                    metric_type,
                     self.sample_rate,
                 )
                 .await
@@ -149,6 +149,8 @@ impl PQBuildParams {
     }
 
     /// Build a [ProductQuantizer] from the given data.
+    ///
+    /// If the [MetricType] is [MetricType::Cosine], the input data will be normalized.
     pub async fn build(
         &self,
         data: &dyn Array,
@@ -185,7 +187,7 @@ impl PQBuildParams {
 }
 
 fn create_typed_pq<
-    T: ArrowFloatType<ArrayType = PrimitiveArray<T>> + ArrowNumericType + L2 + Cosine + Dot,
+    T: ArrowFloatType<ArrayType = PrimitiveArray<T>> + ArrowNumericType + L2 + Dot,
 >(
     proto: &Pq,
     metric_type: MetricType,
@@ -202,6 +204,12 @@ fn create_typed_pq<
 
 /// Load ProductQuantizer from Protobuf
 pub fn from_proto(proto: &Pq, metric_type: MetricType) -> Result<Arc<dyn ProductQuantizer>> {
+    let mt = if metric_type == MetricType::Cosine {
+        MetricType::L2
+    } else {
+        metric_type
+    };
+
     if let Some(tensor) = &proto.codebook_tensor {
         let fsl = FixedSizeListArray::try_from(tensor)?;
 
@@ -209,21 +217,15 @@ pub fn from_proto(proto: &Pq, metric_type: MetricType) -> Result<Arc<dyn Product
             pb::tensor::DataType::Bfloat16 => {
                 unimplemented!()
             }
-            pb::tensor::DataType::Float16 => Ok(create_typed_pq::<Float16Type>(
-                proto,
-                metric_type,
-                fsl.values(),
-            )),
-            pb::tensor::DataType::Float32 => Ok(create_typed_pq::<Float32Type>(
-                proto,
-                metric_type,
-                fsl.values(),
-            )),
-            pb::tensor::DataType::Float64 => Ok(create_typed_pq::<Float64Type>(
-                proto,
-                metric_type,
-                fsl.values(),
-            )),
+            pb::tensor::DataType::Float16 => {
+                Ok(create_typed_pq::<Float16Type>(proto, mt, fsl.values()))
+            }
+            pb::tensor::DataType::Float32 => {
+                Ok(create_typed_pq::<Float32Type>(proto, mt, fsl.values()))
+            }
+            pb::tensor::DataType::Float64 => {
+                Ok(create_typed_pq::<Float64Type>(proto, mt, fsl.values()))
+            }
             _ => Err(Error::Index {
                 message: format!("PQ builder: unsupported data type: {:?}", tensor.data_type),
                 location: location!(),
