@@ -21,13 +21,13 @@ use std::sync::Arc;
 
 use lance_core::{Error, Result};
 use lance_linalg::{
-    distance::{Cosine, Dot, MetricType, L2},
+    distance::{Dot, MetricType, L2},
     kmeans::{KMeans, KMeansParams},
 };
 
 /// Train KMeans model and returns the centroids of each cluster.
 #[allow(clippy::too_many_arguments)]
-pub async fn train_kmeans<T: ArrowFloatType + Dot + L2 + Cosine>(
+pub async fn train_kmeans<T: ArrowFloatType + Dot + L2>(
     array: &T::ArrayType,
     centroids: Option<Arc<T::ArrayType>>,
     dimension: usize,

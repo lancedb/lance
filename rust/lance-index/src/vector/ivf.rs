@@ -253,19 +253,17 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
 
-        if metric_type == MetricType::Cosine {
+        let mt = if metric_type == MetricType::Cosine {
             transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
                 vector_column,
             )));
+            MetricType::L2
+        } else {
+            metric_type
         };
 
-        // TODO: add range filter
-        let ivf_transform = Arc::new(IvfTransformer::new(
-            centroids.clone(),
-            MetricType::L2,
-            vector_column,
-        ));
-        transforms.push(ivf_transform.clone() as Arc<dyn Transformer>);
+        let ivf_transform = Arc::new(IvfTransformer::new(centroids.clone(), mt, vector_column));
+        transforms.push(ivf_transform.clone());
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(

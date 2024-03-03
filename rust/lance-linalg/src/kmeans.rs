@@ -394,6 +394,7 @@ where
         let mut best_kmeans = Self::empty(k, dimension, params.metric_type);
         let mut best_stddev = f32::MAX;
 
+        // TODO: use seed for Rng.
         let rng = SmallRng::from_entropy();
         for redo in 1..=params.redos {
             let mut kmeans = if let Some(centroids) = params.centroids.as_ref() {
@@ -488,9 +489,6 @@ where
                             return compute_partitions_l2(centroids_array, values, dimension)
                                 .collect();
                         }
-                        MetricType::Cosine => {
-                            panic!("KMeans: should not use cosine distance to train kmeans, use L2 instead.");
-                        }
                         MetricType::Dot => values
                             .chunks_exact(dimension)
                             .map(|vector| {
@@ -498,6 +496,9 @@ where
                                 argmin_value(centroid_stream.map(|cent| dot_distance(vector, cent)))
                             })
                             .collect::<Vec<_>>(),
+                        MetricType::Cosine => {
+                            panic!("KMeans: should not use cosine distance to train kmeans, use L2 instead.");
+                        }
                     }
                 })
                 .await

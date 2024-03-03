@@ -286,27 +286,34 @@ pub(super) async fn build_pq_model(
     ivf: Option<&Ivf>,
 ) -> Result<Arc<dyn ProductQuantizer>> {
     if let Some(codebook) = &params.codebook {
+        let mt = if metric_type == MetricType::Cosine {
+            info!("Normalize training data for PQ training: Cosine");
+            MetricType::L2
+        } else {
+            metric_type
+        };
+
         return match codebook.data_type() {
             DataType::Float16 => Ok(Arc::new(ProductQuantizerImpl::<Float16Type>::new(
                 params.num_sub_vectors,
                 params.num_bits as u32,
                 dim,
                 Arc::new(codebook.as_primitive().clone()),
-                metric_type,
+                mt,
             ))),
             DataType::Float32 => Ok(Arc::new(ProductQuantizerImpl::<Float32Type>::new(
                 params.num_sub_vectors,
                 params.num_bits as u32,
                 dim,
                 Arc::new(codebook.as_primitive().clone()),
-                metric_type,
+                mt,
             ))),
             DataType::Float64 => Ok(Arc::new(ProductQuantizerImpl::<Float64Type>::new(
                 params.num_sub_vectors,
                 params.num_bits as u32,
                 dim,
                 Arc::new(codebook.as_primitive().clone()),
-                metric_type,
+                mt,
             ))),
             _ => {
                 return Err(Error::Index {

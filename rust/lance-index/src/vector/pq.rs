@@ -25,7 +25,7 @@ use lance_arrow::floats::FloatArray;
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
-use lance_linalg::kernels::{argmin, argmin_value_float, normalize_fsl};
+use lance_linalg::kernels::{argmin, argmin_value_float};
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 pub mod builder;
@@ -124,6 +124,11 @@ impl<T: ArrowFloatType + Dot + L2> ProductQuantizerImpl<T> {
         codebook: Arc<T::ArrayType>,
         metric_type: MetricType,
     ) -> Self {
+        assert_ne!(
+            metric_type,
+            MetricType::Cosine,
+            "Product quantization does not support cosine, use normalized L2 instead"
+        );
         assert_eq!(nbits, 8, "nbits can only be 8");
         Self {
             num_bits: nbits,
@@ -335,13 +340,6 @@ impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantiz
                 location: location!(),
             })?
             .clone();
-
-        let fsl = if self.metric_type == MetricType::Cosine {
-            // Normalize cosine vectors to unit length.
-            normalize_fsl(&fsl)?
-        } else {
-            fsl
-        };
 
         let num_sub_vectors = self.num_sub_vectors;
         let dim = self.dimension;
