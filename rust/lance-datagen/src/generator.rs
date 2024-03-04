@@ -880,13 +880,12 @@ const MS_PER_DAY: i64 = 86400000;
 pub mod array {
     use arrow_array::types::{
         ArrowPrimitiveType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-        UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
+        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     };
     use arrow_array::{ArrowNativeTypeOp, Date32Array, Date64Array, PrimitiveArray};
     use chrono::Utc;
     use rand::distributions::Uniform;
     use rand::prelude::Distribution;
-    use rand::Rng;
 
     use super::*;
 

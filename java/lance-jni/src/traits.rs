@@ -67,8 +67,10 @@ pub trait JMapExt {
 
     fn get_i64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<i64>>;
 
+    #[allow(dead_code)]
     fn get_f32(&self, env: &mut JNIEnv, key: &str) -> Result<Option<f32>>;
 
+    #[allow(dead_code)]
     fn get_f64(&self, env: &mut JNIEnv, key: &str) -> Result<Option<f64>>;
 }
 

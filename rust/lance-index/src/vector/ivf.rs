@@ -19,35 +19,35 @@ use std::sync::Arc;
 
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{
-    cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
+    cast::AsArray, Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, UInt32Array,
 };
-use arrow_schema::{DataType, Field};
-use arrow_select::take::take;
+use arrow_schema::DataType;
 use async_trait::async_trait;
-use futures::{stream, StreamExt};
+use snafu::{location, Location};
+
+pub use builder::IvfBuildParams;
 use lance_arrow::*;
 use lance_core::{Error, Result};
+use lance_linalg::kmeans::KMeans;
 use lance_linalg::{
     distance::{Cosine, Dot, MetricType, L2},
     MatrixView,
 };
-use log::info;
-use snafu::{location, Location};
-use tracing::{instrument, Instrument};
 
-pub mod builder;
-pub mod shuffler;
-
-use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
+use crate::vector::ivf::transform::IvfTransformer;
 use crate::vector::{
     pq::{transform::PQTransformer, ProductQuantizer},
     residual::ResidualTransform,
     transform::Transformer,
 };
-pub use builder::IvfBuildParams;
-use lance_linalg::kmeans::KMeans;
 
-fn new_ivf_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
+use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
+
+pub mod builder;
+pub mod shuffler;
+mod transform;
+
+fn new_ivf_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveType>(
     centroids: &T::ArrayType,
     dimension: usize,
     metric_type: MetricType,
@@ -55,7 +55,7 @@ fn new_ivf_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
     range: Option<Range<u32>>,
 ) -> Arc<dyn Ivf> {
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
-    Arc::new(IvfImpl::<T>::new(mat, metric_type, transforms, range))
+    Arc::new(IvfImpl::<T>::new(mat, metric_type, "", transforms, range))
 }
 
 /// Create an IVF from the flatten centroids.
@@ -106,7 +106,7 @@ pub fn new_ivf(
     }
 }
 
-fn new_ivf_with_pq_impl<T: ArrowFloatType + Dot + Cosine + L2 + 'static>(
+fn new_ivf_with_pq_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveType>(
     centroids: &T::ArrayType,
     dimension: usize,
     metric_type: MetricType,
@@ -170,7 +170,7 @@ pub fn new_ivf_with_pq(
 /// IVF - IVF file partition
 ///
 #[async_trait]
-pub trait Ivf: Send + Sync + std::fmt::Debug {
+pub trait Ivf: Send + Sync + std::fmt::Debug + Transformer {
     /// Compute the partitions for each vector in the input data.
     ///
     /// Parameters
@@ -202,32 +202,12 @@ pub trait Ivf: Send + Sync + std::fmt::Debug {
 
     /// Find the closest partitions for the query vector.
     fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array>;
-
-    /// Partition a batch of vectors into multiple batches, each batch contains vectors and other data.
-    ///
-    /// It transform a [RecordBatch] that contains one vector column into a record batch with
-    /// schema `(PART_ID_COLUMN, ...)`, where [PART_ID_COLUMN] has the partition id for each vector.
-    ///
-    /// Parameters
-    /// ----------
-    /// - *batch*: input [RecordBatch]
-    /// - *column: the name of the vector column to be partitioned and transformed.
-    /// - *partion_ids*: optional precomputed partition IDs for each vector.
-    /// Note that the vector column might be transformed by the `transforms` in the IVF.
-    ///
-    /// **Warning**: unstable API.
-    async fn partition_transform(
-        &self,
-        batch: &RecordBatch,
-        column: &str,
-        partition_ids: Option<UInt32Array>,
-    ) -> Result<RecordBatch>;
 }
 
 /// IVF - IVF file partition
 ///
 #[derive(Debug, Clone)]
-pub struct IvfImpl<T: ArrowFloatType + Dot + L2 + Cosine> {
+pub struct IvfImpl<T: ArrowFloatType + Dot + L2> {
     /// KMean model of the IVF
     ///
     /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
@@ -237,25 +217,30 @@ pub struct IvfImpl<T: ArrowFloatType + Dot + L2 + Cosine> {
     /// Transform applied to each partition.
     transforms: Vec<Arc<dyn Transformer>>,
 
+    ivf_transform: Arc<IvfTransformer<T>>,
+
     /// Metric type to compute pair-wise vector distance.
     metric_type: MetricType,
-
-    /// Only covers a range of partitions.
-    partition_range: Option<Range<u32>>,
 }
 
-impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
+impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
     pub fn new(
         centroids: MatrixView<T>,
         metric_type: MetricType,
+        vector_column: &str,
         transforms: Vec<Arc<dyn Transformer>>,
-        range: Option<Range<u32>>,
+        _range: Option<Range<u32>>,
     ) -> Self {
+        let ivf_transform = Arc::new(IvfTransformer::new(
+            centroids.clone(),
+            metric_type,
+            vector_column,
+        ));
         Self {
             centroids,
             metric_type,
             transforms,
-            partition_range: range,
+            ivf_transform,
         }
     }
 
@@ -266,96 +251,60 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> IvfImpl<T> {
         pq: Arc<dyn ProductQuantizer>,
         range: Option<Range<u32>>,
     ) -> Self {
-        let transforms: Vec<Arc<dyn Transformer>> = if pq.use_residual() {
-            vec![
-                Arc::new(ResidualTransform::new(
-                    centroids.clone(),
-                    PART_ID_COLUMN,
-                    vector_column,
-                )),
-                Arc::new(PQTransformer::new(
-                    pq.clone(),
-                    RESIDUAL_COLUMN,
-                    PQ_CODE_COLUMN,
-                )),
-            ]
+        let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
+
+        let mt = if metric_type == MetricType::Cosine {
+            transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
+                vector_column,
+            )));
+            MetricType::L2
         } else {
-            vec![Arc::new(PQTransformer::new(
+            metric_type
+        };
+
+        let ivf_transform = Arc::new(IvfTransformer::new(centroids.clone(), mt, vector_column));
+        transforms.push(ivf_transform.clone());
+
+        if let Some(range) = range {
+            transforms.push(Arc::new(transform::PartitionFilter::new(
+                PART_ID_COLUMN,
+                range,
+            )));
+        }
+
+        if pq.use_residual() {
+            transforms.push(Arc::new(ResidualTransform::new(
+                centroids.clone(),
+                PART_ID_COLUMN,
+                vector_column,
+            )));
+            transforms.push(Arc::new(PQTransformer::new(
+                pq.clone(),
+                RESIDUAL_COLUMN,
+                PQ_CODE_COLUMN,
+            )));
+        } else {
+            transforms.push(Arc::new(PQTransformer::new(
                 pq.clone(),
                 vector_column,
                 PQ_CODE_COLUMN,
-            ))]
+            )));
         };
         Self {
             centroids: centroids.clone(),
             metric_type,
             transforms,
-            partition_range: range,
+            ivf_transform,
         }
     }
 
     fn dimension(&self) -> usize {
         self.centroids.ndim()
     }
-
-    /// Compute the partition for each row in the input Matrix.
-    ///
-    #[instrument(level = "debug", skip(data))]
-    async fn do_compute_partitions(&self, data: &MatrixView<T>) -> UInt32Array {
-        use lance_linalg::kmeans::compute_partitions;
-
-        let dimension = data.ndim();
-        let centroids = self.centroids.data();
-        let data = data.data();
-        let metric_type = self.metric_type;
-
-        let num_centroids = centroids.len() / dimension;
-        let num_rows = data.len() / dimension;
-
-        let chunks = std::cmp::min(num_cpus::get(), num_rows);
-
-        info!(
-            "computing partition on {} chunks, out of {} centroids, and {} vectors",
-            chunks, num_centroids, num_rows,
-        );
-        // TODO: when usize::div_ceil() comes to stable Rust, we can use it here.
-        let chunk_size = num_rows / chunks + if num_rows % chunks > 0 { 1 } else { 0 };
-        let stride = chunk_size * dimension;
-
-        let result: Vec<Vec<Option<u32>>> = stream::iter(0..chunks)
-            .map(|chunk_id| stride * chunk_id..std::cmp::min(stride * (chunk_id + 1), data.len()))
-            // When there are a large number of CPUs and a small number of rows,
-            // it's possible there isn't an split of rows that there isn't
-            // an even split of rows that both covers all CPUs and all rows.
-            // For example, for 400 rows and 32 CPUs, 12-element chunks (12 * 32 = 384)
-            // wouldn't cover all rows but 13-element chunks (13 * 32 = 416) would
-            // have one empty chunk at the end. This filter removes those empty chunks.
-            .filter(|range| futures::future::ready(range.start < range.end))
-            .map(|range| async {
-                let range: Range<usize> = range;
-                let centroids = centroids.clone();
-                let data = Arc::new(
-                    data.slice(range.start, range.end - range.start)
-                        .as_any()
-                        .downcast_ref::<T::ArrayType>()
-                        .unwrap()
-                        .clone(),
-                );
-
-                compute_partitions::<T>(centroids, data, dimension, metric_type)
-                    .in_current_span()
-                    .await
-            })
-            .buffered(chunks)
-            .collect::<Vec<_>>()
-            .await;
-
-        UInt32Array::from_iter(result.iter().flatten().copied())
-    }
 }
 
 #[async_trait]
-impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
+impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> Ivf for IvfImpl<T> {
     async fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
         let array = data
             .values()
@@ -370,7 +319,7 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
                 location: Default::default(),
             })?;
         let mat = MatrixView::<T>::new(Arc::new(array.clone()), data.value_length());
-        Ok(self.do_compute_partitions(&mat).await)
+        Ok(self.ivf_transform.compute_partitions(&mat).await)
     }
 
     async fn compute_residual(
@@ -397,15 +346,15 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
             self.compute_partitions(original).await?
         };
         let dim = original.value_length() as usize;
-        let mut residual_arr: Vec<T::Native> = Vec::with_capacity(original.values().len());
-        flatten_arr
+        let residual_arr = flatten_arr
             .as_slice()
             .chunks_exact(dim)
             .zip(part_ids.values())
-            .for_each(|(vector, &part_id)| {
+            .flat_map(|(vector, &part_id)| {
                 let centroid = self.centroids.row(part_id as usize).unwrap();
-                residual_arr.extend(vector.iter().zip(centroid.iter()).map(|(&v, &c)| v - c));
-            });
+                vector.iter().zip(centroid.iter()).map(|(&v, &c)| v - c)
+            })
+            .collect::<Vec<_>>();
         let arr = T::ArrayType::from(residual_arr);
         Ok(FixedSizeListArray::try_new_from_values(arr, dim as i32)?)
     }
@@ -422,64 +371,24 @@ impl<T: ArrowFloatType + Dot + L2 + Cosine + 'static> Ivf for IvfImpl<T> {
                 ),
                 location: Default::default(),
             })?;
-        // todo: hold kmeans in this struct.
-        let kmeans = KMeans::<T>::with_centroids(
-            self.centroids.data().clone(),
-            self.dimension(),
-            self.metric_type,
-        );
+        let mt = if self.metric_type == MetricType::Cosine {
+            MetricType::L2
+        } else {
+            self.metric_type
+        };
+        let kmeans =
+            KMeans::<T>::with_centroids(self.centroids.data().clone(), self.dimension(), mt);
         Ok(kmeans.find_partitions(query.as_slice(), nprobes)?)
     }
+}
 
-    async fn partition_transform(
-        &self,
-        batch: &RecordBatch,
-        column: &str,
-        partition_ids: Option<UInt32Array>,
-    ) -> Result<RecordBatch> {
-        let vector_arr = batch.column_by_name(column).ok_or(Error::Index {
-            message: format!("Column {} does not exist.", column),
-            location: location!(),
-        })?;
-        let data = vector_arr.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "Column {} is not a vector type: {}",
-                column,
-                vector_arr.data_type()
-            ),
-            location: location!(),
-        })?;
-
-        let part_ids = if let Some(part_ids) = partition_ids {
-            part_ids
-        } else {
-            self.compute_partitions(data).await?
-        };
-
-        let (part_ids, batch) = if let Some(part_range) = self.partition_range.as_ref() {
-            let idx_in_range: UInt32Array = part_ids
-                .iter()
-                .enumerate()
-                .filter(|(_idx, part_id)| part_id.map(|r| part_range.contains(&r)).unwrap_or(false))
-                .map(|(idx, _)| idx as u32)
-                .collect();
-            let part_ids = take(&part_ids, &idx_in_range, None)?
-                .as_primitive::<UInt32Type>()
-                .clone();
-            let batch = batch.take(&idx_in_range)?;
-            (part_ids, batch)
-        } else {
-            (part_ids, batch.clone())
-        };
-
-        let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), false);
-        let mut batch = batch.try_with_column(field, Arc::new(part_ids))?;
-
-        // Transform each batch
+#[async_trait]
+impl<T: ArrowFloatType + Dot + L2> Transformer for IvfImpl<T> {
+    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let mut batch = batch.clone();
         for transform in self.transforms.as_slice() {
             batch = transform.transform(&batch).await?;
         }
-
         Ok(batch)
     }
 }

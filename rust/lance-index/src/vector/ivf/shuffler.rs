@@ -25,14 +25,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::types::UInt64Type;
 use arrow_array::{
-    cast::AsArray, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array, UInt8Array,
+    cast::AsArray, types::UInt64Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
+    UInt64Array, UInt8Array,
 };
 use arrow_schema::{DataType, Field as ArrowField, Field, Schema as ArrowSchema};
 use futures::stream::repeat_with;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
-use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::datatypes::Schema;
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
@@ -42,6 +42,7 @@ use lance_io::ReadBatchParams;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 
+use crate::vector::transform::{KeepFiniteVectors, Transformer};
 use crate::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use log::info;
@@ -90,12 +91,10 @@ pub async fn shuffle_dataset(
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
-    let column: Arc<str> = column.into();
-
     // TODO: dynamically detect schema from the transforms.
     let schema = Arc::new(arrow_schema::Schema::new(vec![
         ROW_ID_FIELD.clone(),
-        Field::new(PART_ID_COLUMN, DataType::UInt32, false),
+        Field::new(PART_ID_COLUMN, DataType::UInt32, true),
         Field::new(
             PQ_CODE_COLUMN,
             DataType::FixedSizeList(
@@ -127,40 +126,62 @@ pub async fn shuffle_dataset(
             Schema::try_from(schema.as_ref())?,
         )?;
 
+        let column = column.to_owned();
         let precomputed_partitions = precomputed_partitions.map(Arc::new);
         let stream = data
             .zip(repeat_with(move || ivf.clone()))
             .map(move |(b, ivf)| {
-                let col_ref = column.clone();
-
                 // If precomputed_partitions map is provided, use it
                 // for fast partitions.
                 let partition_map = precomputed_partitions
                     .as_ref()
                     .cloned()
                     .unwrap_or(Arc::new(HashMap::new()));
+                let nan_filter = KeepFiniteVectors::new(&column);
 
                 tokio::task::spawn(async move {
-                    let batch = b?;
+                    let mut batch = b?;
 
-                    let part_ids = if !partition_map.is_empty() {
+                    if !partition_map.is_empty() {
                         let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
                             message: "column does not exist".to_string(),
                             location: location!(),
                         })?;
-                        let part_ids = row_ids
-                            .as_primitive::<UInt64Type>()
-                            .values()
-                            .iter()
-                            .filter_map(|row_id| partition_map.get(row_id).copied())
-                            .collect::<Vec<_>>();
-                        Some(UInt32Array::from(part_ids))
-                    } else {
-                        None
-                    };
+                        let part_ids = UInt32Array::from_iter(
+                            row_ids
+                                .as_primitive::<UInt64Type>()
+                                .values()
+                                .iter()
+                                .map(|row_id| partition_map.get(row_id).copied()),
+                        );
+                        let part_ids = UInt32Array::from(part_ids);
+                        batch = batch
+                            .try_with_column(
+                                Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true),
+                                Arc::new(part_ids.clone()),
+                            )
+                            .expect("failed to add part id column");
 
-                    ivf.partition_transform(&batch, col_ref.as_ref(), part_ids)
-                        .await
+                        if part_ids.null_count() > 0 {
+                            info!(
+                                "Filter out rows without valid partition IDs: null_count={}",
+                                part_ids.null_count()
+                            );
+                            let indices = UInt32Array::from_iter(
+                                part_ids
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(idx, v)| v.map(|_| idx as u32)),
+                            );
+                            assert_eq!(indices.len(), batch.num_rows() - part_ids.null_count());
+                            batch = batch.take(&indices)?;
+                        }
+                    }
+
+                    // Filter out NaNs/Infs
+                    batch = nan_filter.transform(&batch).await?;
+
+                    ivf.transform(&batch).await
                 })
             })
             .buffer_unordered(num_cpus::get())
@@ -477,7 +498,7 @@ impl IvfShuffler {
                 // TODO: dynamically detect schema from the transforms.
                 let schema = Arc::new(ArrowSchema::new(vec![
                     ROW_ID_FIELD.clone(),
-                    ArrowField::new(PART_ID_COLUMN, DataType::UInt32, false),
+                    ArrowField::new(PART_ID_COLUMN, DataType::UInt32, true),
                     ArrowField::new(
                         PQ_CODE_COLUMN,
                         DataType::FixedSizeList(
@@ -572,7 +593,7 @@ mod test {
     fn make_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
             ROW_ID_FIELD.clone(),
-            ArrowField::new(PART_ID_COLUMN, DataType::UInt32, false),
+            ArrowField::new(PART_ID_COLUMN, DataType::UInt32, true),
             ArrowField::new(
                 PQ_CODE_COLUMN,
                 DataType::FixedSizeList(

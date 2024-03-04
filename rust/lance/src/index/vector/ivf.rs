@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ use lance_index::{
     vector::{
         hnsw::HNSWBuilder,
         ivf::{builder::load_precomputed_partitions, shuffler::shuffle_dataset, IvfBuildParams},
-        pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
+        pq::{PQBuildParams, ProductQuantizer},
         Query, DIST_COL,
     },
     Index, IndexType,
@@ -56,18 +56,21 @@ use lance_io::{
     traits::{Reader, WriteExt, Writer},
 };
 use lance_linalg::distance::{Cosine, Dot, MetricType, L2};
+use lance_linalg::kernels::{normalize_arrow, normalize_fsl};
 use log::{debug, info};
 use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::{location, Location};
-use tracing::{instrument, span, Level};
+use tracing::instrument;
 use uuid::Uuid;
 
-#[cfg(feature = "opq")]
-use super::opq::train_opq;
-use super::{pq::PQIndex, utils::maybe_sample_training_data, VectorIndex};
+use super::{
+    pq::{build_pq_model, PQIndex},
+    utils::maybe_sample_training_data,
+    VectorIndex,
+};
 use crate::dataset::builder::DatasetBuilder;
 use crate::{
     dataset::Dataset,
@@ -408,13 +411,20 @@ impl Index for IVFIndex {
 impl VectorIndex for IVFIndex {
     #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
-        let partition_ids =
-            self.ivf
-                .find_partitions(&query.key, query.nprobes, self.metric_type)?;
+        let mut query = query.clone();
+        let mt = if self.metric_type == MetricType::Cosine {
+            let key = normalize_arrow(&query.key)?;
+            query.key = key;
+            MetricType::L2
+        } else {
+            self.metric_type
+        };
+
+        let partition_ids = self.ivf.find_partitions(&query.key, query.nprobes, mt)?;
         assert!(partition_ids.len() <= query.nprobes);
         let part_ids = partition_ids.values().to_vec();
         let batches = stream::iter(part_ids)
-            .map(|part_id| self.search_in_partition(part_id as usize, query, pre_filter.clone()))
+            .map(|part_id| self.search_in_partition(part_id as usize, &query, pre_filter.clone()))
             .buffer_unordered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
@@ -562,7 +572,7 @@ pub(crate) struct Ivf {
     ///
     /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
     /// memory allocator.
-    centroids: Arc<FixedSizeListArray>,
+    pub(crate) centroids: Arc<FixedSizeListArray>,
 
     /// Offset of each partition in the file.
     offsets: Vec<usize>,
@@ -581,7 +591,7 @@ impl Ivf {
     }
 
     /// Ivf model dimension.
-    fn dimension(&self) -> usize {
+    pub(super) fn dimension(&self) -> usize {
         self.centroids.value_length() as usize
     }
 
@@ -726,6 +736,75 @@ fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
     Ok(())
 }
 
+/// Build IVF model from the dataset.
+///
+/// Parameters
+/// ----------
+/// - *dataset*: Dataset instance
+/// - *column*: vector column.
+/// - *dim*: vector dimension.
+/// - *metric_type*: distance metric type.
+/// - *params*: IVF build parameters.
+///
+/// Returns
+/// -------
+/// - IVF model.
+///
+/// Visibility: pub(super) for testing
+#[instrument(level = "debug", skip_all, name = "build_ivf_model")]
+pub(super) async fn build_ivf_model(
+    dataset: &Dataset,
+    column: &str,
+    dim: usize,
+    metric_type: MetricType,
+    params: &IvfBuildParams,
+) -> Result<Ivf> {
+    if let Some(centroids) = params.centroids.as_ref() {
+        info!("Pre-computed IVF centroids is provided, skip IVF training");
+        if centroids.values().len() != params.num_partitions * dim {
+            return Err(Error::Index {
+                message: format!(
+                    "IVF centroids length mismatch: {} != {}",
+                    centroids.len(),
+                    params.num_partitions * dim,
+                ),
+                location: location!(),
+            });
+        }
+        return Ok(Ivf::new(centroids.clone()));
+    }
+    let sample_size_hint = params.num_partitions * params.sample_rate;
+
+    let start = std::time::Instant::now();
+    info!(
+        "Loading training data for IVF. Sample size: {}",
+        sample_size_hint
+    );
+    let training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+    info!(
+        "Finished loading training data in {:02} seconds",
+        start.elapsed().as_secs_f32()
+    );
+
+    // If metric type is cosine, normalize the training data, and after this point,
+    // treat the metric type as L2.
+    let (training_data, mt) = if metric_type == MetricType::Cosine {
+        let training_data = normalize_fsl(&training_data)?;
+        (training_data, MetricType::L2)
+    } else {
+        (training_data, metric_type)
+    };
+
+    info!("Start to train IVF model");
+    let start = std::time::Instant::now();
+    let ivf = train_ivf_model(&training_data, mt, params).await?;
+    info!(
+        "Trained IVF model in {:02} seconds",
+        start.elapsed().as_secs_f32()
+    );
+    Ok(ivf)
+}
+
 /// Build IVF(PQ) index
 pub async fn build_ivf_pq_index(
     dataset: &Dataset,
@@ -759,151 +838,14 @@ pub async fn build_ivf_pq_index(
         });
     };
 
-    // Maximum to train [IvfBuildParams::sample_size](default 256) vectors per centroid, see Faiss.
-    let sample_size_hint = std::cmp::max(
-        ivf_params.num_partitions,
-        lance_index::vector::pq::num_centroids(pq_params.num_bits as u32),
-    ) * ivf_params.sample_rate;
+    let ivf_model = build_ivf_model(dataset, column, dim, metric_type, ivf_params).await?;
 
-    let mut training_data = if ivf_params.centroids.is_none() {
-        let start = std::time::Instant::now();
-        log::info!(
-            "Loading training data for IVF. Sample size: {}",
-            sample_size_hint
-        );
-        let data = Some(maybe_sample_training_data(dataset, column, sample_size_hint).await?);
-        log::info!(
-            "Finished loading training data in {:02} seconds",
-            start.elapsed().as_secs_f32()
-        );
-        data
+    let ivf_residual = if matches!(metric_type, MetricType::Cosine | MetricType::L2) {
+        Some(&ivf_model)
     } else {
         None
     };
-
-    #[cfg(feature = "opq")]
-    let mut transforms: Vec<Box<dyn Transformer>> = vec![];
-    #[cfg(not(feature = "opq"))]
-    let transforms: Vec<Box<dyn Transformer>> = vec![];
-
-    let start = std::time::Instant::now();
-    // Train IVF partitions.
-    let ivf_model = if let Some(centroids) = &ivf_params.centroids {
-        if centroids.values().len() != ivf_params.num_partitions * dim {
-            return Err(Error::Index {
-                message: format!(
-                    "IVF centroids length mismatch: {} != {}",
-                    centroids.len(),
-                    ivf_params.num_partitions * dim,
-                ),
-                location: location!(),
-            });
-        }
-        Ivf::new(centroids.clone())
-    } else {
-        // Transform training data if necessary.
-        for transform in transforms.iter() {
-            if let Some(training_data) = &mut training_data {
-                *training_data = transform.transform(training_data).await?;
-            }
-        }
-
-        info!("Start to train IVF model");
-        train_ivf_model(training_data.as_ref().unwrap(), metric_type, ivf_params).await?
-    };
-    info!(
-        "Trained IVF model in {:02} seconds",
-        start.elapsed().as_secs_f32()
-    );
-
-    let start = std::time::Instant::now();
-    let pq: Arc<dyn ProductQuantizer> = if let Some(codebook) = &pq_params.codebook {
-        match codebook.data_type() {
-            DataType::Float16 => Arc::new(ProductQuantizerImpl::<Float16Type>::new(
-                pq_params.num_sub_vectors,
-                pq_params.num_bits as u32,
-                dim,
-                Arc::new(codebook.as_primitive().clone()),
-                metric_type,
-            )),
-            DataType::Float32 => Arc::new(ProductQuantizerImpl::<Float32Type>::new(
-                pq_params.num_sub_vectors,
-                pq_params.num_bits as u32,
-                dim,
-                Arc::new(codebook.as_primitive().clone()),
-                metric_type,
-            )),
-            DataType::Float64 => Arc::new(ProductQuantizerImpl::<Float64Type>::new(
-                pq_params.num_sub_vectors,
-                pq_params.num_bits as u32,
-                dim,
-                Arc::new(codebook.as_primitive().clone()),
-                metric_type,
-            )),
-            _ => {
-                return Err(Error::Index {
-                    message: format!("Wrong codebook data type: {:?}", codebook.data_type()),
-                    location: location!(),
-                });
-            }
-        }
-    } else {
-        info!(
-            "Start to train PQ code: PQ{}, bits={}",
-            pq_params.num_sub_vectors, pq_params.num_bits
-        );
-        let expected_sample_size =
-            lance_index::vector::pq::num_centroids(pq_params.num_bits as u32)
-                * pq_params.sample_rate;
-        let training_data = if let Some(training_data) = training_data {
-            if training_data.value_length() as usize > expected_sample_size {
-                training_data.sample(expected_sample_size)?
-            } else {
-                training_data
-            }
-        } else {
-            let start = std::time::Instant::now();
-            log::info!(
-                "Loading training data for PQ. Sample size: {}",
-                expected_sample_size
-            );
-            let data = maybe_sample_training_data(dataset, column, expected_sample_size).await?;
-            log::info!(
-                "Finished loading training data in {:02} seconds",
-                start.elapsed().as_secs_f32()
-            );
-            data
-        };
-
-        // TODO: consolidate IVF models to `lance_index`.
-        let ivf2 = lance_index::vector::ivf::new_ivf(
-            ivf_model.centroids.values(),
-            ivf_model.dimension(),
-            metric_type,
-            vec![],
-            None,
-        )?;
-
-        info!(
-            "starting to compute partitions for PQ training, sample size: {}",
-            training_data.value_length()
-        );
-        // Compute the residual vector to train Product Quantizer.
-        // TODO: maybe use precomputed partitions here. since these are aggressively down sampled
-        // the time to compute them is not that bad.
-        let part_ids = ivf2.compute_partitions(&training_data).await?;
-
-        let training_data = if ivf_params.use_residual {
-            span!(Level::INFO, "compute residual for PQ training")
-                .in_scope(|| ivf2.compute_residual(&training_data, Some(&part_ids)))
-                .await?
-        } else {
-            training_data
-        };
-        info!("Start train PQ: params={:#?}", pq_params);
-        pq_params.build(&training_data, metric_type).await?
-    };
-    info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
+    let pq = build_pq_model(dataset, column, dim, metric_type, pq_params, ivf_residual).await?;
 
     // Transform data, compute residuals and sort by partition ids.
     let mut scanner = dataset.scan();
@@ -931,7 +873,7 @@ pub async fn build_ivf_pq_index(
         column,
         index_name,
         uuid,
-        &transforms,
+        &[],
         ivf_model,
         pq,
         metric_type,
@@ -1383,6 +1325,10 @@ async fn train_ivf_model(
     metric_type: MetricType,
     params: &IvfBuildParams,
 ) -> Result<Ivf> {
+    assert!(
+        metric_type != MetricType::Cosine,
+        "Cosine metric should be done by normalized L2 distance",
+    );
     let values = data.values();
     let dim = data.value_length() as usize;
     match values.data_type() {
@@ -1408,6 +1354,7 @@ mod tests {
 
     use std::collections::HashMap;
     use std::iter::repeat;
+    use std::ops::Range;
 
     use arrow_array::types::UInt64Type;
     use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader, UInt64Array};
@@ -1415,8 +1362,8 @@ mod tests {
     use lance_core::utils::address::RowAddress;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
-        generate_random_array, generate_random_array_with_seed, generate_scaled_random_array,
-        sample_without_replacement,
+        generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
+        generate_scaled_random_array, sample_without_replacement,
     };
     use rand::{seq::SliceRandom, thread_rng};
     use tempfile::tempdir;
@@ -1635,8 +1582,11 @@ mod tests {
         }
     }
 
-    async fn generate_test_dataset(test_uri: &str) -> (Dataset, Arc<FixedSizeListArray>) {
-        let vectors = generate_random_array(1000 * DIM);
+    async fn generate_test_dataset(
+        test_uri: &str,
+        range: Range<f32>,
+    ) -> (Dataset, Arc<FixedSizeListArray>) {
+        let vectors = generate_random_array_with_range(1000 * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();
@@ -1665,7 +1615,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let (mut dataset, vector_array) = generate_test_dataset(test_uri).await;
+        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
         let centroids = generate_random_array(2 * DIM);
         let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
@@ -1880,14 +1830,13 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let (mut dataset, vector_array) = generate_test_dataset(test_uri).await;
+        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
         let centroids = generate_random_array(2 * DIM);
         let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
         let ivf_params = IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
 
-        let codebook = Arc::new(generate_random_array(256 * DIM));
-        let pq_params = PQBuildParams::with_codebook(4, 8, codebook);
+        let pq_params = PQBuildParams::new(4, 8);
 
         let params =
             VectorIndexParams::with_ivf_pq_params(MetricType::Cosine, ivf_params, pq_params);
@@ -1913,12 +1862,75 @@ mod tests {
         assert_eq!(5, results[0].num_rows());
         for batch in results.iter() {
             let dist = &batch["_distance"];
-            assert!(dist
-                .as_primitive::<Float32Type>()
+            dist.as_primitive::<Float32Type>()
                 .values()
                 .iter()
-                .all(|v| (0.0..2.0).contains(v)));
+                .for_each(|v| {
+                    assert!(
+                        (0.0..2.0).contains(v),
+                        "Expect cosine value in range [0.0, 2.0], got: {}",
+                        v
+                    )
+                });
         }
+    }
+
+    #[tokio::test]
+    async fn test_build_ivf_model_l2() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let (dataset, _) = generate_test_dataset(test_uri, 1000.0..1100.0).await;
+
+        let ivf_params = IvfBuildParams::new(2);
+        let ivf_model = build_ivf_model(&dataset, "vector", DIM, MetricType::L2, &ivf_params)
+            .await
+            .unwrap();
+        assert_eq!(2, ivf_model.centroids.len());
+        assert_eq!(32, ivf_model.centroids.value_length());
+        assert_eq!(2, ivf_model.num_partitions());
+
+        // All centroids values should be in the range [1000, 1100]
+        ivf_model
+            .centroids
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .for_each(|v| {
+                assert!((1000.0..1100.0).contains(v));
+            });
+    }
+
+    #[tokio::test]
+    async fn test_build_ivf_model_cosine() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let (dataset, _) = generate_test_dataset(test_uri, 1000.0..1100.0).await;
+
+        let ivf_params = IvfBuildParams::new(2);
+        let ivf_model = build_ivf_model(&dataset, "vector", DIM, MetricType::Cosine, &ivf_params)
+            .await
+            .unwrap();
+        assert_eq!(2, ivf_model.centroids.len());
+        assert_eq!(32, ivf_model.centroids.value_length());
+        assert_eq!(2, ivf_model.num_partitions());
+
+        // All centroids values should be in the range [1000, 1100]
+        ivf_model
+            .centroids
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .for_each(|v| {
+                assert!(
+                    (-1.0..1.0).contains(v),
+                    "Expect cosine value in range [-1.0, 1.0], got: {}",
+                    v
+                );
+            });
     }
 
     #[tokio::test]
@@ -1926,7 +1938,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let (mut dataset, vector_array) = generate_test_dataset(test_uri).await;
+        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
         let centroids = generate_random_array(2 * DIM);
         let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
@@ -2114,11 +2126,7 @@ mod tests {
             true,
         )]));
 
-        let arr = generate_random_array(1000 * DIM)
-            .values()
-            .iter()
-            .map(|&v| v + 1000.0)
-            .collect::<Float32Array>();
+        let arr = generate_random_array_with_range(1000 * DIM, 1000.0..1001.0);
         let fsl = FixedSizeListArray::try_new_from_values(arr.clone(), DIM as i32).unwrap();
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
@@ -2126,7 +2134,7 @@ mod tests {
 
         let params = VectorIndexParams::ivf_pq(2, 8, 4, false, MetricType::Cosine, 50);
         dataset
-            .create_index(&[&"vector"], IndexType::Vector, None, &params, false)
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
@@ -2135,9 +2143,7 @@ mod tests {
             .await
             .unwrap();
         let ivf_idx = idx.as_any().downcast_ref::<IVFIndex>().unwrap();
-        // All centroids are normalized.
-        //
-        // If not normalized, the centroids should be on the mean of original vector space
+
         assert!(ivf_idx
             .ivf
             .centroids
@@ -2152,14 +2158,16 @@ mod tests {
             .as_any()
             .downcast_ref::<PQIndex>()
             .unwrap();
-        assert!(pq_idx
+
+        // PQ code is on residual space
+        pq_idx
             .pq
             .codebook_as_fsl()
             .values()
             .as_primitive::<Float32Type>()
             .values()
             .iter()
-            .all(|v| (0.0..=1.0).contains(v)));
+            .for_each(|v| assert!((-1.0..=1.0).contains(v), "Got {}", v));
 
         let dataset = Dataset::open(test_uri).await.unwrap();
 
@@ -2180,7 +2188,7 @@ mod tests {
                 .unwrap()
                 .as_primitive::<UInt64Type>()
                 .value(0);
-            println!("Row id: {}", row_id);
+            println!("Row id: {} query_id: {}", row_id, query_id);
             if row_id == (query_id as u64) {
                 correct_times += 1;
             }

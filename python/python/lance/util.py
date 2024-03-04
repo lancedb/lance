@@ -78,7 +78,7 @@ class KMeans:
     >>> import numpy as np
     >>> import lance
     >>> data = np.random.randn(1000, 128).astype(np.float32)
-    >>> kmeans = lance.util.KMeans(8, metric_type="cosine")
+    >>> kmeans = lance.util.KMeans(8, metric_type="l2")
     >>> kmeans.fit(data)
     >>> centroids = np.stack(kmeans.centroids.to_numpy(zero_copy_only=False))
     >>> clusters = kmeans.predict(data)

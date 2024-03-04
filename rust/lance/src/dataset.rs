@@ -46,7 +46,6 @@ use log::warn;
 use object_store::path::Path;
 use snafu::{location, Location};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::default::Default;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;

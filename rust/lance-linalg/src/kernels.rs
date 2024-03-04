@@ -14,19 +14,23 @@
 
 use std::cmp::Ordering;
 use std::iter::Sum;
+use std::sync::Arc;
 use std::{collections::hash_map::DefaultHasher, hash::Hash, hash::Hasher};
 
 use arrow_array::{
-    cast::{as_largestring_array, as_primitive_array, as_string_array},
+    cast::{as_largestring_array, as_primitive_array, as_string_array, AsArray},
     types::{
-        Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrowNumericType, GenericStringArray, OffsetSizeTrait, PrimitiveArray, UInt64Array,
+    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, FixedSizeListArray, GenericStringArray,
+    OffsetSizeTrait, PrimitiveArray, UInt64Array,
 };
 use arrow_schema::{ArrowError, DataType};
+use lance_arrow::ArrowFloatType;
 use num_traits::{bounds::Bounded, Float, Num};
 
-use crate::Result;
+use crate::{Error, MatrixView, Result};
 
 /// Argmax on a [PrimitiveArray].
 ///
@@ -128,6 +132,54 @@ pub fn argmin_opt<T: Num + Bounded + PartialOrd>(
 pub fn normalize<T: Float + Sum>(v: &[T]) -> impl Iterator<Item = T> + '_ {
     let l2_norm = v.iter().map(|x| x.powi(2)).sum::<T>().sqrt();
     v.iter().map(move |&x| x / l2_norm)
+}
+
+fn do_normalize_arrow<T: ArrowPrimitiveType>(arr: &dyn Array) -> Result<ArrayRef>
+where
+    <T as ArrowPrimitiveType>::Native: Float + Sum,
+{
+    let v = arr.as_primitive::<T>();
+    Ok(Arc::new(PrimitiveArray::<T>::from_iter_values(normalize(v.values()))) as ArrayRef)
+}
+
+pub fn normalize_arrow(v: &dyn Array) -> Result<ArrayRef> {
+    match v.data_type() {
+        DataType::Float16 => do_normalize_arrow::<Float16Type>(v),
+        DataType::Float32 => do_normalize_arrow::<Float32Type>(v),
+        DataType::Float64 => do_normalize_arrow::<Float64Type>(v),
+        _ => Err(Error::SchemaError(format!(
+            "Normalize only supports float array, got: {}",
+            v.data_type()
+        ))),
+    }
+}
+
+fn do_normalize_fsl<T: ArrowPrimitiveType + ArrowFloatType>(
+    fsl: &FixedSizeListArray,
+) -> Result<FixedSizeListArray>
+where
+    <T as ArrowPrimitiveType>::Native: Float + Sum,
+{
+    let mat = MatrixView::<T>::try_from(fsl).map_err(|e| {
+        Error::SchemaError(format!("Convert FixedSizeList to MatrixView failed: {}", e))
+    })?;
+    let normalized = mat.normalize();
+    normalized.try_into().map_err(|e| {
+        Error::SchemaError(format!("Convert MatrixView to FixedSizeList failed: {}", e))
+    })
+}
+
+/// L2 normalize a [FixedSizeListArray] (of vectors).
+pub fn normalize_fsl(fsl: &FixedSizeListArray) -> Result<FixedSizeListArray> {
+    match fsl.value_type() {
+        DataType::Float16 => do_normalize_fsl::<Float16Type>(fsl),
+        DataType::Float32 => do_normalize_fsl::<Float32Type>(fsl),
+        DataType::Float64 => do_normalize_fsl::<Float64Type>(fsl),
+        _ => Err(ArrowError::SchemaError(format!(
+            "Normalize only supports float array, got: {}",
+            fsl.value_type()
+        ))),
+    }
 }
 
 fn hash_numeric_type<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Result<UInt64Array>

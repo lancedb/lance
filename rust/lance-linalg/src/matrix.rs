@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrowPrimitiveType, FixedSizeListArray};
 use arrow_schema::{ArrowError, DataType};
-use lance_arrow::{ArrowFloatType, FloatArray, FloatType};
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, FloatType};
 use num_traits::{AsPrimitive, Float, FromPrimitive, ToPrimitive};
 use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
 
@@ -310,6 +310,14 @@ impl<T: ArrowFloatType> MatrixView<T> {
             data: self,
             cur_idx: 0,
         }
+    }
+}
+
+impl<T: ArrowFloatType> TryFrom<MatrixView<T>> for FixedSizeListArray {
+    type Error = Error;
+
+    fn try_from(value: MatrixView<T>) -> Result<Self> {
+        Self::try_new_from_values(value.data.as_ref().clone(), value.num_columns as i32)
     }
 }
 

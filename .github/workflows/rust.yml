@@ -121,6 +121,10 @@ jobs:
           workspaces: rust
       - name: Install dependencies
         run: brew install protobuf
+      - name: Set up Rust
+        run: |
+          rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
+          rustup component add rustfmt
       - name: Run tests
         run: |
           cargo build --all-features
