@@ -158,7 +158,6 @@ where
 mod tests {
     use super::*;
     use crate::test_utils::{arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64};
-    use approx::assert_relative_eq;
     use proptest::prelude::*;
 
     /// Reference implementation of L2 norm.

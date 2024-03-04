@@ -288,7 +288,6 @@ mod tests {
     use crate::test_utils::{
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
     };
-    use approx::assert_relative_eq;
     use num_traits::{Float, FromPrimitive};
     use proptest::prelude::*;
 
