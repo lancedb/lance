@@ -98,7 +98,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_releaseNativeDataset(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragments<'a>(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragmentsNative<'a>(
     mut env: JNIEnv<'a>,
     jdataset: JObject,
 ) -> JObject<'a> {

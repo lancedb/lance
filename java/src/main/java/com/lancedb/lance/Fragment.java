@@ -18,6 +18,12 @@ package com.lancedb.lance;
  *
  */
 public class Fragment {
+  /** Pointer to the {@link Dataset} instance in Java.
+   *
+   * This object can be GC-ed by JVM.
+   */
+  Dataset dataset;
+
   // Only keep fragmentId for reference, so we don't need to make this
   // object to be {@link Closable} to track Rust native object.
   private final long fragmentId;

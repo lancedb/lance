@@ -27,11 +27,11 @@ import org.apache.arrow.c.ArrowArrayStream;
  * It implements the {@link java.io.Closeable} interface to ensure proper resource management.
  */
 public class Dataset implements Closeable {
-  private long nativeDatasetHandle;
-
   static {
     JarJniLoader.loadLib(Dataset.class, "/nativelib", "lance_jni");
   }
+
+  private long nativeDatasetHandle;
 
   private Dataset() {
   }
@@ -58,11 +58,16 @@ public class Dataset implements Closeable {
    */
   public native int countRows();
 
-  /** Get all fragments in this dataset.
+  /**
+   * Get all fragments in this dataset.
    *
    * @return A list of {@link Fragment}.
    */
-  public native List<Fragment> getFragments();
+  public List<Fragment> getFragments() {
+    return  this.getFragmentsNative().stream().peek(f -> f.dataset = this).toList();
+  }
+
+  private native List<Fragment> getFragmentsNative();
 
   /**
    * Closes this dataset and releases any system resources associated with it.
