@@ -1915,7 +1915,7 @@ mod tests {
 
         let params = VectorIndexParams::ivf_pq(2, 8, 4, false, MetricType::Cosine, 50);
         dataset
-            .create_index(&[&"vector"], IndexType::Vector, None, &params, false)
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();

@@ -29,7 +29,7 @@ use lance_arrow::{ArrowFloatType, FloatArray};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{Dot, L2};
 use lance_linalg::{distance::MetricType, MatrixView};
-use rand::{self, SeedableRng};
+use rand::SeedableRng;
 use snafu::{location, Location};
 
 use super::utils::divide_to_subvectors;

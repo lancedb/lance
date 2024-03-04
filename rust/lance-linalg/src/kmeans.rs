@@ -33,7 +33,6 @@ use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 use log::{info, warn};
 use num_traits::{AsPrimitive, Float, FromPrimitive, Zero};
 use rand::prelude::*;
-use rand::Rng;
 use tracing::instrument;
 
 use crate::distance::dot_distance_batch;
