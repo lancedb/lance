@@ -20,7 +20,13 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 from helper import ProgressForTest
-from lance import FragmentMetadata, LanceDataset, LanceFragment, LanceOperation
+from lance import (
+    FragmentMetadata,
+    LanceDataset,
+    LanceFragment,
+    LanceOperation,
+    write_dataset,
+)
 from lance.fragment import write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
@@ -59,6 +65,20 @@ def test_write_fragment_two_phases(tmp_path: Path):
     pd.testing.assert_frame_equal(
         df, pd.DataFrame({"a": [i * 10 for i in range(num_files)]})
     )
+
+
+def test_scan_fragment(tmp_path: Path):
+    tab = pa.table({"a": range(100), "b": range(100, 200)})
+    ds = write_dataset(tab, tmp_path)
+    frag = ds.get_fragments()[0]
+
+    actual = frag.to_table(
+        columns=["b"],
+        filter="a >= 2",
+        offset=20,
+    )
+    expected = pa.table({"b": range(122, 200)})
+    assert actual == expected
 
 
 def test_write_fragments(tmp_path: Path):
