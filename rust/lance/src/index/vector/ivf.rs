@@ -40,6 +40,7 @@ use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
+        hnsw::HNSWBuilder,
         ivf::{builder::load_precomputed_partitions, shuffler::shuffle_dataset, IvfBuildParams},
         pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
         Query, DIST_COL,
@@ -734,6 +735,224 @@ pub async fn build_ivf_pq_index(
     metric_type: MetricType,
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
+) -> Result<()> {
+    sanity_check_params(ivf_params, pq_params)?;
+
+    info!(
+        "Building vector index: IVF{},{}PQ{}, metric={}",
+        ivf_params.num_partitions,
+        if pq_params.use_opq { "O" } else { "" },
+        pq_params.num_sub_vectors,
+        metric_type,
+    );
+
+    let field = sanity_check(dataset, column)?;
+    let dim = if let DataType::FixedSizeList(_, d) = field.data_type() {
+        d as usize
+    } else {
+        return Err(Error::Index {
+            message: format!(
+                "VectorIndex requires the column data type to be fixed size list of floats, got {}",
+                field.data_type()
+            ),
+            location: location!(),
+        });
+    };
+
+    // Maximum to train [IvfBuildParams::sample_size](default 256) vectors per centroid, see Faiss.
+    let sample_size_hint = std::cmp::max(
+        ivf_params.num_partitions,
+        lance_index::vector::pq::num_centroids(pq_params.num_bits as u32),
+    ) * ivf_params.sample_rate;
+
+    let mut training_data = if ivf_params.centroids.is_none() {
+        let start = std::time::Instant::now();
+        log::info!(
+            "Loading training data for IVF. Sample size: {}",
+            sample_size_hint
+        );
+        let data = Some(maybe_sample_training_data(dataset, column, sample_size_hint).await?);
+        log::info!(
+            "Finished loading training data in {:02} seconds",
+            start.elapsed().as_secs_f32()
+        );
+        data
+    } else {
+        None
+    };
+
+    #[cfg(feature = "opq")]
+    let mut transforms: Vec<Box<dyn Transformer>> = vec![];
+    #[cfg(not(feature = "opq"))]
+    let transforms: Vec<Box<dyn Transformer>> = vec![];
+
+    let start = std::time::Instant::now();
+    // Train IVF partitions.
+    let ivf_model = if let Some(centroids) = &ivf_params.centroids {
+        if centroids.values().len() != ivf_params.num_partitions * dim {
+            return Err(Error::Index {
+                message: format!(
+                    "IVF centroids length mismatch: {} != {}",
+                    centroids.len(),
+                    ivf_params.num_partitions * dim,
+                ),
+                location: location!(),
+            });
+        }
+        Ivf::new(centroids.clone())
+    } else {
+        // Transform training data if necessary.
+        for transform in transforms.iter() {
+            if let Some(training_data) = &mut training_data {
+                *training_data = transform.transform(training_data).await?;
+            }
+        }
+
+        info!("Start to train IVF model");
+        train_ivf_model(training_data.as_ref().unwrap(), metric_type, ivf_params).await?
+    };
+    info!(
+        "Trained IVF model in {:02} seconds",
+        start.elapsed().as_secs_f32()
+    );
+
+    let start = std::time::Instant::now();
+    let pq: Arc<dyn ProductQuantizer> = if let Some(codebook) = &pq_params.codebook {
+        match codebook.data_type() {
+            DataType::Float16 => Arc::new(ProductQuantizerImpl::<Float16Type>::new(
+                pq_params.num_sub_vectors,
+                pq_params.num_bits as u32,
+                dim,
+                Arc::new(codebook.as_primitive().clone()),
+                metric_type,
+            )),
+            DataType::Float32 => Arc::new(ProductQuantizerImpl::<Float32Type>::new(
+                pq_params.num_sub_vectors,
+                pq_params.num_bits as u32,
+                dim,
+                Arc::new(codebook.as_primitive().clone()),
+                metric_type,
+            )),
+            DataType::Float64 => Arc::new(ProductQuantizerImpl::<Float64Type>::new(
+                pq_params.num_sub_vectors,
+                pq_params.num_bits as u32,
+                dim,
+                Arc::new(codebook.as_primitive().clone()),
+                metric_type,
+            )),
+            _ => {
+                return Err(Error::Index {
+                    message: format!("Wrong codebook data type: {:?}", codebook.data_type()),
+                    location: location!(),
+                });
+            }
+        }
+    } else {
+        info!(
+            "Start to train PQ code: PQ{}, bits={}",
+            pq_params.num_sub_vectors, pq_params.num_bits
+        );
+        let expected_sample_size =
+            lance_index::vector::pq::num_centroids(pq_params.num_bits as u32)
+                * pq_params.sample_rate;
+        let training_data = if let Some(training_data) = training_data {
+            if training_data.value_length() as usize > expected_sample_size {
+                training_data.sample(expected_sample_size)?
+            } else {
+                training_data
+            }
+        } else {
+            let start = std::time::Instant::now();
+            log::info!(
+                "Loading training data for PQ. Sample size: {}",
+                expected_sample_size
+            );
+            let data = maybe_sample_training_data(dataset, column, expected_sample_size).await?;
+            log::info!(
+                "Finished loading training data in {:02} seconds",
+                start.elapsed().as_secs_f32()
+            );
+            data
+        };
+
+        // TODO: consolidate IVF models to `lance_index`.
+        let ivf2 = lance_index::vector::ivf::new_ivf(
+            ivf_model.centroids.values(),
+            ivf_model.dimension(),
+            metric_type,
+            vec![],
+            None,
+        )?;
+
+        info!(
+            "starting to compute partitions for PQ training, sample size: {}",
+            training_data.value_length()
+        );
+        // Compute the residual vector to train Product Quantizer.
+        // TODO: maybe use precomputed partitions here. since these are aggressively down sampled
+        // the time to compute them is not that bad.
+        let part_ids = ivf2.compute_partitions(&training_data).await?;
+
+        let training_data = if ivf_params.use_residual {
+            span!(Level::INFO, "compute residual for PQ training")
+                .in_scope(|| ivf2.compute_residual(&training_data, Some(&part_ids)))
+                .await?
+        } else {
+            training_data
+        };
+        info!("Start train PQ: params={:#?}", pq_params);
+        pq_params.build(&training_data, metric_type).await?
+    };
+    info!("Trained PQ in: {} seconds", start.elapsed().as_secs_f32());
+
+    // Transform data, compute residuals and sort by partition ids.
+    let mut scanner = dataset.scan();
+    scanner.batch_readahead(num_cpus::get() * 2);
+    scanner.project(&[column])?;
+    scanner.with_row_id();
+
+    // Scan the dataset and compute residual, pq with with partition ID.
+    // For now, it loads all data into memory.
+    let stream = scanner.try_into_stream().await?;
+
+    let precomputed_partitions = match &ivf_params.precomputed_partitons_file {
+        Some(file) => {
+            info!("Loading precomputed partitions from file: {}", file);
+            let ds = DatasetBuilder::from_uri(file).load().await?;
+            let stream = ds.scan().try_into_stream().await?;
+
+            Some(load_precomputed_partitions(stream, ds.count_rows().await?).await?)
+        }
+        None => None,
+    };
+
+    write_index_file(
+        dataset,
+        column,
+        index_name,
+        uuid,
+        &transforms,
+        ivf_model,
+        pq,
+        metric_type,
+        stream,
+        precomputed_partitions,
+        ivf_params.shuffle_partition_batches,
+        ivf_params.shuffle_partition_concurrency,
+        ivf_params.precomputed_shuffle_buffers.clone(),
+    )
+    .await
+}
+
+/// Build IVF_HNSW index
+pub async fn build_ivf_hnsw_index(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    uuid: &str,
+    metric_type: MetricType,
+    ivf_params: &IvfBuildParams,
+    hnsw_params: &HNSWBuilder,
 ) -> Result<()> {
     sanity_check_params(ivf_params, pq_params)?;
 

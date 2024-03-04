@@ -63,6 +63,7 @@ lazy_static::lazy_static! {
 
 /// One level of the HNSW graph.
 ///
+#[derive(Clone)]
 struct HnswLevel {
     /// Vector ID to the node index in `nodes`.
     /// The node on different layer share the same Vector ID, which is the index
@@ -179,6 +180,7 @@ impl Graph for HnswLevel {
 
 /// HNSW graph.
 ///
+#[derive(Clone)]
 pub struct HNSW {
     levels: Vec<HnswLevel>,
     metric_type: MetricType,
@@ -216,6 +218,10 @@ struct HnswMetadata {
 }
 
 impl HNSW {
+    pub fn metric_type(&self) -> MetricType {
+        self.metric_type
+    }
+
     /// Load the HNSW graph from a [FileReader].
     ///
     /// Parameters

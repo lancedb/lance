@@ -26,6 +26,12 @@ use super::{select_neighbors, select_neighbors_heuristic, HNSW};
 use crate::vector::graph::{builder::GraphBuilder, greedy_search, storage::VectorStorage};
 use crate::vector::hnsw::HnswLevel;
 
+/// Parameters of building HNSW index
+#[derive(Debug,Clone)]
+pub struct HnswBuildParams {
+    
+}
+
 /// Build a HNSW graph.
 ///
 /// Currently, the HNSW graph is fully built in memory.
@@ -33,6 +39,7 @@ use crate::vector::hnsw::HnswLevel;
 /// During the build, the graph is built layer by layer.
 ///
 /// Each node in the graph has a global ID which is the index on the base layer.
+#[derive(Clone)]
 pub struct HNSWBuilder {
     /// max level of
     max_level: u16,
