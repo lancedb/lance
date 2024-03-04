@@ -366,7 +366,7 @@ mod tests {
     };
     use approx::assert_relative_eq;
     use arrow_array::Float32Array;
-    use proptest::prop_assume;
+    use proptest::prelude::*;
 
     fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
         let xy = x
@@ -436,7 +436,10 @@ mod tests {
         (expected, error)
     }
 
-    fn do_cosine_test<T: FloatToArrayType>(x: &[T], y: &[T])
+    fn do_cosine_test<T: FloatToArrayType>(
+        x: &[T],
+        y: &[T],
+    ) -> std::result::Result<(), TestCaseError>
     where
         T::ArrowType: Cosine,
     {
@@ -446,7 +449,8 @@ mod tests {
         let (expected, max_error) = cosine_ref(&x_f64, &y_f64, 1e-6);
         let result = T::ArrowType::cosine(x, y);
 
-        assert_relative_eq!(result, expected, epsilon = max_error);
+        prop_assert!(approx::relative_eq!(result, expected, epsilon = max_error));
+        Ok(())
     }
 
     proptest::proptest! {
@@ -455,28 +459,28 @@ mod tests {
             // Cosine requires non-zero vectors
             prop_assume!(norm_l2(&x) > 1e-6);
             prop_assume!(norm_l2(&y) > 1e-6);
-            do_cosine_test(&x, &y);
+            do_cosine_test(&x, &y)?;
         }
 
         #[test]
         fn test_cosine_bf16((x, y) in arbitrary_vector_pair(arbitrary_bf16, 4..4048)){
             prop_assume!(norm_l2(&x) > 1e-6);
             prop_assume!(norm_l2(&y) > 1e-6);
-            do_cosine_test(&x, &y);
+            do_cosine_test(&x, &y)?;
         }
 
         #[test]
         fn test_cosine_f32((x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)){
             prop_assume!(norm_l2(&x) > 1e-10);
             prop_assume!(norm_l2(&y) > 1e-10);
-            do_cosine_test(&x, &y);
+            do_cosine_test(&x, &y)?;
         }
 
         #[test]
         fn test_cosine_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
             prop_assume!(norm_l2(&x) > 1e-20);
             prop_assume!(norm_l2(&y) > 1e-20);
-            do_cosine_test(&x, &y);
+            do_cosine_test(&x, &y)?;
         }
     }
 }

@@ -166,7 +166,7 @@ mod tests {
         data.iter().map(|v| (*v * *v)).sum::<f64>().sqrt() as f32
     }
 
-    fn do_norm_l2_test<T: FloatToArrayType>(data: &[T])
+    fn do_norm_l2_test<T: FloatToArrayType>(data: &[T]) -> std::result::Result<(), TestCaseError>
     where
         T::ArrowType: Normalize,
     {
@@ -178,28 +178,29 @@ mod tests {
         let result = norm_l2(data);
         let reference = norm_l2_reference(&f64_data);
 
-        assert_relative_eq!(result, reference, max_relative = 1e-6);
+        prop_assert!(approx::relative_eq!(result, reference, max_relative = 1e-6));
+        Ok(())
     }
 
     proptest::proptest! {
         #[test]
         fn test_l2_norm_f16(data in prop::collection::vec(arbitrary_f16(), 4..4048)) {
-            do_norm_l2_test(&data);
+            do_norm_l2_test(&data)?;
         }
 
         #[test]
         fn test_l2_norm_bf16(data in prop::collection::vec(arbitrary_bf16(), 4..4048)){
-            do_norm_l2_test(&data);
+            do_norm_l2_test(&data)?;
         }
 
         #[test]
         fn test_l2_norm_f32(data in prop::collection::vec(arbitrary_f32(), 4..4048)){
-            do_norm_l2_test(&data);
+            do_norm_l2_test(&data)?;
         }
 
         #[test]
         fn test_l2_norm_f64(data in prop::collection::vec(arbitrary_f64(), 4..4048)){
-            do_norm_l2_test(&data);
+            do_norm_l2_test(&data)?;
         }
     }
 }

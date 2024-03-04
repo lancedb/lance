@@ -294,6 +294,7 @@ mod tests {
 
     use approx::assert_relative_eq;
     use arrow_array::Float32Array;
+    use proptest::prelude::*;
 
     use crate::test_utils::{
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
@@ -406,7 +407,7 @@ mod tests {
             .sum::<f64>()
     }
 
-    fn do_l2_test<T: FloatToArrayType>(x: &[T], y: &[T])
+    fn do_l2_test<T: FloatToArrayType>(x: &[T], y: &[T]) -> std::result::Result<(), TestCaseError>
     where
         T::ArrowType: L2,
     {
@@ -416,7 +417,15 @@ mod tests {
         let result = l2(x, y);
         let reference = l2_distance_reference(&x_f64, &y_f64) as f32;
 
-        assert_relative_eq!(result, reference, max_relative = 1e-6);
+        prop_assert!(approx::relative_eq!(result, reference, max_relative = 1e-6));
+        Ok(())
+    }
+
+    #[test]
+    fn test_l2_distance_f16_max() {
+        let x = vec![f16::MAX; 4048];
+        let y = vec![-f16::MAX; 4048];
+        do_l2_test(&x, &y).unwrap();
     }
 
     // Test L2 distance over different types.
@@ -426,22 +435,22 @@ mod tests {
     proptest::proptest! {
         #[test]
         fn test_l2_distance_f16((x, y) in arbitrary_vector_pair(arbitrary_f16, 4..4048)) {
-            do_l2_test(&x, &y);
+            do_l2_test(&x, &y)?;
         }
 
         #[test]
         fn test_l2_distance_bf16((x, y) in arbitrary_vector_pair(arbitrary_bf16, 4..4048)){
-            do_l2_test(&x, &y);
+            do_l2_test(&x, &y)?;
         }
 
         #[test]
         fn test_l2_distance_f32((x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)){
-            do_l2_test(&x, &y);
+            do_l2_test(&x, &y)?;
         }
 
         #[test]
         fn test_l2_distance_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
-            do_l2_test(&x, &y);
+            do_l2_test(&x, &y)?;
         }
     }
 }

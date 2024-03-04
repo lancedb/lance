@@ -290,6 +290,7 @@ mod tests {
     };
     use approx::assert_relative_eq;
     use num_traits::{Float, FromPrimitive};
+    use proptest::prelude::*;
 
     #[test]
     fn test_dot() {
@@ -336,7 +337,7 @@ mod tests {
         (2.0 * T::epsilon().as_() * dot) as f32
     }
 
-    fn do_dot_test<T: FloatToArrayType>(x: &[T], y: &[T])
+    fn do_dot_test<T: FloatToArrayType>(x: &[T], y: &[T]) -> std::result::Result<(), TestCaseError>
     where
         T::ArrowType: Dot,
     {
@@ -348,28 +349,29 @@ mod tests {
 
         let max_error = max_error::<T>(&f64_x, &f64_y);
 
-        assert_relative_eq!(expected, result, epsilon = max_error);
+        prop_assert!(approx::relative_eq!(expected, result, epsilon = max_error));
+        Ok(())
     }
 
     proptest::proptest! {
         #[test]
         fn test_dot_f16((x, y) in arbitrary_vector_pair(arbitrary_f16, 4..4048)) {
-            do_dot_test(&x, &y);
+            do_dot_test(&x, &y)?;
         }
 
         #[test]
         fn test_dot_bf16((x, y) in arbitrary_vector_pair(arbitrary_bf16, 4..4048)){
-            do_dot_test(&x, &y);
+            do_dot_test(&x, &y)?;
         }
 
         #[test]
         fn test_dot_f32((x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)){
-            do_dot_test(&x, &y);
+            do_dot_test(&x, &y)?;
         }
 
         #[test]
         fn test_dot_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
-            do_dot_test(&x, &y);
+            do_dot_test(&x, &y)?;
         }
     }
 }
