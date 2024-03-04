@@ -14,10 +14,7 @@
 
 use arrow::array::RecordBatchReader;
 
-use jni::{
-    objects::{JObject, JValue},
-    JNIEnv,
-};
+use jni::{objects::JObject, JNIEnv};
 use lance::dataset::{Dataset, WriteParams};
 
 use crate::{fragment::new_java_fragment, traits::IntoJava, Result, RT};
@@ -115,18 +112,12 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragments<'a>(
     let array_list = env
         .new_object("java/util/ArrayList", "()V", &[])
         .expect("failed to create ArrayList");
+    let jlist = env.get_list(&array_list).expect("failed to get list");
     for f in fragments.into_iter() {
         let j_fragment = new_java_fragment(&mut env, f);
-        // if let Err(err) =
-        //     env.call_method(&array_list, "add", "(l)z", &[JValue::Object(&j_fragment)])
-        // {
-        //     env.throw_new(
-        //         "java/lang/RuntimeException",
-        //         format!("Failed to add fragment to list: {}", err),
-        //     );
-        //     // .expect("failed to throw exception");
-        //     return JObject::null();
-        // }
+        jlist
+            .add(&mut env, &j_fragment)
+            .expect("failed to add fragment to list");
     }
     array_list
 }
