@@ -13,6 +13,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Need up-to-date compilers for kernels
+      CC: gcc-12
+      CXX: g++-12
     defaults:
       run:
         working-directory: .
