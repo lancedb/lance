@@ -14,9 +14,16 @@
 
 use jni::{
     objects::{JObject, JString, JValue},
+    sys::{jint, jlong},
     JNIEnv,
 };
 use lance::dataset::fragment::FileFragment;
+
+use crate::{
+    blocking_dataset::{BlockingDataset, NATIVE_DATASET},
+    error::{Error, Result},
+    RT,
+};
 
 #[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentArrowReader_open<'local>(
@@ -40,4 +47,36 @@ pub(crate) fn new_java_fragment<'a>(env: &mut JNIEnv<'a>, fragment: FileFragment
     };
 
     j_fragment
+}
+
+fn fragment_count_rows(dataset: &BlockingDataset, fragment_id: i64) -> Result<jint> {
+    let fragment = match dataset.inner.get_fragment(fragment_id as usize) {
+        Some(f) => f,
+        None => {
+            return Err(Error::InvalidArgument {
+                message: format!("Fragment not found: {}", fragment_id),
+            });
+        }
+    };
+    Ok(RT.block_on(fragment.count_rows())? as jint)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Fragment_countRowsNative<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+    fragment_id: jlong,
+) -> jint {
+    match {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+                .expect("Dataset handle not set");
+        fragment_count_rows(&dataset, fragment_id)
+    } {
+        Ok(r) => r,
+        Err(e) => {
+            env.throw(e.to_string()).expect("failed to throw exception");
+            -1
+        }
+    }
 }

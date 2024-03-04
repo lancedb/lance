@@ -77,8 +77,9 @@ public class DatasetTest {
       
       var fragments = dataset.getFragments();
       System.out.println("Fragments are: " + fragments);
-      assertEquals(fragments.size(), 1);
-      assertEquals(fragments.get(0).getFragmentId(), 0);
+      assertEquals(1, fragments.size());
+      assertEquals(0, fragments.get(0).getFragmentId());
+      assertEquals(9, fragments.get(0).countRows());
     }
   }
 
