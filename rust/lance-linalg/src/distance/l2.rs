@@ -38,9 +38,11 @@ use crate::simd::{
 };
 use crate::{Error, Result};
 
+use super::Normalize;
+
 /// Calculate the L2 distance between two vectors.
 ///
-pub trait L2: ArrowFloatType {
+pub trait L2: ArrowFloatType + Normalize {
     /// Calculate the L2 distance between two vectors.
     fn l2(x: &[Self::Native], y: &[Self::Native]) -> f32;
 
