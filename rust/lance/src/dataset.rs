@@ -2022,9 +2022,9 @@ fn check_row_ids(row_ids: &[u64]) -> RowIdMeta {
 
 #[cfg(test)]
 mod tests {
-    use std::{ops::Range, sync::Mutex};
-    use std::vec;
     use std::collections::HashSet;
+    use std::vec;
+    use std::{ops::Range, sync::Mutex};
 
     use super::*;
     use crate::arrow::FixedSizeListArrayExt;
