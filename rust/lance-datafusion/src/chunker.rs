@@ -74,6 +74,11 @@ impl BatchReaderChunker {
 
         while rows_collected < self.output_size {
             if let Some(batch) = self.buffered.pop_front() {
+                // Skip empty batch
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+
                 let rows_remaining_in_batch = batch.num_rows() - self.i;
                 let rows_to_take =
                     std::cmp::min(rows_remaining_in_batch, self.output_size - rows_collected);

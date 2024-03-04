@@ -2022,10 +2022,9 @@ fn check_row_ids(row_ids: &[u64]) -> RowIdMeta {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::ops::Range;
-    use std::sync::Mutex;
+    use std::{ops::Range, sync::Mutex};
     use std::vec;
+    use std::collections::HashSet;
 
     use super::*;
     use crate::arrow::FixedSizeListArrayExt;
@@ -2170,10 +2169,13 @@ mod tests {
             DataType::Int32,
             false,
         )]));
-        let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone());
+        let i32_array: ArrayRef = Arc::new(Int32Array::new(vec![].into(), None));
+        let batch = RecordBatch::try_from_iter(vec![("i", i32_array)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         // check schema of reader and original is same
         assert_eq!(schema.as_ref(), reader.schema().as_ref());
         let result = Dataset::write(reader, test_uri, None).await.unwrap();
+
         // check dataset empty
         assert_eq!(result.count_rows().await.unwrap(), 0);
         // Since the dataset is empty, will return None.
