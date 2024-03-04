@@ -14,7 +14,10 @@
 
 //! Lance secondary index library
 
-#![cfg_attr(feature = "nightly", feature(stdarch_x86_avx512))]
+#![cfg_attr(
+    all(feature = "nightly", target_arch = "x86_64"),
+    feature(stdarch_x86_avx512)
+)]
 
 use std::{any::Any, sync::Arc};
 

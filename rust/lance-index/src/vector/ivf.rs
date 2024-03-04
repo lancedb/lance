@@ -253,20 +253,17 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
 
-        // Re-enable it after search path fixed.
-        // if metric_type == MetricType::Cosine {
-        //     transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
-        //         vector_column,
-        //     )));
-        // };
+        let mt = if metric_type == MetricType::Cosine {
+            transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
+                vector_column,
+            )));
+            MetricType::L2
+        } else {
+            metric_type
+        };
 
-        // TODO: add range filter
-        let ivf_transform = Arc::new(IvfTransformer::new(
-            centroids.clone(),
-            metric_type,
-            vector_column,
-        ));
-        transforms.push(ivf_transform.clone() as Arc<dyn Transformer>);
+        let ivf_transform = Arc::new(IvfTransformer::new(centroids.clone(), mt, vector_column));
+        transforms.push(ivf_transform.clone());
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(
@@ -349,16 +346,15 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> Ivf for IvfImpl<T> {
             self.compute_partitions(original).await?
         };
         let dim = original.value_length() as usize;
-        let mut residual_arr: Vec<<T as ArrowFloatType>::Native> =
-            Vec::with_capacity(original.values().len());
-        flatten_arr
+        let residual_arr = flatten_arr
             .as_slice()
             .chunks_exact(dim)
             .zip(part_ids.values())
-            .for_each(|(vector, &part_id)| {
+            .flat_map(|(vector, &part_id)| {
                 let centroid = self.centroids.row(part_id as usize).unwrap();
-                residual_arr.extend(vector.iter().zip(centroid.iter()).map(|(&v, &c)| v - c));
-            });
+                vector.iter().zip(centroid.iter()).map(|(&v, &c)| v - c)
+            })
+            .collect::<Vec<_>>();
         let arr = T::ArrayType::from(residual_arr);
         Ok(FixedSizeListArray::try_new_from_values(arr, dim as i32)?)
     }
@@ -375,12 +371,13 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> Ivf for IvfImpl<T> {
                 ),
                 location: Default::default(),
             })?;
-        // todo: hold kmeans in this struct.
-        let kmeans = KMeans::<T>::with_centroids(
-            self.centroids.data().clone(),
-            self.dimension(),
-            self.metric_type,
-        );
+        let mt = if self.metric_type == MetricType::Cosine {
+            MetricType::L2
+        } else {
+            self.metric_type
+        };
+        let kmeans =
+            KMeans::<T>::with_centroids(self.centroids.data().clone(), self.dimension(), mt);
         Ok(kmeans.find_partitions(query.as_slice(), nprobes)?)
     }
 }

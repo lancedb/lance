@@ -21,13 +21,10 @@ use std::sync::Arc;
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array};
 use async_trait::async_trait;
-use lance_arrow::floats::FloatArray;
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{
-    cosine_distance_batch, dot_distance_batch, l2_distance_batch, Cosine, Dot, L2,
-};
-use lance_linalg::kernels::{argmin, argmin_value_float, normalize};
+use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
+use lance_linalg::kernels::{argmin, argmin_value_float};
 use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 pub mod builder;
@@ -82,7 +79,7 @@ pub trait ProductQuantizer: Send + Sync + std::fmt::Debug {
 //
 // TODO: move this to be pub(crate) once we have a better way to test it.
 #[derive(Debug)]
-pub struct ProductQuantizerImpl<T: ArrowFloatType + Cosine + Dot + L2> {
+pub struct ProductQuantizerImpl<T: ArrowFloatType + Dot + L2> {
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
@@ -117,7 +114,7 @@ pub struct ProductQuantizerImpl<T: ArrowFloatType + Cosine + Dot + L2> {
     pub codebook: Arc<T::ArrayType>,
 }
 
-impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
+impl<T: ArrowFloatType + Dot + L2> ProductQuantizerImpl<T> {
     /// Create a [`ProductQuantizer`] with pre-trained codebook.
     pub fn new(
         m: usize,
@@ -126,6 +123,11 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
         codebook: Arc<T::ArrayType>,
         metric_type: MetricType,
     ) -> Self {
+        assert_ne!(
+            metric_type,
+            MetricType::Cosine,
+            "Product quantization does not support cosine, use normalized L2 instead"
+        );
         assert_eq!(nbits, 8, "nbits can only be 8");
         Self {
             num_bits: nbits,
@@ -201,11 +203,11 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
                             lance_linalg::distance::DistanceType::L2 => {
                                 l2_distance_batch(sub_vec, centroids, sub_vector_width)
                             }
-                            lance_linalg::distance::DistanceType::Cosine => {
-                                cosine_distance_batch(sub_vec, centroids, sub_vector_width)
-                            }
                             lance_linalg::distance::DistanceType::Dot => {
                                 dot_distance_batch(sub_vec, centroids, sub_vector_width)
+                            }
+                            lance_linalg::distance::DistanceType::Cosine => {
+                                panic!("There should not be cosine for PQ");
                             }
                         };
                         argmin_value_float(distances).map(|(_, v)| v).unwrap_or(0.0)
@@ -321,7 +323,7 @@ impl<T: ArrowFloatType + Cosine + Dot + L2> ProductQuantizerImpl<T> {
 }
 
 #[async_trait]
-impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for ProductQuantizerImpl<T> {
+impl<T: ArrowFloatType + Dot + L2 + 'static> ProductQuantizer for ProductQuantizerImpl<T> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -331,35 +333,12 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
             .as_fixed_size_list_opt()
             .ok_or(Error::Index {
                 message: format!(
-                    "Expect to be a float vector array, got: {:?}",
+                    "Expect to be a FixedSizeList<float> vector array, got: {:?} array",
                     data.data_type()
                 ),
                 location: location!(),
             })?
             .clone();
-
-        let fsl = if self.metric_type == MetricType::Cosine {
-            // Normalize cosine vectors to unit length.
-            let values = fsl
-                .values()
-                .as_any()
-                .downcast_ref::<T::ArrayType>()
-                .ok_or(Error::Index {
-                    message: format!(
-                        "Expect to be a float vector array, got: {:?}",
-                        fsl.value_type()
-                    ),
-                    location: location!(),
-                })?
-                .as_slice()
-                .chunks(self.dimension)
-                .flat_map(normalize)
-                .collect::<Vec<_>>();
-            let data = T::ArrayType::from(values);
-            FixedSizeListArray::try_new_from_values(data, self.dimension as i32)?
-        } else {
-            fsl
-        };
 
         let num_sub_vectors = self.num_sub_vectors;
         let dim = self.dimension;
@@ -435,20 +414,10 @@ impl<T: ArrowFloatType + Cosine + Dot + L2 + 'static> ProductQuantizer for Produ
         match self.metric_type {
             MetricType::L2 => self.l2_distances(query, code),
             MetricType::Cosine => {
-                let query: &T::ArrayType = query.as_any().downcast_ref().ok_or(Error::Index {
-                    message: format!(
-                        "Build cosine distance table, type mismatch: {}",
-                        query.data_type()
-                    ),
-                    location: Default::default(),
-                })?;
-
-                // Normalized query vector.
-                let query = T::ArrayType::from(normalize(query.as_slice()).collect::<Vec<_>>());
                 // L2 over normalized vectors:  ||x - y|| = x^2 + y^2 - 2 * xy = 1 + 1 - 2 * xy = 2 * (1 - xy)
                 // Cosine distance: 1 - |xy| / (||x|| * ||y||) = 1 - xy / (x^2 * y^2) = 1 - xy / (1 * 1) = 1 - xy
                 // Therefore, Cosine = L2 / 2
-                let l2_dists = self.l2_distances(&query, code)?;
+                let l2_dists = self.l2_distances(query, code)?;
                 Ok(l2_dists.values().iter().map(|v| *v / 2.0).collect())
             }
             MetricType::Dot => self.dot_distances(query, code),
@@ -506,7 +475,7 @@ mod tests {
     use approx::assert_relative_eq;
     use arrow_array::{
         types::{Float16Type, Float32Type},
-        Float16Array, Float32Array,
+        Float16Array,
     };
     use half::f16;
     use lance_testing::datagen::generate_random_array;
@@ -533,28 +502,6 @@ mod tests {
         let tensor = proto.codebook_tensor.as_ref().unwrap();
         assert_eq!(tensor.data_type, pb::tensor::DataType::Float16 as i32);
         assert_eq!(tensor.shape, vec![256, 16]);
-    }
-
-    #[tokio::test]
-    async fn test_empty_dist_iter() {
-        let pq = ProductQuantizerImpl::<Float32Type> {
-            num_bits: 8,
-            num_sub_vectors: 4,
-            dimension: 16,
-            codebook: Arc::new(Float32Array::from_iter_values(
-                (0..256 * 16).map(|v| v as f32),
-            )),
-            metric_type: MetricType::Cosine,
-        };
-
-        let data = Float32Array::from_iter_values(repeat(0.0).take(16));
-        let data = FixedSizeListArray::try_new_from_values(data, 16).unwrap();
-        let rst = pq.transform(&data).await;
-        assert!(rst.is_err());
-        assert!(rst
-            .unwrap_err()
-            .to_string()
-            .contains("it is likely that distance is NaN"));
     }
 
     #[tokio::test]

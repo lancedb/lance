@@ -23,6 +23,7 @@ mod test {
         sync::{Arc, Mutex},
     };
 
+    use approx::assert_relative_eq;
     use arrow::array::AsArray;
     use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
@@ -87,7 +88,7 @@ mod test {
             let key: &Float32Array = query.key.as_primitive();
             assert_eq!(key.len(), self.assert_query_value.len());
             for (i, &v) in key.iter().zip(self.assert_query_value.iter()) {
-                assert_eq!(v, i.unwrap());
+                assert_relative_eq!(v, i.unwrap());
             }
             Ok(self.ret_val.clone())
         }
@@ -129,10 +130,9 @@ mod test {
         let centroids = FixedSizeListArray::try_new_from_values(centroids, 2).unwrap();
         let mut ivf = Ivf::new(Arc::new(centroids));
         // Add 4 partitions
-        ivf.add_partition(0, 0);
-        ivf.add_partition(0, 0);
-        ivf.add_partition(0, 0);
-        ivf.add_partition(0, 0);
+        for _ in 0..4 {
+            ivf.add_partition(0, 0);
+        }
         // hold on to this pointer, because the index only holds a weak reference
         let session = Arc::new(Session::default());
 
@@ -177,20 +177,20 @@ mod test {
         } in [
             // L2 should residualize with the correct centroid
             TestCase {
-                query: vec![1.0, 1.0],
+                query: vec![1.0; 2],
                 metric: MetricType::L2,
-                expected_query_at_subindex: vec![0.0, 0.0],
+                expected_query_at_subindex: vec![0.0; 2],
             },
             // Cosine should normalize and residualize
             TestCase {
-                query: vec![1.0, 1.0],
+                query: vec![1.0; 2],
                 metric: MetricType::Cosine,
-                expected_query_at_subindex: vec![0.0, 0.0],
+                expected_query_at_subindex: vec![1.0 / 2.0_f32.sqrt() - 1.0; 2],
             },
             TestCase {
-                query: vec![2.0, 2.0],
+                query: vec![2.0; 2],
                 metric: MetricType::Cosine,
-                expected_query_at_subindex: vec![0.0, 0.0],
+                expected_query_at_subindex: vec![2.0 / 8.0_f32.sqrt() - 1.0; 2],
             },
         ] {
             let q = Query {
