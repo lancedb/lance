@@ -14,10 +14,24 @@
 
 package com.lancedb.lance;
 
-/** Fragment API. */
+/** Data Fragment.
+ *
+ */
 public class Fragment {
-  private long nativeHandle;
+  // Only keep fragmentId for reference, so we dont need to make this
+  // object to be Closable to track Rust native object.
+  private long fragmentId;
 
-  /// Private constructor, calling from JNI
-  private Fragment() {}
+  /** Private constructor, calling from JNI. */
+  private Fragment(long fragmentId) {
+    this.fragmentId = fragmentId;
+  }
+
+  public long getFragmentId() {
+    return this.fragmentId;
+  }
+
+  public String toString() {
+    return String.format("Fragment(id=%d)", this.fragmentId);
+  }
 }

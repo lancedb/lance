@@ -17,6 +17,12 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import com.lancedb.lance.WriteParams.WriteMode;
+import java.io.IOException;
+import java.net.URISyntaxException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
@@ -28,14 +34,6 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-
-import com.lancedb.lance.WriteParams.WriteMode;
-
-import java.io.IOException;
-import java.net.URISyntaxException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 
 public class DatasetTest {
 
@@ -76,6 +74,11 @@ public class DatasetTest {
         Dataset datasetRead = Dataset.open(datasetPath.toString());
         assertEquals(9, datasetRead.countRows());
       });
+      
+      var fragments = dataset.getFragments();
+      System.out.println("Fragments are: " + fragments);
+      assertEquals(fragments.size(), 1);
+      assertEquals(fragments.get(0).getFragmentId(), 0);
     }
   }
 
