@@ -117,15 +117,16 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragments<'a>(
         .expect("failed to create ArrayList");
     for f in fragments.into_iter() {
         let j_fragment = new_java_fragment(&mut env, f);
-        if let Err(err) =
-            env.call_method(&array_list, "add", "(l)z", &[JValue::Object(&j_fragment)])
-        {
-            env.throw_new(
-                "java/lang/RuntimeException",
-                format!("Failed to add fragment to list: {}", err),
-            )
-            .expect("failed to throw exception");
-        }
+        // if let Err(err) =
+        //     env.call_method(&array_list, "add", "(l)z", &[JValue::Object(&j_fragment)])
+        // {
+        //     env.throw_new(
+        //         "java/lang/RuntimeException",
+        //         format!("Failed to add fragment to list: {}", err),
+        //     );
+        //     // .expect("failed to throw exception");
+        //     return JObject::null();
+        // }
     }
     array_list
 }

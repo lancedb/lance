@@ -27,13 +27,17 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentArrowReader_open<'loca
 }
 
 pub(crate) fn new_java_fragment<'a>(env: &mut JNIEnv<'a>, fragment: FileFragment) -> JObject<'a> {
-    let j_fragment = env
-        .new_object(
-            "com/lancedb/lance/Fragment",
-            "(j)V",
-            &[JValue::Long(fragment.id() as i64)],
-        )
-        .expect("Failed to allocate Fragment object");
+    let j_fragment = match env.new_object(
+        "com/lancedb/lance/Fragment",
+        "(J)V",
+        &[JValue::Long(fragment.id() as i64)],
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            env.throw(e.to_string()).unwrap();
+            return JObject::null();
+        }
+    };
 
     j_fragment
 }

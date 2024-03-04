@@ -18,9 +18,9 @@ package com.lancedb.lance;
  *
  */
 public class Fragment {
-  // Only keep fragmentId for reference, so we dont need to make this
-  // object to be Closable to track Rust native object.
-  private long fragmentId;
+  // Only keep fragmentId for reference, so we don't need to make this
+  // object to be {@link Closable} to track Rust native object.
+  private final long fragmentId;
 
   /** Private constructor, calling from JNI. */
   private Fragment(long fragmentId) {
