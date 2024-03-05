@@ -29,13 +29,13 @@ use datafusion_common::{
 use prost::Message;
 use snafu::{location, Location};
 
-use lance_core::{Error, Result};
 use datafusion_substrait::substrait::proto::{
     expression_reference::ExprType,
     plan_rel::RelType,
     read_rel::{NamedTable, ReadType},
     rel, ExtendedExpression, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelRoot,
 };
+use lance_core::{Error, Result};
 
 // This is slightly tedious but when we convert expressions from SQL strings to logical
 // datafusion expressions there is no type coercion that happens.  In other words "x = 7"
