@@ -19,7 +19,7 @@ use lance::dataset::{Dataset, WriteParams};
 
 use crate::{fragment::new_java_fragment, traits::IntoJava, Result, RT};
 
-pub(crate) const NATIVE_DATASET: &str = "nativeDatasetHandle";
+pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
 pub struct BlockingDataset {
     pub(crate) inner: Dataset,

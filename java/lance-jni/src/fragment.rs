@@ -33,7 +33,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentArrowReader_open<'loca
     todo!("Implement FragmentArrowReader::open")
 }
 
-pub(crate) fn new_java_fragment<'a>(env: &mut JNIEnv<'a>, fragment: FileFragment) -> JObject<'a> {
+pub fn new_java_fragment<'a>(env: &mut JNIEnv<'a>, fragment: FileFragment) -> JObject<'a> {
     let j_fragment = match env.new_object(
         "com/lancedb/lance/Fragment",
         "(J)V",
@@ -50,20 +50,17 @@ pub(crate) fn new_java_fragment<'a>(env: &mut JNIEnv<'a>, fragment: FileFragment
 }
 
 fn fragment_count_rows(dataset: &BlockingDataset, fragment_id: jlong) -> Result<jint> {
-    let fragment = match dataset.inner.get_fragment(fragment_id as usize) {
-        Some(f) => f,
-        None => {
-            return Err(Error::InvalidArgument {
-                message: format!("Fragment not found: {}", fragment_id),
-            });
-        }
+    let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
+        return Err(Error::InvalidArgument {
+            message: format!("Fragment not found: {}", fragment_id),
+        });
     };
     Ok(RT.block_on(fragment.count_rows())? as jint)
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Fragment_countRowsNative<'a>(
-    mut env: JNIEnv<'a>,
+pub extern "system" fn Java_com_lancedb_lance_Fragment_countRowsNative(
+    mut env: JNIEnv,
     _jfragment: JObject,
     jdataset: JObject,
     fragment_id: jlong,
@@ -73,12 +70,13 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_countRowsNative<'a>(
             .unwrap();
         return -1;
     }
-    match {
+    let res = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
                 .expect("Dataset handle not set");
         fragment_count_rows(&dataset, fragment_id)
-    } {
+    };
+    match res {
         Ok(r) => r,
         Err(e) => {
             e.throw(&mut env);
