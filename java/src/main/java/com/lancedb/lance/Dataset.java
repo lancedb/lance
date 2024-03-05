@@ -61,8 +61,6 @@ public class Dataset implements Closeable {
   /**
    * Get all fragments in this dataset.
    *
-   * We do not need to close fragments.
-   *
    * @return A list of {@link Fragment}.
    */
   public List<Fragment> getFragments() {
