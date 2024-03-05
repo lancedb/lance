@@ -2239,6 +2239,26 @@ mod tests {
         assert_eq!(&expected_struct_arr, as_struct_array(sorted_arr.as_ref()));
     }
 
+    #[lance_test_macros::test(tokio::test)]
+    async fn test_create_with_empty_iter() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone());
+        // check schema of reader and original is same
+        assert_eq!(schema.as_ref(), reader.schema().as_ref());
+        let result = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // check dataset empty
+        assert_eq!(result.count_rows().await.unwrap(), 0);
+        // Since the dataset is empty, will return None.
+        assert_eq!(result.manifest.max_fragment_id(), None);
+    }
+
     #[tokio::test]
     async fn test_write_params() {
         let test_dir = tempdir().unwrap();
