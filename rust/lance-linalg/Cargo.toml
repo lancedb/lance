@@ -30,6 +30,7 @@ approx = { workspace = true }
 arrow-arith = { workspace = true }
 criterion = { workspace = true }
 lance-testing = { path = "../lance-testing" }
+proptest.workspace = true
 
 [build-dependencies]
 cc = "1.0.83"
