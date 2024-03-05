@@ -80,14 +80,14 @@ byteorder = "1.5"
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4.23"
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
-datafusion = { version = "35.0.0", default-features = false, features = [
+datafusion = { version = "36.0.0", default-features = false, features = [
     "regex_expressions",
 ] }
-datafusion-common = "35.0"
-datafusion-sql = "35.0"
-datafusion-expr = "35.0"
-datafusion-physical-expr = "35.0"
-datafusion-substrait = "35.0"
+datafusion-common = "36.0"
+datafusion-sql = "36.0"
+datafusion-expr = "36.0"
+datafusion-physical-expr = "36.0"
+datafusion-substrait = "36.0"
 either = "1.0"
 futures = "0.3"
 http = "0.2.9"
@@ -113,7 +113,6 @@ serde = { version = "^1" }
 serde_json = { version = "1" }
 shellexpand = "3.0"
 snafu = "0.7.4"
-substrait = "0.22.1"
 substrait-expr = "0.2.0"
 tempfile = "3"
 tokio = { version = "1.23", features = [

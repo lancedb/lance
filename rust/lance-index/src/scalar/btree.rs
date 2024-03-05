@@ -493,15 +493,15 @@ impl Ord for OrderableScalarValue {
             (DurationNanosecond(_), _) => {
                 panic!("Attempt to compare DurationNanosecond with non-DurationNanosecond")
             }
-            (Struct(_v1, _t1), Struct(_v2, _t2)) => todo!(),
-            (Struct(v1, _), Null) => {
-                if v1.is_none() {
+            (Struct(_arr), Struct(_arr2)) => todo!(),
+            (Struct(arr), Null) => {
+                if arr.is_empty() {
                     Ordering::Equal
                 } else {
                     Ordering::Greater
                 }
             }
-            (Struct(_, _), _) => panic!("Attempt to compare Struct with non-Struct"),
+            (Struct(_arr), _) => panic!("Attempt to compare Struct with non-Struct"),
             (Dictionary(_k1, _v1), Dictionary(_k2, _v2)) => todo!(),
             (Dictionary(_, v1), Null) => Self(*v1.clone()).cmp(&Self(ScalarValue::Null)),
             (Dictionary(_, _), _) => panic!("Attempt to compare Dictionary with non-Dictionary"),

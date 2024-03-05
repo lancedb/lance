@@ -30,7 +30,7 @@ use prost::Message;
 use snafu::{location, Location};
 
 use lance_core::{Error, Result};
-use substrait::proto::{
+use datafusion_substrait::substrait::proto::{
     expression_reference::ExprType,
     plan_rel::RelType,
     read_rel::{NamedTable, ReadType},
