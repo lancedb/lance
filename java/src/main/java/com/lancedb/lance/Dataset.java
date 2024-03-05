@@ -68,12 +68,12 @@ public class Dataset implements Closeable {
     // Set a pointer in Fragment to dataset, to make it is easier to issue IOs later.
     //
     // We do not need to close Fragments.
-    return Arrays.stream(this.getFragmentsIdsNative())
+    return Arrays.stream(this.getFragmentsIds())
         .mapToObj(fid -> new Fragment(this, fid))
         .collect(Collectors.toList());
   }
 
-  private native int[] getFragmentsIdsNative();
+  private native int[] getFragmentsIds();
 
   /**
    * Closes this dataset and releases any system resources associated with it. If the dataset is
