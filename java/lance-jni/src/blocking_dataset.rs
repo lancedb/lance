@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,14 +14,15 @@
 
 use arrow::array::RecordBatchReader;
 
-use jni::objects::JObject;
-use jni::JNIEnv;
+use jni::{objects::JObject, JNIEnv};
 use lance::dataset::{Dataset, WriteParams};
 
 use crate::{traits::IntoJava, Result, RT};
 
+pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
+
 pub struct BlockingDataset {
-    inner: Dataset,
+    pub(crate) inner: Dataset,
 }
 
 impl BlockingDataset {
@@ -66,7 +67,7 @@ fn attach_native_dataset<'local>(
     // 1. The Java object (`j_dataset`) should implement the `java.io.Closeable` interface.
     // 2. Users of this Java object should be instructed to always use it within a try-with-resources
     //    statement (or manually call the `close()` method) to ensure that `self.close()` is invoked.
-    match unsafe { env.set_rust_field(&j_dataset, "nativeDatasetHandle", dataset) } {
+    match unsafe { env.set_rust_field(&j_dataset, NATIVE_DATASET, dataset) } {
         Ok(_) => j_dataset,
         Err(err) => {
             env.throw_new(
@@ -82,4 +83,37 @@ fn attach_native_dataset<'local>(
 fn create_java_dataset_object<'a>(env: &mut JNIEnv<'a>) -> JObject<'a> {
     env.new_object("com/lancedb/lance/Dataset", "()V", &[])
         .expect("Failed to create Java Dataset instance")
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_releaseNativeDataset(
+    mut env: JNIEnv,
+    obj: JObject,
+) {
+    let dataset: BlockingDataset = unsafe {
+        env.take_rust_field(obj, "nativeDatasetHandle")
+            .expect("Failed to take native dataset handle")
+    };
+    dataset.close()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragmentsIds<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+) -> JObject<'a> {
+    let fragments = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+                .expect("Failed to get native dataset handle");
+        dataset.inner.get_fragments()
+    };
+
+    let array_list = env
+        .new_int_array(fragments.len() as i32)
+        .expect("Failed to create int array");
+    let fragment_ids = fragments.iter().map(|f| f.id() as i32).collect::<Vec<_>>();
+    env.set_int_array_region(&array_list, 0, &fragment_ids)
+        .expect("Failed to set int array region");
+    array_list.into()
 }

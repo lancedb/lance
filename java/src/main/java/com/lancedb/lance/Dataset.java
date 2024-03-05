@@ -16,31 +16,33 @@ package com.lancedb.lance;
 
 import io.questdb.jar.jni.JarJniLoader;
 import java.io.Closeable;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import org.apache.arrow.c.ArrowArrayStream;
 
 /**
- * Class representing a Lance dataset, interfacing with the native lance library.
- * This class provides functionality to open and manage datasets with native code.
- * The native library is loaded statically and utilized through native methods.
- * It implements the {@link java.io.Closeable} interface to ensure proper resource management.
+ * Class representing a Lance dataset, interfacing with the native lance library. This class
+ * provides functionality to open and manage datasets with native code. The native library is loaded
+ * statically and utilized through native methods. It implements the {@link java.io.Closeable}
+ * interface to ensure proper resource management.
  */
 public class Dataset implements Closeable {
-  private long nativeDatasetHandle;
-
   static {
     JarJniLoader.loadLib(Dataset.class, "/nativelib", "lance_jni");
   }
 
-  private Dataset() {
-  }
+  private long nativeDatasetHandle;
+
+  private Dataset() {}
 
   public static Dataset write(ArrowArrayStream stream, String path, WriteParams params) {
     return writeWithFfiStream(stream.memoryAddress(), path, params.toMap());
   }
 
-  private static native Dataset writeWithFfiStream(long arrowStreamMemoryAddress, String path,
-      Map<String, Object> params);
+  private static native Dataset writeWithFfiStream(
+      long arrowStreamMemoryAddress, String path, Map<String, Object> params);
 
   /**
    * Opens a dataset from the specified path using the native library.
@@ -58,8 +60,24 @@ public class Dataset implements Closeable {
   public native int countRows();
 
   /**
-   * Closes this dataset and releases any system resources associated with it.
-   * If the dataset is already closed, then invoking this method has no effect.
+   * Get all fragments in this dataset.
+   *
+   * @return A list of {@link Fragment}.
+   */
+  public List<Fragment> getFragments() {
+    // Set a pointer in Fragment to dataset, to make it is easier to issue IOs later.
+    //
+    // We do not need to close Fragments.
+    return Arrays.stream(this.getFragmentsIds())
+        .mapToObj(fid -> new Fragment(this, fid))
+        .collect(Collectors.toList());
+  }
+
+  private native int[] getFragmentsIds();
+
+  /**
+   * Closes this dataset and releases any system resources associated with it. If the dataset is
+   * already closed, then invoking this method has no effect.
    */
   @Override
   public void close() {
