@@ -49,7 +49,7 @@ pub(crate) fn new_java_fragment<'a>(env: &mut JNIEnv<'a>, fragment: FileFragment
     j_fragment
 }
 
-fn fragment_count_rows(dataset: &BlockingDataset, fragment_id: i64) -> Result<jint> {
+fn fragment_count_rows(dataset: &BlockingDataset, fragment_id: jlong) -> Result<jint> {
     let fragment = match dataset.inner.get_fragment(fragment_id as usize) {
         Some(f) => f,
         None => {
@@ -64,9 +64,15 @@ fn fragment_count_rows(dataset: &BlockingDataset, fragment_id: i64) -> Result<ji
 #[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Fragment_countRowsNative<'a>(
     mut env: JNIEnv<'a>,
+    _jfragment: JObject,
     jdataset: JObject,
     fragment_id: jlong,
 ) -> jint {
+    if fragment_id != 0 {
+        env.throw(format!("Fragment id is not 0: {}", fragment_id))
+            .unwrap();
+        return -1;
+    }
     match {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
@@ -75,7 +81,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_countRowsNative<'a>(
     } {
         Ok(r) => r,
         Err(e) => {
-            env.throw(e.to_string()).expect("failed to throw exception");
+            e.throw(&mut env);
             -1
         }
     }

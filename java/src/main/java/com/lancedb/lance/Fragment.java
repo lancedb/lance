@@ -14,9 +14,7 @@
 
 package com.lancedb.lance;
 
-/** Data Fragment.
- *
- */
+/** Data Fragment. */
 public class Fragment {
   // Only keep fragmentId for reference, so we don't need to make this
   // object to be {@link Closable} to track Rust native object.
@@ -30,6 +28,8 @@ public class Fragment {
     this.fragmentId = fragmentId;
   }
 
+  private native int countRowsNative(Dataset dataset, long fragmentId);
+
   public long getFragmentId() {
     return this.fragmentId;
   }
@@ -42,6 +42,4 @@ public class Fragment {
   public int countRows() {
     return countRowsNative(this.dataset, this.fragmentId);
   }
-
-  private native int countRowsNative(Dataset dataset, Long fragmentId);
 }
