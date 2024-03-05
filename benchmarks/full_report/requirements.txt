@@ -3,3 +3,5 @@ seaborn
 matplotlib
 tqdm
 pandas
+pytest
+tempfile
