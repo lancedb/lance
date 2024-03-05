@@ -60,7 +60,7 @@ mod dynamodb;
 mod external_manifest;
 
 /// Read the transaction data from a transaction file.
-async fn read_transaction_file(
+pub async fn read_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction_file: &str,

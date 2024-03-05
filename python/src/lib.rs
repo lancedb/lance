@@ -36,6 +36,7 @@ use dataset::optimize::{
 use dataset::MergeInsertBuilder;
 use env_logger::Env;
 use futures::StreamExt;
+use internal::register_internal_apis;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 
@@ -48,6 +49,7 @@ pub(crate) mod datagen;
 pub(crate) mod dataset;
 pub(crate) mod executor;
 pub(crate) mod fragment;
+pub(crate) mod internal;
 pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod tracing;
@@ -121,6 +123,7 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     register_datagen(py, m)?;
+    register_internal_apis(py, m)?;
     Ok(())
 }
 
