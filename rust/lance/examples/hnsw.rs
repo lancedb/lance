@@ -42,7 +42,7 @@ struct Args {
     ef: usize,
 
     /// Max number of edges of each node.
-    #[arg(long, default_value = "64")]
+    #[arg(long, default_value = "30")]
     max_edges: usize,
 
     #[arg(long, default_value = "7")]
@@ -90,10 +90,11 @@ async fn main() {
     let k = 10;
     let gt = ground_truth(&mat, q, k);
 
-    for ef_construction in [50, 100, 200, 400] {
+    for ef_construction in [15, 30, 50] {
         let now = std::time::Instant::now();
         let hnsw = HNSWBuilder::new(vector_store.clone())
             .max_level(args.max_level)
+            .num_edges(15)
             .max_num_edges(args.max_edges)
             .ef_construction(ef_construction)
             .build()
