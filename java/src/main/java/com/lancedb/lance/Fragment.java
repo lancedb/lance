@@ -18,19 +18,20 @@ package com.lancedb.lance;
 public class Fragment {
   // Only keep fragmentId for reference, so we don't need to make this
   // object to be {@link Closable} to track Rust native object.
-  private final long fragmentId;
+  private final int fragmentId;
 
   /** Pointer to the {@link Dataset} instance in Java. */
-  Dataset dataset;
+  private final Dataset dataset;
 
   /** Private constructor, calling from JNI. */
-  private Fragment(long fragmentId) {
+  Fragment(Dataset dataset, int fragmentId) {
+    this.dataset = dataset;
     this.fragmentId = fragmentId;
   }
 
   private native int countRowsNative(Dataset dataset, long fragmentId);
 
-  public long getFragmentId() {
+  public int getFragmentId() {
     return this.fragmentId;
   }
 

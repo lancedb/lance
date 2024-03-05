@@ -16,6 +16,7 @@ package com.lancedb.lance;
 
 import io.questdb.jar.jni.JarJniLoader;
 import java.io.Closeable;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -67,12 +68,12 @@ public class Dataset implements Closeable {
     // Set a pointer in Fragment to dataset, to make it is easier to issue IOs later.
     //
     // We do not need to close Fragments.
-    return this.getFragmentsNative().stream()
-        .peek(f -> f.dataset = this)
+    return Arrays.stream(this.getFragmentsIdsNative())
+        .mapToObj(fid -> new Fragment(this, fid))
         .collect(Collectors.toList());
   }
 
-  private native List<Fragment> getFragmentsNative();
+  private native int[] getFragmentsIdsNative();
 
   /**
    * Closes this dataset and releases any system resources associated with it. If the dataset is

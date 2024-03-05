@@ -13,41 +13,16 @@
 // limitations under the License.
 
 use jni::{
-    objects::{JObject, JString, JValue},
+    objects::JObject,
     sys::{jint, jlong},
     JNIEnv,
 };
-use lance::dataset::fragment::FileFragment;
 
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     error::{Error, Result},
     RT,
 };
-
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentArrowReader_open<'local>(
-    mut _env: JNIEnv<'local>,
-    _path: JString,
-) -> JObject<'local> {
-    todo!("Implement FragmentArrowReader::open")
-}
-
-pub fn new_java_fragment<'a>(env: &mut JNIEnv<'a>, fragment: FileFragment) -> JObject<'a> {
-    let j_fragment = match env.new_object(
-        "com/lancedb/lance/Fragment",
-        "(J)V",
-        &[JValue::Long(fragment.id() as i64)],
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            env.throw(e.to_string()).unwrap();
-            return JObject::null();
-        }
-    };
-
-    j_fragment
-}
 
 fn fragment_count_rows(dataset: &BlockingDataset, fragment_id: jlong) -> Result<jint> {
     let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
@@ -65,11 +40,6 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_countRowsNative(
     jdataset: JObject,
     fragment_id: jlong,
 ) -> jint {
-    if fragment_id != 0 {
-        env.throw(format!("Fragment id is not 0: {}", fragment_id))
-            .unwrap();
-        return -1;
-    }
     let res = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }

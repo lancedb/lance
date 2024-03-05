@@ -17,7 +17,7 @@ use arrow::array::RecordBatchReader;
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::{Dataset, WriteParams};
 
-use crate::{fragment::new_java_fragment, traits::IntoJava, Result, RT};
+use crate::{traits::IntoJava, Result, RT};
 
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
@@ -98,7 +98,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_releaseNativeDataset(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragmentsNative<'a>(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragmentsIds<'a>(
     mut env: JNIEnv<'a>,
     jdataset: JObject,
 ) -> JObject<'a> {
@@ -110,14 +110,10 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragmentsNative<'a>(
     };
 
     let array_list = env
-        .new_object("java/util/ArrayList", "()V", &[])
-        .expect("failed to create ArrayList");
-    let jlist = env.get_list(&array_list).expect("failed to get list");
-    for f in fragments.into_iter() {
-        let j_fragment = new_java_fragment(&mut env, f);
-        jlist
-            .add(&mut env, &j_fragment)
-            .expect("failed to add fragment to list");
-    }
-    array_list
+        .new_int_array(fragments.len() as i32)
+        .expect("Failed to create int array");
+    let fragment_ids = fragments.iter().map(|f| f.id() as i32).collect::<Vec<_>>();
+    env.set_int_array_region(&array_list, 0, &fragment_ids)
+        .expect("Failed to set int array region");
+    array_list.into()
 }
