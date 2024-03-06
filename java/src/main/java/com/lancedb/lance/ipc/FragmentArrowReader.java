@@ -16,16 +16,15 @@ package com.lancedb.lance.ipc;
 
 import java.io.IOException;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.vector.compression.CompressionCodec;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
-/// Fragment Arrow Reader
+/** Fragment Arrow Reader. */
 class FragmentArrowReader extends ArrowReader {
   private long nativeHandle;
 
-  FragmentArrowReader(BufferAllocator allocator, CompressionCodec.Factory compressionFactory) {
-    super(allocator, compressionFactory);
+  FragmentArrowReader(BufferAllocator allocator) {
+    super(allocator);
   }
 
   @Override

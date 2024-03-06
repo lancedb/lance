@@ -16,11 +16,13 @@ package com.lancedb.lance;
 
 import io.questdb.jar.jni.JarJniLoader;
 import java.io.Closeable;
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.memory.BufferAllocator;
 
 /**
  * Class representing a Lance dataset, interfacing with the native lance library. This class
@@ -35,6 +37,8 @@ public class Dataset implements Closeable {
 
   private long nativeDatasetHandle;
 
+  BufferAllocator allocator;
+
   private Dataset() {}
 
   public static Dataset write(ArrowArrayStream stream, String path, WriteParams params) {
@@ -45,12 +49,25 @@ public class Dataset implements Closeable {
       long arrowStreamMemoryAddress, String path, Map<String, Object> params);
 
   /**
+   * Open a dataset from the specified path.
+   *
+   * @param path file path
+   * @param allocator Arrow buffer allocator.
+   * @return Dataset
+   */
+  public static Dataset open(String path, BufferAllocator allocator) throws IOException {
+    var dataset = openNative(path);
+    dataset.allocator = allocator;
+    return dataset;
+  }
+
+  /**
    * Opens a dataset from the specified path using the native library.
    *
    * @param path The file path of the dataset to open.
    * @return A new instance of {@link Dataset} linked to the opened dataset.
    */
-  public static native Dataset open(String path);
+  public static native Dataset openNative(String path);
 
   /**
    * Count the number of rows in the dataset.

@@ -48,6 +48,7 @@ public class Fragment {
     return countRowsNative(dataset, fragmentId);
   }
 
+  /** Create a new Fragment Scanner. */
   public ArrowReader newScan(ScanOptions options) throws IOException  {
     return null;
   }

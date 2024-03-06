@@ -97,7 +97,7 @@ pub fn extract_write_params(env: &mut JNIEnv, params: &JObject) -> Result<WriteP
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_open<'local>(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     path: JString,
