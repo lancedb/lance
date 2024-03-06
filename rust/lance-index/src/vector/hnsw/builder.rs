@@ -27,63 +27,45 @@ use crate::vector::graph::{builder::GraphBuilder, greedy_search, storage::Vector
 use crate::vector::hnsw::HnswLevel;
 
 /// Parameters of building HNSW index
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub struct HnswBuildParams {
-    
-}
-
-/// Build a HNSW graph.
-///
-/// Currently, the HNSW graph is fully built in memory.
-///
-/// During the build, the graph is built layer by layer.
-///
-/// Each node in the graph has a global ID which is the index on the base layer.
-#[derive(Clone)]
-pub struct HNSWBuilder {
     /// max level of
-    max_level: u16,
+    pub max_level: u16,
 
     /// number of connections to establish while inserting new element
-    m: usize,
+    pub m: usize,
 
     /// max number of connections for each element per layers.
-    m_max: usize,
+    pub m_max: usize,
 
-    /// Size of the dynamic list for the candidates
-    ef_construction: usize,
+    /// size of the dynamic list for the candidates
+    pub ef_construction: usize,
 
-    /// Vector storage for the graph.
-    vectors: Arc<InMemoryVectorStorage>,
+    /// whether extend candidates while selecting neighbors
+    pub extend_candidates: bool,
 
-    levels: Vec<GraphBuilder>,
+    /// log base used for assigning random level
+    pub log_base: f32,
 
-    entry_point: u32,
-
-    extend_candidates: bool,
-
-    log_base: f32,
-
-    use_select_heuristic: bool,
+    /// whether select neighbors heuristic
+    pub use_select_heuristic: bool,
 }
 
-impl HNSWBuilder {
-    /// Create a new [`HNSWBuilder`] with in memory vector storage.
-    pub fn new(vectors: Arc<InMemoryVectorStorage>) -> Self {
+impl Default for HnswBuildParams {
+    fn default() -> Self {
         Self {
-            max_level: 8,
-            m: 30,
-            m_max: 64,
-            ef_construction: 100,
-            vectors,
-            levels: vec![],
-            entry_point: 0,
+            max_level: 7,
+            m: 20,
+            m_max: 30,
+            ef_construction: 25,
             extend_candidates: false,
             log_base: 10.0,
             use_select_heuristic: true,
         }
     }
+}
 
+impl HnswBuildParams {
     /// The maximum level of the graph.
     /// The default value is `8`.
     pub fn max_level(mut self, max_level: u16) -> Self {
@@ -131,6 +113,47 @@ impl HNSWBuilder {
         self.use_select_heuristic = flag;
         self
     }
+}
+
+/// Build a HNSW graph.
+///
+/// Currently, the HNSW graph is fully built in memory.
+///
+/// During the build, the graph is built layer by layer.
+///
+/// Each node in the graph has a global ID which is the index on the base layer.
+#[derive(Clone)]
+pub struct HNSWBuilder {
+    params: HnswBuildParams,
+
+    /// Vector storage for the graph.
+    vectors: Arc<InMemoryVectorStorage>,
+
+    levels: Vec<GraphBuilder>,
+
+    entry_point: u32,
+}
+
+impl HNSWBuilder {
+    /// Create a new [`HNSWBuilder`] with in memory vector storage.
+    pub fn new(vectors: Arc<InMemoryVectorStorage>) -> Self {
+        Self {
+            params: HnswBuildParams::default(),
+            vectors,
+            levels: vec![],
+            entry_point: 0,
+        }
+    }
+
+    /// Create a new [`HNSWBuilder`] with prepared params and in memory vector storage.
+    pub fn with_params(params: HnswBuildParams, vectors: Arc<InMemoryVectorStorage>) -> Self {
+        Self {
+            params: params,
+            vectors,
+            levels: vec![],
+            entry_point: 0,
+        }
+    }
 
     /// New node's level
     ///
@@ -141,11 +164,11 @@ impl HNSWBuilder {
         // We use log10 instead of log(e), so each layer has about 1/10 of its bottom layer.
         let m = self.vectors.len();
         min(
-            (m as f32).log(self.log_base).ceil() as u16
+            (m as f32).log(self.params.log_base).ceil() as u16
                 - (rng.gen::<f32>() * self.vectors.len() as f32)
-                    .log(self.log_base)
+                    .log(self.params.log_base)
                     .ceil() as u16,
-            self.max_level,
+            self.params.max_level,
         )
     }
 
@@ -177,27 +200,27 @@ impl HNSWBuilder {
         let mut ep = vec![ep];
         for cur_level in self.levels.iter_mut().rev().skip(levels_to_search) {
             cur_level.insert(node);
-            let candidates = beam_search(cur_level, &ep, vector, self.ef_construction)?;
-            let neighbors: Vec<_> = if self.use_select_heuristic {
+            let candidates = beam_search(cur_level, &ep, vector, self.params.ef_construction)?;
+            let neighbors: Vec<_> = if self.params.use_select_heuristic {
                 select_neighbors_heuristic(
                     cur_level,
                     query,
                     &candidates,
-                    self.m,
-                    self.extend_candidates,
+                    self.params.m,
+                    self.params.extend_candidates,
                 )
                 .collect()
             } else {
-                select_neighbors(&candidates, self.m).collect()
+                select_neighbors(&candidates, self.params.m).collect()
             };
 
             for (distance, nb) in neighbors.iter() {
                 cur_level.connect(node, *nb, Some(*distance))?;
             }
             for (_, nb) in neighbors {
-                cur_level.prune(nb, self.m_max)?;
+                cur_level.prune(nb, self.params.m_max)?;
             }
-            cur_level.prune(node, self.m_max)?;
+            cur_level.prune(node, self.params.m_max)?;
             ep = candidates.values().copied().collect();
         }
 
@@ -218,11 +241,11 @@ impl HNSWBuilder {
         log::info!(
             "Building HNSW graph: metric_type={}, max_levels={}, m_max={}, ef_construction={}",
             self.vectors.metric_type(),
-            self.max_level,
-            self.m_max,
-            self.ef_construction
+            self.params.max_level,
+            self.params.m_max,
+            self.params.ef_construction
         );
-        for _ in 0..self.max_level {
+        for _ in 0..self.params.max_level {
             let mut level = GraphBuilder::new(self.vectors.clone());
             level.insert(0);
             self.levels.push(level);
@@ -247,7 +270,7 @@ impl HNSWBuilder {
             graphs,
             self.entry_point,
             self.vectors.metric_type(),
-            self.use_select_heuristic,
+            self.params.use_select_heuristic,
         ))
     }
 }

@@ -12,45 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    any::Any,
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
-use arrow_arith::numeric::sub;
-use arrow_array::{
-    cast::{as_struct_array, AsArray},
-    types::{Float16Type, Float32Type, Float64Type},
-    Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
-};
-use arrow_ord::sort::sort_to_indices;
-use arrow_schema::DataType;
-use arrow_select::{concat::concat_batches, take::take};
+use arrow_array::{cast::AsArray, types::Float32Type, RecordBatch};
+
+use arrow_select::concat::concat_batches;
 use async_trait::async_trait;
-use futures::{
-    stream::{self, StreamExt},
-    TryStreamExt,
-};
+use futures::TryStreamExt;
 use lance_arrow::*;
 use lance_core::{datatypes::Field, Error, Result};
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use lance_index::{
     optimize::OptimizeOptions,
-    vector::{hnsw::HNSW, Query, DIST_COL},
+    vector::{
+        graph::memory::InMemoryVectorStorage,
+        hnsw::{builder::HnswBuildParams, HNSWBuilder, HNSW},
+        Query, DIST_COL,
+    },
     Index, IndexType,
 };
-use lance_io::{
-    encodings::plain::PlainEncoder,
-    local::to_local_path,
-    object_store::ObjectStore,
-    object_writer::ObjectWriter,
-    stream::RecordBatchStream,
-    traits::{Reader, WriteExt, Writer},
+use lance_io::traits::Reader;
+use lance_linalg::{
+    distance::{Cosine, Dot, MetricType, L2},
+    MatrixView,
 };
-use lance_linalg::distance::{Cosine, Dot, MetricType, L2};
 use log::{debug, info};
-use object_store::path::Path;
+use object_store::{memory::InMemory, path::Path};
 use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -71,7 +58,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct HNSWIndex {
-    inner: HNSW,
+    hnsw: HNSW,
 }
 
 #[async_trait]
@@ -90,7 +77,7 @@ impl Index for HNSWIndex {
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(json!({
             "index_type": "HNSW",
-            "metric_type": self.inner.metric_type().to_string(),
+            "metric_type": self.hnsw.metric_type().to_string(),
         }))
     }
 
@@ -111,10 +98,12 @@ impl Index for HNSWIndex {
 #[async_trait]
 impl VectorIndex for HNSWIndex {
     #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {}
+    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+        todo!()
+    }
 
     fn is_loadable(&self) -> bool {
-        false
+        true
     }
 
     fn use_residual(&self) -> bool {
@@ -151,6 +140,36 @@ impl VectorIndex for HNSWIndex {
     }
 
     fn metric_type(&self) -> MetricType {
-        self.metric_type
+        self.hnsw.metric_type()
     }
+}
+
+pub(super) async fn build_hnsw_model(
+    dataset: &Dataset,
+    column: &str,
+    dim: usize,
+    metric_type: MetricType,
+    params: &HnswBuildParams,
+) -> Result<HNSW> {
+    let projection = dataset.schema().project(&[column])?;
+    let batches = dataset
+        .scan()
+        .try_into_stream()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+    let batch = concat_batches(&Arc::new(arrow_schema::Schema::from(&projection)), &batches)?;
+    let array = batch.column_by_name(column).ok_or(Error::Index {
+        message: format!(
+            "Sample training data: column {} does not exist in return",
+            column
+        ),
+        location: location!(),
+    })?;
+    let mat = Arc::new(MatrixView::<Float32Type>::try_from(
+        array.as_fixed_size_list(),
+    )?);
+
+    let vector_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), metric_type));
+    HNSWBuilder::with_params(params.clone(), vector_store).build()
 }

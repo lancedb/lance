@@ -134,13 +134,13 @@ fn is_ivf_pq(stages: &[StageParams]) -> bool {
 }
 
 fn is_ivf_hnsw(stages: &[StageParams]) -> bool {
-    if stages.len() < 2 {
+    if stages.len() < 3 {
         return false;
     }
     let len = stages.len();
 
-    matches!(&stages[len - 1], StageParams::Hnsw(_))
-        && matches!(&stages[len - 2], StageParams::Ivf(_))
+    matches!(&stages[len - 2], StageParams::Hnsw(_))
+        && matches!(&stages[len - 3], StageParams::Ivf(_))
 }
 
 /// Build a Vector Index
@@ -186,7 +186,7 @@ pub(crate) async fn build_vector_index(
             pq_params,
         )
         .await?
-    } else if is_ivf_hnsw(stages) {
+    } else if is_ivf_hnsw_pq(stages) {
         let len = stages.len();
         let StageParams::Ivf(ivf_params) = &stages[len - 2] else {
             return Err(Error::Index {

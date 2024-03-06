@@ -40,9 +40,9 @@ use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
-        hnsw::HNSWBuilder,
+        hnsw::{builder::HnswBuildParams, HNSWBuilder},
         ivf::{builder::load_precomputed_partitions, shuffler::shuffle_dataset, IvfBuildParams},
-        pq::{PQBuildParams, ProductQuantizer},
+        pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
         Query, DIST_COL,
     },
     Index, IndexType,
@@ -63,7 +63,7 @@ use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::{location, Location};
-use tracing::instrument;
+use tracing::{instrument, span, Level};
 use uuid::Uuid;
 
 use super::{
@@ -894,13 +894,15 @@ pub async fn build_ivf_hnsw_index(
     uuid: &str,
     metric_type: MetricType,
     ivf_params: &IvfBuildParams,
-    hnsw_params: &HNSWBuilder,
+    hnsw_params: &HnswBuildParams,
+    pq_params: &PQBuildParams,
 ) -> Result<()> {
     sanity_check_params(ivf_params, pq_params)?;
 
     info!(
-        "Building vector index: IVF{},{}PQ{}, metric={}",
+        "Building vector index: IVF{},{}HNSW{},PQ{}, metric={}",
         ivf_params.num_partitions,
+        hnsw_params.ef_construction,
         if pq_params.use_opq { "O" } else { "" },
         pq_params.num_sub_vectors,
         metric_type,
