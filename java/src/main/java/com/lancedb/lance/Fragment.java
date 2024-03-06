@@ -14,6 +14,10 @@
 
 package com.lancedb.lance;
 
+import java.io.IOException;
+import org.apache.arrow.dataset.scanner.ScanOptions;
+import org.apache.arrow.vector.ipc.ArrowReader;
+
 /** Data Fragment. */
 public class Fragment {
   // Only keep fragmentId for reference, so we don't need to make this
@@ -42,5 +46,9 @@ public class Fragment {
   /** Count rows in this Fragment. */
   public int countRows() {
     return countRowsNative(dataset, fragmentId);
+  }
+
+  public ArrowReader newScan(ScanOptions options) throws IOException  {
+    return null;
   }
 }
