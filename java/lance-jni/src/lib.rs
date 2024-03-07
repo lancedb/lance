@@ -38,6 +38,7 @@ mod blocking_dataset;
 pub mod error;
 mod fragment;
 mod traits;
+mod ffi;
 
 use self::traits::{FromJString, JMapExt};
 use crate::blocking_dataset::BlockingDataset;

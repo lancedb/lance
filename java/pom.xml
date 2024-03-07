@@ -15,7 +15,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.source>11</maven.compiler.source>
         <maven.compiler.target>11</maven.compiler.target>
-        <arrow.version>14.0.2</arrow.version>
+        <arrow.version>15.0.0</arrow.version>
     </properties>
 
     <dependencies>
@@ -123,7 +123,10 @@
                 </plugin>
                 <plugin>
                     <artifactId>maven-surefire-plugin</artifactId>
-                    <version>2.22.1</version>
+                    <version>3.2.5</version>
+                    <configuration>
+                        <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+                    </configuration>
                 </plugin>
                 <plugin>
                     <artifactId>maven-jar-plugin</artifactId>
