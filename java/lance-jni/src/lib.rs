@@ -39,6 +39,7 @@ pub mod error;
 mod ffi;
 mod fragment;
 mod traits;
+mod ffi;
 
 use self::traits::{FromJString, JMapExt};
 use crate::blocking_dataset::BlockingDataset;

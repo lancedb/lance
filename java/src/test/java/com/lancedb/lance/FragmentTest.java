@@ -14,4 +14,56 @@
 
 package com.lancedb.lance;
 
-public class FragmentTest {}
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+import java.io.IOException;
+import java.net.URISyntaxException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;
+import org.apache.arrow.dataset.scanner.ScanOptions;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.ipc.ArrowFileReader;
+import org.apache.arrow.vector.ipc.SeekableReadChannel;
+import org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+public class FragmentTest {
+  @TempDir private static Path tempDir; // Temporary directory for the tests
+
+  @Test
+  void testFragmentScannerSchema() throws IOException, URISyntaxException {
+    Path path = Paths.get(DatasetTest.class.getResource("/random_access.arrow").toURI());
+    try (BufferAllocator allocator = new RootAllocator();
+        ArrowFileReader reader =
+            new ArrowFileReader(
+                new SeekableReadChannel(
+                    new ByteArrayReadableSeekableByteChannel(Files.readAllBytes(path))),
+                allocator);
+        ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
+      Data.exportArrayStream(allocator, reader, arrowStream);
+      Path datasetPath = tempDir.resolve("fragment_scheme");
+      Dataset.write(
+          arrowStream,
+          datasetPath.toString(),
+          new WriteParams.Builder()
+              .withMaxRowsPerFile(10)
+              .withMaxRowsPerGroup(20)
+              .withMode(WriteParams.WriteMode.CREATE)
+              .build());
+
+      var dataset = Dataset.open(datasetPath.toString(), allocator);
+      assertEquals(9, dataset.countRows());
+      var fragment = dataset.getFragments().get(0);
+      System.out.println(fragment.toString());
+
+      var scanner = fragment.newScan(new ScanOptions(1024));
+      var schema = scanner.schema();
+      assertEquals(schema, reader.getVectorSchemaRoot().getSchema());
+    }
+  }
+}

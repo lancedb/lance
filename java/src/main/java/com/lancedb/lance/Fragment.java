@@ -14,9 +14,9 @@
 
 package com.lancedb.lance;
 
-import java.io.IOException;
+import com.lancedb.lance.ipc.FragmentScanner;
 import org.apache.arrow.dataset.scanner.ScanOptions;
-import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.dataset.scanner.Scanner;
 
 /** Data Fragment. */
 public class Fragment {
@@ -49,7 +49,7 @@ public class Fragment {
   }
 
   /** Create a new Fragment Scanner. */
-  public ArrowReader newScan(ScanOptions options) throws IOException  {
-    return null;
+  public Scanner newScan(ScanOptions options) {
+    return new FragmentScanner(dataset, fragmentId, options, dataset.allocator);
   }
 }

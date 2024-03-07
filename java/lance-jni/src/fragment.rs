@@ -54,3 +54,25 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_countRowsNative(
         }
     }
 }
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_getSchema(
+    mut env: JNIEnv,
+    _scanner: JObject,
+    jdataset: JObject,
+    fragment_id: jint,
+    columns: JObject, // Optional<List[String]>
+    schema: jlong
+) {
+    let res = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+                .expect("Dataset handle not set");
+        let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
+            return Err(Error::InvalidArgument {
+                message: format!("Fragment not found: {}", fragment_id),
+            });
+        };
+
+    };
+}
