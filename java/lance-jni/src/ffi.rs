@@ -14,13 +14,17 @@
 
 use jni::{objects::JObject, JNIEnv};
 use jni::objects::JString;
+use jni::signature::{ReturnType, TypeSignature};
 
 use crate::{Result, Error};
 
 /// Extend JNIEnv with helper functions.
 pub trait JNIEnvExt {
 
-    /// Get strings from Java List<String> object
+    /// Get Option<JObject> from Java [java.util.Optional<..>].
+    fn get_option(&mut self, obj: &JObject) -> Result<Option<JObject>>;
+
+    /// Get strings from Java List<String> object.
     fn get_strings(&mut self, obj: &JObject) -> Result<Vec<String>>;
 
     /// Get Option<Vec<String>> from Java Optional<List<String>>.
@@ -28,6 +32,21 @@ pub trait JNIEnvExt {
 }
 
 impl JNIEnvExt for JNIEnv<'_> {
+
+    fn get_option(&mut self, obj: &JObject) -> Result<Option<JObject>> {
+        let is_empty = self.call_method(obj, "java/util/Optional/isEmpty", "()Z", &[])?;
+        if !is_empty.z()? {
+            return Ok(None);
+        } else {
+            let signature = TypeSignature {
+              args: vec![],
+                ret: ReturnType::Object,
+            };
+            let inner = self.call_method(obj, "java/util/Optional/get", signature.to_string(), &[])?;
+            Ok(Some(inner.l()?))
+        }
+    }
+
     fn get_strings(&mut self, obj: &JObject) -> Result<Vec<String>> {
         let list = self.get_list(obj)?;
         let mut iter = list.iter(self)?;
