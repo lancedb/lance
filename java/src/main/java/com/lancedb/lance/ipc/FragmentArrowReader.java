@@ -15,6 +15,9 @@
 package com.lancedb.lance.ipc;
 
 import java.io.IOException;
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.ArrowSchema;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -22,6 +25,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 /** Fragment Arrow Reader. */
 class FragmentArrowReader extends ArrowReader {
   private long nativeHandle;
+  private ArrowArrayStream stream;
 
   FragmentArrowReader(BufferAllocator allocator) {
     super(allocator);
@@ -42,6 +46,8 @@ class FragmentArrowReader extends ArrowReader {
 
   @Override
   protected Schema readSchema() throws IOException {
-    return null;
+    var arrowSchema = ArrowSchema.allocateNew(allocator);
+    stream.getSchema(arrowSchema);
+    return Data.importSchema(allocator, arrowSchema, null);
   }
 }
