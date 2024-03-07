@@ -35,15 +35,15 @@ use futures::{
     TryStreamExt,
 };
 use lance_arrow::*;
-use lance_core::{datatypes::Field, Error, Result};
+use lance_core::{datatypes::Field, Error, Result, ROW_ID_FIELD};
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
-        hnsw::{builder::HnswBuildParams, HNSWBuilder},
+        hnsw::{builder::HnswBuildParams, HNSWBuilder, HNSW},
         ivf::{builder::load_precomputed_partitions, shuffler::shuffle_dataset, IvfBuildParams},
         pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
-        Query, DIST_COL,
+        Query, DIST_COL, PART_ID_COLUMN, PQ_CODE_COLUMN,
     },
     Index, IndexType,
 };
@@ -71,7 +71,7 @@ use super::{
     utils::maybe_sample_training_data,
     VectorIndex,
 };
-use crate::dataset::builder::DatasetBuilder;
+use crate::{dataset::builder::DatasetBuilder, index::vector::hnsw::build_hnsw_model};
 use crate::{
     dataset::Dataset,
     index::{
@@ -540,9 +540,9 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                 )?)),
             },
             pb::VectorIndexStage {
-                stage: Some(pb::vector_index_stage::Stage::Pq(
-                    idx.pq.as_ref().try_into()?,
-                )),
+                stage: Some(pb::vector_index_stage::Stage::Pq(pb::Pq::try_from(
+                    idx.pq.as_ref(),
+                )?)),
             },
         ]);
 
@@ -900,7 +900,7 @@ pub async fn build_ivf_hnsw_index(
     sanity_check_params(ivf_params, pq_params)?;
 
     info!(
-        "Building vector index: IVF{},{}HNSW{},PQ{}, metric={}",
+        "Building vector index: IVF{},HNSW{},{}PQ{}, metric={}",
         ivf_params.num_partitions,
         hnsw_params.ef_construction,
         if pq_params.use_opq { "O" } else { "" },
@@ -1087,6 +1087,59 @@ pub async fn build_ivf_hnsw_index(
         }
         None => None,
     };
+
+    // Shuffle the dataset into partitions, and build HNSW for each partition.
+    let num_partitions = ivf_model.num_partitions() as u32;
+    let ivf_model = lance_index::vector::ivf::new_ivf_with_pq(
+        ivf_model.centroids.values(),
+        ivf_model.centroids.value_length() as usize,
+        metric_type,
+        column,
+        pq.clone(),
+        Some(0..num_partitions),
+    )?;
+
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        arrow_schema::Field::new(
+            column,
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            false,
+        ),
+        arrow_schema::Field::new(PART_ID_COLUMN, DataType::UInt32, true),
+        arrow_schema::Field::new(
+            PQ_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
+                pq.num_sub_vectors() as i32,
+            ),
+            false,
+        ),
+    ]));
+
+    let partition_streams = shuffle_dataset(
+        stream,
+        column,
+        ivf_model,
+        precomputed_partitions,
+        num_partitions,
+        pq.num_sub_vectors(),
+        ivf_params.shuffle_partition_batches,
+        ivf_params.shuffle_partition_concurrency,
+        ivf_params.precomputed_shuffle_buffers.clone(),
+        schema,
+    )
+    .await?;
+
+    for stream in partition_streams.into_iter() {
+        let hnsw = build_hnsw_model(dataset, stream, column, metric_type, hnsw_params).await?;
+    }
+
+    // Construct the HNSW graph with the quantized vectors.
+    let hnsw = build_hnsw_model(dataset, column, metric_type, &hnsw_params).await?;
 
     write_index_file(
         dataset,
@@ -1282,6 +1335,40 @@ async fn write_index_file(
         metric_type,
         ivf,
         pq,
+        transforms,
+    };
+
+    let metadata = pb::Index::try_from(&metadata)?;
+    let pos = writer.write_protobuf(&metadata).await?;
+    writer
+        .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+        .await?;
+    writer.shutdown().await?;
+
+    Ok(())
+}
+
+async fn write_ivf_hnsw_files(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    uuid: &str,
+    ivf: Ivf,
+    hnsw: HNSW,
+    metric_type: MetricType,
+    transforms: Vec<pb::Transform>,
+) -> Result<()> {
+    let object_store = dataset.object_store();
+    let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
+    let mut writer = object_store.create(&path).await?;
+
+    let metadata = IvfPQIndexMetadata {
+        name: index_name.to_string(),
+        column: column.to_string(),
+        dimension: hnsw.dimension() as u32,
+        dataset_version: dataset.version().version,
+        metric_type,
+        ivf,
         transforms,
     };
 

@@ -18,7 +18,7 @@ use arrow_array::{cast::AsArray, types::Float32Type, RecordBatch};
 
 use arrow_select::concat::concat_batches;
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{datatypes::Field, Error, Result};
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
@@ -31,7 +31,7 @@ use lance_index::{
     },
     Index, IndexType,
 };
-use lance_io::traits::Reader;
+use lance_io::{stream::RecordBatchStream, traits::Reader};
 use lance_linalg::{
     distance::{Cosine, Dot, MetricType, L2},
     MatrixView,
@@ -146,18 +146,27 @@ impl VectorIndex for HNSWIndex {
 
 pub(super) async fn build_hnsw_model(
     dataset: &Dataset,
+    stream: impl RecordBatchStream + Unpin + 'static,
     column: &str,
-    dim: usize,
     metric_type: MetricType,
     params: &HnswBuildParams,
 ) -> Result<HNSW> {
-    let projection = dataset.schema().project(&[column])?;
-    let batches = dataset
-        .scan()
-        .try_into_stream()
-        .await?
-        .try_collect::<Vec<_>>()
-        .await?;
+    for batch in stream {
+        let batch = batch?;
+        let array = batch.column_by_name(column).ok_or(Error::Index {
+            message: format!(
+                "Sample training data: column {} does not exist in return",
+                column
+            ),
+            location: location!(),
+        })?;
+        let mat = Arc::new(MatrixView::<Float32Type>::try_from(
+            array.as_fixed_size_list(),
+        )?);
+        let vector_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), metric_type));
+        return HNSWBuilder::with_params(params.clone(), vector_store).build();
+    }
+    let batches = stream.try_collect::<Vec<_>>().await?;
     let batch = concat_batches(&Arc::new(arrow_schema::Schema::from(&projection)), &batches)?;
     let array = batch.column_by_name(column).ok_or(Error::Index {
         message: format!(

@@ -16,12 +16,15 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use arrow_schema::{DataType, Field};
 use object_store::path::Path;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use lance_core::{Error, Result, ROW_ID};
-use lance_index::vector::{ivf::shuffler::shuffle_dataset, pq::ProductQuantizer};
+use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
+use lance_index::vector::{
+    ivf::shuffler::shuffle_dataset, pq::ProductQuantizer, PART_ID_COLUMN, PQ_CODE_COLUMN,
+};
 use lance_io::{stream::RecordBatchStream, traits::Writer};
 use lance_linalg::distance::MetricType;
 
@@ -68,6 +71,19 @@ pub(super) async fn build_partitions(
         Some(part_range),
     )?;
 
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        Field::new(PART_ID_COLUMN, DataType::UInt32, true),
+        Field::new(
+            PQ_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                pq.num_sub_vectors() as i32,
+            ),
+            false,
+        ),
+    ]));
+
     let stream = shuffle_dataset(
         data,
         column,
@@ -78,6 +94,7 @@ pub(super) async fn build_partitions(
         shuffle_partition_batches,
         shuffle_partition_concurrency,
         precomputed_shuffle_buffers,
+        schema,
     )
     .await?;
 

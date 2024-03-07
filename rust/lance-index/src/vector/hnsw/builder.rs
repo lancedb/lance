@@ -65,56 +65,6 @@ impl Default for HnswBuildParams {
     }
 }
 
-impl HnswBuildParams {
-    /// The maximum level of the graph.
-    /// The default value is `8`.
-    pub fn max_level(mut self, max_level: u16) -> Self {
-        self.max_level = max_level;
-        self
-    }
-
-    /// The number of connections to establish while inserting new element
-    /// The default value is `30`.
-    pub fn num_edges(mut self, m: usize) -> Self {
-        self.m = m;
-        self
-    }
-
-    /// The maximum number of connections for each node per layer.
-    /// The default value is `64`.
-    pub fn max_num_edges(mut self, m_max: usize) -> Self {
-        self.m_max = m_max;
-        self
-    }
-
-    /// Number of candidates to be considered when searching for the nearest neighbors
-    /// during the construction of the graph.
-    ///
-    /// The default value is `100`.
-    pub fn ef_construction(mut self, ef_construction: usize) -> Self {
-        self.ef_construction = ef_construction;
-        self
-    }
-
-    /// Whether to expend to search candidate neighbors during heuristic search.
-    ///
-    /// The default value is `false`.
-    ///
-    /// See `extendCandidates` parameter in the paper (Algorithm 4)
-    pub fn extend_candidates(mut self, flag: bool) -> Self {
-        self.extend_candidates = flag;
-        self
-    }
-
-    /// Use select heuristic when searching for the nearest neighbors.
-    ///
-    /// See algorithm 4 in HNSW paper.
-    pub fn use_select_heuristic(mut self, flag: bool) -> Self {
-        self.use_select_heuristic = flag;
-        self
-    }
-}
-
 /// Build a HNSW graph.
 ///
 /// Currently, the HNSW graph is fully built in memory.
@@ -153,6 +103,54 @@ impl HNSWBuilder {
             levels: vec![],
             entry_point: 0,
         }
+    }
+
+    /// The maximum level of the graph.
+    /// The default value is `8`.
+    pub fn max_level(mut self, max_level: u16) -> Self {
+        self.params.max_level = max_level;
+        self
+    }
+
+    /// The number of connections to establish while inserting new element
+    /// The default value is `30`.
+    pub fn num_edges(mut self, m: usize) -> Self {
+        self.params.m = m;
+        self
+    }
+
+    /// The maximum number of connections for each node per layer.
+    /// The default value is `64`.
+    pub fn max_num_edges(mut self, m_max: usize) -> Self {
+        self.params.m_max = m_max;
+        self
+    }
+
+    /// Number of candidates to be considered when searching for the nearest neighbors
+    /// during the construction of the graph.
+    ///
+    /// The default value is `100`.
+    pub fn ef_construction(mut self, ef_construction: usize) -> Self {
+        self.params.ef_construction = ef_construction;
+        self
+    }
+
+    /// Whether to expend to search candidate neighbors during heuristic search.
+    ///
+    /// The default value is `false`.
+    ///
+    /// See `extendCandidates` parameter in the paper (Algorithm 4)
+    pub fn extend_candidates(mut self, flag: bool) -> Self {
+        self.params.extend_candidates = flag;
+        self
+    }
+
+    /// Use select heuristic when searching for the nearest neighbors.
+    ///
+    /// See algorithm 4 in HNSW paper.
+    pub fn use_select_heuristic(mut self, flag: bool) -> Self {
+        self.params.use_select_heuristic = flag;
+        self
     }
 
     /// New node's level

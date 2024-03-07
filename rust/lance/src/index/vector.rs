@@ -27,6 +27,7 @@ mod utils;
 #[cfg(test)]
 mod fixture_test;
 
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::{hnsw::HNSWBuilder, ivf::IvfBuildParams, pq::PQBuildParams};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
@@ -55,7 +56,7 @@ pub enum StageParams {
 
     PQ(PQBuildParams),
 
-    Hnsw(HNSWBuilder),
+    Hnsw(HnswBuildParams),
 }
 
 /// The parameters to build vector index.
@@ -133,13 +134,14 @@ fn is_ivf_pq(stages: &[StageParams]) -> bool {
         && matches!(&stages[len - 2], StageParams::Ivf(_))
 }
 
-fn is_ivf_hnsw(stages: &[StageParams]) -> bool {
+fn is_ivf_hnsw_pq(stages: &[StageParams]) -> bool {
     if stages.len() < 3 {
         return false;
     }
     let len = stages.len();
 
-    matches!(&stages[len - 2], StageParams::Hnsw(_))
+    matches!(&stages[len - 1], StageParams::Hnsw(_))
+        && matches!(&stages[len - 2], StageParams::PQ(_))
         && matches!(&stages[len - 3], StageParams::Ivf(_))
 }
 
@@ -188,7 +190,13 @@ pub(crate) async fn build_vector_index(
         .await?
     } else if is_ivf_hnsw_pq(stages) {
         let len = stages.len();
-        let StageParams::Ivf(ivf_params) = &stages[len - 2] else {
+        let StageParams::Ivf(ivf_params) = &stages[len - 3] else {
+            return Err(Error::Index {
+                message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                location: location!(),
+            });
+        };
+        let StageParams::PQ(pq_params) = &stages[len - 2] else {
             return Err(Error::Index {
                 message: format!("Build Vector Index: invalid stages: {:?}", stages),
                 location: location!(),
@@ -208,6 +216,7 @@ pub(crate) async fn build_vector_index(
             params.metric_type,
             ivf_params,
             hnsw_params,
+            pq_params,
         )
         .await?
     } else {
