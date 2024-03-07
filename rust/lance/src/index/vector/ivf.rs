@@ -1101,14 +1101,14 @@ pub async fn build_ivf_hnsw_index(
 
     let schema = Arc::new(arrow_schema::Schema::new(vec![
         ROW_ID_FIELD.clone(),
-        arrow_schema::Field::new(
-            column,
-            DataType::FixedSizeList(
-                Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
-                dim as i32,
-            ),
-            false,
-        ),
+        // arrow_schema::Field::new(
+        //     column,
+        //     DataType::FixedSizeList(
+        //         Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+        //         dim as i32,
+        //     ),
+        //     false,
+        // ),
         arrow_schema::Field::new(PART_ID_COLUMN, DataType::UInt32, true),
         arrow_schema::Field::new(
             PQ_CODE_COLUMN,
@@ -1134,12 +1134,9 @@ pub async fn build_ivf_hnsw_index(
     )
     .await?;
 
-    for stream in partition_streams.into_iter() {
+    for stream in partition_streams {
         let hnsw = build_hnsw_model(dataset, stream, column, metric_type, hnsw_params).await?;
     }
-
-    // Construct the HNSW graph with the quantized vectors.
-    let hnsw = build_hnsw_model(dataset, column, metric_type, &hnsw_params).await?;
 
     write_index_file(
         dataset,
@@ -1354,7 +1351,6 @@ async fn write_ivf_hnsw_files(
     index_name: &str,
     uuid: &str,
     ivf: Ivf,
-    hnsw: HNSW,
     metric_type: MetricType,
     transforms: Vec<pb::Transform>,
 ) -> Result<()> {
