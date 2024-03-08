@@ -20,17 +20,17 @@ use crate::Result;
 /// Extend JNIEnv with helper functions.
 pub trait JNIEnvExt {
     /// Get strings from Java List<String> object.
-    fn get_strings<'a>(&'a mut self, obj: &'a JObject<'a>) -> Result<Vec<String>>;
+    fn get_strings(&mut self, obj: &JObject) -> Result<Vec<String>>;
 
     /// Get Option<Vec<String>> from Java Optional<List<String>>.
     fn get_strings_opt(&mut self, obj: &JObject) -> Result<Option<Vec<String>>>;
 }
 
 impl JNIEnvExt for JNIEnv<'_> {
-    fn get_strings<'a>(&'a mut self, obj: &'a JObject<'a>) -> Result<Vec<String>> {
+    fn get_strings(&mut self, obj: &JObject) -> Result<Vec<String>> {
         let list = self.get_list(obj)?;
         let mut iter = list.iter(self)?;
-        let mut results = vec![];
+        let mut results = Vec::with_capacity(list.size(self)? as usize);
         while let Some(elem) = iter.next(self)? {
             let jstr = JString::from(elem);
             let val = self.get_string(&jstr)?;
