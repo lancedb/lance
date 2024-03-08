@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use jni::{JNIEnv, objects::JObject};
 use jni::objects::JString;
+use jni::{objects::JObject, JNIEnv};
 
 use crate::Result;
 
@@ -44,7 +44,8 @@ impl JNIEnvExt for JNIEnv<'_> {
         if !is_empty.z()? {
             Ok(None)
         } else {
-            let inner = self.call_method(obj, "java/util/Optional/get", "()Ljava/util/List;", &[])?;
+            let inner =
+                self.call_method(obj, "java/util/Optional/get", "()Ljava/util/List;", &[])?;
             let inner_obj = inner.l()?;
             Ok(Some(self.get_strings(&inner_obj)?))
         }
