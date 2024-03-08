@@ -298,6 +298,60 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
         }
     }
 
+    fn new_with_hnsw(
+        centroids: MatrixView<T>,
+        metric_type: MetricType,
+        vector_column: &str,
+        pq: Arc<dyn ProductQuantizer>,
+        range: Option<Range<u32>>,
+    ) -> Self {
+        let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
+
+        let mt = if metric_type == MetricType::Cosine {
+            transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
+                vector_column,
+            )));
+            MetricType::L2
+        } else {
+            metric_type
+        };
+
+        let ivf_transform = Arc::new(IvfTransformer::new(centroids.clone(), mt, vector_column));
+        transforms.push(ivf_transform.clone());
+
+        if let Some(range) = range {
+            transforms.push(Arc::new(transform::PartitionFilter::new(
+                PART_ID_COLUMN,
+                range,
+            )));
+        }
+
+        if pq.use_residual() {
+            transforms.push(Arc::new(ResidualTransform::new(
+                centroids.clone(),
+                PART_ID_COLUMN,
+                vector_column,
+            )));
+            transforms.push(Arc::new(PQTransformer::new(
+                pq.clone(),
+                RESIDUAL_COLUMN,
+                PQ_CODE_COLUMN,
+            )));
+        } else {
+            transforms.push(Arc::new(PQTransformer::new(
+                pq.clone(),
+                vector_column,
+                PQ_CODE_COLUMN,
+            )));
+        };
+        Self {
+            centroids: centroids.clone(),
+            metric_type,
+            transforms,
+            ivf_transform,
+        }
+    }
+
     fn dimension(&self) -> usize {
         self.centroids.ndim()
     }

@@ -71,13 +71,16 @@ use super::{
     utils::maybe_sample_training_data,
     VectorIndex,
 };
-use crate::{dataset::builder::DatasetBuilder, index::vector::hnsw::build_hnsw_model};
+use crate::{
+    dataset::builder::DatasetBuilder,
+    index::vector::{hnsw::build_hnsw_model, ivf::io::write_hnsw_index_partitions},
+};
 use crate::{
     dataset::Dataset,
     index::{
         pb,
         prefilter::PreFilter,
-        vector::{ivf::io::write_index_partitions, Transformer},
+        vector::{ivf::io::write_pq_index_partitions, Transformer},
         INDEX_FILE_NAME,
     },
     session::Session,
@@ -284,7 +287,7 @@ pub(crate) async fn optimize_vector_indices(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    write_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(&indices_to_merge)).await?;
+    write_pq_index_partitions(&mut writer, &mut ivf_mut, shuffled, Some(&indices_to_merge)).await?;
     let metadata = IvfPQIndexMetadata {
         name: format!("_{}_idx", vector_column),
         column: vector_column.to_string(),
@@ -868,7 +871,7 @@ pub async fn build_ivf_pq_index(
         None => None,
     };
 
-    write_index_file(
+    write_ivf_pq_file(
         dataset,
         column,
         index_name,
@@ -950,7 +953,7 @@ pub async fn build_ivf_hnsw_index(
 
     let start = std::time::Instant::now();
     // Train IVF partitions.
-    let ivf_model = if let Some(centroids) = &ivf_params.centroids {
+    let ivf = if let Some(centroids) = &ivf_params.centroids {
         if centroids.values().len() != ivf_params.num_partitions * dim {
             return Err(Error::Index {
                 message: format!(
@@ -1039,8 +1042,8 @@ pub async fn build_ivf_hnsw_index(
 
         // TODO: consolidate IVF models to `lance_index`.
         let ivf2 = lance_index::vector::ivf::new_ivf(
-            ivf_model.centroids.values(),
-            ivf_model.dimension(),
+            ivf.centroids.values(),
+            ivf.dimension(),
             metric_type,
             vec![],
             None,
@@ -1088,65 +1091,16 @@ pub async fn build_ivf_hnsw_index(
         None => None,
     };
 
-    // Shuffle the dataset into partitions, and build HNSW for each partition.
-    let num_partitions = ivf_model.num_partitions() as u32;
-    let ivf_model = lance_index::vector::ivf::new_ivf_with_pq(
-        ivf_model.centroids.values(),
-        ivf_model.centroids.value_length() as usize,
-        metric_type,
-        column,
-        pq.clone(),
-        Some(0..num_partitions),
-    )?;
-
-    let schema = Arc::new(arrow_schema::Schema::new(vec![
-        ROW_ID_FIELD.clone(),
-        // arrow_schema::Field::new(
-        //     column,
-        //     DataType::FixedSizeList(
-        //         Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
-        //         dim as i32,
-        //     ),
-        //     false,
-        // ),
-        arrow_schema::Field::new(PART_ID_COLUMN, DataType::UInt32, true),
-        arrow_schema::Field::new(
-            PQ_CODE_COLUMN,
-            DataType::FixedSizeList(
-                Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
-                pq.num_sub_vectors() as i32,
-            ),
-            false,
-        ),
-    ]));
-
-    let partition_streams = shuffle_dataset(
-        stream,
-        column,
-        ivf_model,
-        precomputed_partitions,
-        num_partitions,
-        pq.num_sub_vectors(),
-        ivf_params.shuffle_partition_batches,
-        ivf_params.shuffle_partition_concurrency,
-        ivf_params.precomputed_shuffle_buffers.clone(),
-        schema,
-    )
-    .await?;
-
-    for stream in partition_streams {
-        let hnsw = build_hnsw_model(dataset, stream, column, metric_type, hnsw_params).await?;
-    }
-
-    write_index_file(
+    write_ivf_hnsw_file(
         dataset,
         column,
         index_name,
         uuid,
-        &transforms,
-        ivf_model,
+        &[],
+        ivf,
         pq,
         metric_type,
+        hnsw_params,
         stream,
         precomputed_partitions,
         ivf_params.shuffle_partition_batches,
@@ -1280,7 +1234,7 @@ pub(crate) async fn remap_index_file(
 /// Write the index to the index file.
 ///
 #[allow(clippy::too_many_arguments)]
-async fn write_index_file(
+async fn write_ivf_pq_file(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
@@ -1301,7 +1255,7 @@ async fn write_index_file(
 
     let start = std::time::Instant::now();
     let num_partitions = ivf.num_partitions() as u32;
-    builder::build_partitions(
+    builder::build_pq_partitions(
         &mut writer,
         stream,
         column,
@@ -1345,26 +1299,61 @@ async fn write_index_file(
     Ok(())
 }
 
-async fn write_ivf_hnsw_files(
+async fn write_ivf_hnsw_file(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
     uuid: &str,
-    ivf: Ivf,
+    transformers: &[Box<dyn Transformer>],
+    mut ivf: Ivf,
+    pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
-    transforms: Vec<pb::Transform>,
+    hnsw_params: &HnswBuildParams,
+    stream: impl RecordBatchStream + Unpin + 'static,
+    precomputed_partitons: Option<HashMap<u64, u32>>,
+    shuffle_partition_batches: usize,
+    shuffle_partition_concurrency: usize,
+    precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
     let object_store = dataset.object_store();
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
     let mut writer = object_store.create(&path).await?;
 
+    let start = std::time::Instant::now();
+    let num_partitions = ivf.num_partitions() as u32;
+    builder::build_hnsw_partitions(
+        dataset,
+        &mut writer,
+        stream,
+        column,
+        &mut ivf,
+        pq.clone(),
+        metric_type,
+        hnsw_params,
+        0..num_partitions,
+        precomputed_partitons,
+        shuffle_partition_batches,
+        shuffle_partition_concurrency,
+        precomputed_shuffle_buffers,
+    )
+    .await?;
+    info!("Built IVF partitions: {}s", start.elapsed().as_secs_f32());
+
+    // Convert [`Transformer`] to metadata.
+    let mut transforms = vec![];
+    for t in transformers {
+        let t = t.save(&mut writer).await?;
+        transforms.push(t);
+    }
+
     let metadata = IvfPQIndexMetadata {
         name: index_name.to_string(),
         column: column.to_string(),
-        dimension: hnsw.dimension() as u32,
+        dimension: pq.dimension() as u32,
         dataset_version: dataset.version().version,
         metric_type,
         ivf,
+        pq,
         transforms,
     };
 

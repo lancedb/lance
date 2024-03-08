@@ -90,15 +90,27 @@ pub async fn shuffle_dataset(
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
-    out_schema: Arc<arrow_schema::Schema>,
 ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        arrow_schema::Field::new(PART_ID_COLUMN, DataType::UInt32, true),
+        arrow_schema::Field::new(
+            PQ_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
+                num_sub_vectors as i32,
+            ),
+            false,
+        ),
+    ]));
+
     // step 1: either use precomputed shuffle files or write shuffle data to a file
     let shuffler = if let Some((path, buffers)) = precomputed_shuffle_buffers {
         let mut shuffler = IvfShuffler::try_new(
             num_partitions,
             num_sub_vectors,
             Some(path),
-            Schema::try_from(out_schema.as_ref())?,
+            Schema::try_from(schema.as_ref())?,
         )?;
         unsafe {
             shuffler.set_unsorted_buffers(&buffers);
@@ -110,7 +122,7 @@ pub async fn shuffle_dataset(
             num_partitions,
             num_sub_vectors,
             None,
-            Schema::try_from(out_schema.as_ref())?,
+            Schema::try_from(schema.as_ref())?,
         )?;
 
         let column = column.to_owned();
@@ -185,7 +197,7 @@ pub async fn shuffle_dataset(
             })
             .boxed();
 
-        let stream = lance_io::stream::RecordBatchStreamAdapter::new(out_schema.clone(), stream);
+        let stream = lance_io::stream::RecordBatchStreamAdapter::new(schema.clone(), stream);
 
         let start = std::time::Instant::now();
         shuffler.write_unsorted_stream(stream).await?;
