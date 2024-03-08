@@ -27,14 +27,17 @@ use arrow_array::{
 use futures::{Stream, StreamExt};
 use lance_arrow::*;
 use lance_core::Error;
+use lance_file::writer::{FileWriter, FileWriterOptions};
+use lance_index::vector::pq::ProductQuantizationStorage;
 use lance_index::vector::{
     graph::memory::InMemoryVectorStorage,
     hnsw::{builder::HnswBuildParams, HNSWBuilder},
     PART_ID_COLUMN, PQ_CODE_COLUMN,
 };
-use lance_io::encodings::plain::PlainEncoder;
 use lance_io::traits::Writer;
+use lance_io::{encodings::plain::PlainEncoder, object_store::ObjectStore};
 use lance_linalg::{distance::MetricType, MatrixView};
+use lance_table::io::manifest::ManifestDescribing;
 use snafu::{location, Location};
 
 use super::{IVFIndex, Ivf};
@@ -209,7 +212,7 @@ pub(super) async fn write_hnsw_index_partitions(
     column: &str,
     metric_type: MetricType,
     hnsw_params: &HnswBuildParams,
-    writer: &mut dyn Writer,
+    writer: &mut FileWriter<ManifestDescribing>,
     ivf: &mut Ivf,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
     existing_indices: Option<&[&IVFIndex]>,
@@ -360,16 +363,8 @@ pub(super) async fn write_hnsw_index_partitions(
         let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), metric_type));
 
         let hnsw = HNSWBuilder::with_params(hnsw_params.clone(), vec_store).build()?;
-
-        let pq_store = ProductQuantiz::new();
-
-        ivf.add_partition(writer.tell().await?, total_records as u32);
         if total_records > 0 {
-            let pq_refs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-            PlainEncoder::write(writer, &pq_refs).await?;
-
-            let row_ids_refs = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-            PlainEncoder::write(writer, row_ids_refs.as_slice()).await?;
+            hnsw.write(writer).await?;
         }
         log::info!(
             "Wrote partition {} in {} ms",

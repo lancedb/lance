@@ -17,6 +17,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field};
+use lance_file::writer::FileWriter;
+use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -101,7 +103,7 @@ pub(super) async fn build_pq_partitions(
 #[instrument(level = "debug", skip(writer, data, ivf, pq))]
 pub(super) async fn build_hnsw_partitions(
     dataset: &Dataset,
-    writer: &mut dyn Writer,
+    writer: &mut FileWriter<ManifestDescribing>,
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
     ivf: &mut Ivf,

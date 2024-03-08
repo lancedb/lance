@@ -16,6 +16,7 @@ mod statistics;
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
 use arrow_array::cast::{as_large_list_array, as_list_array, as_struct_array};

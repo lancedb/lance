@@ -143,31 +143,3 @@ impl VectorIndex for HNSWIndex {
         self.hnsw.metric_type()
     }
 }
-
-pub(super) async fn build_hnsw_model(
-    dataset: &Dataset,
-    stream: impl Stream<Item = Result<RecordBatch>>,
-    column: &str,
-    metric_type: MetricType,
-    params: &HnswBuildParams,
-) -> Result<HNSW> {
-    stream.for_each(|b| {
-        let batch = b?;
-        
-    });
-    let batches = stream.try_collect::<Vec<_>>().await?;
-    let batch = concat_batches(&Arc::new(arrow_schema::Schema::from(&projection)), &batches)?;
-    let array = batch.column_by_name(column).ok_or(Error::Index {
-        message: format!(
-            "Sample training data: column {} does not exist in return",
-            column
-        ),
-        location: location!(),
-    })?;
-    let mat = Arc::new(MatrixView::<Float32Type>::try_from(
-        array.as_fixed_size_list(),
-    )?);
-
-    let vector_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), metric_type));
-    HNSWBuilder::with_params(params.clone(), vector_store).build()
-}

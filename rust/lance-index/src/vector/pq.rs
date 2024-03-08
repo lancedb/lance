@@ -37,6 +37,7 @@ use self::distance::{build_distance_table_l2, compute_l2_distance};
 pub use self::utils::num_centroids;
 use super::pb;
 pub use builder::PQBuildParams;
+pub use storage::ProductQuantizationStorage;
 use utils::get_sub_vector_centroids;
 
 /// Product Quantization

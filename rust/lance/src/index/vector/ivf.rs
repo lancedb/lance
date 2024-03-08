@@ -27,7 +27,7 @@ use arrow_array::{
     Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Schema};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
 use futures::{
@@ -36,11 +36,15 @@ use futures::{
 };
 use lance_arrow::*;
 use lance_core::{datatypes::Field, Error, Result, ROW_ID_FIELD};
-use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
+use lance_file::{
+    format::{MAGIC, MAJOR_VERSION, MINOR_VERSION},
+    writer::{FileWriter, FileWriterOptions},
+};
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
-        hnsw::{builder::HnswBuildParams, HNSWBuilder, HNSW},
+        graph::NEIGHBORS_FIELD,
+        hnsw::{builder::HnswBuildParams, HNSWBuilder, HNSW, VECTOR_ID_FIELD},
         ivf::{builder::load_precomputed_partitions, shuffler::shuffle_dataset, IvfBuildParams},
         pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
         Query, DIST_COL, PART_ID_COLUMN, PQ_CODE_COLUMN,
@@ -71,10 +75,7 @@ use super::{
     utils::maybe_sample_training_data,
     VectorIndex,
 };
-use crate::{
-    dataset::builder::DatasetBuilder,
-    index::vector::{hnsw::build_hnsw_model, ivf::io::write_hnsw_index_partitions},
-};
+use crate::dataset::builder::DatasetBuilder;
 use crate::{
     dataset::Dataset,
     index::{
@@ -1317,10 +1318,15 @@ async fn write_ivf_hnsw_file(
 ) -> Result<()> {
     let object_store = dataset.object_store();
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
-    let mut writer = object_store.create(&path).await?;
+    let writer = object_store.create(&path).await?;
+
+    let schema = Schema::new(vec![NEIGHBORS_FIELD.clone(), VECTOR_ID_FIELD.clone()]);
+    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
+    let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
 
     let start = std::time::Instant::now();
     let num_partitions = ivf.num_partitions() as u32;
+
     builder::build_hnsw_partitions(
         dataset,
         &mut writer,
@@ -1339,6 +1345,7 @@ async fn write_ivf_hnsw_file(
     .await?;
     info!("Built IVF partitions: {}s", start.elapsed().as_secs_f32());
 
+    let mut writer = writer.object_writer;
     // Convert [`Transformer`] to metadata.
     let mut transforms = vec![];
     for t in transformers {
