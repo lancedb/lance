@@ -82,7 +82,7 @@
                         </goals>
                         <configuration>
                             <path>lance-jni</path>
-<!--                            <release>true</release>-->
+                            <release>true</release>
                             <copyTo>src/main/resources/nativelib</copyTo>
                             <copyWithPlatformDir>true</copyWithPlatformDir>
                         </configuration>

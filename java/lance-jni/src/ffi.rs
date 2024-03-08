@@ -44,7 +44,7 @@ impl JNIEnvExt for JNIEnv<'_> {
         if !is_empty.z()? {
             Ok(None)
         } else {
-            let inner = self.call_method(obj, "java/util/Optional/get", "()Z", &[])?;
+            let inner = self.call_method(obj, "java/util/Optional/get", "()Ljava/util/List;", &[])?;
             let inner_obj = inner.l()?;
             Ok(Some(self.get_strings(&inner_obj)?))
         }
