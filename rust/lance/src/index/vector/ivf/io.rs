@@ -342,6 +342,7 @@ pub(super) async fn write_hnsw_index_partitions(
         }
 
         let total_records = row_id_array.iter().map(|a| a.len()).sum::<usize>();
+        let offset = writer.tell().await?;
 
         let projection = dataset.schema().project(&[column])?;
         let mut vector_batches = Vec::with_capacity(row_id_array.len());
@@ -366,6 +367,9 @@ pub(super) async fn write_hnsw_index_partitions(
         if total_records > 0 {
             hnsw.write(writer).await?;
         }
+
+        let length = writer.tell().await? - offset;
+        ivf.add_partition(offset, length as u32);
         log::info!(
             "Wrote partition {} in {} ms",
             part_id,

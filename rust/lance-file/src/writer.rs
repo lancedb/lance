@@ -647,7 +647,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         Ok(())
     }
 
-    async fn write_footer(&mut self) -> Result<()> {
+    pub async fn write_footer(&mut self) -> Result<()> {
         // Step 1. Write page table.
         let field_id_offset = *self.schema.field_ids().iter().min().unwrap();
         let pos = self

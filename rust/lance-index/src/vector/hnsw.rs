@@ -336,8 +336,11 @@ impl HNSW {
             "lance:hnsw".to_string(),
             serde_json::to_string(&hnsw_metadata)?,
         );
-        writer.finish_with_metadata(&metadata).await?;
-        Ok(())
+        for (k, v) in metadata {
+            writer.add_metadata(&k, &v);
+        }
+
+        writer.write_footer().await
     }
 }
 
