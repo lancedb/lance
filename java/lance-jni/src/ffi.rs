@@ -12,42 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use jni::{objects::JObject, JNIEnv};
+use jni::{JNIEnv, objects::JObject};
 use jni::objects::JString;
-use jni::signature::{ReturnType, TypeSignature};
 
-use crate::{Result, Error};
+use crate::Result;
 
 /// Extend JNIEnv with helper functions.
 pub trait JNIEnvExt {
-
-    /// Get Option<JObject> from Java [java.util.Optional<..>].
-    fn get_option(&mut self, obj: &JObject) -> Result<Option<JObject>>;
-
     /// Get strings from Java List<String> object.
-    fn get_strings(&mut self, obj: &JObject) -> Result<Vec<String>>;
+    fn get_strings<'a>(&'a mut self, obj: &'a JObject<'a>) -> Result<Vec<String>>;
 
     /// Get Option<Vec<String>> from Java Optional<List<String>>.
     fn get_strings_opt(&mut self, obj: &JObject) -> Result<Option<Vec<String>>>;
 }
 
 impl JNIEnvExt for JNIEnv<'_> {
-
-    fn get_option(&mut self, obj: &JObject) -> Result<Option<JObject>> {
-        let is_empty = self.call_method(obj, "java/util/Optional/isEmpty", "()Z", &[])?;
-        if !is_empty.z()? {
-            return Ok(None);
-        } else {
-            let signature = TypeSignature {
-              args: vec![],
-                ret: ReturnType::Object,
-            };
-            let inner = self.call_method(obj, "java/util/Optional/get", signature.to_string(), &[])?;
-            Ok(Some(inner.l()?))
-        }
-    }
-
-    fn get_strings(&mut self, obj: &JObject) -> Result<Vec<String>> {
+    fn get_strings<'a>(&'a mut self, obj: &'a JObject<'a>) -> Result<Vec<String>> {
         let list = self.get_list(obj)?;
         let mut iter = list.iter(self)?;
         let mut results = vec![];
@@ -60,6 +40,16 @@ impl JNIEnvExt for JNIEnv<'_> {
     }
 
     fn get_strings_opt(&mut self, obj: &JObject) -> Result<Option<Vec<String>>> {
-        todo!()
+        let is_empty = self.call_method(obj, "java/util/Optional/isEmpty", "()Z", &[])?;
+        if !is_empty.z()? {
+            Ok(None)
+        } else {
+            let inner = self.call_method(obj, "java/util/Optional/get", "()Z", &[])?;
+            let inner_obj = inner.l()?;
+            Ok(Some(self.get_strings(&inner_obj)?))
+        }
     }
 }
+
+#[cfg(test)]
+mod tests {}
