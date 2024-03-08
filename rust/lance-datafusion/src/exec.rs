@@ -22,6 +22,8 @@ use datafusion::{
     datasource::streaming::StreamingTable,
     execution::{
         context::{SessionConfig, SessionContext, SessionState},
+        disk_manager::DiskManagerConfig,
+        memory_pool::GreedyMemoryPool,
         runtime_env::{RuntimeConfig, RuntimeEnv},
         TaskContext,
     },
@@ -147,12 +149,36 @@ impl ExecutionPlan for OneShotExec {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct LanceExecutionOptions {
+    pub use_spilling: bool,
+    pub mem_pool_size: u64,
+}
+
+impl Default for LanceExecutionOptions {
+    fn default() -> Self {
+        Self {
+            use_spilling: false,
+            mem_pool_size: 1024 * 1024 * 100,
+        }
+    }
+}
+
 /// Executes a plan using default session & runtime configuration
 ///
 /// Only executes a single partition.  Panics if the plan has more than one partition.
-pub fn execute_plan(plan: Arc<dyn ExecutionPlan>) -> Result<SendableRecordBatchStream> {
+pub fn execute_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+) -> Result<SendableRecordBatchStream> {
     let session_config = SessionConfig::new();
-    let runtime_config = RuntimeConfig::new();
+    let mut runtime_config = RuntimeConfig::new();
+    if options.use_spilling {
+        runtime_config.disk_manager = DiskManagerConfig::NewOs;
+        runtime_config.memory_pool = Some(Arc::new(GreedyMemoryPool::new(
+            options.mem_pool_size as usize,
+        )));
+    }
     let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
     let session_state = SessionState::new_with_config_rt(session_config, runtime_env);
     // NOTE: we are only executing the first partition here. Therefore, if

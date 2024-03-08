@@ -42,7 +42,7 @@ use futures::{
 use lance_core::{Error, Result};
 use lance_datafusion::{
     chunker::chunk_concat_stream,
-    exec::{execute_plan, OneShotExec},
+    exec::{execute_plan, LanceExecutionOptions, OneShotExec},
 };
 use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
@@ -1124,7 +1124,13 @@ impl BtreeTrainingSource for BTreeUpdater {
         // them back into a single partition.
         let all_data = Arc::new(UnionExec::new(vec![old_input, new_input]));
         let ordered = Arc::new(SortPreservingMergeExec::new(vec![sort_expr], all_data));
-        let unchunked = execute_plan(ordered)?;
+        let unchunked = execute_plan(
+            ordered,
+            LanceExecutionOptions {
+                use_spilling: true,
+                ..Default::default()
+            },
+        )?;
         Ok(chunk_concat_stream(unchunked, chunk_size as usize))
     }
 }
