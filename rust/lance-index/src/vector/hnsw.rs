@@ -186,10 +186,6 @@ pub struct HNSW {
     metric_type: MetricType,
     /// Entry point of the graph.
     entry_point: u32,
-
-    #[allow(dead_code)]
-    /// Whether to use the heuristic to select neighbors (Algorithm 4 or 3 in the paper).
-    use_select_heuristic: bool,
 }
 
 impl Debug for HNSW {
@@ -218,6 +214,14 @@ struct HnswMetadata {
 }
 
 impl HNSW {
+    pub fn empty() -> Self {
+        Self {
+            levels: vec![],
+            metric_type: MetricType::L2,
+            entry_point: 0,
+        }
+    }
+
     pub fn metric_type(&self) -> MetricType {
         self.metric_type
     }
@@ -263,21 +267,14 @@ impl HNSW {
             levels,
             metric_type: mt,
             entry_point: hnsw_metadata.entry_point,
-            use_select_heuristic: true,
         })
     }
 
-    fn from_builder(
-        levels: Vec<HnswLevel>,
-        entry_point: u32,
-        metric_type: MetricType,
-        use_select_heuristic: bool,
-    ) -> Self {
+    fn from_builder(levels: Vec<HnswLevel>, entry_point: u32, metric_type: MetricType) -> Self {
         Self {
             levels,
             metric_type,
             entry_point,
-            use_select_heuristic,
         }
     }
 

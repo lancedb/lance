@@ -364,6 +364,10 @@ pub(crate) async fn open_vector_index(
                     location: location!(),
                 });
             }
+            Some(Stage::Hnsw(_)) => {
+                let hnsw = lance_index::vector::hnsw::HNSW::empty();
+                last_stage = Some(Arc::new(hnsw));
+            }
             _ => {}
         }
     }

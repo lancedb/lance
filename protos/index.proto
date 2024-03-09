@@ -101,6 +101,9 @@ message PQ {
   Tensor codebook_tensor = 5;
 }
 
+// HNSW index metadata
+message HNSW {}
+
 // Transform type
 enum TransformType {
   OPQ = 0;
@@ -155,9 +158,10 @@ message VectorIndexStage {
     Transform transform = 4;
     // DiskANN
     DiskAnn diskann = 5;
+    // HNSW
+    HNSW hnsw = 6;
   }
 }
-
 
 // Metric Type for Vector Index
 enum VectorMetricType {

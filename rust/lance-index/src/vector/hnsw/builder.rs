@@ -268,7 +268,6 @@ impl HNSWBuilder {
             graphs,
             self.entry_point,
             self.vectors.metric_type(),
-            self.params.use_select_heuristic,
         ))
     }
 }
