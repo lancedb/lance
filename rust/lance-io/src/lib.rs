@@ -17,6 +17,7 @@ use arrow_array::UInt32Array;
 
 pub mod encodings;
 pub mod local;
+pub mod memory;
 pub mod object_reader;
 pub mod object_store;
 pub mod object_writer;

@@ -437,7 +437,7 @@ impl SelfDescribingFileReader for FileReader {
         let mut manifest: Manifest = read_struct(object_reader.as_ref(), manifest_position).await?;
         populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
         let schema = manifest.schema;
-        Self::try_new_from_reader(path, object_reader, metadata, schema, 0, 0, cache).await
+        Self::try_new_from_reader(object_reader, Some(metadata), schema, 0, 0, cache).await
     }
 }
 

@@ -36,6 +36,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
+use self::hnsw::HNSWIndex;
 use self::{
     ivf::{build_ivf_hnsw_index, build_ivf_pq_index, remap_index_file, IVFIndex},
     pq::PQIndex,
@@ -366,7 +367,7 @@ pub(crate) async fn open_vector_index(
             }
             Some(Stage::Hnsw(_)) => {
                 let hnsw = lance_index::vector::hnsw::HNSW::empty();
-                last_stage = Some(Arc::new(hnsw));
+                last_stage = Some(Arc::new(HNSWIndex::new(hnsw)));
             }
             _ => {}
         }

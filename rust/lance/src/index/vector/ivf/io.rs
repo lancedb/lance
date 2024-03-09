@@ -344,28 +344,44 @@ pub(super) async fn write_hnsw_index_partitions(
         let total_records = row_id_array.iter().map(|a| a.len()).sum::<usize>();
         let offset = writer.tell().await?;
 
-        let projection = dataset.schema().project(&[column])?;
-        let mut vector_batches = Vec::with_capacity(row_id_array.len());
-        for row_ids in &row_id_array {
-            let array = dataset
-                .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
-                .await?
-                .column_by_name(column)
-                .expect("row id column not found")
-                .clone();
-            vector_batches.push(array);
-        }
-        let vector_arrs = vector_batches
-            .iter()
-            .map(|arr| arr.as_ref())
-            .collect::<Vec<_>>();
-        let fsl = arrow_select::concat::concat(&vector_arrs).unwrap();
-        let mat = Arc::new(MatrixView::<Float32Type>::try_from(fsl.as_fixed_size_list()).unwrap());
-        let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), metric_type));
-
-        let hnsw = HNSWBuilder::with_params(hnsw_params.clone(), vec_store).build()?;
         if total_records > 0 {
+            let projection = dataset.schema().project(&[column])?;
+            let mut vector_batches = Vec::with_capacity(row_id_array.len());
+            for row_ids in &row_id_array {
+                let array = dataset
+                    .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
+                    .await?
+                    .column_by_name(column)
+                    .expect("row id column not found")
+                    .clone();
+                vector_batches.push(array);
+            }
+
+            let vector_arrs = vector_batches
+                .iter()
+                .map(|arr| arr.as_ref())
+                .collect::<Vec<_>>();
+            let fsl = arrow_select::concat::concat(&vector_arrs).unwrap();
+            let mat =
+                Arc::new(MatrixView::<Float32Type>::try_from(fsl.as_fixed_size_list()).unwrap());
+            let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), metric_type));
+
+            let hnsw = HNSWBuilder::with_params(hnsw_params.clone(), vec_store).build()?;
+
+            // Layout:
+            // 1. Batches of HNSW nodes
+            // 2. PQ codes
+            // 3. Row IDs
+            // 3. lance metadata & footer
             hnsw.write(writer).await?;
+            let pq_refs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+
+            let pq_offset = writer.tell().await? - offset;
+            PlainEncoder::write(&mut writer.object_writer, &pq_refs).await?;
+            let row_ids_refs = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+            PlainEncoder::write(&mut writer.object_writer, row_ids_refs.as_slice()).await?;
+            writer.add_metadata("lance:pq", &pq_offset.to_string());
+            writer.write_footer().await?;
         }
 
         let length = writer.tell().await? - offset;

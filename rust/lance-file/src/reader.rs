@@ -124,9 +124,8 @@ impl FileReader {
         let metadata = Self::read_metadata(object_reader.as_ref(), session).await?;
 
         Self::try_new_from_reader(
-            path,
             object_reader,
-            metadata,
+            Some(metadata),
             schema,
             fragment_id,
             field_id_offset,
@@ -136,17 +135,21 @@ impl FileReader {
     }
 
     pub async fn try_new_from_reader(
-        path: &Path,
         object_reader: Box<dyn Reader>,
-        metadata: Arc<Metadata>,
+        metadata: Option<Arc<Metadata>>,
         schema: Schema,
         fragment_id: u32,
         field_id_offset: u32,
         session: Option<&FileMetadataCache>,
     ) -> Result<Self> {
+        let metadata = match metadata {
+            Some(metadata) => metadata,
+            None => Self::read_metadata(object_reader.as_ref(), session).await?,
+        };
+
         let page_table = async {
             let num_fields = schema.max_field_id().unwrap_or_default() + 1 - field_id_offset as i32;
-            Self::load_from_cache(session, path, |_| async {
+            Self::load_from_cache(session, object_reader.path(), |_| async {
                 PageTable::load(
                     object_reader.as_ref(),
                     metadata.page_table_position,
@@ -200,6 +203,10 @@ impl FileReader {
             Ok(metadata)
         })
         .await
+    }
+
+    pub fn metadata(&self) -> Arc<Metadata> {
+        self.metadata.clone()
     }
 
     /// Get the statistics page table. This will read the metadata if it is not cached.

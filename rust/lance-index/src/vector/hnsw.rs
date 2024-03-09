@@ -337,7 +337,7 @@ impl HNSW {
             writer.add_metadata(&k, &v);
         }
 
-        writer.write_footer().await
+        Ok(())
     }
 }
 

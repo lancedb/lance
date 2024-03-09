@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{any::Any, collections::HashMap, ops::Range, sync::Arc};
 
 use arrow_array::{cast::AsArray, types::Float32Type, RecordBatch};
 
@@ -20,18 +20,24 @@ use arrow_select::concat::concat_batches;
 use async_trait::async_trait;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
-use lance_core::{datatypes::Field, Error, Result};
-use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
+use lance_core::{
+    datatypes::{Field, Schema},
+    Error, Result,
+};
+use lance_file::{
+    format::{MAGIC, MAJOR_VERSION, MINOR_VERSION},
+    reader::FileReader,
+};
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
-        graph::memory::InMemoryVectorStorage,
-        hnsw::{builder::HnswBuildParams, HNSWBuilder, HNSW},
+        graph::{memory::InMemoryVectorStorage, NEIGHBORS_FIELD},
+        hnsw::{builder::HnswBuildParams, HNSWBuilder, HNSW, VECTOR_ID_FIELD},
         Query, DIST_COL,
     },
     Index, IndexType,
 };
-use lance_io::{stream::RecordBatchStream, traits::Reader};
+use lance_io::{memory::MemoryBufReader, stream::RecordBatchStream, traits::Reader};
 use lance_linalg::{
     distance::{Cosine, Dot, MetricType, L2},
     MatrixView,
@@ -59,6 +65,12 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct HNSWIndex {
     hnsw: HNSW,
+}
+
+impl HNSWIndex {
+    pub fn new(hnsw: HNSW) -> Self {
+        Self { hnsw }
+    }
 }
 
 #[async_trait]
@@ -116,14 +128,45 @@ impl VectorIndex for HNSWIndex {
 
     async fn load(
         &self,
-        _reader: &dyn Reader,
-        _offset: usize,
-        _length: usize,
+        reader: &dyn Reader,
+        offset: usize,
+        length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
-        Err(Error::Index {
-            message: "Flat index does not support load".to_string(),
-            location: location!(),
-        })
+        let bytes = reader
+            .get_range(Range {
+                start: offset,
+                end: offset + length,
+            })
+            .await?;
+
+        let schema = Schema::try_from(&arrow_schema::Schema::new(vec![
+            NEIGHBORS_FIELD.clone(),
+            VECTOR_ID_FIELD.clone(),
+        ]))?;
+
+        let file_reader = FileReader::try_new_from_reader(
+            Box::new(MemoryBufReader::new(
+                bytes,
+                reader.block_size(),
+                reader.path().to_owned(),
+            )),
+            None,
+            schema,
+            0,
+            0,
+            None,
+        )
+        .await?;
+
+        // let pq_code_length = self.pq.num_sub_vectors() * length;
+        // let pq_code =
+        //     read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;
+
+        // let row_id_offset = offset + pq_code_length /* *1 */;
+        // let row_ids =
+        //     read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
+
+        self.hnsw.load(&file_reader).await
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
