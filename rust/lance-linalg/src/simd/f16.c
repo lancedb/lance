@@ -64,7 +64,7 @@ float FUNC(l2_f16)(const FP16 *x, const FP16 *y, uint32_t dimension) {
 
 #pragma clang loop unroll(enable) interleave(enable) vectorize(enable)
   for (uint32_t i = 0; i < dimension; i++) {
-    float s = x[i] - y[i];
+    float s = (float) x[i] - (float) y[i];
     sum += s * s;
   }
   return sum;

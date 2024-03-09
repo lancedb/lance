@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Developers.
+// Copyright 2024 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ use lazy_static::lazy_static;
 use snafu::{location, Location};
 use traits::IntoJava;
 
+#[macro_export]
 macro_rules! ok_or_throw {
     ($env:expr, $result:expr) => {
         match $result {
@@ -35,6 +36,7 @@ macro_rules! ok_or_throw {
 
 mod blocking_dataset;
 pub mod error;
+mod fragment;
 mod traits;
 
 use self::traits::{FromJString, JMapExt};
@@ -119,16 +121,4 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_countRows(
             as jint,
         Err(_) => -1,
     }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_releaseNativeDataset(
-    mut env: JNIEnv,
-    obj: JObject,
-) {
-    let dataset: BlockingDataset = unsafe {
-        env.take_rust_field(obj, "nativeDatasetHandle")
-            .expect("Failed to take native dataset handle")
-    };
-    dataset.close()
 }

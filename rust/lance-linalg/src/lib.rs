@@ -22,6 +22,9 @@ pub mod kmeans;
 pub mod matrix;
 pub mod simd;
 
+#[cfg(test)]
+pub(crate) mod test_utils;
+
 pub use matrix::MatrixView;
 
 use arrow_schema::ArrowError;
