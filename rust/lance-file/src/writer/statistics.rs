@@ -624,6 +624,7 @@ pub fn supports_stats_collection(datatype: &DataType) -> bool {
 
 #[derive(Debug)]
 pub struct StatisticsCollector {
+    schema: Schema,
     builders: BTreeMap<i32, (Field, StatisticsBuilder)>,
 }
 
@@ -638,7 +639,10 @@ impl StatisticsCollector {
         if builders.is_empty() {
             None
         } else {
-            Some(Self { builders })
+            Some(Self {
+                schema: schema.clone(),
+                builders,
+            })
         }
     }
 
@@ -670,6 +674,8 @@ impl StatisticsCollector {
             arrays.push(Arc::new(stats));
         });
 
+        self.reset();
+
         let schema = Arc::new(ArrowSchema::new(fields));
         let batch = RecordBatch::try_new(schema.clone(), arrays);
         match batch {
@@ -679,6 +685,13 @@ impl StatisticsCollector {
             )
             .into()),
         }
+    }
+
+    fn reset(&mut self) {
+        self.builders = visit_fields(&self.schema)
+            .filter(|f| supports_stats_collection(&f.data_type()))
+            .map(|f| (f.id, (f.clone(), StatisticsBuilder::new(&f.data_type()))))
+            .collect();
     }
 }
 

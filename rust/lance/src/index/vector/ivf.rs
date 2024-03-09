@@ -2193,6 +2193,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_ivf_hnsw() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
+
+        let centroids = generate_random_array(2 * DIM);
+        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
+        let ivf_params = IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
+
+        let codebook = Arc::new(generate_random_array(256 * DIM));
+        let pq_params = PQBuildParams::with_codebook(4, 8, codebook);
+        let hnsw_params = HnswBuildParams::default();
+        let params = VectorIndexParams::with_ivf_hnsw_pq_params(
+            MetricType::L2,
+            ivf_params,
+            pq_params,
+            hnsw_params,
+        );
+
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let sample_query = vector_array.value(10);
+        let query = sample_query.as_primitive::<Float32Type>();
+        let results = dataset
+            .scan()
+            .nearest("vector", query, 5)
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(1, results.len());
+        assert_eq!(5, results[0].num_rows());
+    }
+
+    #[tokio::test]
     async fn test_check_cosine_normalization() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();

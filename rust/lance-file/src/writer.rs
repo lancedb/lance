@@ -658,6 +658,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
 
         // Step 2. Write statistics.
         self.metadata.stats_metadata = self.write_statistics().await?;
+        self.batch_id = 0;
 
         // Step 3. Write manifest and dictionary values.
         Self::write_dictionaries(&mut self.object_writer, &mut self.schema).await?;

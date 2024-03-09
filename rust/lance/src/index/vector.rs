@@ -116,6 +116,25 @@ impl VectorIndexParams {
             metric_type,
         }
     }
+
+    /// Create index parameters with `IVF`, `PQ` and `HNSW` parameters, respectively.
+    /// This is used for `IVF_HNSW_PQ` index.
+    pub fn with_ivf_hnsw_pq_params(
+        metric_type: MetricType,
+        ivf: IvfBuildParams,
+        pq: PQBuildParams,
+        hnsw: HnswBuildParams,
+    ) -> Self {
+        let stages = vec![
+            StageParams::Ivf(ivf),
+            StageParams::PQ(pq),
+            StageParams::Hnsw(hnsw),
+        ];
+        Self {
+            stages,
+            metric_type,
+        }
+    }
 }
 
 impl IndexParams for VectorIndexParams {
