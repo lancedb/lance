@@ -269,8 +269,13 @@ impl ProductQuantizationStorage {
             .collect()
     }
 
-    /// Write the PQ storage as a Lance partition to disk.
-    pub async fn write_partition(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<usize> {
+    /// Write the PQ storage as a Lance partition to disk,
+    /// and returns the number of rows written.
+    ///
+    pub async fn write_partition(
+        &self,
+        writer: &mut FileWriter<ManifestDescribing>,
+    ) -> Result<usize> {
         let batch_size: usize = 10240; // TODO: make it configurable
         for i in (0..self.batch.num_rows()).step_by(batch_size) {
             let offset = i * batch_size;
@@ -282,7 +287,6 @@ impl ProductQuantizationStorage {
     }
 
     /// Write the PQ storage to disk.
-
     pub async fn write_full(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
         let pos = writer.object_writer.tell().await?;
         let mat = MatrixView::<Float32Type>::new(self.codebook.clone(), self.dimension);
@@ -292,20 +296,14 @@ impl ProductQuantizationStorage {
             .write_protobuf(&codebook_tensor)
             .await?;
 
+        self.write_partition(writer).await?;
+
         let metadata = ProductQuantizationMetadata {
             codebook_position: pos,
             num_bits: self.num_bits,
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
         };
-
-        let batch_size: usize = 10240; // TODO: make it configurable
-        for i in (0..self.batch.num_rows()).step_by(batch_size) {
-            let offset = i * batch_size;
-            let length = min(batch_size, self.batch.num_rows() - offset);
-            let slice = self.batch.slice(offset, length);
-            writer.write(&[slice]).await?;
-        }
 
         let index_metadata = IndexMetadata {
             index_type: "PQ".to_string(),
@@ -472,7 +470,7 @@ mod tests {
         .await
         .unwrap();
 
-        storage.write(&mut file_writer).await.unwrap();
+        storage.write_full(&mut file_writer).await.unwrap();
 
         let storage2 = ProductQuantizationStorage::load(&store, &path)
             .await
