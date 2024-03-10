@@ -269,8 +269,21 @@ impl ProductQuantizationStorage {
             .collect()
     }
 
+    /// Write the PQ storage as a Lance partition to disk.
+    pub async fn write_partition(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<usize> {
+        let batch_size: usize = 10240; // TODO: make it configurable
+        for i in (0..self.batch.num_rows()).step_by(batch_size) {
+            let offset = i * batch_size;
+            let length = min(batch_size, self.batch.num_rows() - offset);
+            let slice = self.batch.slice(offset, length);
+            writer.write(&[slice]).await?;
+        }
+        Ok(self.batch.num_rows())
+    }
+
     /// Write the PQ storage to disk.
-    pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
+
+    pub async fn write_full(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
         let pos = writer.object_writer.tell().await?;
         let mat = MatrixView::<Float32Type>::new(self.codebook.clone(), self.dimension);
         let codebook_tensor = pb::Tensor::from(&mat);
