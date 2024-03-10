@@ -374,13 +374,13 @@ pub(super) async fn write_hnsw_index_partitions(
             // 3. Row IDs
             // 3. lance metadata & footer
             hnsw.write(writer).await?;
-            let pq_refs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+            // let pq_refs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
 
-            let pq_offset = writer.tell().await? - offset;
-            PlainEncoder::write(&mut writer.object_writer, &pq_refs).await?;
+            let binary_offset = writer.tell().await? - offset;
+            // PlainEncoder::write(&mut writer.object_writer, &pq_refs).await?;
             let row_ids_refs = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
             PlainEncoder::write(&mut writer.object_writer, row_ids_refs.as_slice()).await?;
-            writer.add_metadata("lance:pq", &pq_offset.to_string());
+            writer.add_metadata("lance:binary_offset", &binary_offset.to_string());
             writer.write_footer().await?;
         }
 

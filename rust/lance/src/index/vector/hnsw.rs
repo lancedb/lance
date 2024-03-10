@@ -14,15 +14,19 @@
 
 use std::{any::Any, collections::HashMap, ops::Range, sync::Arc};
 
-use arrow_array::{cast::AsArray, types::Float32Type, RecordBatch};
+use arrow::compute::take;
+use arrow_array::{
+    cast::AsArray, types::Float32Type, Array, Float32Array, RecordBatch, UInt32Array,
+};
 
+use arrow_schema::DataType;
 use arrow_select::concat::concat_batches;
 use async_trait::async_trait;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{
     datatypes::{Field, Schema},
-    Error, Result,
+    Error, Result, ROW_ID_FIELD,
 };
 use lance_file::{
     format::{MAGIC, MAJOR_VERSION, MINOR_VERSION},
@@ -37,7 +41,10 @@ use lance_index::{
     },
     Index, IndexType,
 };
-use lance_io::{memory::MemoryBufReader, stream::RecordBatchStream, traits::Reader};
+use lance_io::{
+    memory::MemoryBufReader, stream::RecordBatchStream, traits::Reader,
+    utils::read_fixed_stride_array,
+};
 use lance_linalg::{
     distance::{Cosine, Dot, MetricType, L2},
     MatrixView,
@@ -65,11 +72,15 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct HNSWIndex {
     hnsw: HNSW,
+    row_ids: Option<Arc<dyn Array>>,
 }
 
 impl HNSWIndex {
     pub fn new(hnsw: HNSW) -> Self {
-        Self { hnsw }
+        Self {
+            hnsw,
+            row_ids: None,
+        }
     }
 }
 
@@ -111,7 +122,22 @@ impl Index for HNSWIndex {
 impl VectorIndex for HNSWIndex {
     #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
-        todo!()
+        let results = self.hnsw.search(
+            query.key.as_primitive::<Float32Type>().as_slice(),
+            query.k,
+            30,
+        )?;
+
+        let node_ids = UInt32Array::from_iter_values(results.iter().map(|x| x.0));
+
+        let row_ids = take(&self.row_ids.as_ref().unwrap(), &node_ids, None)?;
+        let distances = Arc::new(Float32Array::from_iter_values(results.iter().map(|x| x.1)));
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(DIST_COL, DataType::Float32, true),
+            ROW_ID_FIELD.clone(),
+        ]));
+        Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
     }
 
     fn is_loadable(&self) -> bool {
@@ -158,15 +184,29 @@ impl VectorIndex for HNSWIndex {
         )
         .await?;
 
-        // let pq_code_length = self.pq.num_sub_vectors() * length;
-        // let pq_code =
-        //     read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;
+        let hnsw = HNSW::load(&file_reader).await?;
 
-        // let row_id_offset = offset + pq_code_length /* *1 */;
-        // let row_ids =
-        //     read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
+        let offset = file_reader
+            .schema()
+            .metadata
+            .get("lance:binary_offset")
+            .ok_or(Error::Index {
+                message: "lance:binary_offset not found in schema metadata".to_string(),
+                location: location!(),
+            })?
+            .parse::<usize>()
+            .map_err(|e| Error::Index {
+                message: format!("Failed to parse lance:binary_offset: {}", e),
+                location: location!(),
+            })?;
 
-        self.hnsw.load(&file_reader).await
+        let row_ids =
+            read_fixed_stride_array(reader, &DataType::UInt64, offset, self.hnsw.len(), ..).await?;
+
+        Ok(Box::new(Self {
+            hnsw,
+            row_ids: Some(row_ids),
+        }))
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {

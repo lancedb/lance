@@ -84,22 +84,18 @@ struct HnswLevel {
     neighbors_values: Arc<UInt32Array>,
 
     /// Vector storage of the graph.
-    vectors: Arc<dyn VectorStorage>,
+    vectors: Option<Arc<dyn VectorStorage>>,
 }
 
 impl HnswLevel {
     /// Load one Hnsw level from the file.
-    async fn load(
-        reader: &FileReader,
-        row_range: Range<usize>,
-        vectors: Arc<dyn VectorStorage>,
-    ) -> Result<Self> {
+    async fn load(reader: &FileReader, row_range: Range<usize>) -> Result<Self> {
         let nodes = reader.read_range(row_range, reader.schema(), None).await?;
-        Ok(Self::new(nodes, vectors))
+        Ok(Self::new(nodes, None))
     }
 
     /// Create a new Hnsw Level from the nodes and the vector storage object.
-    fn new(nodes: RecordBatch, vectors: Arc<dyn VectorStorage>) -> Self {
+    fn new(nodes: RecordBatch, vectors: Option<Arc<dyn VectorStorage>>) -> Self {
         let neighbors: Arc<ListArray> = nodes
             .column_by_name(NEIGHBORS_COL)
             .unwrap()
@@ -145,7 +141,7 @@ impl HnswLevel {
             ],
         )?;
 
-        Ok(Self::new(batch, vectors))
+        Ok(Self::new(batch, Some(vectors)))
     }
 
     fn schema(&self) -> SchemaRef {
@@ -174,7 +170,7 @@ impl Graph for HnswLevel {
     }
 
     fn storage(&self) -> Arc<dyn VectorStorage> {
-        self.vectors.clone()
+        self.vectors.clone().unwrap()
     }
 }
 
@@ -226,13 +222,16 @@ impl HNSW {
         self.metric_type
     }
 
+    pub fn len(&self) -> usize {
+        self.levels[0].len()
+    }
+
     /// Load the HNSW graph from a [FileReader].
     ///
     /// Parameters
     /// ----------
     /// - *reader*: the file reader to read the graph from.
-    /// - *vector_storage*: A preloaded [VectorStorage] storage.
-    pub async fn load(reader: &FileReader, vector_storage: Arc<dyn VectorStorage>) -> Result<Self> {
+    pub async fn load(reader: &FileReader) -> Result<Self> {
         let schema = reader.schema();
         let mt = if let Some(index_metadata) = schema.metadata.get("lance:index") {
             let index_metadata: SchemaIndexMetadata = serde_json::from_str(index_metadata)?;
@@ -261,7 +260,7 @@ impl HNSW {
         for i in 0..hnsw_metadata.level_offsets.len() - 1 {
             let start = hnsw_metadata.level_offsets[i];
             let end = hnsw_metadata.level_offsets[i + 1];
-            levels.push(HnswLevel::load(reader, start..end, vector_storage.clone()).await?);
+            levels.push(HnswLevel::load(reader, start..end).await?);
         }
         Ok(Self {
             levels,
