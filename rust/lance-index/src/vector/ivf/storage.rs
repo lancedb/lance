@@ -79,7 +79,7 @@ impl IvfMetadadta {
             ivf_metadata.pb_position as usize,
         )
         .await?;
-        IvfMetadadta::try_from(pb)
+        Self::try_from(pb)
     }
 
     /// Write the IVF metadata to the lance file.
