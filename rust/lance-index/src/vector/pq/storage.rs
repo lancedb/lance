@@ -52,11 +52,99 @@ use crate::{
 const PQ_METADTA_KEY: &str = "lance:pq";
 
 #[derive(Serialize, Deserialize)]
-struct ProductQuantizationMetadata {
+pub struct ProductQuantizationMetadata {
     codebook_position: usize,
     num_bits: u32,
     num_sub_vectors: usize,
     dimension: usize,
+}
+
+impl ProductQuantizationMetadata {
+    /// Load metadata of PQ quantization from a Lance File.
+    ///
+    pub fn load(reader: &FileReader) -> Result<Self> {
+        let metadata = reader
+            .schema()
+            .metadata
+            .get(PQ_METADTA_KEY)
+            .ok_or(Error::Index {
+                message: format!(
+                    "Reading PQ storage: metadata key {} not found",
+                    PQ_METADTA_KEY
+                ),
+                location: location!(),
+            })?;
+        serde_json::from_str(metadata).map_err(|_| Error::Index {
+            message: format!("Failed to parse PQ metadata: {}", metadata),
+            location: location!(),
+        })
+    }
+}
+
+/// Loader to load partitioned PQ storage from disk.
+pub struct ProductQuantizationStorageLoader {
+    reader: FileReader,
+    metric_type: MetricType,
+    codebook: Arc<Float32Array>,
+    metadata: ProductQuantizationMetadata,
+
+    // Pre-computed offsets.
+    offsets: Vec<usize>,
+}
+
+impl ProductQuantizationStorageLoader {
+    /// Open a Loader.
+    ///
+    ///
+    pub async fn open(object_store: &ObjectStore, path: &Path) -> Result<Self> {
+        let reader = FileReader::try_new_self_described(object_store, path, None).await?;
+        let schema = reader.schema();
+
+        let metadata_str = schema
+            .metadata
+            .get(INDEX_METADATA_SCHEMA_KEY)
+            .ok_or(Error::Index {
+                message: format!(
+                    "Reading PQ storage: index key {} not found",
+                    INDEX_METADATA_SCHEMA_KEY
+                ),
+                location: location!(),
+            })?;
+        let index_metadata: IndexMetadata =
+            serde_json::from_str(metadata_str).map_err(|_| Error::Index {
+                message: format!("Failed to parse index metadata: {}", metadata_str),
+                location: location!(),
+            })?;
+        let metric_type: MetricType = MetricType::try_from(index_metadata.metric_type.as_str())?;
+
+        let metadata = ProductQuantizationMetadata::load(&reader)?;
+        let codebook_tensor: pb::Tensor =
+            read_message(reader.object_reader.as_ref(), metadata.codebook_position).await?;
+        let fsl = FixedSizeListArray::try_from(&codebook_tensor)?;
+        let codebook = Arc::new(fsl.values().as_primitive::<Float32Type>().clone());
+        Ok(Self {
+            reader,
+            metric_type,
+            codebook,
+            metadata,
+        })
+    }
+
+    /// Get the number of partitions in the storage.
+    pub fn num_partitions() -> usize {
+        unimplemented!()
+    }
+
+    pub async fn load_partition(&self, part_id: usize) -> Result<ProductQuantizationStorage> {
+        ProductQuantizationStorage::load_partition(
+            &self.reader,
+            range,
+            metric_type,
+            codebook,
+            metadata,
+        )
+        .await
+    }
 }
 
 /// Product Quantization Storage
@@ -190,6 +278,31 @@ impl ProductQuantizationStorage {
         )
     }
 
+    /// Load a partition of PQ storage from disk.
+    ///
+    /// Parameters
+    /// ----------
+    /// - *reader: &FileReader
+    pub async fn load_partition(
+        reader: &FileReader,
+        range: std::ops::Range<usize>,
+        metric_type: MetricType,
+        codebook: Arc<Float32Array>,
+        metadata: ProductQuantizationMetadata,
+    ) -> Result<Self> {
+        let schema = reader.schema();
+        let batch = reader.read_range(range, schema, None).await?;
+
+        Self::new(
+            codebook,
+            batch,
+            metadata.num_bits,
+            metadata.num_sub_vectors,
+            metadata.dimension,
+            metric_type,
+        )
+    }
+
     /// Load full PQ storage from disk.
     ///
     /// Parameters
@@ -226,18 +339,7 @@ impl ProductQuantizationStorage {
             })?;
         let metric_type: MetricType = MetricType::try_from(index_metadata.metric_type.as_str())?;
 
-        let metadata = schema.metadata.get(PQ_METADTA_KEY).ok_or(Error::Index {
-            message: format!(
-                "Reading PQ storage: metadata key {} not found",
-                PQ_METADTA_KEY
-            ),
-            location: location!(),
-        })?;
-        let pq_matadata: ProductQuantizationMetadata =
-            serde_json::from_str(metadata).map_err(|_| Error::Index {
-                message: format!("Failed to parse PQ metadata: {}", metadata),
-                location: location!(),
-            })?;
+        let pq_matadata = ProductQuantizationMetadata::load(&reader)?;
         let codebook_tensor: pb::Tensor =
             read_message(reader.object_reader.as_ref(), pq_matadata.codebook_position).await?;
         let fsl = FixedSizeListArray::try_from(&codebook_tensor)?;
@@ -245,17 +347,7 @@ impl ProductQuantizationStorage {
         // Hard coded to float32 for now
         let codebook = Arc::new(fsl.values().as_primitive::<Float32Type>().clone());
 
-        let total = reader.len();
-        let batch = reader.read_range(0..total, schema, None).await?;
-
-        Self::new(
-            codebook,
-            batch,
-            pq_matadata.num_bits,
-            pq_matadata.num_sub_vectors,
-            pq_matadata.dimension,
-            metric_type,
-        )
+        Self::load_partition(&reader, 0..reader.len(), metric_type, codebook, pq_matadata).await
     }
 
     pub fn schema(&self) -> SchemaRef {
