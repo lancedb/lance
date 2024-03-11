@@ -143,9 +143,9 @@ impl IvfProductQuantizationStorage {
         ProductQuantizationStorage::load_partition(
             &self.reader,
             range,
-            metric_type,
-            codebook,
-            metadata,
+            self.metric_type,
+            self.codebook.clone(),
+            &self.metadata,
         )
         .await
     }
@@ -292,7 +292,7 @@ impl ProductQuantizationStorage {
         range: std::ops::Range<usize>,
         metric_type: MetricType,
         codebook: Arc<Float32Array>,
-        metadata: ProductQuantizationMetadata,
+        metadata: &ProductQuantizationMetadata,
     ) -> Result<Self> {
         let schema = reader.schema();
         let batch = reader.read_range(range, schema, None).await?;
@@ -351,7 +351,14 @@ impl ProductQuantizationStorage {
         // Hard coded to float32 for now
         let codebook = Arc::new(fsl.values().as_primitive::<Float32Type>().clone());
 
-        Self::load_partition(&reader, 0..reader.len(), metric_type, codebook, pq_matadata).await
+        Self::load_partition(
+            &reader,
+            0..reader.len(),
+            metric_type,
+            codebook,
+            &pq_matadata,
+        )
+        .await
     }
 
     pub fn schema(&self) -> SchemaRef {

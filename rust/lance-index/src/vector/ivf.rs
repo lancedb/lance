@@ -23,7 +23,6 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use lance_file::reader::FileReader;
 use snafu::{location, Location};
 
 pub use builder::IvfBuildParams;
@@ -48,28 +47,6 @@ pub mod builder;
 pub mod shuffler;
 pub(crate) mod storage;
 mod transform;
-
-const IVF_METADTA_KEY: &str = "lance:ivf";
-
-pub struct IvfMetadata {
-    rows_in_partition: Vec<u32>,
-}
-
-impl IvfMetadata {
-    pub fn empty() -> Self {
-        Self {
-            rows_in_partition: vec![],
-        }
-    }
-
-    pub fn load(reader: &FileReader) -> Result<Self> {
-        todo!()
-    }
-
-    pub fn append(&mut self, rows: u32) {
-        self.rows_in_partition.push(rows);
-    }
-}
 
 fn new_ivf_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveType>(
     centroids: &T::ArrayType,
