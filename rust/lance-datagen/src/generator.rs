@@ -1100,7 +1100,7 @@ pub mod array {
         let data_type = DataType::Time32(resolution.clone());
         let size = ByteCount::from(data_type.primitive_width().unwrap() as u64);
         let dist = Uniform::new(start, end);
-        let sample_fn = move |rng: &mut _| dist.sample(rng) as i32;
+        let sample_fn = move |rng: &mut _| dist.sample(rng);
 
         match resolution {
             TimeUnit::Second => Box::new(FnGen::<i32, Time32SecondArray, _>::new_known_size(
@@ -1128,7 +1128,7 @@ pub mod array {
         let data_type = DataType::Time64(resolution.clone());
         let size = ByteCount::from(data_type.primitive_width().unwrap() as u64);
         let dist = Uniform::new(start, end);
-        let sample_fn = move |rng: &mut _| dist.sample(rng) as i64;
+        let sample_fn = move |rng: &mut _| dist.sample(rng);
 
         match resolution {
             TimeUnit::Microsecond => {
@@ -1243,7 +1243,7 @@ pub mod array {
 
     pub fn rand_timestamp(data_type: &DataType) -> Box<dyn ArrayGenerator> {
         let now = chrono::Utc::now();
-        let one_year_ago = now - chrono::Duration::days(365);
+        let one_year_ago = now - chrono::Duration::try_days(365).unwrap();
         rand_timestamp_in_range(one_year_ago, now, data_type)
     }
 
