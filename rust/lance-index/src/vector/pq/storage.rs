@@ -42,6 +42,7 @@ use crate::{
     pb,
     vector::{
         graph::storage::{DistCalculator, VectorStorage},
+        ivf::storage::IvfData,
         pq::transform::PQTransformer,
         transform::Transformer,
         PQ_CODE_COLUMN,
@@ -82,14 +83,16 @@ impl ProductQuantizationMetadata {
 }
 
 /// Loader to load partitioned PQ storage from disk.
-pub struct ProductQuantizationStorageLoader {
+pub struct IvfProductQuantizationStorage {
     reader: FileReader,
     metric_type: MetricType,
     codebook: Arc<Float32Array>,
     metadata: ProductQuantizationMetadata,
+
+    ivf: IvfData,
 }
 
-impl ProductQuantizationStorageLoader {
+impl IvfProductQuantizationStorage {
     /// Open a Loader.
     ///
     ///
@@ -114,7 +117,7 @@ impl ProductQuantizationStorageLoader {
             })?;
         let metric_type: MetricType = MetricType::try_from(index_metadata.metric_type.as_str())?;
 
-        let ivf_metadata: 
+        let ivf_data = IvfData::load(&reader).await?;
 
         let metadata = ProductQuantizationMetadata::load(&reader)?;
         let codebook_tensor: pb::Tensor =
@@ -126,6 +129,7 @@ impl ProductQuantizationStorageLoader {
             metric_type,
             codebook,
             metadata,
+            ivf: ivf_data,
         })
     }
 
@@ -135,6 +139,7 @@ impl ProductQuantizationStorageLoader {
     }
 
     pub async fn load_partition(&self, part_id: usize) -> Result<ProductQuantizationStorage> {
+        let range = self.ivf.row_range(part_id);
         ProductQuantizationStorage::load_partition(
             &self.reader,
             range,

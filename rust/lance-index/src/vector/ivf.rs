@@ -46,7 +46,7 @@ use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 
 pub mod builder;
 pub mod shuffler;
-mod storage;
+pub(crate) mod storage;
 mod transform;
 
 const IVF_METADTA_KEY: &str = "lance:ivf";
@@ -65,7 +65,7 @@ impl IvfMetadata {
     pub fn load(reader: &FileReader) -> Result<Self> {
         todo!()
     }
-    
+
     pub fn append(&mut self, rows: u32) {
         self.rows_in_partition.push(rows);
     }
