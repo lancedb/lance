@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
@@ -107,10 +108,10 @@ impl IvfData {
     }
 
     /// Range of the rows for one partition.
-    pub fn row_range(&self, partition: usize) -> (usize, usize) {
+    pub fn row_range(&self, partition: usize) -> Range<usize> {
         let start = self.partition_row_offsets[partition];
         let end = self.partition_row_offsets[partition + 1];
-        (start, end)
+        start..end
     }
 }
 
