@@ -23,14 +23,15 @@ use lance_io::{traits::WriteExt, utils::read_message};
 use lance_table::io::manifest::ManifestDescribing;
 use log::debug;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use snafu::{location, Location};
 
 use crate::pb::Ivf as PbIvf;
 
 const IVF_METADATA_KEY: &str = "lance:ivf";
 
-struct IvfMetadadta {
+#[warn(dead_code)]
+#[derive(Debug, PartialEq)]
+pub struct IvfMetadadta {
     /// Centroids of the IVF indices. Can be empty.
     centroids: Arc<FixedSizeListArray>,
 
@@ -130,11 +131,13 @@ impl TryFrom<PbIvf> for IvfMetadadta {
         // v1 index format. It will be deprecated soon.
         //
         // This new offset uses the row offset in the lance file.
-        let offsets = proto.lengths.iter().scan(0, |state, &x| {
-            let old = *state;
-            *state += x as usize;
-            Some(old)
-        });
+        let offsets = [0]
+            .iter()
+            .chain(proto.lengths.iter())
+            .scan(0_usize, |state, &x| {
+                *state += x as usize;
+                Some(*state)
+            });
         Ok(Self {
             centroids,
             lengths: proto.lengths.clone(),
@@ -159,4 +162,60 @@ impl TryFrom<&IvfMetadadta> for PbIvf {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use arrow_array::{Float32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_core::datatypes::Schema;
+    use lance_io::object_store::ObjectStore;
+    use lance_table::format::SelfDescribingFileReader;
+    use object_store::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn test_ivf_find_rows() {
+        let mut ivf = IvfMetadadta::empty(4);
+        ivf.add_partition(20);
+        ivf.add_partition(50);
+
+        assert_eq!(ivf.row_range(0), (0, 20));
+        assert_eq!(ivf.row_range(1), (20, 70));
+    }
+
+    #[tokio::test]
+    async fn test_write_and_load() {
+        let mut ivf = IvfMetadadta::empty(4);
+        ivf.add_partition(20);
+        ivf.add_partition(50);
+
+        let object_store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let arrow_schema = ArrowSchema::new(vec![Field::new("a", DataType::Float32, true)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        {
+            let mut writer =
+                FileWriter::try_new(&object_store, &path, schema.clone(), &Default::default())
+                    .await
+                    .unwrap();
+            // Write some dummy data
+            let batch = RecordBatch::try_new(
+                Arc::new(arrow_schema),
+                vec![Arc::new(Float32Array::from(vec![Some(1.0)]))],
+            )
+            .unwrap();
+            writer.write(&[batch]).await.unwrap();
+            ivf.write(&mut writer).await.unwrap();
+            writer.finish().await.unwrap();
+        }
+
+        let reader = FileReader::try_new_self_described(&object_store, &path, None)
+            .await
+            .unwrap();
+        assert!(reader.schema().metadata.contains_key(IVF_METADATA_KEY));
+
+        let ivf2 = IvfMetadadta::load(&reader).await.unwrap();
+        assert_eq!(ivf, ivf2);
+        assert_eq!(ivf2.num_partitions(), 2);
+    }
+}
