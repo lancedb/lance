@@ -179,8 +179,8 @@ mod tests {
         ivf.add_partition(20);
         ivf.add_partition(50);
 
-        assert_eq!(ivf.row_range(0), (0, 20));
-        assert_eq!(ivf.row_range(1), (20, 70));
+        assert_eq!(ivf.row_range(0), 0..20);
+        assert_eq!(ivf.row_range(1), 20..70);
     }
 
     #[tokio::test]
