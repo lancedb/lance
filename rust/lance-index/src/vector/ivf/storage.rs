@@ -31,7 +31,7 @@ const IVF_METADATA_KEY: &str = "lance:ivf";
 
 #[warn(dead_code)]
 #[derive(Debug, PartialEq)]
-pub struct IvfMetadadta {
+pub struct IvfData {
     /// Centroids of the IVF indices. Can be empty.
     centroids: Arc<FixedSizeListArray>,
 
@@ -44,12 +44,12 @@ pub struct IvfMetadadta {
 
 /// The IVF metadata stored in the Lance Schema
 #[derive(Serialize, Deserialize, Debug)]
-struct IvfMetadataInSchema {
+struct IvfMetadata {
     // The file position to store the protobuf binary of IVF metadata.
     pb_position: usize,
 }
 
-impl IvfMetadadta {
+impl IvfData {
     pub fn empty(dim: usize) -> Self {
         let values = Float32Array::from(Vec::<f32>::new());
         Self {
@@ -68,7 +68,7 @@ impl IvfMetadadta {
             message: format!("{} not found during search", IVF_METADATA_KEY),
             location: location!(),
         })?;
-        let ivf_metadata: IvfMetadataInSchema =
+        let ivf_metadata: IvfMetadata =
             serde_json::from_str(meta_str).map_err(|e| Error::Index {
                 message: format!("Failed to parse IVF metadata: {}", e),
                 location: location!(),
@@ -86,7 +86,7 @@ impl IvfMetadadta {
     pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
         let pb = PbIvf::try_from(self)?;
         let pos = writer.object_writer.write_protobuf(&pb).await?;
-        let ivf_metadata = IvfMetadataInSchema { pb_position: pos };
+        let ivf_metadata = IvfMetadata { pb_position: pos };
         writer.add_metadata(IVF_METADATA_KEY, &serde_json::to_string(&ivf_metadata)?);
         Ok(())
     }
@@ -114,7 +114,7 @@ impl IvfMetadadta {
     }
 }
 
-impl TryFrom<PbIvf> for IvfMetadadta {
+impl TryFrom<PbIvf> for IvfData {
     type Error = Error;
 
     fn try_from(proto: PbIvf) -> Result<Self> {
@@ -146,10 +146,10 @@ impl TryFrom<PbIvf> for IvfMetadadta {
     }
 }
 
-impl TryFrom<&IvfMetadadta> for PbIvf {
+impl TryFrom<&IvfData> for PbIvf {
     type Error = Error;
 
-    fn try_from(meta: &IvfMetadadta) -> Result<Self> {
+    fn try_from(meta: &IvfData) -> Result<Self> {
         let lengths = meta.lengths.clone();
 
         Ok(Self {
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_ivf_find_rows() {
-        let mut ivf = IvfMetadadta::empty(4);
+        let mut ivf = IvfData::empty(4);
         ivf.add_partition(20);
         ivf.add_partition(50);
 
@@ -184,7 +184,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_and_load() {
-        let mut ivf = IvfMetadadta::empty(4);
+        let mut ivf = IvfData::empty(4);
         ivf.add_partition(20);
         ivf.add_partition(50);
 
@@ -214,7 +214,7 @@ mod tests {
             .unwrap();
         assert!(reader.schema().metadata.contains_key(IVF_METADATA_KEY));
 
-        let ivf2 = IvfMetadadta::load(&reader).await.unwrap();
+        let ivf2 = IvfData::load(&reader).await.unwrap();
         assert_eq!(ivf, ivf2);
         assert_eq!(ivf2.num_partitions(), 2);
     }
