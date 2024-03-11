@@ -13,6 +13,7 @@
 
 import random
 import string
+from datetime import date, datetime, timedelta
 
 import lance
 import numpy as np
@@ -88,6 +89,34 @@ def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa
 
         actual_price = actual_data["price"][0]
         assert actual_price == expected_price
+
+
+def test_temporal_index(tmp_path):
+    # Timestamps
+    now = datetime.now()
+    today = date.today()
+    table = pa.Table.from_pydict({
+        "ts": [now - timedelta(days=i) for i in range(100)],
+        "date": [today - timedelta(days=i) for i in range(100)],
+        "time": pa.array([i for i in range(100)], type=pa.time32("s")),
+        "id": [i for i in range(100)],
+    })
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("ts", index_type="BTREE")
+    dataset.create_scalar_index("date", index_type="BTREE")
+    dataset.create_scalar_index("time", index_type="BTREE")
+
+    # Timestamp
+    half_now = now - timedelta(days=50)
+    scanner = dataset.scanner(filter=f"ts > timestamp '{half_now}'", scan_in_order=True)
+    assert "MaterializeIndex" in scanner.explain_plan(True)
+    assert scanner.to_table() == table.slice(0, 50)
+
+    # Date
+    half_toady = today - timedelta(days=50)
+    scanner = dataset.scanner(filter=f"date > date '{half_toady}'", scan_in_order=True)
+    assert "MaterializeIndex" in scanner.explain_plan(True)
+    assert scanner.to_table() == table.slice(0, 50)
 
 
 def test_indexed_vector_scan(indexed_dataset: lance.LanceDataset, data_table: pa.Table):

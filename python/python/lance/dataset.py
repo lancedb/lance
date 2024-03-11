@@ -1177,9 +1177,16 @@ class LanceDataset(pa.dataset.Dataset):
             and not pa.types.is_floating(field.type)
             and not pa.types.is_boolean(field.type)
             and not pa.types.is_string(field.type)
+            and not pa.types.is_temporal(field.type)
         ):
             raise TypeError(
-                f"Scalar index column {column} must be int, float, bool, or str"
+                f"Scalar index column {column} must be int",
+                ", float, bool, str, or temporal",
+            )
+
+        if pa.types.is_duration(field.type):
+            raise TypeError(
+                f"Scalar index column {column} cannot currently be a duration"
             )
 
         index_type = index_type.upper()
