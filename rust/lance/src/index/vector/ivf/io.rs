@@ -376,16 +376,20 @@ pub(super) async fn write_hnsw_index_partitions(
             hnsw.write(writer).await?;
             // let pq_refs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
 
-            let binary_offset = writer.tell().await? - offset;
+            // let binary_offset = writer.tell().await? - offset;
             // PlainEncoder::write(&mut writer.object_writer, &pq_refs).await?;
-            let row_ids_refs = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-            PlainEncoder::write(&mut writer.object_writer, row_ids_refs.as_slice()).await?;
-            writer.add_metadata("lance:binary_offset", &binary_offset.to_string());
+            // let row_ids_refs = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+            // PlainEncoder::write(&mut writer.object_writer, row_ids_refs.as_slice()).await?;
+            // writer.add_metadata("lance:binary_offset", &binary_offset.to_string());
             writer.write_footer().await?;
         }
 
         let length = writer.tell().await? - offset;
         ivf.add_partition(offset, length as u32);
+        println!(
+            "wrote partition {} at offset {} with length {}",
+            part_id, offset, length
+        );
         log::info!(
             "Wrote partition {} in {} ms",
             part_id,

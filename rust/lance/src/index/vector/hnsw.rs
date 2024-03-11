@@ -72,14 +72,14 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct HNSWIndex {
     hnsw: HNSW,
-    row_ids: Option<Arc<dyn Array>>,
+    // row_ids: Option<Arc<dyn Array>>,
 }
 
 impl HNSWIndex {
     pub fn new(hnsw: HNSW) -> Self {
         Self {
             hnsw,
-            row_ids: None,
+            // row_ids: None,
         }
     }
 }
@@ -130,14 +130,18 @@ impl VectorIndex for HNSWIndex {
 
         let node_ids = UInt32Array::from_iter_values(results.iter().map(|x| x.0));
 
-        let row_ids = take(&self.row_ids.as_ref().unwrap(), &node_ids, None)?;
+        // let row_ids = take(&self.row_ids.as_ref().unwrap(), &node_ids, None)?;
         let distances = Arc::new(Float32Array::from_iter_values(results.iter().map(|x| x.1)));
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(DIST_COL, DataType::Float32, true),
-            ROW_ID_FIELD.clone(),
+            // ROW_ID_FIELD.clone(),
+            arrow_schema::Field::new("_node_id", DataType::UInt32, true),
         ]));
-        Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
+        Ok(RecordBatch::try_new(
+            schema,
+            vec![distances, Arc::new(node_ids)],
+        )?)
     }
 
     fn is_loadable(&self) -> bool {
@@ -165,47 +169,38 @@ impl VectorIndex for HNSWIndex {
             })
             .await?;
 
+        let reader = MemoryBufReader::new(bytes, reader.block_size(), reader.path().clone());
+
         let schema = Schema::try_from(&arrow_schema::Schema::new(vec![
             NEIGHBORS_FIELD.clone(),
             VECTOR_ID_FIELD.clone(),
         ]))?;
 
-        let file_reader = FileReader::try_new_from_reader(
-            Box::new(MemoryBufReader::new(
-                bytes,
-                reader.block_size(),
-                reader.path().to_owned(),
-            )),
-            None,
-            schema,
-            0,
-            0,
-            None,
-        )
-        .await?;
+        let file_reader =
+            FileReader::try_new_from_reader(Box::new(reader), None, schema, 0, 0, None).await?;
 
         let hnsw = HNSW::load(&file_reader).await?;
 
-        let offset = file_reader
-            .schema()
-            .metadata
-            .get("lance:binary_offset")
-            .ok_or(Error::Index {
-                message: "lance:binary_offset not found in schema metadata".to_string(),
-                location: location!(),
-            })?
-            .parse::<usize>()
-            .map_err(|e| Error::Index {
-                message: format!("Failed to parse lance:binary_offset: {}", e),
-                location: location!(),
-            })?;
+        // let offset = file_reader
+        //     .schema()
+        //     .metadata
+        //     .get("lance:binary_offset")
+        //     .ok_or(Error::Index {
+        //         message: "lance:binary_offset not found in schema metadata".to_string(),
+        //         location: location!(),
+        //     })?
+        //     .parse::<usize>()
+        //     .map_err(|e| Error::Index {
+        //         message: format!("Failed to parse lance:binary_offset: {}", e),
+        //         location: location!(),
+        //     })?;
 
-        let row_ids =
-            read_fixed_stride_array(reader, &DataType::UInt64, offset, self.hnsw.len(), ..).await?;
+        // let row_ids =
+        //     read_fixed_stride_array(reader, &DataType::UInt64, offset, self.hnsw.len(), ..).await?;
 
         Ok(Box::new(Self {
             hnsw,
-            row_ids: Some(row_ids),
+            // row_ids: Some(row_ids),
         }))
     }
 
