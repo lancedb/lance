@@ -1054,7 +1054,7 @@ pub mod array {
     /// is a more common use pattern
     pub fn rand_date32() -> Box<dyn ArrayGenerator> {
         let now = chrono::Utc::now();
-        let one_year_ago = now - chrono::Duration::days(365);
+        let one_year_ago = now - chrono::TimeDelta::try_days(365).expect("TimeDelta try days");
         rand_date32_in_range(one_year_ago, now)
     }
 
@@ -1087,7 +1087,7 @@ pub mod array {
     /// is a more common use pattern
     pub fn rand_date64() -> Box<dyn ArrayGenerator> {
         let now = chrono::Utc::now();
-        let one_year_ago = now - chrono::Duration::days(365);
+        let one_year_ago = now - chrono::TimeDelta::try_days(365).expect("TimeDelta try_days");
         rand_date64_in_range(one_year_ago, now)
     }
 

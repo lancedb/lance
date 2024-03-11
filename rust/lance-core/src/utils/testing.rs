@@ -17,7 +17,7 @@
 use crate::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::Duration;
+use chrono::{Duration, TimeDelta};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
@@ -252,6 +252,6 @@ impl<'a> MockClock<'a> {
 impl<'a> Drop for MockClock<'a> {
     fn drop(&mut self) {
         // Reset the clock to the epoch
-        mock_instant::MockClock::set_system_time(Duration::days(0).to_std().unwrap());
+        mock_instant::MockClock::set_system_time(TimeDelta::try_days(0).unwrap().to_std().unwrap());
     }
 }
