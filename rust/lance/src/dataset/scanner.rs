@@ -43,7 +43,7 @@ use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_datafusion::exec::execute_plan;
+use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_datafusion::expr::parse_substrait;
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
@@ -667,12 +667,18 @@ impl Scanner {
     #[instrument(skip_all)]
     pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
         let plan = self.create_plan().await?;
-        Ok(DatasetRecordBatchStream::new(execute_plan(plan)?))
+        Ok(DatasetRecordBatchStream::new(execute_plan(
+            plan,
+            LanceExecutionOptions::default(),
+        )?))
     }
 
-    pub(crate) async fn try_into_dfstream(&self) -> Result<SendableRecordBatchStream> {
+    pub(crate) async fn try_into_dfstream(
+        &self,
+        options: LanceExecutionOptions,
+    ) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
-        execute_plan(plan)
+        execute_plan(plan, options)
     }
 
     pub async fn try_into_batch(&self) -> Result<RecordBatch> {
@@ -705,7 +711,7 @@ impl Scanner {
             plan,
             plan_schema,
         )?);
-        let mut stream = execute_plan(count_plan)?;
+        let mut stream = execute_plan(count_plan, LanceExecutionOptions::default())?;
 
         // A count plan will always return a single batch with a single row.
         if let Some(first_batch) = stream.next().await {
