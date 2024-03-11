@@ -87,9 +87,6 @@ pub struct ProductQuantizationStorageLoader {
     metric_type: MetricType,
     codebook: Arc<Float32Array>,
     metadata: ProductQuantizationMetadata,
-
-    // Pre-computed offsets.
-    offsets: Vec<usize>,
 }
 
 impl ProductQuantizationStorageLoader {
@@ -116,6 +113,8 @@ impl ProductQuantizationStorageLoader {
                 location: location!(),
             })?;
         let metric_type: MetricType = MetricType::try_from(index_metadata.metric_type.as_str())?;
+
+        let ivf_metadata: 
 
         let metadata = ProductQuantizationMetadata::load(&reader)?;
         let codebook_tensor: pb::Tensor =
