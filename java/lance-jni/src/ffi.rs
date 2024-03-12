@@ -40,24 +40,14 @@ impl JNIEnvExt for JNIEnv<'_> {
     }
 
     fn get_strings_opt(&mut self, obj: &JObject) -> Result<Option<Vec<String>>> {
-        println!("get_strings_opt XX");
-        println!("Object is: {:?}", obj);
-        let is_empty = match self.call_method(obj, "isEmpty", "()Z", &[]) {
-            Ok(e) => e,
-            Err(e) => {
-                println!("Get string ops: err={}", e.to_string());
-                return Ok(None);
-            }
-        };
-        println!("After calling: {:?}", is_empty);
-        return Ok(None);
-        // if is_empty.z()? {
-        //     Ok(None)
-        // } else {
-        //     let inner =
-        //         self.call_method(obj, "get", "()Ljava/util/List;", &[])?;
-        //     let inner_obj = inner.l()?;
-        //     Ok(Some(self.get_strings(&inner_obj)?))
-        // }
+        let is_empty = self.call_method(obj, "isEmpty", "()Z", &[])?;
+        if is_empty.z()? {
+            Ok(None)
+        } else {
+            let inner =
+                self.call_method(obj, "get", "()Ljava/util/List;", &[])?;
+            let inner_obj = inner.l()?;
+            Ok(Some(self.get_strings(&inner_obj)?))
+        }
     }
 }

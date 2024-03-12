@@ -99,18 +99,15 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_getSchema(
     _scanner: JObject,
     jdataset: JObject,
     fragment_id: jint,
-    columns: JObject, // Optional<List[String]>
+    columns: JObject, // Optional<String[]>
 ) -> jlong {
-    println!("THIS IS RUST !!");
     let columns = match env.get_strings_opt(&columns) {
         Ok(c) => c,
         Err(e) => {
-            // env.throw(e.to_string());
-            println!("Error: {}", e.to_string());
+            env.throw(e.to_string()).expect("Failed to throw exception");
             return -1;
         }
     };
-    println!("Columns: {:?}", columns);
 
     let res = {
         let dataset =
