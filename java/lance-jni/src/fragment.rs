@@ -12,15 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use arrow::ffi::FFI_ArrowSchema;
+use arrow_schema::Schema;
 use jni::{
     objects::JObject,
     sys::{jint, jlong},
     JNIEnv,
 };
+use lance::dataset::fragment::FileFragment;
+use snafu::{location, Location};
 
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     error::{Error, Result},
+    ffi::JNIEnvExt,
     RT,
 };
 
@@ -31,6 +36,38 @@ fn fragment_count_rows(dataset: &BlockingDataset, fragment_id: jlong) -> Result<
         });
     };
     Ok(RT.block_on(fragment.count_rows())? as jint)
+}
+
+struct FragmentScanner {
+    fragment: FileFragment,
+}
+
+impl FragmentScanner {
+    async fn try_open(dataset: &BlockingDataset, fragment_id: usize) -> Result<Self> {
+        let fragment = dataset
+            .inner
+            .get_fragment(fragment_id)
+            .ok_or_else(|| Error::IO {
+                message: format!("Fragment not found: {}", fragment_id),
+                location: location!(),
+            })?;
+        Ok(Self { fragment })
+    }
+
+    /// Returns the schema of the scanner, with optional columns.
+    fn schema(&self, columns: Option<Vec<String>>) -> Result<Schema> {
+        let schema = self.fragment.schema();
+        let schema = if let Some(columns) = columns {
+            schema
+                .project(&columns)
+                .map_err(|e| Error::InvalidArgument {
+                    message: format!("Failed to select columns: {}", e),
+                })?
+        } else {
+            schema.clone()
+        };
+        Ok((&schema).into())
+    }
 }
 
 #[no_mangle]
@@ -62,17 +99,37 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_getSchema(
     jdataset: JObject,
     fragment_id: jint,
     columns: JObject, // Optional<List[String]>
-    schema: jlong
-) {
-    let res = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
-                .expect("Dataset handle not set");
-        let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
-            return Err(Error::InvalidArgument {
-                message: format!("Fragment not found: {}", fragment_id),
-            });
-        };
-
+) -> jlong {
+    println!("THIS IS RUST !!");
+    let columns = match env.get_strings_opt(&columns) {
+        Ok(c) => c,
+        Err(e) => {
+            // env.throw(e.to_string());
+            println!("Error: {}", e.to_string());
+            return -1;
+        }
     };
+    println!("Columns: {:?}", columns);
+
+    // let res = {
+    //     let dataset =
+    //         unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+    //             .expect("Dataset handle not set");
+    //     dataset.clone()
+    // };
+    // let scanner = ok_or_throw_with_return!(
+    //     env,
+    //     RT.block_on(async { FragmentScanner::try_open(&res, fragment_id as usize).await }),
+    //     0
+    // );
+
+    // let schema = ok_or_throw_with_return!(env, scanner.schema(columns), 0);
+    // let ffi_schema =
+    //     Box::new(FFI_ArrowSchema::try_from(&schema).expect("Failed to convert schema"));
+    // let ptr = Box::into_raw(ffi_schema) as jlong;
+    // ptr
+    // columns.map(|c| c.len() as i64).unwrap_or_default()
+    // columns.map(|s| s.len() as i64).unwrap_or_default()
+    // 0
+    -2
 }

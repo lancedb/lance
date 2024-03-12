@@ -34,12 +34,24 @@ macro_rules! ok_or_throw {
     };
 }
 
+#[macro_export]
+macro_rules! ok_or_throw_with_return {
+    ($env:expr, $result:expr, $ret:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(err) => {
+                err.throw(&mut $env);
+                return $ret;
+            }
+        }
+    };
+}
+
 mod blocking_dataset;
 pub mod error;
 mod ffi;
 mod fragment;
 mod traits;
-mod ffi;
 
 use self::traits::{FromJString, JMapExt};
 use crate::blocking_dataset::BlockingDataset;

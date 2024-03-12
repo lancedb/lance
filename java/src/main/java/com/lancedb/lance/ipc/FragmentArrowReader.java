@@ -15,6 +15,7 @@
 package com.lancedb.lance.ipc;
 
 import java.io.IOException;
+import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
@@ -33,6 +34,8 @@ class FragmentArrowReader extends ArrowReader {
 
   @Override
   public boolean loadNextBatch() throws IOException {
+    ArrowArray array = ArrowArray.allocateNew(super.allocator);
+    stream.getNext(array);
     return true;
   }
 
@@ -42,7 +45,9 @@ class FragmentArrowReader extends ArrowReader {
   }
 
   @Override
-  protected void closeReadSource() throws IOException {}
+  protected void closeReadSource() throws IOException {
+    stream.release();
+  }
 
   @Override
   protected Schema readSchema() throws IOException {

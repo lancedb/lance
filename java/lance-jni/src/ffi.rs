@@ -28,7 +28,7 @@ pub trait JNIEnvExt {
 
 impl JNIEnvExt for JNIEnv<'_> {
     fn get_strings(&mut self, obj: &JObject) -> Result<Vec<String>> {
-        let list = self.get_list(obj)?;
+        let list = self.get_list(&obj)?;
         let mut iter = list.iter(self)?;
         let mut results = Vec::with_capacity(list.size(self)? as usize);
         while let Some(elem) = iter.next(self)? {
@@ -40,14 +40,24 @@ impl JNIEnvExt for JNIEnv<'_> {
     }
 
     fn get_strings_opt(&mut self, obj: &JObject) -> Result<Option<Vec<String>>> {
-        let is_empty = self.call_method(obj, "java/util/Optional/isEmpty", "()Z", &[])?;
-        if is_empty.z()? {
-            Ok(None)
-        } else {
-            let inner =
-                self.call_method(obj, "java/util/Optional/get", "()Ljava/util/List;", &[])?;
-            let inner_obj = inner.l()?;
-            Ok(Some(self.get_strings(&inner_obj)?))
-        }
+        println!("get_strings_opt XX");
+        println!("Object is: {:?}", obj);
+        let is_empty = match self.call_method(obj, "isEmpty", "()Z", &[]) {
+            Ok(e) => e,
+            Err(e) => {
+                println!("Get string ops: err={}", e.to_string());
+                return Ok(None);
+            }
+        };
+        println!("After calling: {:?}", is_empty);
+        return Ok(None);
+        // if is_empty.z()? {
+        //     Ok(None)
+        // } else {
+        //     let inner =
+        //         self.call_method(obj, "get", "()Ljava/util/List;", &[])?;
+        //     let inner_obj = inner.l()?;
+        //     Ok(Some(self.get_strings(&inner_obj)?))
+        // }
     }
 }
