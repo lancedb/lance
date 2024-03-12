@@ -264,6 +264,32 @@ impl HNSW {
         })
     }
 
+    /// Load a partition of HNSW
+    ///
+    /// Parameters
+    /// ----------
+    /// - *reader*: the file reader to read the graph from.
+    pub async fn load_partition(
+        reader: &FileReader,
+        range: std::ops::Range<usize>,
+        metric_type: MetricType,
+        vector_storage: Arc<dyn VectorStorage>,
+        metadata: HnswMetadata,
+    ) -> Result<Self> {
+        let mut levels = Vec::with_capacity(metadata.level_offsets.len());
+        for offset in metadata.level_offsets {
+            let start = offset + range.start;
+            let end = offset + range.end;
+            levels.push(HnswLevel::load(reader, start..end, vector_storage.clone()).await?);
+        }
+        Ok(Self {
+            levels,
+            metric_type,
+            entry_point: metadata.entry_point,
+            use_select_heuristic: true,
+        })
+    }
+
     fn from_builder(
         levels: Vec<HnswLevel>,
         entry_point: u32,
