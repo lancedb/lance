@@ -12,14 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::num::NonZeroUsize;
+
+#[derive(Debug)]
+pub enum IndexDeltaOption {
+    NewDelta,
+    Merge(NonZeroUsize),
+}
+
 /// Options for optimizing all indices.
 #[derive(Debug)]
 pub struct OptimizeOptions {
-    /// Number of delta indices to merge for one column. Default: 1.
+    /// Number of delta indices to merge for one column. Default: Merge(1)
     ///
-    /// If `num_indices_to_merge` is 0, a new delta index will be created.
-    /// If `num_indices_to_merge` is 1, the delta updates will be merged into the latest index.
-    /// If `num_indices_to_merge` is more than 1, the delta updates and latest N indices
+    /// If `index_delta_option` is NewDelta, a new delta index will be created.
+    /// If `index_delta_option` is Merge(1), the delta updates will be merged into the latest index.
+    /// If `index_delta_option` is Merge(>1), the delta updates and latest N indices
     /// will be merged into one single index.
     ///
     /// It is up to the caller to decide how many indices to merge / keep. Callers can
@@ -27,13 +35,13 @@ pub struct OptimizeOptions {
     ///
     /// A common usage pattern will be that, the caller can keep a large snapshot of the index of the base version,
     /// and accumulate a few delta indices, then merge them into the snapshot.
-    pub num_indices_to_merge: usize,
+    pub index_delta_option: IndexDeltaOption,
 }
 
 impl Default for OptimizeOptions {
     fn default() -> Self {
         Self {
-            num_indices_to_merge: 1,
+            index_delta_option: IndexDeltaOption::Merge(NonZeroUsize::new(1).unwrap()),
         }
     }
 }
