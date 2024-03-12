@@ -93,6 +93,7 @@ pub struct IvfProductQuantizationStorage {
     ivf: IvfData,
 }
 
+#[allow(dead_code)]
 impl IvfProductQuantizationStorage {
     /// Open a Loader.
     ///
@@ -153,6 +154,7 @@ impl IvfProductQuantizationStorage {
 }
 
 /// Write partition of PQ storage to disk.
+#[allow(dead_code)]
 pub async fn write_parted_product_quantizations(
     object_store: &ObjectStore,
     path: &Path,
