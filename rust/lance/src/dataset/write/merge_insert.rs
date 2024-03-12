@@ -61,7 +61,7 @@ use lance_core::{
     Error, Result,
 };
 use lance_datafusion::{
-    exec::{execute_plan, OneShotExec},
+    exec::{execute_plan, LanceExecutionOptions, OneShotExec},
     utils::reader_to_stream,
 };
 use lance_index::DatasetIndexExt;
@@ -437,7 +437,13 @@ impl MergeInsertJob {
             )
             .unwrap(),
         );
-        execute_plan(joined)
+        execute_plan(
+            joined,
+            LanceExecutionOptions {
+                use_spilling: true,
+                ..Default::default()
+            },
+        )
     }
 
     // If the join keys are not indexed then we need to do a full scan of the table
