@@ -81,6 +81,25 @@ message IVF {
 
   // Tensor of centroids. `num_partitions * dimension` of float32s.
   Tensor centroids_tensor = 4;
+
+  repeated SubIndex sub_indexes = 5;
+}
+
+message SubIndex {
+  oneof sub_index {
+    // Flat index
+    Flat flat = 1;
+    // `IVF` - Inverted File
+    IVF ivf = 2;
+    // Product Quantization
+    PQ pq = 3;
+    // Transformer
+    Transform transform = 4;
+    // DiskANN
+    DiskAnn diskann = 5;
+    // HNSW
+    HNSW hnsw = 6;
+  }
 }
 
 // Product Quantization.
