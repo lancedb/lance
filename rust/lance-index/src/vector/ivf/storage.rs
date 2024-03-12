@@ -16,7 +16,6 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::FixedSizeListArray;
-use itertools::Itertools;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{traits::WriteExt, utils::read_message};
