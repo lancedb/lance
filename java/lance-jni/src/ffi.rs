@@ -41,7 +41,7 @@ impl JNIEnvExt for JNIEnv<'_> {
 
     fn get_strings_opt(&mut self, obj: &JObject) -> Result<Option<Vec<String>>> {
         let is_empty = self.call_method(obj, "java/util/Optional/isEmpty", "()Z", &[])?;
-        if !is_empty.z()? {
+        if is_empty.z()? {
             Ok(None)
         } else {
             let inner =
@@ -51,6 +51,3 @@ impl JNIEnvExt for JNIEnv<'_> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {}
