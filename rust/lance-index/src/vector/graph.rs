@@ -172,6 +172,7 @@ pub(super) fn beam_search(
     start: &[u32],
     query: &[f32],
     k: usize,
+    bitset: Option<&roaring::bitmap::RoaringBitmap>,
 ) -> Result<BTreeMap<OrderedFloat, u32>> {
     let mut visited: HashSet<_> = start.iter().copied().collect();
     let dist_calc = graph.storage().dist_calculator(query);
@@ -181,11 +182,22 @@ pub(super) fn beam_search(
         .zip(start)
         .map(|(&dist, id)| (dist.into(), *id))
         .collect::<BTreeMap<_, _>>();
-    let mut results = candidates.clone();
+    let mut results = candidates
+        .clone()
+        .into_iter()
+        .filter(|node| {
+            !bitset
+                .map(|bitset| bitset.contains(node.1))
+                .unwrap_or(false)
+        })
+        .collect::<BTreeMap<_, _>>();
 
     while !candidates.is_empty() {
         let (dist, current) = candidates.pop_first().expect("candidates is empty");
-        let furthest = *results.last_key_value().expect("results set is empty").0;
+        let furthest = results
+            .last_key_value()
+            .map(|kv| *kv.0)
+            .unwrap_or(OrderedFloat(f32::INFINITY));
         if dist > furthest {
             break;
         }
@@ -199,14 +211,22 @@ pub(super) fn beam_search(
                 continue;
             }
             visited.insert(neighbor);
-            let furthest = *results.last_key_value().expect("results set is empty").0;
+            let furthest = results
+                .last_key_value()
+                .map(|kv| *kv.0)
+                .unwrap_or(OrderedFloat(f32::INFINITY));
             let dist = dist_calc.distance(&[neighbor])[0].into();
             if dist < furthest || results.len() < k {
-                results.insert(dist, neighbor);
-                candidates.insert(dist, neighbor);
-                if results.len() > k {
-                    results.pop_last();
+                if !bitset
+                    .map(|bitset| bitset.contains(neighbor))
+                    .unwrap_or(false)
+                {
+                    results.insert(dist, neighbor);
+                    if results.len() > k {
+                        results.pop_last();
+                    }
                 }
+                candidates.insert(dist, neighbor);
             }
         }
     }
