@@ -16,6 +16,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::FixedSizeListArray;
+use itertools::Itertools;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{traits::WriteExt, utils::read_message};
@@ -24,7 +25,7 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
-use crate::pb::Ivf as PbIvf;
+use crate::pb::{self, Ivf as PbIvf};
 
 const IVF_METADATA_KEY: &str = "lance:ivf";
 
@@ -39,6 +40,8 @@ pub struct IvfData {
 
     /// pre-computed row offset for each partition, do not persist.
     partition_row_offsets: Vec<usize>,
+
+    partition_indexes: Vec<pb::SubIndex>,
 }
 
 /// The IVF metadata stored in the Lance Schema
@@ -54,6 +57,7 @@ impl IvfData {
             centroids: None,
             lengths: vec![],
             partition_row_offsets: vec![0],
+            partition_indexes: vec![],
         }
     }
 
@@ -134,6 +138,7 @@ impl TryFrom<PbIvf> for IvfData {
             centroids,
             lengths: proto.lengths.clone(),
             partition_row_offsets: offsets.collect(),
+            partition_indexes: proto.sub_indexes,
         })
     }
 }
@@ -153,6 +158,7 @@ impl TryFrom<&IvfData> for PbIvf {
                 .as_ref()
                 .map(|c| c.as_ref().try_into())
                 .transpose()?,
+            sub_indexes: vec![],
         })
     }
 }

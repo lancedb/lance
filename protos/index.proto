@@ -81,6 +81,25 @@ message IVF {
 
   // Tensor of centroids. `num_partitions * dimension` of float32s.
   Tensor centroids_tensor = 4;
+
+  repeated SubIndex sub_indexes = 5;
+}
+
+message SubIndex {
+  oneof sub_index {
+    // Flat index
+    Flat flat = 1;
+    // `IVF` - Inverted File
+    IVF ivf = 2;
+    // Product Quantization
+    PQ pq = 3;
+    // Transformer
+    Transform transform = 4;
+    // DiskANN
+    DiskAnn diskann = 5;
+    // HNSW
+    HNSW hnsw = 6;
+  }
 }
 
 // Product Quantization.
@@ -142,6 +161,14 @@ message DiskAnn {
   repeated uint64 entries = 6;
 }
 
+message HNSW {
+  // Entry point
+  uint32 entry_point = 1;
+
+  // Level offsets
+  repeated uint64 level_offsets = 2;
+}
+
 // One stage in the vector index pipeline.
 message VectorIndexStage {
   oneof stage {
@@ -155,9 +182,10 @@ message VectorIndexStage {
     Transform transform = 4;
     // DiskANN
     DiskAnn diskann = 5;
+    // HNSW
+    HNSW hnsw = 6;
   }
 }
-
 
 // Metric Type for Vector Index
 enum VectorMetricType {
