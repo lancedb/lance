@@ -15,9 +15,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray, Float32Array};
-
-use lance_arrow::FixedSizeListArrayExt;
+use arrow_array::FixedSizeListArray;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{traits::WriteExt, utils::read_message};
@@ -34,7 +32,7 @@ const IVF_METADATA_KEY: &str = "lance:ivf";
 #[derive(Debug, PartialEq)]
 pub struct IvfData {
     /// Centroids of the IVF indices. Can be empty.
-    centroids: Arc<FixedSizeListArray>,
+    centroids: Option<Arc<FixedSizeListArray>>,
 
     /// Length of each partition.
     lengths: Vec<u32>,
@@ -51,13 +49,9 @@ struct IvfMetadata {
 }
 
 impl IvfData {
-    pub fn empty(dim: usize) -> Self {
-        let values = Float32Array::from(Vec::<f32>::new());
+    pub fn empty() -> Self {
         Self {
-            centroids: Arc::new(
-                FixedSizeListArray::try_new_from_values(values, dim as i32)
-                    .expect("Creating empty centroids"),
-            ),
+            centroids: None,
             lengths: vec![],
             partition_row_offsets: vec![0],
         }
@@ -100,7 +94,7 @@ impl IvfData {
     }
 
     pub fn has_centroids(&self) -> bool {
-        self.centroids.len() > 0
+        self.centroids.is_some()
     }
 
     pub fn num_partitions(&self) -> usize {
@@ -140,7 +134,7 @@ impl TryFrom<PbIvf> for IvfData {
                 Some(*state)
             });
         Ok(Self {
-            centroids,
+            centroids: Some(centroids),
             lengths: proto.lengths.clone(),
             partition_row_offsets: offsets.collect(),
         })
@@ -157,7 +151,11 @@ impl TryFrom<&IvfData> for PbIvf {
             centroids: vec![], // Deprecated
             lengths,
             offsets: vec![], // Deprecated
-            centroids_tensor: Some(meta.centroids.as_ref().try_into()?),
+            centroids_tensor: meta
+                .centroids
+                .as_ref()
+                .map(|c| c.as_ref().try_into())
+                .transpose()?,
         })
     }
 }
@@ -175,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_ivf_find_rows() {
-        let mut ivf = IvfData::empty(4);
+        let mut ivf = IvfData::empty();
         ivf.add_partition(20);
         ivf.add_partition(50);
 
@@ -185,7 +183,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_and_load() {
-        let mut ivf = IvfData::empty(4);
+        let mut ivf = IvfData::empty();
         ivf.add_partition(20);
         ivf.add_partition(50);
 

@@ -24,7 +24,7 @@ use arrow_array::{
     FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
 use arrow_schema::SchemaRef;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
     object_store::ObjectStore,
@@ -83,6 +83,7 @@ impl ProductQuantizationMetadata {
 }
 
 /// Loader to load partitioned PQ storage from disk.
+#[allow(dead_code)]
 pub struct IvfProductQuantizationStorage {
     reader: FileReader,
     metric_type: MetricType,
@@ -134,8 +135,8 @@ impl IvfProductQuantizationStorage {
     }
 
     /// Get the number of partitions in the storage.
-    pub fn num_partitions() -> usize {
-        unimplemented!()
+    pub fn num_partitions(&self) -> usize {
+        self.ivf.num_partitions()
     }
 
     pub async fn load_partition(&self, part_id: usize) -> Result<ProductQuantizationStorage> {
@@ -149,6 +150,37 @@ impl IvfProductQuantizationStorage {
         )
         .await
     }
+}
+
+/// Write partition of PQ storage to disk.
+pub async fn write_parted_product_quantizations(
+    object_store: &ObjectStore,
+    path: &Path,
+    partitions: Box<dyn Iterator<Item = ProductQuantizationStorage>>,
+) -> Result<()> {
+    let mut peek = partitions.peekable();
+    let first = peek.peek().ok_or(Error::Index {
+        message: "No partitions to write".to_string(),
+        location: location!(),
+    })?;
+    let schema = first.schema();
+    let lance_schema = Schema::try_from(schema.as_ref())?;
+    let mut writer = FileWriter::<ManifestDescribing>::try_new(
+        object_store,
+        path,
+        lance_schema,
+        &Default::default(), // TODO: support writer options.
+    )
+    .await?;
+
+    let mut ivf_data = IvfData::empty();
+    for storage in peek {
+        let num_rows = storage.write_partition(&mut writer).await?;
+        ivf_data.add_partition(num_rows as u32);
+    }
+    ivf_data.write(&mut writer).await?;
+
+    Ok(())
 }
 
 /// Product Quantization Storage
