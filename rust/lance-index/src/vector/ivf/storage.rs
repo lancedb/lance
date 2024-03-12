@@ -115,12 +115,9 @@ impl TryFrom<PbIvf> for IvfData {
     fn try_from(proto: PbIvf) -> Result<Self> {
         let centroids = if let Some(tensor) = proto.centroids_tensor.as_ref() {
             debug!("Ivf: loading IVF centroids from index format v2");
-            Arc::new(FixedSizeListArray::try_from(tensor)?)
+            Some(Arc::new(FixedSizeListArray::try_from(tensor)?))
         } else {
-            return Err(Error::Schema {
-                message: "Centroids tensor not found".to_string(),
-                location: location!(),
-            });
+            None
         };
         // We are not using offsets from the protobuf, which was the file offset in the
         // v1 index format. It will be deprecated soon.
@@ -134,7 +131,7 @@ impl TryFrom<PbIvf> for IvfData {
                 Some(*state)
             });
         Ok(Self {
-            centroids: Some(centroids),
+            centroids,
             lengths: proto.lengths.clone(),
             partition_row_offsets: offsets.collect(),
         })
