@@ -15,12 +15,13 @@
 use arrow::ffi::FFI_ArrowSchema;
 use arrow_schema::Schema;
 use jni::{
+    JNIEnv,
     objects::JObject,
     sys::{jint, jlong},
-    JNIEnv,
 };
-use lance::dataset::fragment::FileFragment;
 use snafu::{location, Location};
+
+use lance::dataset::fragment::FileFragment;
 
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
@@ -111,25 +112,20 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_getSchema(
     };
     println!("Columns: {:?}", columns);
 
-    // let res = {
-    //     let dataset =
-    //         unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
-    //             .expect("Dataset handle not set");
-    //     dataset.clone()
-    // };
-    // let scanner = ok_or_throw_with_return!(
-    //     env,
-    //     RT.block_on(async { FragmentScanner::try_open(&res, fragment_id as usize).await }),
-    //     0
-    // );
+    let res = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+                .expect("Dataset handle not set");
+        dataset.clone()
+    };
+    let scanner = ok_or_throw_with_return!(
+        env,
+        RT.block_on(async { FragmentScanner::try_open(&res, fragment_id as usize).await }),
+        0
+    );
 
-    // let schema = ok_or_throw_with_return!(env, scanner.schema(columns), 0);
-    // let ffi_schema =
-    //     Box::new(FFI_ArrowSchema::try_from(&schema).expect("Failed to convert schema"));
-    // let ptr = Box::into_raw(ffi_schema) as jlong;
-    // ptr
-    // columns.map(|c| c.len() as i64).unwrap_or_default()
-    // columns.map(|s| s.len() as i64).unwrap_or_default()
-    // 0
-    -2
+    let schema = ok_or_throw_with_return!(env, scanner.schema(columns), 0);
+    let ffi_schema =
+        Box::new(FFI_ArrowSchema::try_from(&schema).expect("Failed to convert schema"));
+    Box::into_raw(ffi_schema) as jlong
 }

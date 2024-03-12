@@ -15,6 +15,9 @@
 package com.lancedb.lance.ipc;
 
 import com.lancedb.lance.Dataset;
+import java.util.Optional;
+import org.apache.arrow.c.ArrowSchema;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.dataset.scanner.ScanOptions;
 import org.apache.arrow.dataset.scanner.ScanTask;
 import org.apache.arrow.dataset.scanner.Scanner;
@@ -40,7 +43,7 @@ public class FragmentScanner implements Scanner {
     this.allocator = allocator;
   }
 
-  private static native long getSchema(Dataset dataset, int fragmentId);
+  private static native long getSchema(Dataset dataset, int fragmentId, Optional<String[]> columns);
 
   @Override
   public ArrowReader scanBatches() {
@@ -56,11 +59,9 @@ public class FragmentScanner implements Scanner {
   /** Get the schema of the Scanner. */
   @Override
   public Schema schema() {
-    long address = getSchema(dataset, fragmentId);
-    System.out.println("Schema address: " + address);
-    //    var schema = ArrowSchema.wrap(address);
-    //    return Data.importSchema(allocator, schema, null);
-    return null;
+    long address = getSchema(dataset, fragmentId, options.getColumns());
+    var schema = ArrowSchema.wrap(address);
+    return Data.importSchema(allocator, schema, null);
   }
 
   @Override
