@@ -6,7 +6,7 @@ The need for this arises when one needs to train a model on a subset of data or 
 all of it on the disk at once. This becomes a considerable problem when you just want a subset of a Terrabyte or Petabyte-scale dataset.
 
 In this example, we will be bypassing this problem by downloading a text dataset in parts, tokenizing it and saving it as a Lance dataset. 
-This can be done for as many or as few data samples as you wish with peak memory consumption never exceeding 3GBs!
+This can be done for as many or as few data samples as you wish with average memory consumption approximately 3-4 GBs!
 
 For this example, we are working with the `wikitext <https://huggingface.co/datasets/wikitext>`_ dataset, 
 which is a collection of over 100 million tokens extracted from the set of verified Good and Featured articles on Wikipedia.
