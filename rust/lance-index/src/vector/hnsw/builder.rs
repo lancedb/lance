@@ -148,7 +148,7 @@ impl HNSWBuilder {
     /// Create a new [`HNSWBuilder`] with prepared params and in memory vector storage.
     pub fn with_params(params: HnswBuildParams, vectors: Arc<InMemoryVectorStorage>) -> Self {
         Self {
-            params: params,
+            params,
             vectors,
             levels: vec![],
             entry_point: 0,
