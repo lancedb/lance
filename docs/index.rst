@@ -29,6 +29,7 @@ The key features of Lance include:
    Integrations <./integrations/integrations>
    API References <./api/api>
    Contributor Guide <./contributing>
+   Examples <./examples/examples>
 
 
 Indices and tables
