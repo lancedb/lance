@@ -167,7 +167,7 @@ mod tests {
         types::{Float32Type, Int32Type, UInt64Type},
         RecordBatchIterator, RecordBatchReader, UInt64Array,
     };
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
@@ -543,6 +543,14 @@ mod tests {
             DataType::Utf8,
             DataType::Float32,
             DataType::Date32,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Date64,
+            DataType::Date32,
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Time32(TimeUnit::Second),
+            // Not supported today, error from datafusion:
+            // Min/max accumulator not implemented for Duration(Nanosecond)
+            // DataType::Duration(TimeUnit::Nanosecond),
         ] {
             let tempdir = tempdir().unwrap();
             let index_store = test_store(&tempdir);
