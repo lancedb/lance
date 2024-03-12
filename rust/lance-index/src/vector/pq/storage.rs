@@ -24,7 +24,7 @@ use arrow_array::{
     FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
 use arrow_schema::SchemaRef;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
     object_store::ObjectStore,
@@ -42,6 +42,7 @@ use crate::{
     pb,
     vector::{
         graph::storage::{DistCalculator, VectorStorage},
+        ivf::storage::IvfData,
         pq::transform::PQTransformer,
         transform::Transformer,
         PQ_CODE_COLUMN,
@@ -52,11 +53,136 @@ use crate::{
 const PQ_METADTA_KEY: &str = "lance:pq";
 
 #[derive(Serialize, Deserialize)]
-struct ProductQuantizationMetadata {
+pub struct ProductQuantizationMetadata {
     codebook_position: usize,
     num_bits: u32,
     num_sub_vectors: usize,
     dimension: usize,
+}
+
+impl ProductQuantizationMetadata {
+    /// Load metadata of PQ quantization from a Lance File.
+    ///
+    pub fn load(reader: &FileReader) -> Result<Self> {
+        let metadata = reader
+            .schema()
+            .metadata
+            .get(PQ_METADTA_KEY)
+            .ok_or(Error::Index {
+                message: format!(
+                    "Reading PQ storage: metadata key {} not found",
+                    PQ_METADTA_KEY
+                ),
+                location: location!(),
+            })?;
+        serde_json::from_str(metadata).map_err(|_| Error::Index {
+            message: format!("Failed to parse PQ metadata: {}", metadata),
+            location: location!(),
+        })
+    }
+}
+
+/// Loader to load partitioned PQ storage from disk.
+#[allow(dead_code)]
+pub struct IvfProductQuantizationStorage {
+    reader: FileReader,
+    metric_type: MetricType,
+    codebook: Arc<Float32Array>,
+    metadata: ProductQuantizationMetadata,
+
+    ivf: IvfData,
+}
+
+#[allow(dead_code)]
+impl IvfProductQuantizationStorage {
+    /// Open a Loader.
+    ///
+    ///
+    pub async fn open(object_store: &ObjectStore, path: &Path) -> Result<Self> {
+        let reader = FileReader::try_new_self_described(object_store, path, None).await?;
+        let schema = reader.schema();
+
+        let metadata_str = schema
+            .metadata
+            .get(INDEX_METADATA_SCHEMA_KEY)
+            .ok_or(Error::Index {
+                message: format!(
+                    "Reading PQ storage: index key {} not found",
+                    INDEX_METADATA_SCHEMA_KEY
+                ),
+                location: location!(),
+            })?;
+        let index_metadata: IndexMetadata =
+            serde_json::from_str(metadata_str).map_err(|_| Error::Index {
+                message: format!("Failed to parse index metadata: {}", metadata_str),
+                location: location!(),
+            })?;
+        let metric_type: MetricType = MetricType::try_from(index_metadata.metric_type.as_str())?;
+
+        let ivf_data = IvfData::load(&reader).await?;
+
+        let metadata = ProductQuantizationMetadata::load(&reader)?;
+        let codebook_tensor: pb::Tensor =
+            read_message(reader.object_reader.as_ref(), metadata.codebook_position).await?;
+        let fsl = FixedSizeListArray::try_from(&codebook_tensor)?;
+        let codebook = Arc::new(fsl.values().as_primitive::<Float32Type>().clone());
+        Ok(Self {
+            reader,
+            metric_type,
+            codebook,
+            metadata,
+            ivf: ivf_data,
+        })
+    }
+
+    /// Get the number of partitions in the storage.
+    pub fn num_partitions(&self) -> usize {
+        self.ivf.num_partitions()
+    }
+
+    pub async fn load_partition(&self, part_id: usize) -> Result<ProductQuantizationStorage> {
+        let range = self.ivf.row_range(part_id);
+        ProductQuantizationStorage::load_partition(
+            &self.reader,
+            range,
+            self.metric_type,
+            self.codebook.clone(),
+            &self.metadata,
+        )
+        .await
+    }
+}
+
+/// Write partition of PQ storage to disk.
+#[allow(dead_code)]
+pub async fn write_parted_product_quantizations(
+    object_store: &ObjectStore,
+    path: &Path,
+    partitions: Box<dyn Iterator<Item = ProductQuantizationStorage>>,
+) -> Result<()> {
+    let mut peek = partitions.peekable();
+    let first = peek.peek().ok_or(Error::Index {
+        message: "No partitions to write".to_string(),
+        location: location!(),
+    })?;
+    let schema = first.schema();
+    let lance_schema = Schema::try_from(schema.as_ref())?;
+    let mut writer = FileWriter::<ManifestDescribing>::try_new(
+        object_store,
+        path,
+        lance_schema,
+        &Default::default(), // TODO: support writer options.
+    )
+    .await?;
+
+    let mut ivf_data = IvfData::empty();
+    for storage in peek {
+        let num_rows = storage.write_partition(&mut writer).await?;
+        ivf_data.add_partition(num_rows as u32);
+    }
+    ivf_data.write(&mut writer).await?;
+
+    Ok(())
 }
 
 /// Product Quantization Storage
@@ -190,6 +316,31 @@ impl ProductQuantizationStorage {
         )
     }
 
+    /// Load a partition of PQ storage from disk.
+    ///
+    /// Parameters
+    /// ----------
+    /// - *reader: &FileReader
+    pub async fn load_partition(
+        reader: &FileReader,
+        range: std::ops::Range<usize>,
+        metric_type: MetricType,
+        codebook: Arc<Float32Array>,
+        metadata: &ProductQuantizationMetadata,
+    ) -> Result<Self> {
+        let schema = reader.schema();
+        let batch = reader.read_range(range, schema, None).await?;
+
+        Self::new(
+            codebook,
+            batch,
+            metadata.num_bits,
+            metadata.num_sub_vectors,
+            metadata.dimension,
+            metric_type,
+        )
+    }
+
     /// Load full PQ storage from disk.
     ///
     /// Parameters
@@ -226,18 +377,7 @@ impl ProductQuantizationStorage {
             })?;
         let metric_type: MetricType = MetricType::try_from(index_metadata.metric_type.as_str())?;
 
-        let metadata = schema.metadata.get(PQ_METADTA_KEY).ok_or(Error::Index {
-            message: format!(
-                "Reading PQ storage: metadata key {} not found",
-                PQ_METADTA_KEY
-            ),
-            location: location!(),
-        })?;
-        let pq_matadata: ProductQuantizationMetadata =
-            serde_json::from_str(metadata).map_err(|_| Error::Index {
-                message: format!("Failed to parse PQ metadata: {}", metadata),
-                location: location!(),
-            })?;
+        let pq_matadata = ProductQuantizationMetadata::load(&reader)?;
         let codebook_tensor: pb::Tensor =
             read_message(reader.object_reader.as_ref(), pq_matadata.codebook_position).await?;
         let fsl = FixedSizeListArray::try_from(&codebook_tensor)?;
@@ -245,17 +385,14 @@ impl ProductQuantizationStorage {
         // Hard coded to float32 for now
         let codebook = Arc::new(fsl.values().as_primitive::<Float32Type>().clone());
 
-        let total = reader.len();
-        let batch = reader.read_range(0..total, schema, None).await?;
-
-        Self::new(
-            codebook,
-            batch,
-            pq_matadata.num_bits,
-            pq_matadata.num_sub_vectors,
-            pq_matadata.dimension,
+        Self::load_partition(
+            &reader,
+            0..reader.len(),
             metric_type,
+            codebook,
+            &pq_matadata,
         )
+        .await
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -269,8 +406,25 @@ impl ProductQuantizationStorage {
             .collect()
     }
 
+    /// Write the PQ storage as a Lance partition to disk,
+    /// and returns the number of rows written.
+    ///
+    pub async fn write_partition(
+        &self,
+        writer: &mut FileWriter<ManifestDescribing>,
+    ) -> Result<usize> {
+        let batch_size: usize = 10240; // TODO: make it configurable
+        for i in (0..self.batch.num_rows()).step_by(batch_size) {
+            let offset = i * batch_size;
+            let length = min(batch_size, self.batch.num_rows() - offset);
+            let slice = self.batch.slice(offset, length);
+            writer.write(&[slice]).await?;
+        }
+        Ok(self.batch.num_rows())
+    }
+
     /// Write the PQ storage to disk.
-    pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
+    pub async fn write_full(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
         let pos = writer.object_writer.tell().await?;
         let mat = MatrixView::<Float32Type>::new(self.codebook.clone(), self.dimension);
         let codebook_tensor = pb::Tensor::from(&mat);
@@ -279,20 +433,14 @@ impl ProductQuantizationStorage {
             .write_protobuf(&codebook_tensor)
             .await?;
 
+        self.write_partition(writer).await?;
+
         let metadata = ProductQuantizationMetadata {
             codebook_position: pos,
             num_bits: self.num_bits,
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
         };
-
-        let batch_size: usize = 10240; // TODO: make it configurable
-        for i in (0..self.batch.num_rows()).step_by(batch_size) {
-            let offset = i * batch_size;
-            let length = min(batch_size, self.batch.num_rows() - offset);
-            let slice = self.batch.slice(offset, length);
-            writer.write(&[slice]).await?;
-        }
 
         let index_metadata = IndexMetadata {
             index_type: "PQ".to_string(),
@@ -459,7 +607,7 @@ mod tests {
         .await
         .unwrap();
 
-        storage.write(&mut file_writer).await.unwrap();
+        storage.write_full(&mut file_writer).await.unwrap();
 
         let storage2 = ProductQuantizationStorage::load(&store, &path)
             .await

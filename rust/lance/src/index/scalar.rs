@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use lance_datafusion::chunker::chunk_concat_stream;
+use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
 use lance_index::scalar::{
     btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
     flat::FlatIndexMetadata,
@@ -63,7 +63,12 @@ impl BtreeTrainingSource for TrainingRequest {
             )]))?
             .project(&[&self.column])?;
 
-        let ordered_batches = scan.try_into_dfstream().await?;
+        let ordered_batches = scan
+            .try_into_dfstream(LanceExecutionOptions {
+                use_spilling: true,
+                ..Default::default()
+            })
+            .await?;
         Ok(chunk_concat_stream(ordered_batches, chunk_size as usize))
     }
 }

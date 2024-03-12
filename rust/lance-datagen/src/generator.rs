@@ -514,6 +514,39 @@ impl ArrayGenerator for RandomBinaryGenerator {
     }
 }
 
+// A function that converts an array from one type to another
+type WrapFn = Box<
+    dyn Fn(Arc<dyn arrow_array::Array>) -> Result<Arc<dyn arrow_array::Array>, ArrowError>
+        + Send
+        + Sync,
+>;
+
+struct WrappedGenerator {
+    generator: Box<dyn ArrayGenerator>,
+    data_type: DataType,
+    element_size_bytes: Option<ByteCount>,
+    wrap_fn: WrapFn,
+}
+
+impl ArrayGenerator for WrappedGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let array = self.generator.generate(length, rng)?;
+        (self.wrap_fn)(array)
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        self.element_size_bytes
+    }
+}
+
 pub struct CycleBinaryGenerator<T: ByteArrayType> {
     values: Vec<u8>,
     lengths: Vec<usize>,
@@ -878,11 +911,17 @@ impl BatchGeneratorBuilder {
 const MS_PER_DAY: i64 = 86400000;
 
 pub mod array {
+
     use arrow_array::types::{
         ArrowPrimitiveType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
         UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     };
-    use arrow_array::{ArrowNativeTypeOp, Date32Array, Date64Array, PrimitiveArray};
+    use arrow_array::{
+        ArrowNativeTypeOp, Date32Array, Date64Array, PrimitiveArray, Time32MillisecondArray,
+        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    };
+    use arrow_schema::TimeUnit;
     use chrono::Utc;
     use rand::distributions::Uniform;
     use rand::prelude::Distribution;
@@ -1048,13 +1087,71 @@ pub mod array {
         cycle_vec(underlying, dimension)
     }
 
+    /// Create a generator of randomly sampled time32 values covering the entire
+    /// range of 1 day
+    pub fn rand_time32(resolution: &TimeUnit) -> Box<dyn ArrayGenerator> {
+        let start = 0;
+        let end = match resolution {
+            TimeUnit::Second => 86_400,
+            TimeUnit::Millisecond => 86_400_000,
+            _ => panic!(),
+        };
+
+        let data_type = DataType::Time32(resolution.clone());
+        let size = ByteCount::from(data_type.primitive_width().unwrap() as u64);
+        let dist = Uniform::new(start, end);
+        let sample_fn = move |rng: &mut _| dist.sample(rng);
+
+        match resolution {
+            TimeUnit::Second => Box::new(FnGen::<i32, Time32SecondArray, _>::new_known_size(
+                data_type, sample_fn, 1, size,
+            )),
+            TimeUnit::Millisecond => {
+                Box::new(FnGen::<i32, Time32MillisecondArray, _>::new_known_size(
+                    data_type, sample_fn, 1, size,
+                ))
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// Create a generator of randomly sampled time64 values covering the entire
+    /// range of 1 day
+    pub fn rand_time64(resolution: &TimeUnit) -> Box<dyn ArrayGenerator> {
+        let start = 0_i64;
+        let end: i64 = match resolution {
+            TimeUnit::Microsecond => 86_400_000,
+            TimeUnit::Nanosecond => 86_400_000_000,
+            _ => panic!(),
+        };
+
+        let data_type = DataType::Time64(resolution.clone());
+        let size = ByteCount::from(data_type.primitive_width().unwrap() as u64);
+        let dist = Uniform::new(start, end);
+        let sample_fn = move |rng: &mut _| dist.sample(rng);
+
+        match resolution {
+            TimeUnit::Microsecond => {
+                Box::new(FnGen::<i64, Time64MicrosecondArray, _>::new_known_size(
+                    data_type, sample_fn, 1, size,
+                ))
+            }
+            TimeUnit::Nanosecond => {
+                Box::new(FnGen::<i64, Time64NanosecondArray, _>::new_known_size(
+                    data_type, sample_fn, 1, size,
+                ))
+            }
+            _ => panic!(),
+        }
+    }
+
     /// Create a generator of randomly sampled date32 values
     ///
     /// Instead of sampling the entire range, all values will be drawn from the last year as this
     /// is a more common use pattern
     pub fn rand_date32() -> Box<dyn ArrayGenerator> {
         let now = chrono::Utc::now();
-        let one_year_ago = now - chrono::Duration::days(365);
+        let one_year_ago = now - chrono::TimeDelta::try_days(365).expect("TimeDelta try days");
         rand_date32_in_range(one_year_ago, now)
     }
 
@@ -1087,8 +1184,77 @@ pub mod array {
     /// is a more common use pattern
     pub fn rand_date64() -> Box<dyn ArrayGenerator> {
         let now = chrono::Utc::now();
-        let one_year_ago = now - chrono::Duration::days(365);
+        let one_year_ago = now - chrono::TimeDelta::try_days(365).expect("TimeDelta try_days");
         rand_date64_in_range(one_year_ago, now)
+    }
+
+    /// Create a generator of randomly sampled timestamp values in the given range
+    ///
+    /// Currently just samples the entire range of u64 values and casts to timestamp
+    pub fn rand_timestamp_in_range(
+        start: chrono::DateTime<Utc>,
+        end: chrono::DateTime<Utc>,
+        data_type: &DataType,
+    ) -> Box<dyn ArrayGenerator> {
+        let end_ms = end.timestamp_millis();
+        let start_ms = start.timestamp_millis();
+        let (start_ticks, end_ticks) = match data_type {
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                (start_ms * 1000 * 1000, end_ms * 1000 * 1000)
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => (start_ms * 1000, end_ms * 1000),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => (start_ms, end_ms),
+            DataType::Timestamp(TimeUnit::Second, _) => (start.timestamp(), end.timestamp()),
+            _ => panic!(),
+        };
+        let dist = Uniform::new(start_ticks, end_ticks);
+
+        let data_type = data_type.clone();
+        let sample_fn = move |rng: &mut _| (dist.sample(rng));
+        let width = data_type
+            .primitive_width()
+            .map(|width| ByteCount::from(width as u64))
+            .unwrap();
+
+        match data_type {
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                Box::new(FnGen::<i64, TimestampNanosecondArray, _>::new_known_size(
+                    data_type, sample_fn, 1, width,
+                ))
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                Box::new(FnGen::<i64, TimestampMicrosecondArray, _>::new_known_size(
+                    data_type, sample_fn, 1, width,
+                ))
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                Box::new(FnGen::<i64, TimestampMicrosecondArray, _>::new_known_size(
+                    data_type, sample_fn, 1, width,
+                ))
+            }
+            DataType::Timestamp(TimeUnit::Second, _) => {
+                Box::new(FnGen::<i64, TimestampSecondArray, _>::new_known_size(
+                    data_type, sample_fn, 1, width,
+                ))
+            }
+            _ => panic!(),
+        }
+    }
+
+    pub fn rand_timestamp(data_type: &DataType) -> Box<dyn ArrayGenerator> {
+        let now = chrono::Utc::now();
+        let one_year_ago = now - chrono::Duration::try_days(365).unwrap();
+        rand_timestamp_in_range(one_year_ago, now, data_type)
+    }
+
+    pub fn rand_duration(data_type: &DataType) -> Box<dyn ArrayGenerator> {
+        let data_type_clone = data_type.clone();
+        Box::new(WrappedGenerator {
+            generator: rand::<Int64Type>(),
+            data_type: data_type.clone(),
+            element_size_bytes: Some(ByteCount(8)),
+            wrap_fn: Box::new(move |array| arrow_cast::cast(&array, &data_type_clone)),
+        })
     }
 
     /// Create a generator of randomly sampled date64 values
@@ -1159,7 +1325,11 @@ pub mod array {
             ),
             DataType::Date32 => rand_date32(),
             DataType::Date64 => rand_date64(),
-            _ => unimplemented!(),
+            DataType::Time32(resolution) => rand_time32(resolution),
+            DataType::Time64(resolution) => rand_time64(resolution),
+            DataType::Timestamp(_, _) => rand_timestamp(data_type),
+            DataType::Duration(_) => rand_duration(data_type),
+            _ => unimplemented!("random generation of {}", data_type),
         }
     }
 

@@ -206,6 +206,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         Ok(())
     }
 
+    /// Add schema metedata, as (key, value) pair to the file.
     pub fn add_metadata(&mut self, key: &str, value: &str) {
         self.schema
             .metadata

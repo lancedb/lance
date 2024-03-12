@@ -139,7 +139,7 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
             });
         }
 
-        let field = Field::new("item", flat_array.data_type().clone(), false);
+        let field = Field::new("item", flat_array.data_type().clone(), true);
         Ok(Self::try_new(
             Arc::new(field),
             dim as i32,
