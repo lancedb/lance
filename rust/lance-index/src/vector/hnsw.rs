@@ -398,7 +398,6 @@ mod tests {
     use arrow_array::types::Float32Type;
     use lance_linalg::matrix::MatrixView;
     use lance_testing::datagen::generate_random_array;
-    use roaring::RoaringBitmap;
 
     #[test]
     fn test_select_neighbors() {
