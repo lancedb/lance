@@ -269,6 +269,10 @@ impl HNSW {
     /// Parameters
     /// ----------
     /// - *reader*: the file reader to read the graph from.
+    /// - *range*: the row range of the partition.
+    /// - *metric_type*: the metric type of the index.
+    /// - *vector_storage*: A preloaded [VectorStorage] storage.
+    /// - *metadata*: the metadata of the HNSW.
     pub async fn load_partition(
         reader: &FileReader,
         range: std::ops::Range<usize>,
@@ -276,10 +280,11 @@ impl HNSW {
         vector_storage: Arc<dyn VectorStorage>,
         metadata: HnswMetadata,
     ) -> Result<Self> {
-        let mut levels = Vec::with_capacity(metadata.level_offsets.len());
-        for offset in metadata.level_offsets {
-            let start = offset + range.start;
-            let end = offset + range.end;
+        let mut levels = Vec::with_capacity(metadata.level_offsets.len() - 1);
+        // TODO: load levels in parallel.
+        for i in 0..metadata.level_offsets.len() - 1 {
+            let start = metadata.level_offsets[i] + range.start;
+            let end = metadata.level_offsets[i + 1] + range.end;
             levels.push(HnswLevel::load(reader, start..end, vector_storage.clone()).await?);
         }
         Ok(Self {
@@ -336,11 +341,12 @@ impl HNSW {
 
     /// Returns the metadata of this [`HNSW`].
     pub fn metadata(&self) -> HnswMetadata {
-        let mut level_offsets = Vec::with_capacity(self.levels.len());
+        let mut level_offsets = Vec::with_capacity(self.levels.len() + 1);
         let mut offset = 0;
+        level_offsets.push(offset);
         for level in self.levels.iter() {
-            level_offsets.push(offset);
             offset += level.len();
+            level_offsets.push(offset);
         }
 
         HnswMetadata {
@@ -369,7 +375,13 @@ impl HNSW {
         Ok(())
     }
 
-    // Write partitioned HNSWs to the file.
+    /// Write partitioned HNSWs to the file.
+    ///
+    /// Parameters
+    /// ----------
+    /// - *object_store*: the object store to write the file to.
+    /// - *path*: the path to write the file to.
+    /// - *partitions*: the partitions of the HNSW graph.
     pub async fn write_parted_hnsw(
         object_store: &ObjectStore,
         path: &Path,
@@ -400,7 +412,7 @@ impl HNSW {
         Ok(())
     }
 
-    // Write levels' nodes, and returns the offset of each level.
+    /// Write levels' nodes, and returns the offset of each level.
     pub async fn write_levels(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<usize> {
         let mut num_rows = 0;
         for level in self.levels.iter() {
