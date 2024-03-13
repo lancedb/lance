@@ -14,6 +14,7 @@ rust-version.workspace = true
 [dependencies]
 lance-arrow.workspace = true
 lance-core.workspace = true
+arrow = { workspace = true, features = ["ffi"] }
 arrow-arith.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true

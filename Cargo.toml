@@ -89,6 +89,7 @@ datafusion = { version = "36.0.0", default-features = false, features = [
 datafusion-common = "36.0"
 datafusion-sql = "36.0"
 datafusion-expr = "36.0"
+datafusion-execution = "36.0"
 datafusion-physical-expr = "36.0"
 datafusion-substrait = "36.0"
 either = "1.0"
