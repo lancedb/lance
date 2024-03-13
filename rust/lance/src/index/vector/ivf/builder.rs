@@ -23,11 +23,18 @@ use snafu::{location, Location};
 use tracing::instrument;
 
 use lance_core::{Error, Result, ROW_ID};
-use lance_index::vector::{hnsw::builder::HnswBuildParams, ivf::shuffler::shuffle_dataset, pq::ProductQuantizer};
+use lance_index::vector::{
+    hnsw::{builder::HnswBuildParams, HnswMetadata},
+    ivf::shuffler::shuffle_dataset,
+    pq::ProductQuantizer,
+};
 use lance_io::{stream::RecordBatchStream, traits::Writer};
 use lance_linalg::distance::MetricType;
 
-use crate::{index::vector::ivf::{io::write_index_partitions, Ivf}, Dataset};
+use crate::{
+    index::vector::ivf::{io::write_pq_partitions, Ivf},
+    Dataset,
+};
 
 use super::io::write_hnsw_index_partitions;
 
@@ -85,7 +92,7 @@ pub(super) async fn build_partitions(
     )
     .await?;
 
-    write_index_partitions(writer, ivf, Some(stream), None).await?;
+    write_pq_partitions(writer, ivf, Some(stream), None).await?;
 
     Ok(())
 }
@@ -109,7 +116,7 @@ pub(super) async fn build_hnsw_partitions(
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
-) -> Result<()> {
+) -> Result<Vec<HnswMetadata>> {
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
         return Err(Error::Schema {
@@ -156,7 +163,5 @@ pub(super) async fn build_hnsw_partitions(
         Some(stream),
         None,
     )
-    .await?;
-
-    Ok(())
+    .await
 }

@@ -12,22 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 use std::time::Instant;
+use std::{cmp::Reverse, pin::Pin};
 
 use arrow::datatypes::Float32Type;
 use arrow_array::{
     cast::AsArray, types::UInt64Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
+use futures::stream::Peekable;
 use futures::{Stream, StreamExt};
 use lance_arrow::*;
 use lance_core::Error;
 use lance_file::writer::FileWriter;
 use lance_index::vector::{
     graph::memory::InMemoryVectorStorage,
-    hnsw::{builder::HnswBuildParams, HNSWBuilder},
+    hnsw::{builder::HnswBuildParams, HNSWBuilder, HnswMetadata},
     PART_ID_COLUMN, PQ_CODE_COLUMN,
 };
 use lance_io::encodings::plain::PlainEncoder;
@@ -41,89 +42,75 @@ use crate::index::vector::{hnsw::HNSWIndex, pq::PQIndex, VectorIndex};
 use crate::Result;
 use crate::{dataset::ROW_ID, Dataset};
 
-// async fn merge_stream_by_partition<I: VectorIndex>(
-//     sources: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
-// ) -> Result<impl Stream<Item = Result<RecordBatch>>> {
-//     // build the initial heap
-//     // TODO: extract heap sort to a separate function.
-//     let mut streams_heap = BinaryHeap::new();
-//     let mut new_streams = vec![];
+/// Merge streams with the same partition id and collect PQ codes and row IDs.
+async fn merge_streams(
+    streams_heap: &mut BinaryHeap<(Reverse<u32>, usize)>,
+    new_streams: &mut Vec<Pin<Box<Peekable<impl Stream<Item = Result<RecordBatch>>>>>>,
+    part_id: u32,
+    pq_array: &mut Vec<Arc<dyn Array>>,
+    row_id_array: &mut Vec<Arc<dyn Array>>,
+) -> Result<()> {
+    while let Some((Reverse(stream_part_id), stream_idx)) = streams_heap.pop() {
+        if stream_part_id != part_id {
+            streams_heap.push((Reverse(stream_part_id), stream_idx));
+            break;
+        }
 
-//     if let Some(streams) = sources {
-//         for stream in streams {
-//             let mut stream = Box::pin(stream.peekable());
+        let mut stream = new_streams[stream_idx].as_mut();
+        let batch = match stream.next().await {
+            Some(Ok(batch)) => batch,
+            Some(Err(e)) => {
+                return Err(Error::IO {
+                    message: format!("failed to read batch: {}", e),
+                    location: location!(),
+                });
+            }
+            None => {
+                return Err(Error::IO {
+                    message: "failed to read batch: unexpected end of stream".to_string(),
+                    location: location!(),
+                });
+            }
+        };
 
-//             match stream.as_mut().peek().await {
-//                 Some(Ok(batch)) => {
-//                     let part_ids: &UInt32Array = batch
-//                         .column_by_name(PART_ID_COLUMN)
-//                         .expect("part id column not found")
-//                         .as_primitive();
-//                     let part_id = part_ids.values()[0];
-//                     streams_heap.push((Reverse(part_id), new_streams.len()));
-//                     new_streams.push(stream);
-//                 }
-//                 Some(Err(e)) => {
-//                     return Err(Error::IO {
-//                         message: format!("failed to read batch: {}", e),
-//                         location: location!(),
-//                     });
-//                 }
-//                 None => {
-//                     return Err(Error::IO {
-//                         message: "failed to read batch: end of stream".to_string(),
-//                         location: location!(),
-//                     });
-//                 }
-//             }
-//         }
-//     }
+        let pq_codes = Arc::new(
+            batch
+                .column_by_name(PQ_CODE_COLUMN)
+                .expect("pq code column not found")
+                .as_fixed_size_list()
+                .clone(),
+        );
+        let row_ids: Arc<dyn Array> = Arc::new(
+            batch
+                .column_by_name(ROW_ID)
+                .expect("row id column not found")
+                .as_primitive::<UInt64Type>()
+                .clone(),
+        );
+        pq_array.push(pq_codes);
+        row_id_array.push(row_ids);
 
-//     // Merge all streams with the same partition id.
-//     let result = futures::stream::try_unfold(0, |_| async move {
-//         while let stream = streams_heap.pop() {
-//             let (Reverse(_), stream_idx) = match stream {
-//                 Some(v) => v,
-//                 None => return Ok(None),
-//             };
-
-//             let mut stream = new_streams[stream_idx].as_mut();
-//             let batch = match stream.next().await {
-//                 Some(Ok(batch)) => batch,
-//                 Some(Err(e)) => {
-//                     return Err(e);
-//                 }
-//                 None => {
-//                     continue;
-//                 }
-//             };
-
-//             match stream.peek().await {
-//                 Some(Ok(batch)) => {
-//                     let part_ids: &UInt32Array = batch
-//                         .column_by_name(PART_ID_COLUMN)
-//                         .expect("part id column not found")
-//                         .as_primitive();
-//                     if !part_ids.is_empty() {
-//                         streams_heap.push((Reverse(part_ids.value(0)), stream_idx));
-//                     }
-//                 }
-//                 Some(Err(e)) => {
-//                     return Err(Error::IO {
-//                         message: format!("IVF Shuffler::failed to read batch: {}", e),
-//                         location: location!(),
-//                     });
-//                 }
-//                 None => {}
-//             };
-
-//             return Ok(Some((batch, 0)));
-//         }
-//         Ok(None)
-//     });
-
-//     Ok(result)
-// }
+        match stream.peek().await {
+            Some(Ok(batch)) => {
+                let part_ids: &UInt32Array = batch
+                    .column_by_name(PART_ID_COLUMN)
+                    .expect("part id column not found")
+                    .as_primitive();
+                if !part_ids.is_empty() {
+                    streams_heap.push((Reverse(part_ids.value(0)), stream_idx));
+                }
+            }
+            Some(Err(e)) => {
+                return Err(Error::IO {
+                    message: format!("IVF Shuffler::failed to read batch: {}", e),
+                    location: location!(),
+                });
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
 
 /// Write each partition of IVF_PQ index to the index file.
 ///
@@ -137,7 +124,7 @@ use crate::{dataset::ROW_ID, Dataset};
 /// These existing partitions must have the same centroids and PQ codebook.
 ///
 /// TODO: migrate this function to `lance-index` crate.
-pub(super) async fn write_index_partitions(
+pub(super) async fn write_pq_partitions(
     writer: &mut dyn Writer,
     ivf: &mut Ivf,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
@@ -209,65 +196,14 @@ pub(super) async fn write_index_partitions(
         }
 
         // Merge all streams with the same partition id.
-        while let Some((Reverse(stream_part_id), stream_idx)) = streams_heap.pop() {
-            if stream_part_id != part_id {
-                streams_heap.push((Reverse(stream_part_id), stream_idx));
-                break;
-            }
-
-            let mut stream = new_streams[stream_idx].as_mut();
-            let batch = match stream.next().await {
-                Some(Ok(batch)) => batch,
-                Some(Err(e)) => {
-                    return Err(Error::IO {
-                        message: format!("failed to read batch: {}", e),
-                        location: location!(),
-                    });
-                }
-                None => {
-                    return Err(Error::IO {
-                        message: "failed to read batch: unexpected end of stream".to_string(),
-                        location: location!(),
-                    });
-                }
-            };
-
-            let pq_codes = Arc::new(
-                batch
-                    .column_by_name(PQ_CODE_COLUMN)
-                    .expect("pq code column not found")
-                    .as_fixed_size_list()
-                    .clone(),
-            );
-            let row_ids: Arc<dyn Array> = Arc::new(
-                batch
-                    .column_by_name(ROW_ID)
-                    .expect("row id column not found")
-                    .as_primitive::<UInt64Type>()
-                    .clone(),
-            );
-            pq_array.push(pq_codes);
-            row_id_array.push(row_ids);
-
-            match stream.peek().await {
-                Some(Ok(batch)) => {
-                    let part_ids: &UInt32Array = batch
-                        .column_by_name(PART_ID_COLUMN)
-                        .expect("part id column not found")
-                        .as_primitive();
-                    if !part_ids.is_empty() {
-                        streams_heap.push((Reverse(part_ids.value(0)), stream_idx));
-                    }
-                }
-                Some(Err(e)) => {
-                    return Err(Error::IO {
-                        message: format!("IVF Shuffler::failed to read batch: {}", e),
-                        location: location!(),
-                    });
-                }
-                None => {}
-            }
-        }
+        merge_streams(
+            &mut streams_heap,
+            &mut new_streams,
+            part_id,
+            &mut pq_array,
+            &mut row_id_array,
+        )
+        .await?;
 
         let total_records = row_id_array.iter().map(|a| a.len()).sum::<usize>();
         ivf.add_partition(writer.tell().await?, total_records as u32);
@@ -296,9 +232,10 @@ pub(super) async fn write_hnsw_index_partitions(
     ivf: &mut Ivf,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
     existing_indices: Option<&[&IVFIndex]>,
-) -> Result<()> {
+) -> Result<Vec<HnswMetadata>> {
     let mut streams_heap = BinaryHeap::new();
     let mut new_streams = vec![];
+    let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
 
     if let Some(streams) = streams {
         for stream in streams {
@@ -334,141 +271,50 @@ pub(super) async fn write_hnsw_index_partitions(
         let start = Instant::now();
         let mut pq_array: Vec<Arc<dyn Array>> = vec![];
         let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
+        let mut vector_batches = Vec::new();
 
-        // if let Some(&previous_indices) = existing_indices.as_ref() {
-        //     for &idx in previous_indices.iter() {
-        //         let sub_index = idx.load_partition(part_id as usize, true).await?;
-        //         let pq_index =
-        //             sub_index
-        //                 .as_any()
-        //                 .downcast_ref::<HNSWIndex>()
-        //                 .ok_or(Error::Index {
-        //                     message: "Invalid sub index".to_string(),
-        //                     location: location!(),
-        //                 })?;
-        //         if let Some(pq_code) = pq_index.code.as_ref() {
-        //             let fsl = Arc::new(
-        //                 FixedSizeListArray::try_new_from_values(
-        //                     pq_code.as_ref().clone(),
-        //                     pq_index.pq.num_sub_vectors() as i32,
-        //                 )
-        //                 .unwrap(),
-        //             );
-        //             pq_array.push(fsl);
-        //             row_id_array.push(pq_index.row_ids.as_ref().unwrap().clone());
-        //         }
-        //     }
-        // }
-
-        // Merge all streams with the same partition id.
-        while let Some((Reverse(stream_part_id), stream_idx)) = streams_heap.pop() {
-            if stream_part_id != part_id {
-                streams_heap.push((Reverse(stream_part_id), stream_idx));
-                break;
-            }
-
-            let mut stream = new_streams[stream_idx].as_mut();
-            let batch = match stream.next().await {
-                Some(Ok(batch)) => batch,
-                Some(Err(e)) => {
-                    return Err(Error::IO {
-                        message: format!("failed to read batch: {}", e),
-                        location: location!(),
-                    });
-                }
-                None => {
-                    return Err(Error::IO {
-                        message: "failed to read batch: unexpected end of stream".to_string(),
-                        location: location!(),
-                    });
-                }
-            };
-
-            let pq_codes = Arc::new(
-                batch
-                    .column_by_name(PQ_CODE_COLUMN)
-                    .expect("pq code column not found")
-                    .as_fixed_size_list()
-                    .clone(),
-            );
-            let row_ids: Arc<dyn Array> = Arc::new(
-                batch
-                    .column_by_name(ROW_ID)
-                    .expect("row id column not found")
-                    .as_primitive::<UInt64Type>()
-                    .clone(),
-            );
-            pq_array.push(pq_codes);
-            row_id_array.push(row_ids);
-
-            match stream.peek().await {
-                Some(Ok(batch)) => {
-                    let part_ids: &UInt32Array = batch
-                        .column_by_name(PART_ID_COLUMN)
-                        .expect("part id column not found")
-                        .as_primitive();
-                    if !part_ids.is_empty() {
-                        streams_heap.push((Reverse(part_ids.value(0)), stream_idx));
-                    }
-                }
-                Some(Err(e)) => {
-                    return Err(Error::IO {
-                        message: format!("IVF Shuffler::failed to read batch: {}", e),
-                        location: location!(),
-                    });
-                }
-                None => {}
-            }
-        }
+        merge_streams(
+            &mut streams_heap,
+            &mut new_streams,
+            part_id,
+            &mut pq_array,
+            &mut row_id_array,
+        )
+        .await?;
 
         let total_records = row_id_array.iter().map(|a| a.len()).sum::<usize>();
-        let offset = writer.tell().await?;
+        let offset = writer.len();
 
-        if total_records > 0 {
-            let projection = dataset.schema().project(&[column])?;
-            let mut vector_batches = Vec::with_capacity(row_id_array.len());
-            for row_ids in &row_id_array {
-                let array = dataset
-                    .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
-                    .await?
-                    .column_by_name(column)
-                    .expect("row id column not found")
-                    .clone();
-                vector_batches.push(array);
-            }
-
-            let vector_arrs = vector_batches
-                .iter()
-                .map(|arr| arr.as_ref())
-                .collect::<Vec<_>>();
-            let fsl = arrow_select::concat::concat(&vector_arrs).unwrap();
-            let mat =
-                Arc::new(MatrixView::<Float32Type>::try_from(fsl.as_fixed_size_list()).unwrap());
-            let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), metric_type));
-
-            let hnsw = HNSWBuilder::with_params(hnsw_params.clone(), vec_store).build()?;
-
-            // Layout:
-            // 1. Batches of HNSW nodes
-            // 2. PQ codes
-            // 3. Row IDs
-            // 3. lance metadata & footer
-            hnsw.write_levels(writer).await?;
-            // let pq_refs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-
-            // let binary_offset = writer.tell().await? - offset;
-            // PlainEncoder::write(&mut writer.object_writer, &pq_refs).await?;
-            // let row_ids_refs = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-            // PlainEncoder::write(&mut writer.object_writer, row_ids_refs.as_slice()).await?;
-            // writer.add_metadata("lance:binary_offset", &binary_offset.to_string());
-            writer.write_footer().await?;
+        let projection = dataset.schema().project(&[column])?;
+        for row_ids in &row_id_array {
+            let array = dataset
+                .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
+                .await?
+                .column_by_name(column)
+                .expect("row id column not found")
+                .clone();
+            vector_batches.push(array);
         }
 
-        let length = writer.tell().await? - offset;
-        ivf.add_partition(offset, length as u32);
+        let vector_arrs = vector_batches
+            .iter()
+            .map(|arr| arr.as_ref())
+            .collect::<Vec<_>>();
+        let fsl = arrow_select::concat::concat(&vector_arrs).unwrap();
+        let mat = Arc::new(MatrixView::<Float32Type>::try_from(fsl.as_fixed_size_list()).unwrap());
+        let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), metric_type));
+        let mut hnsw_builder = HNSWBuilder::with_params(hnsw_params.clone(), vec_store);
+        let hnsw = hnsw_builder.build()?;
+
+        hnsw.write_levels(writer).await?;
+        hnsw_metadata.push(hnsw.metadata());
+
+        ivf.add_partition(offset, hnsw.len() as u32);
         println!(
-            "wrote partition {} at offset {} with length {}",
-            part_id, offset, length
+            "wrote partition {} at offset {} with num rows {}",
+            part_id,
+            offset,
+            hnsw.len()
         );
         log::info!(
             "Wrote partition {} in {} ms",
@@ -476,7 +322,7 @@ pub(super) async fn write_hnsw_index_partitions(
             start.elapsed().as_millis()
         );
     }
-    Ok(())
+    Ok(hnsw_metadata)
 }
 
 #[cfg(test)]

@@ -35,15 +35,11 @@ use lance_file::{
 use lance_index::{
     optimize::OptimizeOptions,
     vector::{
-        graph::{memory::InMemoryVectorStorage, NEIGHBORS_FIELD},
+        graph::{memory::InMemoryVectorStorage, VectorStorage, NEIGHBORS_FIELD},
         hnsw::{builder::HnswBuildParams, HNSWBuilder, HNSW, VECTOR_ID_FIELD},
         Query, DIST_COL,
     },
     Index, IndexType,
-};
-use lance_io::{
-    memory::MemoryBufReader, stream::RecordBatchStream, traits::Reader,
-    utils::read_fixed_stride_array,
 };
 use lance_linalg::{
     distance::{Cosine, Dot, MetricType, L2},
@@ -72,7 +68,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct HNSWIndex {
     hnsw: HNSW,
-    // row_ids: Option<Arc<dyn Array>>,
+    storage: Arc<dyn VectorStorage>
 }
 
 impl HNSWIndex {
@@ -162,24 +158,19 @@ impl VectorIndex for HNSWIndex {
         offset: usize,
         length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
-        let bytes = reader
-            .get_range(Range {
-                start: offset,
-                end: offset + length,
-            })
-            .await?;
-
-        let reader = MemoryBufReader::new(bytes, reader.block_size(), reader.path().clone());
+        let reader = reader
+            .as_any()
+            .downcast_ref::<FileReader>()
+            .expect("the reader for HNSW must be a FileReader");
 
         let schema = Schema::try_from(&arrow_schema::Schema::new(vec![
             NEIGHBORS_FIELD.clone(),
             VECTOR_ID_FIELD.clone(),
         ]))?;
 
-        let file_reader =
-            FileReader::try_new_from_reader(Box::new(reader), None, schema, 0, 0, None).await?;
+        
 
-        let hnsw = HNSW::load(&file_reader).await?;
+        let hnsw = HNSW::load_partition(reader, offset..length, self.metric_type(), self.storage, metadata)
 
         // let offset = file_reader
         //     .schema()

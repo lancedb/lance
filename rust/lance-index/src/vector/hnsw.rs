@@ -219,6 +219,11 @@ pub struct HnswMetadata {
 }
 
 impl HNSW {
+    /// The number of nodes in the graph.
+    pub fn len(&self) -> usize {
+        self.levels[0].len()
+    }
+
     /// Load the HNSW graph from a [FileReader].
     ///
     /// Parameters
