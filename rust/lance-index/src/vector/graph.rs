@@ -157,11 +157,15 @@ pub trait Graph {
 /// Parameters
 /// ----------
 /// graph : Graph
-///    The graph to search.
+///  The graph to search.
 /// start : I
-///   The index starting point.
+///  The index starting point.
 /// query : &[f32]
-///   The query vector.
+///  The query vector.
+/// k : usize
+///  The number of results to return.
+/// bitset : Option<&RoaringBitmap>
+///  The bitset of node IDs to filter the results.
 ///
 /// Returns
 /// -------
