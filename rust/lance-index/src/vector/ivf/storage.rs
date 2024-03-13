@@ -39,8 +39,6 @@ pub struct IvfData {
 
     /// pre-computed row offset for each partition, do not persist.
     partition_row_offsets: Vec<usize>,
-
-    partition_indexes: Vec<pb::SubIndex>,
 }
 
 /// The IVF metadata stored in the Lance Schema
@@ -56,7 +54,6 @@ impl IvfData {
             centroids: None,
             lengths: vec![],
             partition_row_offsets: vec![0],
-            partition_indexes: vec![],
         }
     }
 
@@ -137,7 +134,6 @@ impl TryFrom<PbIvf> for IvfData {
             centroids,
             lengths: proto.lengths.clone(),
             partition_row_offsets: offsets.collect(),
-            partition_indexes: proto.sub_indexes,
         })
     }
 }
@@ -157,7 +153,6 @@ impl TryFrom<&IvfData> for PbIvf {
                 .as_ref()
                 .map(|c| c.as_ref().try_into())
                 .transpose()?,
-            sub_indexes: vec![],
         })
     }
 }
