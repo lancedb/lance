@@ -15,6 +15,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 lance.workspace = true
+lance-io.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
 arrow-schema.workspace = true
 datafusion.workspace = true

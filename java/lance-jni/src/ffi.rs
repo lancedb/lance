@@ -40,6 +40,9 @@ impl JNIEnvExt for JNIEnv<'_> {
     }
 
     fn get_strings_opt(&mut self, obj: &JObject) -> Result<Option<Vec<String>>> {
+        if obj.is_null() {
+            return Ok(None);
+        }
         let is_empty = self.call_method(obj, "isEmpty", "()Z", &[])?;
         if is_empty.z()? {
             Ok(None)

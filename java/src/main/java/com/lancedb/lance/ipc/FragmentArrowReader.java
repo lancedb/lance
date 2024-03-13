@@ -15,12 +15,13 @@
 package com.lancedb.lance.ipc;
 
 import com.lancedb.lance.Dataset;
-import com.lancedb.lance.Utils;
 import java.io.IOException;
+import java.util.Optional;
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
+import org.apache.arrow.dataset.scanner.ScanOptions;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -31,12 +32,11 @@ class FragmentArrowReader extends ArrowReader {
   private ArrowArrayStream stream;
 
   FragmentArrowReader(
-      Dataset dataset, int fragmentId, Schema projection, long batchSize, BufferAllocator allocator)
+      Dataset dataset, int fragmentId, ScanOptions options, BufferAllocator allocator)
       throws IOException {
     super(allocator);
 
-    var arrowProjection = Utils.toFfi(projection, allocator);
-    long handle = openStream(dataset, fragmentId, arrowProjection, batchSize);
+    long handle = openStream(dataset, fragmentId, options.getColumns(), options.getBatchSize());
     this.stream = ArrowArrayStream.wrap(handle);
   }
 
@@ -65,6 +65,7 @@ class FragmentArrowReader extends ArrowReader {
   }
 
   /** Open Stream from Rust. */
-  private native long openStream(
-      Dataset dataset, int fragmentId, ArrowSchema projection, long batchSize) throws IOException;
+  private static native long openStream(
+      Dataset dataset, int fragmentId, Optional<String[]> columns, long batchSize)
+      throws IOException;
 }

@@ -50,7 +50,7 @@ public class FragmentScanner implements Scanner {
   public ArrowReader scanBatches() {
     try {
       return new FragmentArrowReader(
-          this.dataset, this.fragmentId, this.schema(), options.getBatchSize(), allocator);
+          this.dataset, this.fragmentId, options, allocator);
     } catch (IOException e) {
       // TODO: handle IO exception?
       throw new RuntimeException(e);

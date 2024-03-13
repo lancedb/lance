@@ -14,14 +14,15 @@
 
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::Schema;
-use datafusion::execution::SendableRecordBatchStream;
 use jni::{
+    JNIEnv,
     objects::JObject,
     sys::{jint, jlong},
-    JNIEnv,
 };
-use lance::dataset::{fragment::FileFragment, scanner::Scanner};
 use snafu::{location, Location};
+
+use lance::dataset::{fragment::FileFragment, scanner::Scanner};
+use lance_io::ffi::to_ffi_arrow_array_stream;
 
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
@@ -130,7 +131,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_getSchema(
 #[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentArrowReader_openStream(
     mut env: JNIEnv,
-    jreader: JObject,
+    _reader: JObject,
     jdataset: JObject,
     fragment_id: jint,
     columns: JObject, // Optional<String[]>
@@ -143,6 +144,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentArrowReader_openStream
             return -1;
         }
     };
+    println!("Jobject dataset: {:?}", jdataset);
     let dataset = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
@@ -170,12 +172,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentArrowReader_openStream
             return -1;
         }
     };
-    let stream = stream.map(|r| match r {
-        Ok(b) => Ok(Box::new(b) as SendableRecordBatchStream),
-        Err(e) => Err(e),
-    });
+    let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone());
 
-    let mut ffi_stream = FFI_ArrowArrayStream::new(Box::new(stream));
-
-    -1
+    Box::into_raw(Box::new(ffi_stream)) as jlong
 }

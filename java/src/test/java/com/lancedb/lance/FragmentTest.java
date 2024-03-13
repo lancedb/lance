@@ -64,6 +64,12 @@ public class FragmentTest {
       var scanner = fragment.newScan(new ScanOptions(1024));
       var schema = scanner.schema();
       assertEquals(schema, reader.getVectorSchemaRoot().getSchema());
+
+      var fragmentReader = scanner.scanBatches();
+//      while (fragmentReader.loadNextBatch()) {
+//        var batch = fragmentReader.getVectorSchemaRoot();
+//        System.out.println(batch);
+//      }
     }
   }
 }
