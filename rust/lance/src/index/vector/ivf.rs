@@ -33,7 +33,7 @@ use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
 use futures::{
     stream::{self, StreamExt},
-    TryStreamExt,
+    Stream, TryStreamExt,
 };
 use lance_arrow::*;
 use lance_core::{datatypes::Field, Error, Result};
@@ -889,16 +889,13 @@ pub(super) async fn build_ivf_model(
     Ok(ivf)
 }
 
-/// Build IVF(PQ) index
-pub async fn build_ivf_pq_index(
+async fn build_ivf_model_and_pq(
     dataset: &Dataset,
     column: &str,
-    index_name: &str,
-    uuid: &str,
     metric_type: MetricType,
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
-) -> Result<()> {
+) -> Result<(Ivf, Arc<dyn ProductQuantizer>)> {
     sanity_check_params(ivf_params, pq_params)?;
 
     info!(
@@ -929,28 +926,52 @@ pub async fn build_ivf_pq_index(
     } else {
         None
     };
+
     let pq = build_pq_model(dataset, column, dim, metric_type, pq_params, ivf_residual).await?;
 
-    // Transform data, compute residuals and sort by partition ids.
+    Ok((ivf_model, pq))
+}
+
+async fn scan_index_field_stream(
+    dataset: &Dataset,
+    column: &str,
+) -> Result<impl RecordBatchStream + Unpin + 'static> {
     let mut scanner = dataset.scan();
     scanner.batch_readahead(num_cpus::get() * 2);
     scanner.project(&[column])?;
     scanner.with_row_id();
+    scanner.try_into_stream().await
+}
 
-    // Scan the dataset and compute residual, pq with with partition ID.
-    // For now, it loads all data into memory.
-    let stream = scanner.try_into_stream().await?;
-
-    let precomputed_partitions = match &ivf_params.precomputed_partitons_file {
+async fn load_precomputed_partitions_if_available(
+    ivf_params: &IvfBuildParams,
+) -> Result<Option<HashMap<u64, u32>>> {
+    match &ivf_params.precomputed_partitons_file {
         Some(file) => {
             info!("Loading precomputed partitions from file: {}", file);
             let ds = DatasetBuilder::from_uri(file).load().await?;
             let stream = ds.scan().try_into_stream().await?;
-
-            Some(load_precomputed_partitions(stream, ds.count_rows().await?).await?)
+            Ok(Some(
+                load_precomputed_partitions(stream, ds.count_rows().await?).await?,
+            ))
         }
-        None => None,
-    };
+        None => Ok(None),
+    }
+}
+
+pub async fn build_ivf_pq_index(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    uuid: &str,
+    metric_type: MetricType,
+    ivf_params: &IvfBuildParams,
+    pq_params: &PQBuildParams,
+) -> Result<()> {
+    let (ivf_model, pq) =
+        build_ivf_model_and_pq(dataset, column, metric_type, ivf_params, pq_params).await?;
+    let stream = scan_index_field_stream(dataset, column).await?;
+    let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
     write_index_file(
         dataset,
@@ -970,7 +991,6 @@ pub async fn build_ivf_pq_index(
     .await
 }
 
-/// Build IVF_HNSW index
 pub async fn build_ivf_hnsw_index(
     dataset: &Dataset,
     column: &str,
@@ -981,59 +1001,10 @@ pub async fn build_ivf_hnsw_index(
     hnsw_params: &HnswBuildParams,
     pq_params: &PQBuildParams,
 ) -> Result<()> {
-    sanity_check_params(ivf_params, pq_params)?;
-
-    info!(
-        "Building vector index: IVF{},HNSW{},{}PQ{}, metric={}",
-        ivf_params.num_partitions,
-        hnsw_params.ef_construction,
-        if pq_params.use_opq { "O" } else { "" },
-        pq_params.num_sub_vectors,
-        metric_type,
-    );
-
-    let field = sanity_check(dataset, column)?;
-    let dim = if let DataType::FixedSizeList(_, d) = field.data_type() {
-        d as usize
-    } else {
-        return Err(Error::Index {
-            message: format!(
-                "VectorIndex requires the column data type to be fixed size list of floats, got {}",
-                field.data_type()
-            ),
-            location: location!(),
-        });
-    };
-
-    let ivf_model = build_ivf_model(dataset, column, dim, metric_type, ivf_params).await?;
-
-    let ivf_residual = if matches!(metric_type, MetricType::Cosine | MetricType::L2) {
-        Some(&ivf_model)
-    } else {
-        None
-    };
-    let pq = build_pq_model(dataset, column, dim, metric_type, pq_params, ivf_residual).await?;
-
-    // Transform data, compute residuals and sort by partition ids.
-    let mut scanner = dataset.scan();
-    scanner.batch_readahead(num_cpus::get() * 2);
-    scanner.project(&[column])?;
-    scanner.with_row_id();
-
-    // Scan the dataset and compute residual, pq with with partition ID.
-    // For now, it loads all data into memory.
-    let stream = scanner.try_into_stream().await?;
-
-    let precomputed_partitions = match &ivf_params.precomputed_partitons_file {
-        Some(file) => {
-            info!("Loading precomputed partitions from file: {}", file);
-            let ds = DatasetBuilder::from_uri(file).load().await?;
-            let stream = ds.scan().try_into_stream().await?;
-
-            Some(load_precomputed_partitions(stream, ds.count_rows().await?).await?)
-        }
-        None => None,
-    };
+    let (ivf_model, pq) =
+        build_ivf_model_and_pq(dataset, column, metric_type, ivf_params, pq_params).await?;
+    let stream = scan_index_field_stream(dataset, column).await?;
+    let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
     write_ivf_hnsw_file(
         dataset,
@@ -1053,6 +1024,7 @@ pub async fn build_ivf_hnsw_index(
     )
     .await
 }
+
 struct RemapPageTask {
     offset: usize,
     length: u32,
