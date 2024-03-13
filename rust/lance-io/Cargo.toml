@@ -38,7 +38,7 @@ prost.workspace = true
 shellexpand.workspace = true
 snafu.workspace = true
 tokio.workspace = true
-tokio-stream = "0.1.14"
+tokio-stream.workspace = true
 tracing.workspace = true
 url.workspace = true
 

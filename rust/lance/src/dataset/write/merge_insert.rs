@@ -40,26 +40,44 @@ use datafusion::{
     execution::context::{SessionConfig, SessionContext},
     logical_expr::{Expr, JoinType},
     physical_plan::{
-        stream::RecordBatchStreamAdapter, ColumnarValue, PhysicalExpr, SendableRecordBatchStream,
+        joins::{HashJoinExec, PartitionMode},
+        repartition::RepartitionExec,
+        stream::RecordBatchStreamAdapter,
+        union::UnionExec,
+        ColumnarValue, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
     },
     scalar::ScalarValue,
 };
 
-use futures::{stream, Stream, StreamExt, TryStreamExt};
+use datafusion_physical_expr::expressions::Column;
+use futures::{
+    stream::{self},
+    Stream, StreamExt, TryStreamExt,
+};
 use lance_core::{
     datatypes::SchemaCompareOptions,
     error::{box_error, InvalidInputSnafu},
+    utils::futures::Capacity,
     Error, Result,
 };
-use lance_datafusion::utils::reader_to_stream;
-use lance_table::format::Fragment;
+use lance_datafusion::{
+    exec::{execute_plan, LanceExecutionOptions, OneShotExec},
+    utils::reader_to_stream,
+};
+use lance_index::DatasetIndexExt;
+use lance_table::format::{Fragment, Index};
+use log::info;
 use roaring::RoaringTreemap;
 use snafu::{location, Location, ResultExt};
 
 use crate::{
     datafusion::dataframe::SessionContextExt,
     dataset::transaction::{Operation, Transaction},
-    io::{commit::commit_transaction, exec::Planner},
+    index::DatasetIndexInternalExt,
+    io::{
+        commit::commit_transaction,
+        exec::{scalar_index::MapIndexExec, utils::ReplayExec, Planner, ProjectionExec, TakeExec},
+    },
     Dataset,
 };
 
@@ -333,32 +351,157 @@ impl MergeInsertJob {
         )
     }
 
-    /// Executes the merge insert job
-    ///
-    /// This will take in the source, merge it with the existing target data, and insert new
-    /// rows, update existing rows, and delete existing rows
-    pub async fn execute(self, source: SendableRecordBatchStream) -> Result<Arc<Dataset>> {
+    async fn join_key_as_scalar_index(&self) -> Result<Option<Index>> {
+        if self.params.on.len() != 1 {
+            Ok(None)
+        } else {
+            let col = &self.params.on[0];
+            self.dataset.load_scalar_index_for_column(col).await
+        }
+    }
+
+    async fn create_indexed_scan_joined_stream(
+        &self,
+        source: SendableRecordBatchStream,
+        index: Index,
+    ) -> Result<SendableRecordBatchStream> {
+        // This relies on a few non-standard physical operators and so we cannot use the
+        // datafusion dataframe API and need to construct the plan manually :'(
+
+        // 1 - Input from user
+        let input = Arc::new(OneShotExec::new(source));
+
+        // 2 - Fork/Replay the input
+        // Regrettably, this needs to have unbounded capacity, and so we need to fully read
+        // the new data into memory.  In the future, we can do better
+        let shared_input = Arc::new(ReplayExec::new(Capacity::Unbounded, input));
+
+        // 3 - Use the index to map input to row addresses
+        let index_column = self.params.on[0].clone();
+        let index_mapper = Arc::new(MapIndexExec::new(
+            self.dataset.clone(),
+            index_column.clone(),
+            shared_input.clone(),
+        ));
+
+        // 4 - Take the mapped row addresses
+        let mut target = Arc::new(TakeExec::try_new(
+            self.dataset.clone(),
+            index_mapper,
+            Arc::new(self.dataset.schema().clone()),
+            num_cpus::get(),
+        )?) as Arc<dyn ExecutionPlan>;
+
+        // 3a - We also need to scan any new unindexed data
+        let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+        if !unindexed_fragments.is_empty() {
+            let unindexed_data = self
+                .dataset
+                .scan()
+                .with_row_id()
+                .with_fragments(unindexed_fragments)
+                .create_plan()
+                .await?;
+            let unioned = UnionExec::new(vec![target, unindexed_data]);
+            // Enforce only 1 partition.
+            target = Arc::new(RepartitionExec::try_new(
+                Arc::new(unioned),
+                datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
+            )?);
+        }
+
+        // 5 - Take puts the row id at the beginning.  A full scan (used when there is no scalar
+        //     index) puts the row id at the end.  We need to match these up so we reorder the row
+        //     id to the end
+        let schema = target.schema();
+        let fields = schema.fields();
+        let mut columns = fields[1..].to_vec();
+        columns.push(fields[0].clone());
+        let projected_schema = lance_core::datatypes::Schema::try_from(&Schema::new(columns))?;
+        let target_projected =
+            Arc::new(ProjectionExec::try_new(target, Arc::new(projected_schema))?);
+
+        // 6 - Finally, join the input (source table) with the taken data (target table)
+        let source_key = Column::new_with_schema(&index_column, shared_input.schema().as_ref())?;
+        let target_key =
+            Column::new_with_schema(&index_column, target_projected.schema().as_ref())?;
+        let joined = Arc::new(
+            HashJoinExec::try_new(
+                target_projected,
+                shared_input,
+                vec![(target_key, source_key)],
+                None,
+                &JoinType::Full,
+                PartitionMode::CollectLeft,
+                true,
+            )
+            .unwrap(),
+        );
+        execute_plan(
+            joined,
+            LanceExecutionOptions {
+                use_spilling: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    // If the join keys are not indexed then we need to do a full scan of the table
+    async fn create_full_table_joined_stream(
+        &self,
+        source: SendableRecordBatchStream,
+    ) -> Result<SendableRecordBatchStream> {
         let session_config = SessionConfig::default().with_target_partitions(1);
         let session_ctx = SessionContext::new_with_config(session_config);
         let schema = source.schema();
         self.check_compatible_schema(&schema)?;
         let existing = session_ctx.read_lance(self.dataset.clone(), true)?;
         let new_data = session_ctx.read_one_shot(source)?;
-        let merger = Merger::try_new(self.params, schema.clone())?;
-        let deleted_rows = merger.deleted_rows.clone();
-        let join_cols = merger
+        let join_cols = self
             .params
             .on
             .iter()
             .map(|c| c.as_str())
             .collect::<Vec<_>>();
         let joined = existing.join(new_data, JoinType::Full, &join_cols, &join_cols, None)?;
-        let joined = joined.execute_stream().await?;
+        Ok(joined.execute_stream().await?)
+    }
 
+    async fn create_joined_stream(
+        &self,
+        source: SendableRecordBatchStream,
+    ) -> Result<SendableRecordBatchStream> {
+        // We need to do a full index scan if we're deleting source data
+        let can_use_scalar_index = matches!(
+            self.params.delete_not_matched_by_source,
+            WhenNotMatchedBySource::Keep
+        );
+        if can_use_scalar_index {
+            if let Some(index) = self.join_key_as_scalar_index().await? {
+                self.create_indexed_scan_joined_stream(source, index).await
+            } else {
+                info!("There is no scalar index on the merge insert join key, falling back to a less efficient full table scan");
+                self.create_full_table_joined_stream(source).await
+            }
+        } else {
+            info!("The merge insert operation is configured to delete rows from the target table, this requires a potentially costly full table scan");
+            self.create_full_table_joined_stream(source).await
+        }
+    }
+
+    /// Executes the merge insert job
+    ///
+    /// This will take in the source, merge it with the existing target data, and insert new
+    /// rows, update existing rows, and delete existing rows
+    pub async fn execute(self, source: SendableRecordBatchStream) -> Result<Arc<Dataset>> {
+        let schema = source.schema();
+
+        let joined = self.create_joined_stream(source).await?;
+        let merger = Merger::try_new(self.params, schema.clone())?;
+        let deleted_rows = merger.deleted_rows.clone();
         let stream = joined
             .and_then(move |batch| merger.clone().execute_batch(batch))
             .try_flatten();
-
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
         let new_fragments = write_fragments_internal(
@@ -687,7 +830,14 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
     use lance_datafusion::utils::reader_to_stream;
+    use lance_datagen::{array, BatchCount, RowCount, Seed};
+    use lance_index::IndexType;
     use tempfile::tempdir;
+
+    use crate::{
+        dataset::{WriteMode, WriteParams},
+        index::scalar::ScalarIndexParams,
+    };
 
     use super::*;
 
@@ -927,5 +1077,130 @@ mod tests {
             .try_build()
             .unwrap();
         check(new_batch.clone(), job, &[1, 4, 5, 6], &[]).await;
+    }
+
+    #[tokio::test]
+    async fn test_indexed_merge_insert() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = lance_datagen::gen()
+            .with_seed(Seed::from(1))
+            .col(Some("key".to_string()), array::rand_pseduo_uuid_hex())
+            .col(Some("value".to_string()), array::step::<UInt32Type>());
+        let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(32));
+        let schema = data.schema();
+
+        // Create an input dataset with a scalar index on key
+        let mut ds = Dataset::write(data, test_uri, None).await.unwrap();
+        let index_params = ScalarIndexParams::default();
+        ds.create_index(&["key"], IndexType::Scalar, None, &index_params, false)
+            .await
+            .unwrap();
+
+        // Create some new (unindexed) data
+        let data = lance_datagen::gen()
+            .with_seed(Seed::from(2))
+            .col(Some("key".to_string()), array::rand_pseduo_uuid_hex())
+            .col(Some("value".to_string()), array::step::<UInt32Type>());
+        let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(8));
+        let ds = Dataset::write(
+            data,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let ds = Arc::new(ds);
+
+        let just_index_col = Schema::new(vec![Field::new("key", DataType::Utf8, false)]);
+
+        // Sample 2048 random indices and then paste on a column of 9999999's
+        let some_indices = ds
+            .sample(2048, &(&just_index_col).try_into().unwrap())
+            .await
+            .unwrap();
+        let some_indices = some_indices.column(0).clone();
+        let some_vals = lance_datagen::gen()
+            .col(None, array::fill::<UInt32Type>(9999999))
+            .into_batch_rows(RowCount::from(2048))
+            .unwrap();
+        let some_vals = some_vals.column(0).clone();
+        let source_batch =
+            RecordBatch::try_new(schema.clone(), vec![some_indices, some_vals]).unwrap();
+        // To make things more interesting, lets make the input a stream of four batches
+        let source_batches = vec![
+            source_batch.slice(0, 512),
+            source_batch.slice(512, 512),
+            source_batch.slice(1024, 512),
+            source_batch.slice(1536, 512),
+        ];
+        let source = Box::new(RecordBatchIterator::new(
+            source_batches.clone().into_iter().map(Ok),
+            schema.clone(),
+        ));
+
+        // Run merge_insert
+        let ds = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+            .unwrap()
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(source)
+            .await
+            .unwrap();
+
+        // Check that the data is as expected
+        let updated = ds
+            .scan()
+            .filter("value = 9999999")
+            .unwrap()
+            .count_rows()
+            .await
+            .unwrap();
+        assert_eq!(updated, 2048);
+
+        // Make sure we don't use an indexed scan if there is a delete criteria
+        let source = Box::new(RecordBatchIterator::new(
+            source_batches.clone().into_iter().map(Ok),
+            schema.clone(),
+        ));
+        // Run merge_insert
+        let ds = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+            .unwrap()
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+            .try_build()
+            .unwrap()
+            .execute_reader(source)
+            .await
+            .unwrap();
+
+        // Check that the data is as expected
+        assert_eq!(ds.count_rows().await.unwrap(), 2048);
+
+        let source = Box::new(RecordBatchIterator::new(
+            source_batches.clone().into_iter().map(Ok),
+            schema.clone(),
+        ));
+        // Run merge_insert one last time.  The index is now completely out of date.  Every
+        // row it points to is a deleted row.  Make sure that doesn't break.
+        let ds = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+            .unwrap()
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(source)
+            .await
+            .unwrap();
+
+        assert_eq!(ds.count_rows().await.unwrap(), 2048);
     }
 }

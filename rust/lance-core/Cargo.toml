@@ -34,6 +34,8 @@ roaring.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
 

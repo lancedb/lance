@@ -17,20 +17,25 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
+use datafusion::{
+    physical_plan::{
+        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
+    },
+    scalar::ScalarValue,
 };
-use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt};
-use lance_core::{utils::address::RowAddress, Error, Result, ROW_ID_FIELD};
+use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::{
+    utils::{address::RowAddress, mask::RowIdTreeMap},
+    Error, Result, ROW_ID_FIELD,
+};
 use lance_index::{
     scalar::{
         expression::{ScalarIndexExpr, ScalarIndexLoader},
-        ScalarIndex,
+        ScalarIndex, ScalarQuery,
     },
     DatasetIndexExt,
 };
 use lance_table::format::Fragment;
-use pin_project::pin_project;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use tracing::{debug_span, instrument};
@@ -96,31 +101,6 @@ impl ScalarIndexExec {
     }
 }
 
-#[pin_project]
-struct StreamWithSchema {
-    #[pin]
-    stream: BoxStream<'static, datafusion::common::Result<RecordBatch>>,
-    schema: Arc<Schema>,
-}
-
-impl Stream for StreamWithSchema {
-    type Item = datafusion::common::Result<RecordBatch>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let this = self.project();
-        this.stream.poll_next(cx)
-    }
-}
-
-impl RecordBatchStream for StreamWithSchema {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-}
-
 impl ExecutionPlan for ScalarIndexExec {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -160,14 +140,159 @@ impl ExecutionPlan for ScalarIndexExec {
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
             .boxed()
             as BoxStream<'static, datafusion::common::Result<RecordBatch>>;
-        Ok(Box::pin(StreamWithSchema {
-            schema: SCALAR_INDEX_SCHEMA.clone(),
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            SCALAR_INDEX_SCHEMA.clone(),
             stream,
-        }))
+        )))
     }
 
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
         todo!()
+    }
+}
+
+lazy_static::lazy_static! {
+    pub static ref INDEX_LOOKUP_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]));
+}
+
+/// An execution node that translates index values into row addresses
+///
+/// This can be combined with TakeExec to perform an "indexed take"
+#[derive(Debug)]
+pub struct MapIndexExec {
+    dataset: Arc<Dataset>,
+    column_name: String,
+    input: Arc<dyn ExecutionPlan>,
+}
+
+impl DisplayAs for MapIndexExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "IndexedLookup")
+            }
+        }
+    }
+}
+
+impl MapIndexExec {
+    pub fn new(dataset: Arc<Dataset>, column_name: String, input: Arc<dyn ExecutionPlan>) -> Self {
+        Self {
+            dataset,
+            column_name,
+            input,
+        }
+    }
+
+    async fn map_batch(
+        column_name: String,
+        dataset: Arc<Dataset>,
+        deletion_mask: Option<Arc<RowIdTreeMap>>,
+        batch: RecordBatch,
+    ) -> datafusion::error::Result<RecordBatch> {
+        let index_vals = batch.column(0);
+        let index_vals = (0..index_vals.len())
+            .map(|idx| ScalarValue::try_from_array(index_vals, idx))
+            .collect::<datafusion::error::Result<Vec<_>>>()?;
+        let query = ScalarIndexExpr::Query(column_name.clone(), ScalarQuery::IsIn(index_vals));
+        let row_addresses = query.evaluate(dataset.as_ref()).await?;
+        debug_assert!(row_addresses.block_list.is_none());
+        if let Some(allow_list) = row_addresses.allow_list {
+            let allow_list =
+                allow_list
+                    .row_ids()
+                    .ok_or(datafusion::error::DataFusionError::External(
+                        "IndexedLookupExec: row addresses didn't have an iterable allow list"
+                            .into(),
+                    ))?;
+            let mut allow_list = allow_list.map(u64::from).collect::<Vec<_>>();
+            if let Some(deletion_mask) = deletion_mask {
+                allow_list.retain(|row_id| !deletion_mask.contains(*row_id));
+            }
+            let allow_list = UInt64Array::from(allow_list);
+            Ok(RecordBatch::try_new(
+                INDEX_LOOKUP_SCHEMA.clone(),
+                vec![Arc::new(allow_list)],
+            )?)
+        } else {
+            Err(datafusion::error::DataFusionError::Internal(
+                "IndexedLookupExec: row addresses didn't have an allow list".to_string(),
+            ))
+        }
+    }
+
+    async fn do_execute(
+        input: datafusion::physical_plan::SendableRecordBatchStream,
+        dataset: Arc<Dataset>,
+        column_name: String,
+    ) -> datafusion::error::Result<
+        impl Stream<Item = datafusion::error::Result<RecordBatch>> + Send + 'static,
+    > {
+        let index = dataset
+            .load_scalar_index_for_column(&column_name)
+            .await?
+            .unwrap();
+        let deletion_mask_fut =
+            PreFilter::create_deletion_mask(dataset.clone(), index.fragment_bitmap.unwrap());
+        let deletion_mask = if let Some(deletion_mask_fut) = deletion_mask_fut {
+            Some(deletion_mask_fut.await?)
+        } else {
+            None
+        };
+        Ok(input.and_then(move |res| {
+            let column_name = column_name.clone();
+            let dataset = dataset.clone();
+            let deletion_mask = deletion_mask.clone();
+            Self::map_batch(column_name, dataset, deletion_mask, res)
+        }))
+    }
+}
+
+impl ExecutionPlan for MapIndexExec {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        INDEX_LOOKUP_SCHEMA.clone()
+    }
+
+    fn output_partitioning(&self) -> Partitioning {
+        self.input.output_partitioning()
+    }
+
+    fn output_ordering(&self) -> Option<&[datafusion_physical_expr::PhysicalSortExpr]> {
+        // The output does have an implicit ordering but nothing we can express with PhysicalSortExpr
+        None
+    }
+
+    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        vec![self.input.clone()]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        unimplemented!()
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        let index_vals = self.input.execute(partition, context)?;
+        let stream_fut =
+            Self::do_execute(index_vals, self.dataset.clone(), self.column_name.clone());
+        let stream = futures::stream::iter(vec![stream_fut])
+            .then(|stream_fut| stream_fut)
+            .try_flatten()
+            .boxed();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            INDEX_LOOKUP_SCHEMA.clone(),
+            stream,
+        )))
     }
 }
 
@@ -361,10 +486,10 @@ impl ExecutionPlan for MaterializeIndexExec {
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
             .boxed()
             as BoxStream<'static, datafusion::common::Result<RecordBatch>>;
-        Ok(Box::pin(StreamWithSchema {
-            schema: MATERIALIZE_INDEX_SCHEMA.clone(),
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            MATERIALIZE_INDEX_SCHEMA.clone(),
             stream,
-        }))
+        )))
     }
 
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
