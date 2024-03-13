@@ -24,7 +24,7 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
-use crate::pb::{self, Ivf as PbIvf};
+use crate::pb::Ivf as PbIvf;
 
 const IVF_METADATA_KEY: &str = "lance:ivf";
 
