@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow::ffi::FFI_ArrowSchema;
+use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::Schema;
+use datafusion::execution::SendableRecordBatchStream;
 use jni::{
-    JNIEnv,
     objects::JObject,
     sys::{jint, jlong},
+    JNIEnv,
 };
+use lance::dataset::{fragment::FileFragment, scanner::Scanner};
 use snafu::{location, Location};
-
-use lance::dataset::fragment::FileFragment;
 
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
@@ -125,4 +125,57 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_getSchema(
     let ffi_schema =
         Box::new(FFI_ArrowSchema::try_from(&schema).expect("Failed to convert schema"));
     Box::into_raw(ffi_schema) as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentArrowReader_openStream(
+    mut env: JNIEnv,
+    jreader: JObject,
+    jdataset: JObject,
+    fragment_id: jint,
+    columns: JObject, // Optional<String[]>
+    batch_size: jlong,
+) -> jlong {
+    let columns = match env.get_strings_opt(&columns) {
+        Ok(c) => c,
+        Err(e) => {
+            env.throw(e.to_string()).expect("Failed to throw exception");
+            return -1;
+        }
+    };
+    let dataset = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
+                .expect("Dataset handle not set");
+        dataset.clone()
+    };
+    let fragment = match dataset.inner.get_fragment(fragment_id as usize) {
+        Some(f) => f,
+        None => {
+            env.throw("Fragment not found")
+                .expect("Throw exception failed");
+            return -1;
+        }
+    };
+    let mut scanner: Scanner = fragment.scan();
+    if let Some(cols) = columns {
+        scanner.project(&cols);
+    };
+    scanner.batch_size(batch_size as usize);
+
+    let stream = match RT.block_on(async { scanner.try_into_stream().await }) {
+        Ok(s) => s,
+        Err(e) => {
+            env.throw(e.to_string()).expect("Throw exception failed");
+            return -1;
+        }
+    };
+    let stream = stream.map(|r| match r {
+        Ok(b) => Ok(Box::new(b) as SendableRecordBatchStream),
+        Err(e) => Err(e),
+    });
+
+    let mut ffi_stream = FFI_ArrowArrayStream::new(Box::new(stream));
+
+    -1
 }

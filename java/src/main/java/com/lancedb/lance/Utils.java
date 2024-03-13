@@ -14,5 +14,18 @@
 
 package com.lancedb.lance;
 
+import org.apache.arrow.c.ArrowSchema;
+import org.apache.arrow.c.Data;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.types.pojo.Schema;
+
 /** Utility. */
-public class Utils {}
+public class Utils {
+
+  /** Convert Arrow Schema to FFI Arrow Schema. */
+  public static ArrowSchema toFfi(Schema schema, BufferAllocator allocator) {
+    var arrowSchema = ArrowSchema.allocateNew(allocator);
+    Data.exportSchema(allocator, schema, null, arrowSchema);
+    return arrowSchema;
+  }
+}

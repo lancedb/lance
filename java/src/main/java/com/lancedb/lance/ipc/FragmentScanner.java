@@ -15,6 +15,7 @@
 package com.lancedb.lance.ipc;
 
 import com.lancedb.lance.Dataset;
+import java.io.IOException;
 import java.util.Optional;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
@@ -47,7 +48,13 @@ public class FragmentScanner implements Scanner {
 
   @Override
   public ArrowReader scanBatches() {
-    return new FragmentArrowReader(allocator);
+    try {
+      return new FragmentArrowReader(
+          this.dataset, this.fragmentId, this.schema(), options.getBatchSize(), allocator);
+    } catch (IOException e) {
+      // TODO: handle IO exception?
+      throw new RuntimeException(e);
+    }
   }
 
   @Override

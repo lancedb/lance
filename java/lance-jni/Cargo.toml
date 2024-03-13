@@ -17,6 +17,7 @@ crate-type = ["cdylib"]
 lance.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
 arrow-schema.workspace = true
+datafusion.workspace = true
 tokio.workspace = true
 jni = "0.21.1"
 snafu.workspace = true
