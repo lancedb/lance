@@ -55,7 +55,7 @@ impl<S: RecordBatchStream + Unpin> Iterator for RecordBatchIteratorAdaptor<S> {
 }
 
 /// Wrap a [`RecordBatchStream`] into an [FFI_ArrowArrayStream].
-pub fn to_ffi(
+pub fn to_ffi_arrow_array_stream(
     stream: impl RecordBatchStream + std::marker::Unpin + 'static,
     rt: tokio::runtime::Runtime,
 ) -> Result<FFI_ArrowArrayStream> {
