@@ -189,7 +189,7 @@ pub(super) fn beam_search(
     let mut results = candidates
         .clone()
         .into_iter()
-        .filter(|node| !bitset.map(|bitset| bitset.contains(node.1)).unwrap_or(true))
+        .filter(|node| bitset.map(|bitset| bitset.contains(node.1)).unwrap_or(true))
         .collect::<BTreeMap<_, _>>();
 
     while !candidates.is_empty() {
