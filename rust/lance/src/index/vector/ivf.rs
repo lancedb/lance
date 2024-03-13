@@ -639,7 +639,6 @@ impl TryFrom<&Ivf> for pb::Ivf {
             offsets: ivf.offsets.iter().map(|o| *o as u64).collect(),
             lengths: ivf.lengths.clone(),
             centroids_tensor: Some(ivf.centroids.as_ref().try_into()?),
-            sub_indexes: vec![],
         })
     }
 }
