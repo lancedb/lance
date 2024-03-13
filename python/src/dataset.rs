@@ -578,7 +578,7 @@ impl Dataset {
             .block_on(Some(self_.py()), self_.ds.take(&row_indices, &projection))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
-        crate::arrow::record_batch_to_pyarrow(self_.py(), &batch)
+        batch.to_pyarrow(self_.py())
     }
 
     fn take_rows(
@@ -605,7 +605,7 @@ impl Dataset {
             )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
-        crate::arrow::record_batch_to_pyarrow(self_.py(), &batch)
+        batch.to_pyarrow(self_.py())
     }
 
     #[pyo3(signature = (row_slices, columns = None, batch_readahead = 10))]
