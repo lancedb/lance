@@ -33,6 +33,7 @@ pub mod vector;
 pub use crate::traits::*;
 
 pub const INDEX_FILE_NAME: &str = "index.idx";
+pub const INDEX_AUXILIARY_FILE_NAME: &str = "auxiliary.idx";
 const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 
 pub mod pb {
