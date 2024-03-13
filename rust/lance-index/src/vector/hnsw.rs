@@ -421,8 +421,6 @@ impl HNSW {
         }
         Ok(num_rows)
     }
-
-    // Write
 }
 
 /// Select neighbors from the ordered candidate list.
