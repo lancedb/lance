@@ -165,7 +165,7 @@ pub trait Graph {
 /// k : usize
 ///  The number of results to return.
 /// bitset : Option<&RoaringBitmap>
-///  The bitset of node IDs to filter the results.
+///  The bitset of node IDs to filter the results, bit 1 for the node to keep, and bit 0 for the node to discard.
 ///
 /// Returns
 /// -------
@@ -189,11 +189,7 @@ pub(super) fn beam_search(
     let mut results = candidates
         .clone()
         .into_iter()
-        .filter(|node| {
-            !bitset
-                .map(|bitset| bitset.contains(node.1))
-                .unwrap_or(false)
-        })
+        .filter(|node| !bitset.map(|bitset| bitset.contains(node.1)).unwrap_or(true))
         .collect::<BTreeMap<_, _>>();
 
     while !candidates.is_empty() {
@@ -221,9 +217,9 @@ pub(super) fn beam_search(
                 .unwrap_or(OrderedFloat(f32::INFINITY));
             let dist = dist_calc.distance(&[neighbor])[0].into();
             if dist < furthest || results.len() < k {
-                if !bitset
+                if bitset
                     .map(|bitset| bitset.contains(neighbor))
-                    .unwrap_or(false)
+                    .unwrap_or(true)
                 {
                     results.insert(dist, neighbor);
                     if results.len() > k {
