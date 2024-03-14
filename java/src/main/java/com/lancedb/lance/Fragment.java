@@ -14,6 +14,10 @@
 
 package com.lancedb.lance;
 
+import com.lancedb.lance.ipc.FragmentScanner;
+import org.apache.arrow.dataset.scanner.ScanOptions;
+import org.apache.arrow.dataset.scanner.Scanner;
+
 /** Data Fragment. */
 public class Fragment {
   // Only keep fragmentId for reference, so we don't need to make this
@@ -42,5 +46,10 @@ public class Fragment {
   /** Count rows in this Fragment. */
   public int countRows() {
     return countRowsNative(dataset, fragmentId);
+  }
+
+  /** Create a new Fragment Scanner. */
+  public Scanner newScan(ScanOptions options) {
+    return new FragmentScanner(dataset, fragmentId, options, dataset.allocator);
   }
 }

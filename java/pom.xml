@@ -35,6 +35,11 @@
             <version>${arrow.version}</version>
         </dependency>
         <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-dataset</artifactId>
+            <version>${arrow.version}</version>
+        </dependency>
+        <dependency>
             <groupId>org.questdb</groupId>
             <artifactId>jar-jni</artifactId>
             <version>1.1.1</version>
@@ -82,7 +87,7 @@
                         </goals>
                         <configuration>
                             <path>lance-jni</path>
-                            <release>true</release>
+<!--                            <release>true</release>-->
                             <copyTo>src/main/resources/nativelib</copyTo>
                             <copyWithPlatformDir>true</copyWithPlatformDir>
                         </configuration>
@@ -126,6 +131,8 @@
                     <version>3.2.5</version>
                     <configuration>
                         <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+                        <forkNode implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory"/>
+                        <useSystemClassLoader>false</useSystemClassLoader>
                     </configuration>
                 </plugin>
                 <plugin>

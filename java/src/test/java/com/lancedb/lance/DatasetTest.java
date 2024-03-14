@@ -37,14 +37,11 @@ import org.junit.jupiter.api.io.TempDir;
 
 public class DatasetTest {
 
-  @TempDir
-  static Path tempDir; // Temporary directory for the tests
+  @TempDir static Path tempDir; // Temporary directory for the tests
   private static Dataset dataset;
 
   @BeforeAll
-  static void setup() {
-
-  }
+  static void setup() {}
 
   @AfterAll
   static void tearDown() {
@@ -57,24 +54,31 @@ public class DatasetTest {
   @Test
   void testWriteStreamAndOpenPath() throws URISyntaxException, IOException {
     Path path = Paths.get(DatasetTest.class.getResource("/random_access.arrow").toURI());
-    try(
-        BufferAllocator allocator = new RootAllocator();
-        ArrowFileReader reader = new ArrowFileReader(
-            new SeekableReadChannel(new ByteArrayReadableSeekableByteChannel(
-                Files.readAllBytes(path))), allocator);
-        ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)
-    ) {
+    try (BufferAllocator allocator = new RootAllocator();
+        ArrowFileReader reader =
+            new ArrowFileReader(
+                new SeekableReadChannel(
+                    new ByteArrayReadableSeekableByteChannel(Files.readAllBytes(path))),
+                allocator);
+        ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
       Data.exportArrayStream(allocator, reader, arrowStream);
       Path datasetPath = tempDir.resolve("new_dataset");
-      assertDoesNotThrow(() -> {
-        dataset = Dataset.write(arrowStream, datasetPath.toString(),
-            new WriteParams.Builder().withMaxRowsPerFile(10)
-            .withMaxRowsPerGroup(20).withMode(WriteMode.CREATE).build());
-        assertEquals(9, dataset.countRows());
-        Dataset datasetRead = Dataset.open(datasetPath.toString());
-        assertEquals(9, datasetRead.countRows());
-      });
-      
+      assertDoesNotThrow(
+          () -> {
+            dataset =
+                Dataset.write(
+                    arrowStream,
+                    datasetPath.toString(),
+                    new WriteParams.Builder()
+                        .withMaxRowsPerFile(10)
+                        .withMaxRowsPerGroup(20)
+                        .withMode(WriteMode.CREATE)
+                        .build());
+            assertEquals(9, dataset.countRows());
+            Dataset datasetRead = Dataset.open(datasetPath.toString(), allocator);
+            assertEquals(9, datasetRead.countRows());
+          });
+
       var fragments = dataset.getFragments();
       assertEquals(1, fragments.size());
       assertEquals(0, fragments.get(0).getFragmentId());
@@ -85,8 +89,10 @@ public class DatasetTest {
   @Test
   void testOpenInvalidPath() {
     String validPath = tempDir.resolve("Invalid_dataset").toString();
-    assertThrows(RuntimeException.class, () -> {
-      dataset = Dataset.open(validPath);
-    });
+    assertThrows(
+        RuntimeException.class,
+        () -> {
+          dataset = Dataset.open(validPath, new RootAllocator());
+        });
   }
 }

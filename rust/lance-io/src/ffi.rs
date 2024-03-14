@@ -27,12 +27,16 @@ struct RecordBatchIteratorAdaptor<S: RecordBatchStream> {
     #[pin]
     stream: S,
 
-    rt: tokio::runtime::Runtime,
+    handle: tokio::runtime::Handle,
 }
 
 impl<S: RecordBatchStream> RecordBatchIteratorAdaptor<S> {
-    fn new(stream: S, schema: SchemaRef, rt: tokio::runtime::Runtime) -> Self {
-        Self { schema, stream, rt }
+    fn new(stream: S, schema: SchemaRef, handle: tokio::runtime::Handle) -> Self {
+        Self {
+            schema,
+            stream,
+            handle,
+        }
     }
 }
 
@@ -48,7 +52,7 @@ impl<S: RecordBatchStream + Unpin> Iterator for RecordBatchIteratorAdaptor<S> {
     type Item = std::result::Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.rt
+        self.handle
             .block_on(async { self.stream.next().await })
             .map(|r| r.map_err(|e| ArrowError::ExternalError(Box::new(e))))
     }
@@ -57,10 +61,10 @@ impl<S: RecordBatchStream + Unpin> Iterator for RecordBatchIteratorAdaptor<S> {
 /// Wrap a [`RecordBatchStream`] into an [FFI_ArrowArrayStream].
 pub fn to_ffi_arrow_array_stream(
     stream: impl RecordBatchStream + std::marker::Unpin + 'static,
-    rt: tokio::runtime::Runtime,
+    handle: tokio::runtime::Handle,
 ) -> Result<FFI_ArrowArrayStream> {
     let schema = stream.schema();
-    let arrow_stream = RecordBatchIteratorAdaptor::new(stream, schema, rt);
+    let arrow_stream = RecordBatchIteratorAdaptor::new(stream, schema, handle);
     let reader = FFI_ArrowArrayStream::new(Box::new(arrow_stream));
 
     Ok(reader)
