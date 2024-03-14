@@ -144,10 +144,10 @@ message DiskAnn {
 
 message HNSW {
   // Entry point
-  uint32 entry_point = 1;
+  // uint32 entry_point = 1;
 
   // Level offsets
-  repeated uint64 level_offsets = 2;
+  // repeated uint64 level_offsets = 2;
 }
 
 // One stage in the vector index pipeline.

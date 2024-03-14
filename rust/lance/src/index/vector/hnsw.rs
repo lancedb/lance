@@ -68,7 +68,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct HNSWIndex {
     hnsw: HNSW,
-    storage: Arc<dyn VectorStorage>
+    storage: Arc<dyn VectorStorage>,
 }
 
 impl HNSWIndex {
@@ -168,26 +168,14 @@ impl VectorIndex for HNSWIndex {
             VECTOR_ID_FIELD.clone(),
         ]))?;
 
-        
-
-        let hnsw = HNSW::load_partition(reader, offset..length, self.metric_type(), self.storage, metadata)
-
-        // let offset = file_reader
-        //     .schema()
-        //     .metadata
-        //     .get("lance:binary_offset")
-        //     .ok_or(Error::Index {
-        //         message: "lance:binary_offset not found in schema metadata".to_string(),
-        //         location: location!(),
-        //     })?
-        //     .parse::<usize>()
-        //     .map_err(|e| Error::Index {
-        //         message: format!("Failed to parse lance:binary_offset: {}", e),
-        //         location: location!(),
-        //     })?;
-
-        // let row_ids =
-        //     read_fixed_stride_array(reader, &DataType::UInt64, offset, self.hnsw.len(), ..).await?;
+        let hnsw = HNSW::load(
+            reader,
+            offset..length,
+            self.metric_type(),
+            self.storage,
+            metadata,
+        )
+        .await;
 
         Ok(Box::new(Self {
             hnsw,

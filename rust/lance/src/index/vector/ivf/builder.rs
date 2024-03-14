@@ -101,7 +101,7 @@ pub(super) async fn build_partitions(
 ///
 ///
 #[allow(clippy::too_many_arguments)]
-#[instrument(level = "debug", skip(data, ivf, pq))]
+#[instrument(level = "debug", skip(writer, auxiliary_writer, data, ivf, pq))]
 pub(super) async fn build_hnsw_partitions(
     dataset: &Dataset,
     writer: &mut FileWriter<ManifestDescribing>,

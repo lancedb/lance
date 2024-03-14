@@ -232,7 +232,7 @@ pub(super) async fn write_hnsw_index_partitions(
     metric_type: MetricType,
     hnsw_params: &HnswBuildParams,
     writer: &mut FileWriter<ManifestDescribing>,
-    auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
+    mut auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
     ivf: &mut Ivf,
     pq: Arc<dyn ProductQuantizer>,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
@@ -310,7 +310,7 @@ pub(super) async fn write_hnsw_index_partitions(
         let mut hnsw_builder = HNSWBuilder::with_params(hnsw_params.clone(), vec_store);
         let hnsw = hnsw_builder.build()?;
 
-        if let Some(writer) = auxiliary_writer {
+        if let Some(writer) = auxiliary_writer.as_mut() {
             let pq_array = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
             let row_id_array = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
             let pq_column = concat(&pq_array)?;
@@ -332,7 +332,7 @@ pub(super) async fn write_hnsw_index_partitions(
                 metric_type,
             )?;
 
-            pq_store.write_partition(writer).await?;
+            pq_store.write_partition(*writer).await?;
         }
 
         hnsw.write_levels(writer).await?;
