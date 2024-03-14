@@ -429,7 +429,7 @@ impl MergeInsertJob {
             HashJoinExec::try_new(
                 target_projected,
                 shared_input,
-                vec![(target_key, source_key)],
+                vec![(Arc::new(target_key), Arc::new(source_key))],
                 None,
                 &JoinType::Full,
                 PartitionMode::CollectLeft,
@@ -477,6 +477,7 @@ impl MergeInsertJob {
             WhenNotMatchedBySource::Keep
         );
         if can_use_scalar_index {
+            dbg!("Using scalar index for merge insert");
             if let Some(index) = self.join_key_as_scalar_index().await? {
                 self.create_indexed_scan_joined_stream(source, index).await
             } else {
@@ -484,6 +485,7 @@ impl MergeInsertJob {
                 self.create_full_table_joined_stream(source).await
             }
         } else {
+            dbg!("Falling back to slow merge insert");
             info!("The merge insert operation is configured to delete rows from the target table, this requires a potentially costly full table scan");
             self.create_full_table_joined_stream(source).await
         }
