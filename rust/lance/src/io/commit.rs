@@ -150,6 +150,25 @@ pub(crate) async fn commit_new_dataset(
     Ok(manifest)
 }
 
+/// Internal function to check if a manifest could use some migration.
+///
+/// Manifest migrations happen on each write, but sometimes we need to run them
+/// before certain new operations. An easy way to force a migration is to run
+/// `dataset.delete(false)`, which won't modify data but will cause a migration.
+/// However, you don't want to always have to do this, so we provide this method
+/// to check if a migration is needed.
+pub fn manifest_needs_migration(manifest: &Manifest) -> bool {
+    manifest.writer_version.is_none()
+        || manifest.fragments.iter().any(|f| {
+            f.physical_rows.is_none()
+                || (f
+                    .deletion_file
+                    .as_ref()
+                    .map(|d| d.num_deleted_rows.is_none())
+                    .unwrap_or(false))
+        })
+}
+
 /// Update manifest with new metadata fields.
 ///
 /// Fields such as `physical_rows` and `num_deleted_rows` may not have been
@@ -343,7 +362,7 @@ pub(crate) async fn commit_transaction(
 
         let previous_writer_version = &dataset.manifest.writer_version;
         // The versions of Lance prior to when we started writing the writer version
-        // sometimes wrote incorrect `Fragment.phyiscal_rows` values, so we should
+        // sometimes wrote incorrect `Fragment.physical_rows` values, so we should
         // make sure to recompute them.
         // See: https://github.com/lancedb/lance/issues/1531
         let recompute_stats = previous_writer_version.is_none();
