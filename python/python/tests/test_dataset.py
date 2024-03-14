@@ -960,6 +960,7 @@ def test_merge_insert_conditional_upsert_example(tmp_path: Path):
         ),
     })
 
+    print(table)
     assert table.sort_by("id") == expected
 
     # No matches

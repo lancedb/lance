@@ -89,7 +89,7 @@ use super::write_fragments_internal;
 fn combined_schema(schema: &Schema) -> Schema {
     let target = Field::new("target", DataType::Struct(schema.fields.clone()), false);
     let source = Field::new("source", DataType::Struct(schema.fields.clone()), false);
-    Schema::new(vec![target, source])
+    Schema::new(vec![source, target])
 }
 
 // This takes a double-wide table (e.g. the result of the outer join below) and takes the left
@@ -104,16 +104,16 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
     let half_num_fields = num_fields / 2;
     let row_id_col = num_fields - 1;
 
-    let target_arrays = batch.columns()[0..half_num_fields].to_vec();
-    let target = StructArray::new(schema.fields.clone(), target_arrays, None);
-
-    let source_arrays = batch.columns()[half_num_fields..row_id_col].to_vec();
+    let source_arrays = batch.columns()[0..half_num_fields].to_vec();
     let source = StructArray::new(schema.fields.clone(), source_arrays, None);
+
+    let target_arrays = batch.columns()[half_num_fields..row_id_col].to_vec();
+    let target = StructArray::new(schema.fields.clone(), target_arrays, None);
 
     let combined_schema = combined_schema(schema);
     RecordBatch::try_new(
         Arc::new(combined_schema),
-        vec![Arc::new(target), Arc::new(source)],
+        vec![Arc::new(source), Arc::new(target)],
     )
     .unwrap()
 }
