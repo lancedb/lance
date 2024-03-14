@@ -32,8 +32,10 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use itertools::Itertools;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
+use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::MetricType;
 use lance_table::io::manifest::ManifestDescribing;
+use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::{location, Location};
@@ -42,6 +44,7 @@ use super::graph::{
     builder::GraphBuilder, greedy_search, storage::VectorStorage, Graph, OrderedFloat, OrderedNode,
     NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
+use super::ivf::storage::IvfData;
 use crate::vector::graph::beam_search;
 
 pub mod builder;
@@ -210,7 +213,7 @@ struct SchemaIndexMetadata {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct HnswMetadata {
+pub struct HnswMetadata {
     entry_point: u32,
     level_offsets: Vec<usize>,
 }
@@ -261,6 +264,37 @@ impl HNSW {
         })
     }
 
+    /// Load a partition of HNSW
+    ///
+    /// Parameters
+    /// ----------
+    /// - *reader*: the file reader to read the graph from.
+    /// - *range*: the row range of the partition.
+    /// - *metric_type*: the metric type of the index.
+    /// - *vector_storage*: A preloaded [VectorStorage] storage.
+    /// - *metadata*: the metadata of the HNSW.
+    pub async fn load_partition(
+        reader: &FileReader,
+        range: std::ops::Range<usize>,
+        metric_type: MetricType,
+        vector_storage: Arc<dyn VectorStorage>,
+        metadata: HnswMetadata,
+    ) -> Result<Self> {
+        let mut levels = Vec::with_capacity(metadata.level_offsets.len() - 1);
+        // TODO: load levels in parallel.
+        for i in 0..metadata.level_offsets.len() - 1 {
+            let start = metadata.level_offsets[i] + range.start;
+            let end = metadata.level_offsets[i + 1] + range.end;
+            levels.push(HnswLevel::load(reader, start..end, vector_storage.clone()).await?);
+        }
+        Ok(Self {
+            levels,
+            metric_type,
+            entry_point: metadata.entry_point,
+            use_select_heuristic: true,
+        })
+    }
+
     fn from_builder(
         levels: Vec<HnswLevel>,
         entry_point: u32,
@@ -305,24 +339,31 @@ impl HNSW {
             .collect())
     }
 
+    /// Returns the metadata of this [`HNSW`].
+    pub fn metadata(&self) -> HnswMetadata {
+        let mut level_offsets = Vec::with_capacity(self.levels.len() + 1);
+        let mut offset = 0;
+        level_offsets.push(offset);
+        for level in self.levels.iter() {
+            offset += level.len();
+            level_offsets.push(offset);
+        }
+
+        HnswMetadata {
+            entry_point: self.entry_point,
+            level_offsets,
+        }
+    }
+
     /// Write the HNSW graph to a Lance file.
     pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
-        let mut level_offsets = vec![0];
-        for level in self.levels.iter() {
-            level_offsets.push(level_offsets.last().unwrap() + level.len());
-            // TODO: add chunking to each batch.
-            writer.write(&[level.nodes.clone()]).await?;
-        }
-        level_offsets.pop();
+        self.write_levels(writer).await?;
 
         let index_metadata = json!({
             "type": HNSW_TYPE,
             "metric_type": self.metric_type.to_string(),
         });
-        let hnsw_metadata = HnswMetadata {
-            entry_point: self.entry_point,
-            level_offsets,
-        };
+        let hnsw_metadata = self.metadata();
 
         let mut metadata = HashMap::<String, String>::new();
         metadata.insert("lance:index".to_string(), index_metadata.to_string());
@@ -332,6 +373,53 @@ impl HNSW {
         );
         writer.finish_with_metadata(&metadata).await?;
         Ok(())
+    }
+
+    /// Write partitioned HNSWs to the file.
+    ///
+    /// Parameters
+    /// ----------
+    /// - *object_store*: the object store to write the file to.
+    /// - *path*: the path to write the file to.
+    /// - *partitions*: the partitions of the HNSW graph.
+    pub async fn write_parted_hnsw(
+        object_store: &ObjectStore,
+        path: &Path,
+        partitions: Box<dyn Iterator<Item = HNSW>>,
+    ) -> Result<()> {
+        let mut peek = partitions.peekable();
+        let first = peek.peek().ok_or(Error::Index {
+            message: "No partitions to write".to_string(),
+            location: location!(),
+        })?;
+        let schema = first.schema();
+        let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref())?;
+        let mut writer = FileWriter::<ManifestDescribing>::try_new(
+            object_store,
+            path,
+            lance_schema,
+            &Default::default(), // TODO: support writer options.
+        )
+        .await?;
+
+        let mut ivf_data = IvfData::empty();
+        for hnsw in peek {
+            let num_rows = hnsw.write_levels(&mut writer).await?;
+            ivf_data.add_partition(num_rows as u32);
+        }
+        ivf_data.write(&mut writer).await?;
+
+        Ok(())
+    }
+
+    /// Write levels' nodes, and returns the offset of each level.
+    pub async fn write_levels(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<usize> {
+        let mut num_rows = 0;
+        for level in self.levels.iter() {
+            writer.write(&[level.nodes.clone()]).await?;
+            num_rows += level.nodes.num_rows();
+        }
+        Ok(num_rows)
     }
 }
 
