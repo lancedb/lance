@@ -108,7 +108,7 @@ async fn main() {
         let construct_time = now.elapsed().as_secs_f32();
         let now = std::time::Instant::now();
         let results: HashSet<u32> = hnsw
-            .search(q, k, args.ef)
+            .search(q, k, args.ef, None)
             .unwrap()
             .iter()
             .map(|(i, _)| *i)
