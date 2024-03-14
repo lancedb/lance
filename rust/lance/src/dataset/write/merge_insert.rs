@@ -422,9 +422,14 @@ impl MergeInsertJob {
             Arc::new(ProjectionExec::try_new(target, Arc::new(projected_schema))?);
 
         // 6 - Finally, join the input (source table) with the taken data (target table)
-        let source_key = Column::new_with_schema(&index_column, shared_input.schema().as_ref())?;
-        let target_key =
-            Column::new_with_schema(&index_column, target_projected.schema().as_ref())?;
+        let source_key = Arc::new(Column::new_with_schema(
+            &index_column,
+            shared_input.schema().as_ref(),
+        )?);
+        let target_key = Arc::new(Column::new_with_schema(
+            &index_column,
+            target_projected.schema().as_ref(),
+        )?);
         let joined = Arc::new(
             HashJoinExec::try_new(
                 target_projected,
