@@ -429,7 +429,7 @@ impl MergeInsertJob {
             HashJoinExec::try_new(
                 target_projected,
                 shared_input,
-                vec![(target_key, source_key)],
+                vec![(Arc::new(target_key), Arc::new(source_key))],
                 None,
                 &JoinType::Full,
                 PartitionMode::CollectLeft,

@@ -229,7 +229,8 @@ mod tests {
             SortMergeJoinExec::try_new(
                 shared.clone(),
                 shared,
-                vec![(Column::new("x", 0), Column::new("x", 0))],
+                vec![(Arc::new(Column::new("x", 0)), Arc::new(Column::new("x", 0)))],
+                None,
                 JoinType::Inner,
                 vec![SortOptions::default()],
                 true,
