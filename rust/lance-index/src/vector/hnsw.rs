@@ -482,6 +482,7 @@ mod tests {
     use arrow_array::types::Float32Type;
     use lance_linalg::matrix::MatrixView;
     use lance_testing::datagen::generate_random_array;
+    use tests::builder::HnswBuildParams;
 
     #[test]
     fn test_select_neighbors() {
@@ -520,11 +521,14 @@ mod tests {
         let data = generate_random_array(TOTAL * DIM);
         let mat = Arc::new(MatrixView::<Float32Type>::new(data.into(), DIM));
         let store = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
-        let hnsw = HNSWBuilder::new(store.clone())
-            .max_num_edges(MAX_EDGES)
-            .ef_construction(50)
-            .build()
-            .unwrap();
+        let hnsw = HNSWBuilder::with_params(
+            HnswBuildParams::default()
+                .max_num_edges(MAX_EDGES)
+                .ef_construction(50),
+            store.clone(),
+        )
+        .build()
+        .unwrap();
         assert!(hnsw.levels.len() > 1);
         assert_eq!(hnsw.levels[0].len(), TOTAL);
 
@@ -567,12 +571,15 @@ mod tests {
         let vectors = Arc::new(InMemoryVectorStorage::new(mat.clone(), MetricType::L2));
         let q = mat.row(0).unwrap();
 
-        let hnsw = HNSWBuilder::new(vectors.clone())
-            .max_num_edges(MAX_EDGES)
-            .ef_construction(100)
-            .max_level(4)
-            .build()
-            .unwrap();
+        let hnsw = HNSWBuilder::with_params(
+            HnswBuildParams::default()
+                .max_num_edges(MAX_EDGES)
+                .ef_construction(100)
+                .max_level(4),
+            vectors.clone(),
+        )
+        .build()
+        .unwrap();
 
         let results: HashSet<u32> = hnsw
             .search(q, K, 128)

@@ -23,7 +23,10 @@ use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance_index::vector::{graph::memory::InMemoryVectorStorage, hnsw::builder::HNSWBuilder};
+use lance_index::vector::{
+    graph::memory::InMemoryVectorStorage,
+    hnsw::builder::{HNSWBuilder, HnswBuildParams},
+};
 use lance_linalg::{distance::MetricType, MatrixView};
 use lance_testing::datagen::generate_random_array_with_seed;
 
@@ -42,10 +45,12 @@ fn bench_hnsw(c: &mut Criterion) {
         format!("create_hnsw({TOTAL}x1024,levels=6)").as_str(),
         |b| {
             b.iter(|| {
-                let hnsw = HNSWBuilder::new(vectors.clone())
-                    .max_level(6)
-                    .build()
-                    .unwrap();
+                let hnsw = HNSWBuilder::with_params(
+                    HnswBuildParams::default().max_level(6),
+                    vectors.clone(),
+                )
+                .build()
+                .unwrap();
                 let uids: HashSet<u32> = hnsw
                     .search(query, K, 300)
                     .unwrap()
