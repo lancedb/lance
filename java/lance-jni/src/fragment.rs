@@ -130,7 +130,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_getSchema(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentArrowReader_openStream(
+pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentScanner_openStream(
     mut env: JNIEnv,
     _reader: JObject,
     jdataset: JObject,

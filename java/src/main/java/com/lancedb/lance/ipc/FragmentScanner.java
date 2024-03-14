@@ -17,6 +17,7 @@ package com.lancedb.lance.ipc;
 import com.lancedb.lance.Dataset;
 import java.io.IOException;
 import java.util.Optional;
+import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.dataset.scanner.ScanOptions;
@@ -46,11 +47,17 @@ public class FragmentScanner implements Scanner {
 
   private static native long getSchema(Dataset dataset, int fragmentId, Optional<String[]> columns);
 
+  static native void openStream(
+          Dataset dataset, int fragmentId, Optional<String[]> columns, long batchSize, long stream)
+          throws IOException;
+
   @Override
   public ArrowReader scanBatches() {
     try {
-      return new FragmentArrowReader(
-          this.dataset, this.fragmentId, options, allocator);
+      ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator);
+      openStream(
+              dataset, fragmentId, options.getColumns(), options.getBatchSize(), s.memoryAddress());
+      return Data.importArrayStream(allocator, s);
     } catch (IOException e) {
       // TODO: handle IO exception?
       throw new RuntimeException(e);
