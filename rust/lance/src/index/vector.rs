@@ -216,13 +216,13 @@ pub(crate) async fn build_vector_index(
                 location: location!(),
             });
         };
-        let StageParams::PQ(pq_params) = &stages[len - 2] else {
+        let StageParams::Hnsw(hnsw_params) = &stages[len - 2] else {
             return Err(Error::Index {
                 message: format!("Build Vector Index: invalid stages: {:?}", stages),
                 location: location!(),
             });
         };
-        let StageParams::Hnsw(hnsw_params) = &stages[len - 1] else {
+        let StageParams::PQ(pq_params) = &stages[len - 1] else {
             return Err(Error::Index {
                 message: format!("Build Vector Index: invalid stages: {:?}", stages),
                 location: location!(),

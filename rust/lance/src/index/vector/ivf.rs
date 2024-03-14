@@ -1234,7 +1234,7 @@ async fn write_ivf_hnsw_file(
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
     let writer = object_store.create(&path).await?;
 
-    let schema = Schema::new(vec![NEIGHBORS_FIELD.clone(), VECTOR_ID_FIELD.clone()]);
+    let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
     let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
 
@@ -1261,7 +1261,7 @@ async fn write_ivf_hnsw_file(
     let start = std::time::Instant::now();
     let num_partitions = ivf.num_partitions() as u32;
 
-    let hnsw_metadata = builder::build_hnsw_partitions(
+    let (hnsw_metadata, aux_ivf) = builder::build_hnsw_partitions(
         dataset,
         &mut writer,
         Some(&mut aux_writer),
@@ -1280,16 +1280,21 @@ async fn write_ivf_hnsw_file(
     .await?;
     info!("Built IVF partitions: {}s", start.elapsed().as_secs_f32());
 
+    // Add the metadata of HNSW partitions
+    let hnsw_metadata_json = json!(hnsw_metadata);
+    writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
+
+    // Convert ['Ivf'] to [`IvfData`] for new index format
     let mut ivf_data = IvfData::empty();
     for length in ivf.lengths {
         ivf_data.add_partition(length);
     }
-
     ivf_data.write(&mut writer).await?;
-
-    let hnsw_metadata_json = json!(hnsw_metadata);
-    writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
     writer.finish().await?;
+
+    // Write the aux file
+    aux_ivf.write(&mut aux_writer).await?;
+    aux_writer.finish().await?;
     Ok(())
 }
 
@@ -2113,6 +2118,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ivf_hnsw() {
+        env_logger::init();
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 

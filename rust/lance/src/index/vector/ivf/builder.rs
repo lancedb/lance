@@ -25,7 +25,7 @@ use tracing::instrument;
 use lance_core::{Error, Result, ROW_ID};
 use lance_index::vector::{
     hnsw::{builder::HnswBuildParams, HnswMetadata},
-    ivf::shuffler::shuffle_dataset,
+    ivf::{shuffler::shuffle_dataset, storage::IvfData},
     pq::ProductQuantizer,
 };
 use lance_io::{stream::RecordBatchStream, traits::Writer};
@@ -117,7 +117,7 @@ pub(super) async fn build_hnsw_partitions(
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
-) -> Result<Vec<HnswMetadata>> {
+) -> Result<(Vec<HnswMetadata>, IvfData)> {
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
         return Err(Error::Schema {

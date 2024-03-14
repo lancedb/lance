@@ -27,6 +27,7 @@ use futures::{Stream, StreamExt};
 use lance_arrow::*;
 use lance_core::Error;
 use lance_file::writer::FileWriter;
+use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::storage::ProductQuantizationStorage;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::{
@@ -237,7 +238,7 @@ pub(super) async fn write_hnsw_index_partitions(
     pq: Arc<dyn ProductQuantizer>,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
     existing_indices: Option<&[&IVFIndex]>,
-) -> Result<Vec<HnswMetadata>> {
+) -> Result<(Vec<HnswMetadata>, IvfData)> {
     let mut streams_heap = BinaryHeap::new();
     let mut new_streams = vec![];
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
@@ -272,6 +273,7 @@ pub(super) async fn write_hnsw_index_partitions(
         }
     }
 
+    let mut aux_ivf = IvfData::empty();
     for part_id in 0..ivf.num_partitions() as u32 {
         let start = Instant::now();
         let mut pq_array: Vec<Arc<dyn Array>> = vec![];
@@ -315,9 +317,9 @@ pub(super) async fn write_hnsw_index_partitions(
             let row_id_array = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
             let pq_column = concat(&pq_array)?;
             let row_ids_column = concat(&row_id_array)?;
-            let pq_batch = RecordBatch::try_from_iter(vec![
-                (PQ_CODE_COLUMN, pq_column),
-                (ROW_ID, row_ids_column),
+            let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![
+                (ROW_ID, row_ids_column, true),
+                (PQ_CODE_COLUMN, pq_column, false),
             ])?;
             let pq_store = ProductQuantizationStorage::new(
                 pq.codebook_as_fsl()
@@ -325,7 +327,7 @@ pub(super) async fn write_hnsw_index_partitions(
                     .as_primitive::<Float32Type>()
                     .clone()
                     .into(),
-                pq_batch,
+                pq_batch.clone(),
                 pq.num_bits(),
                 pq.num_sub_vectors(),
                 pq.dimension(),
@@ -333,25 +335,20 @@ pub(super) async fn write_hnsw_index_partitions(
             )?;
 
             pq_store.write_partition(*writer).await?;
+            aux_ivf.add_partition(pq_batch.num_rows() as u32);
         }
 
         hnsw.write_levels(writer).await?;
         hnsw_metadata.push(hnsw.metadata());
 
         ivf.add_partition(offset, hnsw.len() as u32);
-        println!(
-            "wrote partition {} at offset {} with num rows {}",
-            part_id,
-            offset,
-            hnsw.len()
-        );
         log::info!(
             "Wrote partition {} in {} ms",
             part_id,
             start.elapsed().as_millis()
         );
     }
-    Ok(hnsw_metadata)
+    Ok((hnsw_metadata, aux_ivf))
 }
 
 #[cfg(test)]
