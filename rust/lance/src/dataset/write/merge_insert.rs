@@ -101,12 +101,13 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
     // The keys and non_keys on both sides will be equal
     let num_fields = batch.num_columns();
     debug_assert_eq!(num_fields % 2, 1);
-    let row_id_col = num_fields / 2;
+    let half_num_fields = num_fields / 2;
+    let row_id_col = num_fields - 1;
 
-    let target_arrays = batch.columns()[0..row_id_col].to_vec();
+    let target_arrays = batch.columns()[0..half_num_fields].to_vec();
     let target = StructArray::new(schema.fields.clone(), target_arrays, None);
 
-    let source_arrays = batch.columns()[row_id_col + 1..].to_vec();
+    let source_arrays = batch.columns()[half_num_fields..row_id_col].to_vec();
     let source = StructArray::new(schema.fields.clone(), source_arrays, None);
 
     let combined_schema = combined_schema(schema);
@@ -377,11 +378,22 @@ impl MergeInsertJob {
         let shared_input = Arc::new(ReplayExec::new(Capacity::Unbounded, input));
 
         // 3 - Use the index to map input to row addresses
+        // First, we need to project to the key column
+        let schema = shared_input.schema();
+        let field = schema.field_with_name(&self.params.on[0])?;
+        let key_only_schema =
+            lance_core::datatypes::Schema::try_from(&Schema::new(vec![field.clone()]))?;
+        let index_mapper_input = Arc::new(ProjectionExec::try_new(
+            shared_input.clone(),
+            Arc::new(key_only_schema),
+        )?);
+
+        // Then we pass the key column into the index mapper
         let index_column = self.params.on[0].clone();
         let index_mapper = Arc::new(MapIndexExec::new(
             self.dataset.clone(),
             index_column.clone(),
-            shared_input.clone(),
+            index_mapper_input,
         ));
 
         // 4 - Take the mapped row addresses
@@ -392,7 +404,17 @@ impl MergeInsertJob {
             num_cpus::get(),
         )?) as Arc<dyn ExecutionPlan>;
 
-        // 3a - We also need to scan any new unindexed data
+        // 5 - Take puts the row id at the beginning.  A full scan (used when there is no scalar
+        //     index) puts the row id at the end.  We need to match these up so we reorder the row
+        //     id to the end
+        let schema = target.schema();
+        let fields = schema.fields();
+        let mut columns = fields[1..].to_vec();
+        columns.push(fields[0].clone());
+        let projected_schema = lance_core::datatypes::Schema::try_from(&Schema::new(columns))?;
+        target = Arc::new(ProjectionExec::try_new(target, Arc::new(projected_schema))?);
+
+        // 5a - We also need to scan any new unindexed data and union it in
         let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
         if !unindexed_fragments.is_empty() {
             let unindexed_data = self
@@ -410,25 +432,13 @@ impl MergeInsertJob {
             )?);
         }
 
-        // 5 - Take puts the row id at the beginning.  A full scan (used when there is no scalar
-        //     index) puts the row id at the end.  We need to match these up so we reorder the row
-        //     id to the end
-        let schema = target.schema();
-        let fields = schema.fields();
-        let mut columns = fields[1..].to_vec();
-        columns.push(fields[0].clone());
-        let projected_schema = lance_core::datatypes::Schema::try_from(&Schema::new(columns))?;
-        let target_projected =
-            Arc::new(ProjectionExec::try_new(target, Arc::new(projected_schema))?);
-
         // 6 - Finally, join the input (source table) with the taken data (target table)
         let source_key = Column::new_with_schema(&index_column, shared_input.schema().as_ref())?;
-        let target_key =
-            Column::new_with_schema(&index_column, target_projected.schema().as_ref())?;
+        let target_key = Column::new_with_schema(&index_column, target.schema().as_ref())?;
         let joined = Arc::new(
             HashJoinExec::try_new(
-                target_projected,
                 shared_input,
+                target,
                 vec![(Arc::new(target_key), Arc::new(source_key))],
                 None,
                 &JoinType::Full,
@@ -463,7 +473,7 @@ impl MergeInsertJob {
             .iter()
             .map(|c| c.as_str())
             .collect::<Vec<_>>();
-        let joined = existing.join(new_data, JoinType::Full, &join_cols, &join_cols, None)?;
+        let joined = new_data.join(existing, JoinType::Full, &join_cols, &join_cols, None)?;
         Ok(joined.execute_stream().await?)
     }
 
@@ -480,7 +490,6 @@ impl MergeInsertJob {
             if let Some(index) = self.join_key_as_scalar_index().await? {
                 self.create_indexed_scan_joined_stream(source, index).await
             } else {
-                info!("There is no scalar index on the merge insert join key, falling back to a less efficient full table scan");
                 self.create_full_table_joined_stream(source).await
             }
         } else {
@@ -723,14 +732,15 @@ impl Merger {
     {
         let num_fields = batch.schema().fields.len();
         // The schema of the combined batches will be:
-        // existing_data_keys, existing_data_non_keys, existing_data_row_id, new_data_keys, new_data_non_keys
+        // source_keys, source_payload, target_keys, target_payload, row_id
         // The keys and non_keys on both sides will be equal
         debug_assert_eq!(num_fields % 2, 1);
-        let row_id_col = num_fields / 2;
-        let right_offset = row_id_col + 1;
+        let row_id_col = num_fields - 1;
+        let right_offset = num_fields / 2;
         let num_keys = self.params.on.len();
 
-        let right_cols = Vec::from_iter(right_offset..num_fields);
+        let left_cols = Vec::from_iter(0..right_offset);
+        let right_cols_with_id = Vec::from_iter(right_offset..num_fields);
 
         let mut batches = Vec::with_capacity(2);
         let (left_only, in_both, right_only) =
@@ -765,7 +775,7 @@ impl Merger {
             if matched.num_rows() > 0 {
                 let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
                 deleted_row_ids.extend(row_ids.values());
-                let matched = matched.project(&right_cols)?;
+                let matched = matched.project(&left_cols)?;
                 // The payload columns of an outer join are always nullable.  We need to restore
                 // non-nullable to columns that were originally non-nullable.  This should be safe
                 // since the not_matched rows should all be valid on the right_cols
@@ -779,8 +789,8 @@ impl Merger {
             }
         }
         if self.params.insert_not_matched {
-            let not_matched = arrow::compute::filter_record_batch(&batch, &right_only)?;
-            let not_matched = not_matched.project(&right_cols)?;
+            let not_matched = arrow::compute::filter_record_batch(&batch, &left_only)?;
+            let not_matched = not_matched.project(&left_cols)?;
             // See comment above explaining this schema replacement
             let not_matched = RecordBatch::try_new(
                 self.schema.clone(),
@@ -790,12 +800,14 @@ impl Merger {
         }
         match self.params.delete_not_matched_by_source {
             WhenNotMatchedBySource::Delete => {
-                let unmatched = arrow::compute::filter(batch.column(row_id_col), &left_only)?;
+                let unmatched = arrow::compute::filter(batch.column(row_id_col), &right_only)?;
                 let row_ids = unmatched.as_primitive::<UInt64Type>();
                 deleted_row_ids.extend(row_ids.values());
             }
             WhenNotMatchedBySource::DeleteIf(_) => {
-                let unmatched = arrow::compute::filter_record_batch(&batch, &left_only)?;
+                let target_data = batch.project(&right_cols_with_id)?;
+                let unmatched = arrow::compute::filter_record_batch(&target_data, &right_only)?;
+                let row_id_col = unmatched.num_columns() - 1;
                 let to_delete = self.delete_expr.unwrap().evaluate(&unmatched)?;
                 match to_delete {
                     ColumnarValue::Array(mask) => {
@@ -1086,8 +1098,8 @@ mod tests {
 
         let data = lance_datagen::gen()
             .with_seed(Seed::from(1))
-            .col(Some("key".to_string()), array::rand_pseduo_uuid_hex())
-            .col(Some("value".to_string()), array::step::<UInt32Type>());
+            .col(Some("value".to_string()), array::step::<UInt32Type>())
+            .col(Some("key".to_string()), array::rand_pseduo_uuid_hex());
         let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(32));
         let schema = data.schema();
 
@@ -1101,8 +1113,8 @@ mod tests {
         // Create some new (unindexed) data
         let data = lance_datagen::gen()
             .with_seed(Seed::from(2))
-            .col(Some("key".to_string()), array::rand_pseduo_uuid_hex())
-            .col(Some("value".to_string()), array::step::<UInt32Type>());
+            .col(Some("value".to_string()), array::step::<UInt32Type>())
+            .col(Some("key".to_string()), array::rand_pseduo_uuid_hex());
         let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(8));
         let ds = Dataset::write(
             data,
@@ -1131,7 +1143,7 @@ mod tests {
             .unwrap();
         let some_vals = some_vals.column(0).clone();
         let source_batch =
-            RecordBatch::try_new(schema.clone(), vec![some_indices, some_vals]).unwrap();
+            RecordBatch::try_new(schema.clone(), vec![some_vals, some_indices]).unwrap();
         // To make things more interesting, lets make the input a stream of four batches
         let source_batches = vec![
             source_batch.slice(0, 512),
