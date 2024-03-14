@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
+use arrow::ffi::FFI_ArrowSchema;
 use arrow_schema::Schema;
 use jni::{
-    JNIEnv,
     objects::JObject,
     sys::{jint, jlong},
+    JNIEnv,
 };
 use snafu::{location, Location};
 
@@ -151,17 +151,18 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentArrowReader_openStream
                 .expect("Dataset handle not set");
         dataset.clone()
     };
-    let fragment = match dataset.inner.get_fragment(fragment_id as usize) {
-        Some(f) => f,
-        None => {
-            env.throw("Fragment not found")
-                .expect("Throw exception failed");
-            return -1;
-        }
+    let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
+        env.throw("Fragment not found")
+            .expect("Throw exception failed");
+        return -1;
     };
     let mut scanner: Scanner = fragment.scan();
     if let Some(cols) = columns {
-        scanner.project(&cols);
+        if let Err(e) = scanner.project(&cols) {
+            env.throw(format!("Setting scanner projection: {}", e))
+                .expect("Throw exception failed");
+            return -1;
+        }
     };
     scanner.batch_size(batch_size as usize);
 

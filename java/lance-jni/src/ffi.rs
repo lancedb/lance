@@ -28,7 +28,7 @@ pub trait JNIEnvExt {
 
 impl JNIEnvExt for JNIEnv<'_> {
     fn get_strings(&mut self, obj: &JObject) -> Result<Vec<String>> {
-        let list = self.get_list(&obj)?;
+        let list = self.get_list(obj)?;
         let mut iter = list.iter(self)?;
         let mut results = Vec::with_capacity(list.size(self)? as usize);
         while let Some(elem) = iter.next(self)? {
@@ -47,8 +47,7 @@ impl JNIEnvExt for JNIEnv<'_> {
         if is_empty.z()? {
             Ok(None)
         } else {
-            let inner =
-                self.call_method(obj, "get", "()Ljava/util/List;", &[])?;
+            let inner = self.call_method(obj, "get", "()Ljava/util/List;", &[])?;
             let inner_obj = inner.l()?;
             Ok(Some(self.get_strings(&inner_obj)?))
         }
