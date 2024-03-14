@@ -36,15 +36,24 @@ class FragmentArrowReader extends ArrowReader {
       throws IOException {
     super(allocator);
 
-    long handle = openStream(dataset, fragmentId, options.getColumns(), options.getBatchSize());
-    this.stream = ArrowArrayStream.wrap(handle);
+    ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator);
+    openStream(
+        dataset, fragmentId, options.getColumns(), options.getBatchSize(), s.memoryAddress());
+    this.stream = s;
   }
+
+  /** Open Stream from Rust. */
+  private static native void openStream(
+      Dataset dataset, int fragmentId, Optional<String[]> columns, long batchSize, long stream)
+      throws IOException;
 
   @Override
   public boolean loadNextBatch() throws IOException {
     ArrowArray array = ArrowArray.allocateNew(super.allocator);
     stream.getNext(array);
-    return true;
+    array.close();
+    return false;
+    //    return true;
   }
 
   @Override
@@ -54,18 +63,18 @@ class FragmentArrowReader extends ArrowReader {
 
   @Override
   protected void closeReadSource() throws IOException {
-    stream.release();
+    if (stream != null) {
+      stream.close();
+      stream = null;
+    }
   }
 
   @Override
   protected Schema readSchema() throws IOException {
     var arrowSchema = ArrowSchema.allocateNew(allocator);
     stream.getSchema(arrowSchema);
-    return Data.importSchema(allocator, arrowSchema, null);
+    var schema = Data.importSchema(allocator, arrowSchema, null);
+    arrowSchema.close();
+    return schema;
   }
-
-  /** Open Stream from Rust. */
-  private static native long openStream(
-      Dataset dataset, int fragmentId, Optional<String[]> columns, long batchSize)
-      throws IOException;
 }

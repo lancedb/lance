@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use arrow::ffi::FFI_ArrowSchema;
+use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::Schema;
 use jni::{
     objects::JObject,
@@ -136,15 +137,15 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentArrowReader_openStream
     fragment_id: jint,
     columns: JObject, // Optional<String[]>
     batch_size: jlong,
-) -> jlong {
+    stream_addr: jlong,
+) {
     let columns = match env.get_strings_opt(&columns) {
         Ok(c) => c,
         Err(e) => {
             env.throw(e.to_string()).expect("Failed to throw exception");
-            return -1;
+            return;
         }
     };
-    println!("Jobject dataset: {:?}", jdataset);
     let dataset = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }
@@ -154,14 +155,14 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentArrowReader_openStream
     let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
         env.throw("Fragment not found")
             .expect("Throw exception failed");
-        return -1;
+        return;
     };
     let mut scanner: Scanner = fragment.scan();
     if let Some(cols) = columns {
         if let Err(e) = scanner.project(&cols) {
             env.throw(format!("Setting scanner projection: {}", e))
                 .expect("Throw exception failed");
-            return -1;
+            return;
         }
     };
     scanner.batch_size(batch_size as usize);
@@ -170,10 +171,9 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_FragmentArrowReader_openStream
         Ok(s) => s,
         Err(e) => {
             env.throw(e.to_string()).expect("Throw exception failed");
-            return -1;
+            return;
         }
     };
-    let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone());
-
-    Box::into_raw(Box::new(ffi_stream)) as jlong
+    let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone()).unwrap();
+    unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
 }

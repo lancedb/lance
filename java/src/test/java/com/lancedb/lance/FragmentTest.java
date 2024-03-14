@@ -59,17 +59,21 @@ public class FragmentTest {
       var dataset = Dataset.open(datasetPath.toString(), allocator);
       assertEquals(9, dataset.countRows());
       var fragment = dataset.getFragments().get(0);
-      System.out.println(fragment.toString());
 
       var scanner = fragment.newScan(new ScanOptions(1024));
       var schema = scanner.schema();
       assertEquals(schema, reader.getVectorSchemaRoot().getSchema());
 
-      var fragmentReader = scanner.scanBatches();
-//      while (fragmentReader.loadNextBatch()) {
-//        var batch = fragmentReader.getVectorSchemaRoot();
-//        System.out.println(batch);
-//      }
+      try (var fragmentReader = scanner.scanBatches()) {
+        var batchCount = 0;
+        while (fragmentReader.loadNextBatch()) {
+          var batch = fragmentReader.getVectorSchemaRoot();
+          batchCount ++;
+          System.out.println(batch);
+        }
+        assert(batchCount > 0);
+      }
+
     }
   }
 }
