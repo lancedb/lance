@@ -69,7 +69,7 @@ public class FragmentTest {
         while (fragmentReader.loadNextBatch()) {
           var batch = fragmentReader.getVectorSchemaRoot();
           batchCount ++;
-          System.out.println(batch);
+          System.out.println(batch.toString());
         }
         assert(batchCount > 0);
       }
