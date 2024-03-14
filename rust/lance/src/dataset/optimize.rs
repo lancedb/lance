@@ -499,8 +499,15 @@ pub async fn plan_compaction(
     dataset: &Dataset,
     options: &CompactionOptions,
 ) -> Result<CompactionPlan> {
-    // We assume here that get_fragments is returning the fragments in a
-    // meaningful order that we want to preserve.
+    // get_fragments should be returning fragments in sorted order (by id)
+    // and fragment ids should be unique
+    debug_assert!(
+        dataset
+            .get_fragments()
+            .windows(2)
+            .all(|w| w[0].id() < w[1].id()),
+        "fragments in manifest are not sorted"
+    );
     let mut fragment_metrics = futures::stream::iter(dataset.get_fragments())
         .map(|fragment| async move {
             match collect_metrics(&fragment).await {
@@ -1356,12 +1363,7 @@ mod tests {
             .iter()
             .map(|f| f.id())
             .collect::<Vec<_>>();
-        // Fragment ids are assigned on task completion, but that isn't deterministic.
-        // But we can say the old fragment id=3 should be in the middle, and all
-        // the other ids should be greater than 6.
-        assert_eq!(fragment_ids[2], 3);
-        assert!(fragment_ids.iter().all(|id| *id > 6 || *id == 3));
-        dataset.validate().await.unwrap();
+        assert_eq!(fragment_ids, vec![3, 7, 8, 9, 10]);
     }
 
     #[tokio::test]
