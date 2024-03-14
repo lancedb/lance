@@ -170,7 +170,7 @@ impl FileReader {
         let (page_table, stats_page_table) = futures::try_join!(page_table, stats_page_table)?;
 
         Ok(Self {
-            object_reader: object_reader,
+            object_reader,
             metadata,
             schema,
             page_table,
