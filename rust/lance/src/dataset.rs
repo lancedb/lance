@@ -1104,8 +1104,8 @@ impl Dataset {
                 let fragment = self.get_fragment(fragment_id as usize).ok_or_else(|| {
                     Error::invalid_input(
                         format!(
-                            "row_id belongs to non-existant fragment: {}",
-                            row_ids[current_start]
+                            "row_id {} belongs to non-existant fragment: {}",
+                            row_ids[range.start], fragment_id
                         ),
                         location!(),
                     )

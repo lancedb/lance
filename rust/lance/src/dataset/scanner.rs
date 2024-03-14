@@ -57,7 +57,8 @@ use tracing::{info_span, instrument, Span};
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::DatasetIndexInternalExt;
-use crate::io::exec::{FilterPlan, MaterializeIndexExec, PreFilterSource, ScalarIndexExec};
+use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
+use crate::io::exec::{FilterPlan, PreFilterSource};
 use crate::io::exec::{
     KNNFlatExec, KNNIndexExec, LancePushdownScanExec, LanceScanExec, Planner, ProjectionExec,
     ScanConfig, TakeExec,

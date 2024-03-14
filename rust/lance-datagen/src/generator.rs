@@ -7,7 +7,7 @@ use arrow::{
 use arrow_array::{
     make_array,
     types::{ArrowDictionaryKeyType, BinaryType, ByteArrayType, Utf8Type},
-    Array, FixedSizeListArray, RecordBatch, RecordBatchReader,
+    Array, FixedSizeBinaryArray, FixedSizeListArray, RecordBatch, RecordBatchReader, StringArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use rand::{Rng, RngCore, SeedableRng};
@@ -419,6 +419,60 @@ impl ArrayGenerator for CycleVectorGenerator {
         self.underlying_gen
             .element_size_bytes()
             .map(|byte_count| ByteCount::from(byte_count.0 * self.dimension.0 as u64))
+    }
+}
+
+#[derive(Default)]
+pub struct PseduoUuidGenerator {}
+
+impl ArrayGenerator for PseduoUuidGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        Ok(Arc::new(FixedSizeBinaryArray::try_from_iter(
+            (0..length.0).map(|_| {
+                let mut data = vec![0; 16];
+                rng.fill_bytes(&mut data);
+                data
+            }),
+        )?))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &DataType::FixedSizeBinary(16)
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        Some(ByteCount::from(16))
+    }
+}
+
+#[derive(Default)]
+pub struct PseduoUuidHexGenerator {}
+
+impl ArrayGenerator for PseduoUuidHexGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let mut data = vec![0; 16 * length.0 as usize];
+        rng.fill_bytes(&mut data);
+        let data_hex = hex::encode(data);
+
+        Ok(Arc::new(StringArray::from_iter_values(
+            (0..length.0 as usize).map(|i| data_hex.get(i * 32..(i + 1) * 32).unwrap()),
+        )))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &DataType::Utf8
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        Some(ByteCount::from(16))
     }
 }
 
@@ -898,8 +952,9 @@ impl BatchGeneratorBuilder {
     }
 
     /// Set the seed for the generator
-    pub fn with_seed(&mut self, seed: Seed) {
+    pub fn with_seed(mut self, seed: Seed) -> Self {
         self.seed = Some(seed);
+        self
     }
 
     /// Adds nulls (with the given probability) to all columns
@@ -1143,6 +1198,25 @@ pub mod array {
             }
             _ => panic!(),
         }
+    }
+
+    /// Create a generator of random UUIDs, stored as fixed size binary values
+    ///
+    /// Note, these are "pseudo UUIDs".  They are 16-byte randomish values but they
+    /// are not guaranteed to be unique.  We use a simplistic RNG that trades uniqueness
+    /// for speed.
+    pub fn rand_pseduo_uuid() -> Box<dyn ArrayGenerator> {
+        Box::<PseduoUuidGenerator>::default()
+    }
+
+    /// Create a generator of random UUIDs, stored as 32-character strings (hex encoding
+    /// of the 16-byte binary value)
+    ///
+    /// Note, these are "pseudo UUIDs".  They are 16-byte randomish values but they
+    /// are not guaranteed to be unique.  We use a simplistic RNG that trades uniqueness
+    /// for speed.
+    pub fn rand_pseduo_uuid_hex() -> Box<dyn ArrayGenerator> {
+        Box::<PseduoUuidHexGenerator>::default()
     }
 
     /// Create a generator of randomly sampled date32 values

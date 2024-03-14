@@ -23,7 +23,7 @@ use super::{memory::InMemoryVectorStorage, Graph, GraphNode, OrderedFloat};
 use crate::vector::graph::storage::VectorStorage;
 
 /// GraphNode during build.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GraphBuilderNode {
     /// Node ID
     pub(crate) id: u32,
@@ -74,6 +74,7 @@ impl From<&GraphBuilderNode> for GraphNode<u32> {
 ///
 /// [GraphBuilder] is used to build a graph in memory.
 ///
+#[derive(Clone)]
 pub struct GraphBuilder {
     pub(crate) nodes: HashMap<u32, GraphBuilderNode>,
 
