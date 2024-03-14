@@ -1363,12 +1363,7 @@ mod tests {
             .iter()
             .map(|f| f.id())
             .collect::<Vec<_>>();
-        // Fragment ids are assigned on task completion, but that isn't deterministic.
-        // But we can say the old fragment id=3 should be in the middle, and all
-        // the other ids should be greater than 6.
-        assert_eq!(fragment_ids[2], 3);
-        assert!(fragment_ids.iter().all(|id| *id > 6 || *id == 3));
-        dataset.validate().await.unwrap();
+        assert_eq!(fragment_ids, vec![3, 7, 8, 9, 10]);
     }
 
     #[tokio::test]
