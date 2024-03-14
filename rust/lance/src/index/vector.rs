@@ -27,6 +27,7 @@ mod utils;
 #[cfg(test)]
 mod fixture_test;
 
+use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::{hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
@@ -35,6 +36,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
+use self::hnsw::HNSWIndex;
 use self::{
     ivf::{build_ivf_hnsw_index, build_ivf_pq_index, remap_index_file, IVFIndex},
     pq::PQIndex,
@@ -115,6 +117,25 @@ impl VectorIndexParams {
             metric_type,
         }
     }
+
+    /// Create index parameters with `IVF`, `PQ` and `HNSW` parameters, respectively.
+    /// This is used for `IVF_HNSW_PQ` index.
+    pub fn with_ivf_hnsw_pq_params(
+        metric_type: MetricType,
+        ivf: IvfBuildParams,
+        hnsw: HnswBuildParams,
+        pq: PQBuildParams,
+    ) -> Self {
+        let stages = vec![
+            StageParams::Ivf(ivf),
+            StageParams::Hnsw(hnsw),
+            StageParams::PQ(pq),
+        ];
+        Self {
+            stages,
+            metric_type,
+        }
+    }
 }
 
 impl IndexParams for VectorIndexParams {
@@ -134,13 +155,13 @@ fn is_ivf_pq(stages: &[StageParams]) -> bool {
 }
 
 fn is_ivf_hnsw_pq(stages: &[StageParams]) -> bool {
-    if stages.len() < 3 {
+    if stages.len() < 2 {
         return false;
     }
     let len = stages.len();
 
-    matches!(&stages[len - 1], StageParams::Hnsw(_))
-        && matches!(&stages[len - 2], StageParams::PQ(_))
+    matches!(&stages[len - 1], StageParams::PQ(_))
+        && matches!(&stages[len - 2], StageParams::Hnsw(_))
         && matches!(&stages[len - 3], StageParams::Ivf(_))
 }
 
@@ -343,6 +364,16 @@ pub(crate) async fn open_vector_index(
                     message: "DiskANN support is removed from Lance.".to_string(),
                     location: location!(),
                 });
+            }
+            Some(Stage::Hnsw(hnsw_proto)) => {
+                if last_stage.is_some() {
+                    return Err(Error::Index {
+                        message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
+                        location: location!(),
+                    });
+                }
+                let hnsw = HNSW::empty();
+                last_stage = Some(Arc::new(HNSWIndex::try_new(hnsw, reader.clone()).await?));
             }
             _ => {}
         }

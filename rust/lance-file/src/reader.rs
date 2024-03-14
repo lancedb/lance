@@ -125,8 +125,8 @@ impl FileReader {
 
         Self::try_new_from_reader(
             path,
-            object_reader,
-            metadata,
+            object_reader.into(),
+            Some(metadata),
             schema,
             fragment_id,
             field_id_offset,
@@ -137,13 +137,18 @@ impl FileReader {
 
     pub async fn try_new_from_reader(
         path: &Path,
-        object_reader: Box<dyn Reader>,
-        metadata: Arc<Metadata>,
+        object_reader: Arc<dyn Reader>,
+        metadata: Option<Arc<Metadata>>,
         schema: Schema,
         fragment_id: u32,
         field_id_offset: u32,
         session: Option<&FileMetadataCache>,
     ) -> Result<Self> {
+        let metadata = match metadata {
+            Some(metadata) => metadata,
+            None => Self::read_metadata(object_reader.as_ref(), session).await?,
+        };
+
         let page_table = async {
             let num_fields = schema.max_field_id().unwrap_or_default() + 1 - field_id_offset as i32;
             Self::load_from_cache(session, path, |_| async {
@@ -165,7 +170,7 @@ impl FileReader {
         let (page_table, stats_page_table) = futures::try_join!(page_table, stats_page_table)?;
 
         Ok(Self {
-            object_reader: object_reader.into(),
+            object_reader: object_reader,
             metadata,
             schema,
             page_table,

@@ -12,15 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{any::Any, collections::HashMap, ops::Range, sync::Arc};
-
-use arrow::compute::take;
-use arrow_array::{
-    cast::AsArray, types::Float32Type, Array, Float32Array, RecordBatch, UInt32Array,
+use std::{
+    any::Any,
+    collections::HashMap,
+    fmt::{Debug, Formatter},
+    sync::Arc,
 };
 
+use arrow_array::{cast::AsArray, types::Float32Type, Float32Array, RecordBatch, UInt32Array};
+
 use arrow_schema::DataType;
-use arrow_select::concat::concat_batches;
 use async_trait::async_trait;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
@@ -36,11 +37,13 @@ use lance_index::{
     optimize::OptimizeOptions,
     vector::{
         graph::{memory::InMemoryVectorStorage, VectorStorage, NEIGHBORS_FIELD},
-        hnsw::{builder::HnswBuildParams, HNSWBuilder, HNSW, VECTOR_ID_FIELD},
+        hnsw::{builder::HnswBuildParams, HNSWBuilder, HnswMetadata, HNSW, VECTOR_ID_FIELD},
+        ivf::storage::IVF_PARTITION_KEY,
         Query, DIST_COL,
     },
     Index, IndexType,
 };
+use lance_io::traits::Reader;
 use lance_linalg::{
     distance::{Cosine, Dot, MetricType, L2},
     MatrixView,
@@ -52,30 +55,67 @@ use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
 use snafu::{location, Location};
-use tracing::{instrument, span, Level};
-use uuid::Uuid;
+use tokio::sync::Mutex;
+use tracing::instrument;
 
 #[cfg(feature = "opq")]
 use super::opq::train_opq;
 use super::{pq::PQIndex, utils::maybe_sample_training_data, VectorIndex};
-use crate::dataset::builder::DatasetBuilder;
-use crate::{
-    dataset::Dataset,
-    index::{pb, prefilter::PreFilter, INDEX_FILE_NAME},
-    session::Session,
-};
+use crate::index::prefilter::PreFilter;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HNSWIndex {
     hnsw: HNSW,
-    storage: Arc<dyn VectorStorage>,
+    storage: Option<Arc<dyn VectorStorage>>,
+    partition_metadata: Option<Vec<HnswMetadata>>,
+}
+
+impl Debug for HNSWIndex {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.hnsw.fmt(f)
+    }
 }
 
 impl HNSWIndex {
-    pub fn new(hnsw: HNSW) -> Self {
-        Self {
+    pub async fn try_new(hnsw: HNSW, reader: Arc<dyn Reader>) -> Result<Self> {
+        let schema = Schema::try_from(&arrow_schema::Schema::new(vec![
+            NEIGHBORS_FIELD.clone(),
+            VECTOR_ID_FIELD.clone(),
+        ]))?;
+
+        let reader = FileReader::try_new_from_reader(
+            reader.path(),
+            reader.clone(),
+            None,
+            schema,
+            0,
+            0,
+            None,
+        )
+        .await?;
+
+        let partition_metadata = match reader.schema().metadata.get(IVF_PARTITION_KEY) {
+            Some(json) => {
+                let metadata: Vec<HnswMetadata> = serde_json::from_str(json)?;
+                Some(metadata)
+            }
+            None => None,
+        };
+
+        Ok(Self {
             hnsw,
-            // row_ids: None,
+            storage: None,
+            partition_metadata: partition_metadata,
+        })
+    }
+
+    fn get_partition_metadata(&self, partition_id: usize) -> Result<HnswMetadata> {
+        match self.partition_metadata {
+            Some(ref metadata) => Ok(metadata[partition_id].clone()),
+            None => Err(Error::Index {
+                message: "No partition metadata found".to_string(),
+                location: location!(),
+            }),
         }
     }
 }
@@ -158,28 +198,49 @@ impl VectorIndex for HNSWIndex {
         offset: usize,
         length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
-        let reader = reader
-            .as_any()
-            .downcast_ref::<FileReader>()
-            .expect("the reader for HNSW must be a FileReader");
+        Err(Error::Index {
+            message: "Loading HNSW index from file not supported".to_string(),
+            location: location!(),
+        })
+    }
 
+    async fn load_partition(
+        &self,
+        reader: Arc<dyn Reader>,
+        offset: usize,
+        length: usize,
+        partition_id: usize,
+    ) -> Result<Box<dyn VectorIndex>> {
         let schema = Schema::try_from(&arrow_schema::Schema::new(vec![
             NEIGHBORS_FIELD.clone(),
             VECTOR_ID_FIELD.clone(),
         ]))?;
 
-        let hnsw = HNSW::load(
-            reader,
+        let reader = FileReader::try_new_from_reader(
+            reader.path(),
+            reader.clone(),
+            None,
+            schema,
+            0,
+            0,
+            None,
+        )
+        .await?;
+
+        let metadata = self.get_partition_metadata(partition_id)?;
+        let hnsw = HNSW::load_partition(
+            &reader,
             offset..length,
             self.metric_type(),
-            self.storage,
+            self.storage.clone().unwrap(),
             metadata,
         )
-        .await;
+        .await?;
 
         Ok(Box::new(Self {
             hnsw,
-            // row_ids: Some(row_ids),
+            storage: self.storage.clone(),
+            partition_metadata: self.partition_metadata.clone(),
         }))
     }
 

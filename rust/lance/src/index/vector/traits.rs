@@ -72,12 +72,12 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     async fn load_partition(
         &self,
-        reader: &dyn Reader,
+        reader: Arc<dyn Reader>,
         offset: usize,
         length: usize,
-        partition_id: u32,
+        partition_id: usize,
     ) -> Result<Box<dyn VectorIndex>> {
-        self.load(reader, offset, length).await
+        self.load(reader.as_ref(), offset, length).await
     }
 
     /// Load the index with metadata
