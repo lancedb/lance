@@ -29,13 +29,13 @@ use datafusion_common::{
 use prost::Message;
 use snafu::{location, Location};
 
-use lance_core::{Error, Result};
-use substrait::proto::{
+use datafusion_substrait::substrait::proto::{
     expression_reference::ExprType,
     plan_rel::RelType,
     read_rel::{NamedTable, ReadType},
     rel, ExtendedExpression, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelRoot,
 };
+use lance_core::{Error, Result};
 
 const MS_PER_DAY: i64 = 86400000;
 

@@ -36,6 +36,7 @@ macro_rules! ok_or_throw {
 
 mod blocking_dataset;
 pub mod error;
+mod ffi;
 mod fragment;
 mod traits;
 

@@ -25,7 +25,10 @@ use arrow_select::concat::concat;
 use clap::Parser;
 use futures::StreamExt;
 use lance::Dataset;
-use lance_index::vector::{graph::memory::InMemoryVectorStorage, hnsw::HNSWBuilder};
+use lance_index::vector::{
+    graph::memory::InMemoryVectorStorage,
+    hnsw::{builder::HnswBuildParams, HNSWBuilder},
+};
 use lance_linalg::{distance::MetricType, MatrixView};
 
 #[derive(Parser, Debug)]
@@ -92,13 +95,16 @@ async fn main() {
 
     for ef_construction in [15, 30, 50] {
         let now = std::time::Instant::now();
-        let hnsw = HNSWBuilder::new(vector_store.clone())
-            .max_level(args.max_level)
-            .num_edges(15)
-            .max_num_edges(args.max_edges)
-            .ef_construction(ef_construction)
-            .build()
-            .unwrap();
+        let hnsw = HNSWBuilder::with_params(
+            HnswBuildParams::default()
+                .max_level(args.max_level)
+                .num_edges(15)
+                .max_num_edges(args.max_edges)
+                .ef_construction(ef_construction),
+            vector_store.clone(),
+        )
+        .build()
+        .unwrap();
         let construct_time = now.elapsed().as_secs_f32();
         let now = std::time::Instant::now();
         let results: HashSet<u32> = hnsw

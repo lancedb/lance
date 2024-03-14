@@ -24,8 +24,8 @@ lance-arrow.workspace = true
 lance-core = { workspace = true, features = ["datafusion"] }
 prost.workspace = true
 snafu.workspace = true
-substrait.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 substrait-expr.workspace = true
+

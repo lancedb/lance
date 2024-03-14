@@ -32,15 +32,15 @@ public class Fragment {
   private native int countRowsNative(Dataset dataset, long fragmentId);
 
   public int getFragmentId() {
-    return this.fragmentId;
+    return fragmentId;
   }
 
   public String toString() {
-    return String.format("Fragment(id=%d)", this.fragmentId);
+    return String.format("Fragment(id=%d)", fragmentId);
   }
 
   /** Count rows in this Fragment. */
   public int countRows() {
-    return countRowsNative(this.dataset, this.fragmentId);
+    return countRowsNative(dataset, fragmentId);
   }
 }

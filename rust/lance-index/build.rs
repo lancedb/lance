@@ -22,7 +22,12 @@ fn main() -> Result<()> {
     prost_build.protoc_arg("--experimental_allow_proto3_optional");
     prost_build.compile_protos(&["./protos/index.proto"], &["./protos"])?;
 
-    let rust_toolchain = env::var("RUSTUP_TOOLCHAIN").unwrap();
+    let rust_toolchain = env::var("RUSTUP_TOOLCHAIN")
+        .or_else(|e| match e {
+            env::VarError::NotPresent => Ok("stable".into()),
+            e => Err(e),
+        })
+        .unwrap();
     if rust_toolchain.starts_with("nightly") {
         // enable the 'nightly' feature flag
         println!("cargo:rustc-cfg=feature=\"nightly\"");

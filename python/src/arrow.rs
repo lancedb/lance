@@ -14,20 +14,13 @@
 
 use std::sync::Arc;
 
-use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::pyarrow::*;
-use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
+use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use half::bf16;
 use lance::arrow::bfloat16::BFloat16Array;
 use lance_arrow::bfloat16::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
-use pyo3::{
-    exceptions::PyValueError,
-    ffi::Py_uintptr_t,
-    prelude::*,
-    pyclass::CompareOp,
-    types::{PyTuple, PyType},
-};
+use pyo3::{exceptions::PyValueError, prelude::*, pyclass::CompareOp, types::PyType};
 
 #[pyclass]
 pub struct BFloat16(bf16);
@@ -94,35 +87,4 @@ pub fn bfloat16_array(values: Vec<Option<f32>>, py: Python<'_>) -> PyResult<PyOb
 
     let pyarrow_batch = batch.to_pyarrow(py)?;
     pyarrow_batch.call_method1(py, "__getitem__", ("bfloat16",))
-}
-
-/// Temporary solution until arrow-rs 47.0.0 is released.
-/// https://github.com/apache/arrow-rs/blob/878217b9e330b4f1ed13e798a214ea11fbeb2bbb/arrow/src/pyarrow.rs#L318
-///
-/// TODO: replace this method with `Box<RecordBatchReader>::into_pyarrow()`
-/// once arrow-rs 47.0.0 is released.
-pub fn reader_to_pyarrow(
-    py: Python,
-    reader: Box<dyn RecordBatchReader + Send>,
-) -> PyResult<PyObject> {
-    let mut stream = FFI_ArrowArrayStream::new(reader);
-
-    let stream_ptr = (&mut stream) as *mut FFI_ArrowArrayStream;
-    let module = py.import("pyarrow")?;
-    let class = module.getattr("RecordBatchReader")?;
-    let args = PyTuple::new(py, [stream_ptr as Py_uintptr_t]);
-    let reader = class.call_method1("_import_from_c", args)?;
-
-    Ok(PyObject::from(reader))
-}
-
-/// Temporary solution until arrow-rs 47.0.0 is released.
-/// https://github.com/apache/arrow-rs/pull/4806
-///
-/// TODO: replace this method once arrow-rs 47.0.0 is released.
-pub fn record_batch_to_pyarrow(py: Python<'_>, batch: &RecordBatch) -> PyResult<PyObject> {
-    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
-    let reader: Box<dyn RecordBatchReader + Send> = Box::new(reader);
-    let py_reader = reader_to_pyarrow(py, reader)?;
-    py_reader.call_method0(py, "read_next_batch")
 }

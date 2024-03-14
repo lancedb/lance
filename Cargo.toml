@@ -18,7 +18,7 @@ exclude = ["python"]
 resolver = "2"
 
 [workspace.package]
-version = "0.10.2"
+version = "0.10.3"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -41,18 +41,18 @@ categories = [
 rust-version = "1.75"
 
 [workspace.dependencies]
-lance = { version = "=0.10.2", path = "./rust/lance" }
-lance-arrow = { version = "=0.10.2", path = "./rust/lance-arrow" }
-lance-core = { version = "=0.10.2", path = "./rust/lance-core" }
-lance-datafusion = { version = "=0.10.2", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=0.10.2", path = "./rust/lance-datagen" }
-lance-file = { version = "=0.10.2", path = "./rust/lance-file" }
-lance-index = { version = "=0.10.2", path = "./rust/lance-index" }
-lance-io = { version = "=0.10.2", path = "./rust/lance-io" }
-lance-linalg = { version = "=0.10.2", path = "./rust/lance-linalg" }
-lance-table = { version = "=0.10.2", path = "./rust/lance-table" }
-lance-test-macros = { version = "=0.10.2", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=0.10.2", path = "./rust/lance-testing" }
+lance = { version = "=0.10.3", path = "./rust/lance" }
+lance-arrow = { version = "=0.10.3", path = "./rust/lance-arrow" }
+lance-core = { version = "=0.10.3", path = "./rust/lance-core" }
+lance-datafusion = { version = "=0.10.3", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=0.10.3", path = "./rust/lance-datagen" }
+lance-file = { version = "=0.10.3", path = "./rust/lance-file" }
+lance-index = { version = "=0.10.3", path = "./rust/lance-index" }
+lance-io = { version = "=0.10.3", path = "./rust/lance-io" }
+lance-linalg = { version = "=0.10.3", path = "./rust/lance-linalg" }
+lance-table = { version = "=0.10.3", path = "./rust/lance-table" }
+lance-test-macros = { version = "=0.10.3", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=0.10.3", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "50.0.0", optional = false, features = ["prettyprint"] }
@@ -83,14 +83,15 @@ chrono = { version = "0.4.25", default-features = false, features = [
     "now"
 ] }
 criterion = { version = "0.5", features = ["async", "async_tokio"] }
-datafusion = { version = "35.0.0", default-features = false, features = [
+datafusion = { version = "36.0.0", default-features = false, features = [
     "regex_expressions",
 ] }
-datafusion-common = "35.0"
-datafusion-sql = "35.0"
-datafusion-expr = "35.0"
-datafusion-physical-expr = "35.0"
-datafusion-substrait = "35.0"
+datafusion-common = "36.0"
+datafusion-sql = "36.0"
+datafusion-expr = "36.0"
+datafusion-execution = "36.0"
+datafusion-physical-expr = "36.0"
+datafusion-substrait = "36.0"
 either = "1.0"
 futures = "0.3"
 http = "0.2.9"
@@ -116,7 +117,6 @@ serde = { version = "^1" }
 serde_json = { version = "1" }
 shellexpand = "3.0"
 snafu = "0.7.4"
-substrait = "0.22.1"
 substrait-expr = "0.2.0"
 tempfile = "3"
 tokio = { version = "1.23", features = [
@@ -125,6 +125,8 @@ tokio = { version = "1.23", features = [
     "fs",
     "sync",
 ] }
+tokio-stream = "0.1.14"
+tokio-util = { version = "0.7.10" }
 tracing = "0.1"
 url = "2.3"
 uuid = { version = "1.2", features = ["v4", "serde"] }

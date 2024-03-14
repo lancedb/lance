@@ -17,16 +17,16 @@ mod optimizer;
 mod planner;
 mod projection;
 mod pushdown_scan;
-mod scalar_index;
+pub mod scalar_index;
 mod scan;
 mod take;
 #[cfg(test)]
 pub mod testing;
+pub mod utils;
 
 pub use knn::*;
 pub use planner::{FilterPlan, Planner};
 pub use projection::ProjectionExec;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
-pub use scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 pub use scan::LanceScanExec;
 pub use take::TakeExec;
