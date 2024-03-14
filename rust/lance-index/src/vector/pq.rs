@@ -29,7 +29,7 @@ use lance_linalg::{distance::MetricType, MatrixView};
 use snafu::{location, Location};
 pub mod builder;
 mod distance;
-pub(crate) mod storage;
+pub mod storage;
 pub mod transform;
 pub(crate) mod utils;
 

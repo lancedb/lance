@@ -101,10 +101,11 @@ pub(super) async fn build_partitions(
 ///
 ///
 #[allow(clippy::too_many_arguments)]
-#[instrument(level = "debug", skip(writer, data, ivf, pq))]
+#[instrument(level = "debug", skip(data, ivf, pq))]
 pub(super) async fn build_hnsw_partitions(
     dataset: &Dataset,
     writer: &mut FileWriter<ManifestDescribing>,
+    auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
     ivf: &mut Ivf,
@@ -159,7 +160,9 @@ pub(super) async fn build_hnsw_partitions(
         metric_type,
         hnsw_params,
         writer,
+        auxiliary_writer,
         ivf,
+        pq,
         Some(stream),
         None,
     )

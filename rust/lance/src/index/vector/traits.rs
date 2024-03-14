@@ -70,6 +70,15 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         length: usize,
     ) -> Result<Box<dyn VectorIndex>>;
 
+    /// Load the index with metadata
+    // async fn load_with_metadata(
+    //     &self,
+    //     reader: &dyn Reader,
+    //     offset: usize,
+    //     length: usize,
+    //     // metadata:
+    // )
+
     /// Remap the index according to mapping
     ///
     /// Each item in mapping describes an old row id -> new row id

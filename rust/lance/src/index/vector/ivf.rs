@@ -36,7 +36,7 @@ use futures::{
     Stream, TryStreamExt,
 };
 use lance_arrow::*;
-use lance_core::{datatypes::Field, Error, Result};
+use lance_core::{datatypes::Field, Error, Result, ROW_ID_FIELD};
 use lance_file::{
     format::{MAGIC, MAJOR_VERSION, MINOR_VERSION},
     writer::{FileWriter, FileWriterOptions},
@@ -53,9 +53,9 @@ use lance_index::{
             IvfBuildParams,
         },
         pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
-        Query, DIST_COL,
+        Query, DIST_COL, PQ_CODE_COLUMN,
     },
-    Index, IndexType,
+    Index, IndexType, INDEX_AUXILIARY_FILE_NAME,
 };
 use lance_io::{
     encodings::plain::PlainEncoder,
@@ -1238,12 +1238,33 @@ async fn write_ivf_hnsw_file(
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
     let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
 
+    let aux_path = dataset
+        .indices_dir()
+        .child(uuid)
+        .child(INDEX_AUXILIARY_FILE_NAME);
+    let aux_writer = object_store.create(&aux_path).await?;
+    let schema = Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        arrow_schema::Field::new(
+            PQ_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
+                pq.num_sub_vectors() as i32,
+            ),
+            false,
+        ),
+    ]);
+    let schema = lance_core::datatypes::Schema::try_from(&schema)?;
+    let mut aux_writer =
+        FileWriter::with_object_writer(aux_writer, schema, &FileWriterOptions::default())?;
+
     let start = std::time::Instant::now();
     let num_partitions = ivf.num_partitions() as u32;
 
     let hnsw_metadata = builder::build_hnsw_partitions(
         dataset,
         &mut writer,
+        Some(&mut aux_writer),
         stream,
         column,
         &mut ivf,

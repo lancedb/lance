@@ -96,7 +96,7 @@ impl Index for HNSWIndex {
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(json!({
             "index_type": "HNSW",
-            "metric_type": self.hnsw.metric_type().to_string(),
+            "metric_type": self.metric_type().to_string(),
         }))
     }
 

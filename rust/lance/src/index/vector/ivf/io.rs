@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::{cmp::Reverse, pin::Pin};
 
+use arrow::compute::concat;
 use arrow::datatypes::Float32Type;
 use arrow_array::{
     cast::AsArray, types::UInt64Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
@@ -26,6 +27,8 @@ use futures::{Stream, StreamExt};
 use lance_arrow::*;
 use lance_core::Error;
 use lance_file::writer::FileWriter;
+use lance_index::vector::pq::storage::ProductQuantizationStorage;
+use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::{
     graph::memory::InMemoryVectorStorage,
     hnsw::{builder::HnswBuildParams, HNSWBuilder, HnswMetadata},
@@ -229,7 +232,9 @@ pub(super) async fn write_hnsw_index_partitions(
     metric_type: MetricType,
     hnsw_params: &HnswBuildParams,
     writer: &mut FileWriter<ManifestDescribing>,
+    auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
     ivf: &mut Ivf,
+    pq: Arc<dyn ProductQuantizer>,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
     existing_indices: Option<&[&IVFIndex]>,
 ) -> Result<Vec<HnswMetadata>> {
@@ -282,7 +287,6 @@ pub(super) async fn write_hnsw_index_partitions(
         )
         .await?;
 
-        let total_records = row_id_array.iter().map(|a| a.len()).sum::<usize>();
         let offset = writer.len();
 
         let projection = dataset.schema().project(&[column])?;
@@ -305,6 +309,31 @@ pub(super) async fn write_hnsw_index_partitions(
         let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), metric_type));
         let mut hnsw_builder = HNSWBuilder::with_params(hnsw_params.clone(), vec_store);
         let hnsw = hnsw_builder.build()?;
+
+        if let Some(writer) = auxiliary_writer {
+            let pq_array = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+            let row_id_array = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+            let pq_column = concat(&pq_array)?;
+            let row_ids_column = concat(&row_id_array)?;
+            let pq_batch = RecordBatch::try_from_iter(vec![
+                (PQ_CODE_COLUMN, pq_column),
+                (ROW_ID, row_ids_column),
+            ])?;
+            let pq_store = ProductQuantizationStorage::new(
+                pq.codebook_as_fsl()
+                    .values()
+                    .as_primitive::<Float32Type>()
+                    .clone()
+                    .into(),
+                pq_batch,
+                pq.num_bits(),
+                pq.num_sub_vectors(),
+                pq.dimension(),
+                metric_type,
+            )?;
+
+            pq_store.write_partition(writer).await?;
+        }
 
         hnsw.write_levels(writer).await?;
         hnsw_metadata.push(hnsw.metadata());
