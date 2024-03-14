@@ -499,8 +499,15 @@ pub async fn plan_compaction(
     dataset: &Dataset,
     options: &CompactionOptions,
 ) -> Result<CompactionPlan> {
-    // We assume here that get_fragments is returning the fragments in a
-    // meaningful order that we want to preserve.
+    // get_fragments should be returning fragments in sorted order (by id)
+    // and fragment ids should be unique
+    debug_assert!(
+        dataset
+            .get_fragments()
+            .windows(2)
+            .all(|w| w[0].id() < w[1].id()),
+        "fragments in manifest are not sorted"
+    );
     let mut fragment_metrics = futures::stream::iter(dataset.get_fragments())
         .map(|fragment| async move {
             match collect_metrics(&fragment).await {

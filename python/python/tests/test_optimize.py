@@ -14,6 +14,7 @@
 import pickle
 import random
 import re
+import threading
 from pathlib import Path
 
 import lance
@@ -55,6 +56,46 @@ def create_table(min, max, nvec, ndim=8):
         "id": np.arange(0, nvec),
     })
     return tbl
+
+
+def test_compact_with_write(tmp_path: Path):
+    # This test creates a dataset with a manifest containing fragments
+    # that are not in sorted order (by id)
+    #
+    # We do this by runnign compaction concurrently with append
+    #
+    # This is because compaction first reserves a fragment id.  Then the
+    # concurrent writes grab later ids and commit them.  Then the compaction
+    # commits with its earlier id.
+    #
+    # In the next compaction we should detect this, and reorder the fragments
+    # when writing the compacted file.
+    base_dir = tmp_path / "dataset"
+    NUM_FRAGS = 5
+    ROWS_PER_FRAG = 300
+
+    # First, create some data
+    data = create_table(min=0, max=1, nvec=ROWS_PER_FRAG)
+    dataset = lance.write_dataset(data, base_dir)
+    for _ in range(NUM_FRAGS):
+        lance.write_dataset(data, base_dir, mode="append")
+
+    # Now, run compaction at the same time as creating new data
+    def do_compaction():
+        dataset = lance.dataset(base_dir)
+        dataset.optimize.compact_files()
+
+    compact_thread = threading.Thread(target=do_compaction)
+    compact_thread.start()
+    for _ in range(NUM_FRAGS):
+        lance.write_dataset(data, base_dir, mode="append")
+    compact_thread.join()
+
+    # Now, run compaction again, this should succeed
+    dataset = lance.dataset(base_dir)
+    dataset.optimize.compact_files()
+
+    assert dataset.to_table().num_rows == ROWS_PER_FRAG * (NUM_FRAGS * 2 + 1)
 
 
 def test_index_remapping(tmp_path: Path):
