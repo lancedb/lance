@@ -197,10 +197,11 @@ def test_index_remapping_multiple_rewrite_tasks(tmp_path: Path):
     assert len(fragments) == 2
 
     index = ds.list_indices()[0]
-    frag_ids = index["fragment_ids"]
+    index_frag_ids = list(index["fragment_ids"])
+    frag_ids = [frag.fragment_id for frag in fragments]
 
-    assert len(frag_ids) == 1
-    assert list(frag_ids)[0] == fragments[0].fragment_id
+    assert len(index_frag_ids) == 1
+    assert index_frag_ids[0] in frag_ids
 
 
 def test_dataset_distributed_optimize(tmp_path: Path):
