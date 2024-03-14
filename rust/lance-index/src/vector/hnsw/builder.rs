@@ -200,7 +200,8 @@ impl HNSWBuilder {
         let mut ep = vec![ep];
         for cur_level in self.levels.iter_mut().rev().skip(levels_to_search) {
             cur_level.insert(node);
-            let candidates = beam_search(cur_level, &ep, vector, self.params.ef_construction)?;
+            let candidates =
+                beam_search(cur_level, &ep, vector, self.params.ef_construction, None)?;
             let neighbors: Vec<_> = if self.params.use_select_heuristic {
                 select_neighbors_heuristic(
                     cur_level,
