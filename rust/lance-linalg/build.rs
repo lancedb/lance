@@ -69,8 +69,8 @@ fn main() -> Result<(), String> {
         // While GCC doesn't have support for _Float16 until GCC 12, clang
         // has support for __fp16 going back to at least clang 6.
         // We use haswell since it's the oldest CPUs on AWS.
-        if let Err(_) = build_f16_with_flags("avx2", &["-march=haswell"]) {
-            Err("Unable to build f16 kernels.  Please use Clang >= 6 or GCC >= 12 or remove the fp16kernels feature".to_string())
+        if let Err(err) = build_f16_with_flags("avx2", &["-march=haswell"]) {
+            Err(format!("Unable to build f16 kernels.  Please use Clang >= 6 or GCC >= 12 or remove the fp16kernels feature.  Received error: {}", err))
         } else {
             Ok(())
         }
