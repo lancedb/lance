@@ -23,44 +23,28 @@ use arrow_array::{cast::AsArray, types::Float32Type, Float32Array, RecordBatch, 
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
-use lance_core::{
-    datatypes::{Field, Schema},
-    Error, Result, ROW_ID_FIELD,
-};
-use lance_file::{
-    format::{MAGIC, MAJOR_VERSION, MINOR_VERSION},
-    reader::FileReader,
-};
+use lance_core::{datatypes::Schema, Error, Result};
+use lance_file::reader::FileReader;
 use lance_index::{
-    optimize::OptimizeOptions,
     vector::{
-        graph::{memory::InMemoryVectorStorage, VectorStorage, NEIGHBORS_FIELD},
-        hnsw::{builder::HnswBuildParams, HNSWBuilder, HnswMetadata, HNSW, VECTOR_ID_FIELD},
+        graph::{VectorStorage, NEIGHBORS_FIELD},
+        hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
         Query, DIST_COL,
     },
     Index, IndexType,
 };
 use lance_io::traits::Reader;
-use lance_linalg::{
-    distance::{Cosine, Dot, MetricType, L2},
-    MatrixView,
-};
-use log::{debug, info};
-use object_store::{memory::InMemory, path::Path};
-use rand::{rngs::SmallRng, SeedableRng};
+use lance_linalg::distance::MetricType;
 use roaring::RoaringBitmap;
-use serde::Serialize;
 use serde_json::json;
 use snafu::{location, Location};
-use tokio::sync::Mutex;
 use tracing::instrument;
 
 #[cfg(feature = "opq")]
 use super::opq::train_opq;
-use super::{pq::PQIndex, utils::maybe_sample_training_data, VectorIndex};
+use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 
 #[derive(Clone)]
@@ -162,6 +146,7 @@ impl VectorIndex for HNSWIndex {
             query.key.as_primitive::<Float32Type>().as_slice(),
             query.k,
             30,
+            None,
         )?;
 
         let node_ids = UInt32Array::from_iter_values(results.iter().map(|x| x.0));

@@ -236,6 +236,11 @@ impl HNSW {
         self.levels[0].len()
     }
 
+    /// Whether the graph is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Metric type of the graph.
     pub fn metric_type(&self) -> MetricType {
         self.metric_type

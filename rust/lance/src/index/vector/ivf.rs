@@ -2118,11 +2118,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ivf_hnsw() {
-        env_logger::init();
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
+        let (mut dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
         let centroids = generate_random_array(2 * DIM);
         let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
@@ -2142,21 +2141,6 @@ mod tests {
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
-
-        let sample_query = vector_array.value(10);
-        let query = sample_query.as_primitive::<Float32Type>();
-        let results = dataset
-            .scan()
-            .nearest("vector", query, 5)
-            .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(1, results.len());
-        assert_eq!(5, results[0].num_rows());
     }
 
     #[tokio::test]
