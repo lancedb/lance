@@ -63,21 +63,19 @@ fn main() -> Result<(), String> {
             // We create a special cfg so that we can detect we have in fact
             // generated the AVX512 version of the f16 kernels.
             println!("cargo:rustc-cfg=kernel_suppport=\"avx512\"");
-            return Ok(());
         };
         // Build a version with AVX
         // While GCC doesn't have support for _Float16 until GCC 12, clang
         // has support for __fp16 going back to at least clang 6.
         // We use haswell since it's the oldest CPUs on AWS.
         if let Err(err) = build_f16_with_flags("avx2", &["-march=haswell"]) {
-            Err(format!("Unable to build f16 kernels.  Please use Clang >= 6 or GCC >= 12 or remove the fp16kernels feature.  Received error: {}", err))
-        } else {
-            Ok(())
-        }
+            return Err(format!("Unable to build f16 kernels.  Please use Clang >= 6 or GCC >= 12 or remove the fp16kernels feature.  Received error: {}", err));
+        };
         // There is no SSE instruction set for f16 -> f32 float conversion
     } else {
         return Err("Unable to build f16 kernels on given target_arch.  Please use x86_64 or aarch64 or remove the fp16kernels feature".to_string());
     }
+    Ok(())
 }
 
 fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
