@@ -17,7 +17,6 @@
 use std::{
     any::Any,
     collections::HashMap,
-    default,
     sync::{Arc, Weak},
 };
 
@@ -33,7 +32,7 @@ use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
 use futures::{
     stream::{self, StreamExt},
-    Stream, TryStreamExt,
+    TryStreamExt,
 };
 use lance_arrow::*;
 use lance_core::{datatypes::Field, Error, Result, ROW_ID_FIELD};
@@ -52,7 +51,7 @@ use lance_index::{
             storage::{IvfData, IVF_PARTITION_KEY},
             IvfBuildParams,
         },
-        pq::{PQBuildParams, ProductQuantizer, ProductQuantizerImpl},
+        pq::{PQBuildParams, ProductQuantizer},
         Query, DIST_COL, PQ_CODE_COLUMN,
     },
     Index, IndexType, INDEX_AUXILIARY_FILE_NAME,
@@ -74,7 +73,7 @@ use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
 use snafu::{location, Location};
-use tracing::{instrument, span, Level};
+use tracing::instrument;
 use uuid::Uuid;
 
 use super::{
@@ -575,80 +574,6 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
         })
     }
 }
-
-/// Ivf HNSW index metadata
-#[derive(Debug)]
-pub struct IvfHNSWIndexMetadata {
-    /// Index name
-    name: String,
-
-    /// The column to build the index for.
-    column: String,
-
-    /// Vector dimension.
-    dimension: u32,
-
-    /// The version of dataset where this index was built.
-    dataset_version: u64,
-
-    /// Metric to compute distance
-    pub(crate) metric_type: MetricType,
-
-    /// IVF model
-    pub(crate) ivf: Ivf,
-
-    /// Product Quantizer
-    pub(crate) pq: Arc<dyn ProductQuantizer>,
-
-    /// Transforms to be applied before search.
-    transforms: Vec<pb::Transform>,
-}
-
-/// Convert a IvfHNSWIndex to protobuf payload
-impl TryFrom<&IvfHNSWIndexMetadata> for pb::Index {
-    type Error = Error;
-
-    fn try_from(idx: &IvfHNSWIndexMetadata) -> Result<Self> {
-        let mut stages: Vec<pb::VectorIndexStage> = idx
-            .transforms
-            .iter()
-            .map(|tf| {
-                Ok(pb::VectorIndexStage {
-                    stage: Some(pb::vector_index_stage::Stage::Transform(tf.clone())),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        stages.extend_from_slice(&[
-            pb::VectorIndexStage {
-                stage: Some(pb::vector_index_stage::Stage::Ivf(pb::Ivf::try_from(
-                    &idx.ivf,
-                )?)),
-            },
-            pb::VectorIndexStage {
-                stage: Some(pb::vector_index_stage::Stage::Hnsw(pb::Hnsw {})),
-            },
-        ]);
-
-        Ok(Self {
-            name: idx.name.clone(),
-            columns: vec![idx.column.clone()],
-            dataset_version: idx.dataset_version,
-            index_type: pb::IndexType::Vector.into(),
-            implementation: Some(pb::index::Implementation::VectorIndex(pb::VectorIndex {
-                spec_version: 1,
-                dimension: idx.dimension,
-                stages,
-                metric_type: match idx.metric_type {
-                    MetricType::L2 => pb::VectorMetricType::L2.into(),
-                    MetricType::Cosine => pb::VectorMetricType::Cosine.into(),
-                    MetricType::Dot => pb::VectorMetricType::Dot.into(),
-                },
-            })),
-        })
-    }
-}
-
 /// Ivf Model
 #[derive(Debug, Clone)]
 pub(crate) struct Ivf {

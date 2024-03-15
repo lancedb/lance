@@ -70,6 +70,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         length: usize,
     ) -> Result<Box<dyn VectorIndex>>;
 
+    /// Load the partition from the reader on-demand.
     async fn load_partition(
         &self,
         reader: Arc<dyn Reader>,
@@ -79,15 +80,6 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ) -> Result<Box<dyn VectorIndex>> {
         self.load(reader.as_ref(), offset, length).await
     }
-
-    /// Load the index with metadata
-    // async fn load_with_metadata(
-    //     &self,
-    //     reader: &dyn Reader,
-    //     offset: usize,
-    //     length: usize,
-    //     // metadata:
-    // )
 
     /// Remap the index according to mapping
     ///

@@ -365,16 +365,6 @@ pub(crate) async fn open_vector_index(
                     location: location!(),
                 });
             }
-            Some(Stage::Hnsw(hnsw_proto)) => {
-                if last_stage.is_some() {
-                    return Err(Error::Index {
-                        message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
-                        location: location!(),
-                    });
-                }
-                let hnsw = HNSW::empty();
-                last_stage = Some(Arc::new(HNSWIndex::try_new(hnsw, reader.clone()).await?));
-            }
             _ => {}
         }
     }
