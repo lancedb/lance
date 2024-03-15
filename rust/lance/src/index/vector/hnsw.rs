@@ -36,7 +36,7 @@ use lance_index::{
     Index, IndexType,
 };
 use lance_io::traits::Reader;
-use lance_linalg::distance::MetricType;
+use lance_linalg::distance::DistanceType;
 use roaring::RoaringBitmap;
 use serde_json::json;
 use snafu::{location, Location};
@@ -120,7 +120,7 @@ impl Index for HNSWIndex {
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(json!({
             "index_type": "HNSW",
-            "metric_type": self.metric_type().to_string(),
+            "distance_type": self.metric_type().to_string(),
         }))
     }
 
@@ -252,7 +252,7 @@ impl VectorIndex for HNSWIndex {
         })
     }
 
-    fn metric_type(&self) -> MetricType {
-        self.hnsw.metric_type()
+    fn metric_type(&self) -> DistanceType {
+        self.hnsw.distance_type()
     }
 }

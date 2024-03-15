@@ -33,7 +33,7 @@ use itertools::Itertools;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::object_store::ObjectStore;
-use lance_linalg::distance::MetricType;
+use lance_linalg::distance::{DistanceType, MetricType};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
@@ -189,7 +189,7 @@ impl Graph for HnswLevel {
 #[derive(Clone)]
 pub struct HNSW {
     levels: Vec<HnswLevel>,
-    metric_type: MetricType,
+    distance_type: MetricType,
     /// Entry point of the graph.
     entry_point: u32,
 
@@ -204,7 +204,7 @@ impl Debug for HNSW {
             f,
             "HNSW(max_layers: {}, metric={})",
             self.levels.len(),
-            self.metric_type
+            self.distance_type
         )
     }
 }
@@ -227,7 +227,7 @@ impl HNSW {
     pub fn empty() -> Self {
         Self {
             levels: vec![],
-            metric_type: MetricType::L2,
+            distance_type: MetricType::L2,
             entry_point: 0,
             use_select_heuristic: true,
         }
@@ -244,8 +244,8 @@ impl HNSW {
     }
 
     /// Metric type of the graph.
-    pub fn metric_type(&self) -> MetricType {
-        self.metric_type
+    pub fn distance_type(&self) -> DistanceType {
+        self.distance_type
     }
 
     /// Load the HNSW graph from a [FileReader].
@@ -287,7 +287,7 @@ impl HNSW {
         }
         Ok(Self {
             levels,
-            metric_type: mt,
+            distance_type: mt,
             entry_point: hnsw_metadata.entry_point,
             use_select_heuristic: true,
         })
@@ -318,7 +318,7 @@ impl HNSW {
         }
         Ok(Self {
             levels,
-            metric_type,
+            distance_type: metric_type,
             entry_point: metadata.entry_point,
             use_select_heuristic: true,
         })
@@ -332,7 +332,7 @@ impl HNSW {
     ) -> Self {
         Self {
             levels,
-            metric_type,
+            distance_type: metric_type,
             entry_point,
             use_select_heuristic,
         }
@@ -396,7 +396,7 @@ impl HNSW {
 
         let index_metadata = json!({
             "type": HNSW_TYPE,
-            "metric_type": self.metric_type.to_string(),
+            "metric_type": self.distance_type.to_string(),
         });
         let hnsw_metadata = self.metadata();
 
