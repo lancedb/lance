@@ -29,12 +29,16 @@ fn main() {
     println!("cargo:rerun-if-changed=src/simd/f16.c");
 
     if cfg!(not(feature = "fp16kernels")) {
-        println!("cargo:warning=fp16kernels feature is not enabled, skipping build of optimized f16 kernels");
+        println!(
+            "cargo:warning=fp16kernels feature is not enabled, skipping build of fp16 kernels"
+        );
         return;
     }
 
     if cfg!(target_os = "windows") {
-        println!("cargo:warning=Skipping build of optimized f16 kernels as they are not supported on Windows");
+        println!(
+            "cargo:warning=Skipping build of fp16 kernels as they are not supported on Windows"
+        );
         return;
     }
 
@@ -53,10 +57,9 @@ fn main() {
             // It's likely the compiler doesn't support the sapphirerapids architecture
             // Clang 12 and GCC 11 are the first versions with sapphire rapids support
             println!(
-                "cargo:warning=Skipping build of optimized f16 kernels due to error: {}",
+                "cargo:warning=Skipping build of optimized fp16 kernels.  Clang/GCC too old or compiler does not support sapphirerapids architecture.  Error: {}",
                 err
             );
-            return;
         } else {
             // We create a special cfg so that we can detect we have in fact
             // generated the AVX512 version of the f16 kernels.
@@ -66,7 +69,9 @@ fn main() {
         // While GCC doesn't have support for _Float16 until GCC 12, clang
         // has support for __fp16 going back to at least clang 6.
         // We use haswell since it's the oldest CPUs on AWS.
-        build_f16_with_flags("avx2", &["-march=haswell"]).unwrap();
+        if let Err(_) = build_f16_with_flags("avx2", &["-march=haswell"]) {
+            println!("cargo:warning=Unable to build any fp16 kernels.  Please use Clang >= 6 or GCC >= 12");
+        }
         // There is no SSE instruction set for f16 -> f32 float conversion
     }
 }
