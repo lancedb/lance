@@ -140,7 +140,7 @@ impl Index for HNSWIndex {
 
 #[async_trait]
 impl VectorIndex for HNSWIndex {
-    #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
+    #[instrument(level = "debug", skip_all, name = "HNSWIndex::search")]
     async fn search(&self, query: &Query, _pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
         let results = self.hnsw.search(
             query.key.as_primitive::<Float32Type>().as_slice(),
