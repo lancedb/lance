@@ -28,9 +28,13 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
 
-    if cfg!(any(not(feature = "fp16kernels"), target_os = "windows")) {
-        // We only compile the f16 kernels if the feature is enabled
-        // MSVC does not support the f16 type, so we also skip it on Windows.
+    if cfg!(not(feature = "fp16kernels")) {
+        println!("cargo:warning=fp16kernels feature is not enabled, skipping build of optimized f16 kernels");
+        return;
+    }
+
+    if cfg!(target_os = "windows") {
+        println!("cargo:warning=Skipping build of optimized f16 kernels as they are not supported on Windows");
         return;
     }
 
@@ -48,7 +52,11 @@ fn main() {
         {
             // It's likely the compiler doesn't support the sapphirerapids architecture
             // Clang 12 and GCC 11 are the first versions with sapphire rapids support
-            eprintln!("Skipping Sapphire Rapids build due to error: {}", err);
+            println!(
+                "cargo:warning=Skipping build of optimized f16 kernels due to error: {}",
+                err
+            );
+            return;
         } else {
             // We create a special cfg so that we can detect we have in fact
             // generated the AVX512 version of the f16 kernels.
