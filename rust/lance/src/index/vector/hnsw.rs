@@ -29,7 +29,7 @@ use lance_file::reader::FileReader;
 use lance_index::{
     vector::{
         graph::{VectorStorage, NEIGHBORS_FIELD},
-        hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
+        hnsw::{builder::HNSW_METADATA_KEY, HnswMetadata, HNSW, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
         Query, DIST_COL,
     },
@@ -179,14 +179,33 @@ impl VectorIndex for HNSWIndex {
 
     async fn load(
         &self,
-        reader: &dyn Reader,
-        offset: usize,
-        length: usize,
+        reader: Arc<dyn Reader>,
+        _offset: usize,
+        _length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
-        Err(Error::Index {
-            message: "Loading HNSW index from file not supported".to_string(),
-            location: location!(),
-        })
+        let schema = Schema::try_from(&arrow_schema::Schema::new(vec![
+            NEIGHBORS_FIELD.clone(),
+            VECTOR_ID_FIELD.clone(),
+        ]))?;
+
+        let reader = FileReader::try_new_from_reader(
+            reader.path(),
+            reader.clone(),
+            None,
+            schema,
+            0,
+            0,
+            None,
+        )
+        .await?;
+
+        let hnsw = HNSW::load(&reader, self.storage.clone().unwrap()).await?;
+
+        Ok(Box::new(Self {
+            hnsw,
+            storage: self.storage.clone(),
+            partition_metadata: self.partition_metadata.clone(),
+        }))
     }
 
     async fn load_partition(

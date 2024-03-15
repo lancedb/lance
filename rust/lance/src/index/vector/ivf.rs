@@ -470,7 +470,7 @@ impl VectorIndex for IVFIndex {
 
     async fn load(
         &self,
-        _reader: &dyn Reader,
+        _reader: Arc<dyn Reader>,
         _offset: usize,
         _length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
@@ -969,7 +969,7 @@ impl RemapPageTask {
 impl RemapPageTask {
     async fn load_and_remap(
         mut self,
-        reader: &dyn Reader,
+        reader: Arc<dyn Reader>,
         index: &IVFIndex,
         mapping: &HashMap<u64, Option<u64>>,
     ) -> Result<Self> {
@@ -1023,13 +1023,13 @@ pub(crate) async fn remap_index_file(
     let old_path = dataset.indices_dir().child(old_uuid).child(INDEX_FILE_NAME);
     let new_path = dataset.indices_dir().child(new_uuid).child(INDEX_FILE_NAME);
 
-    let reader = object_store.open(&old_path).await?;
+    let reader: Arc<dyn Reader> = object_store.open(&old_path).await?.into();
     let mut writer = object_store.create(&new_path).await?;
 
     let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;
 
     let mut task_stream = stream::iter(tasks.into_iter())
-        .map(|task| task.load_and_remap(reader.as_ref(), index, mapping))
+        .map(|task| task.load_and_remap(reader.clone(), index, mapping))
         .buffered(num_cpus::get());
 
     let mut ivf = Ivf {

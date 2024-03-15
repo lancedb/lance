@@ -41,6 +41,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::{location, Location};
 
+use self::builder::HNSW_METADATA_KEY;
+
 use super::graph::{
     builder::GraphBuilder, greedy_search, storage::VectorStorage, Graph, OrderedFloat, OrderedNode,
     NEIGHBORS_COL, NEIGHBORS_FIELD,
@@ -270,7 +272,7 @@ impl HNSW {
             });
         };
         let hnsw_metadata: HnswMetadata =
-            serde_json::from_str(schema.metadata.get("lance:hnsw").ok_or_else(|| {
+            serde_json::from_str(schema.metadata.get(HNSW_METADATA_KEY).ok_or_else(|| {
                 Error::Index {
                     message: "hnsw metadata not found in the schema".to_string(),
                     location: location!(),

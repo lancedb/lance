@@ -211,17 +211,29 @@ impl VectorIndex for PQIndex {
     /// Load a PQ index (page) from the disk.
     async fn load(
         &self,
-        reader: &dyn Reader,
+        reader: Arc<dyn Reader>,
         offset: usize,
         length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
         let pq_code_length = self.pq.num_sub_vectors() * length;
-        let pq_code =
-            read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;
+        let pq_code = read_fixed_stride_array(
+            reader.as_ref(),
+            &DataType::UInt8,
+            offset,
+            pq_code_length,
+            ..,
+        )
+        .await?;
 
         let row_id_offset = offset + pq_code_length /* *1 */;
-        let row_ids =
-            read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
+        let row_ids = read_fixed_stride_array(
+            reader.as_ref(),
+            &DataType::UInt64,
+            row_id_offset,
+            length,
+            ..,
+        )
+        .await?;
 
         Ok(Box::new(Self {
             code: Some(Arc::new(pq_code.as_primitive().clone())),
