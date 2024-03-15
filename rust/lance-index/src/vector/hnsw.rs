@@ -420,7 +420,7 @@ impl HNSW {
     pub async fn write_parted_hnsw(
         object_store: &ObjectStore,
         path: &Path,
-        partitions: Box<dyn Iterator<Item = HNSW>>,
+        partitions: Box<dyn Iterator<Item = Self>>,
     ) -> Result<()> {
         let mut peek = partitions.peekable();
         let first = peek.peek().ok_or(Error::Index {

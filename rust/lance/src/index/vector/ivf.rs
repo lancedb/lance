@@ -916,6 +916,7 @@ pub async fn build_ivf_pq_index(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn build_ivf_hnsw_index(
     dataset: &Dataset,
     column: &str,
@@ -1139,12 +1140,13 @@ async fn write_index_file(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_ivf_hnsw_file(
     dataset: &Dataset,
     column: &str,
-    index_name: &str,
+    _index_name: &str,
     uuid: &str,
-    transformers: &[Box<dyn Transformer>],
+    _transformers: &[Box<dyn Transformer>],
     mut ivf: Ivf,
     pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,

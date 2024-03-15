@@ -27,7 +27,6 @@ mod utils;
 #[cfg(test)]
 mod fixture_test;
 
-use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::{hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
@@ -36,7 +35,6 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
-use self::hnsw::HNSWIndex;
 use self::{
     ivf::{build_ivf_hnsw_index, build_ivf_pq_index, remap_index_file, IVFIndex},
     pq::PQIndex,

@@ -42,7 +42,7 @@ use lance_table::io::manifest::ManifestDescribing;
 use snafu::{location, Location};
 
 use super::{IVFIndex, Ivf};
-use crate::index::vector::{hnsw::HNSWIndex, pq::PQIndex, VectorIndex};
+use crate::index::vector::pq::PQIndex;
 use crate::Result;
 use crate::{dataset::ROW_ID, Dataset};
 
@@ -227,6 +227,7 @@ pub(super) async fn write_pq_partitions(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn write_hnsw_index_partitions(
     dataset: &Dataset,
     column: &str,
@@ -237,7 +238,7 @@ pub(super) async fn write_hnsw_index_partitions(
     ivf: &mut Ivf,
     pq: Arc<dyn ProductQuantizer>,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
-    existing_indices: Option<&[&IVFIndex]>,
+    _existing_indices: Option<&[&IVFIndex]>,
 ) -> Result<(Vec<HnswMetadata>, IvfData)> {
     let mut streams_heap = BinaryHeap::new();
     let mut new_streams = vec![];
@@ -334,7 +335,7 @@ pub(super) async fn write_hnsw_index_partitions(
                 metric_type,
             )?;
 
-            pq_store.write_partition(*writer).await?;
+            pq_store.write_partition(writer).await?;
             aux_ivf.add_partition(pq_batch.num_rows() as u32);
         }
 
@@ -355,14 +356,10 @@ pub(super) async fn write_hnsw_index_partitions(
 mod tests {
     use super::*;
 
-    use crate::{
-        index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt},
-        Dataset,
-    };
+    use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
     use arrow_array::{RecordBatch, RecordBatchIterator};
     use arrow_schema::{Field, Schema};
     use lance_index::IndexType;
-    use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
 
     #[tokio::test]

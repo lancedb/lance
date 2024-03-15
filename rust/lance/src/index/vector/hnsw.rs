@@ -29,7 +29,7 @@ use lance_file::reader::FileReader;
 use lance_index::{
     vector::{
         graph::{VectorStorage, NEIGHBORS_FIELD},
-        hnsw::{builder::HNSW_METADATA_KEY, HnswMetadata, HNSW, VECTOR_ID_FIELD},
+        hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
         Query, DIST_COL,
     },
@@ -89,7 +89,7 @@ impl HNSWIndex {
         Ok(Self {
             hnsw,
             storage: None,
-            partition_metadata: partition_metadata,
+            partition_metadata,
         })
     }
 
@@ -141,7 +141,7 @@ impl Index for HNSWIndex {
 #[async_trait]
 impl VectorIndex for HNSWIndex {
     #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, _pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
         let results = self.hnsw.search(
             query.key.as_primitive::<Float32Type>().as_slice(),
             query.k,
