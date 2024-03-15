@@ -582,10 +582,7 @@ impl IvfShuffler {
 
 #[cfg(test)]
 mod test {
-    use arrow_array::{
-        types::{UInt32Type, UInt64Type, UInt8Type},
-        Array,
-    };
+    use arrow_array::types::{UInt32Type, UInt8Type};
     use lance_io::stream::RecordBatchStreamAdapter;
 
     use super::*;
