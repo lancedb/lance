@@ -2044,7 +2044,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ivf_hnsw() {
-        env_logger::init();
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 

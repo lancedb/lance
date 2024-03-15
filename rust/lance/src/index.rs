@@ -34,7 +34,6 @@ use lance_io::utils::{read_message, read_message_from_buf, read_metadata_offset}
 use lance_table::format::Fragment;
 use lance_table::format::Index as IndexMetadata;
 use lance_table::io::manifest::read_manifest_indexes;
-use log::info;
 use roaring::RoaringBitmap;
 use serde_json::json;
 use snafu::{location, Location};
