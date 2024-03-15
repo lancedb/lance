@@ -399,7 +399,7 @@ pub(crate) async fn open_vector_index_v2(
             message: "Index Metadata not found".to_owned(),
             location: location!(),
         })?;
-    let index_metadata: lance_index::IndexMetadata = serde_json::from_str(&index_metadata)?;
+    let index_metadata: lance_index::IndexMetadata = serde_json::from_str(index_metadata)?;
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
     let aux_path = dataset

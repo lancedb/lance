@@ -137,7 +137,7 @@ impl IndexInformationProvider for ScalarIndexInfo {
     }
 }
 
-async fn open_index_proto(dataset: &Dataset, reader: &dyn Reader) -> Result<pb::Index> {
+async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
     let file_size = reader.size().await?;
     let tail_bytes = read_last_block(reader).await?;
     let metadata_pos = read_metadata_offset(&tail_bytes)?;
@@ -501,7 +501,7 @@ impl DatasetIndexInternalExt for Dataset {
             crate::index::vector::open_vector_index_v2(Arc::new(self.clone()), column, uuid, reader)
                 .await
         } else {
-            let proto = open_index_proto(self, reader.as_ref()).await?;
+            let proto = open_index_proto(reader.as_ref()).await?;
             match &proto.implementation {
                 Some(Implementation::VectorIndex(vector_index)) => {
                     let dataset = Arc::new(self.clone());
