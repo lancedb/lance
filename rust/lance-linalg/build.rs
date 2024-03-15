@@ -47,9 +47,7 @@ fn main() -> Result<(), String> {
     } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-march=armv8.2-a+fp16"]).unwrap();
-    }
-
-    if cfg!(target_arch = "x86_64") {
+    } else if cfg!(target_arch = "x86_64") {
         // Build a version with AVX512
         if let Err(err) = build_f16_with_flags("avx512", &["-march=sapphirerapids", "-mavx512fp16"])
         {
