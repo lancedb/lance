@@ -14,7 +14,7 @@
 
 use std::env;
 
-fn main() {
+fn main() -> Result<(), String> {
     let rust_toolchain = env::var("RUSTUP_TOOLCHAIN")
         .or_else(|e| match e {
             env::VarError::NotPresent => Ok("stable".into()),
@@ -32,14 +32,13 @@ fn main() {
         println!(
             "cargo:warning=fp16kernels feature is not enabled, skipping build of fp16 kernels"
         );
-        return;
+        return Ok(());
     }
 
     if cfg!(target_os = "windows") {
-        println!(
-            "cargo:warning=Skipping build of fp16 kernels as they are not supported on Windows"
+        return Err(
+            "cargo:warning=fp16 kernels are not supported on Windows.  Please remove fp16kernels feature".to_string()
         );
-        return;
     }
 
     if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
@@ -64,15 +63,20 @@ fn main() {
             // We create a special cfg so that we can detect we have in fact
             // generated the AVX512 version of the f16 kernels.
             println!("cargo:rustc-cfg=kernel_suppport=\"avx512\"");
+            return Ok(());
         };
         // Build a version with AVX
         // While GCC doesn't have support for _Float16 until GCC 12, clang
         // has support for __fp16 going back to at least clang 6.
         // We use haswell since it's the oldest CPUs on AWS.
         if let Err(_) = build_f16_with_flags("avx2", &["-march=haswell"]) {
-            println!("cargo:warning=Unable to build any fp16 kernels.  Please use Clang >= 6 or GCC >= 12");
+            Err("Unable to build f16 kernels.  Please use Clang >= 6 or GCC >= 12 or remove the fp16kernels feature".to_string())
+        } else {
+            Ok(())
         }
         // There is no SSE instruction set for f16 -> f32 float conversion
+    } else {
+        return Err("Unable to build f16 kernels on given target_arch.  Please use x86_64 or aarch64 or remove the fp16kernels feature".to_string());
     }
 }
 
