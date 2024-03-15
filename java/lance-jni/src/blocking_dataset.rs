@@ -21,6 +21,7 @@ use crate::{traits::IntoJava, Result, RT};
 
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
+#[derive(Clone)]
 pub struct BlockingDataset {
     pub(crate) inner: Dataset,
 }

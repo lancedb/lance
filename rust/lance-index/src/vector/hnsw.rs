@@ -36,6 +36,7 @@ use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::MetricType;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::{location, Location};
@@ -346,7 +347,13 @@ impl HNSW {
     /// Returns
     /// -------
     /// A list of `(id_in_graph, distance)` pairs. Or Error if the search failed.
-    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<(u32, f32)>> {
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        bitset: Option<RoaringBitmap>,
+    ) -> Result<Vec<(u32, f32)>> {
         let mut ep = self.entry_point;
         let num_layers = self.levels.len();
 
@@ -354,7 +361,7 @@ impl HNSW {
             ep = greedy_search(level, ep, query)?.1;
         }
 
-        let candidates = beam_search(&self.levels[0], &[ep], query, ef)?;
+        let candidates = beam_search(&self.levels[0], &[ep], query, ef, bitset.as_ref())?;
         Ok(select_neighbors(&candidates, k)
             .map(|(d, u)| (u, d.into()))
             .collect())
@@ -496,9 +503,6 @@ fn select_neighbors_heuristic(
 mod tests {
     use super::*;
 
-    use std::collections::HashSet;
-
-    use super::super::graph::OrderedFloat;
     use crate::vector::graph::memory::InMemoryVectorStorage;
     use arrow_array::types::Float32Type;
     use lance_linalg::matrix::MatrixView;
@@ -603,7 +607,7 @@ mod tests {
         .unwrap();
 
         let results: HashSet<u32> = hnsw
-            .search(q, K, 128)
+            .search(q, K, 128, None)
             .unwrap()
             .iter()
             .map(|(i, _)| *i)

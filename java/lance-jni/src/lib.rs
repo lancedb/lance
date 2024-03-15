@@ -34,6 +34,19 @@ macro_rules! ok_or_throw {
     };
 }
 
+#[macro_export]
+macro_rules! ok_or_throw_with_return {
+    ($env:expr, $result:expr, $ret:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(err) => {
+                err.throw(&mut $env);
+                return $ret;
+            }
+        }
+    };
+}
+
 mod blocking_dataset;
 pub mod error;
 mod ffi;
@@ -97,7 +110,7 @@ pub fn extract_write_params(env: &mut JNIEnv, params: &JObject) -> Result<WriteP
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_open<'local>(
+pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     path: JString,
