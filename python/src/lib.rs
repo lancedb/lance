@@ -119,6 +119,7 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(read_tfrecord))?;
     m.add_wrapped(wrap_pyfunction!(cleanup_partial_writes))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
+    m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     register_datagen(py, m)?;
     Ok(())
@@ -261,4 +262,16 @@ fn read_tfrecord(
     })?;
 
     Ok(PyArrowType(stream_reader))
+}
+
+#[pyfunction]
+#[pyo3(signature = (dataset,))]
+fn manifest_needs_migration(dataset: &PyAny) -> PyResult<bool> {
+    let py = dataset.py();
+    let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
+    let dataset_ref = &dataset.as_ref(py).borrow().ds;
+    let manifest = RT
+        .block_on(Some(py), dataset_ref.latest_manifest())?
+        .map_err(|err| PyIOError::new_err(format!("Failed to connect to data: {}", err)))?;
+    Ok(::lance::io::commit::manifest_needs_migration(&manifest))
 }
