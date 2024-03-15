@@ -49,7 +49,7 @@ use crate::{dataset::ROW_ID, Dataset};
 /// Merge streams with the same partition id and collect PQ codes and row IDs.
 async fn merge_streams(
     streams_heap: &mut BinaryHeap<(Reverse<u32>, usize)>,
-    new_streams: &mut Vec<Pin<Box<Peekable<impl Stream<Item = Result<RecordBatch>>>>>>,
+    new_streams: &mut [Pin<Box<Peekable<impl Stream<Item = Result<RecordBatch>>>>>],
     part_id: u32,
     pq_array: &mut Vec<Arc<dyn Array>>,
     row_id_array: &mut Vec<Arc<dyn Array>>,
