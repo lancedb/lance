@@ -161,7 +161,10 @@ impl HnswLevel {
 
     /// Range of neighbors for the given node, specified by its index.
     fn neighbors_range(&self, id: u32) -> Range<usize> {
-        let idx = self.id_to_node[&id];
+        let idx = *self
+            .id_to_node
+            .get(&id)
+            .expect(format!("Node {} not found", id).as_str());
         let start = self.neighbors.value_offsets()[idx] as usize;
         let end = start + self.neighbors.value_length(idx) as usize;
         start..end
@@ -361,7 +364,7 @@ impl HNSW {
         let mut ep = self.entry_point;
         let num_layers = self.levels.len();
 
-        for level in self.levels.iter().rev().take(num_layers - 1) {
+        for (i, level) in self.levels.iter().enumerate().rev().take(num_layers - 1) {
             ep = greedy_search(level, ep, query)?.1;
         }
 
@@ -451,6 +454,16 @@ impl HNSW {
     pub async fn write_levels(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<usize> {
         let mut num_rows = 0;
         for level in self.levels.iter() {
+            assert!(
+                level
+                    .nodes
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap()
+                    .value(0)
+                    == 0
+            );
             writer.write(&[level.nodes.clone()]).await?;
             num_rows += level.nodes.num_rows();
         }

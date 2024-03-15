@@ -339,10 +339,10 @@ pub(super) async fn write_hnsw_index_partitions(
             aux_ivf.add_partition(pq_batch.num_rows() as u32);
         }
 
-        hnsw.write_levels(writer).await?;
+        let length = hnsw.write_levels(writer).await?;
         hnsw_metadata.push(hnsw.metadata());
 
-        ivf.add_partition(offset, hnsw.len() as u32);
+        ivf.add_partition(offset, length as u32);
         log::info!(
             "Wrote partition {} in {} ms",
             part_id,
