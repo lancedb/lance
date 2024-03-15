@@ -22,6 +22,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_file::reader::FileReader;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::IndexInformationProvider;
@@ -30,9 +31,11 @@ use lance_index::scalar::ScalarIndex;
 pub use lance_index::IndexParams;
 use lance_index::{pb, DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME};
 use lance_io::traits::Reader;
-use lance_io::utils::{read_message, read_message_from_buf, read_metadata_offset};
-use lance_table::format::Fragment;
+use lance_io::utils::{
+    read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
+};
 use lance_table::format::Index as IndexMetadata;
+use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use serde_json::json;
@@ -135,16 +138,8 @@ impl IndexInformationProvider for ScalarIndexInfo {
 }
 
 async fn open_index_proto(dataset: &Dataset, reader: &dyn Reader) -> Result<pb::Index> {
-    let object_store = dataset.object_store();
-
     let file_size = reader.size().await?;
-    let block_size = object_store.block_size();
-    let begin = if file_size < block_size {
-        0
-    } else {
-        file_size - block_size
-    };
-    let tail_bytes = reader.get_range(begin..file_size).await?;
+    let tail_bytes = read_last_block(reader).await?;
     let metadata_pos = read_metadata_offset(&tail_bytes)?;
     let proto: pb::Index = if metadata_pos < file_size - tail_bytes.len() {
         // We have not read the metadata bytes yet.
@@ -492,17 +487,38 @@ impl DatasetIndexInternalExt for Dataset {
         let index_file = index_dir.child(INDEX_FILE_NAME);
         let reader: Arc<dyn Reader> = self.object_store.open(&index_file).await?.into();
 
-        let proto = open_index_proto(self, reader.as_ref()).await?;
-        match &proto.implementation {
-            Some(Implementation::VectorIndex(vector_index)) => {
-                let dataset = Arc::new(self.clone());
-                crate::index::vector::open_vector_index(dataset, column, uuid, vector_index, reader)
+        let tailing_bytes = read_last_block(reader.as_ref()).await?;
+        let (major_version, minor_version) = read_version(&tailing_bytes)?;
+
+        // the index file is in lance format since version (0,2)
+        // TODO: we need to change the legacy IVF_PQ to be in lance format
+        if major_version > 0 || minor_version > 1 {
+            let reader = FileReader::try_new_self_described_from_reader(
+                reader.clone(),
+                Some(&self.session.file_metadata_cache),
+            )
+            .await?;
+            crate::index::vector::open_vector_index_v2(Arc::new(self.clone()), column, uuid, reader)
+                .await
+        } else {
+            let proto = open_index_proto(self, reader.as_ref()).await?;
+            match &proto.implementation {
+                Some(Implementation::VectorIndex(vector_index)) => {
+                    let dataset = Arc::new(self.clone());
+                    crate::index::vector::open_vector_index(
+                        dataset,
+                        column,
+                        uuid,
+                        vector_index,
+                        reader,
+                    )
                     .await
+                }
+                None => Err(Error::Internal {
+                    message: "Index proto was missing implementation field".into(),
+                    location: location!(),
+                }),
             }
-            None => Err(Error::Internal {
-                message: "Index proto was missing implementation field".into(),
-                location: location!(),
-            }),
         }
     }
 

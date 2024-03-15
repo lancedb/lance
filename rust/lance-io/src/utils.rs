@@ -128,6 +128,17 @@ pub async fn read_struct<
     Ok(obj)
 }
 
+pub async fn read_last_block(reader: &dyn Reader) -> Result<Bytes> {
+    let file_size = reader.size().await?;
+    let block_size = reader.block_size();
+    let begin = if file_size < block_size {
+        0
+    } else {
+        file_size - block_size
+    };
+    reader.get_range(begin..file_size).await
+}
+
 pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
     let len = bytes.len();
     if len < 16 {
@@ -141,6 +152,24 @@ pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
     }
     let offset_bytes = bytes.slice(len - 16..len - 8);
     Ok(LittleEndian::read_u64(offset_bytes.as_ref()) as usize)
+}
+
+/// Read the version from the footer bytes
+pub fn read_version(bytes: &Bytes) -> Result<(u16, u16)> {
+    let len = bytes.len();
+    if len < 8 {
+        return Err(Error::IO {
+            message: format!(
+                "does not have sufficient data, len: {}, bytes: {:?}",
+                len, bytes
+            ),
+            location: location!(),
+        });
+    }
+
+    let major_version = LittleEndian::read_u16(bytes.slice(len - 8..len - 6).as_ref());
+    let minor_version = LittleEndian::read_u16(bytes.slice(len - 6..len - 4).as_ref());
+    Ok((major_version, minor_version))
 }
 
 /// Read protobuf from a buffer.

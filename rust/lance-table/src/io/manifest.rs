@@ -286,7 +286,8 @@ mod test {
         metadata.insert(String::from("lance:extra"), String::from("for_test"));
         file_writer.finish_with_metadata(&metadata).await.unwrap();
 
-        let reader = FileReader::try_new_self_described(&store, &path, None)
+        let reader = store.open(&path).await.unwrap();
+        let reader = FileReader::try_new_self_described_from_reader(reader.into(), None)
             .await
             .unwrap();
         let schema = ArrowSchema::from(reader.schema());

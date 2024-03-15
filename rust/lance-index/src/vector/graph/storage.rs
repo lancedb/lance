@@ -33,6 +33,8 @@ pub trait VectorStorage: Send + Sync {
         self.len() == 0
     }
 
+    fn row_ids(&self) -> &[u64];
+
     /// Return the metric type of the vectors.
     fn metric_type(&self) -> MetricType;
 

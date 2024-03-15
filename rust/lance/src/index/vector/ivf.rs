@@ -51,10 +51,13 @@ use lance_index::{
             storage::{IvfData, IVF_PARTITION_KEY},
             IvfBuildParams,
         },
-        pq::{PQBuildParams, ProductQuantizer},
+        pq::{
+            storage::{ProductQuantizationMetadata, PQ_METADTA_KEY},
+            PQBuildParams, ProductQuantizer,
+        },
         Query, DIST_COL, PQ_CODE_COLUMN,
     },
-    Index, IndexType, INDEX_AUXILIARY_FILE_NAME,
+    Index, IndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
 };
 use lance_io::{
     encodings::plain::PlainEncoder,
@@ -64,8 +67,11 @@ use lance_io::{
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
 };
-use lance_linalg::distance::{Cosine, Dot, MetricType, L2};
 use lance_linalg::kernels::{normalize_arrow, normalize_fsl};
+use lance_linalg::{
+    distance::{Cosine, DistanceType, Dot, MetricType, L2},
+    MatrixView,
+};
 use log::{debug, info};
 use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -665,18 +671,28 @@ impl TryFrom<&pb::Ivf> for Ivf {
             debug!("Ivf: loading IVF centroids from index format v1");
             // For backward-compatibility
             let f32_centroids = Float32Array::from(proto.centroids.clone());
-            let dimension = f32_centroids.len() / proto.offsets.len();
+            let dimension = f32_centroids.len() / proto.lengths.len();
             Arc::new(FixedSizeListArray::try_new_from_values(
                 f32_centroids,
                 dimension as i32,
             )?)
         };
 
-        Ok(Self {
+        let mut ivf = Self {
             centroids,
             offsets: proto.offsets.iter().map(|o| *o as usize).collect(),
             lengths: proto.lengths.clone(),
-        })
+        };
+
+        if ivf.offsets.is_empty() && !ivf.lengths.is_empty() {
+            let mut offset = 0;
+            for len in &ivf.lengths {
+                ivf.offsets.push(offset);
+                offset += *len as usize;
+            }
+        }
+
+        Ok(ivf)
     }
 }
 
@@ -898,7 +914,7 @@ pub async fn build_ivf_pq_index(
     let stream = scan_index_field_stream(dataset, column).await?;
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
-    write_index_file(
+    write_ivf_pq_file(
         dataset,
         column,
         index_name,
@@ -1075,7 +1091,7 @@ pub(crate) async fn remap_index_file(
 /// Write the index to the index file.
 ///
 #[allow(clippy::too_many_arguments)]
-async fn write_index_file(
+async fn write_ivf_pq_file(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
@@ -1132,9 +1148,9 @@ async fn write_index_file(
 
     let metadata = pb::Index::try_from(&metadata)?;
     let pos = writer.write_protobuf(&metadata).await?;
-    writer
-        .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
-        .await?;
+    // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
+    // change it to latest version value after refactoring the IVF_PQ
+    writer.write_magics(pos, 0, 1, MAGIC).await?;
     writer.shutdown().await?;
 
     Ok(())
@@ -1149,7 +1165,7 @@ async fn write_ivf_hnsw_file(
     _transformers: &[Box<dyn Transformer>],
     mut ivf: Ivf,
     pq: Arc<dyn ProductQuantizer>,
-    metric_type: MetricType,
+    distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
     stream: impl RecordBatchStream + Unpin + 'static,
     precomputed_partitons: Option<HashMap<u64, u32>>,
@@ -1164,6 +1180,15 @@ async fn write_ivf_hnsw_file(
     let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
     let mut writer = FileWriter::with_object_writer(writer, schema, &FileWriterOptions::default())?;
+    writer.add_metadata(
+        INDEX_METADATA_SCHEMA_KEY,
+        json!(IndexMetadata {
+            index_type: "IVF_HNSW".to_string(),
+            distance_type: distance_type.to_string(),
+        })
+        .to_string()
+        .as_str(),
+    );
 
     let aux_path = dataset
         .indices_dir()
@@ -1184,6 +1209,41 @@ async fn write_ivf_hnsw_file(
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
     let mut aux_writer =
         FileWriter::with_object_writer(aux_writer, schema, &FileWriterOptions::default())?;
+    aux_writer.add_metadata(
+        INDEX_METADATA_SCHEMA_KEY,
+        json!(IndexMetadata {
+            index_type: "PQ".to_string(),
+            distance_type: distance_type.to_string(),
+        })
+        .to_string()
+        .as_str(),
+    );
+    let mat = MatrixView::<Float32Type>::new(
+        Arc::new(
+            pq.codebook_as_fsl()
+                .values()
+                .as_primitive::<Float32Type>()
+                .clone(),
+        ),
+        pq.dimension(),
+    );
+    let codebook_tensor = pb::Tensor::from(&mat);
+    let codebook_pos = aux_writer.tell().await?;
+    aux_writer
+        .object_writer
+        .write_protobuf(&codebook_tensor)
+        .await?;
+    aux_writer.add_metadata(
+        PQ_METADTA_KEY,
+        json!(ProductQuantizationMetadata {
+            codebook_position: codebook_pos,
+            num_bits: pq.num_bits(),
+            num_sub_vectors: pq.num_sub_vectors(),
+            dimension: pq.dimension(),
+        })
+        .to_string()
+        .as_str(),
+    );
 
     let start = std::time::Instant::now();
     let num_partitions = ivf.num_partitions() as u32;
@@ -1196,7 +1256,7 @@ async fn write_ivf_hnsw_file(
         column,
         &mut ivf,
         pq.clone(),
-        metric_type,
+        distance_type,
         hnsw_params,
         0..num_partitions,
         precomputed_partitons,
@@ -1212,7 +1272,7 @@ async fn write_ivf_hnsw_file(
     writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
 
     // Convert ['Ivf'] to [`IvfData`] for new index format
-    let mut ivf_data = IvfData::empty();
+    let mut ivf_data = IvfData::with_centroids(ivf.centroids.clone());
     for length in ivf.lengths {
         ivf_data.add_partition(length);
     }
@@ -2047,7 +2107,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let (mut dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
+        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
         let centroids = generate_random_array(2 * DIM);
         let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
@@ -2086,6 +2146,21 @@ mod tests {
             .child(INDEX_AUXILIARY_FILE_NAME);
         assert!(dataset.object_store().exists(&index_path).await.unwrap());
         assert!(dataset.object_store().exists(&aux_path).await.unwrap());
+
+        let sample_query = vector_array.value(10);
+        let query = sample_query.as_primitive::<Float32Type>();
+        let results = dataset
+            .scan()
+            .nearest("vector", query, 5)
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(1, results.len());
+        assert_eq!(5, results[0].num_rows());
     }
 
     #[tokio::test]

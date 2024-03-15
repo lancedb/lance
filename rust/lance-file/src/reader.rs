@@ -685,7 +685,6 @@ async fn _read_fixed_stride_array(
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(page_table, field, batch_id)?;
-
     read_fixed_stride_array(
         reader.object_reader.as_ref(),
         &field.data_type(),

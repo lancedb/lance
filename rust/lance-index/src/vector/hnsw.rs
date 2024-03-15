@@ -49,6 +49,7 @@ use super::graph::{
 };
 use super::ivf::storage::IvfData;
 use crate::vector::graph::beam_search;
+use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 
 pub mod builder;
 
@@ -160,9 +161,12 @@ impl HnswLevel {
 
     /// Range of neighbors for the given node, specified by its index.
     fn neighbors_range(&self, id: u32) -> Range<usize> {
-        let idx = self.id_to_node[&id];
-        let start = self.neighbors.value_offsets()[idx] as usize;
-        let end = start + self.neighbors.value_length(idx) as usize;
+        let idx = self
+            .id_to_node
+            .get(&id)
+            .expect(format!("miss node {}", id).as_str());
+        let start = self.neighbors.value_offsets()[*idx] as usize;
+        let end = start + self.neighbors.value_length(*idx) as usize;
         start..end
     }
 }
@@ -209,14 +213,6 @@ impl Debug for HNSW {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct SchemaIndexMetadata {
-    #[serde(rename = "type")]
-    type_: String,
-
-    metric_type: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HnswMetadata {
     entry_point: u32,
@@ -238,6 +234,10 @@ impl HNSW {
         self.levels[0].len()
     }
 
+    pub fn storage(&self) -> &dyn VectorStorage {
+        self.levels[0].vectors.as_ref()
+    }
+
     /// Whether the graph is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -256,15 +256,15 @@ impl HNSW {
     /// - *vector_storage*: A preloaded [VectorStorage] storage.
     pub async fn load(reader: &FileReader, vector_storage: Arc<dyn VectorStorage>) -> Result<Self> {
         let schema = reader.schema();
-        let mt = if let Some(index_metadata) = schema.metadata.get("lance:index") {
-            let index_metadata: SchemaIndexMetadata = serde_json::from_str(index_metadata)?;
-            if index_metadata.type_ != "HNSW" {
+        let mt = if let Some(index_metadata) = schema.metadata.get(INDEX_METADATA_SCHEMA_KEY) {
+            let index_metadata: IndexMetadata = serde_json::from_str(index_metadata)?;
+            if index_metadata.index_type != HNSW_TYPE {
                 return Err(Error::Index {
                     message: "index type is not HNSW".to_string(),
                     location: location!(),
                 });
             }
-            MetricType::try_from(index_metadata.metric_type.as_str())?
+            MetricType::try_from(index_metadata.distance_type.as_str())?
         } else {
             return Err(Error::Index {
                 message: "index metadata not found in the schema".to_string(),
@@ -313,7 +313,7 @@ impl HNSW {
         // TODO: load levels in parallel.
         for i in 0..metadata.level_offsets.len() - 1 {
             let start = metadata.level_offsets[i] + range.start;
-            let end = metadata.level_offsets[i + 1] + range.end;
+            let end = metadata.level_offsets[i + 1] + range.start;
             levels.push(HnswLevel::load(reader, start..end, vector_storage.clone()).await?);
         }
         Ok(Self {
@@ -394,16 +394,19 @@ impl HNSW {
     pub async fn write(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<()> {
         self.write_levels(writer).await?;
 
-        let index_metadata = json!({
-            "type": HNSW_TYPE,
-            "metric_type": self.distance_type.to_string(),
+        let index_metadata = json!(IndexMetadata {
+            index_type: HNSW_TYPE.to_string(),
+            distance_type: self.distance_type.to_string(),
         });
         let hnsw_metadata = self.metadata();
 
         let mut metadata = HashMap::<String, String>::new();
-        metadata.insert("lance:index".to_string(), index_metadata.to_string());
         metadata.insert(
-            "lance:hnsw".to_string(),
+            INDEX_METADATA_SCHEMA_KEY.to_string(),
+            index_metadata.to_string(),
+        );
+        metadata.insert(
+            HNSW_METADATA_KEY.to_string(),
             serde_json::to_string(&hnsw_metadata)?,
         );
         writer.finish_with_metadata(&metadata).await?;

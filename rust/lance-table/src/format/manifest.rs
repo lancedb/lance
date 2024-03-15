@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use chrono::prelude::*;
 use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
 use lance_file::reader::FileReader;
-use lance_io::traits::ProtoStruct;
+use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost_types::Timestamp;
 
@@ -417,33 +417,41 @@ pub trait SelfDescribingFileReader {
         cache: Option<&FileMetadataCache>,
     ) -> Result<Self>
     where
+        Self: Sized,
+    {
+        let reader = object_store.open(path).await?;
+        Self::try_new_self_described_from_reader(reader.into(), cache).await
+    }
+
+    async fn try_new_self_described_from_reader(
+        reader: Arc<dyn Reader>,
+        cache: Option<&FileMetadataCache>,
+    ) -> Result<Self>
+    where
         Self: Sized;
 }
 
 #[async_trait]
 impl SelfDescribingFileReader for FileReader {
-    async fn try_new_self_described(
-        object_store: &ObjectStore,
-        path: &Path,
+    async fn try_new_self_described_from_reader(
+        reader: Arc<dyn Reader>,
         cache: Option<&FileMetadataCache>,
     ) -> Result<Self> {
-        let object_reader = object_store.open(path).await?;
-        let metadata = Self::read_metadata(object_reader.as_ref(), cache).await?;
+        let metadata = Self::read_metadata(reader.as_ref(), cache).await?;
         let manifest_position = metadata.manifest_position.ok_or(Error::Internal {
             message: format!(
                 "Attempt to open file at {} as self-describing but it did not contain a manifest",
-                path
+                reader.path(),
             ),
             location: location!(),
         })?;
-        let mut manifest: Manifest = read_struct(object_reader.as_ref(), manifest_position).await?;
-        populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
-        let schema = manifest.schema;
+        let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position).await?;
+        populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         Self::try_new_from_reader(
-            path,
-            object_reader.into(),
+            reader.path(),
+            reader.clone(),
             Some(metadata),
-            schema,
+            manifest.schema,
             0,
             0,
             cache,

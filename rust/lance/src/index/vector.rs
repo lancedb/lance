@@ -27,7 +27,11 @@ mod utils;
 #[cfg(test)]
 mod fixture_test;
 
+use lance_file::reader::FileReader;
+use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::{hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams};
+use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
@@ -35,6 +39,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
+use self::hnsw::HNSWIndex;
 use self::{
     ivf::{build_ivf_hnsw_index, build_ivf_pq_index, remap_index_file, IVFIndex},
     pq::PQIndex,
@@ -377,4 +382,61 @@ pub(crate) async fn open_vector_index(
     let idx = last_stage.unwrap();
     dataset.session.index_cache.insert_vector(uuid, idx.clone());
     Ok(idx)
+}
+
+#[instrument(level = "debug", skip(dataset, reader))]
+pub(crate) async fn open_vector_index_v2(
+    dataset: Arc<Dataset>,
+    column: &str,
+    uuid: &str,
+    reader: FileReader,
+) -> Result<Arc<dyn VectorIndex>> {
+    let index_metadata = reader
+        .schema()
+        .metadata
+        .get(INDEX_METADATA_SCHEMA_KEY)
+        .ok_or(Error::Index {
+            message: "Index Metadata not found".to_owned(),
+            location: location!(),
+        })?;
+    let index_metadata: lance_index::IndexMetadata = serde_json::from_str(&index_metadata)?;
+    let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
+
+    let aux_path = dataset
+        .indices_dir()
+        .child(uuid)
+        .child(INDEX_AUXILIARY_FILE_NAME);
+    let aux_reader = dataset.object_store().open(&aux_path).await?;
+
+    let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
+        "IVF_HNSW" => {
+            let ivf_data = IvfData::load(&reader).await?;
+            let hnsw = HNSWIndex::try_new(
+                HNSW::empty(),
+                reader.object_reader.clone(),
+                aux_reader.into(),
+            )
+            .await?;
+            let pb_ivf = pb::Ivf::try_from(&ivf_data)?;
+            let ivf = Ivf::try_from(&pb_ivf)?;
+
+            Arc::new(IVFIndex::try_new(
+                dataset.session.clone(),
+                uuid,
+                ivf,
+                reader.object_reader.clone(),
+                Arc::new(hnsw),
+                distance_type,
+            )?)
+        }
+
+        _ => {
+            return Err(Error::Index {
+                message: format!("Unsupported index type: {}", index_metadata.index_type),
+                location: location!(),
+            })
+        }
+    };
+
+    Ok(index)
 }

@@ -38,7 +38,7 @@ pub const INDEX_FILE_NAME: &str = "index.idx";
 /// This file is used to store additional information about the index, to improve performance.
 /// - For 'IVF_HNSW' index, it stores the partitioned PQ Storage.
 pub const INDEX_AUXILIARY_FILE_NAME: &str = "auxiliary.idx";
-const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
+pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 
 pub mod pb {
     #![allow(clippy::use_self)]
@@ -92,8 +92,8 @@ pub trait IndexParams: Send + Sync {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub(crate) struct IndexMetadata {
+pub struct IndexMetadata {
     #[serde(rename = "type")]
     pub index_type: String,
-    pub metric_type: String,
+    pub distance_type: String,
 }

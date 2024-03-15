@@ -22,13 +22,16 @@ use lance_linalg::{distance::MetricType, MatrixView};
 
 /// All data are stored in memory
 pub struct InMemoryVectorStorage {
+    row_ids: Vec<u64>,
     vectors: Arc<MatrixView<Float32Type>>,
     metric_type: MetricType,
 }
 
 impl InMemoryVectorStorage {
     pub fn new(vectors: Arc<MatrixView<Float32Type>>, metric_type: MetricType) -> Self {
+        let row_ids = (0..vectors.num_rows() as u64).collect();
         Self {
+            row_ids,
             vectors,
             metric_type,
         }
@@ -49,6 +52,10 @@ impl InMemoryVectorStorage {
 impl VectorStorage for InMemoryVectorStorage {
     fn len(&self) -> usize {
         self.vectors.num_rows()
+    }
+
+    fn row_ids(&self) -> &[u64] {
+        &self.row_ids
     }
 
     fn metric_type(&self) -> MetricType {

@@ -26,11 +26,11 @@ use snafu::{location, Location};
 
 use crate::pb::Ivf as PbIvf;
 
-const IVF_METADATA_KEY: &str = "lance:ivf";
+pub const IVF_METADATA_KEY: &str = "lance:ivf";
 pub const IVF_PARTITION_KEY: &str = "lance:ivf:partition";
 
 #[warn(dead_code)]
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IvfData {
     /// Centroids of the IVF indices. Can be empty.
     centroids: Option<Arc<FixedSizeListArray>>,
@@ -53,6 +53,14 @@ impl IvfData {
     pub fn empty() -> Self {
         Self {
             centroids: None,
+            lengths: vec![],
+            partition_row_offsets: vec![0],
+        }
+    }
+
+    pub fn with_centroids(centroids: Arc<FixedSizeListArray>) -> Self {
+        Self {
+            centroids: Some(centroids),
             lengths: vec![],
             partition_row_offsets: vec![0],
         }
