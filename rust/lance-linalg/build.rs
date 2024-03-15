@@ -69,7 +69,7 @@ fn main() -> Result<(), String> {
         // has support for __fp16 going back to at least clang 6.
         // We use haswell since it's the oldest CPUs on AWS.
         if let Err(err) = build_f16_with_flags("avx2", &["-march=haswell"]) {
-            return Err(format!("Unable to build f16 kernels.  Please use Clang >= 6 or GCC >= 12 or remove the fp16kernels feature.  Received error: {}", err));
+            return Err(format!("Unable to build AVX2 f16 kernels.  Please use Clang >= 6 or GCC >= 12 or remove the fp16kernels feature.  Received error: {}", err));
         };
         // There is no SSE instruction set for f16 -> f32 float conversion
     } else {
