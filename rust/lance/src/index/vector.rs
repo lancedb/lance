@@ -153,7 +153,7 @@ fn is_ivf_pq(stages: &[StageParams]) -> bool {
 }
 
 fn is_ivf_hnsw_pq(stages: &[StageParams]) -> bool {
-    if stages.len() < 2 {
+    if stages.len() < 3 {
         return false;
     }
     let len = stages.len();

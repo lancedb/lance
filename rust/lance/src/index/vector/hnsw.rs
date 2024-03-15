@@ -134,7 +134,7 @@ impl Index for HNSWIndex {
     /// This is a kind of slow operation.  It's better to use the fragment_bitmap.  This
     /// only exists for cases where the fragment_bitmap has become corrupted or missing.
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        todo!()
+        unimplemented!()
     }
 }
 
@@ -150,13 +150,10 @@ impl VectorIndex for HNSWIndex {
         )?;
 
         let node_ids = UInt32Array::from_iter_values(results.iter().map(|x| x.0));
-
-        // let row_ids = take(&self.row_ids.as_ref().unwrap(), &node_ids, None)?;
         let distances = Arc::new(Float32Array::from_iter_values(results.iter().map(|x| x.1)));
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(DIST_COL, DataType::Float32, true),
-            // ROW_ID_FIELD.clone(),
             arrow_schema::Field::new("_node_id", DataType::UInt32, true),
         ]));
         Ok(RecordBatch::try_new(
@@ -249,14 +246,8 @@ impl VectorIndex for HNSWIndex {
     }
 
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        // This will be needed if we want to clean up IVF to allow more than just
-        // one layer (e.g. IVF -> IVF -> PQ).  We need to pass on the call to
-        // remap to the lower layers.
-
-        // Currently, remapping for IVF is implemented in remap_index_file which
-        // mirrors some of the other IVF routines like build_ivf_pq_index
         Err(Error::Index {
-            message: "Remapping IVF in this way not supported".to_string(),
+            message: "Remapping HNSW in this way not supported".to_string(),
             location: location!(),
         })
     }

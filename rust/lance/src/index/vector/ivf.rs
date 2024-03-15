@@ -1284,7 +1284,6 @@ async fn train_ivf_model(
 mod tests {
     use super::*;
 
-    use std::collections::HashMap;
     use std::iter::repeat;
     use std::ops::Range;
 
