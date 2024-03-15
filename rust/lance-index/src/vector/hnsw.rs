@@ -161,12 +161,9 @@ impl HnswLevel {
 
     /// Range of neighbors for the given node, specified by its index.
     fn neighbors_range(&self, id: u32) -> Range<usize> {
-        let idx = self
-            .id_to_node
-            .get(&id)
-            .expect(format!("miss node {}", id).as_str());
-        let start = self.neighbors.value_offsets()[*idx] as usize;
-        let end = start + self.neighbors.value_length(*idx) as usize;
+        let idx = self.id_to_node[&id];
+        let start = self.neighbors.value_offsets()[idx] as usize;
+        let end = start + self.neighbors.value_length(idx) as usize;
         start..end
     }
 }
