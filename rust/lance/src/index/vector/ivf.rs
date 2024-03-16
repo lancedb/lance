@@ -37,7 +37,7 @@ use futures::{
 use lance_arrow::*;
 use lance_core::{datatypes::Field, Error, Result, ROW_ID_FIELD};
 use lance_file::{
-    format::{MAGIC, MAJOR_VERSION, MINOR_VERSION},
+    format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
 };
 use lance_index::{
