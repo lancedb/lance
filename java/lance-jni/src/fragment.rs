@@ -108,7 +108,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createNative(
                 location: location!(),
             }
             .throw(&mut env);
-            return -1;
+            -1
         }
     }
 }
