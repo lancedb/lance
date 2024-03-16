@@ -538,10 +538,9 @@ impl DistCalculator for PQDistCalculator {
 mod tests {
     use super::*;
 
-    use arrow_array::FixedSizeListArray;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::{datatypes::Schema, ROW_ID_FIELD};
+    use lance_core::ROW_ID_FIELD;
 
     const DIM: usize = 32;
     const TOTAL: usize = 512;

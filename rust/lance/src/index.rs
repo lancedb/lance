@@ -548,7 +548,7 @@ mod tests {
     use super::*;
 
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{Field, Schema};
     use lance_arrow::*;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;

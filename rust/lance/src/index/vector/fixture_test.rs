@@ -107,7 +107,7 @@ mod test {
 
         async fn load(
             &self,
-            _reader: &dyn Reader,
+            _reader: Arc<dyn Reader>,
             _offset: usize,
             _length: usize,
         ) -> Result<Box<dyn VectorIndex>> {

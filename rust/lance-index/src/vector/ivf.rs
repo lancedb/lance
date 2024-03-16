@@ -45,7 +45,7 @@ use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
 
 pub mod builder;
 pub mod shuffler;
-pub(crate) mod storage;
+pub mod storage;
 mod transform;
 
 fn new_ivf_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveType>(

@@ -182,8 +182,6 @@ pub struct GraphBuilderStats {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
-
     use arrow_array::{types::Float32Type, Float32Array};
     use lance_linalg::{distance::MetricType, MatrixView};
 
