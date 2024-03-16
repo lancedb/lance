@@ -429,7 +429,7 @@ impl DatasetIndexExt for Dataset {
 ///
 /// Internal use only. No API stability guarantees.
 #[async_trait]
-pub(crate) trait DatasetIndexInternalExt: DatasetIndexExt {
+pub trait DatasetIndexInternalExt: DatasetIndexExt {
     /// Opens an index (scalar or vector) as a generic index
     async fn open_generic_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn Index>>;
     /// Opens the requested scalar index
