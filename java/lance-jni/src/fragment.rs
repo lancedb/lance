@@ -30,6 +30,7 @@ use crate::{
     error::{Error, Result},
     ffi::JNIEnvExt,
     traits::FromJString,
+    utils::extract_write_params,
     RT,
 };
 
@@ -99,7 +100,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createNative(
 
     let fragment_id_opts = ok_or_throw_with_return!(env, env.get_int_opt(&fragment_id), -1);
 
-    let write_params = ok_or_throw!(
+    let write_params = ok_or_throw_with_return!(
         env,
         extract_write_params(
             &mut env,
@@ -107,14 +108,15 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createNative(
             &max_rows_per_group,
             &max_bytes_per_file,
             &mode
-        )
+        ),
+        -1
     );
 
     match RT.block_on(FileFragment::create(
         &path_str,
         fragment_id_opts.unwrap_or(0) as usize,
         reader,
-        None,
+        Some(write_params),
     )) {
         Ok(fragment) => fragment.id as jint,
         Err(e) => {

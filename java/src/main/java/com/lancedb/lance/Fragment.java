@@ -38,11 +38,15 @@ public class Fragment {
   /** Create a fragment from the given data. */
   public static FragmentMetadata create(String datasetUri, ArrowArrayStream stream,
       Optional<Integer> fragementId, WriteParams params) {
-    return new FragmentMetadata(createNative(datasetUri, stream.memoryAddress(), fragementId));
+    return new FragmentMetadata(createNative(datasetUri, stream.memoryAddress(), fragementId,
+        params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(),
+        params.getMaxBytesPerFile(), params.getMode()));
   }
 
   private static native int createNative(String datasetUri, long arrowStreamMemoryAddress,
-      Optional<Integer> fragmentId);
+      Optional<Integer> fragmentId, Optional<Integer> maxRowsPerFile,
+      Optional<Integer> maxRowsPerGroup, Optional<Long> maxBytesPerFile,
+      Optional<String> mode);
 
   private native int countRowsNative(Dataset dataset, long fragmentId);
 

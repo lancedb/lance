@@ -16,12 +16,11 @@ use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use jni::objects::{JObject, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
-use lance::dataset::{WriteMode, WriteParams};
 use lazy_static::lazy_static;
 use snafu::{location, Location};
 use traits::IntoJava;
 
-use crate::ffi::JNIEnvExt;
+use crate::utils::extract_write_params;
 
 #[macro_export]
 macro_rules! ok_or_throw {
@@ -54,6 +53,7 @@ pub mod error;
 mod ffi;
 mod fragment;
 mod traits;
+mod utils;
 
 use self::traits::FromJString;
 use crate::blocking_dataset::BlockingDataset;
@@ -104,30 +104,6 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>
         BlockingDataset::write(reader, &path_str, Some(write_params))
     );
     dataset.into_java(&mut env)
-}
-
-pub fn extract_write_params(
-    env: &mut JNIEnv,
-    max_rows_per_file: &JObject,
-    max_rows_per_group: &JObject,
-    max_bytes_per_file: &JObject,
-    mode: &JObject,
-) -> Result<WriteParams> {
-    let mut write_params = WriteParams::default();
-
-    if let Some(max_rows_per_file_val) = env.get_int_opt(max_rows_per_file)? {
-        write_params.max_rows_per_file = max_rows_per_file_val as usize;
-    }
-    if let Some(max_rows_per_group_val) = env.get_int_opt(max_rows_per_group)? {
-        write_params.max_rows_per_group = max_rows_per_group_val as usize;
-    }
-    if let Some(max_bytes_per_file_val) = env.get_long_opt(max_bytes_per_file)? {
-        write_params.max_bytes_per_file = max_bytes_per_file_val as usize;
-    }
-    if let Some(mode_val) = env.get_string_opt(mode)? {
-        write_params.mode = WriteMode::try_from(mode_val.as_str())?;
-    }
-    Ok(write_params)
 }
 
 #[no_mangle]
