@@ -80,7 +80,11 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createNative(
     _obj: JObject,
     dataset_uri: JString,
     arrow_array_stream_addr: jlong,
-    fragment_id: JObject, // Optional<Integer>
+    fragment_id: JObject,        // Optional<Integer>
+    max_rows_per_file: JObject,  // Optional<Integer>
+    max_rows_per_group: JObject, // Optional<Integer>
+    max_bytes_per_file: JObject, // Optional<Long>
+    mode: JObject,               // Optional<String>
 ) -> jint {
     let path_str: String = ok_or_throw_with_return!(env, dataset_uri.extract(&mut env), -1);
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
@@ -94,6 +98,17 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createNative(
     );
 
     let fragment_id_opts = ok_or_throw_with_return!(env, env.get_int_opt(&fragment_id), -1);
+
+    let write_params = ok_or_throw!(
+        env,
+        extract_write_params(
+            &mut env,
+            &max_rows_per_file,
+            &max_rows_per_group,
+            &max_bytes_per_file,
+            &mode
+        )
+    );
 
     match RT.block_on(FileFragment::create(
         &path_str,

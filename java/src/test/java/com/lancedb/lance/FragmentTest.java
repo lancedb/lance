@@ -89,7 +89,7 @@ public class FragmentTest {
                 allocator);
         ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
       Data.exportArrayStream(allocator, reader, arrowStream);
-      Path datasetPath = tempDir.resolve("new_dataset");
+      Path datasetPath = tempDir.resolve("new_fragment");
       int fragmentId = 1;
       FragmentMetadata fragmentMeta = Fragment.create(datasetPath.toString(), arrowStream, Optional.of(fragmentId), new WriteParams.Builder().build());
       assertEquals(fragmentId, fragmentMeta.getFragementId());
