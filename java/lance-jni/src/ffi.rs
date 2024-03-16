@@ -24,6 +24,9 @@ pub trait JNIEnvExt {
 
     /// Get Option<Vec<String>> from Java Optional<List<String>>.
     fn get_strings_opt(&mut self, obj: &JObject) -> Result<Option<Vec<String>>>;
+
+    /// Get Option<i32> from Java Optional<Integer>.
+    fn get_int_opt(&mut self, obj: &JObject) -> Result<Option<i32>>;
 }
 
 impl JNIEnvExt for JNIEnv<'_> {
@@ -50,6 +53,22 @@ impl JNIEnvExt for JNIEnv<'_> {
             let inner = self.call_method(obj, "get", "()Ljava/util/List;", &[])?;
             let inner_obj = inner.l()?;
             Ok(Some(self.get_strings(&inner_obj)?))
+        }
+    }
+
+    fn get_int_opt(&mut self, obj: &JObject) -> Result<Option<i32>> {
+        if obj.is_null() {
+            return Ok(None);
+        }
+        let is_empty = self.call_method(obj, "isEmpty", "()Z", &[])?;
+        if is_empty.z()? {
+            Ok(None)
+        } else {
+            let inner = self.call_method(obj, "get", "()Ljava/lang/Object;", &[])?;
+            let inner_obj = inner.l()?;
+            let int_inner = self.call_method(inner_obj, "intValue", "()I", &[])?;
+            let int_value = int_inner.i()?;
+            Ok(Some(int_value))
         }
     }
 }

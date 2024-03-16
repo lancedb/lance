@@ -15,6 +15,8 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.FragmentScanner;
+import java.util.Optional;
+import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.dataset.scanner.ScanOptions;
 import org.apache.arrow.dataset.scanner.Scanner;
 
@@ -32,6 +34,15 @@ public class Fragment {
     this.dataset = dataset;
     this.fragmentId = fragmentId;
   }
+
+  /** Create a fragment from the given data. */
+  public static FragmentMetadata create(String datasetUri, ArrowArrayStream stream,
+      Optional<Integer> fragementId, WriteParams params) {
+    return new FragmentMetadata(createNative(datasetUri, stream.memoryAddress(), fragementId));
+  }
+
+  private static native int createNative(String datasetUri, long arrowStreamMemoryAddress,
+      Optional<Integer> fragmentId);
 
   private native int countRowsNative(Dataset dataset, long fragmentId);
 

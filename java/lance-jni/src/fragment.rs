@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use arrow::ffi::FFI_ArrowSchema;
-use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::Schema;
 use jni::{
-    objects::JObject,
+    objects::{JObject, JString},
     sys::{jint, jlong},
     JNIEnv,
 };
@@ -29,6 +29,7 @@ use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     error::{Error, Result},
     ffi::JNIEnvExt,
+    traits::FromJString,
     RT,
 };
 
@@ -70,6 +71,45 @@ impl FragmentScanner {
             schema.clone()
         };
         Ok((&schema).into())
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Fragment_createNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    dataset_uri: JString,
+    arrow_array_stream_addr: jlong,
+    fragment_id: JObject, // Optional<Integer>
+) -> jint {
+    let path_str: String = ok_or_throw_with_return!(env, dataset_uri.extract(&mut env), -1);
+    let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
+    let reader = ok_or_throw_with_return!(
+        env,
+        unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }.map_err(|e| Error::Arrow {
+            message: e.to_string(),
+            location: location!(),
+        }),
+        -1
+    );
+
+    let fragment_id_opts = ok_or_throw_with_return!(env, env.get_int_opt(&fragment_id), -1);
+
+    match RT.block_on(FileFragment::create(
+        &path_str,
+        fragment_id_opts.unwrap_or(0) as usize,
+        reader,
+        None,
+    )) {
+        Ok(fragment) => fragment.id as jint,
+        Err(e) => {
+            Error::IO {
+                message: e.to_string(),
+                location: location!(),
+            }
+            .throw(&mut env);
+            return -1;
+        }
     }
 }
 
