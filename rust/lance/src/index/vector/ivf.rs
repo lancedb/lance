@@ -1080,9 +1080,9 @@ pub(crate) async fn remap_index_file(
 
     let metadata = pb::Index::try_from(&metadata)?;
     let pos = writer.write_protobuf(&metadata).await?;
-    writer
-        .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
-        .await?;
+    // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
+    // change it to latest version value after refactoring the IVF_PQ
+    writer.write_magics(pos, 0, 1, MAGIC).await?;
     writer.shutdown().await?;
 
     Ok(())
