@@ -46,6 +46,8 @@ pub(crate) mod prefilter;
 pub mod scalar;
 pub mod vector;
 
+pub use crate::index::prefilter::{FilterLoader, PreFilter};
+
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::vector::remap_vector_index;
 use crate::io::commit::commit_transaction;
