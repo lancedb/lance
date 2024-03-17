@@ -59,7 +59,7 @@ def create_text2image_10m(args):
     fsl = pa.FixedSizeListArray.from_arrays(arr, 200)
     gt = pa.array(np.stack(ids).reshape(-1))
     gt_fsl = pa.FixedSizeListArray.from_arrays(gt, args.k)
-    tbl = pa.Table.from_arrays([fsl, gt_fsl], ["vector", "groud_truth"])
+    tbl = pa.Table.from_arrays([fsl, gt_fsl], ["vector", "ground_truth"])
     lance.write_dataset(
         tbl, query_path, max_rows_per_group=10240, max_rows_per_file=1000000
     )
