@@ -22,7 +22,7 @@ import attrs
 import lance
 import numpy as np
 
-from .data import Downloadable
+from .data import BenchmarkData
 
 
 @attrs.define
@@ -32,9 +32,9 @@ class AnnTest:
     ground_truth: np.ndarray = attrs.field(converter=np.load)
 
 
-def _load_dataset(params: str | Dict[str, Any] | Downloadable) -> lance.LanceDataset:
-    if isinstance(params, Downloadable):
-        return params.download()
+def _load_dataset(params: str | Dict[str, Any] | BenchmarkData) -> lance.LanceDataset:
+    if isinstance(params, BenchmarkData):
+        return params.base()
     if isinstance(params, dict):
         return lance.LanceDataset(**params)
     elif isinstance(params, str):
