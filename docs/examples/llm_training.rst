@@ -85,10 +85,11 @@ However we also need to make sure that the tokens we get from the dataset aren't
 
 Let's say, for some arbitrary block size, during the training loop the dataset return the following tokens:
 
-:meth:`"Vienna is the capital of Austria"` at index = 12 for sample #1, and,
-:meth:`"is the capital of Austria and"` at index = 13 for sample #2, and so on
+`"Vienna is the capital of Austria"` at index = 12 for sample #1, and,
 
-The problem here is that if we allow the sample to fetch the 'samples' for any arbitrary number of indices, they may overlap (as we see above).
+`"is the capital of Austria and"` at index = 13 for sample #2, and so on
+
+The problem here is that if we allow the dataloader to fetch the 'samples' for any arbitrary number of indices, they may overlap (as we see above).
 This is not good for the model as it may start to overfit after seeing sufficient overlapping tokens.
 
 To solve this problem, we define a custom Sampler that only returns the indices that are 'block_size' apart from each other, ensuring that we don't see any overlapping samples.
