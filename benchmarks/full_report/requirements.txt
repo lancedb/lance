@@ -4,4 +4,4 @@ matplotlib
 tqdm
 pandas
 pytest
-tempfile
+ruff

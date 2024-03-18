@@ -17,9 +17,12 @@ framework. The configuration is loaded from a yaml file and converted
 into a Benchmark object."""
 
 from typing import Any, Dict
+
 import attrs
 import lance
 import numpy as np
+
+from .data import BenchmarkData
 
 
 @attrs.define
@@ -29,7 +32,9 @@ class AnnTest:
     ground_truth: np.ndarray = attrs.field(converter=np.load)
 
 
-def _load_dataset(params: str | Dict[str, Any]) -> lance.LanceDataset:
+def _load_dataset(params: str | Dict[str, Any] | BenchmarkData) -> lance.LanceDataset:
+    if isinstance(params, BenchmarkData):
+        return params.base()
     if isinstance(params, dict):
         return lance.LanceDataset(**params)
     elif isinstance(params, str):
