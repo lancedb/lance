@@ -28,7 +28,7 @@ env:
 
 jobs:
   linux-build:
-    runs-on: ubuntu-22.04
+    runs-on: buildjet-8vcpu-ubuntu-2204
     timeout-minutes: 45
     strategy:
       matrix:
@@ -41,9 +41,30 @@ jobs:
       CXX: g++-12
     steps:
       - uses: actions/checkout@v4
+      # pin the toolchain version to avoid surprises
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        if: ${{ matrix.toolchain == 'stable' }}
+        with:
+          toolchain: "1.76.0"
+          cache-workspaces: "src/rust"
+          # Disable full debug symbol generation to speed up CI build and keep memory down
+          # "1" means line tables only, which is useful for panic tracebacks.
+          rustflags: "-C debuginfo=1"
+          components: "rustfmt,clippy"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        if: ${{ matrix.toolchain != 'stable' }}
+        with:
+          toolchain: "nightly"
+          cache-workspaces: "src/rust"
+          # Disable full debug symbol generation to speed up CI build and keep memory down
+          # "1" means line tables only, which is useful for panic tracebacks.
+          rustflags: "-C debuginfo=1"
+          components: "rustfmt,clippy"
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: "buildjet-v0"
           workspaces: rust
+          cache-provider: "buildjet"
       - name: Install dependencies
         run: |
           sudo apt update
@@ -52,18 +73,16 @@ jobs:
           rustup component add rustfmt
       - name: Run cargo fmt
         run: cargo fmt --check
-      # split everything us so we know what's slow.
-      - name: Build
-        run: |
-          cargo build --all-features --tests
       - name: Start DynamoDB local for tests
         if: ${{ matrix.toolchain == 'stable' }}
         run: |
           docker run -d -e AWS_ACCESS_KEY_ID=DUMMYKEY -e AWS_SECRET_ACCESS_KEY=DUMMYKEY -p 8000:8000 amazon/dynamodb-local
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run tests
         if: ${{ matrix.toolchain == 'stable' }}
         run: |
-          cargo test --features dynamodb,tensorflow,dynamodb_tests,cli
+          cargo llvm-cov --workspace --codecov --output-path coverage.codecov --features dynamodb,tensorflow,dynamodb_tests,cli
       - name: Run tests (nightly)
         if: ${{ matrix.toolchain != 'stable' }}
         run: |
@@ -71,6 +90,14 @@ jobs:
       - name: Build benchmarks
         if: ${{ matrix.toolchain == 'stable' }}
         run: cargo build --benches
+      - name: Upload coverage to Codecov
+        if: ${{ matrix.toolchain == 'stable' }}
+        uses: codecov/codecov-action@v4
+        with:
+          codecov_yml_path: codecov.yml
+          files: coverage.codecov
+          flags: unittests
+          fail_ci_if_error: false
   linux-arm:
     runs-on: buildjet-4vcpu-ubuntu-2204-arm
     timeout-minutes: 30
