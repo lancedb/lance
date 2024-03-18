@@ -46,6 +46,8 @@ pub(crate) mod prefilter;
 pub mod scalar;
 pub mod vector;
 
+pub use crate::index::prefilter::{FilterLoader, PreFilter};
+
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::vector::remap_vector_index;
 use crate::io::commit::commit_transaction;
@@ -429,7 +431,7 @@ impl DatasetIndexExt for Dataset {
 ///
 /// Internal use only. No API stability guarantees.
 #[async_trait]
-pub(crate) trait DatasetIndexInternalExt: DatasetIndexExt {
+pub trait DatasetIndexInternalExt: DatasetIndexExt {
     /// Opens an index (scalar or vector) as a generic index
     async fn open_generic_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn Index>>;
     /// Opens the requested scalar index
@@ -548,7 +550,7 @@ mod tests {
     use super::*;
 
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{Field, Schema};
     use lance_arrow::*;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;

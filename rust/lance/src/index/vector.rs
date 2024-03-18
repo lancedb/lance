@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
+pub mod hnsw;
 pub mod ivf;
 pub mod pq;
 mod traits;
@@ -26,7 +27,7 @@ mod utils;
 #[cfg(test)]
 mod fixture_test;
 
-use lance_index::vector::{ivf::IvfBuildParams, pq::PQBuildParams};
+use lance_index::vector::{hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
@@ -35,7 +36,7 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use self::{
-    ivf::{build_ivf_pq_index, remap_index_file, IVFIndex},
+    ivf::{build_ivf_hnsw_index, build_ivf_pq_index, remap_index_file, IVFIndex},
     pq::PQIndex,
 };
 
@@ -53,6 +54,8 @@ pub enum StageParams {
     Ivf(IvfBuildParams),
 
     PQ(PQBuildParams),
+
+    Hnsw(HnswBuildParams),
 }
 
 /// The parameters to build vector index.
@@ -112,6 +115,26 @@ impl VectorIndexParams {
             metric_type,
         }
     }
+
+    /// Create index parameters with `IVF`, `PQ` and `HNSW` parameters, respectively.
+    /// This is used for `IVF_HNSW_PQ` index.
+    #[allow(dead_code)]
+    fn with_ivf_hnsw_pq_params(
+        metric_type: MetricType,
+        ivf: IvfBuildParams,
+        hnsw: HnswBuildParams,
+        pq: PQBuildParams,
+    ) -> Self {
+        let stages = vec![
+            StageParams::Ivf(ivf),
+            StageParams::Hnsw(hnsw),
+            StageParams::PQ(pq),
+        ];
+        Self {
+            stages,
+            metric_type,
+        }
+    }
 }
 
 impl IndexParams for VectorIndexParams {
@@ -128,6 +151,17 @@ fn is_ivf_pq(stages: &[StageParams]) -> bool {
 
     matches!(&stages[len - 1], StageParams::PQ(_))
         && matches!(&stages[len - 2], StageParams::Ivf(_))
+}
+
+fn is_ivf_hnsw_pq(stages: &[StageParams]) -> bool {
+    if stages.len() < 3 {
+        return false;
+    }
+    let len = stages.len();
+
+    matches!(&stages[len - 1], StageParams::PQ(_))
+        && matches!(&stages[len - 2], StageParams::Hnsw(_))
+        && matches!(&stages[len - 3], StageParams::Ivf(_))
 }
 
 /// Build a Vector Index
@@ -170,6 +204,37 @@ pub(crate) async fn build_vector_index(
             uuid,
             params.metric_type,
             ivf_params,
+            pq_params,
+        )
+        .await?
+    } else if is_ivf_hnsw_pq(stages) {
+        let len = stages.len();
+        let StageParams::Ivf(ivf_params) = &stages[len - 3] else {
+            return Err(Error::Index {
+                message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                location: location!(),
+            });
+        };
+        let StageParams::Hnsw(hnsw_params) = &stages[len - 2] else {
+            return Err(Error::Index {
+                message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                location: location!(),
+            });
+        };
+        let StageParams::PQ(pq_params) = &stages[len - 1] else {
+            return Err(Error::Index {
+                message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                location: location!(),
+            });
+        };
+        build_ivf_hnsw_index(
+            dataset,
+            column,
+            name,
+            uuid,
+            params.metric_type,
+            ivf_params,
+            hnsw_params,
             pq_params,
         )
         .await?

@@ -26,6 +26,8 @@ use super::{select_neighbors, select_neighbors_heuristic, HNSW};
 use crate::vector::graph::{builder::GraphBuilder, greedy_search, storage::VectorStorage};
 use crate::vector::hnsw::HnswLevel;
 
+pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
+
 /// Parameters of building HNSW index
 #[derive(Debug, Clone)]
 pub struct HnswBuildParams {

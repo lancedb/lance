@@ -172,14 +172,10 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
-    use arrow_array::types::Float16Type;
-    use arrow_array::{
-        cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float16Array, Float32Array,
-    };
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{FixedSizeListArray, Float16Array, Float32Array};
+    use arrow_schema::Schema;
     use half::f16;
     use lance_arrow::*;
-    use num_traits::Float;
 
     #[tokio::test]
     async fn test_normalize_transformer_f32() {

@@ -42,6 +42,8 @@ use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
 
 /// A trait to be implemented by anything supplying a prefilter row id mask
+///
+/// This trait is for internal use only and has no stability guarantees.
 #[async_trait]
 pub trait FilterLoader: Send + 'static {
     async fn load(self: Box<Self>) -> Result<RowIdMask>;
@@ -51,6 +53,8 @@ pub trait FilterLoader: Send + 'static {
 ///
 /// This could be both rows that are deleted or a prefilter
 /// that should be applied to the search
+///
+/// This struct is for internal use only and has no stability guarantees.
 pub struct PreFilter {
     // Expressing these as tasks allows us to start calculating the block list
     // and allow list at the same time we start searching the query.  We will await

@@ -506,6 +506,9 @@ impl Transaction {
             }
         };
 
+        // If a fragment was reserved then it may not belong at the end of the fragments list.
+        final_fragments.sort_by_key(|frag| frag.id);
+
         let mut manifest = if let Some(current_manifest) = current_manifest {
             Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments))
         } else {

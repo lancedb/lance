@@ -65,10 +65,21 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// Load the index from the reader on-demand.
     async fn load(
         &self,
-        reader: &dyn Reader,
+        reader: Arc<dyn Reader>,
         offset: usize,
         length: usize,
     ) -> Result<Box<dyn VectorIndex>>;
+
+    /// Load the partition from the reader on-demand.
+    async fn load_partition(
+        &self,
+        reader: Arc<dyn Reader>,
+        offset: usize,
+        length: usize,
+        _partition_id: usize,
+    ) -> Result<Box<dyn VectorIndex>> {
+        self.load(reader, offset, length).await
+    }
 
     /// Remap the index according to mapping
     ///
