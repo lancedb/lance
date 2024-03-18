@@ -45,20 +45,22 @@ public class WriteParams {
     this.mode = mode;
   }
 
-  /**
-   * Create a map of the key-value pair of write params.
-   *
-   * @return a map of write params
-   */
-  public Map<String, Object> toMap() {
-    Map<String, Object> params = new HashMap<>();
-    maxRowsPerFile.ifPresent(value -> params.put("max_rows_per_file", value));
-    maxRowsPerGroup.ifPresent(value -> params.put("max_rows_per_group", value));
-    maxBytesPerFile.ifPresent(value -> params.put("max_bytes_per_file", value));
-    mode.ifPresent(value -> params.put("mode", value.toString()));
-    return params;
+  public Optional<Integer> getMaxRowsPerFile() {
+    return maxRowsPerFile;
   }
 
+  public Optional<Integer> getMaxRowsPerGroup() {
+    return maxRowsPerGroup;
+  }
+
+  public Optional<Long> getMaxBytesPerFile() {
+    return maxBytesPerFile;
+  }
+
+  /** Get Mode with name. */
+  public Optional<String> getMode() {
+    return mode.map(Enum::name);
+  }
 
   /**
    * A builder of WriteParams.
