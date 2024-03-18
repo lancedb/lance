@@ -94,6 +94,7 @@ jobs:
         if: ${{ matrix.toolchain == 'stable' }}
         uses: codecov/codecov-action@v4
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           codecov_yml_path: codecov.yml
           files: coverage.codecov
           flags: unittests
