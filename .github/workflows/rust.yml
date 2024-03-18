@@ -62,7 +62,7 @@ jobs:
           components: "rustfmt,clippy"
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "buildjet-v0"
+          prefix-key: "buildjet-v1"
           workspaces: rust
           cache-provider: "buildjet"
       - name: Install dependencies
@@ -87,9 +87,6 @@ jobs:
         if: ${{ matrix.toolchain != 'stable' }}
         run: |
           cargo test
-      - name: Build benchmarks
-        if: ${{ matrix.toolchain == 'stable' }}
-        run: cargo build --benches
       - name: Upload coverage to Codecov
         if: ${{ matrix.toolchain == 'stable' }}
         uses: codecov/codecov-action@v4
@@ -117,7 +114,7 @@ jobs:
       - name: Run tests
         run: |
           cargo test --all-features -- --test-threads 1
-  clippy:
+  clippy_and_benchmark:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -131,6 +128,8 @@ jobs:
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Run clippy
         run: cargo clippy --features cli,dynamodb,tensorflow,dynamodb_tests --tests --benches -- -D warnings
+      - name: Build benchmarks
+        run: cargo build --benches
   mac-build:
     runs-on: "macos-14"
     timeout-minutes: 45
