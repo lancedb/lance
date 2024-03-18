@@ -124,7 +124,7 @@ impl VectorIndexParams {
     /// Create index parameters with `IVF`, `PQ` and `HNSW` parameters, respectively.
     /// This is used for `IVF_HNSW_PQ` index.
     #[allow(dead_code)]
-    fn with_ivf_hnsw_pq_params(
+    pub fn with_ivf_hnsw_pq_params(
         metric_type: MetricType,
         ivf: IvfBuildParams,
         hnsw: HnswBuildParams,
