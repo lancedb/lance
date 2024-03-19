@@ -80,14 +80,15 @@ async fn main() {
 
     let column = args.column.as_deref().unwrap_or("vector");
 
-    let ivf_params = IvfBuildParams::new(200);
+    let mut ivf_params = IvfBuildParams::new(128);
+    ivf_params.sample_rate = 20480;
     let pq_params = PQBuildParams::default();
     let hnsw_params = HnswBuildParams::default()
-        .ef_construction(20)
+        .ef_construction(100)
         .num_edges(15)
         .max_num_edges(30);
     let params = VectorIndexParams::with_ivf_hnsw_pq_params(
-        MetricType::L2,
+        MetricType::Cosine,
         ivf_params,
         hnsw_params,
         pq_params,

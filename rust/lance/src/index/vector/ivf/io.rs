@@ -294,7 +294,6 @@ pub(super) async fn write_hnsw_index_partitions(
 
         let mut vector_batches = Vec::new();
 
-        println!("debug: taking vectors of {} batches...", row_id_array.len());
         let projection = dataset.schema().project(&[column])?;
         for row_ids in &row_id_array {
             let array = dataset
@@ -324,10 +323,11 @@ pub(super) async fn write_hnsw_index_partitions(
         tasks.push(task);
     }
 
+    log::info!("building hnsw partitions...");
     let mut results = futures::stream::iter(tasks).buffered(6);
     while let Some(result) = results.next().await {
+        log::info!("partition {} build done", hnsw_metadata.len());
         let (hnsw, pq_storage) = result?;
-
         let offset = writer.tell().await?;
         let length = hnsw.write_levels(writer).await?;
         ivf.add_partition(offset, length as u32);
