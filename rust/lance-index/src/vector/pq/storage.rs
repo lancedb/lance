@@ -83,6 +83,7 @@ impl ProductQuantizationMetadata {
 }
 
 /// Loader to load partitioned PQ storage from disk.
+#[derive(Clone)]
 pub struct IvfProductQuantizationStorage {
     reader: FileReader,
     metric_type: MetricType,
