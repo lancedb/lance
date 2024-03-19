@@ -67,6 +67,7 @@ fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashS
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
     let args = Args::parse();
 
     let mut dataset = Dataset::open(&args.uri)
@@ -85,12 +86,20 @@ async fn main() {
         hnsw_params,
         pq_params,
     );
-    let now = std::time::Instant::now();
-    dataset
-        .create_index(&[column], IndexType::Vector, None, &params, false)
+    println!("{:?}", params);
+    let indexes = dataset
+        .load_indices_by_name(format!("{}_idx", column).as_str())
         .await
         .unwrap();
-    let build_time = now.elapsed().as_secs();
+    if indexes.is_empty() {
+        let now = std::time::Instant::now();
+        dataset
+            .create_index(&[column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        let build_time = now.elapsed().as_secs_f32();
+        println!("build={:.3}s", build_time);
+    }
 
     let batches = dataset
         .scan()
@@ -114,7 +123,7 @@ async fn main() {
     let now = std::time::Instant::now();
     let results = dataset
         .scan()
-        .nearest(column, &q, k) // Convert &[f32] to reference to PrimitiveArray<Float32Type>
+        .nearest(column, &q, k)
         .unwrap()
         .try_into_stream()
         .await
@@ -124,12 +133,34 @@ async fn main() {
         .unwrap();
     let search_time = now.elapsed().as_micros();
     println!(
-        "level={}, construct={:.3}s search={:.3} us",
+        "level={}, search={:.3} us",
         args.max_level,
         // hnsw_params,
         // args.ef,
         // results.intersection(&gt).count() as f32 / k as f32,
-        build_time,
+        // build_time,
+        search_time
+    );
+
+    let now = std::time::Instant::now();
+    let results = dataset
+        .scan()
+        .nearest(column, &q, k)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let search_time = now.elapsed().as_micros();
+    println!(
+        "warm up: level={}, search={:.3} us",
+        args.max_level,
+        // hnsw_params,
+        // args.ef,
+        // results.intersection(&gt).count() as f32 / k as f32,
+        // build_time,
         search_time
     );
 }

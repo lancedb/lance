@@ -294,6 +294,7 @@ pub(super) async fn write_hnsw_index_partitions(
 
         let mut vector_batches = Vec::new();
 
+        println!("debug: taking vectors of {} batches...", row_id_array.len());
         let projection = dataset.schema().project(&[column])?;
         for row_ids in &row_id_array {
             let array = dataset

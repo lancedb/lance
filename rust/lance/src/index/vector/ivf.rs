@@ -18,6 +18,7 @@ use std::{
     any::Any,
     collections::HashMap,
     sync::{Arc, Weak},
+    time::Instant,
 };
 
 use arrow_arith::numeric::sub;
@@ -188,7 +189,12 @@ impl IVFIndex {
         query: &Query,
         pre_filter: Arc<PreFilter>,
     ) -> Result<RecordBatch> {
+        let now = Instant::now();
         let part_index = self.load_partition(partition_id, true).await?;
+        println!(
+            "debug: load partition elapsed {}",
+            now.elapsed().as_micros()
+        );
 
         let query = if self.sub_index.use_residual() {
             let partition_centroids = self.ivf.centroids.value(partition_id);
@@ -200,6 +206,10 @@ impl IVFIndex {
             query.clone()
         };
         let batch = part_index.search(&query, pre_filter).await?;
+        println!(
+            "debug: search partition elapsed {}",
+            now.elapsed().as_micros()
+        );
         Ok(batch)
     }
 }
@@ -436,7 +446,12 @@ impl VectorIndex for IVFIndex {
             self.metric_type
         };
 
+        let now = Instant::now();
         let partition_ids = self.ivf.find_partitions(&query.key, query.nprobes, mt)?;
+        println!(
+            "debug: find partitions elapsed {}",
+            now.elapsed().as_micros()
+        );
         assert!(partition_ids.len() <= query.nprobes);
         let part_ids = partition_ids.values().to_vec();
         let batches = stream::iter(part_ids)
@@ -459,6 +474,10 @@ impl VectorIndex for IVFIndex {
         let selection = sort_to_indices(dist_col, None, Some(limit))?;
         let struct_arr = StructArray::from(batch);
         let taken_distances = take(&struct_arr, &selection, None)?;
+        println!(
+            "debug: search partitions elapsed {}",
+            now.elapsed().as_micros()
+        );
         Ok(as_struct_array(&taken_distances).into())
     }
 

@@ -17,6 +17,7 @@ use std::{
     collections::HashMap,
     fmt::{Debug, Formatter},
     sync::Arc,
+    time::Instant,
 };
 
 use arrow_array::{cast::AsArray, types::Float32Type, Float32Array, RecordBatch, UInt64Array};
@@ -137,6 +138,7 @@ impl Index for HNSWIndex {
 impl VectorIndex for HNSWIndex {
     #[instrument(level = "debug", skip_all, name = "HNSWIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+        let now = Instant::now();
         let row_ids = self.hnsw.storage().row_ids();
         let bitmap = if pre_filter.is_empty() {
             None
@@ -160,6 +162,10 @@ impl VectorIndex for HNSWIndex {
             30,
             bitmap,
         )?;
+        println!(
+            "debug: search hnsw-inner elapsed {}",
+            now.elapsed().as_micros()
+        );
 
         let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| row_ids[x.0 as usize]));
         let distances = Arc::new(Float32Array::from_iter_values(results.iter().map(|x| x.1)));
@@ -168,6 +174,8 @@ impl VectorIndex for HNSWIndex {
             arrow_schema::Field::new(DIST_COL, DataType::Float32, true),
             arrow_schema::Field::new(ROW_ID, DataType::UInt64, true),
         ]));
+
+        println!("debug: search hnsw elapsed {}", now.elapsed().as_micros());
         Ok(RecordBatch::try_new(
             schema,
             vec![distances, Arc::new(row_ids)],
