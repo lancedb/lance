@@ -14,29 +14,45 @@
 
 """Preparing Benchmark Data"""
 
-from abc import ABC, abstractmethod
+from abc import ABC, abstractproperty
 from subprocess import check_call
 from pathlib import Path
-from typing import Tuple
-import numpy as np
 
+import numpy as np
 import lance
 
 
 class BenchmarkData(ABC):
-    @abstractmethod
+    @abstractproperty
+    def base_dir(self) -> Path:
+        """Return the directory where the base dataset is stored."""
+
+    @abstractproperty
+    def ground_truth_dir(self) -> Path:
+        """Return the directory where the ground truth is stored."""
+
     def base(self) -> lance.LanceDataset:
         """Return the base lance dataset.
 
         Base dataset is used to store the vectors.
         """
+        self.prepare()
+        return lance.LanceDataset(self.base_dir)
 
-    @abstractmethod
-    def ground_truth(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Return the queries and ground truth.
+    def query(self) -> np.ndarray:
+        """Query vectors: [n, D] of float32 array"""
+        self.prepare()
+        ds = lance.LanceDataset(self.base_dir)
+        tbl = ds.to_table(["vector"])
+        return np.stack(tbl["vector"].to_numpy())
 
-        Returns query and ground truth vectors.
-        """
+    def ground_truth(self) -> np.ndarray:
+        """Return ground truth as [n, K] of int64 array"""
+        self.prepare()
+        ds = lance.LanceDataset(self.ground_truth_dir)
+        tbl = ds.to_table(columns=["ground_truth"])
+        ground_truth = np.stack(tbl["ground_truth"].to_numpy())
+        return ground_truth
 
 
 class Text2Image_10M(BenchmarkData):
@@ -71,20 +87,7 @@ class Text2Image_10M(BenchmarkData):
                 shell=True,
             )
 
-    def base(self) -> lance.LanceDataset:
-        self.prepare()
-        return lance.LanceDataset(self.base_dir)
-
-    def ground_truth(self) -> Tuple[np.ndarray]:
-        self.prepare()
-        ds = lance.LanceDataset(self.ground_truth_dir)
-        tbl = ds.to_table()
-        queries = np.stack(tbl["vector"].to_numpy())
-        ground_truth = np.stack(tbl["ground_truth"].to_numpy())
-
-        return (queries, ground_truth)
-
 
 DATASETS = {
-    "text2image-10M": Text2Image_10M(),
+    "text2image-10m": Text2Image_10M(),
 }

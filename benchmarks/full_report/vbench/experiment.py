@@ -22,14 +22,14 @@ import attrs
 import lance
 import numpy as np
 
-from .data import BenchmarkData
+from .data import BenchmarkData, DATASETS
 
 
 @attrs.define
 class AnnTest:
     name: str = attrs.field()
-    query: np.ndarray = attrs.field(converter=np.load)
-    ground_truth: np.ndarray = attrs.field(converter=np.load)
+    query: np.ndarray = attrs.field()
+    ground_truth: np.ndarray = attrs.field()
 
 
 def _load_dataset(params: str | Dict[str, Any] | BenchmarkData) -> lance.LanceDataset:
@@ -53,3 +53,18 @@ class Benchmark:
             name: AnnTest(name=name, **config) for name, config in configs.items()
         }
     )
+
+
+BENCHMARKS = {
+    "text2image-10m": Benchmark(
+        name="text2image-10m",
+        data=DATASETS["text2image-10m"],
+        desc="Text2image(10M) dataset from BigANN benchmark.",
+        test_cases={
+            "base": {
+                "query": DATASETS["text2image-10m"].query(),
+                "ground_truth": DATASETS["text2image-10m"].ground_truth(),
+            }
+        },
+    )
+}
