@@ -52,6 +52,9 @@ struct Args {
 
     #[arg(long, default_value = "7")]
     max_level: u16,
+
+    #[arg(long, default_value = "false")]
+    replace: bool,
 }
 
 fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
@@ -77,9 +80,12 @@ async fn main() {
 
     let column = args.column.as_deref().unwrap_or("vector");
 
-    let ivf_params = IvfBuildParams::default();
+    let ivf_params = IvfBuildParams::new(200);
     let pq_params = PQBuildParams::default();
-    let hnsw_params = HnswBuildParams::default();
+    let hnsw_params = HnswBuildParams::default()
+        .ef_construction(20)
+        .num_edges(15)
+        .max_num_edges(30);
     let params = VectorIndexParams::with_ivf_hnsw_pq_params(
         MetricType::L2,
         ivf_params,
