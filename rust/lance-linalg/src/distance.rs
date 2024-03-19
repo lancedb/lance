@@ -35,11 +35,12 @@ pub use dot::*;
 pub use l2::*;
 use lance_arrow::FloatToArrayType;
 pub use norm_l2::*;
+use serde::{Deserialize, Serialize};
 
 use crate::Result;
 
 /// Distance metrics type.
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DistanceType {
     L2,
     Cosine,
