@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use jni::objects::{JMap, JObject, JString};
+use jni::objects::{JObject, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
-use lance::dataset::{WriteMode, WriteParams};
 use lazy_static::lazy_static;
 use snafu::{location, Location};
 use traits::IntoJava;
+
+use crate::utils::extract_write_params;
 
 #[macro_export]
 macro_rules! ok_or_throw {
@@ -52,8 +53,9 @@ pub mod error;
 mod ffi;
 mod fragment;
 mod traits;
+mod utils;
 
-use self::traits::{FromJString, JMapExt};
+use self::traits::FromJString;
 use crate::blocking_dataset::BlockingDataset;
 pub use error::{Error, Result};
 
@@ -70,11 +72,23 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>
     _obj: JObject,
     arrow_array_stream_addr: jlong,
     path: JString,
-    params: JObject,
+    max_rows_per_file: JObject,  // Optional<Integer>
+    max_rows_per_group: JObject, // Optional<Integer>
+    max_bytes_per_file: JObject, // Optional<Long>
+    mode: JObject,               // Optional<String>
 ) -> JObject<'local> {
     let path_str: String = ok_or_throw!(env, path.extract(&mut env));
 
-    let write_params = ok_or_throw!(env, extract_write_params(&mut env, &params));
+    let write_params = ok_or_throw!(
+        env,
+        extract_write_params(
+            &mut env,
+            &max_rows_per_file,
+            &max_rows_per_group,
+            &max_bytes_per_file,
+            &mode
+        )
+    );
 
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = ok_or_throw!(
@@ -90,23 +104,6 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_writeWithFfiStream<'local>
         BlockingDataset::write(reader, &path_str, Some(write_params))
     );
     dataset.into_java(&mut env)
-}
-
-pub fn extract_write_params(env: &mut JNIEnv, params: &JObject) -> Result<WriteParams> {
-    let params_map = JMap::from_env(env, params)?;
-
-    let mut write_params = WriteParams::default();
-
-    if let Some(max_rows) = params_map.get_i32(env, "max_row_per_file")? {
-        write_params.max_rows_per_group = max_rows as usize;
-    }
-    if let Some(max_bytes) = params_map.get_i64(env, "max_bytes_per_file")? {
-        write_params.max_bytes_per_file = max_bytes as usize;
-    }
-    if let Some(mode) = params_map.get_string(env, "mode")? {
-        write_params.mode = WriteMode::try_from(mode.as_str())?;
-    }
-    Ok(write_params)
 }
 
 #[no_mangle]
