@@ -43,6 +43,7 @@ use lance_io::traits::Writer;
 use lance_linalg::{distance::MetricType, MatrixView};
 use lance_table::io::manifest::ManifestDescribing;
 use snafu::{location, Location};
+use tokio::sync::Mutex;
 
 use super::{IVFIndex, Ivf};
 use crate::index::vector::pq::PQIndex;
@@ -276,69 +277,76 @@ pub(super) async fn write_hnsw_index_partitions(
     }
 
     let mut aux_ivf = IvfData::empty();
-    let mut tasks = Vec::with_capacity(ivf.num_partitions());
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
     let shared_params = Arc::new(hnsw_params.clone());
-    for part_id in 0..ivf.num_partitions() as u32 {
-        let mut pq_array: Vec<Arc<dyn Array>> = vec![];
-        let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
-
-        merge_streams(
-            &mut streams_heap,
-            &mut new_streams,
-            part_id,
-            &mut pq_array,
-            &mut row_id_array,
-        )
-        .await?;
-
-        let mut vector_batches = Vec::new();
-
-        let projection = dataset.schema().project(&[column])?;
-        for row_ids in &row_id_array {
-            let array = dataset
-                .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
-                .await?
-                .column_by_name(column)
-                .expect("row id column not found")
-                .clone();
-            vector_batches.push(array);
-        }
-
-        let params = shared_params.clone();
-        let pq = pq.clone();
-        let build_with_pq = auxiliary_writer.is_some();
-        let task = utils::tokio::spawn_cpu(move || {
-            build_hnsw_partition(
-                metric_type,
-                params,
-                row_id_array,
-                pq_array,
-                vector_batches,
-                build_with_pq,
-                pq,
-            )
-        });
-
-        tasks.push(task);
-    }
 
     log::info!("building hnsw partitions...");
-    let mut results = futures::stream::iter(tasks).buffered(6);
-    while let Some(result) = results.next().await {
-        log::info!("partition {} build done", hnsw_metadata.len());
-        let (hnsw, pq_storage) = result?;
-        let offset = writer.tell().await?;
-        let length = hnsw.write_levels(writer).await?;
-        ivf.add_partition(offset, length as u32);
-        hnsw_metadata.push(hnsw.metadata());
+    let mut start = 0;
+    while start < ivf.num_partitions() {
+        let mut tasks = Vec::with_capacity(6);
+        let end = std::cmp::min(start + 6, ivf.num_partitions());
+        for part_id in start..end {
+            let mut pq_array: Vec<Arc<dyn Array>> = vec![];
+            let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
 
-        if let Some(pq_storage) = pq_storage {
-            let aux_writer = auxiliary_writer.as_mut().unwrap();
-            pq_storage.write_partition(aux_writer).await?;
-            aux_ivf.add_partition(pq_storage.len() as u32);
+            merge_streams(
+                &mut streams_heap,
+                &mut new_streams,
+                part_id as u32,
+                &mut pq_array,
+                &mut row_id_array,
+            )
+            .await?;
+
+            let mut vector_batches = Vec::new();
+
+            let projection = dataset.schema().project(&[column])?;
+            for row_ids in &row_id_array {
+                let array = dataset
+                    .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
+                    .await?
+                    .column_by_name(column)
+                    .expect("row id column not found")
+                    .clone();
+                vector_batches.push(array);
+            }
+
+            let params = shared_params.clone();
+            let pq = pq.clone();
+            let build_with_pq = auxiliary_writer.is_some();
+            let task = utils::tokio::spawn_cpu(move || {
+                build_hnsw_partition(
+                    metric_type,
+                    params,
+                    row_id_array,
+                    pq_array,
+                    vector_batches,
+                    build_with_pq,
+                    pq,
+                )
+            });
+
+            tasks.push(task);
         }
+
+        for result in tasks {
+            let (hnsw, pq_storage) = result.await?;
+            let offset = writer.tell().await?;
+            let length = hnsw.write_levels(writer).await?;
+            ivf.add_partition(offset, length as u32);
+            hnsw_metadata.push(hnsw.metadata());
+
+            if let Some(pq_storage) = pq_storage {
+                let aux_writer = auxiliary_writer.as_mut().unwrap();
+                pq_storage.write_partition(aux_writer).await?;
+                aux_ivf.add_partition(pq_storage.len() as u32);
+            }
+            log::info!("partition {} build done", hnsw_metadata.len());
+        }
+
+        start = end;
     }
+
     Ok((hnsw_metadata, aux_ivf))
 }
 
