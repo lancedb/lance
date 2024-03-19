@@ -79,9 +79,11 @@ impl<T: ArrowFloatType + L2 + Dot> IvfTransformer<T> {
 
         let chunks = std::cmp::min(num_cpus::get(), num_rows);
 
-        info!(
+        log::debug!(
             "computing partition on {} chunks, out of {} centroids, and {} vectors",
-            chunks, num_centroids, num_rows,
+            chunks,
+            num_centroids,
+            num_rows,
         );
         // TODO: when usize::div_ceil() comes to stable Rust, we can use it here.
         let chunk_size = num_rows / chunks + if num_rows % chunks > 0 { 1 } else { 0 };
