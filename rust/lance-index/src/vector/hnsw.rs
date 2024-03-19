@@ -451,7 +451,7 @@ impl HNSW {
     pub async fn write_levels(&self, writer: &mut FileWriter<ManifestDescribing>) -> Result<usize> {
         let mut num_rows = 0;
         for level in self.levels.iter() {
-            assert!(
+            debug_assert!(
                 level
                     .nodes
                     .column(0)

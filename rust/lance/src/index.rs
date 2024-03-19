@@ -492,33 +492,48 @@ impl DatasetIndexInternalExt for Dataset {
 
         // the index file is in lance format since version (0,2)
         // TODO: we need to change the legacy IVF_PQ to be in lance format
-        if major_version > 0 || minor_version > 1 {
-            let reader = FileReader::try_new_self_described_from_reader(
-                reader.clone(),
-                Some(&self.session.file_metadata_cache),
-            )
-            .await?;
-            crate::index::vector::open_vector_index_v2(Arc::new(self.clone()), column, uuid, reader)
-                .await
-        } else {
-            let proto = open_index_proto(reader.as_ref()).await?;
-            match &proto.implementation {
-                Some(Implementation::VectorIndex(vector_index)) => {
-                    let dataset = Arc::new(self.clone());
-                    crate::index::vector::open_vector_index(
-                        dataset,
-                        column,
-                        uuid,
-                        vector_index,
-                        reader,
-                    )
-                    .await
+        match (major_version, minor_version) {
+            (0, 1) | (0, 0) => {
+                let proto = open_index_proto(reader.as_ref()).await?;
+                match &proto.implementation {
+                    Some(Implementation::VectorIndex(vector_index)) => {
+                        let dataset = Arc::new(self.clone());
+                        crate::index::vector::open_vector_index(
+                            dataset,
+                            column,
+                            uuid,
+                            vector_index,
+                            reader,
+                        )
+                        .await
+                    }
+                    None => Err(Error::Internal {
+                        message: "Index proto was missing implementation field".into(),
+                        location: location!(),
+                    }),
                 }
-                None => Err(Error::Internal {
-                    message: "Index proto was missing implementation field".into(),
-                    location: location!(),
-                }),
             }
+
+            (0, 2) => {
+                let reader = FileReader::try_new_self_described_from_reader(
+                    reader.clone(),
+                    Some(&self.session.file_metadata_cache),
+                )
+                .await?;
+                crate::index::vector::open_vector_index_v2(
+                    Arc::new(self.clone()),
+                    column,
+                    uuid,
+                    reader,
+                )
+                .await
+            }
+
+            _ => Err(Error::Index {
+                message: "unsupported index version (maybe need to upgrade your lance version)"
+                    .to_owned(),
+                location: location!(),
+            }),
         }
     }
 
