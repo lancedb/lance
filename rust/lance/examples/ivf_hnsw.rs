@@ -114,6 +114,8 @@ async fn main() {
         .await
         .unwrap()
         .column(0)
+        .as_fixed_size_list()
+        .values()
         .as_primitive::<Float32Type>()
         .clone();
     let k = 10;
