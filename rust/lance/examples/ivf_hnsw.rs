@@ -93,39 +93,30 @@ async fn main() {
         pq_params,
     );
     println!("{:?}", params);
-    let indexes = dataset
-        .load_indices_by_name(format!("{}_idx", column).as_str())
+    // let indexes = dataset
+    //     .load_indices_by_name(format!("{}_idx", column).as_str())
+    //     .await
+    //     .unwrap();
+    // if indexes.is_empty() {
+    let now = std::time::Instant::now();
+    dataset
+        .create_index(&[column], IndexType::Vector, None, &params, true)
         .await
         .unwrap();
-    if indexes.is_empty() {
-        let now = std::time::Instant::now();
-        dataset
-            .create_index(&[column], IndexType::Vector, None, &params, true)
-            .await
-            .unwrap();
-        let build_time = now.elapsed().as_secs_f32();
-        println!("build={:.3}s", build_time);
-    }
+    let build_time = now.elapsed().as_secs_f32();
+    println!("build={:.3}s", build_time);
+    // }
 
-    let batches = dataset
-        .scan()
-        .project(&[column])
-        .unwrap()
-        .try_into_stream()
+    println!("Loaded {} batches", dataset.count_rows().await.unwrap());
+
+    let q = dataset
+        .take(&[0], &dataset.schema().project(&[column]).unwrap())
         .await
         .unwrap()
-        .then(|batch| async move { batch.unwrap().column_by_name(column).unwrap().clone() })
-        .collect::<Vec<_>>()
-        .await;
-    let arrs = batches.iter().map(|b| b.as_ref()).collect::<Vec<_>>();
-    let fsl = concat(&arrs).unwrap();
-    let mat = Arc::new(MatrixView::<Float32Type>::try_from(fsl.as_fixed_size_list()).unwrap());
-    println!("Loaded {:?} batches", mat.num_rows());
-
-    let q = mat.row(0).unwrap();
+        .column(0)
+        .as_primitive::<Float32Type>()
+        .clone();
     let k = 10;
-    let gt = ground_truth(&mat, q, k);
-    let q = PrimitiveArray::from_iter_values(q.iter().copied());
     let now = std::time::Instant::now();
     let results = dataset
         .scan()
