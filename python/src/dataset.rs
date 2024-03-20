@@ -24,6 +24,7 @@ use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use chrono::Duration;
 
+use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::ColumnAlteration;
@@ -894,7 +895,11 @@ impl Dataset {
         let params: Box<dyn IndexParams> = if index_type == "BTREE" {
             Box::<ScalarIndexParams>::default()
         } else {
-            prepare_vector_index_params(&index_type, kwargs)?
+            let column_type = match self.ds.schema().field(columns[0]) {
+                Some(f) => f.data_type().clone(),
+                None => return Err(PyValueError::new_err("Column not found in dataset schema.")),
+            };
+            prepare_vector_index_params(&index_type, &column_type, kwargs)?
         };
 
         let replace = replace.unwrap_or(true);
@@ -1144,6 +1149,7 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
 
 fn prepare_vector_index_params(
     index_type: &str,
+    column_type: &DataType,
     kwargs: Option<&PyDict>,
 ) -> PyResult<Box<dyn IndexParams>> {
     let mut m_type = MetricType::L2;
@@ -1179,7 +1185,22 @@ fn prepare_vector_index_params(
                     "Expected '_ivf_centroids' as the first column name.",
                 ));
             }
-            let centroids = as_fixed_size_list_array(batch.column(0));
+
+            // It's important that the centroids are the same data type
+            // as the vectors that will be indexed.
+            let mut centroids: Arc<dyn Array> = batch.column(0).clone();
+            if centroids.data_type() != column_type {
+                centroids = lance_arrow::cast::cast_with_options(
+                    centroids.as_ref(),
+                    column_type,
+                    &Default::default(),
+                )
+                .map_err(|e| {
+                    PyValueError::new_err(format!("Failed to cast centroids to column type: {}", e))
+                })?;
+            }
+            let centroids = as_fixed_size_list_array(centroids.as_ref());
+
             ivf_params.centroids = Some(Arc::new(centroids.clone()))
         };
 
