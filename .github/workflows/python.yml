@@ -247,10 +247,6 @@ jobs:
   linux-release-test:
     timeout-minutes: 60
     name: Python Linux 3.${{ matrix.python-minor-version }} ${{ matrix.platform }} manylinux${{ matrix.config.manylinux }}
-    env:
-      # Need up-to-date compilers for kernels
-      CC: gcc-12
-      CXX: g++-12
     strategy:
       matrix:
         python-minor-version: [ "8" ]
