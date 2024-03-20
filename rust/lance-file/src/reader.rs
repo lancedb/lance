@@ -117,6 +117,7 @@ impl FileReader {
         schema: Schema,
         fragment_id: u32,
         field_id_offset: u32,
+        num_fields: u32,
         session: Option<&FileMetadataCache>,
     ) -> Result<Self> {
         let object_reader = object_store.open(path).await?;
@@ -130,11 +131,13 @@ impl FileReader {
             schema,
             fragment_id,
             field_id_offset,
+            num_fields,
             session,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn try_new_from_reader(
         path: &Path,
         object_reader: Arc<dyn Reader>,
@@ -142,6 +145,7 @@ impl FileReader {
         schema: Schema,
         fragment_id: u32,
         field_id_offset: u32,
+        num_fields: u32,
         session: Option<&FileMetadataCache>,
     ) -> Result<Self> {
         let metadata = match metadata {
@@ -150,12 +154,11 @@ impl FileReader {
         };
 
         let page_table = async {
-            let num_fields = schema.max_field_id().unwrap_or_default() + 1 - field_id_offset as i32;
             Self::load_from_cache(session, path, |_| async {
                 PageTable::load(
                     object_reader.as_ref(),
                     metadata.page_table_position,
-                    num_fields,
+                    num_fields as i32,
                     metadata.num_batches() as i32,
                     field_id_offset as i32,
                 )
@@ -255,7 +258,10 @@ impl FileReader {
 
     /// Open one Lance data file for read.
     pub async fn try_new(object_store: &ObjectStore, path: &Path, schema: Schema) -> Result<Self> {
-        Self::try_new_with_fragment_id(object_store, path, schema, 0, 0, None).await
+        // If just reading a lance data file we assume the schema is the schema of the data file
+        let num_fields = schema.max_field_id().unwrap_or_default() + 1;
+        Self::try_new_with_fragment_id(object_store, path, schema, 0, 0, num_fields as u32, None)
+            .await
     }
 
     /// Instruct the FileReader to return meta row id column.
@@ -979,10 +985,17 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let fragment = 123_u64;
-        let mut reader =
-            FileReader::try_new_with_fragment_id(&store, &path, schema, fragment as u32, 0, None)
-                .await
-                .unwrap();
+        let mut reader = FileReader::try_new_with_fragment_id(
+            &store,
+            &path,
+            schema,
+            fragment as u32,
+            0,
+            2,
+            None,
+        )
+        .await
+        .unwrap();
         reader.with_row_id(true);
 
         for b in 0..10 {
@@ -1114,10 +1127,17 @@ mod tests {
         // delete even rows
         let dv = DeletionVector::Bitmap(RoaringBitmap::from_iter((0..100).filter(|x| x % 2 == 0)));
 
-        let mut reader =
-            FileReader::try_new_with_fragment_id(&store, &path, schema, fragment as u32, 0, None)
-                .await
-                .unwrap();
+        let mut reader = FileReader::try_new_with_fragment_id(
+            &store,
+            &path,
+            schema,
+            fragment as u32,
+            0,
+            2,
+            None,
+        )
+        .await
+        .unwrap();
         reader.with_row_id(true);
 
         for b in 0..10 {
@@ -1171,10 +1191,17 @@ mod tests {
         // delete even rows
         let dv = DeletionVector::Bitmap(RoaringBitmap::from_iter((0..100).filter(|x| x % 2 == 0)));
 
-        let mut reader =
-            FileReader::try_new_with_fragment_id(&store, &path, schema, fragment as u32, 0, None)
-                .await
-                .unwrap();
+        let mut reader = FileReader::try_new_with_fragment_id(
+            &store,
+            &path,
+            schema,
+            fragment as u32,
+            0,
+            2,
+            None,
+        )
+        .await
+        .unwrap();
         reader.with_row_id(false);
 
         for b in 0..10 {
@@ -1763,5 +1790,60 @@ mod tests {
             actual.column_by_name("b").unwrap().as_ref(),
             &BooleanArray::from(vec![false, false, true, false, true])
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_projection() {
+        // The dataset schema may be very large.  The file reader should support reading
+        // a small projection of that schema (this just tests the field_offset / num_fields
+        // parameters)
+        let store = ObjectStore::memory();
+        let path = Path::from("/partial_read");
+
+        // Create a large schema
+        let mut fields = vec![];
+        for i in 0..100 {
+            fields.push(ArrowField::new(format!("f{}", i), DataType::Int32, false));
+        }
+        let arrow_schema = ArrowSchema::new(fields);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let partial_schema = schema.project(&["f50"]).unwrap();
+        let partial_arrow: ArrowSchema = (&partial_schema).into();
+
+        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
+            &store,
+            &path,
+            partial_schema.clone(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        let array = Int32Array::from(vec![0; 15]);
+        let batch =
+            RecordBatch::try_new(Arc::new(partial_arrow), vec![Arc::new(array.clone())]).unwrap();
+        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let field_id = partial_schema.fields.first().unwrap().id;
+        let num_fields = 1;
+        let reader = FileReader::try_new_with_fragment_id(
+            &store,
+            &path,
+            schema.clone(),
+            0,
+            field_id as u32,
+            num_fields,
+            None,
+        )
+        .await
+        .unwrap();
+        let actual = reader
+            .read_batch(0, ReadBatchParams::RangeFull, &partial_schema, None)
+            .await
+            .unwrap();
+
+        assert_eq!(actual, batch);
     }
 }
