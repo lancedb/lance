@@ -104,6 +104,7 @@ def test_sql_predicates(dataset):
         ("rec.dt = TIMESTAMP(6) '2021-01-01 00:00:00'", 1),
         ("rec.date = DATE '2021-01-01'", 1),
         ("rec.date >= cast('2021-01-31' as date)", 70),
+        # DELETE ME
         ("cast(rec.date as string) = '2021-01-01'", 1),
         ("decimal = DECIMAL(5,3) '12.000'", 1),
         ("decimal >= DECIMAL(5,3) '50.000'", 50),
