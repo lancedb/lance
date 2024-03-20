@@ -246,12 +246,22 @@ jobs:
       run: sudo rm -rf target/wheels
   linux-release-test:
     timeout-minutes: 60
+    name: Python Linux 3.${{ matrix.python-minor-version }} ${{ matrix.platform }} manylinux${{ matrix.config.manylinux }}
+    env:
+      # Need up-to-date compilers for kernels
+      CC: gcc-12
+      CXX: g++-12
     strategy:
       matrix:
         python-minor-version: [ "8" ]
         platform:
           - x86_64
           - aarch64
+        config:
+          - manylinux: "2_17"
+            extra_args: ""
+          - manylinux: "2_28"
+            extra_args: "--features fp16kernels"
     runs-on: "ubuntu-22.04"
     steps:
     - uses: actions/checkout@v4
@@ -265,8 +275,9 @@ jobs:
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release --strip --features fp16kernels"
+        args: "--release --strip ${{ matrix.config.extra_args }}"
         arm-build: ${{ matrix.platform == 'aarch64' }}
+        manylinux: ${{ matrix.config.manylinux }}
   mac-release-test:
     timeout-minutes: 60
     runs-on: ${{ matrix.config.runner }}
