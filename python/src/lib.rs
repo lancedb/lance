@@ -36,6 +36,7 @@ use dataset::optimize::{
 use dataset::MergeInsertBuilder;
 use env_logger::Env;
 use futures::StreamExt;
+use lance_index::DatasetIndexExt;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 
@@ -270,8 +271,13 @@ fn manifest_needs_migration(dataset: &PyAny) -> PyResult<bool> {
     let py = dataset.py();
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
     let dataset_ref = &dataset.as_ref(py).borrow().ds;
+    let indices = RT
+        .block_on(Some(py), dataset_ref.load_indices())?
+        .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
     let manifest = RT
         .block_on(Some(py), dataset_ref.latest_manifest())?
-        .map_err(|err| PyIOError::new_err(format!("Failed to connect to data: {}", err)))?;
-    Ok(::lance::io::commit::manifest_needs_migration(&manifest))
+        .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
+    Ok(::lance::io::commit::manifest_needs_migration(
+        &manifest, &indices,
+    ))
 }

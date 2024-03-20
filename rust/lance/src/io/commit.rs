@@ -35,7 +35,7 @@
 
 use std::sync::Arc;
 
-use lance_table::format::{pb, DeletionFile, Fragment, Index, Manifest};
+use lance_table::format::{pb, DeletionFile, Fragment, Index, Manifest, WriterVersion};
 use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler};
 use lance_table::io::deletion::read_deletion_file;
 use snafu::{location, Location};
@@ -157,7 +157,7 @@ pub(crate) async fn commit_new_dataset(
 /// `dataset.delete(false)`, which won't modify data but will cause a migration.
 /// However, you don't want to always have to do this, so we provide this method
 /// to check if a migration is needed.
-pub fn manifest_needs_migration(manifest: &Manifest) -> bool {
+pub fn manifest_needs_migration(manifest: &Manifest, indices: &[Index]) -> bool {
     manifest.writer_version.is_none()
         || manifest.fragments.iter().any(|f| {
             f.physical_rows.is_none()
@@ -167,6 +167,9 @@ pub fn manifest_needs_migration(manifest: &Manifest) -> bool {
                     .map(|d| d.num_deleted_rows.is_none())
                     .unwrap_or(false))
         })
+        || indices
+            .iter()
+            .any(|i| must_recalculate_fragment_bitmap(i, manifest.writer_version.as_ref()))
 }
 
 /// Update manifest with new metadata fields.
@@ -261,22 +264,18 @@ pub(crate) async fn migrate_fragments(
     new_fragments.try_collect().await
 }
 
+fn must_recalculate_fragment_bitmap(index: &Index, version: Option<&WriterVersion>) -> bool {
+    // If the fragment bitmap was written by an old version of lance then we need to recalculate
+    // it because it could be corrupt due to a bug in versions < 0.8.15
+    index.fragment_bitmap.is_none() || version.map(|v| v.older_than(0, 8, 15)).unwrap_or(true)
+}
+
 /// Update indices with new fields.
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()> {
     for index in indices {
-        // If the fragment bitmap is missing we need to recalculate it
-        let mut must_recalculate_fragment_bitmap = index.fragment_bitmap.is_none();
-        // If the fragment bitmap was written by an old version of lance then we need to recalculate
-        // it because it could be corrupt due to a bug in versions < 0.8.15
-        must_recalculate_fragment_bitmap |=
-            if let Some(writer_version) = &dataset.manifest.writer_version {
-                writer_version.older_than(0, 8, 15)
-            } else {
-                true
-            };
-        if must_recalculate_fragment_bitmap {
+        if must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref()) {
             debug_assert_eq!(index.fields.len(), 1);
             let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;
             // We need to calculate the fragments covered by the index
