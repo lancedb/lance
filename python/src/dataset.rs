@@ -23,6 +23,7 @@ use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use chrono::Duration;
 
+use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::ColumnAlteration;
@@ -940,7 +941,33 @@ impl Dataset {
                                 "Expected '_ivf_centroids' as the first column name.",
                             ));
                         }
-                        let centroids = as_fixed_size_list_array(batch.column(0));
+
+                        // It's important that the centroids are the same data type
+                        // as the vectors that will be indexed.
+                        let target_type = match self.ds.schema().field(columns[0]) {
+                            Some(f) => f.data_type().clone(),
+                            None => {
+                                return Err(PyValueError::new_err(
+                                    "Column not found in dataset schema.",
+                                ))
+                            }
+                        };
+                        let mut centroids: Arc<dyn Array> = batch.column(0).clone();
+                        if centroids.data_type() != &target_type {
+                            centroids = lance_arrow::cast::cast_with_options(
+                                centroids.as_ref(),
+                                &target_type,
+                                &Default::default(),
+                            )
+                            .map_err(|e| {
+                                PyValueError::new_err(format!(
+                                    "Failed to cast centroids to column type: {}",
+                                    e
+                                ))
+                            })?;
+                        }
+                        let centroids = as_fixed_size_list_array(centroids.as_ref());
+
                         ivf_params.centroids = Some(Arc::new(centroids.clone()))
                     };
 
