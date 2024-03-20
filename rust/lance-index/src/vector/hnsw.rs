@@ -29,6 +29,7 @@ use arrow_array::{
     ListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
@@ -280,12 +281,15 @@ impl HNSW {
                 }
             })?)?;
 
-        let mut levels = Vec::with_capacity(hnsw_metadata.level_offsets.len() - 1);
-        for i in 0..hnsw_metadata.level_offsets.len() - 1 {
-            let start = hnsw_metadata.level_offsets[i];
-            let end = hnsw_metadata.level_offsets[i + 1];
-            levels.push(HnswLevel::load(reader, start..end, vector_storage.clone()).await?);
-        }
+        let levels = futures::stream::iter(0..hnsw_metadata.level_offsets.len() - 1)
+            .map(|i| {
+                let start = hnsw_metadata.level_offsets[i];
+                let end = hnsw_metadata.level_offsets[i + 1];
+                HnswLevel::load(reader, start..end, vector_storage.clone())
+            })
+            .buffered(num_cpus::get())
+            .try_collect()
+            .await?;
         Ok(Self {
             levels,
             distance_type: mt,
