@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Instant;
@@ -278,7 +278,7 @@ pub(super) async fn write_hnsw_index_partitions(
     // TODO: make it configurable, limit by the number of CPU cores & memory
     let parallel_limit = 3;
     let mut aux_ivf = IvfData::empty();
-    let mut task_queue = std::collections::LinkedList::new();
+    let mut task_queue = VecDeque::with_capacity(parallel_limit);
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
     let shared_params = Arc::new(hnsw_params.clone());
     for part_id in 0..ivf.num_partitions() as u32 {
