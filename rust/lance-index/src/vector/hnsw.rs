@@ -133,14 +133,15 @@ impl HnswLevel {
     }
 
     fn from_builder(builder: &GraphBuilder, vectors: Arc<dyn VectorStorage>) -> Result<Self> {
-        let mut vector_id_builder = UInt32Builder::new();
-        let mut neighbours_builder = ListBuilder::new(UInt32Builder::new());
+        let mut vector_id_builder = UInt32Builder::with_capacity(builder.nodes.len());
+        let mut neighbours_builder =
+            ListBuilder::with_capacity(UInt32Builder::new(), builder.nodes.len());
 
-        for &id in builder.nodes.keys().sorted() {
-            let node = builder.nodes.get(&id).unwrap();
-            assert_eq!(node.id, id);
+        for id in builder.nodes.keys().sorted() {
+            let node = builder.nodes.get(id).unwrap();
+            assert_eq!(node.id, *id);
             vector_id_builder.append_value(node.id);
-            neighbours_builder.append_value(node.neighbors.clone().iter().map(|n| Some(n.id)));
+            neighbours_builder.append_value(node.neighbors.iter().map(|n| Some(n.id)));
         }
 
         let schema = Schema::new(vec![VECTOR_ID_FIELD.clone(), NEIGHBORS_FIELD.clone()]);
