@@ -133,6 +133,14 @@ def test_add_columns_exprs(tmp_path):
     assert dataset.to_table() == pa.table({"a": range(100), "b": range(1, 101)})
 
 
+def test_add_many_columns(tmp_path: Path):
+    table = pa.table([pa.array([1, 2, 3])], names=["0"])
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.add_columns(dict([(str(i), "0") for i in range(1, 1000)]))
+    dataset = lance.dataset(tmp_path)
+    assert dataset.to_table().num_rows == 3
+
+
 def test_query_after_merge(tmp_path):
     # https://github.com/lancedb/lance/issues/1905
     tab = pa.table({
