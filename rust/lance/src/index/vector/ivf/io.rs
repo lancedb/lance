@@ -283,8 +283,8 @@ pub(super) async fn write_hnsw_index_partitions(
     log::info!("building hnsw partitions...");
     let mut start = 0;
     while start < ivf.num_partitions() {
-        let mut tasks = Vec::with_capacity(3);
-        let end = std::cmp::min(start + 3, ivf.num_partitions());
+        let mut tasks = Vec::with_capacity(6);
+        let end = std::cmp::min(start + 6, ivf.num_partitions());
         for part_id in start..end {
             let mut pq_array: Vec<Arc<dyn Array>> = vec![];
             let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
@@ -300,26 +300,9 @@ pub(super) async fn write_hnsw_index_partitions(
             .await?;
 
             let mut vector_batches = Vec::with_capacity(row_id_array.len());
+
             log::info!("partition {} takes vectors...", part_id);
             let projection = dataset.schema().project(&[column])?;
-            {
-                let mut vector_stream = futures::stream::iter(&row_id_array)
-                    .map(|row_ids| async {
-                        dataset
-                            .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
-                            .await
-                    })
-                    .buffered(num_cpus::get() * 2);
-
-                while let Some(batch) = vector_stream.next().await {
-                    let vector_array = batch?
-                        .column_by_name(column)
-                        .expect("row id column not found")
-                        .clone();
-
-                    vector_batches.push(vector_array);
-                }
-            }
             for row_ids in &row_id_array {
                 let array = dataset
                     .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
