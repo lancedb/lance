@@ -16,7 +16,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # cancel-in-progress: true
 
 env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
@@ -247,6 +247,8 @@ jobs:
   linux-release-test:
     timeout-minutes: 60
     name: Python Linux 3.${{ matrix.python-minor-version }} ${{ matrix.platform }} manylinux${{ matrix.config.manylinux }}
+    env:
+      CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"
     strategy:
       matrix:
         python-minor-version: [ "8" ]
