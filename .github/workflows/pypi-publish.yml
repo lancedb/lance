@@ -26,7 +26,7 @@ jobs:
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release --strip"
+        args: "--release --strip --features fp16kernels"
         arm-build: ${{ matrix.platform == 'aarch64' }}
     - uses: ./.github/workflows/upload_wheel
       with:
@@ -58,7 +58,7 @@ jobs:
     - uses: ./.github/workflows/build_mac_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release --strip --target ${{ matrix.config.target }}"
+        args: "--release --strip --target ${{ matrix.config.target }} --features fp16kernels"
     - uses: ./.github/workflows/upload_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
