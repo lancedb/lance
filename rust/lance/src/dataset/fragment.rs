@@ -203,6 +203,7 @@ impl FileFragment {
             let data_file_schema = data_file.schema(full_schema);
             let schema_per_file = data_file_schema.intersection(projection)?;
             let add_row_id = with_row_id && i == 0;
+            let num_fields = data_file.fields.len() as u32;
             if add_row_id || !schema_per_file.fields.is_empty() {
                 let path = self.dataset.data_dir().child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
@@ -212,6 +213,7 @@ impl FileFragment {
                     self.schema().clone(),
                     self.id() as u32,
                     field_id_offset,
+                    num_fields,
                     Some(&self.dataset.session.file_metadata_cache),
                 )
                 .await?;
@@ -309,12 +311,14 @@ impl FileFragment {
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
         let path = self.dataset.data_dir().child(some_file.path.as_str());
+        let num_fields = some_file.fields.len() as u32;
         let reader = FileReader::try_new_with_fragment_id(
             &self.dataset.object_store,
             &path,
             self.schema().clone(),
             self.id() as u32,
             Self::get_field_id_offset(some_file),
+            num_fields,
             Some(&self.dataset.session.file_metadata_cache),
         )
         .await?;
@@ -337,15 +341,17 @@ impl FileFragment {
             .map(|data_file| {
                 let path = self.dataset.data_dir().child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
-                (path, field_id_offset)
+                let num_fields = data_file.fields.len() as u32;
+                (path, field_id_offset, num_fields)
             })
-            .map(|(path, field_id_offset)| async move {
+            .map(|(path, field_id_offset, num_fields)| async move {
                 let reader = FileReader::try_new_with_fragment_id(
                     &self.dataset.object_store,
                     &path,
                     self.schema().clone(),
                     self.id() as u32,
                     field_id_offset,
+                    num_fields,
                     Some(&self.dataset.session.file_metadata_cache),
                 )
                 .await?;
@@ -1487,6 +1493,7 @@ mod tests {
             schema.as_ref().try_into().unwrap(),
             10,
             0,
+            1,
             None,
         )
         .await
