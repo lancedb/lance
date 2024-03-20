@@ -29,6 +29,8 @@ pub(super) mod storage;
 /// Vector storage to back a graph.
 pub use storage::VectorStorage;
 
+use self::storage::DistCalculator;
+
 pub(crate) const NEIGHBORS_COL: &str = "__neighbors";
 
 lazy_static::lazy_static! {
@@ -176,10 +178,14 @@ pub(super) fn beam_search(
     start: &[u32],
     query: &[f32],
     k: usize,
+    dist_calc: Option<Arc<dyn DistCalculator>>,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
 ) -> Result<BTreeMap<OrderedFloat, u32>> {
     let mut visited: HashSet<_> = start.iter().copied().collect();
-    let dist_calc = graph.storage().dist_calculator(query);
+    let dist_calc = match dist_calc {
+        Some(dist_calc) => dist_calc,
+        None => graph.storage().dist_calculator(query).into(),
+    };
     let mut candidates: BTreeMap<OrderedFloat, _> = dist_calc
         .distance(start)
         .iter()
@@ -254,9 +260,13 @@ pub(super) fn greedy_search(
     graph: &dyn Graph,
     start: u32,
     query: &[f32],
+    dist_calc: Option<Arc<dyn DistCalculator>>,
 ) -> Result<(OrderedFloat, u32)> {
     let mut current = start;
-    let dist_calc = graph.storage().dist_calculator(query);
+    let dist_calc = match dist_calc {
+        Some(dist_calc) => dist_calc,
+        None => graph.storage().dist_calculator(query).into(),
+    };
     let mut closest_dist = dist_calc.distance(&[start])[0];
     loop {
         let neighbors: Vec<_> = graph
