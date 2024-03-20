@@ -275,11 +275,28 @@ pub(super) async fn write_hnsw_index_partitions(
         }
     }
 
+    // TODO: make it configurable, limit by the number of CPU cores & memory
+    let parallel_limit = 3;
     let mut aux_ivf = IvfData::empty();
-    let mut tasks = Vec::with_capacity(ivf.num_partitions());
+    let mut task_queue = std::collections::LinkedList::new();
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
     let shared_params = Arc::new(hnsw_params.clone());
     for part_id in 0..ivf.num_partitions() as u32 {
+        if task_queue.len() >= parallel_limit {
+            let task = task_queue.pop_front().unwrap();
+            let (hnsw, pq_storage): (HNSW, Option<ProductQuantizationStorage>) = task.await?;
+
+            let offset = writer.tell().await?;
+            let length = hnsw.write_levels(writer).await?;
+            ivf.add_partition(offset, length as u32);
+            hnsw_metadata.push(hnsw.metadata());
+
+            if let Some(pq_storage) = pq_storage {
+                let aux_writer = auxiliary_writer.as_mut().unwrap();
+                pq_storage.write_partition(aux_writer).await?;
+                aux_ivf.add_partition(pq_storage.len() as u32);
+            }
+        }
         let mut pq_array: Vec<Arc<dyn Array>> = vec![];
         let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
 
@@ -320,12 +337,11 @@ pub(super) async fn write_hnsw_index_partitions(
             )
         });
 
-        tasks.push(task);
+        task_queue.push_back(task);
     }
 
-    let mut results = futures::stream::iter(tasks).buffered(6);
-    while let Some(result) = results.next().await {
-        let (hnsw, pq_storage) = result?;
+    while let Some(task) = task_queue.pop_front() {
+        let (hnsw, pq_storage) = task.await?;
 
         let offset = writer.tell().await?;
         let length = hnsw.write_levels(writer).await?;
@@ -338,6 +354,7 @@ pub(super) async fn write_hnsw_index_partitions(
             aux_ivf.add_partition(pq_storage.len() as u32);
         }
     }
+
     Ok((hnsw_metadata, aux_ivf))
 }
 
