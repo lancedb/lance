@@ -19,24 +19,26 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{cast::AsArray, types::Float32Type, Float32Array, RecordBatch, UInt32Array};
+use arrow_array::{cast::AsArray, types::Float32Type, Float32Array, RecordBatch, UInt64Array};
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_arrow::*;
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_index::{
     vector::{
-        graph::{VectorStorage, NEIGHBORS_FIELD},
+        graph::NEIGHBORS_FIELD,
         hnsw::{HnswMetadata, HNSW, VECTOR_ID_FIELD},
         ivf::storage::IVF_PARTITION_KEY,
+        pq::storage::IvfProductQuantizationStorage,
         Query, DIST_COL,
     },
     Index, IndexType,
 };
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
+use lance_table::format::SelfDescribingFileReader;
 use roaring::RoaringBitmap;
 use serde_json::json;
 use snafu::{location, Location};
@@ -50,7 +52,9 @@ use crate::index::prefilter::PreFilter;
 #[derive(Clone)]
 pub struct HNSWIndex {
     hnsw: HNSW,
-    storage: Option<Arc<dyn VectorStorage>>,
+
+    // TODO: move these into IVFIndex after the refactor is complete
+    partition_storage: IvfProductQuantizationStorage,
     partition_metadata: Option<Vec<HnswMetadata>>,
 }
 
@@ -61,23 +65,12 @@ impl Debug for HNSWIndex {
 }
 
 impl HNSWIndex {
-    pub async fn try_new(hnsw: HNSW, reader: Arc<dyn Reader>) -> Result<Self> {
-        let schema = Schema::try_from(&arrow_schema::Schema::new(vec![
-            NEIGHBORS_FIELD.clone(),
-            VECTOR_ID_FIELD.clone(),
-        ]))?;
-
-        let reader = FileReader::try_new_from_reader(
-            reader.path(),
-            reader.clone(),
-            None,
-            schema,
-            0,
-            0,
-            2,
-            None,
-        )
-        .await?;
+    pub async fn try_new(
+        hnsw: HNSW,
+        reader: Arc<dyn Reader>,
+        aux_reader: Arc<dyn Reader>,
+    ) -> Result<Self> {
+        let reader = FileReader::try_new_self_described_from_reader(reader.clone(), None).await?;
 
         let partition_metadata = match reader.schema().metadata.get(IVF_PARTITION_KEY) {
             Some(json) => {
@@ -87,9 +80,10 @@ impl HNSWIndex {
             None => None,
         };
 
+        let ivf_pq_store = IvfProductQuantizationStorage::open(aux_reader).await?;
         Ok(Self {
             hnsw,
-            storage: None,
+            partition_storage: ivf_pq_store,
             partition_metadata,
         })
     }
@@ -142,24 +136,41 @@ impl Index for HNSWIndex {
 #[async_trait]
 impl VectorIndex for HNSWIndex {
     #[instrument(level = "debug", skip_all, name = "HNSWIndex::search")]
-    async fn search(&self, query: &Query, _pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
+        let row_ids = self.hnsw.storage().row_ids();
+        let bitmap = if pre_filter.is_empty() {
+            None
+        } else {
+            pre_filter.wait_for_ready().await?;
+
+            let indices = pre_filter.filter_row_ids(row_ids);
+            Some(
+                RoaringBitmap::from_sorted_iter(indices.into_iter().map(|i| i as u32)).map_err(
+                    |e| Error::Index {
+                        message: format!("Error creating RoaringBitmap: {}", e),
+                        location: location!(),
+                    },
+                )?,
+            )
+        };
+
         let results = self.hnsw.search(
             query.key.as_primitive::<Float32Type>().as_slice(),
             query.k,
             30,
-            None,
+            bitmap,
         )?;
 
-        let node_ids = UInt32Array::from_iter_values(results.iter().map(|x| x.0));
+        let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| row_ids[x.0 as usize]));
         let distances = Arc::new(Float32Array::from_iter_values(results.iter().map(|x| x.1)));
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(DIST_COL, DataType::Float32, true),
-            arrow_schema::Field::new("_node_id", DataType::UInt32, true),
+            arrow_schema::Field::new(ROW_ID, DataType::UInt64, true),
         ]));
         Ok(RecordBatch::try_new(
             schema,
-            vec![distances, Arc::new(node_ids)],
+            vec![distances, Arc::new(row_ids)],
         )?)
     }
 
@@ -198,11 +209,15 @@ impl VectorIndex for HNSWIndex {
         )
         .await?;
 
-        let hnsw = HNSW::load(&reader, self.storage.clone().unwrap()).await?;
+        let hnsw = HNSW::load(
+            &reader,
+            Arc::new(self.partition_storage.load_partition(0).await?),
+        )
+        .await?;
 
         Ok(Box::new(Self {
             hnsw,
-            storage: self.storage.clone(),
+            partition_storage: self.partition_storage.clone(),
             partition_metadata: self.partition_metadata.clone(),
         }))
     }
@@ -214,36 +229,21 @@ impl VectorIndex for HNSWIndex {
         length: usize,
         partition_id: usize,
     ) -> Result<Box<dyn VectorIndex>> {
-        let schema = Schema::try_from(&arrow_schema::Schema::new(vec![
-            NEIGHBORS_FIELD.clone(),
-            VECTOR_ID_FIELD.clone(),
-        ]))?;
-
-        let reader = FileReader::try_new_from_reader(
-            reader.path(),
-            reader.clone(),
-            None,
-            schema,
-            0,
-            0,
-            2,
-            None,
-        )
-        .await?;
+        let reader = FileReader::try_new_self_described_from_reader(reader, None).await?;
 
         let metadata = self.get_partition_metadata(partition_id)?;
         let hnsw = HNSW::load_partition(
             &reader,
-            offset..length,
+            offset..offset + length,
             self.metric_type(),
-            self.storage.clone().unwrap(),
+            Arc::new(self.partition_storage.load_partition(partition_id).await?),
             metadata,
         )
         .await?;
 
         Ok(Box::new(Self {
             hnsw,
-            storage: self.storage.clone(),
+            partition_storage: self.partition_storage.clone(),
             partition_metadata: self.partition_metadata.clone(),
         }))
     }

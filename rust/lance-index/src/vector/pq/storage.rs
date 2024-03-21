@@ -28,7 +28,7 @@ use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
     object_store::ObjectStore,
-    traits::{WriteExt, Writer},
+    traits::{Reader, WriteExt, Writer},
     utils::read_message,
 };
 use lance_linalg::{distance::MetricType, MatrixView};
@@ -50,14 +50,14 @@ use crate::{
     IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
 };
 
-const PQ_METADTA_KEY: &str = "lance:pq";
+pub const PQ_METADTA_KEY: &str = "lance:pq";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProductQuantizationMetadata {
-    codebook_position: usize,
-    num_bits: u32,
-    num_sub_vectors: usize,
-    dimension: usize,
+    pub codebook_position: usize,
+    pub num_bits: u32,
+    pub num_sub_vectors: usize,
+    pub dimension: usize,
 }
 
 impl ProductQuantizationMetadata {
@@ -83,7 +83,7 @@ impl ProductQuantizationMetadata {
 }
 
 /// Loader to load partitioned PQ storage from disk.
-#[allow(dead_code)]
+#[derive(Clone)]
 pub struct IvfProductQuantizationStorage {
     reader: FileReader,
     metric_type: MetricType,
@@ -98,8 +98,8 @@ impl IvfProductQuantizationStorage {
     /// Open a Loader.
     ///
     ///
-    pub async fn open(object_store: &ObjectStore, path: &Path) -> Result<Self> {
-        let reader = FileReader::try_new_self_described(object_store, path, None).await?;
+    pub async fn open(reader: Arc<dyn Reader>) -> Result<Self> {
+        let reader = FileReader::try_new_self_described_from_reader(reader, None).await?;
         let schema = reader.schema();
 
         let metadata_str = schema
@@ -117,7 +117,7 @@ impl IvfProductQuantizationStorage {
                 message: format!("Failed to parse index metadata: {}", metadata_str),
                 location: location!(),
             })?;
-        let metric_type: MetricType = MetricType::try_from(index_metadata.metric_type.as_str())?;
+        let metric_type: MetricType = MetricType::try_from(index_metadata.distance_type.as_str())?;
 
         let ivf_data = IvfData::load(&reader).await?;
 
@@ -375,7 +375,7 @@ impl ProductQuantizationStorage {
                 message: format!("Failed to parse index metadata: {}", metadata_str),
                 location: location!(),
             })?;
-        let metric_type: MetricType = MetricType::try_from(index_metadata.metric_type.as_str())?;
+        let metric_type: MetricType = MetricType::try_from(index_metadata.distance_type.as_str())?;
 
         let pq_matadata = ProductQuantizationMetadata::load(&reader)?;
         let codebook_tensor: pb::Tensor =
@@ -399,7 +399,6 @@ impl ProductQuantizationStorage {
         self.batch.schema()
     }
 
-    #[allow(dead_code)]
     pub fn get_row_ids(&self, ids: &[u32]) -> Vec<u64> {
         ids.iter()
             .map(|&id| self.row_ids.value(id as usize))
@@ -444,7 +443,7 @@ impl ProductQuantizationStorage {
 
         let index_metadata = IndexMetadata {
             index_type: "PQ".to_string(),
-            metric_type: self.metric_type.to_string(),
+            distance_type: self.metric_type.to_string(),
         };
 
         let mut schema_metadata = HashMap::new();
@@ -464,6 +463,10 @@ impl ProductQuantizationStorage {
 impl VectorStorage for ProductQuantizationStorage {
     fn len(&self) -> usize {
         self.batch.num_rows()
+    }
+
+    fn row_ids(&self) -> &[u64] {
+        self.row_ids.values()
     }
 
     fn metric_type(&self) -> MetricType {

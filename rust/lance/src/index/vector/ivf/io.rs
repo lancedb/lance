@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Instant;
 use std::{cmp::Reverse, pin::Pin};
@@ -27,6 +28,8 @@ use futures::{Stream, StreamExt};
 use lance_arrow::*;
 use lance_core::Error;
 use lance_file::writer::FileWriter;
+use lance_index::vector::graph::VectorStorage;
+use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::pq::storage::ProductQuantizationStorage;
 use lance_index::vector::pq::ProductQuantizer;
@@ -43,8 +46,8 @@ use snafu::{location, Location};
 
 use super::{IVFIndex, Ivf};
 use crate::index::vector::pq::PQIndex;
-use crate::Result;
 use crate::{dataset::ROW_ID, Dataset};
+use crate::{utils, Result};
 
 /// Merge streams with the same partition id and collect PQ codes and row IDs.
 async fn merge_streams(
@@ -242,8 +245,6 @@ pub(super) async fn write_hnsw_index_partitions(
 ) -> Result<(Vec<HnswMetadata>, IvfData)> {
     let mut streams_heap = BinaryHeap::new();
     let mut new_streams = vec![];
-    let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
-
     if let Some(streams) = streams {
         for stream in streams {
             let mut stream = Box::pin(stream.peekable());
@@ -274,12 +275,30 @@ pub(super) async fn write_hnsw_index_partitions(
         }
     }
 
+    // TODO: make it configurable, limit by the number of CPU cores & memory
+    let parallel_limit = 3;
     let mut aux_ivf = IvfData::empty();
+    let mut task_queue = VecDeque::with_capacity(parallel_limit);
+    let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
+    let shared_params = Arc::new(hnsw_params.clone());
     for part_id in 0..ivf.num_partitions() as u32 {
-        let start = Instant::now();
+        if task_queue.len() >= parallel_limit {
+            let task = task_queue.pop_front().unwrap();
+            let (hnsw, pq_storage): (HNSW, Option<ProductQuantizationStorage>) = task.await?;
+
+            let offset = writer.tell().await?;
+            let length = hnsw.write_levels(writer).await?;
+            ivf.add_partition(offset, length as u32);
+            hnsw_metadata.push(hnsw.metadata());
+
+            if let Some(pq_storage) = pq_storage {
+                let aux_writer = auxiliary_writer.as_mut().unwrap();
+                pq_storage.write_partition(aux_writer).await?;
+                aux_ivf.add_partition(pq_storage.len() as u32);
+            }
+        }
         let mut pq_array: Vec<Arc<dyn Array>> = vec![];
         let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
-        let mut vector_batches = Vec::new();
 
         merge_streams(
             &mut streams_heap,
@@ -290,7 +309,7 @@ pub(super) async fn write_hnsw_index_partitions(
         )
         .await?;
 
-        let offset = writer.len();
+        let mut vector_batches = Vec::new();
 
         let projection = dataset.schema().project(&[column])?;
         for row_ids in &row_id_array {
@@ -303,53 +322,89 @@ pub(super) async fn write_hnsw_index_partitions(
             vector_batches.push(array);
         }
 
-        let vector_arrs = vector_batches
-            .iter()
-            .map(|arr| arr.as_ref())
-            .collect::<Vec<_>>();
-        let fsl = arrow_select::concat::concat(&vector_arrs).unwrap();
-        let mat = Arc::new(MatrixView::<Float32Type>::try_from(fsl.as_fixed_size_list()).unwrap());
-        let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), metric_type));
-        let mut hnsw_builder = HNSWBuilder::with_params(hnsw_params.clone(), vec_store);
-        let hnsw = hnsw_builder.build()?;
-
-        if let Some(writer) = auxiliary_writer.as_mut() {
-            let pq_array = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-            let row_id_array = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-            let pq_column = concat(&pq_array)?;
-            let row_ids_column = concat(&row_id_array)?;
-            let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![
-                (ROW_ID, row_ids_column, true),
-                (PQ_CODE_COLUMN, pq_column, false),
-            ])?;
-            let pq_store = ProductQuantizationStorage::new(
-                pq.codebook_as_fsl()
-                    .values()
-                    .as_primitive::<Float32Type>()
-                    .clone()
-                    .into(),
-                pq_batch.clone(),
-                pq.num_bits(),
-                pq.num_sub_vectors(),
-                pq.dimension(),
+        let params = shared_params.clone();
+        let pq = pq.clone();
+        let build_with_pq = auxiliary_writer.is_some();
+        let task = utils::tokio::spawn_cpu(move || {
+            build_hnsw_partition(
                 metric_type,
-            )?;
+                params,
+                row_id_array,
+                pq_array,
+                vector_batches,
+                build_with_pq,
+                pq,
+            )
+        });
 
-            pq_store.write_partition(writer).await?;
-            aux_ivf.add_partition(pq_batch.num_rows() as u32);
-        }
+        task_queue.push_back(task);
+    }
 
-        hnsw.write_levels(writer).await?;
+    while let Some(task) = task_queue.pop_front() {
+        let (hnsw, pq_storage) = task.await?;
+
+        let offset = writer.tell().await?;
+        let length = hnsw.write_levels(writer).await?;
+        ivf.add_partition(offset, length as u32);
         hnsw_metadata.push(hnsw.metadata());
 
-        ivf.add_partition(offset, hnsw.len() as u32);
-        log::info!(
-            "Wrote partition {} in {} ms",
-            part_id,
-            start.elapsed().as_millis()
-        );
+        if let Some(pq_storage) = pq_storage {
+            let aux_writer = auxiliary_writer.as_mut().unwrap();
+            pq_storage.write_partition(aux_writer).await?;
+            aux_ivf.add_partition(pq_storage.len() as u32);
+        }
     }
+
     Ok((hnsw_metadata, aux_ivf))
+}
+
+fn build_hnsw_partition(
+    metric_type: MetricType,
+    hnsw_params: Arc<HnswBuildParams>,
+    row_id_array: Vec<Arc<dyn Array>>,
+    pq_array: Vec<Arc<dyn Array>>,
+    vector_array: Vec<Arc<dyn Array>>,
+    build_with_pq: bool,
+    pq: Arc<dyn ProductQuantizer>,
+) -> Result<(HNSW, Option<ProductQuantizationStorage>)> {
+    let vector_arrs = vector_array
+        .iter()
+        .map(|arr| arr.as_ref())
+        .collect::<Vec<_>>();
+    let fsl = arrow_select::concat::concat(&vector_arrs).unwrap();
+    let mat = Arc::new(MatrixView::<Float32Type>::try_from(fsl.as_fixed_size_list()).unwrap());
+    let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), metric_type));
+    let mut hnsw_builder = HNSWBuilder::with_params(hnsw_params.deref().clone(), vec_store);
+    let hnsw = hnsw_builder.build()?;
+
+    let pq_storage = if build_with_pq {
+        let pq_array = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+        let row_id_array = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+        let pq_column = concat(&pq_array)?;
+        let row_ids_column = concat(&row_id_array)?;
+        let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![
+            (ROW_ID, row_ids_column, true),
+            (PQ_CODE_COLUMN, pq_column, false),
+        ])?;
+        let pq_store = ProductQuantizationStorage::new(
+            pq.codebook_as_fsl()
+                .values()
+                .as_primitive::<Float32Type>()
+                .clone()
+                .into(),
+            pq_batch.clone(),
+            pq.num_bits(),
+            pq.num_sub_vectors(),
+            pq.dimension(),
+            metric_type,
+        )?;
+
+        Some(pq_store)
+    } else {
+        None
+    };
+
+    Ok((hnsw, pq_storage))
 }
 
 #[cfg(test)]
