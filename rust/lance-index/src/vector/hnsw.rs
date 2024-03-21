@@ -45,8 +45,10 @@ use snafu::{location, Location};
 use self::builder::HNSW_METADATA_KEY;
 
 use super::graph::{
-    builder::GraphBuilder, greedy_search, storage::VectorStorage, Graph, OrderedFloat, OrderedNode,
-    NEIGHBORS_COL, NEIGHBORS_FIELD,
+    builder::GraphBuilder,
+    greedy_search,
+    storage::{DistCalculator, VectorStorage},
+    Graph, OrderedFloat, OrderedNode, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
 use super::ivf::storage::IvfData;
 use crate::vector::graph::beam_search;
@@ -369,11 +371,21 @@ impl HNSW {
         let mut ep = self.entry_point;
         let num_layers = self.levels.len();
 
+        let dist_calc: Arc<dyn DistCalculator> =
+            self.levels[0].storage().dist_calculator(query).into();
+
         for level in self.levels.iter().rev().take(num_layers - 1) {
-            ep = greedy_search(level, ep, query)?.1;
+            ep = greedy_search(level, ep, query, Some(dist_calc.clone()))?.1;
         }
 
-        let candidates = beam_search(&self.levels[0], &[ep], query, ef, bitset.as_ref())?;
+        let candidates = beam_search(
+            &self.levels[0],
+            &[ep],
+            query,
+            ef,
+            Some(dist_calc),
+            bitset.as_ref(),
+        )?;
         Ok(select_neighbors(&candidates, k)
             .map(|(d, u)| (u, d.into()))
             .collect())
