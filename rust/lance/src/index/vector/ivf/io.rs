@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::{cmp::Reverse, pin::Pin};
 
+use arrow::array::{ArrayBuilder, ArrayDataBuilder, FixedSizeListBuilder, Float32Builder};
 use arrow::compute::concat;
 use arrow::datatypes::Float32Type;
 use arrow_array::{
@@ -276,7 +277,7 @@ pub(super) async fn write_hnsw_index_partitions(
     }
 
     // TODO: make it configurable, limit by the number of CPU cores & memory
-    let parallel_limit = 2;
+    let parallel_limit = 3;
     let mut aux_ivf = IvfData::empty();
     let mut task_queue = VecDeque::with_capacity(parallel_limit);
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
@@ -398,16 +399,22 @@ fn build_hnsw_partition(
         .map(|arr| arr.as_ref())
         .collect::<Vec<_>>();
     let fsl = arrow_select::concat::concat(&vector_arrs).unwrap();
+    std::mem::drop(vector_array);
+
     let mat = Arc::new(MatrixView::<Float32Type>::try_from(fsl.as_fixed_size_list()).unwrap());
     let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), metric_type));
     let mut hnsw_builder = HNSWBuilder::with_params(hnsw_params.deref().clone(), vec_store);
     let hnsw = hnsw_builder.build()?;
 
     let pq_storage = if build_with_pq {
-        let pq_array = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-        let row_id_array = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-        let pq_column = concat(&pq_array)?;
-        let row_ids_column = concat(&row_id_array)?;
+        let row_id_arr = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+        let row_ids_column = concat(&row_id_arr)?;
+        std::mem::drop(row_id_array);
+
+        let pq_arr = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+        let pq_column = concat(&pq_arr)?;
+        std::mem::drop(pq_array);
+
         let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![
             (ROW_ID, row_ids_column, true),
             (PQ_CODE_COLUMN, pq_column, false),
