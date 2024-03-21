@@ -24,7 +24,7 @@ use arrow_array::{
     cast::AsArray, types::UInt64Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
 use futures::stream::Peekable;
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use lance_arrow::*;
 use lance_core::Error;
 use lance_file::writer::FileWriter;
@@ -276,11 +276,12 @@ pub(super) async fn write_hnsw_index_partitions(
     }
 
     // TODO: make it configurable, limit by the number of CPU cores & memory
-    let parallel_limit = 3;
+    let parallel_limit = 2;
     let mut aux_ivf = IvfData::empty();
     let mut task_queue = VecDeque::with_capacity(parallel_limit);
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
     let shared_params = Arc::new(hnsw_params.clone());
+    log::info!("building hnsw partitions in parallel {}", parallel_limit);
     for part_id in 0..ivf.num_partitions() as u32 {
         if task_queue.len() >= parallel_limit {
             let task = task_queue.pop_front().unwrap();
@@ -296,10 +297,33 @@ pub(super) async fn write_hnsw_index_partitions(
                 pq_storage.write_partition(aux_writer).await?;
                 aux_ivf.add_partition(pq_storage.len() as u32);
             }
+
+            log::info!("hnsw partition {} built", hnsw_metadata.len() - 1);
         }
+        // while task_queue.len() > 0 {
+        //     let task = task_queue.front_mut().unwrap();
+        //     match task.now_or_never() {
+        //         Some(result) => {
+        //             let (hnsw, pq_storage): (HNSW, Option<ProductQuantizationStorage>) = result?;
+
+        //             let offset = writer.tell().await?;
+        //             let length = hnsw.write_levels(writer).await?;
+        //             ivf.add_partition(offset, length as u32);
+        //             hnsw_metadata.push(hnsw.metadata());
+
+        //             if let Some(pq_storage) = pq_storage {
+        //                 let aux_writer = auxiliary_writer.as_mut().unwrap();
+        //                 pq_storage.write_partition(aux_writer).await?;
+        //                 aux_ivf.add_partition(pq_storage.len() as u32);
+        //             }
+        //         }
+        //         None => break,
+        //     }
+        // }
         let mut pq_array: Vec<Arc<dyn Array>> = vec![];
         let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
 
+        log::info!("hnsw partition {} merging streams", part_id);
         merge_streams(
             &mut streams_heap,
             &mut new_streams,
@@ -311,6 +335,7 @@ pub(super) async fn write_hnsw_index_partitions(
 
         let mut vector_batches = Vec::new();
 
+        log::info!("hnsw partition {} taking vectors", part_id);
         let projection = dataset.schema().project(&[column])?;
         for row_ids in &row_id_array {
             let array = dataset
@@ -353,6 +378,7 @@ pub(super) async fn write_hnsw_index_partitions(
             pq_storage.write_partition(aux_writer).await?;
             aux_ivf.add_partition(pq_storage.len() as u32);
         }
+        log::info!("hnsw partition {} built", hnsw_metadata.len() - 1);
     }
 
     Ok((hnsw_metadata, aux_ivf))

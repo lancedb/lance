@@ -264,9 +264,9 @@ impl HNSWBuilder {
             self.insert(i as u32)?;
         }
 
-        if log_enabled!(Info) {
+        if log_enabled!(log::Level::Debug) {
             for (i, level) in self.levels.iter().enumerate() {
-                info!("HNSW level {}: {:#?}", i, level.stats());
+                log::debug!("HNSW level {}: {:#?}", i, level.stats());
             }
         }
 

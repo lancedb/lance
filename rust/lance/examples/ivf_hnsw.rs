@@ -53,14 +53,17 @@ struct Args {
     #[arg(long, default_value = "7")]
     max_level: u16,
 
-    #[arg(long, default_value = "false")]
+    #[arg(long, default_value = "true")]
     replace: bool,
 
     #[arg(long, default_value = "1")]
     nprobe: usize,
 
-    #[arg(long, default_value = "10")]
+    #[arg(short, default_value = "10")]
     k: usize,
+
+    #[arg(long, default_value = "false")]
+    create_index: bool,
 }
 
 fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
@@ -100,19 +103,16 @@ async fn main() {
         pq_params,
     );
     println!("{:?}", params);
-    // let indexes = dataset
-    //     .load_indices_by_name(format!("{}_idx", column).as_str())
-    //     .await
-    //     .unwrap();
-    // if indexes.is_empty() {
-    // let now = std::time::Instant::now();
-    // dataset
-    //     .create_index(&[column], IndexType::Vector, None, &params, true)
-    //     .await
-    //     .unwrap();
-    // let build_time = now.elapsed().as_secs_f32();
-    // println!("build={:.3}s", build_time);
-    // }
+
+    if args.create_index {
+        let now = std::time::Instant::now();
+        dataset
+            .create_index(&[column], IndexType::Vector, None, &params, args.replace)
+            .await
+            .unwrap();
+        let build_time = now.elapsed().as_secs_f32();
+        println!("build={:.3}s", build_time);
+    }
 
     println!("Loaded {} batches", dataset.count_rows().await.unwrap());
 
