@@ -246,20 +246,24 @@ jobs:
       run: sudo rm -rf target/wheels
   linux-release-test:
     timeout-minutes: 60
-    name: Python Linux 3.${{ matrix.python-minor-version }} ${{ matrix.platform }} manylinux${{ matrix.config.manylinux }}
+    name: Python Linux 3.${{ matrix.python-minor-version }} ${{ matrix.config.platform }} manylinux${{ matrix.config.manylinux }}
     env:
       CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"
     strategy:
       matrix:
         python-minor-version: [ "8" ]
-        platform:
-          - x86_64
-          - aarch64
         config:
-          - manylinux: "2_17"
+          - platform: x86_64
+            manylinux: "2_17"
             extra_args: ""
-          - manylinux: "2_28"
+          - platform: x86_64
+            manylinux: "2_28"
             extra_args: "--features fp16kernels"
+          - platform: aarch64
+            manylinux: "2_24"
+            extra_args: ""
+          # We don't build fp16 kernels for aarch64, because it uses 
+          # cross compilation image, which doesn't have a new enough compiler.
     runs-on: "ubuntu-22.04"
     steps:
     - uses: actions/checkout@v4
@@ -274,7 +278,7 @@ jobs:
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
         args: "--release --strip ${{ matrix.config.extra_args }}"
-        arm-build: ${{ matrix.platform == 'aarch64' }}
+        arm-build: ${{ matrix.config.platform == 'aarch64' }}
         manylinux: ${{ matrix.config.manylinux }}
   mac-release-test:
     timeout-minutes: 60
