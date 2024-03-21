@@ -36,6 +36,7 @@ use dataset::optimize::{
 use dataset::MergeInsertBuilder;
 use env_logger::Env;
 use futures::StreamExt;
+use lance_index::DatasetIndexExt;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 
@@ -119,6 +120,7 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(read_tfrecord))?;
     m.add_wrapped(wrap_pyfunction!(cleanup_partial_writes))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
+    m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     register_datagen(py, m)?;
     Ok(())
@@ -261,4 +263,21 @@ fn read_tfrecord(
     })?;
 
     Ok(PyArrowType(stream_reader))
+}
+
+#[pyfunction]
+#[pyo3(signature = (dataset,))]
+fn manifest_needs_migration(dataset: &PyAny) -> PyResult<bool> {
+    let py = dataset.py();
+    let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
+    let dataset_ref = &dataset.as_ref(py).borrow().ds;
+    let indices = RT
+        .block_on(Some(py), dataset_ref.load_indices())?
+        .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
+    let manifest = RT
+        .block_on(Some(py), dataset_ref.latest_manifest())?
+        .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
+    Ok(::lance::io::commit::manifest_needs_migration(
+        &manifest, &indices,
+    ))
 }
