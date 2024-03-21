@@ -18,6 +18,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{types::Float32Type, FixedSizeListArray, RecordBatch};
+use arrow_schema::Field as ArrowField;
 use async_trait::async_trait;
 
 use lance_core::Result;
@@ -90,6 +91,11 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// If an old row id is not in the mapping then it should be
     /// left alone.
     fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>;
+
+    /// Transform the index in place to be for a different data type.
+    /// 
+    /// This can be used, for example, to transform a float32 index to a float16 index.
+    fn cast(&mut self, to: &ArrowField) -> Result<()>;
 
     /// The metric type of this vector index.
     fn metric_type(&self) -> MetricType;

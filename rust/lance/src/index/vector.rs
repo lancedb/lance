@@ -301,6 +301,10 @@ pub(crate) async fn cast_vector_index(
     from_field: &Field,
     to_field: &Field,
 ) -> Result<()> {
+    // let old_index = dataset
+    //     .open_vector_index(column, &old_uuid.to_string())
+    //     .await?;
+    // old_index.cast(to_field.data_type())?;
     todo!()
 }
 
