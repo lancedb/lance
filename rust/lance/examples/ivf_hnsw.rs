@@ -82,7 +82,7 @@ async fn main() {
     env_logger::init();
     let args = Args::parse();
 
-    let dataset = Dataset::open(&args.uri)
+    let mut dataset = Dataset::open(&args.uri)
         .await
         .expect("Failed to open dataset");
     println!("Dataset schema: {:#?}", dataset.schema());
