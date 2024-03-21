@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Instant;
@@ -43,7 +43,6 @@ use lance_io::traits::Writer;
 use lance_linalg::{distance::MetricType, MatrixView};
 use lance_table::io::manifest::ManifestDescribing;
 use snafu::{location, Location};
-use tokio::sync::Mutex;
 
 use super::{IVFIndex, Ivf};
 use crate::index::vector::pq::PQIndex;
@@ -276,63 +275,17 @@ pub(super) async fn write_hnsw_index_partitions(
         }
     }
 
+    // TODO: make it configurable, limit by the number of CPU cores & memory
+    let parallel_limit = 3;
     let mut aux_ivf = IvfData::empty();
+    let mut task_queue = VecDeque::with_capacity(parallel_limit);
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
     let shared_params = Arc::new(hnsw_params.clone());
+    for part_id in 0..ivf.num_partitions() as u32 {
+        if task_queue.len() >= parallel_limit {
+            let task = task_queue.pop_front().unwrap();
+            let (hnsw, pq_storage): (HNSW, Option<ProductQuantizationStorage>) = task.await?;
 
-    log::info!("building hnsw partitions...");
-    let mut start = 0;
-    while start < ivf.num_partitions() {
-        let mut tasks = Vec::with_capacity(3);
-        let end = std::cmp::min(start + 32, ivf.num_partitions());
-        for part_id in start..end {
-            let mut pq_array: Vec<Arc<dyn Array>> = vec![];
-            let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
-
-            log::info!("partition {} merges streams...", part_id);
-            merge_streams(
-                &mut streams_heap,
-                &mut new_streams,
-                part_id as u32,
-                &mut pq_array,
-                &mut row_id_array,
-            )
-            .await?;
-
-            let mut vector_batches = Vec::with_capacity(row_id_array.len());
-
-            log::info!("partition {} takes vectors...", part_id);
-            let projection = dataset.schema().project(&[column])?;
-            for row_ids in &row_id_array {
-                let array = dataset
-                    .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
-                    .await?
-                    .column_by_name(column)
-                    .expect("row id column not found")
-                    .clone();
-                vector_batches.push(array);
-            }
-
-            let params = shared_params.clone();
-            let pq = pq.clone();
-            let build_with_pq = auxiliary_writer.is_some();
-            let task = utils::tokio::spawn_cpu(move || {
-                build_hnsw_partition(
-                    metric_type,
-                    params,
-                    row_id_array,
-                    pq_array,
-                    vector_batches,
-                    build_with_pq,
-                    pq,
-                )
-            });
-
-            tasks.push(task);
-        }
-
-        for result in tasks {
-            let (hnsw, pq_storage) = result.await?;
             let offset = writer.tell().await?;
             let length = hnsw.write_levels(writer).await?;
             ivf.add_partition(offset, length as u32);
@@ -343,10 +296,63 @@ pub(super) async fn write_hnsw_index_partitions(
                 pq_storage.write_partition(aux_writer).await?;
                 aux_ivf.add_partition(pq_storage.len() as u32);
             }
-            log::info!("partition {} build done", hnsw_metadata.len());
+        }
+        let mut pq_array: Vec<Arc<dyn Array>> = vec![];
+        let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
+
+        merge_streams(
+            &mut streams_heap,
+            &mut new_streams,
+            part_id,
+            &mut pq_array,
+            &mut row_id_array,
+        )
+        .await?;
+
+        let mut vector_batches = Vec::new();
+
+        let projection = dataset.schema().project(&[column])?;
+        for row_ids in &row_id_array {
+            let array = dataset
+                .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
+                .await?
+                .column_by_name(column)
+                .expect("row id column not found")
+                .clone();
+            vector_batches.push(array);
         }
 
-        start = end;
+        let params = shared_params.clone();
+        let pq = pq.clone();
+        let build_with_pq = auxiliary_writer.is_some();
+        let task = utils::tokio::spawn_cpu(move || {
+            build_hnsw_partition(
+                metric_type,
+                params,
+                row_id_array,
+                pq_array,
+                vector_batches,
+                build_with_pq,
+                pq,
+            )
+        });
+
+        task_queue.push_back(task);
+    }
+
+    while let Some(task) = task_queue.pop_front() {
+        let (hnsw, pq_storage) = task.await?;
+
+        let offset = writer.tell().await?;
+        let length = hnsw.write_levels(writer).await?;
+        ivf.add_partition(offset, length as u32);
+        hnsw_metadata.push(hnsw.metadata());
+
+        if let Some(pq_storage) = pq_storage {
+            let aux_writer = auxiliary_writer.as_mut().unwrap();
+            pq_storage.write_partition(aux_writer).await?;
+            aux_ivf.add_partition(pq_storage.len() as u32);
+        }
     }
 
     Ok((hnsw_metadata, aux_ivf))
