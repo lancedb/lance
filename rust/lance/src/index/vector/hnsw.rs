@@ -204,6 +204,7 @@ impl VectorIndex for HNSWIndex {
             schema,
             0,
             0,
+            2,
             None,
         )
         .await?;

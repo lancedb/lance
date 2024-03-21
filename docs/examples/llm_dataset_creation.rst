@@ -12,7 +12,7 @@ For this example, we are working with the `wikitext <https://huggingface.co/data
 which is a collection of over 100 million tokens extracted from the set of verified Good and Featured articles on Wikipedia.
 
 Preparing and pre-processing the raw dataset
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Let's first define the dataset and the tokenizer
 

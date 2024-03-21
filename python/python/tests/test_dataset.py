@@ -1535,3 +1535,12 @@ def test_dynamic_projection(tmp_path: Path):
 
     expected = pa.Table.from_pylist([{"bool": False}, {"bool": True}])
     assert expected == table2
+
+
+def test_migrate_manifest(tmp_path: Path):
+    from lance.lance import manifest_needs_migration
+
+    table = pa.table({"x": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path)
+    # We shouldn't need a migration for a brand new dataset.
+    assert not manifest_needs_migration(ds)
