@@ -22,6 +22,6 @@ python ./big-ann-benchmarks/create_dataset.py --dataset yfcc-10M
 After execution, two datasets will be created:
 
 - *text2image-10m.lance* : base dataset
-- *text2image-10m-queries.lance* : quries / GT dataset.
+- *text2image-10m-queries.lance* : queries / ground truth dataset.
 
 
