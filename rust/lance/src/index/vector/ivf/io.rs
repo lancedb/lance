@@ -277,7 +277,7 @@ pub(super) async fn write_hnsw_index_partitions(
     }
 
     // TODO: make it configurable, limit by the number of CPU cores & memory
-    let parallel_limit = 3;
+    let parallel_limit = 20;
     let mut aux_ivf = IvfData::empty();
     let mut task_queue = VecDeque::with_capacity(parallel_limit);
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
