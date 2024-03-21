@@ -284,7 +284,7 @@ pub(super) async fn write_hnsw_index_partitions(
     let mut start = 0;
     while start < ivf.num_partitions() {
         let mut tasks = Vec::with_capacity(3);
-        let end = std::cmp::min(start + 3, ivf.num_partitions());
+        let end = std::cmp::min(start + 32, ivf.num_partitions());
         for part_id in start..end {
             let mut pq_array: Vec<Arc<dyn Array>> = vec![];
             let mut row_id_array: Vec<Arc<dyn Array>> = vec![];

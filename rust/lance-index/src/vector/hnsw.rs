@@ -29,6 +29,7 @@ use arrow_array::{
     ListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
@@ -44,8 +45,10 @@ use snafu::{location, Location};
 use self::builder::HNSW_METADATA_KEY;
 
 use super::graph::{
-    builder::GraphBuilder, greedy_search, storage::VectorStorage, Graph, OrderedFloat, OrderedNode,
-    NEIGHBORS_COL, NEIGHBORS_FIELD,
+    builder::GraphBuilder,
+    greedy_search,
+    storage::{DistCalculator, VectorStorage},
+    Graph, OrderedFloat, OrderedNode, NEIGHBORS_COL, NEIGHBORS_FIELD,
 };
 use super::ivf::storage::IvfData;
 use crate::vector::graph::beam_search;
@@ -133,9 +136,9 @@ impl HnswLevel {
     }
 
     fn from_builder(builder: &GraphBuilder, vectors: Arc<dyn VectorStorage>) -> Result<Self> {
-        let mut vector_id_builder = UInt32Builder::with_capacity(builder.nodes.len());
+        let mut vector_id_builder = UInt32Builder::with_capacity(builder.len());
         let mut neighbours_builder =
-            ListBuilder::with_capacity(UInt32Builder::new(), builder.nodes.len());
+            ListBuilder::with_capacity(UInt32Builder::new(), builder.len());
 
         for id in builder.nodes.keys().sorted() {
             let node = builder.nodes.get(id).unwrap();
@@ -277,12 +280,15 @@ impl HNSW {
                 }
             })?)?;
 
-        let mut levels = vec![];
-        for i in 0..hnsw_metadata.level_offsets.len() - 1 {
-            let start = hnsw_metadata.level_offsets[i];
-            let end = hnsw_metadata.level_offsets[i + 1];
-            levels.push(HnswLevel::load(reader, start..end, vector_storage.clone()).await?);
-        }
+        let levels = futures::stream::iter(0..hnsw_metadata.level_offsets.len() - 1)
+            .map(|i| {
+                let start = hnsw_metadata.level_offsets[i];
+                let end = hnsw_metadata.level_offsets[i + 1];
+                HnswLevel::load(reader, start..end, vector_storage.clone())
+            })
+            .buffered(num_cpus::get())
+            .try_collect()
+            .await?;
         Ok(Self {
             levels,
             distance_type: mt,
@@ -362,11 +368,21 @@ impl HNSW {
         let mut ep = self.entry_point;
         let num_layers = self.levels.len();
 
+        let dist_calc: Arc<dyn DistCalculator> =
+            self.levels[0].storage().dist_calculator(query).into();
+
         for level in self.levels.iter().rev().take(num_layers - 1) {
-            ep = greedy_search(level, ep, query)?.1;
+            ep = greedy_search(level, ep, query, Some(dist_calc.clone()))?.1;
         }
 
-        let candidates = beam_search(&self.levels[0], &[ep], query, ef, bitset.as_ref())?;
+        let candidates = beam_search(
+            &self.levels[0],
+            &[ep],
+            query,
+            ef,
+            Some(dist_calc),
+            bitset.as_ref(),
+        )?;
         Ok(select_neighbors(&candidates, k)
             .map(|(d, u)| (u, d.into()))
             .collect())

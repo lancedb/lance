@@ -151,11 +151,13 @@ impl IVFIndex {
 
     /// Load one partition of the IVF sub-index.
     ///
+    /// Internal API with no stability guarantees.
+    ///
     /// Parameters
     /// ----------
     ///  - partition_id: partition ID.
     #[instrument(level = "debug", skip(self))]
-    pub(crate) async fn load_partition(
+    pub async fn load_partition(
         &self,
         partition_id: usize,
         write_cache: bool,

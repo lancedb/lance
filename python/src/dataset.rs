@@ -258,7 +258,7 @@ impl Operation {
 pub struct Dataset {
     #[pyo3(get)]
     uri: String,
-    ds: Arc<LanceDataset>,
+    pub(crate) ds: Arc<LanceDataset>,
 }
 
 #[pymethods]

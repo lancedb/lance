@@ -55,6 +55,12 @@ struct Args {
 
     #[arg(long, default_value = "false")]
     replace: bool,
+
+    #[arg(long, default_value = "1")]
+    nprobe: usize,
+
+    #[arg(long, default_value = "10")]
+    k: usize,
 }
 
 fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
@@ -73,7 +79,7 @@ async fn main() {
     env_logger::init();
     let args = Args::parse();
 
-    let mut dataset = Dataset::open(&args.uri)
+    let dataset = Dataset::open(&args.uri)
         .await
         .expect("Failed to open dataset");
     println!("Dataset schema: {:#?}", dataset.schema());
@@ -99,13 +105,13 @@ async fn main() {
     //     .await
     //     .unwrap();
     // if indexes.is_empty() {
-    let now = std::time::Instant::now();
-    dataset
-        .create_index(&[column], IndexType::Vector, None, &params, true)
-        .await
-        .unwrap();
-    let build_time = now.elapsed().as_secs_f32();
-    println!("build={:.3}s", build_time);
+    // let now = std::time::Instant::now();
+    // dataset
+    //     .create_index(&[column], IndexType::Vector, None, &params, true)
+    //     .await
+    //     .unwrap();
+    // let build_time = now.elapsed().as_secs_f32();
+    // println!("build={:.3}s", build_time);
     // }
 
     println!("Loaded {} batches", dataset.count_rows().await.unwrap());
@@ -119,12 +125,12 @@ async fn main() {
         .values()
         .as_primitive::<Float32Type>()
         .clone();
-    let k = 10;
     let now = std::time::Instant::now();
     let results = dataset
         .scan()
-        .nearest(column, &q, k)
+        .nearest(column, &q, args.k)
         .unwrap()
+        .nprobs(args.nprobe)
         .try_into_stream()
         .await
         .unwrap()
@@ -145,8 +151,9 @@ async fn main() {
     let now = std::time::Instant::now();
     let results = dataset
         .scan()
-        .nearest(column, &q, k)
+        .nearest(column, &q, args.k)
         .unwrap()
+        .nprobs(args.nprobe)
         .try_into_stream()
         .await
         .unwrap()

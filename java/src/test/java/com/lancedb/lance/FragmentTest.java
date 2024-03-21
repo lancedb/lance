@@ -21,6 +21,8 @@ import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Optional;
+
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.dataset.scanner.ScanOptions;
@@ -73,6 +75,24 @@ public class FragmentTest {
         assert(batchCount > 0);
       }
 
+    }
+  }
+
+  @Test
+  void testFragementCreate() throws IOException, URISyntaxException {
+    Path path = Paths.get(DatasetTest.class.getResource("/random_access.arrow").toURI());
+    try (BufferAllocator allocator = new RootAllocator();
+        ArrowFileReader reader =
+            new ArrowFileReader(
+                new SeekableReadChannel(
+                    new ByteArrayReadableSeekableByteChannel(Files.readAllBytes(path))),
+                allocator);
+        ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
+      Data.exportArrayStream(allocator, reader, arrowStream);
+      Path datasetPath = tempDir.resolve("new_fragment");
+      int fragmentId = 1;
+      FragmentMetadata fragmentMeta = Fragment.create(datasetPath.toString(), arrowStream, Optional.of(fragmentId), new WriteParams.Builder().build());
+      assertEquals(fragmentId, fragmentMeta.getFragementId());
     }
   }
 }
