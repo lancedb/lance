@@ -202,7 +202,7 @@ pub async fn shuffle_dataset(
 
         let start = std::time::Instant::now();
         shuffler.write_unsorted_stream(stream).await?;
-        info!("wrote unstored stream in {:?} seconds", start.elapsed());
+        info!("wrote unstored stream in {:?}", start.elapsed());
 
         shuffler
     };
@@ -212,15 +212,12 @@ pub async fn shuffle_dataset(
     let partition_files = shuffler
         .write_partitioned_shuffles(shuffle_partition_batches, shuffle_partition_concurrency)
         .await?;
-    info!("counted partition sizes in {:?} seconds", start.elapsed());
+    info!("counted partition sizes in {:?}", start.elapsed());
 
     // step 3: load the sorted chuncks, consumers are expect to be responsible for merging the streams
     let start = std::time::Instant::now();
     let stream = shuffler.load_partitioned_shuffles(partition_files).await?;
-    info!(
-        "merged partitioned shuffles in {:?} seconds",
-        start.elapsed()
-    );
+    info!("merged partitioned shuffles in {:?}", start.elapsed());
 
     Ok(stream)
 }
