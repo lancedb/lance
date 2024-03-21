@@ -87,7 +87,7 @@ use super::{
     utils::maybe_sample_training_data,
     VectorIndex,
 };
-use crate::dataset::builder::DatasetBuilder;
+use crate::{dataset::builder::DatasetBuilder, index::vector::hnsw::HNSWIndex};
 use crate::{
     dataset::Dataset,
     index::{
@@ -244,14 +244,50 @@ pub(crate) async fn optimize_vector_indices(
             location: location!(),
         })?;
 
-    let pq_index = first_idx
-        .sub_index
-        .as_any()
-        .downcast_ref::<PQIndex>()
-        .ok_or(Error::Index {
-            message: "optimizing vector index: it is not a IVF_PQ index".to_string(),
+    let merged = if let Some(pq_index) = first_idx.as_any().downcast_ref::<PQIndex>() {
+        optimize_ivf_pq_indices(
+            first_idx,
+            pq_index,
+            vector_column,
+            unindexed,
+            existing_indices,
+            options,
+            writer,
+            dataset_version,
+        )
+        .await?
+    } else if let Some(hnsw_index) = first_idx.as_any().downcast_ref::<HNSWIndex>() {
+        optimize_ivf_hnsw_indices(
+            first_idx,
+            hnsw_index,
+            vector_column,
+            unindexed,
+            existing_indices,
+            options,
+            writer,
+            dataset_version,
+        )
+        .await?
+    } else {
+        return Err(Error::Index {
+            message: "optimizing vector index: the sub index isn't PQ or HNSW".to_string(),
             location: location!(),
-        })?;
+        });
+    };
+
+    Ok((new_uuid, merged))
+}
+
+async fn optimize_ivf_pq_indices(
+    first_idx: &IVFIndex,
+    pq_index: &PQIndex,
+    vector_column: &str,
+    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
+    existing_indices: &[Arc<dyn Index>],
+    options: &OptimizeOptions,
+    mut writer: ObjectWriter,
+    dataset_version: u64,
+) -> Result<usize> {
     let metric_type = first_idx.metric_type;
     let dim = first_idx.ivf.dimension();
 
@@ -321,7 +357,89 @@ pub(crate) async fn optimize_vector_indices(
     writer.write_magics(pos, 0, 1, MAGIC).await?;
     writer.shutdown().await?;
 
-    Ok((new_uuid, existing_indices.len() - start_pos))
+    Ok(existing_indices.len() - start_pos)
+}
+
+async fn optimize_ivf_hnsw_indices(
+    first_idx: &IVFIndex,
+    hnsw_index: &HNSWIndex,
+    vector_column: &str,
+    unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
+    existing_indices: &[Arc<dyn Index>],
+    options: &OptimizeOptions,
+    mut writer: ObjectWriter,
+    dataset_version: u64,
+) -> Result<usize> {
+    let metric_type = first_idx.metric_type;
+    let dim = first_idx.ivf.dimension();
+
+    // TODO: merge `lance::vector::ivf::IVF` and `lance-index::vector::ivf::Ivf`` implementations.
+    let ivf = lance_index::vector::ivf::new_ivf_with_pq(
+        first_idx.ivf.centroids.values(),
+        first_idx.ivf.dimension(),
+        metric_type,
+        vector_column,
+        pq_index.pq.clone(),
+        None,
+    )?;
+
+    // Shuffled un-indexed data with partition.
+    let shuffled = if let Some(stream) = unindexed {
+        Some(
+            shuffle_dataset(
+                stream,
+                vector_column,
+                ivf,
+                None,
+                first_idx.ivf.num_partitions() as u32,
+                pq_index.pq.num_sub_vectors(),
+                10000,
+                2,
+                None,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let mut ivf_mut = Ivf::new(first_idx.ivf.centroids.clone());
+
+    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
+        0
+    } else {
+        existing_indices.len() - options.num_indices_to_merge
+    };
+
+    let indices_to_merge = existing_indices[start_pos..]
+        .iter()
+        .map(|idx| {
+            idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::Index {
+                message: "optimizing vector index: it is not a IVF index".to_string(),
+                location: location!(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    write_pq_partitions(&mut writer, &mut ivf_mut, shuffled, Some(&indices_to_merge)).await?;
+    let metadata = IvfPQIndexMetadata {
+        name: format!("_{}_idx", vector_column),
+        column: vector_column.to_string(),
+        dimension: dim as u32,
+        dataset_version,
+        metric_type,
+        ivf: ivf_mut,
+        pq: pq_index.pq.clone(),
+        transforms: vec![],
+    };
+
+    let metadata = pb::Index::try_from(&metadata)?;
+    let pos = writer.write_protobuf(&metadata).await?;
+    // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
+    // change it to latest version value after refactoring the IVF_PQ
+    writer.write_magics(pos, 0, 1, MAGIC).await?;
+    writer.shutdown().await?;
+
+    Ok(existing_indices.len() - start_pos)
 }
 
 #[derive(Serialize)]

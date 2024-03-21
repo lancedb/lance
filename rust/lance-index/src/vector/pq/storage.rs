@@ -140,6 +140,10 @@ impl IvfProductQuantizationStorage {
         self.ivf.num_partitions()
     }
 
+    pub fn metadata(&self) -> &ProductQuantizationMetadata {
+        &self.metadata
+    }
+
     pub async fn load_partition(&self, part_id: usize) -> Result<ProductQuantizationStorage> {
         let range = self.ivf.row_range(part_id);
         ProductQuantizationStorage::load_partition(

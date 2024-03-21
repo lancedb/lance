@@ -88,6 +88,10 @@ impl HNSWIndex {
         })
     }
 
+    pub fn storage(&self) -> &IvfProductQuantizationStorage {
+        &self.partition_storage
+    }
+
     fn get_partition_metadata(&self, partition_id: usize) -> Result<HnswMetadata> {
         match self.partition_metadata {
             Some(ref metadata) => Ok(metadata[partition_id].clone()),
