@@ -14,6 +14,7 @@
 
 package com.lancedb.lance;
 
+import com.lancedb.lance.index.IndexBuilder;
 import io.questdb.jar.jni.JarJniLoader;
 import java.io.Closeable;
 import java.io.IOException;
@@ -25,9 +26,12 @@ import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.memory.BufferAllocator;
 
 /**
- * Class representing a Lance dataset, interfacing with the native lance library. This class
- * provides functionality to open and manage datasets with native code. The native library is loaded
- * statically and utilized through native methods. It implements the {@link java.io.Closeable}
+ * Class representing a Lance dataset, interfacing with the native lance
+ * library. This class
+ * provides functionality to open and manage datasets with native code. The
+ * native library is loaded
+ * statically and utilized through native methods. It implements the
+ * {@link java.io.Closeable}
  * interface to ensure proper resource management.
  */
 public class Dataset implements Closeable {
@@ -39,13 +43,14 @@ public class Dataset implements Closeable {
 
   BufferAllocator allocator;
 
-  private Dataset() {}
+  private Dataset() {
+  }
 
   /**
    * Write a dataset to the specified path.
    *
    * @param stream arrow stream
-   * @param path dataset uri
+   * @param path   dataset uri
    * @param params write parameters
    * @return Dataset
    */
@@ -62,7 +67,7 @@ public class Dataset implements Closeable {
   /**
    * Open a dataset from the specified path.
    *
-   * @param path file path
+   * @param path      file path
    * @param allocator Arrow buffer allocator.
    * @return Dataset
    */
@@ -93,7 +98,8 @@ public class Dataset implements Closeable {
    * @return A list of {@link Fragment}.
    */
   public List<Fragment> getFragments() {
-    // Set a pointer in Fragment to dataset, to make it is easier to issue IOs later.
+    // Set a pointer in Fragment to dataset, to make it is easier to issue IOs
+    // later.
     //
     // We do not need to close Fragments.
     return Arrays.stream(this.getFragmentsIds())
@@ -103,8 +109,17 @@ public class Dataset implements Closeable {
 
   private native int[] getFragmentsIds();
 
+  public IndexBuilder createIndex(String column) {
+    return createIndex(List.of(column));
+  }
+
+  public IndexBuilder createIndex(List<String> columns) {
+    return new IndexBuilder(this, columns);
+  }
+
   /**
-   * Closes this dataset and releases any system resources associated with it. If the dataset is
+   * Closes this dataset and releases any system resources associated with it. If
+   * the dataset is
    * already closed, then invoking this method has no effect.
    */
   @Override
@@ -116,7 +131,8 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Native method to release the Lance dataset resources associated with the given handle.
+   * Native method to release the Lance dataset resources associated with the
+   * given handle.
    *
    * @param handle The native handle to the dataset resource.
    */
