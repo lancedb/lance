@@ -248,7 +248,6 @@ impl IvfShuffler {
         let writer = object_store.create(&path).await?;
 
         let mut data = Box::pin(data.peekable());
-
         let schema = match data.as_mut().peek().await {
             Some(Ok(batch)) => batch.schema(),
             Some(Err(err)) => {
@@ -264,6 +263,17 @@ impl IvfShuffler {
                 })
             }
         };
+
+        // validate the schema,
+        // we need to have row ID and partition ID column
+        schema.column_with_name(ROW_ID).ok_or(Error::IO {
+            message: "row ID column not found".to_owned(),
+            location: location!(),
+        })?;
+        schema.column_with_name(PART_ID_COLUMN).ok_or(Error::IO {
+            message: "partition ID column not found".to_owned(),
+            location: location!(),
+        })?;
 
         let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
             writer,
