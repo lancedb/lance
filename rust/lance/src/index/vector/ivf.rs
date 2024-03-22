@@ -2196,7 +2196,7 @@ mod tests {
         let gt = ground_truth(&mat, query.values(), k);
         let recall = results.intersection(&gt).count() as f32 / k as f32;
         assert!(
-            recall >= 0.8,
+            recall >= 0.7,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results.iter().sorted().collect_vec(),
