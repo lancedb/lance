@@ -455,7 +455,7 @@ impl IvfShuffler {
                 let schema =
                     shuffled
                         .iter()
-                        .find(|batches| batches.len() > 0)
+                        .find(|batches| !batches.is_empty())
                         .ok_or(Error::IO {
                             message: "empty input to shuffle".to_owned(),
                             location: location!(),
