@@ -204,6 +204,21 @@ impl IVFIndex {
         let batch = part_index.search(&query, pre_filter).await?;
         Ok(batch)
     }
+
+    /// find the IVF partitions ids given the query vector.
+    ///
+    /// Internal API with no stability guarantees.
+    ///
+    /// Assumes the query vector is normalized if the metric type is cosine.
+    pub async fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
+        let mt = if self.metric_type == MetricType::Cosine {
+            MetricType::L2
+        } else {
+            self.metric_type
+        };
+
+        self.ivf.find_partitions(&query.key, query.nprobes, mt)
+    }
 }
 
 impl std::fmt::Debug for IVFIndex {
@@ -430,15 +445,12 @@ impl VectorIndex for IVFIndex {
     #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<PreFilter>) -> Result<RecordBatch> {
         let mut query = query.clone();
-        let mt = if self.metric_type == MetricType::Cosine {
+        if self.metric_type == MetricType::Cosine {
             let key = normalize_arrow(&query.key)?;
             query.key = key;
-            MetricType::L2
-        } else {
-            self.metric_type
         };
 
-        let partition_ids = self.ivf.find_partitions(&query.key, query.nprobes, mt)?;
+        let partition_ids = self.find_partitions(&query).await?;
         assert!(partition_ids.len() <= query.nprobes);
         let part_ids = partition_ids.values().to_vec();
         let batches = stream::iter(part_ids)
