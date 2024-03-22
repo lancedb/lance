@@ -648,7 +648,6 @@ mod tests {
             .collect();
         let gt = ground_truth(&mat, q, K);
         let recall = results.intersection(&gt).count() as f32 / K as f32;
-        // TODO: improve the recall.
         assert!(recall >= 0.9, "Recall: {}", recall);
     }
 }

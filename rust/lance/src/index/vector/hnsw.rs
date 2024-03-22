@@ -154,10 +154,11 @@ impl VectorIndex for HNSWIndex {
             )
         };
 
+        let ef = query.k + query.k / 2;
         let results = self.hnsw.search(
             query.key.as_primitive::<Float32Type>().as_slice(),
             query.k,
-            30,
+            ef,
             bitmap,
         )?;
 
@@ -179,7 +180,7 @@ impl VectorIndex for HNSWIndex {
     }
 
     fn use_residual(&self) -> bool {
-        false
+        true
     }
 
     fn check_can_remap(&self) -> Result<()> {
