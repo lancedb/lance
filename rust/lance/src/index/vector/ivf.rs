@@ -2131,7 +2131,6 @@ mod tests {
         let ivf_params =
             IvfBuildParams::try_with_centroids(nlist, Arc::new(ivf_centroids)).unwrap();
 
-        // let codebook = Arc::new(generate_random_array(256 * DIM));
         let pq_params = PQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
@@ -2203,7 +2202,6 @@ mod tests {
             results.iter().sorted().collect_vec(),
             gt.iter().sorted().collect_vec()
         );
-        println!("recall: {}", recall);
     }
 
     #[tokio::test]
