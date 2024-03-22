@@ -452,6 +452,15 @@ impl IvfShuffler {
 
                 // third, shuffle the data into each partition
                 let shuffled = self.shuffle_to_partitions(&input, size_counts).await?;
+                let schema =
+                    shuffled
+                        .iter()
+                        .find(|batches| batches.len() > 0)
+                        .ok_or(Error::IO {
+                            message: "empty input to shuffle".to_owned(),
+                            location: location!(),
+                        })?[0]
+                        .schema();
 
                 // finally, write the shuffled data to disk
                 let object_store = ObjectStore::local();
@@ -461,7 +470,7 @@ impl IvfShuffler {
 
                 let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
                     writer,
-                    Schema::try_from(shuffled[0][0].schema().as_ref())?,
+                    Schema::try_from(schema.as_ref())?,
                     &Default::default(),
                 )?;
 
