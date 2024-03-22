@@ -25,18 +25,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayBuilder, ArrayDataBuilder};
-use arrow::buffer::Buffer;
 use arrow::compute::sort_to_indices;
-use arrow::ipc::RecordBatchBuilder;
-use arrow_array::{
-    cast::AsArray, types::UInt64Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
-    UInt64Array, UInt8Array,
-};
-use arrow_schema::{DataType, Field as ArrowField, Field, Schema as ArrowSchema};
+use arrow_array::{cast::AsArray, types::UInt64Type, Array, RecordBatch, UInt32Array};
+use arrow_schema::{DataType, Field};
 use futures::stream::repeat_with;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
-use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
@@ -219,6 +213,7 @@ pub struct IvfShuffler {
 
     num_partitions: u32,
 
+    #[allow(dead_code)]
     pq_width: usize,
 
     output_dir: Path,
@@ -412,27 +407,6 @@ impl IvfShuffler {
                     part_batches.push(batch.slice(start, end - start));
                     start = end;
                 }
-
-                // let pq_codes: &UInt8Array = batch
-                //     .column_by_name(PQ_CODE_COLUMN)
-                //     .expect("PQ Code column not found")
-                //     .as_fixed_size_list()
-                //     .values()
-                //     .as_primitive();
-
-                // let num_sub_vectors = pq_codes.len() / row_ids.len();
-
-                // row_ids
-                //     .values()
-                //     .iter()
-                //     .zip(part_ids.values().iter())
-                //     .enumerate()
-                //     .for_each(|(i, (row_id, part_id))| {
-                //         row_id_buffers[*part_id as usize].push(*row_id);
-                //         pq_code_buffers[*part_id as usize].extend(
-                //             &pq_codes.values()[i * num_sub_vectors..(i + 1) * num_sub_vectors],
-                //         );
-                //     });
             }
         }
 
@@ -548,19 +522,23 @@ impl IvfShuffler {
 
 #[cfg(test)]
 mod test {
-    use arrow_array::types::{UInt32Type, UInt8Type};
+    use arrow_array::{
+        types::{UInt32Type, UInt8Type},
+        FixedSizeListArray, UInt64Array, UInt8Array,
+    };
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_io::stream::RecordBatchStreamAdapter;
 
     use super::*;
 
-    fn make_schema() -> Arc<ArrowSchema> {
-        Arc::new(ArrowSchema::new(vec![
+    fn make_schema() -> Arc<arrow_schema::Schema> {
+        Arc::new(arrow_schema::Schema::new(vec![
             ROW_ID_FIELD.clone(),
-            ArrowField::new(PART_ID_COLUMN, DataType::UInt32, true),
-            ArrowField::new(
+            arrow_schema::Field::new(PART_ID_COLUMN, DataType::UInt32, true),
+            arrow_schema::Field::new(
                 PQ_CODE_COLUMN,
                 DataType::FixedSizeList(
-                    Arc::new(ArrowField::new("item", DataType::UInt8, true)),
+                    Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
                     32,
                 ),
                 false,
