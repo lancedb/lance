@@ -14,18 +14,19 @@
 
 package com.lancedb.lance.index;
 
+/** Distance Type. How to calculate distance between two vectors. */
 public enum DistanceType {
-    L2 (1),
-    COSINE (2),
-    DOT (3);
+  L2(1),
+  COSINE(2),
+  DOT(3);
 
-    private final int value;
+  private final int value;
 
-    DistanceType(int value) {
-        this.value = value;
-    }
+  DistanceType(int value) {
+    this.value = value;
+  }
 
-    int getValue() {
-        return value;
-    }
+  int getValue() {
+    return value;
+  }
 }

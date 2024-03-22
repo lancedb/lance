@@ -65,7 +65,7 @@ public class IndexBuilder {
   /**
    * Set the distance type.
    *
-   * <p>Default type is {@link DistanceType::L2}
+   * <p>Default type is {@link DistanceType.L2}
    */
   public IndexBuilder distanceType(DistanceType dt) {
     this.distanceType = dt;
