@@ -512,8 +512,12 @@ mod test {
         types::{UInt32Type, UInt8Type},
         FixedSizeListArray, UInt64Array, UInt8Array,
     };
+    use arrow_schema::DataType;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::ROW_ID_FIELD;
     use lance_io::stream::RecordBatchStreamAdapter;
+
+    use crate::vector::PQ_CODE_COLUMN;
 
     use super::*;
 
