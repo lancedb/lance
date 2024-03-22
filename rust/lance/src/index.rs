@@ -165,7 +165,7 @@ pub(crate) async fn cast_index(
             })
         }
         IndexType::Vector => {
-            cast_vector_index(dataset, generic, &new_id, from_field, to_field).await?;
+            cast_vector_index(dataset, index_id, &new_id, matched, from_field, to_field).await?;
         }
     }
 

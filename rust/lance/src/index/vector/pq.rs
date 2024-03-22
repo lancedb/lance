@@ -117,6 +117,10 @@ impl Index for PQIndex {
         self
     }
 
+    fn as_mut_any(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
     }
@@ -271,6 +275,43 @@ impl VectorIndex for PQIndex {
         self.code = Some(Arc::new(UInt8Array::from_iter_values(
             remapped.into_iter().flat_map(|(_, code)| code).copied(),
         )));
+        Ok(())
+    }
+
+    fn cast(&mut self, to: &ArrowField) -> Result<()> {
+        let codebook = self.pq.codebook_as_fsl();
+        let codebook =
+            lance_arrow::cast::cast_with_options(&codebook, to.data_type(), &Default::default())?;
+        let codebook = codebook.as_fixed_size_list().values();
+        self.pq = match codebook.data_type() {
+            DataType::Float16 => Arc::new(ProductQuantizerImpl::<Float16Type>::new(
+                self.pq.num_sub_vectors(),
+                self.pq.num_bits(),
+                self.pq.dimension(),
+                Arc::new(codebook.as_primitive().clone()),
+                self.metric_type,
+            )),
+            DataType::Float32 => Arc::new(ProductQuantizerImpl::<Float32Type>::new(
+                self.pq.num_sub_vectors(),
+                self.pq.num_bits(),
+                self.pq.dimension(),
+                Arc::new(codebook.as_primitive().clone()),
+                self.metric_type,
+            )),
+            DataType::Float64 => Arc::new(ProductQuantizerImpl::<Float64Type>::new(
+                self.pq.num_sub_vectors(),
+                self.pq.num_bits(),
+                self.pq.dimension(),
+                Arc::new(codebook.as_primitive().clone()),
+                self.metric_type,
+            )),
+            _ => {
+                return Err(Error::Index {
+                    message: format!("Wrong codebook data type: {:?}", codebook.data_type()),
+                    location: location!(),
+                });
+            }
+        };
         Ok(())
     }
 

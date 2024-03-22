@@ -155,6 +155,7 @@ pub enum Operation {
 pub struct RewrittenIndex {
     pub old_id: Uuid,
     pub new_id: Uuid,
+    pub new_field_ids: Vec<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -488,8 +489,21 @@ impl Transaction {
             Operation::ReserveFragments { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
-            Operation::Merge { ref fragments, .. } => {
+            Operation::Merge {
+                ref fragments,
+                rewritten_indices,
+                ..
+            } => {
                 final_fragments.extend(fragments.clone());
+
+                for rewritten in rewritten_indices {
+                    let index = final_indices
+                        .iter_mut()
+                        .find(|idx| idx.uuid == rewritten.old_id)
+                        .unwrap();
+                    index.uuid = rewritten.new_id;
+                    index.fields = rewritten.new_field_ids.clone();
+                }
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
@@ -806,6 +820,7 @@ impl TryFrom<&pb::transaction::RewrittenIndex> for RewrittenIndex {
                     message: "required field (new_id) missing from message".to_string(),
                     location: location!(),
                 })??,
+            new_field_ids: message.new_field_ids.clone(),
         })
     }
 }
@@ -925,6 +940,7 @@ impl From<&RewrittenIndex> for pb::transaction::RewrittenIndex {
         Self {
             old_id: Some((&value.old_id).into()),
             new_id: Some((&value.new_id).into()),
+            new_field_ids: value.new_field_ids.clone(),
         }
     }
 }

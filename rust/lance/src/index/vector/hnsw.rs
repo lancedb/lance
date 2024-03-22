@@ -21,7 +21,7 @@ use std::{
 
 use arrow_array::{cast::AsArray, types::Float32Type, Float32Array, RecordBatch, UInt64Array};
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field as ArrowField};
 use async_trait::async_trait;
 use lance_arrow::*;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
@@ -103,6 +103,10 @@ impl HNSWIndex {
 impl Index for HNSWIndex {
     /// Cast to [Any].
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -251,6 +255,13 @@ impl VectorIndex for HNSWIndex {
     fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         Err(Error::Index {
             message: "Remapping HNSW in this way not supported".to_string(),
+            location: location!(),
+        })
+    }
+
+    fn cast(&mut self, _to: &ArrowField) -> Result<()> {
+        Err(Error::Index {
+            message: "Casting HNSW not supported".to_string(),
             location: location!(),
         })
     }

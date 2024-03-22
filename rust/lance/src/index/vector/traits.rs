@@ -93,7 +93,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>;
 
     /// Transform the index in place to be for a different data type.
-    /// 
+    ///
     /// This can be used, for example, to transform a float32 index to a float16 index.
     fn cast(&mut self, to: &ArrowField) -> Result<()>;
 

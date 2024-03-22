@@ -27,7 +27,7 @@ use arrow_array::{
     Array, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::{DataType, Schema};
+use arrow_schema::{DataType, Field as ArrowField, Schema};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
 use futures::{
@@ -63,7 +63,6 @@ use lance_io::{
     encodings::plain::PlainEncoder,
     local::to_local_path,
     object_store::ObjectStore,
-    object_writer::ObjectWriter,
     stream::RecordBatchStream,
     traits::{Reader, WriteExt, Writer},
 };
@@ -384,6 +383,10 @@ impl Index for IVFIndex {
         self
     }
 
+    fn as_mut_any(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
     }
@@ -497,6 +500,13 @@ impl VectorIndex for IVFIndex {
         // mirrors some of the other IVF routines like build_ivf_pq_index
         Err(Error::Index {
             message: "Remapping IVF in this way not supported".to_string(),
+            location: location!(),
+        })
+    }
+
+    fn cast(&mut self, _to: &ArrowField) -> Result<()> {
+        Err(Error::Index {
+            message: "Casting IVF index not supported".to_string(),
             location: location!(),
         })
     }
@@ -969,96 +979,63 @@ pub async fn build_ivf_hnsw_index(
     .await
 }
 
-struct RemapPageTask {
-    offset: usize,
-    length: u32,
-    page: Option<Box<dyn VectorIndex>>,
-}
-
-impl RemapPageTask {
-    fn new(offset: usize, length: u32) -> Self {
-        Self {
-            offset,
-            length,
-            page: None,
-        }
-    }
-}
-
-impl RemapPageTask {
-    async fn load_and_remap(
-        mut self,
-        reader: Arc<dyn Reader>,
-        index: &IVFIndex,
-        mapping: &HashMap<u64, Option<u64>>,
-    ) -> Result<Self> {
-        let mut page = index
-            .sub_index
-            .load(reader, self.offset, self.length as usize)
-            .await?;
-        page.remap(mapping)?;
-        self.page = Some(page);
-        Ok(self)
-    }
-
-    async fn write(self, writer: &mut ObjectWriter, ivf: &mut Ivf) -> Result<()> {
-        let page = self.page.as_ref().expect("Load was not called");
-        let page: &PQIndex = page
-            .as_any()
-            .downcast_ref()
-            .expect("Generic index writing not supported yet");
-        ivf.offsets.push(writer.tell().await?);
-        ivf.lengths
-            .push(page.row_ids.as_ref().unwrap().len() as u32);
-        PlainEncoder::write(writer, &[page.code.as_ref().unwrap().as_ref()]).await?;
-        PlainEncoder::write(writer, &[page.row_ids.as_ref().unwrap().as_ref()]).await?;
-        Ok(())
-    }
-}
-
-fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapPageTask>> {
-    let mut tasks: Vec<RemapPageTask> = Vec::with_capacity(offsets.len() * 2 + 1);
-
-    for (offset, length) in offsets.iter().zip(lengths.iter()) {
-        tasks.push(RemapPageTask::new(*offset, *length));
-    }
-
-    Ok(tasks)
-}
-
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn remap_index_file(
+pub(crate) async fn mutate_index_file(
     dataset: &Dataset,
-    old_uuid: &str,
     new_uuid: &str,
     old_version: u64,
     index: &IVFIndex,
-    mapping: &HashMap<u64, Option<u64>>,
     name: String,
     column: String,
     transforms: Vec<pb::Transform>,
+    mut mutate_pq: impl FnMut(&mut PQIndex) -> Result<()>,
+    mut mutate_ivf: impl FnMut(&mut Ivf) -> Result<()>,
 ) -> Result<()> {
+    // TODO: make this function work for other types of indices.
     let object_store = dataset.object_store();
-    let old_path = dataset.indices_dir().child(old_uuid).child(INDEX_FILE_NAME);
+    let old_path = dataset
+        .indices_dir()
+        .child(index.uuid.as_str())
+        .child(INDEX_FILE_NAME);
     let new_path = dataset.indices_dir().child(new_uuid).child(INDEX_FILE_NAME);
 
     let reader: Arc<dyn Reader> = object_store.open(&old_path).await?.into();
     let mut writer = object_store.create(&new_path).await?;
 
-    let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;
+    let offsets = index.ivf.offsets.as_slice();
+    let lengths = index.ivf.lengths.as_slice();
+    let mut page_stream = futures::stream::iter(offsets.iter().zip(lengths.iter()))
+        .map(|(offset, length)| {
+            index
+                .sub_index
+                .load(reader.clone(), *offset, *length as usize)
+        })
+        .buffered(num_cpus::get())
+        .boxed();
 
-    let mut task_stream = stream::iter(tasks.into_iter())
-        .map(|task| task.load_and_remap(reader.clone(), index, mapping))
-        .buffered(num_cpus::get());
-
-    let mut ivf = Ivf {
+    let mut new_index = Ivf {
         centroids: index.ivf.centroids.clone(),
         offsets: Vec::with_capacity(index.ivf.offsets.len()),
         lengths: Vec::with_capacity(index.ivf.lengths.len()),
     };
-    while let Some(write_task) = task_stream.try_next().await? {
-        write_task.write(&mut writer, &mut ivf).await?;
+
+    while let Some(mut page) = page_stream.try_next().await? {
+        let page: &mut PQIndex = page
+            .as_mut_any()
+            .downcast_mut()
+            .expect("Generic index writing not supported yet");
+
+        mutate_pq(page)?;
+
+        new_index.offsets.push(writer.tell().await?);
+        new_index
+            .lengths
+            .push(page.row_ids.as_ref().unwrap().len() as u32);
+        PlainEncoder::write(&mut writer, &[page.code.as_ref().unwrap().as_ref()]).await?;
+        PlainEncoder::write(&mut writer, &[page.row_ids.as_ref().unwrap().as_ref()]).await?;
     }
+
+    mutate_ivf(&mut new_index)?;
 
     let pq_sub_index = index
         .sub_index
@@ -1074,7 +1051,7 @@ pub(crate) async fn remap_index_file(
         column,
         dimension: index.ivf.dimension() as u32,
         dataset_version: old_version,
-        ivf,
+        ivf: new_index,
         metric_type: index.metric_type,
         pq: pq_sub_index.pq.clone(),
         transforms,
@@ -1086,6 +1063,67 @@ pub(crate) async fn remap_index_file(
     // change it to latest version value after refactoring the IVF_PQ
     writer.write_magics(pos, 0, 1, MAGIC).await?;
     writer.shutdown().await?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn remap_index_file(
+    dataset: &Dataset,
+    new_uuid: &str,
+    old_version: u64,
+    index: &IVFIndex,
+    mapping: &HashMap<u64, Option<u64>>,
+    name: String,
+    column: String,
+    transforms: Vec<pb::Transform>,
+) -> Result<()> {
+    mutate_index_file(
+        dataset,
+        new_uuid,
+        old_version,
+        index,
+        name,
+        column,
+        transforms,
+        |pq| pq.remap(mapping),
+        |_ivf| Ok(()),
+    )
+    .await?;
+
+    Ok(())
+}
+
+pub(crate) async fn cast_index_file(
+    dataset: &Dataset,
+    new_uuid: &str,
+    old_version: u64,
+    index: &IVFIndex,
+    target_field: &Field,
+    name: String,
+    transforms: Vec<pb::Transform>,
+) -> Result<()> {
+    let to_field = target_field.into();
+    mutate_index_file(
+        dataset,
+        new_uuid,
+        old_version,
+        index,
+        name,
+        target_field.name.clone(),
+        transforms,
+        |pq| pq.cast(&to_field),
+        |ivf| {
+            let new_centroids = lance_arrow::cast::cast_with_options(
+                ivf.centroids.as_ref(),
+                &target_field.data_type(),
+                &Default::default(),
+            )?;
+            ivf.centroids = Arc::new(new_centroids.as_fixed_size_list().clone());
+            Ok(())
+        },
+    )
+    .await?;
 
     Ok(())
 }
@@ -1771,7 +1809,6 @@ mod tests {
 
         remap_index_file(
             &dataset,
-            &uuid_str,
             &new_uuid_str,
             dataset.version().version,
             ivf_index,

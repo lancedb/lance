@@ -32,7 +32,7 @@ use lance_file::reader::FileReader;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfData;
 use lance_index::vector::{hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams};
-use lance_index::{Index, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
+use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
@@ -277,7 +277,6 @@ pub(crate) async fn remap_vector_index(
 
     remap_index_file(
         dataset.as_ref(),
-        &old_uuid.to_string(),
         &new_uuid.to_string(),
         old_metadata.dataset_version,
         ivf_index,
@@ -296,16 +295,39 @@ pub(crate) async fn remap_vector_index(
 #[instrument(level = "debug", skip_all, fields(new_uuid = new_uuid.to_string(), dataset_uri = dataset.base.to_string(), column = from_field.name))]
 pub(crate) async fn cast_vector_index(
     dataset: &Dataset,
-    index: Arc<dyn Index>,
+    old_uuid: &Uuid,
     new_uuid: &Uuid,
+    old_metadata: &IndexMetadata,
     from_field: &Field,
     to_field: &Field,
 ) -> Result<()> {
-    // let old_index = dataset
-    //     .open_vector_index(column, &old_uuid.to_string())
-    //     .await?;
-    // old_index.cast(to_field.data_type())?;
-    todo!()
+    let old_index = dataset
+        .open_vector_index(&from_field.name, &old_uuid.to_string())
+        .await?;
+
+    let old_index = old_index
+        .as_any()
+        .downcast_ref::<IVFIndex>()
+        .ok_or_else(|| Error::NotSupported {
+            source: "Only IVF indexes can be casted currently".into(),
+            location: location!(),
+        })?;
+
+    crate::index::vector::ivf::cast_index_file(
+        dataset,
+        &new_uuid.to_string(),
+        old_metadata.dataset_version,
+        old_index,
+        to_field,
+        old_metadata.name.clone(),
+        // We can safely assume there are no transforms today.  We assert above that the
+        // top stage is IVF and IVF does not support transforms between IVF and PQ.  This
+        // will be fixed in the future.
+        vec![],
+    )
+    .await?;
+
+    Ok(())
 }
 
 /// Open the Vector index on dataset, specified by the `uuid`.

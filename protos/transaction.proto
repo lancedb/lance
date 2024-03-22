@@ -94,6 +94,8 @@ message Transaction {
     UUID old_id = 1;
     // the id of the new index
     UUID new_id = 2;
+    // The new field ids it is based on. May be empty if unchanged.
+    repeated int32 new_field_ids = 3;
   }
 
   // An operation that rewrites but does not change the data in the table. These

@@ -1874,11 +1874,12 @@ impl Dataset {
                     .filter(|index| index.fields.len() == 1 && index.fields[0] == from_field.id)
                     .collect::<Vec<_>>();
                 for index in affected_indices {
-                    let res = cast_index(&self, &index.uuid, from_field, to_field).await;
+                    let res = cast_index(self, &index.uuid, from_field, to_field).await;
                     match res {
                         Ok(new_id) => rewritten_indices.push(RewrittenIndex {
-                            old_id: index.uuid.clone(),
+                            old_id: index.uuid,
                             new_id,
+                            new_field_ids: vec![to_field.id],
                         }),
                         // If it's not yet supported, we just skip it.
                         Err(Error::NotSupported { .. }) => continue,

@@ -893,6 +893,7 @@ pub async fn commit_compaction(
         .map(|rewritten| RewrittenIndex {
             old_id: rewritten.original,
             new_id: rewritten.new,
+            new_field_ids: vec![],
         })
         .collect();
 
