@@ -4767,6 +4767,15 @@ mod tests {
         let actual_data = dataset.scan().try_into_batch().await?;
         assert_eq!(actual_data, expected_data);
 
+        let query_data = dataset
+            .scan()
+            .nearest("vec", &vec![0.0f32; 128].into(), 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(query_data.num_rows(), 10);
+
         Ok(())
     }
 }

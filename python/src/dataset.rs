@@ -241,7 +241,11 @@ impl Operation {
     fn merge(fragments: Vec<FragmentMetadata>, schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
         let schema = convert_schema(&schema.0)?;
         let fragments = into_fragments(fragments);
-        let op = LanceOperation::Merge { fragments, schema };
+        let op = LanceOperation::Merge {
+            fragments,
+            schema,
+            rewritten_indices: vec![],
+        };
         Ok(Self(op))
     }
 
