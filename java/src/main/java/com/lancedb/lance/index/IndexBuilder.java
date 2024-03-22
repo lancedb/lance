@@ -26,10 +26,26 @@ public class IndexBuilder {
 
   private Optional<IndexParams> params;
 
+  private DistanceType distanceType = DistanceType.L2;
+
+  /** Set true to replace existing index. */
+  private boolean replace = false;
+
   /** Constructor. */
   public IndexBuilder(Dataset dataset, List<String> columns) {
     this.dataset = dataset;
     this.columns = columns;
+  }
+
+  /** Set true to replace existing index. */
+  public IndexBuilder replace() {
+    return this.replace(true);
+  }
+
+  /** Set true to replace existing index. */
+  public IndexBuilder replace(boolean flag) {
+    this.replace = flag;
+    return this;
   }
 
   /**
@@ -43,6 +59,16 @@ public class IndexBuilder {
       throw new IOException("A different index parameter already set.");
     }
     this.params = Optional.of(new IvfPqParams(numPartitions, numSubVectors));
+    return this;
+  }
+
+  /**
+   * Set the distance type.
+   *
+   * <p>Default type is {@link DistanceType::L2}
+   */
+  public IndexBuilder distanceType(DistanceType dt) {
+    this.distanceType = dt;
     return this;
   }
 
@@ -69,7 +95,9 @@ public class IndexBuilder {
           dataset,
           columns.get(0),
           ((IvfPqParams) params).getNumPartitions(),
-          ((IvfPqParams) params).getNumSubVectors());
+          ((IvfPqParams) params).getNumSubVectors(),
+          distanceType.getValue(),
+          this.replace);
 
     } else {
       throw new IOException("Unsupported Index Parameter");
@@ -83,7 +111,14 @@ public class IndexBuilder {
    * @param column the column name.
    * @param numPartitions the number of IVF Partition.
    * @param numSubVectors the number of PQ sub vectors.
+   * @param replace whether to replace existing index.
    */
   private native void createIvfPq(
-      Dataset dataset, String column, int numPartitions, int numSubVectors) throws IOException;
+      Dataset dataset,
+      String column,
+      int numPartitions,
+      int numSubVectors,
+      int distanceType,
+      boolean replace)
+      throws IOException;
 }
