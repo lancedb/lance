@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use arrow::compute::sort_to_indices;
 use arrow_array::{cast::AsArray, types::UInt64Type, Array, RecordBatch, UInt32Array};
-use arrow_schema::{DataType, Field};
+use arrow_schema::Field;
 use futures::stream::repeat_with;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
@@ -41,8 +41,8 @@ use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 
 use crate::vector::transform::{KeepFiniteVectors, Transformer};
-use crate::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
+use crate::vector::PART_ID_COLUMN;
+use lance_core::{Error, Result, ROW_ID};
 use log::info;
 use object_store::path::Path;
 use snafu::{location, Location};
