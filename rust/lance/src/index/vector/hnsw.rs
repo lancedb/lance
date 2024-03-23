@@ -55,7 +55,7 @@ pub(crate) struct HNSWIndexOptions {
 }
 
 #[derive(Clone)]
-pub struct HNSWIndex {
+pub(crate) struct HNSWIndex {
     hnsw: HNSW,
 
     // TODO: move these into IVFIndex after the refactor is complete
