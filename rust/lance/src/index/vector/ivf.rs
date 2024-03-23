@@ -1358,13 +1358,16 @@ async fn train_ivf_model(
 mod tests {
     use super::*;
 
+    use std::collections::HashSet;
     use std::iter::repeat;
     use std::ops::Range;
 
     use arrow_array::types::UInt64Type;
     use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
+    use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
+    use lance_core::ROW_ID;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
@@ -2116,19 +2119,31 @@ mod tests {
         );
     }
 
+    fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
+        let mut dists = vec![];
+        for i in 0..mat.num_rows() {
+            let dist = lance_linalg::distance::l2_distance(query, mat.row(i).unwrap());
+            dists.push((dist, i as u32));
+        }
+        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        dists.truncate(k);
+        dists.into_iter().map(|(_, i)| i).collect()
+    }
+
     #[tokio::test]
     async fn test_create_ivf_hnsw() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
+        let nlist = 4;
         let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
-        let centroids = generate_random_array(2 * DIM);
+        let centroids = generate_random_array(nlist * DIM);
         let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
-        let ivf_params = IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
+        let ivf_params =
+            IvfBuildParams::try_with_centroids(nlist, Arc::new(ivf_centroids)).unwrap();
 
-        let codebook = Arc::new(generate_random_array(256 * DIM));
-        let pq_params = PQBuildParams::with_codebook(4, 8, codebook);
+        let pq_params = PQBuildParams::default();
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             MetricType::L2,
@@ -2161,12 +2176,16 @@ mod tests {
         assert!(dataset.object_store().exists(&index_path).await.unwrap());
         assert!(dataset.object_store().exists(&aux_path).await.unwrap());
 
-        let sample_query = vector_array.value(10);
-        let query = sample_query.as_primitive::<Float32Type>();
+        let mat = MatrixView::<Float32Type>::try_from(vector_array.as_ref()).unwrap();
+        let query = vector_array.value(0);
+        let query = query.as_primitive::<Float32Type>();
+        let k = 100;
         let results = dataset
             .scan()
-            .nearest("vector", query, 5)
+            .with_row_id()
+            .nearest("vector", query, k)
             .unwrap()
+            .nprobs(nlist)
             .try_into_stream()
             .await
             .unwrap()
@@ -2174,7 +2193,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(1, results.len());
-        assert_eq!(5, results[0].num_rows());
+        assert_eq!(k, results[0].num_rows());
+
+        let results = results[0]
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .iter()
+            .map(|v| v.unwrap() as u32)
+            .collect::<HashSet<_>>();
+
+        let gt = ground_truth(&mat, query.values(), k);
+        let recall = results.intersection(&gt).count() as f32 / k as f32;
+        assert!(
+            recall >= 0.8,
+            "recall: {}\n results: {:?}\n\ngt: {:?}",
+            recall,
+            results.iter().sorted().collect_vec(),
+            gt.iter().sorted().collect_vec()
+        );
     }
 
     #[tokio::test]
