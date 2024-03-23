@@ -50,12 +50,19 @@ use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 
 #[derive(Clone)]
+pub(crate) struct HNSWIndexOptions {
+    pub use_residual: bool,
+}
+
+#[derive(Clone)]
 pub struct HNSWIndex {
     hnsw: HNSW,
 
     // TODO: move these into IVFIndex after the refactor is complete
     partition_storage: IvfProductQuantizationStorage,
     partition_metadata: Option<Vec<HnswMetadata>>,
+
+    options: HNSWIndexOptions,
 }
 
 impl Debug for HNSWIndex {
@@ -69,6 +76,7 @@ impl HNSWIndex {
         hnsw: HNSW,
         reader: Arc<dyn Reader>,
         aux_reader: Arc<dyn Reader>,
+        options: HNSWIndexOptions,
     ) -> Result<Self> {
         let reader = FileReader::try_new_self_described_from_reader(reader.clone(), None).await?;
 
@@ -85,6 +93,7 @@ impl HNSWIndex {
             hnsw,
             partition_storage: ivf_pq_store,
             partition_metadata,
+            options,
         })
     }
 
@@ -180,7 +189,7 @@ impl VectorIndex for HNSWIndex {
     }
 
     fn use_residual(&self) -> bool {
-        true
+        self.options.use_residual
     }
 
     fn check_can_remap(&self) -> Result<()> {
@@ -220,6 +229,7 @@ impl VectorIndex for HNSWIndex {
             hnsw,
             partition_storage: self.partition_storage.clone(),
             partition_metadata: self.partition_metadata.clone(),
+            options: self.options.clone(),
         }))
     }
 
@@ -246,6 +256,7 @@ impl VectorIndex for HNSWIndex {
             hnsw,
             partition_storage: self.partition_storage.clone(),
             partition_metadata: self.partition_metadata.clone(),
+            options: self.options.clone(),
         }))
     }
 
