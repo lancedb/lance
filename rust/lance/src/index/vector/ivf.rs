@@ -169,6 +169,17 @@ impl IVFIndex {
         let part_index = if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
             part_idx
         } else {
+            if partition_id >= self.ivf.lengths.len() {
+                return Err(Error::Index {
+                    message: format!(
+                        "partition id {} is out of range of {} partitions",
+                        partition_id,
+                        self.ivf.lengths.len()
+                    ),
+                    location: location!(),
+                });
+            }
+
             let offset = self.ivf.offsets[partition_id];
             let length = self.ivf.lengths[partition_id] as usize;
             let idx = self
