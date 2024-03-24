@@ -195,6 +195,21 @@ impl IVFIndex {
         Ok(part_index)
     }
 
+    /// preprocess the query vector given the partition id.
+    ///
+    /// Internal API with no stability guarantees.
+    pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
+        if self.sub_index.use_residual() {
+            let partition_centroids = self.ivf.centroids.value(partition_id);
+            let residual_key = sub(&query.key, &partition_centroids)?;
+            let mut part_query = query.clone();
+            part_query.key = residual_key;
+            Ok(part_query)
+        } else {
+            Ok(query.clone())
+        }
+    }
+
     async fn search_in_partition(
         &self,
         partition_id: usize,
@@ -203,15 +218,7 @@ impl IVFIndex {
     ) -> Result<RecordBatch> {
         let part_index = self.load_partition(partition_id, true).await?;
 
-        let query = if self.sub_index.use_residual() {
-            let partition_centroids = self.ivf.centroids.value(partition_id);
-            let residual_key = sub(&query.key, &partition_centroids)?;
-            let mut part_query = query.clone();
-            part_query.key = residual_key;
-            part_query
-        } else {
-            query.clone()
-        };
+        let query = self.preprocess_query(partition_id, query)?;
         let batch = part_index.search(&query, pre_filter).await?;
         Ok(batch)
     }
