@@ -52,6 +52,7 @@ mod blocking_dataset;
 pub mod error;
 mod ffi;
 mod fragment;
+mod index;
 mod traits;
 mod utils;
 
