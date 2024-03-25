@@ -45,7 +45,6 @@ use lance_io::ReadBatchParams;
 use lance_linalg::{distance::MetricType, MatrixView};
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
-use object_store::path::Path;
 use snafu::{location, Location};
 
 use super::{IVFIndex, Ivf};
@@ -284,6 +283,26 @@ pub(super) async fn write_hnsw_index_partitions(
         }
     }
 
+    let with_aux = auxiliary_writer.is_some();
+    let build_part_path = |part_id| {
+        let part_file = dataset
+            .indices_dir()
+            .child(uuid)
+            .child(format!("hnsw_part_{}", part_id));
+        let aux_part_file = if with_aux {
+            Some(
+                dataset
+                    .indices_dir()
+                    .child(uuid)
+                    .child(format!("hnsw_part_aux_{}", part_id)),
+            )
+        } else {
+            None
+        };
+
+        (part_file, aux_part_file)
+    };
+
     // TODO: make it configurable, limit by the number of CPU cores & memory
     let mut aux_ivf = IvfData::empty();
     let mut tasks = Vec::with_capacity(ivf.num_partitions());
@@ -302,7 +321,7 @@ pub(super) async fn write_hnsw_index_partitions(
         .await?;
 
         let writer_options = FileWriterOptions::default();
-        let part_file = Path::parse(format!("/tmp/{}/hnsw_part_{}", uuid, part_id))?;
+        let (part_file, aux_part_file) = build_part_path(part_id);
         let part_writer = FileWriter::<ManifestDescribing>::try_new(
             dataset.object_store(),
             &part_file,
@@ -311,13 +330,12 @@ pub(super) async fn write_hnsw_index_partitions(
         )
         .await?;
 
-        let aux_part_file = Path::parse(format!("/tmp/{}/hnsw_part_aux_{}", uuid, part_id))?;
-        let aux_part_writer = match auxiliary_writer.as_mut() {
-            Some(aux_writer) => Some(
+        let aux_part_writer = match aux_part_file {
+            Some(path) => Some(
                 FileWriter::<ManifestDescribing>::try_new(
                     dataset.object_store(),
-                    &aux_part_file,
-                    Schema::try_from(aux_writer.schema())?,
+                    &path,
+                    Schema::try_from(auxiliary_writer.as_ref().unwrap().schema())?,
                     &writer_options,
                 )
                 .await?,
@@ -352,7 +370,7 @@ pub(super) async fn write_hnsw_index_partitions(
     for (part_id, result) in results.into_iter().enumerate() {
         let length = result?;
 
-        let part_file = Path::parse(format!("/tmp/{}/hnsw_part_{}", uuid, part_id))?;
+        let (part_file, aux_part_file) = build_part_path(part_id as u32);
         let part_reader =
             FileReader::try_new_self_described(dataset.object_store(), &part_file, None).await?;
 
@@ -376,10 +394,12 @@ pub(super) async fn write_hnsw_index_partitions(
         )?);
 
         if let Some(aux_writer) = auxiliary_writer.as_mut() {
-            let aux_part_file = Path::parse(format!("/tmp/{}/hnsw_part_aux_{}", uuid, part_id))?;
-            let aux_part_reader =
-                FileReader::try_new_self_described(dataset.object_store(), &aux_part_file, None)
-                    .await?;
+            let aux_part_reader = FileReader::try_new_self_described(
+                dataset.object_store(),
+                aux_part_file.as_ref().unwrap(),
+                None,
+            )
+            .await?;
 
             let batches = futures::stream::iter(0..aux_part_reader.num_batches())
                 .map(|batch_id| {
