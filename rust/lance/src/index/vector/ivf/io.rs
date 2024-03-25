@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BinaryHeap, VecDeque};
-use std::ops::Deref;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 use std::time::Instant;
 use std::{cmp::Reverse, pin::Pin};
@@ -23,15 +22,13 @@ use arrow::datatypes::Float32Type;
 use arrow_array::{
     cast::AsArray, types::UInt64Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
-use datafusion::parquet::column;
 use futures::stream::Peekable;
-use futures::{Future, Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::datatypes::Schema;
 use lance_core::Error;
 use lance_file::reader::FileReader;
 use lance_file::writer::{FileWriter, FileWriterOptions};
-use lance_index::vector::graph::VectorStorage;
 use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfData;
@@ -347,7 +344,7 @@ pub(super) async fn write_hnsw_index_partitions(
 
     let parallel_limit = 16;
     let results = futures::stream::iter(tasks)
-        .map(|task| tokio::spawn(task))
+        .map(tokio::spawn)
         .buffered(parallel_limit)
         .try_collect::<Vec<_>>()
         .await?;
@@ -406,6 +403,7 @@ pub(super) async fn write_hnsw_index_partitions(
     Ok((hnsw_metadata, aux_ivf))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_hnsw_partition(
     dataset: Arc<Dataset>,
     column: Arc<String>,
@@ -454,7 +452,6 @@ async fn build_hnsw_partition(
     let pq = pq.clone();
     let build_with_pq = aux_writer.is_some();
 
-    let hnsw_params = hnsw_params;
     let (hnsw, pq_storage) = utils::tokio::spawn_cpu(move || {
         build_hnsw_index(
             metric_type,
