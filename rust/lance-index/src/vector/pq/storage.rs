@@ -413,11 +413,12 @@ impl ProductQuantizationStorage {
         writer: &mut FileWriter<ManifestDescribing>,
     ) -> Result<usize> {
         let batch_size: usize = 10240; // TODO: make it configurable
-        for i in (0..self.batch.num_rows()).step_by(batch_size) {
-            let offset = i * batch_size;
+        let mut offset = 0;
+        while offset < self.batch.num_rows() {
             let length = min(batch_size, self.batch.num_rows() - offset);
             let slice = self.batch.slice(offset, length);
             writer.write(&[slice]).await?;
+            offset += length;
         }
         Ok(self.batch.num_rows())
     }

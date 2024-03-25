@@ -332,7 +332,7 @@ pub(super) async fn write_hnsw_index_partitions(
         let column = column.clone();
         let hnsw_params = hnsw_params.clone();
         let pq = pq.clone();
-        tasks.push(tokio::spawn(build_hnsw_partition(
+        tasks.push(build_hnsw_partition(
             dataset,
             column,
             metric_type,
@@ -342,11 +342,12 @@ pub(super) async fn write_hnsw_index_partitions(
             pq,
             row_id_array,
             pq_array,
-        )));
+        ));
     }
 
     let parallel_limit = 16;
     let results = futures::stream::iter(tasks)
+        .map(|task| tokio::spawn(task))
         .buffered(parallel_limit)
         .try_collect::<Vec<_>>()
         .await?;
