@@ -471,11 +471,13 @@ async fn build_hnsw_partition(
         HNSW_METADATA_KEY,
         serde_json::to_string(&hnsw.metadata())?.as_str(),
     );
-
     let length = hnsw.write_levels(&mut writer).await?;
+    writer.finish().await?;
+
     if let Some(pq_storage) = pq_storage {
         let aux_writer = aux_writer.as_mut().unwrap();
         pq_storage.write_partition(aux_writer).await?;
+        aux_writer.finish().await?;
     }
 
     Ok(length)
@@ -494,8 +496,10 @@ fn build_hnsw_index(
         .iter()
         .map(|arr| arr.as_ref())
         .collect::<Vec<_>>();
-    let fsl = arrow_select::concat::concat(&vector_arrs).unwrap();
-    let mat = Arc::new(MatrixView::<Float32Type>::try_from(fsl.as_fixed_size_list()).unwrap());
+    let fsl = arrow_select::concat::concat(&vector_arrs)?;
+    let mat = Arc::new(MatrixView::<Float32Type>::try_from(
+        fsl.as_fixed_size_list(),
+    )?);
     let vec_store = Arc::new(InMemoryVectorStorage::new(mat.clone(), metric_type));
     let mut hnsw_builder = HNSWBuilder::with_params(hnsw_params, vec_store);
     let hnsw = hnsw_builder.build()?;
