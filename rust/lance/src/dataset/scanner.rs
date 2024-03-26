@@ -571,7 +571,7 @@ impl Scanner {
     pub(crate) fn physical_schema(&self) -> Result<Arc<Schema>> {
         let mut extra_columns = vec![];
 
-        if let Some(q) = self.nearest.as_ref() {
+        if self.nearest.is_some() {
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
         };
 
