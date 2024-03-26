@@ -130,6 +130,7 @@ async fn main() {
     let plan = scan
         .project(columns)
         .unwrap()
+        .with_row_id()
         .nearest(column, &q, args.k)
         .unwrap()
         .nprobs(args.nprobe);
