@@ -40,17 +40,23 @@ use lance_index::vector::{
     PART_ID_COLUMN, PQ_CODE_COLUMN,
 };
 use lance_io::encodings::plain::PlainEncoder;
+use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::ReadBatchParams;
 use lance_linalg::{distance::MetricType, MatrixView};
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
+use object_store::path::Path;
 use snafu::{location, Location};
+use tempfile::TempDir;
 
 use super::{IVFIndex, Ivf};
 use crate::index::vector::pq::PQIndex;
 use crate::{dataset::ROW_ID, Dataset};
 use crate::{utils, Result};
+
+// TODO: make it configurable, limit by the number of CPU cores & memory
+const HNSW_PARTITIONS_BUILD_PARRALLEL: usize = 16;
 
 /// Merge streams with the same partition id and collect PQ codes and row IDs.
 async fn merge_streams(
@@ -283,60 +289,42 @@ pub(super) async fn write_hnsw_index_partitions(
         }
     }
 
-    let with_aux = auxiliary_writer.is_some();
-    let build_part_path = |part_id| {
-        let part_file = dataset
-            .indices_dir()
-            .child(uuid)
-            .child(format!("hnsw_part_{}", part_id));
-        let aux_part_file = if with_aux {
-            Some(
-                dataset
-                    .indices_dir()
-                    .child(uuid)
-                    .child(format!("hnsw_part_aux_{}", part_id)),
-            )
-        } else {
-            None
-        };
-
-        (part_file, aux_part_file)
-    };
-
-    // TODO: make it configurable, limit by the number of CPU cores & memory
-    let mut aux_ivf = IvfData::empty();
+    let object_store = ObjectStore::local();
+    let mut part_files = Vec::with_capacity(ivf.num_partitions());
+    let mut aux_part_files = Vec::with_capacity(ivf.num_partitions());
+    let tmp_part_dir = Path::from_filesystem_path(TempDir::new()?)?;
     let mut tasks = Vec::with_capacity(ivf.num_partitions());
-    let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
-    for part_id in 0..ivf.num_partitions() as u32 {
+    for part_id in 0..ivf.num_partitions() {
+        part_files.push(tmp_part_dir.child(format!("hnsw_part_{}", part_id)));
+        aux_part_files.push(tmp_part_dir.child(format!("hnsw_part_aux_{}", part_id)));
+
         let mut pq_array: Vec<Arc<dyn Array>> = vec![];
         let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
-
         merge_streams(
             &mut streams_heap,
             &mut new_streams,
-            part_id,
+            part_id as u32,
             &mut pq_array,
             &mut row_id_array,
         )
         .await?;
 
-        let writer_options = FileWriterOptions::default();
-        let (part_file, aux_part_file) = build_part_path(part_id);
+        let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
         let part_writer = FileWriter::<ManifestDescribing>::try_new(
-            dataset.object_store(),
+            &object_store,
             &part_file,
             Schema::try_from(writer.schema())?,
-            &writer_options,
+            &Default::default(),
         )
         .await?;
 
-        let aux_part_writer = match aux_part_file {
-            Some(path) => Some(
+        let aux_part_writer = match auxiliary_writer.as_ref() {
+            Some(writer) => Some(
                 FileWriter::<ManifestDescribing>::try_new(
-                    dataset.object_store(),
-                    &path,
-                    Schema::try_from(auxiliary_writer.as_ref().unwrap().schema())?,
-                    &writer_options,
+                    &object_store,
+                    &aux_part_file,
+                    Schema::try_from(writer.schema())?,
+                    &Default::default(),
                 )
                 .await?,
             ),
@@ -360,17 +348,18 @@ pub(super) async fn write_hnsw_index_partitions(
         ));
     }
 
-    let parallel_limit = 16;
     let results = futures::stream::iter(tasks)
         .map(tokio::spawn)
-        .buffered(parallel_limit)
+        .buffered(HNSW_PARTITIONS_BUILD_PARRALLEL)
         .try_collect::<Vec<_>>()
         .await?;
 
+    let mut aux_ivf = IvfData::empty();
+    let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
     for (part_id, result) in results.into_iter().enumerate() {
         let length = result?;
 
-        let (part_file, aux_part_file) = build_part_path(part_id as u32);
+        let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
         let part_reader =
             FileReader::try_new_self_described(dataset.object_store(), &part_file, None).await?;
 
@@ -394,12 +383,9 @@ pub(super) async fn write_hnsw_index_partitions(
         )?);
 
         if let Some(aux_writer) = auxiliary_writer.as_mut() {
-            let aux_part_reader = FileReader::try_new_self_described(
-                dataset.object_store(),
-                aux_part_file.as_ref().unwrap(),
-                None,
-            )
-            .await?;
+            let aux_part_reader =
+                FileReader::try_new_self_described(dataset.object_store(), aux_part_file, None)
+                    .await?;
 
             let batches = futures::stream::iter(0..aux_part_reader.num_batches())
                 .map(|batch_id| {
@@ -436,28 +422,6 @@ async fn build_hnsw_partition(
     pq_array: Vec<Arc<dyn Array>>,
 ) -> Result<usize> {
     let projection = Arc::new(dataset.schema().project(&[column.as_ref()])?);
-    // let vector_batches = futures::stream::iter(row_id_array.iter())
-    //     .map(|row_ids| {
-    //         (
-    //             row_ids.clone(),
-    //             dataset.clone(),
-    //             projection.clone(),
-    //             column.clone(),
-    //         )
-    //     })
-    //     .map(|(row_ids, dataset, projection, column)| async move {
-    //         let array = dataset
-    //             .take_rows(row_ids.as_primitive::<UInt64Type>().values(), &projection)
-    //             .await?
-    //             .column_by_name(column.as_ref())
-    //             .expect("row id column not found")
-    //             .clone();
-
-    //         Result::Ok(array)
-    //     })
-    //     .buffered(num_cpus::get())
-    //     .try_collect::<Vec<_>>()
-    //     .await?;
     let mut vector_batches = Vec::with_capacity(row_id_array.len());
     for row_ids in row_id_array.iter() {
         let array = dataset
