@@ -572,12 +572,14 @@ impl Scanner {
         let mut extra_columns = vec![];
 
         if let Some(q) = self.nearest.as_ref() {
-            let vector_field = self.dataset.schema().field(&q.column).ok_or(Error::IO {
-                message: format!("Column {} not found", q.column),
-                location: location!(),
-            })?;
-            let vector_field = ArrowField::from(vector_field);
-            extra_columns.push(vector_field);
+            if q.refine_factor.is_some() {
+                let vector_field = self.dataset.schema().field(&q.column).ok_or(Error::IO {
+                    message: format!("Column {} not found", q.column),
+                    location: location!(),
+                })?;
+                let vector_field = ArrowField::from(vector_field);
+                extra_columns.push(vector_field);
+            }
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
         }
 
