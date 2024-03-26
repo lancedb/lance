@@ -108,7 +108,6 @@ pub(super) async fn build_hnsw_partitions(
     auxiliary_writer: Option<&mut FileWriter<ManifestDescribing>>,
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
-    uuid: &str,
     ivf: &mut Ivf,
     pq: Arc<dyn ProductQuantizer>,
     metric_type: MetricType,
@@ -158,7 +157,6 @@ pub(super) async fn build_hnsw_partitions(
     write_hnsw_index_partitions(
         dataset,
         column,
-        uuid,
         metric_type,
         hnsw_params,
         writer,

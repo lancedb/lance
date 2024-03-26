@@ -28,7 +28,7 @@ use lance_arrow::*;
 use lance_core::datatypes::Schema;
 use lance_core::Error;
 use lance_file::reader::FileReader;
-use lance_file::writer::{FileWriter, FileWriterOptions};
+use lance_file::writer::FileWriter;
 use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfData;
@@ -243,7 +243,6 @@ pub(super) async fn write_pq_partitions(
 pub(super) async fn write_hnsw_index_partitions(
     dataset: &Dataset,
     column: &str,
-    uuid: &str,
     metric_type: MetricType,
     hnsw_params: &HnswBuildParams,
     writer: &mut FileWriter<ManifestDescribing>,
@@ -312,7 +311,7 @@ pub(super) async fn write_hnsw_index_partitions(
         let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
         let part_writer = FileWriter::<ManifestDescribing>::try_new(
             &object_store,
-            &part_file,
+            part_file,
             Schema::try_from(writer.schema())?,
             &Default::default(),
         )
@@ -322,7 +321,7 @@ pub(super) async fn write_hnsw_index_partitions(
             Some(writer) => Some(
                 FileWriter::<ManifestDescribing>::try_new(
                     &object_store,
-                    &aux_part_file,
+                    aux_part_file,
                     Schema::try_from(writer.schema())?,
                     &Default::default(),
                 )
@@ -361,7 +360,7 @@ pub(super) async fn write_hnsw_index_partitions(
 
         let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
         let part_reader =
-            FileReader::try_new_self_described(&object_store, &part_file, None).await?;
+            FileReader::try_new_self_described(&object_store, part_file, None).await?;
 
         let offset = writer.tell().await?;
         let batches = futures::stream::iter(0..part_reader.num_batches())

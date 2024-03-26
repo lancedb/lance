@@ -1286,7 +1286,6 @@ async fn write_ivf_hnsw_file(
         Some(&mut aux_writer),
         stream,
         column,
-        uuid,
         &mut ivf,
         pq.clone(),
         distance_type,
@@ -1394,7 +1393,6 @@ mod tests {
     };
     use rand::{seq::SliceRandom, thread_rng};
     use tempfile::tempdir;
-    use uuid::Uuid;
 
     use crate::index::{
         vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt, IndexType,
