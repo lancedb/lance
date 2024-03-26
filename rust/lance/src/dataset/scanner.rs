@@ -572,12 +572,6 @@ impl Scanner {
         let mut extra_columns = vec![];
 
         if let Some(q) = self.nearest.as_ref() {
-            let vector_field = self.dataset.schema().field(&q.column).ok_or(Error::IO {
-                message: format!("Column {} not found", q.column),
-                location: location!(),
-            })?;
-            let vector_field = ArrowField::from(vector_field);
-            extra_columns.push(vector_field);
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
         };
 
@@ -1026,9 +1020,10 @@ impl Scanner {
             let deltas = self.dataset.load_indices_by_name(&index.name).await?;
             let ann_node = self.ann(q, &deltas, filter_plan).await?; // _distance, _rowid
 
-            let with_vector = self.dataset.schema().project(&[&q.column])?;
-            let knn_node_with_vector = self.take(ann_node, &with_vector, self.batch_readahead)?;
             let mut knn_node = if q.refine_factor.is_some() {
+                let with_vector = self.dataset.schema().project(&[&q.column])?;
+                let knn_node_with_vector =
+                    self.take(ann_node, &with_vector, self.batch_readahead)?;
                 // TODO: now we just open an index to get its metric type.
                 let idx = self
                     .dataset
@@ -1038,11 +1033,9 @@ impl Scanner {
                 q.metric_type = idx.metric_type();
                 self.flat_knn(knn_node_with_vector, &q)?
             } else {
-                knn_node_with_vector
+                ann_node
             }; // vector, _distance, _rowid
-
             knn_node = self.knn_combined(&q, index, knn_node, filter_plan).await?;
-
             Ok(knn_node)
         } else {
             // No index found. use flat search.
