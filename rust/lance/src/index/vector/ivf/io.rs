@@ -361,7 +361,7 @@ pub(super) async fn write_hnsw_index_partitions(
 
         let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
         let part_reader =
-            FileReader::try_new_self_described(dataset.object_store(), &part_file, None).await?;
+            FileReader::try_new_self_described(&object_store, &part_file, None).await?;
 
         let offset = writer.tell().await?;
         let batches = futures::stream::iter(0..part_reader.num_batches())
@@ -384,8 +384,7 @@ pub(super) async fn write_hnsw_index_partitions(
 
         if let Some(aux_writer) = auxiliary_writer.as_mut() {
             let aux_part_reader =
-                FileReader::try_new_self_described(dataset.object_store(), aux_part_file, None)
-                    .await?;
+                FileReader::try_new_self_described(&object_store, aux_part_file, None).await?;
 
             let batches = futures::stream::iter(0..aux_part_reader.num_batches())
                 .map(|batch_id| {
