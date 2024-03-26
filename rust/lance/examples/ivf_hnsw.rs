@@ -17,6 +17,7 @@
 //! run with `cargo run --release --example hnsw`
 
 use std::collections::HashSet;
+use std::ops::Div;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
@@ -144,27 +145,27 @@ async fn main() {
         .await
         .unwrap();
     println!(
-        "level={}, nprobe={}, k={}, search={:.3} us",
+        "level={}, nprobe={}, k={}, search={:?}",
         args.max_level,
         args.nprobe,
         args.k,
-        now.elapsed().as_micros()
+        now.elapsed(),
     );
 
+    let now = std::time::Instant::now();
     for _ in 0..10 {
-        let now = std::time::Instant::now();
         plan.try_into_stream()
             .await
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        println!(
-            "warm up: level={}, nprobe={}, k={}, search={:.3} us",
-            args.max_level,
-            args.nprobe,
-            args.k,
-            now.elapsed().as_micros(),
-        );
     }
+    println!(
+        "warm up: level={}, nprobe={}, k={}, search={:?}",
+        args.max_level,
+        args.nprobe,
+        args.k,
+        now.elapsed().div_f32(10.0),
+    );
 }
