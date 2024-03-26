@@ -4771,6 +4771,7 @@ mod tests {
             .scan()
             .nearest("vec", &vec![0.0f32; 128].into(), 10)
             .unwrap()
+            .nprobs(10)
             .try_into_batch()
             .await
             .unwrap();

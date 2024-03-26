@@ -1037,14 +1037,17 @@ pub(crate) async fn mutate_index_file(
 
     mutate_ivf(&mut new_index)?;
 
-    let pq_sub_index = index
+    let mut pq_sub_index = index
         .sub_index
         .as_any()
         .downcast_ref::<PQIndex>()
         .ok_or_else(|| Error::NotSupported {
             source: "Remapping a non-pq sub-index".into(),
             location: location!(),
-        })?;
+        })?
+        .clone();
+
+    mutate_pq(&mut pq_sub_index)?;
 
     let metadata = IvfPQIndexMetadata {
         name,

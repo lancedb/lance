@@ -252,6 +252,10 @@ impl VectorIndex for PQIndex {
     }
 
     fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        if self.code.is_none() {
+            // If there are no codes, then we can skip this.
+            return Ok(());
+        }
         let code = self
             .code
             .as_ref()
@@ -289,21 +293,21 @@ impl VectorIndex for PQIndex {
                 self.pq.num_bits(),
                 self.pq.dimension(),
                 Arc::new(codebook.as_primitive().clone()),
-                self.metric_type,
+                self.pq.metric_type(),
             )),
             DataType::Float32 => Arc::new(ProductQuantizerImpl::<Float32Type>::new(
                 self.pq.num_sub_vectors(),
                 self.pq.num_bits(),
                 self.pq.dimension(),
                 Arc::new(codebook.as_primitive().clone()),
-                self.metric_type,
+                self.pq.metric_type(),
             )),
             DataType::Float64 => Arc::new(ProductQuantizerImpl::<Float64Type>::new(
                 self.pq.num_sub_vectors(),
                 self.pq.num_bits(),
                 self.pq.dimension(),
                 Arc::new(codebook.as_primitive().clone()),
-                self.metric_type,
+                self.pq.metric_type(),
             )),
             _ => {
                 return Err(Error::Index {
