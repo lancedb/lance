@@ -151,7 +151,7 @@ async fn main() {
         now.elapsed().as_micros()
     );
 
-    for _ in 0..100 {
+    for _ in 0..10 {
         let now = std::time::Instant::now();
         plan.try_into_stream()
             .await
