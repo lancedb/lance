@@ -32,7 +32,10 @@ use crate::Result;
 pub enum DistanceType {
     L2,
     Cosine,
-    Dot, // Dot product
+    /// Dot Product
+    Dot,
+    /// Hamming Distance
+    Hamming,
 }
 
 /// For backwards compatibility.
@@ -51,6 +54,7 @@ impl DistanceType {
             Self::L2 => l2_distance_arrow_batch,
             Self::Cosine => cosine_distance_arrow_batch,
             Self::Dot => dot_distance_arrow_batch,
+            Self::Hamming => todo!(),
         }
     }
 
@@ -63,6 +67,7 @@ impl DistanceType {
             Self::L2 => l2,
             Self::Cosine => cosine_distance,
             Self::Dot => dot_distance,
+            Self::Hamming => todo!(),
         }
     }
 }
@@ -76,6 +81,7 @@ impl std::fmt::Display for DistanceType {
                 Self::L2 => "l2",
                 Self::Cosine => "cosine",
                 Self::Dot => "dot",
+                Self::Hamming => "hamming",
             }
         )
     }
@@ -89,6 +95,7 @@ impl TryFrom<&str> for DistanceType {
             "l2" | "euclidean" => Ok(Self::L2),
             "cosine" => Ok(Self::Cosine),
             "dot" => Ok(Self::Dot),
+            "hamming" => Ok(Self::Hamming),
             _ => Err(ArrowError::InvalidArgumentError(format!(
                 "Metric type '{s}' is not supported"
             ))),
