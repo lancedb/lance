@@ -17,18 +17,14 @@
 //! run with `cargo run --release --example hnsw`
 
 use std::collections::HashSet;
-use std::ops::Div;
-use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow_array::types::Float32Type;
-use arrow_array::PrimitiveArray;
-use arrow_select::concat::concat;
 use clap::Parser;
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use lance::index::vector::VectorIndexParams;
 use lance::Dataset;
-use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSWBuilder};
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::{DatasetIndexExt, IndexType};
@@ -54,9 +50,6 @@ struct Args {
     #[arg(long, default_value = "7")]
     max_level: u16,
 
-    #[arg(long, default_value = "true")]
-    replace: bool,
-
     #[arg(long, default_value = "1")]
     nprobe: usize,
 
@@ -65,6 +58,9 @@ struct Args {
 
     #[arg(long, default_value = "false")]
     create_index: bool,
+
+    #[arg(long, default_value = "cosine")]
+    metric_type: String,
 }
 
 fn ground_truth(mat: &MatrixView<Float32Type>, query: &[f32], k: usize) -> HashSet<u32> {
@@ -89,6 +85,7 @@ async fn main() {
     println!("Dataset schema: {:#?}", dataset.schema());
 
     let column = args.column.as_deref().unwrap_or("vector");
+    let metric_type = MetricType::try_from(args.metric_type.as_str()).unwrap();
 
     let mut ivf_params = IvfBuildParams::new(128);
     ivf_params.sample_rate = 20480;
@@ -97,18 +94,14 @@ async fn main() {
         .ef_construction(100)
         .num_edges(15)
         .max_num_edges(30);
-    let params = VectorIndexParams::with_ivf_hnsw_pq_params(
-        MetricType::Cosine,
-        ivf_params,
-        hnsw_params,
-        pq_params,
-    );
+    let params =
+        VectorIndexParams::with_ivf_hnsw_pq_params(metric_type, ivf_params, hnsw_params, pq_params);
     println!("{:?}", params);
 
     if args.create_index {
         let now = std::time::Instant::now();
         dataset
-            .create_index(&[column], IndexType::Vector, None, &params, args.replace)
+            .create_index(&[column], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
         println!("build={:.3}s", now.elapsed().as_secs_f32());
