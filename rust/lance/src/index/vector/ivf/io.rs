@@ -358,12 +358,10 @@ pub(super) async fn write_hnsw_index_partitions(
         }));
     }
 
-    let results = futures::future::try_join_all(tasks).await?;
-
     let mut aux_ivf = IvfData::empty();
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
-    for (part_id, result) in results.into_iter().enumerate() {
-        let length = result?;
+    for (part_id, task) in tasks.into_iter().enumerate() {
+        let length = task.await??;
 
         let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
         let part_reader =
