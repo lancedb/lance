@@ -146,6 +146,11 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         })
     }
 
+    /// Return the schema of the file writer.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
     /// Write a [RecordBatch] to the open file.
     /// All RecordBatch will be treated as one RecordBatch on disk
     ///

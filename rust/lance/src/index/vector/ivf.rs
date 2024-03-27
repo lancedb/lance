@@ -1393,7 +1393,6 @@ mod tests {
     };
     use rand::{seq::SliceRandom, thread_rng};
     use tempfile::tempdir;
-    use uuid::Uuid;
 
     use crate::index::{
         vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt, IndexType,
