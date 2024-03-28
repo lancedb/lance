@@ -482,6 +482,7 @@ impl DatasetIndexInternalExt for Dataset {
 
     async fn open_vector_index(&self, column: &str, uuid: &str) -> Result<Arc<dyn VectorIndex>> {
         if let Some(index) = self.session.index_cache.get_vector(uuid) {
+            log::debug!("Found vector index in cache uuid: {}", uuid);
             return Ok(index);
         }
 
