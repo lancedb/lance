@@ -35,9 +35,7 @@ use datafusion_physical_expr::{
     PhysicalSortExpr,
 };
 use futures::{
-    future::BoxFuture,
-    stream::{self},
-    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
+    future::BoxFuture, stream, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{Error, Result};
 use lance_datafusion::{
@@ -783,6 +781,10 @@ struct BTreeStatistics {
 #[async_trait]
 impl Index for BTreeIndex {
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 

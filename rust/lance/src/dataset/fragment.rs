@@ -1559,6 +1559,7 @@ mod tests {
             Operation::Merge {
                 schema,
                 fragments: vec![frag],
+                rewritten_indices: vec![],
             },
             Some(dataset.manifest.version),
             None,

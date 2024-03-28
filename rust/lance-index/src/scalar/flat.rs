@@ -139,6 +139,10 @@ impl Index for FlatIndex {
         self
     }
 
+    fn as_mut_any(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
     }

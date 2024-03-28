@@ -27,6 +27,7 @@ mod utils;
 #[cfg(test)]
 mod fixture_test;
 
+use lance_core::datatypes::Field;
 use lance_file::reader::FileReader;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfData;
@@ -276,7 +277,6 @@ pub(crate) async fn remap_vector_index(
 
     remap_index_file(
         dataset.as_ref(),
-        &old_uuid.to_string(),
         &new_uuid.to_string(),
         old_metadata.dataset_version,
         ivf_index,
@@ -289,6 +289,44 @@ pub(crate) async fn remap_vector_index(
         vec![],
     )
     .await?;
+    Ok(())
+}
+
+#[instrument(level = "debug", skip_all, fields(new_uuid = new_uuid.to_string(), dataset_uri = dataset.base.to_string(), column = from_field.name))]
+pub(crate) async fn cast_vector_index(
+    dataset: &Dataset,
+    old_uuid: &Uuid,
+    new_uuid: &Uuid,
+    old_metadata: &IndexMetadata,
+    from_field: &Field,
+    to_field: &Field,
+) -> Result<()> {
+    let old_index = dataset
+        .open_vector_index(&from_field.name, &old_uuid.to_string())
+        .await?;
+
+    let old_index = old_index
+        .as_any()
+        .downcast_ref::<IVFIndex>()
+        .ok_or_else(|| Error::NotSupported {
+            source: "Only IVF indexes can be casted currently".into(),
+            location: location!(),
+        })?;
+
+    crate::index::vector::ivf::cast_index_file(
+        dataset,
+        &new_uuid.to_string(),
+        old_metadata.dataset_version,
+        old_index,
+        to_field,
+        old_metadata.name.clone(),
+        // We can safely assume there are no transforms today.  We assert above that the
+        // top stage is IVF and IVF does not support transforms between IVF and PQ.  This
+        // will be fixed in the future.
+        vec![],
+    )
+    .await?;
+
     Ok(())
 }
 
