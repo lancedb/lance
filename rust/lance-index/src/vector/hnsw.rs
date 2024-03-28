@@ -280,21 +280,7 @@ impl HNSW {
                 }
             })?)?;
 
-        let levels = futures::stream::iter(0..hnsw_metadata.level_offsets.len() - 1)
-            .map(|i| {
-                let start = hnsw_metadata.level_offsets[i];
-                let end = hnsw_metadata.level_offsets[i + 1];
-                HnswLevel::load(reader, start..end, vector_storage.clone())
-            })
-            .buffered(num_cpus::get())
-            .try_collect()
-            .await?;
-        Ok(Self {
-            levels,
-            distance_type: mt,
-            entry_point: hnsw_metadata.entry_point,
-            use_select_heuristic: true,
-        })
+        Self::load_partition(reader, 0..reader.len(), mt, vector_storage, hnsw_metadata).await
     }
 
     /// Load a partition of HNSW
@@ -313,13 +299,15 @@ impl HNSW {
         vector_storage: Arc<dyn VectorStorage>,
         metadata: HnswMetadata,
     ) -> Result<Self> {
-        let mut levels = Vec::with_capacity(metadata.level_offsets.len() - 1);
-        // TODO: load levels in parallel.
-        for i in 0..metadata.level_offsets.len() - 1 {
-            let start = metadata.level_offsets[i] + range.start;
-            let end = metadata.level_offsets[i + 1] + range.start;
-            levels.push(HnswLevel::load(reader, start..end, vector_storage.clone()).await?);
-        }
+        let levels = futures::stream::iter(0..metadata.level_offsets.len() - 1)
+            .map(|i| {
+                let start = range.start + metadata.level_offsets[i];
+                let end = range.start + metadata.level_offsets[i + 1];
+                HnswLevel::load(reader, start..end, vector_storage.clone())
+            })
+            .buffered(num_cpus::get())
+            .try_collect()
+            .await?;
         Ok(Self {
             levels,
             distance_type: metric_type,
