@@ -807,9 +807,7 @@ impl Scanner {
         // TODO: Should we use them when postfiltering if there is no vector search?
         let use_scalar_index = self.prefilter || self.nearest.is_none();
 
-        println!("Before planner    ");
         let planner = Planner::new(Arc::new(self.dataset.schema().into()));
-        println!("Make planner: ");
 
         // NOTE: we only support node that have one partition. So any nodes that
         // produce multiple need to be repartitioned to 1.
@@ -846,7 +844,6 @@ impl Scanner {
         } else {
             FilterPlan::default()
         };
-        println!("Before ann node");
 
         // Stage 1: source (either an (K|A)NN search or a (full|indexed) scan)
         let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() {
@@ -884,10 +881,6 @@ impl Scanner {
                 }
             }
         };
-        println!(
-            "After ann node: {}",
-            datafusion::physical_plan::displayable(plan.as_ref()).indent(true),
-        );
         // Stage 1.5 load columns needed for stages 2 & 3
         let mut additional_schema = None;
         if filter_plan.has_refine() {
@@ -907,14 +900,9 @@ impl Scanner {
                     .collect::<Vec<_>>(),
             )?;
         }
-        println!("I Got to addtional schema: {:?}", additional_schema);
         if let Some(additional_schema) = additional_schema {
             plan = self.take(plan, &additional_schema, self.batch_readahead)?;
         }
-        println!(
-            "After additnal: {}",
-            datafusion::physical_plan::displayable(plan.as_ref()).indent(true),
-        );
 
         // Stage 2: filter
         if let Some(refine_expr) = filter_plan.refine_expr {
@@ -924,7 +912,6 @@ impl Scanner {
             let physical_refine_expr = planner.create_physical_expr(&refine_expr)?;
 
             plan = Arc::new(FilterExec::try_new(physical_refine_expr, plan)?);
-            println!("Refine is SOME");
         }
 
         // Stage 3: sort
@@ -963,7 +950,6 @@ impl Scanner {
         }
 
         // Stage 5: take remaining columns required for projection
-        println!("Remaining physical schema: {}", self.physical_schema()?);
         let physical_schema = self.physical_schema()?;
         let remaining_schema = physical_schema.exclude(plan.schema().as_ref())?;
         if !remaining_schema.fields.is_empty() {
@@ -3814,7 +3800,6 @@ mod test {
         let mut td = TestVectorDataset::new().await.unwrap();
         td.make_vector_index().await.unwrap();
         let dataset = &td.dataset;
-        println!("Dataset schema: {:?}", dataset.schema());
         let q: Float32Array = (32..64).map(|v| v as f32).collect();
 
         assert_plan_equals(
