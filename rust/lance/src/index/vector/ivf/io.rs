@@ -49,6 +49,7 @@ use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::TempDir;
+use tokio::sync::Semaphore;
 
 use super::{IVFIndex, Ivf};
 use crate::index::vector::pq::PQIndex;
@@ -293,6 +294,7 @@ pub(super) async fn write_hnsw_index_partitions(
     let mut aux_part_files = Vec::with_capacity(ivf.num_partitions());
     let tmp_part_dir = Path::from_filesystem_path(TempDir::new()?)?;
     let mut tasks = Vec::with_capacity(ivf.num_partitions());
+    let sem = Arc::new(Semaphore::new(HNSW_PARTITIONS_BUILD_PARRALLEL));
     for part_id in 0..ivf.num_partitions() {
         part_files.push(tmp_part_dir.child(format!("hnsw_part_{}", part_id)));
         aux_part_files.push(tmp_part_dir.child(format!("hnsw_part_aux_{}", part_id)));
@@ -334,29 +336,32 @@ pub(super) async fn write_hnsw_index_partitions(
         let column = column.clone();
         let hnsw_params = hnsw_params.clone();
         let pq = pq.clone();
-        tasks.push(build_hnsw_partition(
-            dataset,
-            column,
-            metric_type,
-            hnsw_params,
-            part_writer,
-            aux_part_writer,
-            pq,
-            row_id_array,
-            pq_array,
-        ));
-    }
+        let sem = sem.clone();
+        tasks.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore error");
 
-    let results = futures::stream::iter(tasks)
-        .map(tokio::spawn)
-        .buffered(HNSW_PARTITIONS_BUILD_PARRALLEL)
-        .try_collect::<Vec<_>>()
-        .await?;
+            log::debug!("Building HNSW partition {}", part_id);
+            let result = build_hnsw_partition(
+                dataset,
+                column,
+                metric_type,
+                hnsw_params,
+                part_writer,
+                aux_part_writer,
+                pq,
+                row_id_array,
+                pq_array,
+            )
+            .await;
+            log::debug!("Finished building HNSW partition {}", part_id);
+            result
+        }));
+    }
 
     let mut aux_ivf = IvfData::empty();
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
-    for (part_id, result) in results.into_iter().enumerate() {
-        let length = result?;
+    for (part_id, task) in tasks.into_iter().enumerate() {
+        let length = task.await??;
 
         let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
         let part_reader =
