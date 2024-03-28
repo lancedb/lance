@@ -24,16 +24,15 @@ use async_recursion::async_recursion;
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::{AggregateFunction, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
-use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
-use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     display::DisplayableExecutionPlan,
-    expressions::{create_aggregate_expr, Literal},
+    expressions::{self, create_aggregate_expr, Literal},
     filter::FilterExec,
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
+    sorts::sort::SortExec,
     union::UnionExec,
     ExecutionPlan, SendableRecordBatchStream,
 };
@@ -278,6 +277,7 @@ impl Scanner {
         let mut output = HashMap::new();
         let mut physical_cols_set = HashSet::new();
         let mut physical_cols = vec![];
+
         for (output_name, raw_expr) in columns {
             if output.contains_key(output_name.as_ref()) {
                 return Err(Error::IO {
@@ -572,12 +572,15 @@ impl Scanner {
         let mut extra_columns = vec![];
 
         if let Some(q) = self.nearest.as_ref() {
-            let vector_field = self.dataset.schema().field(&q.column).ok_or(Error::IO {
-                message: format!("Column {} not found", q.column),
-                location: location!(),
-            })?;
-            let vector_field = ArrowField::from(vector_field);
-            extra_columns.push(vector_field);
+            if q.refine_factor.is_some() {
+                debug!("Add vector column because refine factor.");
+                let vector_field = self.dataset.schema().field(&q.column).ok_or(Error::IO {
+                    message: format!("Column {} not found", q.column),
+                    location: location!(),
+                })?;
+                let vector_field = ArrowField::from(vector_field);
+                extra_columns.push(vector_field);
+            }
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
         };
 
@@ -792,7 +795,7 @@ impl Scanner {
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        if self.phyical_columns.fields.is_empty() && !self.with_row_id {
+        if self.phyical_columns.fields.is_empty() && !self.with_row_id && self.nearest.is_none() {
             return Err(Error::InvalidInput {
                 source:
                     "no columns were selected and with_row_id is false, there is nothing to scan"
@@ -878,7 +881,6 @@ impl Scanner {
                 }
             }
         };
-
         // Stage 1.5 load columns needed for stages 2 & 3
         let mut additional_schema = None;
         if filter_plan.has_refine() {
@@ -1026,9 +1028,10 @@ impl Scanner {
             let deltas = self.dataset.load_indices_by_name(&index.name).await?;
             let ann_node = self.ann(q, &deltas, filter_plan).await?; // _distance, _rowid
 
-            let with_vector = self.dataset.schema().project(&[&q.column])?;
-            let knn_node_with_vector = self.take(ann_node, &with_vector, self.batch_readahead)?;
             let mut knn_node = if q.refine_factor.is_some() {
+                let with_vector = self.dataset.schema().project(&[&q.column])?;
+                let knn_node_with_vector =
+                    self.take(ann_node, &with_vector, self.batch_readahead)?;
                 // TODO: now we just open an index to get its metric type.
                 let idx = self
                     .dataset
@@ -1038,7 +1041,7 @@ impl Scanner {
                 q.metric_type = idx.metric_type();
                 self.flat_knn(knn_node_with_vector, &q)?
             } else {
-                knn_node_with_vector
+                ann_node
             }; // vector, _distance, _rowid
 
             knn_node = self.knn_combined(&q, index, knn_node, filter_plan).await?;
@@ -3787,6 +3790,27 @@ mod test {
             LanceScan: uri=..., projection=[s, i], row_id=true, ordered=false",
         )
         .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_no_take() -> Result<()> {
+        // Create a vector dataset
+        let mut td = TestVectorDataset::new().await.unwrap();
+        td.make_vector_index().await.unwrap();
+        let dataset = &td.dataset;
+        let q: Float32Array = (32..64).map(|v| v as f32).collect();
+
+        assert_plan_equals(
+            dataset,
+            |scan| scan.nearest("vec", &q, 2)?.project(&Vec::<String>::new()),
+            "Projection: fields=[_distance]
+  SortExec: TopK(fetch=2), expr=[_distance@0 ASC NULLS LAST]
+    KNNIndex: name=..., k=2, deltas=1",
+        )
+        .await
+        .unwrap();
 
         Ok(())
     }
