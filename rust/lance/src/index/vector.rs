@@ -439,5 +439,10 @@ pub(crate) async fn open_vector_index_v2(
         }
     };
 
+    dataset
+        .session
+        .index_cache
+        .insert_vector(uuid, index.clone());
+
     Ok(index)
 }
