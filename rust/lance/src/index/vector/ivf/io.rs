@@ -471,7 +471,7 @@ async fn build_hnsw_partition(
 fn build_hnsw_index(
     metric_type: MetricType,
     hnsw_params: HnswBuildParams,
-    row_id_array: Vec<Arc<dyn Array>>,
+    row_ids_array: Vec<Arc<dyn Array>>,
     pq_array: Vec<Arc<dyn Array>>,
     vector_array: Vec<Arc<dyn Array>>,
     build_with_pq: bool,
@@ -482,6 +482,8 @@ fn build_hnsw_index(
         .map(|arr| arr.as_ref())
         .collect::<Vec<_>>();
     let fsl = arrow_select::concat::concat(&vector_arrs)?;
+    std::mem::drop(vector_array);
+
     let mat = Arc::new(MatrixView::<Float32Type>::try_from(
         fsl.as_fixed_size_list(),
     )?);
@@ -490,10 +492,14 @@ fn build_hnsw_index(
     let hnsw = hnsw_builder.build()?;
 
     let pq_storage = if build_with_pq {
-        let pq_array = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-        let row_id_array = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-        let pq_column = concat(&pq_array)?;
-        let row_ids_column = concat(&row_id_array)?;
+        let pq_arrs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+        let pq_column = concat(&pq_arrs)?;
+        std::mem::drop(pq_array);
+
+        let row_ids_arrs = row_ids_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+        let row_ids_column = concat(&row_ids_arrs)?;
+        std::mem::drop(row_ids_array);
+
         let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![
             (ROW_ID, row_ids_column, true),
             (PQ_CODE_COLUMN, pq_column, false),
