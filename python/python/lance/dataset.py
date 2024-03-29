@@ -1286,7 +1286,7 @@ class LanceDataset(pa.dataset.Dataset):
         - **max_level**: the maximum number of levels in the graph.
         - **m**: the number of edges per node in the graph.
         - **m_max**: the maximum number of edges per node in the graph.
-        - **ef_construction**: the number of candidate nodes to examine during the construction of the graph.
+        - **ef_construction**: the number of nodes to examine during the construction.
 
         Optional parameters for "DISKANN":
         - **r**: out-degree bound
@@ -1376,7 +1376,8 @@ class LanceDataset(pa.dataset.Dataset):
         index_type = index_type.upper()
         if index_type not in ["IVF_PQ", "DISKANN", "IVF_HNSW_PQ"]:
             raise NotImplementedError(
-                f"Only [IVF_PQ, IVF_HNSW_PQ, DiskANN] index_types supported. Got {index_type}"
+                f"Only [IVF_PQ, IVF_HNSW_PQ, DiskANN] index types supported. "
+                f"Got {index_type}"
             )
         if index_type.startswith("IVF"):
             if num_partitions is None or num_sub_vectors is None:
