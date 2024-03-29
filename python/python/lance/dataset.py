@@ -1281,9 +1281,14 @@ class LanceDataset(pa.dataset.Dataset):
             Must have feature 'opq' enabled in Rust.
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
         - **ivf_centroids**: K-mean centroids for IVF clustering.
+        
+        Optional parameters for "HNSW":
+        - **max_level**: the maximum number of levels in the graph.
+        - **m**: the number of edges per node in the graph.
+        - **m_max**: the maximum number of edges per node in the graph.
+        - **ef_construction**: the number of candidate nodes to examine during the construction of the graph.
 
-        If ``index_type`` is "DISKANN", then the following parameters are optional:
-
+        Optional parameters for "DISKANN":
         - **r**: out-degree bound
         - **l**: number of levels in the graph.
         - **alpha**: distance threshold for the graph.
@@ -1369,11 +1374,11 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["metric_type"] = metric
 
         index_type = index_type.upper()
-        if index_type not in ["IVF_PQ", "DISKANN"]:
+        if index_type not in ["IVF_PQ", "DISKANN", "IVF_HNSW_PQ"]:
             raise NotImplementedError(
-                f"Only IVF_PQ or DiskANN index_types supported. Got {index_type}"
+                f"Only [IVF_PQ, IVF_HNSW_PQ, DiskANN] index_types supported. Got {index_type}"
             )
-        if index_type == "IVF_PQ":
+        if index_type.startswith("IVF"):
             if num_partitions is None or num_sub_vectors is None:
                 raise ValueError(
                     "num_partitions and num_sub_vectors are required for IVF_PQ"
