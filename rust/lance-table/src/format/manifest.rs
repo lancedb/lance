@@ -184,6 +184,29 @@ impl Manifest {
         }
     }
 
+    /// Get the max used field id
+    ///
+    /// This is different than `Schema::max_field_id` because it also considers
+    /// the field ids in the data files that have been dropped from the schema.
+    pub fn max_field_id(&self) -> Option<i32> {
+        let schema_max_id = self.schema.max_field_id();
+        let fragment_max_id = self.fragments.first().and_then(|f| {
+            f.files
+                .iter()
+                .flat_map(|file| file.fields.as_slice())
+                .max()
+                .cloned()
+        });
+        match (schema_max_id, fragment_max_id) {
+            (None, None) => None,
+            (Some(schema_max_id), None) => Some(schema_max_id),
+            (None, Some(fragment_max_id)) => Some(fragment_max_id),
+            (Some(schema_max_id), Some(fragment_max_id)) => {
+                Some(schema_max_id.max(fragment_max_id))
+            }
+        }
+    }
+
     /// Return the fragments that are newer than the given manifest.
     /// Note this does not support recycling of fragment ids.
     pub fn fragments_since(&self, since: &Self) -> Result<Vec<Fragment>> {

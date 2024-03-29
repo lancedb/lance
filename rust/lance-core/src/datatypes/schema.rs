@@ -402,6 +402,11 @@ impl Schema {
     }
 
     // TODO: pub(crate)
+    /// Get the maximum field id in the schema.
+    ///
+    /// Note: When working with Datasets, you should prefer `Manifest::max_field_id`
+    /// over this method. This method does not take into account the field IDs
+    /// of dropped fields.
     pub fn max_field_id(&self) -> Option<i32> {
         self.fields.iter().map(|f| f.max_id()).max()
     }
