@@ -962,6 +962,11 @@ impl Scanner {
             plan = Arc::new(ProjectionExec::try_new(plan, physical_schema)?);
         }
 
+        println!(
+            "Execution plan before optimization: {}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true),
+        );
+
         // Stage 7: final projection
         plan = Arc::new(DFProjectionExec::try_new(self.output_expr()?, plan)?);
 
@@ -970,6 +975,10 @@ impl Scanner {
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
         }
+        println!(
+            "Execution plan AFTER optimization: {}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true),
+        );
 
         debug!("Execution plan:\n{:?}", plan);
 
@@ -1117,7 +1126,7 @@ impl Scanner {
             let new_schema = Schema::try_from(
                 &topk_appended
                     .schema()
-                    .project(&[2 + num_filter_columns, 1 + num_filter_columns, 0])?
+                    .project(&[2 + num_filter_columns, 1 + num_filter_columns])?
                     .with_metadata(knn_node.schema().metadata.clone()),
             )?;
             let topk_appended = ProjectionExec::try_new(topk_appended, Arc::new(new_schema))?;
@@ -3802,12 +3811,26 @@ mod test {
         let dataset = &td.dataset;
         let q: Float32Array = (32..64).map(|v| v as f32).collect();
 
+        // TODO:
         assert_plan_equals(
             dataset,
             |scan| scan.nearest("vec", &q, 2)?.project(&Vec::<String>::new()),
             "Projection: fields=[_distance]
   SortExec: TopK(fetch=2), expr=[_distance@0 ASC NULLS LAST]
     KNNIndex: name=..., k=2, deltas=1",
+        )
+        .await
+        .unwrap();
+
+        assert_plan_equals(
+            dataset,
+            |scan| {
+                scan.nearest("vec", &q, 2)?
+                    .with_row_id()
+                    .project(&Vec::<String>::new())
+            },
+            "SortExec: TopK(fetch=2), expr=[_distance@0 ASC NULLS LAST]
+  KNNIndex: name=..., k=2, deltas=1",
         )
         .await
         .unwrap();
