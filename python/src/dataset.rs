@@ -886,7 +886,7 @@ impl Dataset {
         };
 
         // Only VectorParams are supported.
-        let params = if index_type == "BTREE" {
+        let params: Box<dyn IndexParams> = if index_type == "BTREE" {
             Box::<ScalarIndexParams>::default()
         } else {
             let mut m_type = MetricType::L2;
