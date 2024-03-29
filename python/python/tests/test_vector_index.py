@@ -341,7 +341,8 @@ def test_create_dot_index(dataset, tmp_path):
         metric="dot",
     )
     assert ann_ds.has_index
-    
+
+
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
@@ -352,7 +353,8 @@ def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
         num_sub_vectors=16,
     )
     assert ann_ds.has_index
-    
+
+
 def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     centroids = np.random.randn(5, 128).astype(np.float32)  # IVF5
     dataset_with_index = dataset.create_index(

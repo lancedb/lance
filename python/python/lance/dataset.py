@@ -1281,7 +1281,7 @@ class LanceDataset(pa.dataset.Dataset):
             Must have feature 'opq' enabled in Rust.
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
         - **ivf_centroids**: K-mean centroids for IVF clustering.
-        
+
         Optional parameters for "HNSW":
         - **max_level**: the maximum number of levels in the graph.
         - **m**: the number of edges per node in the graph.
