@@ -186,7 +186,7 @@ impl Manifest {
 
     /// Get the max used field id
     ///
-    /// This is different than `Schema::max_field_id` because it also considers
+    /// This is different than [Schema::max_field_id] because it also considers
     /// the field ids in the data files that have been dropped from the schema.
     pub fn max_field_id(&self) -> Option<i32> {
         let schema_max_id = self.schema.max_field_id();

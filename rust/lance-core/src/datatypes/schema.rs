@@ -404,7 +404,7 @@ impl Schema {
     // TODO: pub(crate)
     /// Get the maximum field id in the schema.
     ///
-    /// Note: When working with Datasets, you should prefer `Manifest::max_field_id`
+    /// Note: When working with Datasets, you should prefer [Manifest::max_field_id()]
     /// over this method. This method does not take into account the field IDs
     /// of dropped fields.
     pub fn max_field_id(&self) -> Option<i32> {
@@ -434,7 +434,7 @@ impl Schema {
     /// be reassigned starting from the maximum field id in this schema.
     ///
     /// If this schema is not associated with a dataset, pass `None` to
-    /// `max_existing_id`. This is the same as passing `Self::max_field_id()`.
+    /// `max_existing_id`. This is the same as passing [Self::max_field_id()].
     pub fn set_field_id(&mut self, max_existing_id: Option<i32>) {
         let schema_max_id = self.max_field_id().unwrap_or(-1);
         let max_existing_id = max_existing_id.unwrap_or(-1);
