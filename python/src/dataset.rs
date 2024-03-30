@@ -1019,16 +1019,16 @@ impl Dataset {
         }
 
         match index_type {
-            "IVF_PQ" => Box::new(VectorIndexParams::with_ivf_pq_params(
+            "IVF_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_pq_params(
                 m_type, ivf_params, pq_params,
-            )),
+            ))),
 
-            "IVF_HNSW_PQ" => Box::new(VectorIndexParams::with_ivf_hnsw_pq_params(
+            "IVF_HNSW_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_pq_params(
                 m_type,
                 ivf_params,
                 hnsw_params,
                 pq_params,
-            )),
+            ))),
 
             _ => {
                 return Err(PyValueError::new_err(format!(
