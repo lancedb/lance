@@ -482,37 +482,129 @@ and Google Cloud Storage. Which object store to use is determined by the URI sch
 the dataset path. For example, ``s3://bucket/path`` will use S3, ``az://bucket/path``
 will use Azure, and ``gs://bucket/path`` will use GCS.
 
-Lance uses the `object-store`_ Rust crate for object store access. There are general
-environment variables that can be used to configure the object store, such as the
-request timeout and proxy configuration. See the `object_store ClientConfigKey`__ docs
-for available configuration options. (The environment variables that can be set
-are the snake-cased versions of these variable names. For example, to set ``ProxyUrl``
-use the environment variable ``PROXY_URL``.)
+These object stores take additional configuration objects. There are two ways to
+specify these configurations: by setting environment variables or by passing them
+to the ``storage_options`` parameter of :py:meth:`lance.dataset` and
+:py:func:`lance.write_dataset`. So for example, to globally set a higher timeout,
+you would run in your shell:
 
-.. _object-store: https://docs.rs/object_store/0.9.0/object_store/
-.. __: https://docs.rs/object_store/latest/object_store/enum.ClientConfigKey.html
+.. code-block:: bash
+
+  export TIMEOUT=60s
+
+If you only want to set the timeout for a single dataset, you can pass it as a
+storage option:
+
+.. code-block:: python
+
+  import lance
+  ds = lance.dataset("s3://path", storage_options={"timeout": "60s"})
+
+
+General Configuration
+~~~~~~~~~~~~~~~~~~~~~
+
+These options apply to all object stores.
+
+.. from https://docs.rs/object_store/latest/object_store/enum.ClientConfigKey.html
+
+.. list-table::
+   :widths: 30 70
+   :header-rows: 1
+
+   * - Key
+     - Description
+   * - ``allow_http``
+     - Allow non-TLS, i.e. non-HTTPS connections. Default, ``False``.
+   * - ``allow_invalid_certificates``
+     - Skip certificate validation on https connections. Default, ``False``.
+       Warning: This is insecure and should only be used for testing.
+   * - ``connect_timeout``
+     - Timeout for only the connect phase of a Client. Default, ``5s``.
+   * - ``request_timeout``
+     - Timeout for the entire request, from connection until the response body
+       has finished. Default, ``30s``.
+   * - ``user_agent``
+     - User agent string to use in requests.
+   * - ``proxy_url``
+     - URL of a proxy server to use for requests. Default, ``None``.
+   * - ``proxy_ca_certificate``
+     - PEM-formatted CA certificate for proxy connections
+   * - ``proxy_excludes``
+     - List of hosts that bypass proxy
 
 
 S3 Configuration
 ~~~~~~~~~~~~~~~~
 
-To configure credentials for AWS S3, you can use the ``AWS_ACCESS_KEY_ID``,
-``AWS_SECRET_ACCESS_KEY``, and ``AWS_SESSION_TOKEN`` environment variables.
+.. code-block:: python
 
-Alternatively, if you are using AWS SSO, you can use the ``AWS_PROFILE`` and
-``AWS_DEFAULT_REGION`` environment variables.
+  import lance
+  ds = lance.dataset(
+      "s3://bucket/path",
+      storage_options={
+          "region": "us-east-1",
+          "access_key_id": "my-access-key",
+          "secret_access_key": "my-secret-key",
+          "session_token": "my-session-token",
+      }
+  )
 
-You can see a full list of environment variables `here`__.
+If you are using AWS SSO, you can specify the ``AWS_PROFILE`` environment variable.
+It cannot be specified in the ``storage_options`` parameter.
 
-.. __: https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env
+These keys can be used as both environment variables or keys in the ``storage_options`` parameter:
+
+.. list-table::
+   :widths: 30 70
+   :header-rows: 1
+
+   * - Key
+     - Description
+   * - ``aws_region`` / ``region``
+     - The AWS region to use. This is currently required.
+   * - ``aws_access_key_id`` / ``access_key_id``
+     - The AWS access key ID to use.
+   * - ``aws_secret_access_key`` / ``secret_access_key``
+     - The AWS secret access key to use.
+   * - ``aws_session_token`` / ``session_token``
+     - The AWS session token to use.
+   * - ``aws_endpoint`` / ``endpoint``
+     - The endpoint to use for S3-compatible stores.
+   * - ``aws_virtual_hosted_style_request`` / ``virtual_hosted_style_request``
+     - Whether to use virtual hosted-style requests, where bucket name is part
+       of the endpoint. Meant to be used with ``aws_endpoint``. Default, ``False``.
+   * - ``aws_s3_express`` / ``s3_express``
+     - Whether to use S3 Express One Zone endpoints. Default, ``False``. See more
+       details below.
+   * - ``aws_server_side_encryption``
+     - The server-side encryption algorithm to use. Must be one of "AES256",
+       ``"aws:kms"``, or ``"aws:kms:dsse"``. Default, ``None``.
+   * - ``aws_sse_kms_key_id``
+     - The KMS key ID to use for server-side encryption. If set,
+       ``aws_server_side_encryption`` must be ``"aws:kms"`` or ``"aws:kms:dsse"``.
+   * - ``aws_sse_bucket_key_enabled``
+     - Whether to use bucket keys for server-side encryption.
+
 
 S3-compatible stores
 ^^^^^^^^^^^^^^^^^^^^
 
 Lance can also connect to S3-compatible stores, such as MinIO. To do so, you must
-specify two environment variables: ``AWS_ENDPOINT`` and ``AWS_DEFAULT_REGION``.
-``AWS_ENDPOINT`` should be the URL of the S3-compatible store, and
-``AWS_DEFAULT_REGION`` should be the region to use.
+specify both region and endpoint:
+
+.. code-block:: python
+
+  import lance
+  ds = lance.dataset(
+      "s3://bucket/path",
+      storage_options={
+          "region": "us-east-1",
+          "endpoint": "http://minio:9000",
+      }
+  )
+
+This can also be done with the ``AWS_ENDPOINT`` and ``AWS_DEFAULT_REGION`` environment variables.
 
 S3 Express
 ^^^^^^^^^^
@@ -525,19 +617,19 @@ region.
 
 .. _S3 Express One Zone: https://aws.amazon.com/s3/storage-classes/express-one-zone/
 
-To configure Lance to use an S3 Express endpoint, you must set the environment
-variable ``S3_EXPRESS``:
-
-.. code-block:: bash
-
-  export S3_EXPRESS=true
-
-You can then pass the bucket name **including the suffix** as you would normally:
+To configure Lance to use an S3 Express endpoint, you must set the storage option
+``s3_express``. The bucket name in your table URI should **include the suffix**.
 
 .. code-block:: python
 
   import lance
-  ds = lance.dataset("s3://my-bucket--use1-az4--x-s3/path/imagenet.lance")
+  ds = lance.dataset(
+      "s3://my-bucket--use1-az4--x-s3/path/imagenet.lance",
+      storage_options={
+          "region": "us-east-1",
+          "s3_express": "true",
+      }
+  )
 
 
 Committing mechanisms for S3
@@ -604,8 +696,9 @@ User may pass in a DynamoDB table name alone with the S3 URI to their dataset to
 .. code-block:: python
 
   import lance
-  # s3+ddb:// URL scheme let's lance know that you want to use DynamoDB for writing to S3 concurrently
-  ds = lance.dataset("s3+ddb://my-bucket/mydataset.lance?ddbTableName=mytable")
+  # s3+ddb:// URL scheme let's lance know that you want to
+  # use DynamoDB for writing to S3 concurrently
+  ds = lance.dataset("s3+ddb://my-bucket/mydataset?ddbTableName=mytable")
 
 The DynamoDB table is expected to have a primary hash key of ``base_uri`` and a range key ``version``.
 The key ``base_uri`` should be string type, and the key ``version`` should be number type.
@@ -616,11 +709,15 @@ For details on how this feature works, please see :ref:`external-manifest-store`
 Google Cloud Storage Configuration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-GCS credentials are configured by setting the ``GOOGLE_SERVICE_ACCOUNT`` environment
-variable to the path of a JSON file containing the service account credentials.
-There are several aliases for this environment variable, documented `here`__.
+.. code-block:: python
 
-.. __: https://docs.rs/object_store/latest/object_store/gcp/struct.GoogleCloudStorageBuilder.html#method.from_env
+  import lance
+  ds = lance.dataset(
+      "gs://my-bucket/my-dataset",
+      storage_options={
+          "service_account": "path/to/service-account.json",
+      }
+  )
 
 .. note::
   
@@ -628,11 +725,78 @@ There are several aliases for this environment variable, documented `here`__.
   maximum throughput significantly. However, if you wish to use HTTP/2 for some reason,
   you can set the environment variable ``HTTP1_ONLY`` to ``false``.
 
+
+These keys can be used as both environment variables or keys in the ``storage_options`` parameter:
+
+.. source: https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html
+
+.. list-table::
+   :widths: 30 70
+   :header-rows: 1
+
+   * - Key
+     - Description
+   * - ``google_service_account`` / ``service_account``
+     - Path to the service account JSON file.
+   * - ``google_service_account_key`` / ``service_account_key``
+     - The serialized service account key.
+   * - ``google_application_credentials`` / ``application_credentials``
+     - Path to the application credentials.
+
+
 Azure Blob Storage Configuration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Azure Blob Storage credentials can be configured by setting the ``AZURE_STORAGE_ACCOUNT_NAME``
-and ``AZURE_STORAGE_ACCOUNT_KEY`` environment variables. The full list of environment
-variables that can be set are documented `here`__.
+.. code-block:: python
 
-.. __: https://docs.rs/object_store/latest/object_store/azure/struct.MicrosoftAzureBuilder.html#method.from_env
+  import lance
+  ds = lance.dataset(
+      "az://my-container/my-dataset",
+      storage_options={
+          "account_name": "some-account",
+          "account_key": "some-key",
+      }
+  )
+
+These keys can be used as both environment variables or keys in the ``storage_options`` parameter:
+
+.. source: https://docs.rs/object_store/latest/object_store/azure/enum.AzureConfigKey.html
+
+.. list-table::
+   :widths: 30 70
+   :header-rows: 1
+
+   * - Key
+     - Description
+   * - ``azure_storage_account_name`` / ``account_name``
+     - The name of the azure storage account.
+   * - ``azure_storage_account_key`` / ``account_key``
+     - The serialized service account key.
+   * - ``azure_client_id`` / ``client_id``
+     - Service principal client id for authorizing requests.
+   * - ``azure_client_secret`` / ``client_secret``
+     - Service principal client secret for authorizing requests.
+   * -  ``azure_tenant_id`` / ``tenant_id``
+     - Tenant id used in oauth flows.
+   * - ``azure_storage_sas_key`` / ``azure_storage_sas_token`` / ``sas_key`` / ``sas_token``
+     - Shared access signature. The signature is expected to be percent-encoded, much like they are provided in the azure storage explorer or azure portal.
+   * - ``azure_storage_token`` / ``bearer_token`` / ``token``
+     - Bearer token.
+   * - ``azure_storage_use_emulator`` / ``object_store_use_emulator`` / ``use_emulator``
+     - Use object store with azurite storage emulator.
+   * - ``azure_endpoint`` / ``endpoint``
+     - Override the endpoint used to communicate with blob storage.
+   * - ``azure_use_fabric_endpoint`` / ``use_fabric_endpoint``
+     - Use object store with url scheme account.dfs.fabric.microsoft.com.
+   * - ``azure_msi_endpoint`` / ``azure_identity_endpoint`` / ``identity_endpoint`` / ``msi_endpoint``
+     - Endpoint to request a imds managed identity token.
+   * - ``azure_object_id`` / ``object_id``
+     - Object id for use with managed identity authentication.
+   * - ``azure_msi_resource_id`` / ``msi_resource_id``
+     - Msi resource id for use with managed identity authentication.
+   * - ``azure_federated_token_file`` / ``federated_token_file``
+     - File containing token for Azure AD workload identity federation.
+   * - ``azure_use_azure_cli`` / ``use_azure_cli``
+     - Use azure cli for acquiring access token.
+   * - ``azure_disable_tagging`` / ``disable_tagging``
+     - Disables tagging objects. This can be desirable if not supported by the backing store.
